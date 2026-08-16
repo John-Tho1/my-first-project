@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USD/RUB 견적 계산기</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --line: #dfe4ec;
+    --text: #1c2430;
+    --muted: #6b7684;
+    --accent: #2563eb;
+    --accent-soft: #eef3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
+    font-size: 15px;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 13px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
+  input[type="number"] {
+    width: 100%;
+    padding: 9px 11px;
+    font-size: 15px;
+    font-family: inherit;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: #fff;
+    color: var(--text);
+  }
+  input[type="number"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  .checkline { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 14px; }
+  .checkline input { width: 16px; height: 16px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.total td { border-bottom: none; padding-top: 14px; font-weight: 700; font-size: 17px; }
+  tr.total td.v { color: var(--accent); }
+  .rub-box {
+    margin-top: 14px;
+    background: var(--accent-soft);
+    border-radius: 9px;
+    padding: 14px 16px;
+  }
+  .rub-box .lbl { font-size: 12px; color: var(--muted); }
+  .rub-box .big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .rub-box .per { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .err { color: #c02626; font-size: 13px; margin-top: 10px; display: none; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 18px; }
+  button {
+    font: inherit; padding: 8px 14px; border-radius: 7px;
+    border: 1px solid var(--line); background: #fff; color: var(--text); cursor: pointer;
+  }
+  button:hover { background: #f0f2f6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>USD/RUB 견적 계산기</h1>
+  <p class="sub">단가·대수·환율을 입력하면 총액이 자동으로 계산됩니다.</p>
+
+  <div class="card">
+    <h2>입력</h2>
+    <div class="grid">
+      <div>
+        <label for="price">대당 단가 (USD)</label>
+        <input type="number" id="price" value="1000" min="0" step="0.01">
+      </div>
+      <div>
+        <label for="qty">대수</label>
+        <input type="number" id="qty" value="10" min="0" step="1">
+      </div>
+      <div>
+        <label for="rate">USD/RUB 환율 (1 USD = ? RUB)</label>
+        <input type="number" id="rate" value="90" min="0" step="0.0001">
+      </div>
+      <div>
+        <label for="ship">운송·부대비용 (USD, 총액)</label>
+        <input type="number" id="ship" value="0" min="0" step="0.01">
+      </div>
+      <div>
+        <label for="disc">할인율 (%)</label>
+        <input type="number" id="disc" value="0" min="0" max="100" step="0.1">
+      </div>
+      <div>
+        <label for="margin">마진율 (%)</label>
+        <input type="number" id="margin" value="0" min="0" step="0.1">
+      </div>
+    </div>
+    <div class="checkline">
+      <input type="checkbox" id="vatOn">
+      <label for="vatOn" style="margin:0; color:var(--text);">부가세(VAT) 적용</label>
+      <input type="number" id="vat" value="20" min="0" step="0.1" style="width:80px; margin-left:4px;" disabled>
+      <span style="color:var(--muted); font-size:13px;">%</span>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div class="card">
+    <h2>견적 결과</h2>
+    <table>
+      <tr><td>공급가 (단가 × 대수)</td><td class="v" id="rBase">-</td></tr>
+      <tr><td>할인</td><td class="v" id="rDisc">-</td></tr>
+      <tr><td>운송·부대비용</td><td class="v" id="rShip">-</td></tr>
+      <tr><td>마진</td><td class="v" id="rMargin">-</td></tr>
+      <tr><td>VAT</td><td class="v" id="rVat">-</td></tr>
+      <tr class="total"><td>총액 (USD)</td><td class="v" id="rUsd">-</td></tr>
+    </table>
+
+    <div class="rub-box">
+      <div class="lbl">총액 (RUB)</div>
+      <div class="big" id="rRub">-</div>
+      <div class="per" id="rPer">-</div>
+    </div>
+  </div>
+
+  <div style="text-align:center;">
+    <button type="button" id="reset">초기화</button>
+  </div>
+  <p class="foot">계산은 브라우저 안에서만 이루어지며 어디에도 전송되지 않습니다.</p>
+</div>
+
+<script>
+(function () {
+  var ids = ['price', 'qty', 'rate', 'ship', 'disc', 'margin', 'vat'];
+  var el = {};
+  ids.concat(['vatOn', 'err', 'rBase', 'rDisc', 'rShip', 'rMargin', 'rVat', 'rUsd', 'rRub', 'rPer', 'reset'])
+     .forEach(function (id) { el[id] = document.getElementById(id); });
+
+  var usdFmt = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  var rubFmt = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  function usd(n) { return '$' + usdFmt.format(n); }
+  function rub(n) { return rubFmt.format(n) + ' ₽'; }
+
+  function num(id) {
+    var v = parseFloat(el[id].value);
+    return isFinite(v) ? v : 0;
+  }
+
+  function calc() {
+    var price = num('price'), qty = num('qty'), rate = num('rate');
+    var ship = num('ship'), disc = num('disc'), margin = num('margin');
+    var vatRate = el.vatOn.checked ? num('vat') : 0;
+
+    var msgs = [];
+    if (price < 0 || qty < 0 || rate < 0 || ship < 0) msgs.push('음수는 입력할 수 없습니다.');
+    if (disc < 0 || disc > 100) msgs.push('할인율은 0~100% 범위로 입력해 주세요.');
+    if (rate === 0) msgs.push('환율을 입력하면 RUB 금액이 표시됩니다.');
+    el.err.textContent = msgs.join(' ');
+    el.err.style.display = msgs.length ? 'block' : 'none';
+
+    price = Math.max(0, price); qty = Math.max(0, qty);
+    rate = Math.max(0, rate); ship = Math.max(0, ship);
+    disc = Math.min(100, Math.max(0, disc));
+    margin = Math.max(0, margin);
+
+    var base = price * qty;
+    var discAmt = base * disc / 100;
+    var afterDisc = base - discAmt;
+    var subtotal = afterDisc + ship;
+    var marginAmt = subtotal * margin / 100;
+    var beforeVat = subtotal + marginAmt;
+    var vatAmt = beforeVat * vatRate / 100;
+    var totalUsd = beforeVat + vatAmt;
+    var totalRub = totalUsd * rate;
+
+    el.rBase.textContent = usd(base);
+    el.rDisc.textContent = discAmt > 0 ? '-' + usd(discAmt) : usd(0);
+    el.rShip.textContent = usd(ship);
+    el.rMargin.textContent = usd(marginAmt);
+    el.rVat.textContent = el.vatOn.checked ? usd(vatAmt) + ' (' + vatRate + '%)' : '미적용';
+    el.rUsd.textContent = usd(totalUsd);
+    el.rRub.textContent = rate > 0 ? rub(totalRub) : '-';
+    el.rPer.textContent = (qty > 0 && rate > 0)
+      ? '대당 ' + rub(totalRub / qty) + '  ·  ' + usd(totalUsd / qty) + '  ·  ' + qty + '대 기준'
+      : '대수와 환율을 입력해 주세요.';
+  }
+
+  ids.forEach(function (id) { el[id].addEventListener('input', calc); });
+  el.vatOn.addEventListener('change', function () {
+    el.vat.disabled = !el.vatOn.checked;
+    calc();
+  });
+  el.reset.addEventListener('click', function () {
+    el.price.value = 1000; el.qty.value = 10; el.rate.value = 90;
+    el.ship.value = 0; el.disc.value = 0; el.margin.value = 0;
+    el.vat.value = 20; el.vatOn.checked = false; el.vat.disabled = true;
+    calc();
+  });
+
+  calc();
+})();
+</script>
+</body>
+</html>

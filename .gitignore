@@ -1,0 +1,12 @@
+# AI 에이전트 간 핸드오프 산출물 (커밋 대상 아님)
+.ai/handoff/*
+!.ai/handoff/.gitkeep
+!.ai/handoff/README.md
+
+# 로컬 전용 설정 (인증·경로가 들어갈 수 있음)
+.codex/config.toml
+.claude/settings.local.json
+
+# OS / 에디터
+.DS_Store
+*.swp

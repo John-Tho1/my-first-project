@@ -58,12 +58,22 @@ fi
 mkdir -p .ai/handoff
 OUT=".ai/handoff/review-$(date +%Y%m%d-%H%M%S).md"
 
+# read-only 샌드박스에서는 파일 읽기 명령이 차단될 수 있다(Windows에서 확인됨).
+# 따라서 프로젝트 규칙을 파일로 읽게 하지 않고 stdin에 직접 실어 보낸다.
+RULES=""
+if [ -f AGENTS.md ]; then
+  RULES="$(cat AGENTS.md)"
+fi
+
 PROMPT="당신은 이 저장소의 독립 코드 리뷰어다. 구현자는 다른 에이전트이며, 당신의 역할은 동의가 아니라 검증이다.
 
 리뷰 범위: ${SCOPE}
-프로젝트 규칙: AGENTS.md를 먼저 읽고 그 규칙 위반 여부를 반드시 확인하라.
 
-변경 내용은 <stdin> 블록의 diff에 있다. 다음 형식의 마크다운 리포트만 출력하라. 서론·칭찬·요약 인사말은 쓰지 마라.
+<stdin> 블록에 두 가지가 들어 있다.
+1. AGENTS.md — 이 프로젝트의 규칙. 위반 여부를 반드시 확인하라.
+2. diff — 검토 대상 변경분.
+
+다음 형식의 마크다운 리포트만 출력하라. 서론·칭찬·요약 인사말은 쓰지 마라.
 
 ## 판정
 PASS 또는 CHANGES_REQUESTED 중 하나.
@@ -80,12 +90,18 @@ PASS 또는 CHANGES_REQUESTED 중 하나.
 규칙:
 - 추측을 사실처럼 쓰지 마라. diff에서 확인되지 않는 것은 '미확인'으로 표시하라.
 - 취향 문제(포매팅, 네이밍 선호)는 적지 마라. 동작·정확성·규칙 위반만 적어라.
-- diff에 없는 파일의 내용이 필요하면 읽어서 확인한 뒤 판단하라."
+- 샌드박스가 파일 읽기를 막을 수 있다. 차단되면 재시도하지 말고, 판단에 필요한 정보가
+  <stdin>에 없는 항목은 '미확인'으로 표시한 뒤 나머지를 마저 검토하라."
 
 CMD=(codex exec --sandbox read-only -o "$OUT")
 [ -n "${CODEX_MODEL-}" ] && CMD+=(-m "$CODEX_MODEL")
 
 echo "▶ Codex 리뷰 실행 중 ($SCOPE, ${DIFF_BYTES}B)..." >&2
-printf '%s\n' "$DIFF" | "${CMD[@]}" "$PROMPT" >/dev/null
+{
+  if [ -n "$RULES" ]; then
+    printf '===== AGENTS.md (프로젝트 규칙) =====\n%s\n\n' "$RULES"
+  fi
+  printf '===== diff (검토 대상) =====\n%s\n' "$DIFF"
+} | "${CMD[@]}" "$PROMPT" >/dev/null
 
 echo "$OUT"

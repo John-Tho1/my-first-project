@@ -3,23 +3,39 @@
 #   cp .codex/config.toml.example .codex/config.toml
 #
 # 실제 .codex/config.toml 은 .gitignore 처리되어 있다(로컬 경로·인증이 들어갈 수 있으므로).
-# 전역 설정은 ~/.codex/config.toml 에 둔다.
+#
+# ⚠ 프로젝트 로컬 파일에서 지원되는 키는 제한적이다.
+#    `profiles` 는 여기 두면 무시되고 경고가 뜬다 — 사용자 레벨에만 둘 수 있다.
+#    (확인: 2026-09-19, Windows Codex CLI 실행 시 경고 메시지)
 
 # 기본 승인/샌드박스 정책 — 이 저장소에서는 절대 danger-full-access 를 쓰지 않는다.
 approval_policy = "on-request"
 sandbox_mode    = "workspace-write"
 
 # ── Claude Code를 Codex의 MCP 서버로 붙인다 ────────────────────────────
-# 이렇게 하면 Codex 세션 안에서 Claude Code의 도구(파일 편집·검색 등)를 호출할 수 있다.
+# Codex 세션 안에서 Claude Code의 도구(파일 편집·검색 등)를 호출할 수 있게 된다.
 # 등록: codex mcp add claude-code -- claude mcp serve
-[mcp_servers.claude-code]
-command = "claude"
-args    = ["mcp", "serve"]
-startup_timeout_sec = 30
-tool_timeout_sec    = 300
+#
+# 기본적으로는 꺼두기를 권한다. 양쪽 쿼터가 동시에 소모되고 추적이 어려워진다.
+# 필요할 때만 아래 주석을 해제하라.
+#
+# [mcp_servers.claude-code]
+# command = "claude"
+# args    = ["mcp", "serve"]
+# startup_timeout_sec = 30
+# tool_timeout_sec    = 300
 
-# ── 리뷰 전용 프로필 ───────────────────────────────────────────────────
+# ── 리뷰 전용 프로필은 여기가 아니라 사용자 레벨에 둔다 ────────────────
+#
+#   ~/.codex/config.toml   (Windows: C:\Users\<사용자>\.codex\config.toml)
+#
+# 에 아래를 추가하라. 이 파일에 넣으면 무시된다.
+#
+# [profiles.reviewer]
+# approval_policy = "never"
+# sandbox_mode    = "read-only"
+#
 # 사용: codex --profile reviewer  /  codex exec --profile reviewer "..."
-[profiles.reviewer]
-approval_policy = "never"
-sandbox_mode    = "read-only"
+#
+# 참고: scripts/codex-review.sh 는 프로필 없이도 --sandbox read-only 를
+#       직접 지정하므로, 이 프로필이 없어도 리뷰는 정상 동작한다.

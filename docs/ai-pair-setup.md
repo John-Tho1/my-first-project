@@ -79,6 +79,27 @@ scripts/codex-task.sh            ← Codex에 서브 개발 위임
 cp .codex/config.toml.example .codex/config.toml
 ```
 
+⚠ **프로젝트 로컬 `.codex/config.toml`은 일부 키만 지원한다.** `profiles`를 여기 두면 아래 경고와 함께 무시된다.
+
+```
+warning: Ignored unsupported project-local config keys in ...\.codex\config.toml: profiles.
+```
+
+리뷰 프로필을 쓰려면 **사용자 레벨**에 둔다.
+
+- macOS/Linux: `~/.codex/config.toml`
+- Windows: `C:\Users\<사용자>\.codex\config.toml`
+
+```toml
+[profiles.reviewer]
+approval_policy = "never"
+sandbox_mode    = "read-only"
+```
+
+`approval_policy`, `sandbox_mode`, `mcp_servers`는 프로젝트 로컬에서 정상 적용된다. [확실 — 2026-09-19 Windows 실행 로그에서 경고 대상이 `profiles`뿐임을 확인]
+
+참고로 `scripts/codex-review.sh`는 프로필 없이도 `--sandbox read-only`를 직접 지정하므로, 이 프로필이 없어도 리뷰는 동작한다.
+
 ---
 
 ## 3. 연결 방식 — 두 갈래
@@ -218,6 +239,8 @@ codex mcp list
 | `codex review --uncommitted/--base/--commit` 존재 | `codex-rs/cli/src/main.rs` 확인 | [확실] |
 | `claude mcp serve` 존재 | 이 환경에서 `claude mcp serve --help` 실행 확인 (v2.1.278) | [확실] |
 | `-m/--model`, `-C/--cd` 플래그명 | 관례상 사용되는 플래그. 소스에서 직접 확인하지 못함 | [추정] — `codex exec --help`로 확인할 것 |
+| 프로젝트 로컬 `.codex/config.toml`이 `profiles`를 무시함 | Windows 실제 실행 로그의 경고 메시지 | [확실] — 2026-09-19 |
+| Windows에서 `.sh` 스크립트는 Git Bash 필요 | PowerShell은 bash 스크립트를 실행하지 못함 | [확실] |
 | 요금제별 구체적 사용량 한도·크레딧 수치 | 검색 결과에 상호 모순이 있어 채택하지 않음 | [미확인] — OpenAI 공식 요금 페이지에서 직접 확인할 것 |
 
 **확인하지 못한 것:** `developers.openai.com`과 `help.openai.com`이 이 실행 환경의 네트워크 정책상 차단되어, Codex 공식 문서 본문과 요금제 한도 페이지는 직접 읽지 못했다. 대신 `openai/codex` 저장소의 소스와 README를 직접 읽어 CLI 동작을 확인했다. 요금·한도 수치는 이 문서에 넣지 않았다.

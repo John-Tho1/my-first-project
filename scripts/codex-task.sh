@@ -37,7 +37,13 @@ fi
 mkdir -p .ai/handoff
 OUT=".ai/handoff/task-$(date +%Y%m%d-%H%M%S).md"
 
-PROMPT="AGENTS.md의 규칙을 먼저 읽고 그 범위 안에서 작업하라.
+# --dry(read-only)에서는 파일 읽기 명령이 차단될 수 있으므로 규칙을 stdin으로 넘긴다.
+RULES=""
+if [ -f AGENTS.md ]; then
+  RULES="$(cat AGENTS.md)"
+fi
+
+PROMPT="<stdin> 블록에 이 프로젝트의 규칙(AGENTS.md)이 들어 있다. 그 범위 안에서 작업하라.
 
 요청: ${TASK}
 
@@ -58,7 +64,11 @@ CMD=(codex exec --sandbox "$SANDBOX" -o "$OUT")
 [ -n "${CODEX_MODEL-}" ] && CMD+=(-m "$CODEX_MODEL")
 
 echo "▶ Codex 위임 실행 중 (sandbox=$SANDBOX)..." >&2
-"${CMD[@]}" "$PROMPT" >/dev/null
+{
+  if [ -n "$RULES" ]; then
+    printf '===== AGENTS.md (프로젝트 규칙) =====\n%s\n' "$RULES"
+  fi
+} | "${CMD[@]}" "$PROMPT" >/dev/null
 
 echo "$OUT"
 [ "$SANDBOX" = "workspace-write" ] && echo "→ git diff 로 변경 내용을 직접 확인하세요." >&2

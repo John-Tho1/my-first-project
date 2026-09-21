@@ -56,7 +56,10 @@ echo
 
 echo "[5] 역방향 MCP (Codex → Claude Code) 재귀 호출 위험"
 if [ -f .codex/config.toml ]; then
-  N=$(grep -cE '^\s*\[mcp_servers' .codex/config.toml 2>/dev/null || echo 0)
+  # grep -c 는 매칭이 없으면 "0"을 출력하고 종료 코드 1을 낸다.
+  # `|| echo 0` 을 붙이면 0이 두 줄이 되어 정수 비교가 깨진다. 빈 값만 0으로 보정한다.
+  N=$(grep -cE '^[[:space:]]*\[mcp_servers' .codex/config.toml 2>/dev/null)
+  [ -z "$N" ] && N=0
   if [ "$N" -gt 0 ]; then
     echo "    ⚠ 활성 ($N건) — 양쪽 쿼터 동시 소모 및 재귀 호출 가능"
     echo "      수정: cp .codex/config.toml.example .codex/config.toml"
@@ -83,7 +86,8 @@ else
   echo "    기대 응답: $TOKEN"
   echo "    --- 실제 출력 ---"
   OUT=$(codex exec --sandbox read-only \
-    "Reply with exactly $TOKEN. Do not read or write files, execute commands, use tools, or invoke other agents." 2>&1)
+    "Reply with exactly $TOKEN. Do not read or write files, execute commands, use tools, or invoke other agents." \
+    </dev/null 2>&1)
   RC=$?
   echo "$OUT" | sed 's/^/      /'
   echo "    --- 종료 코드: $RC ---"

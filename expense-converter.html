@@ -136,7 +136,7 @@
       </div>
       <!-- 환율 입력란은 정산통화에 따라 동적으로 생성 -->
     </div>
-    <p class="hint">환율은 <b>1 원통화 = ? 정산통화</b> 로 입력합니다. 예) 정산통화 USD, 1 RUB = 0.0105 → 10,000 RUB = 105.00 USD</p>
+    <p class="hint">환율은 <b>1 정산통화 = ? 원통화</b> 로 입력합니다. 예) 정산통화 USD, 1 USD = 80 RUB → 10,000 RUB = 125.00 USD</p>
   </div>
 
   <div class="card">
@@ -173,18 +173,20 @@
     </div>
   </div>
 
-  <p class="foot">모든 계산은 정확한 십진 연산으로 원값을 합산하고, 표시 단계에서만 반올림합니다(사사오입). 분류별 소계는 합이 총계와 정확히 일치하도록 끝자리를 배분합니다.</p>
+  <p class="foot">모든 계산은 부동소수점 없이 정확한 분수 연산으로 원값을 합산하고, 표시 단계에서만 반올림합니다(사사오입). 분류별 소계는 합이 총계와 정확히 일치하도록 끝자리를 배분합니다.</p>
 </div>
 
 <script>
 // --- 계산 (DOM 없음) ---------------------------------------------------------
 // 금액·환율은 문자열에서 BigInt 고정소수(10^-IN_SCALE)로 읽는다.
-// 환산액 = 금액 × 환율 → 10^-OUT_SCALE 단위. 부동소수점을 쓰지 않으므로 누적 오차가 없다.
+// 환율은 "1 정산통화 = ? 원통화"이므로 환산액 = 금액 ÷ 환율.
+// 나눗셈 결과를 중간에 반올림하지 않도록, 모든 환산액을 공통 분모 den 위의 분자(BigInt)로 둔다.
+//   den = 10^IN_SCALE × (유효한 환율들의 곱) → 어느 행이든 분자가 정수로 딱 떨어진다.
+// 합산은 분자끼리 정확히 하고, 표시할 때만 분자 ÷ den을 반올림한다.
 const CURRENCIES = ['RUB', 'USD', 'KRW'];
 const CATEGORIES = ['항공권', '숙박', '교통', '식대', '기타'];
 const DECIMALS = { RUB: 2, USD: 2, KRW: 0 };
 const IN_SCALE = 20;
-const OUT_SCALE = IN_SCALE * 2;
 
 const pow10 = n => 10n ** BigInt(n);
 
@@ -220,20 +222,24 @@ function floorDiv(a, b) {
   return (a % b !== 0n && (a < 0n) !== (b < 0n)) ? q - 1n : q;
 }
 
-// v(10^-scale 단위)를 소수 d자리 정수 단위로 반올림 (0.5는 0에서 멀어지는 방향)
-function roundUnits(v, scale, d) {
-  const unit = pow10(scale - d);
-  const a = v < 0n ? -v : v;
-  let q = a / unit;
-  if ((a % unit) * 2n >= unit) q += 1n;
-  return v < 0n ? -q : q;
+// n ÷ d (d > 0)를 정수로 반올림 (0.5는 0에서 멀어지는 방향)
+function divRound(n, d) {
+  const a = n < 0n ? -n : n;
+  let q = a / d;
+  if ((a % d) * 2n >= d) q += 1n;
+  return n < 0n ? -q : q;
+}
+
+// 값 v/den을 소수 d자리 정수 단위로 반올림
+function roundUnits(v, den, d) {
+  return divRound(v * pow10(d), den);
 }
 
 // 각 값을 내림한 뒤, 나머지가 큰 순서로 1단위씩 배분해 합이 targetUnits가 되게 한다.
-function allocateUnits(values, scale, d, targetUnits) {
-  const unit = pow10(scale - d);
-  const out = values.map(v => floorDiv(v, unit));
-  const rems = values.map((v, i) => v - out[i] * unit);
+function allocateUnits(values, den, d, targetUnits) {
+  const scaled = values.map(v => v * pow10(d));
+  const out = scaled.map(v => floorDiv(v, den));
+  const rems = scaled.map((v, i) => v - out[i] * den);
   let k = targetUnits - out.reduce((a, b) => a + b, 0n);
   const order = values.map((_, i) => i)
     .sort((a, b) => (rems[b] > rems[a]) - (rems[b] < rems[a]) || a - b);
@@ -255,6 +261,13 @@ function calculate(rows, settle, rates) {
   const rateByCur = {};
   for (const c of CURRENCIES) if (c !== settle) rateByCur[c] = parseRate(rates[c] ?? '');
 
+  // 공통 분모와, 통화별로 금액에 곱할 배수 (분자 = 금액 × mult[통화])
+  const inUnit = pow10(IN_SCALE);
+  let den = inUnit;
+  for (const c in rateByCur) if (!rateByCur[c].error) den *= rateByCur[c].value;
+  const mult = { [settle]: den / inUnit };
+  for (const c in rateByCur) if (!rateByCur[c].error) mult[c] = den / rateByCur[c].value;
+
   const catRaw = CATEGORIES.map(() => 0n);
   const origRaw = { RUB: 0n, USD: 0n, KRW: 0n };
   let totalRaw = 0n;
@@ -264,14 +277,9 @@ function calculate(rows, settle, rates) {
     const amt = typeof row.amount === 'object' ? row.amount : parseDecimal(row.amount);
     if (amt.empty) return { status: 'empty' };
     if (amt.error) { errors++; return { status: 'error', message: '금액이 ' + amt.error }; }
-    let conv;
-    if (row.currency === settle) {
-      conv = amt.value * pow10(IN_SCALE);
-    } else {
-      const r = rateByCur[row.currency];
-      if (r.error) { errors++; return { status: 'error', message: r.error + ` (${row.currency}→${settle})` }; }
-      conv = amt.value * r.value;
-    }
+    const r = rateByCur[row.currency];
+    if (r && r.error) { errors++; return { status: 'error', message: r.error + ` (${row.currency}→${settle})` }; }
+    const conv = amt.value * mult[row.currency];
     catRaw[CATEGORIES.indexOf(row.category)] += conv;
     origRaw[row.currency] += amt.value;
     totalRaw += conv;
@@ -280,12 +288,12 @@ function calculate(rows, settle, rates) {
   });
 
   const d = DECIMALS[settle];
-  const totalUnits = roundUnits(totalRaw, OUT_SCALE, d);
-  const catUnits = allocateUnits(catRaw, OUT_SCALE, d, totalUnits);
+  const totalUnits = roundUnits(totalRaw, den, d);
+  const catUnits = allocateUnits(catRaw, den, d, totalUnits);
   return {
-    settle, d, rowResults, used, errors,
+    settle, d, den, rowResults, used, errors,
     catRaw, catUnits, totalRaw, totalUnits,
-    origUnits: Object.fromEntries(CURRENCIES.map(c => [c, roundUnits(origRaw[c], IN_SCALE, DECIMALS[c])])),
+    origUnits: Object.fromEntries(CURRENCIES.map(c => [c, roundUnits(origRaw[c], inUnit, DECIMALS[c])])),
     // 검산: 원값 기준과 표시값 기준을 모두 확인
     rawMatch: catRaw.reduce((a, b) => a + b, 0n) === totalRaw,
     shownSum: catUnits.reduce((a, b) => a + b, 0n),
@@ -326,7 +334,7 @@ function renderRates() {
     input.value = rateStore[key] ?? '';
     input.addEventListener('input', () => { rateStore[key] = input.value; recalc(); });
     $('settings').appendChild(el('div', { class: 'rate' }, [
-      el('label', { for: 'rate-' + c, text: `1 ${c} = ? ${settle}` }), input,
+      el('label', { for: 'rate-' + c, text: `1 ${settle} = ? ${c}` }), input,
     ]));
   }
 }
@@ -384,7 +392,7 @@ function recalc() {
     rowEls[i].querySelector('.amt').classList.toggle('bad', rr.status === 'error' && rr.message.startsWith('금액'));
     conv.className = 'conv';
     if (rr.status === 'ok') {
-      conv.textContent = formatUnits(roundUnits(rr.raw, OUT_SCALE, d), d) + ' ' + settle;
+      conv.textContent = formatUnits(roundUnits(rr.raw, res.den, d), d) + ' ' + settle;
     } else if (rr.status === 'error') {
       conv.classList.add('error');
       conv.textContent = '⚠ ' + rr.message;

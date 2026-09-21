@@ -80,6 +80,10 @@
     .row .del { justify-self: end; }
   }
   .empty { color: var(--muted); font-size: 14px; padding: 10px 0; }
+  .row .ocr { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  .row .ocr img { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; flex: none; }
+  .row .ocr .bad { color: var(--danger); }
+  #receipts.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; background: var(--accent-soft); }
 
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 0 0 6px; border-bottom: 1px solid var(--line); }
@@ -139,7 +143,7 @@
     <p class="hint">환율은 <b>1 정산통화 = ? 원통화</b> 로 입력합니다. 예) 정산통화 USD, 1 USD = 80 RUB → 10,000 RUB = 125.00 USD</p>
   </div>
 
-  <div class="card">
+  <div class="card" id="receipts">
     <h2>영수증</h2>
     <div class="rows-head">
       <span>날짜</span><span>분류</span><span>통화</span><span>금액</span><span class="r" id="convHead">환산액</span><span></span>
@@ -147,7 +151,11 @@
     <div id="rows"></div>
     <div class="actions">
       <button type="button" id="addRow">+ 영수증 추가</button>
+      <button type="button" id="addPhoto">📷 사진으로 추가</button>
+      <input type="file" id="photoInput" accept="image/*" multiple hidden>
     </div>
+    <p class="hint">사진을 이 카드에 끌어다 놓아도 됩니다. 통화·금액·날짜를 자동으로 채우며, 결과는 초안이니 사진과 대조해 확인하세요.
+      인식은 이 브라우저 안에서만 하고 사진을 외부로 보내지 않습니다. 처음 한 번 인식 엔진과 언어 데이터를 내려받습니다(인터넷 필요).</p>
   </div>
 
   <div class="card">
@@ -297,6 +305,135 @@ function calculate(rows, settle, rates) {
     // 검산: 원값 기준과 표시값 기준을 모두 확인
     rawMatch: catRaw.reduce((a, b) => a + b, 0n) === totalRaw,
     shownSum: catUnits.reduce((a, b) => a + b, 0n),
+  };
+}
+
+// --- 영수증 텍스트 해석 (DOM 없음) --------------------------------------------
+// OCR 결과 텍스트에서 통화·금액·날짜를 뽑는다. 결과는 초안이며 사용자가 확인한다.
+const TOTAL_WORDS = /к\s*оплате|итого|итог|всего|grand\s*total|total|amount\s*due|balance\s*due|합\s*계|총\s*액|결제\s*금액|받을\s*금액|승인\s*금액|청구\s*금액/i;
+const NOT_TOTAL_WORDS = /sub\s*-?\s*total|подытог|소\s*계|부가세|vat|ндс|tax|change|сдача|거스름/i;
+const ID_LINE_WORDS = /тел|tel|phone|전화|инн|кпп|огрн|사업자|card|карт|카드|№|#/i;
+const DATE_PATTERNS = [
+  /(20\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})/,            // 2026-09-10, 2026.09.10
+  /(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일/,              // 2026년 9월 10일
+  /(?<!\d)(\d{1,2})([./-])(\d{1,2})\2(\d{4}|\d{2})(?!\d)/,        // 10.09.2026 (일.월), 09/10/26 (월/일)
+];
+const TIME_RE = /\d{1,2}:\d{2}(?::\d{2})?/g;
+// "1 234,56"처럼 공백으로 3자리를 묶은 수를 먼저 잡고, 그 외에는 숫자·구분자 덩어리를 잡는다
+const NUM_RE = /\d{1,3}(?:[  ]\d{3})+(?:[.,]\d{1,2})?(?![\d.,])|\d+(?:[.,']\d+)*/g;
+
+// 달력에 실제로 있는 날짜만 반환 (2026-02-31, 04/31 등은 null)
+function toIsoDate(y, m, d) {
+  const yr = Number(y), mo = Number(m), da = Number(d);
+  const t = new Date(Date.UTC(yr, mo - 1, da));
+  if (t.getUTCFullYear() !== yr || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== da) return null;
+  return `${y}-${String(mo).padStart(2, '0')}-${String(da).padStart(2, '0')}`;
+}
+
+// 텍스트에서 앞쪽부터 보며 달력상 유효한 첫 날짜를 반환 (유효기간 2026-02-31 같은 오인식은 건너뜀)
+function detectDate(text) {
+  const hits = [];
+  DATE_PATTERNS.forEach((re, kind) => {
+    for (const m of text.matchAll(new RegExp(re.source, 'g'))) hits.push({ m, kind });
+  });
+  hits.sort((a, b) => a.m.index - b.m.index);
+  for (const { m, kind } of hits) {
+    let iso;
+    if (kind < 2) {
+      iso = toIsoDate(m[1], m[2], m[3]);
+    } else {
+      const year = m[4].length === 2 ? '20' + m[4] : m[4];
+      // '/'는 미국식(월/일), 그 외는 러시아·유럽식(일.월)
+      iso = m[2] === '/' && Number(m[1]) <= 12 ? toIsoDate(year, m[1], m[3]) : toIsoDate(year, m[3], m[1]);
+    }
+    if (iso) return iso;
+  }
+  return null;
+}
+
+// "1 234,56" / "1,234.56" / "12,000" / "1.234.567" → "1234.56" 등. 해석할 수 없으면 null
+function normalizeNumber(raw) {
+  let t = raw.replace(/[\s ']/g, '');
+  const lastDot = t.lastIndexOf('.'), lastComma = t.lastIndexOf(',');
+  if (lastDot >= 0 && lastComma >= 0) {
+    const dec = lastDot > lastComma ? '.' : ',';
+    t = t.split(dec === '.' ? ',' : '.').join('');
+    if (t.split(dec).length !== 2) return null;
+    t = t.replace(dec, '.');
+  } else if (lastDot >= 0 || lastComma >= 0) {
+    const parts = t.split(lastDot >= 0 ? '.' : ',');
+    if (parts.length === 2 && parts[1].length <= 2) t = parts.join('.');           // 1234,56 · 12.5
+    else if (parts.slice(1).every(p => p.length === 3)) t = parts.join('');        // 12,000 · 1.234.567
+    else return null;
+  }
+  return /^\d+(\.\d+)?$/.test(t) ? t : null;
+}
+
+// 한 줄에서 금액 후보를 뽑는다 (날짜·시각·퍼센트·긴 일련번호 제외)
+function amountsIn(line) {
+  let s = line.replace(TIME_RE, ' ');
+  for (const re of DATE_PATTERNS) s = s.replace(new RegExp(re.source, 'g'), ' ');
+  // 날짜를 뺀 뒤에도 하이픈으로 이어진 숫자는 사업자번호·전화·카드번호이므로 통째로 뺀다
+  s = s.replace(/\d+(?:\s*[-–]\s*\d+)+/g, ' ');
+  const out = [];
+  for (const m of s.matchAll(NUM_RE)) {
+    const after = s.slice(m.index + m[0].length).trimStart();
+    if (after.startsWith('%')) continue;
+    if (/^\d{9,}$/.test(m[0])) continue;       // 사업자번호·ИНН·카드번호 등
+    const n = normalizeNumber(m[0]);
+    if (n !== null) out.push(n);
+  }
+  return out;
+}
+
+function detectCurrency(text) {
+  if (/₽|руб|\bRUB\b|\bRUR\b/i.test(text)) return { currency: 'RUB', guessed: false };
+  if (/₩|\bKRW\b|\d\s*원/.test(text)) return { currency: 'KRW', guessed: false };
+  if (/\$|\bUSD\b/i.test(text)) return { currency: 'USD', guessed: false };
+  if (/[Ѐ-ӿ]{3,}/.test(text)) return { currency: 'RUB', guessed: true };
+  if (/[가-힣]{2,}/.test(text)) return { currency: 'KRW', guessed: true };
+  return null;
+}
+
+const largest = list => list.reduce((a, b) => (parseDecimal(b).value > parseDecimal(a).value ? b : a));
+
+// 합계 키워드 바로 뒤의 첫 금액. 세금·거스름돈 키워드가 나오면 거기서 끊는다.
+// "TOTAL 19.02 TAX 1.50"처럼 한 줄에 합쳐져도 합계만 잡고, "Total Tax"·"Subtotal"은 건너뛴다.
+const TOTAL_WORDS_G = new RegExp(TOTAL_WORDS.source, 'gi');
+function totalAmountsIn(line, nextLine) {
+  const out = [];
+  for (const m of line.matchAll(TOTAL_WORDS_G)) {
+    if (/sub\s*-?\s*$/i.test(line.slice(0, m.index))) continue;   // subtotal
+    const rest = line.slice(m.index + m[0].length);
+    const stop = rest.search(NOT_TOTAL_WORDS);
+    const nums = amountsIn(stop >= 0 ? rest.slice(0, stop) : rest);
+    if (nums.length) out.push(nums[0]);
+    else if (stop < 0 && nextLine) {                                 // 금액이 다음 줄에 있는 경우
+      const next = amountsIn(nextLine);
+      if (next.length) out.push(next[next.length - 1]);
+    }
+  }
+  return out;
+}
+
+// → { currency, currencyGuessed, amount(문자열), amountGuessed, date(YYYY-MM-DD) } — 못 찾은 항목은 null
+function parseReceiptText(text) {
+  const lines = String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const keyed = lines.flatMap((line, i) => totalAmountsIn(line, lines[i + 1]));
+  let amount = null, amountGuessed = false;
+  if (keyed.length) {
+    amount = largest(keyed);
+  } else {
+    // 추정할 때는 전화·사업자번호·카드 줄의 숫자를 후보에서 뺀다
+    const all = lines.filter(l => !ID_LINE_WORDS.test(l)).flatMap(amountsIn);
+    if (all.length) { amount = largest(all); amountGuessed = true; }
+  }
+  const cur = detectCurrency(text);
+  return {
+    currency: cur ? cur.currency : null,
+    currencyGuessed: cur ? cur.guessed : false,
+    amount, amountGuessed,
+    date: detectDate(text),
   };
 }
 
@@ -479,12 +616,108 @@ async function copyText(text) {
   }
 }
 
+// --- 영수증 사진 인식 --------------------------------------------------------
+// AGENTS.md §2의 승인된 예외: Tesseract.js를 버전 고정 + SRI로, 사진을 첨부할 때만 불러온다.
+const TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+const TESSERACT_SRI = 'sha384-GJqSu7vueQ9qN0E9yLPb3Wtpd7OrgK8KmYzC8T1IysG1bcvxvIO4qtYR/D3A991F';
+let ocrWorkerPromise = null;
+let ocrProgress = () => {};
+let ocrQueue = Promise.resolve();
+
+function loadScript(src, integrity) {
+  return new Promise((resolve, reject) => {
+    const s = el('script', { src, integrity, crossorigin: 'anonymous' });
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('script load failed'));
+    document.head.appendChild(s);
+  });
+}
+
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      if (!window.Tesseract) await loadScript(TESSERACT_SRC, TESSERACT_SRI);
+      return Tesseract.createWorker(['rus', 'eng', 'kor'], 1, { logger: m => ocrProgress(m) });
+    })();
+    ocrWorkerPromise.catch(() => { ocrWorkerPromise = null; });   // 실패하면 다음 사진에서 다시 시도
+  }
+  return ocrWorkerPromise;
+}
+
+function addPhotos(files) {
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue;
+    const row = addRow();
+    const url = URL.createObjectURL(file);
+    row.dataset.photo = url;
+    const msg = el('span', { text: '인식 대기 중…' });
+    row.appendChild(el('div', { class: 'ocr' }, [
+      el('img', { src: url, alt: '영수증 사진', title: '클릭하면 크게 봅니다' }), msg,
+    ]));
+    ocrQueue = ocrQueue.then(() => recognizeInto(row, file, msg));
+  }
+}
+
+async function recognizeInto(row, file, msg) {
+  if (!row.isConnected) return;   // 대기 중에 삭제된 행
+  msg.textContent = '인식 엔진 준비 중…';
+  ocrProgress = m => {
+    if (!row.isConnected) return;
+    msg.textContent = m.status === 'recognizing text'
+      ? `인식 중… ${Math.round(m.progress * 100)}%`
+      : '인식 엔진 준비 중… (처음 한 번은 오래 걸립니다)';
+  };
+  let text;
+  try {
+    const worker = await getOcrWorker();
+    text = (await worker.recognize(file)).data.text;
+  } catch (_) {
+    if (row.isConnected) {
+      msg.className = 'bad';
+      msg.textContent = '⚠ 인식하지 못했습니다. 인터넷 연결을 확인하거나 직접 입력하세요.';
+    }
+    return;
+  }
+  if (!row.isConnected) return;
+
+  const p = parseReceiptText(text);
+  if (p.date) row.querySelector('.date').value = p.date;
+  if (p.currency) row.querySelector('.cur').value = p.currency;
+  if (p.amount) row.querySelector('.amt').value = p.amount;
+  recalc();
+
+  const found = [];
+  if (p.currency) found.push(`통화 ${p.currency}${p.currencyGuessed ? '(추정)' : ''}`);
+  if (p.amount) found.push(`금액 ${p.amount}${p.amountGuessed ? '(추정 — 합계 줄을 찾지 못함)' : ''}`);
+  if (p.date) found.push(`날짜 ${p.date}`);
+  const missing = [!p.currency && '통화', !p.amount && '금액', !p.date && '날짜'].filter(Boolean);
+  msg.replaceChildren(
+    document.createTextNode(found.length ? `자동 인식: ${found.join(' · ')} — 사진과 대조해 확인하세요. ` : ''),
+    ...(missing.length ? [el('span', { class: 'bad', text: `⚠ 찾지 못함: ${missing.join('·')} — 직접 입력하세요.` })] : []),
+  );
+}
+
+$('addPhoto').addEventListener('click', () => $('photoInput').click());
+$('photoInput').addEventListener('change', e => { addPhotos([...e.target.files]); e.target.value = ''; });
+const receiptsEl = $('receipts');
+receiptsEl.addEventListener('dragover', e => { e.preventDefault(); receiptsEl.classList.add('dragging'); });
+receiptsEl.addEventListener('dragleave', e => { if (!receiptsEl.contains(e.relatedTarget)) receiptsEl.classList.remove('dragging'); });
+receiptsEl.addEventListener('drop', e => {
+  e.preventDefault();
+  receiptsEl.classList.remove('dragging');
+  addPhotos([...e.dataTransfer.files]);
+});
+
 rowsEl.addEventListener('input', recalc);
 rowsEl.addEventListener('change', recalc);
 rowsEl.addEventListener('click', e => {
+  if (e.target.matches('.ocr img')) { window.open(e.target.src); return; }
   const btn = e.target.closest('.del');
   if (!btn) return;
-  btn.closest('.row').remove();
+  const row = btn.closest('.row');
+  row.remove();
+  // 이미지는 행과 함께 사라지므로 object URL을 해제한다 (인식 중이어도 file 객체로 인식하므로 안전)
+  if (row.dataset.photo) URL.revokeObjectURL(row.dataset.photo);
   recalc();
 });
 settleEl.addEventListener('change', () => { renderRates(); recalc(); });

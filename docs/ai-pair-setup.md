@@ -207,6 +207,25 @@ Codex 세션 안에서 `/mcp`로 연결 상태를 확인한다.
 
 ---
 
+## 5-4. Windows 제약 — 확인된 사항
+
+2026-09-21 Windows 실측에서 **`codex exec --sandbox workspace-write` 가 실제 쓰기 권한을 얻지 못했다.** Codex는 read-only 환경이라고 보고했고 파일 생성·목록 조회·사양서 읽기가 모두 차단됐다. [확실 — 실행 로그]
+
+원인: Windows는 쓰기 샌드박스에 별도 프로비저닝이 필요하다. `codex sandbox setup --elevated` 가 그 역할을 하며, Windows 샌드박스 모드를 `elevated` 로 저장한다. [확실 — `codex-rs/cli/src/sandbox_setup.rs`]
+
+**단, `--elevated` 는 관리자 권한을 요구한다.** 회사 PC에서는 막혀 있을 수 있고, 권한 상승은 신중히 판단할 사안이다.
+
+### 권한 없이 쓰는 방법
+
+| 용도 | 명령 | 동작 |
+|---|---|---|
+| 코드 리뷰 | `./scripts/codex-review.sh` | ✅ 영향 없음. read-only 로 돌고 리포트는 **스크립트가** 쓴다 |
+| 문서 생성 | `./scripts/codex-task.sh --write <경로> "지시"` | ✅ Codex는 내용만 반환하고 **스크립트가** 파일을 쓴다. 샌드박스와 무관 |
+| 계획만 받기 | `./scripts/codex-task.sh --dry "지시"` | ✅ read-only 로 동작 |
+| **코드 직접 수정 위임** | `./scripts/codex-task.sh "지시"` | ❌ **이 PC에서는 동작하지 않는다.** 쓰기 샌드박스 프로비저닝이 필요 |
+
+마지막 항목이 막히면 그 작업은 Claude Code가 수행하고 Codex는 검증에만 쓴다. 원래 역할 분담(AGENTS.md §4)이 그러하므로 실질적 손실은 크지 않다.
+
 ## 6. 동작 확인
 
 ```bash

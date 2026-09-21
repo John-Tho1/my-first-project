@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>출장비 정산 환산기</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --line: #dfe4ec;
+    --text: #1c2430;
+    --muted: #6b7684;
+    --accent: #2563eb;
+    --accent-soft: #eef3ff;
+    --danger: #c02626; /* quote-calculator.html의 .err 색상과 동일 */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
+    font-size: 15px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 13px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
+  input, select {
+    width: 100%;
+    padding: 9px 11px;
+    font-size: 15px;
+    font-family: inherit;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: var(--card);
+    color: var(--text);
+    min-width: 0;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  input.bad { border-color: var(--danger); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+
+  /* 영수증 행 */
+  .rows-head, .row {
+    display: grid;
+    grid-template-columns: 150px 1fr 90px 1.2fr 1.3fr 36px;
+    gap: 8px;
+    align-items: center;
+  }
+  .rows-head { font-size: 12px; color: var(--muted); padding: 0 0 6px; }
+  .rows-head .r { text-align: right; }
+  .row { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .row .conv { text-align: right; font-variant-numeric: tabular-nums; font-size: 14px; }
+  .row .conv.muted { color: var(--muted); }
+  .row .conv.error { color: var(--danger); font-size: 13px; }
+  .row .del { padding: 6px 0; width: 36px; color: var(--muted); }
+  @media (max-width: 680px) {
+    .rows-head { display: none; }
+    .row { grid-template-columns: 1fr 1fr; }
+    .row .conv { grid-column: 1 / 2; text-align: left; }
+    .row .del { justify-self: end; }
+  }
+  .empty { color: var(--muted); font-size: 14px; padding: 10px 0; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 0 0 6px; border-bottom: 1px solid var(--line); }
+  th.v { text-align: right; }
+  td { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.total td { border-bottom: none; padding-top: 14px; font-weight: 700; font-size: 17px; }
+  tr.total td.v { color: var(--accent); }
+  .results { display: grid; grid-template-columns: 1.4fr 1fr; gap: 28px; }
+  @media (max-width: 680px) { .results { grid-template-columns: 1fr; } }
+
+  .check {
+    margin-top: 16px;
+    border-radius: 9px;
+    padding: 12px 16px;
+    font-size: 14px;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-soft);
+  }
+  .check .line { font-variant-numeric: tabular-nums; }
+  .check .verdict { font-weight: 700; margin-top: 4px; color: var(--accent); }
+  .check.fail { background: var(--card); border: 2px solid var(--danger); }
+  .check.fail .verdict { color: var(--danger); }
+  .warn { color: var(--danger); font-size: 13px; margin-top: 10px; }
+  .warn:empty { display: none; }
+
+  .actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  .status { color: var(--muted); font-size: 13px; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 18px; }
+  button {
+    font: inherit; padding: 8px 14px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer;
+  }
+  button:hover { background: var(--bg); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--card); }
+  button.primary:hover { opacity: .9; background: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>출장비 정산 환산기</h1>
+  <p class="sub">RUB·USD·KRW가 섞인 영수증을 하나의 정산통화로 환산해 분류별 소계와 총계를 냅니다.</p>
+
+  <div class="card">
+    <h2>정산 설정</h2>
+    <div class="grid" id="settings">
+      <div>
+        <label for="settle">정산통화</label>
+        <select id="settle">
+          <option value="RUB">RUB</option>
+          <option value="USD" selected>USD</option>
+          <option value="KRW">KRW</option>
+        </select>
+      </div>
+      <!-- 환율 입력란은 정산통화에 따라 동적으로 생성 -->
+    </div>
+    <p class="hint">환율은 <b>1 원통화 = ? 정산통화</b> 로 입력합니다. 예) 정산통화 USD, 1 RUB = 0.0105 → 10,000 RUB = 105.00 USD</p>
+  </div>
+
+  <div class="card">
+    <h2>영수증</h2>
+    <div class="rows-head">
+      <span>날짜</span><span>분류</span><span>통화</span><span>금액</span><span class="r" id="convHead">환산액</span><span></span>
+    </div>
+    <div id="rows"></div>
+    <div class="actions">
+      <button type="button" id="addRow">+ 영수증 추가</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>결과</h2>
+    <div class="results">
+      <table>
+        <thead><tr><th>분류</th><th class="v" id="catHead">소계</th></tr></thead>
+        <tbody id="catBody"></tbody>
+      </table>
+      <table>
+        <thead><tr><th>통화별 원금액</th><th class="v">소계 (환산 전)</th></tr></thead>
+        <tbody id="origBody"></tbody>
+      </table>
+    </div>
+    <div class="warn" id="warn"></div>
+    <div class="check" id="check">
+      <div class="line" id="checkLine"></div>
+      <div class="verdict" id="checkVerdict"></div>
+    </div>
+    <div class="actions">
+      <button type="button" class="primary" id="copy">결과 표 복사 (엑셀용)</button>
+      <span class="status" id="copyStatus" role="status"></span>
+    </div>
+  </div>
+
+  <p class="foot">모든 계산은 정확한 십진 연산으로 원값을 합산하고, 표시 단계에서만 반올림합니다(사사오입). 분류별 소계는 합이 총계와 정확히 일치하도록 끝자리를 배분합니다.</p>
+</div>
+
+<script>
+// --- 계산 (DOM 없음) ---------------------------------------------------------
+// 금액·환율은 문자열에서 BigInt 고정소수(10^-IN_SCALE)로 읽는다.
+// 환산액 = 금액 × 환율 → 10^-OUT_SCALE 단위. 부동소수점을 쓰지 않으므로 누적 오차가 없다.
+const CURRENCIES = ['RUB', 'USD', 'KRW'];
+const CATEGORIES = ['항공권', '숙박', '교통', '식대', '기타'];
+const DECIMALS = { RUB: 2, USD: 2, KRW: 0 };
+const IN_SCALE = 20;
+const OUT_SCALE = IN_SCALE * 2;
+
+const pow10 = n => 10n ** BigInt(n);
+
+// '' → {empty}, 숫자 → {value}, 그 외 → {error}
+function parseDecimal(raw) {
+  const s = String(raw).trim();
+  if (s === '') return { empty: true };
+  // type=number는 지수 표기(1e3, 1e-7)도 허용하므로 문자열 그대로 정확히 해석한다
+  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(s);
+  if (!m || (m[2] === '' && !m[3])) return { error: '숫자가 아닙니다' };
+  const exp = m[4] ? Number(m[4]) : 0;
+  if (Math.abs(exp) > 30) return { error: '범위를 벗어났습니다' };
+  const scale = (m[3] || '').length - exp;   // 소수 자릿수
+  const cut = scale - IN_SCALE;              // 정밀도를 넘는 자릿수
+  // 잘라낼 자릿수가 숫자 길이보다 길어도 slice 인덱스가 음수가 되지 않도록 앞을 0으로 채운다
+  const digits = ((m[2] || '0') + (m[3] || '')).padStart(cut + 1, '0');
+  if (cut > 0 && /[1-9]/.test(digits.slice(-cut))) return { error: '소수 자릿수가 너무 깁니다' };
+  const v = cut > 0 ? BigInt(digits.slice(0, -cut)) : BigInt(digits) * pow10(-cut);
+  return { value: m[1] === '-' ? -v : v };
+}
+
+function parseRate(raw) {
+  const r = parseDecimal(raw);
+  if (r.empty) return { error: '환율 미입력' };
+  if (r.error) return { error: '환율이 ' + r.error };
+  if (r.value === 0n) return { error: '환율이 0입니다' };
+  if (r.value < 0n) return { error: '환율은 양수여야 합니다' };
+  return r;
+}
+
+function floorDiv(a, b) {
+  const q = a / b;
+  return (a % b !== 0n && (a < 0n) !== (b < 0n)) ? q - 1n : q;
+}
+
+// v(10^-scale 단위)를 소수 d자리 정수 단위로 반올림 (0.5는 0에서 멀어지는 방향)
+function roundUnits(v, scale, d) {
+  const unit = pow10(scale - d);
+  const a = v < 0n ? -v : v;
+  let q = a / unit;
+  if ((a % unit) * 2n >= unit) q += 1n;
+  return v < 0n ? -q : q;
+}
+
+// 각 값을 내림한 뒤, 나머지가 큰 순서로 1단위씩 배분해 합이 targetUnits가 되게 한다.
+function allocateUnits(values, scale, d, targetUnits) {
+  const unit = pow10(scale - d);
+  const out = values.map(v => floorDiv(v, unit));
+  const rems = values.map((v, i) => v - out[i] * unit);
+  let k = targetUnits - out.reduce((a, b) => a + b, 0n);
+  const order = values.map((_, i) => i)
+    .sort((a, b) => (rems[b] > rems[a]) - (rems[b] < rems[a]) || a - b);
+  for (let j = 0; k > 0n && j < order.length; j++, k--) out[order[j]] += 1n;
+  return out;
+}
+
+// 정수 단위 → "1,234.50" (sep=false면 "1234.50")
+function formatUnits(units, d, sep = true) {
+  const neg = units < 0n;
+  const s = (neg ? -units : units).toString().padStart(d + 1, '0');
+  let int = d ? s.slice(0, -d) : s;
+  if (sep) int = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (neg ? '-' : '') + int + (d ? '.' + s.slice(-d) : '');
+}
+
+// rows: [{category, currency, amount: 문자열|{error}}], rates: {통화: 문자열}
+function calculate(rows, settle, rates) {
+  const rateByCur = {};
+  for (const c of CURRENCIES) if (c !== settle) rateByCur[c] = parseRate(rates[c] ?? '');
+
+  const catRaw = CATEGORIES.map(() => 0n);
+  const origRaw = { RUB: 0n, USD: 0n, KRW: 0n };
+  let totalRaw = 0n;
+  let used = 0, errors = 0;
+
+  const rowResults = rows.map(row => {
+    const amt = typeof row.amount === 'object' ? row.amount : parseDecimal(row.amount);
+    if (amt.empty) return { status: 'empty' };
+    if (amt.error) { errors++; return { status: 'error', message: '금액이 ' + amt.error }; }
+    let conv;
+    if (row.currency === settle) {
+      conv = amt.value * pow10(IN_SCALE);
+    } else {
+      const r = rateByCur[row.currency];
+      if (r.error) { errors++; return { status: 'error', message: r.error + ` (${row.currency}→${settle})` }; }
+      conv = amt.value * r.value;
+    }
+    catRaw[CATEGORIES.indexOf(row.category)] += conv;
+    origRaw[row.currency] += amt.value;
+    totalRaw += conv;
+    used++;
+    return { status: 'ok', raw: conv };
+  });
+
+  const d = DECIMALS[settle];
+  const totalUnits = roundUnits(totalRaw, OUT_SCALE, d);
+  const catUnits = allocateUnits(catRaw, OUT_SCALE, d, totalUnits);
+  return {
+    settle, d, rowResults, used, errors,
+    catRaw, catUnits, totalRaw, totalUnits,
+    origUnits: Object.fromEntries(CURRENCIES.map(c => [c, roundUnits(origRaw[c], IN_SCALE, DECIMALS[c])])),
+    // 검산: 원값 기준과 표시값 기준을 모두 확인
+    rawMatch: catRaw.reduce((a, b) => a + b, 0n) === totalRaw,
+    shownSum: catUnits.reduce((a, b) => a + b, 0n),
+  };
+}
+
+// --- 화면 --------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const rowsEl = $('rows');
+const settleEl = $('settle');
+const rateStore = {};   // "RUB>USD" → 입력 문자열. 정산통화를 바꿔도 쌍별로 보존
+let lastResult = null;
+
+function today() {
+  const t = new Date();
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+}
+
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'text') e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function renderRates() {
+  const settle = settleEl.value;
+  $('settings').querySelectorAll('.rate').forEach(n => n.remove());
+  for (const c of CURRENCIES) {
+    if (c === settle) continue;
+    const key = `${c}>${settle}`;
+    const input = el('input', {
+      type: 'number', step: 'any', min: '0', id: 'rate-' + c,
+      'data-cur': c, placeholder: '환율 입력',
+    });
+    input.value = rateStore[key] ?? '';
+    input.addEventListener('input', () => { rateStore[key] = input.value; recalc(); });
+    $('settings').appendChild(el('div', { class: 'rate' }, [
+      el('label', { for: 'rate-' + c, text: `1 ${c} = ? ${settle}` }), input,
+    ]));
+  }
+}
+
+function addRow(data = {}) {
+  const cat = el('select', { 'aria-label': '분류', class: 'cat' },
+    CATEGORIES.map(c => el('option', { value: c, text: c })));
+  const cur = el('select', { 'aria-label': '통화', class: 'cur' },
+    CURRENCIES.map(c => el('option', { value: c, text: c })));
+  cat.value = data.category || CATEGORIES[0];
+  cur.value = data.currency || settleEl.value;
+  const row = el('div', { class: 'row' }, [
+    el('input', { type: 'date', 'aria-label': '날짜', class: 'date', value: data.date || today() }),
+    cat, cur,
+    el('input', { type: 'number', step: 'any', 'aria-label': '금액', class: 'amt', placeholder: '금액' }),
+    el('div', { class: 'conv' }),
+    el('button', { type: 'button', class: 'del', title: '행 삭제', 'aria-label': '행 삭제', text: '✕' }),
+  ]);
+  if (data.amount != null) row.querySelector('.amt').value = data.amount;
+  rowsEl.appendChild(row);
+  recalc();
+  return row;
+}
+
+function readRows() {
+  return [...rowsEl.querySelectorAll('.row')].map(r => {
+    const amtEl = r.querySelector('.amt');
+    return {
+      category: r.querySelector('.cat').value,
+      currency: r.querySelector('.cur').value,
+      // type=number에 문자를 넣으면 value가 ''가 되므로 badInput으로 구분한다
+      amount: amtEl.validity.badInput ? { error: '숫자가 아닙니다' } : amtEl.value,
+    };
+  });
+}
+
+function readRates() {
+  const rates = {};
+  $('settings').querySelectorAll('.rate input').forEach(i => {
+    rates[i.dataset.cur] = i.validity.badInput ? 'x' : i.value;
+  });
+  return rates;
+}
+
+function recalc() {
+  const settle = settleEl.value;
+  const res = calculate(readRows(), settle, readRates());
+  lastResult = res;
+  const d = res.d;
+
+  // 행별 환산액
+  const rowEls = rowsEl.querySelectorAll('.row');
+  res.rowResults.forEach((rr, i) => {
+    const conv = rowEls[i].querySelector('.conv');
+    rowEls[i].querySelector('.amt').classList.toggle('bad', rr.status === 'error' && rr.message.startsWith('금액'));
+    conv.className = 'conv';
+    if (rr.status === 'ok') {
+      conv.textContent = formatUnits(roundUnits(rr.raw, OUT_SCALE, d), d) + ' ' + settle;
+    } else if (rr.status === 'error') {
+      conv.classList.add('error');
+      conv.textContent = '⚠ ' + rr.message;
+    } else {
+      conv.classList.add('muted');
+      conv.textContent = '—';
+    }
+  });
+  if (!rowEls.length) {
+    if (!rowsEl.querySelector('.empty')) rowsEl.appendChild(el('div', { class: 'empty', text: '영수증이 없습니다. 아래 버튼으로 추가하세요.' }));
+  } else {
+    rowsEl.querySelector('.empty')?.remove();
+  }
+
+  // 환율 입력란 오류 표시
+  $('settings').querySelectorAll('.rate input').forEach(i => {
+    const needed = res.rowResults.some((rr, idx) => rr.status === 'error' && rowEls[idx].querySelector('.cur').value === i.dataset.cur && !rr.message.startsWith('금액'));
+    i.classList.toggle('bad', needed);
+  });
+
+  $('convHead').textContent = `환산액 (${settle})`;
+  $('catHead').textContent = `소계 (${settle})`;
+
+  // 분류별 소계 + 총계
+  const catBody = $('catBody');
+  catBody.replaceChildren(
+    ...CATEGORIES.map((c, i) => el('tr', {}, [
+      el('td', { text: c }), el('td', { class: 'v', text: formatUnits(res.catUnits[i], d) }),
+    ])),
+    el('tr', { class: 'total' }, [
+      el('td', { text: '총계' }), el('td', { class: 'v', text: formatUnits(res.totalUnits, d) + ' ' + settle }),
+    ]),
+  );
+
+  // 통화별 원금액
+  $('origBody').replaceChildren(...CURRENCIES.map(c => el('tr', {}, [
+    el('td', { text: c }), el('td', { class: 'v', text: formatUnits(res.origUnits[c], DECIMALS[c]) }),
+  ])));
+
+  $('warn').textContent = res.errors
+    ? `⚠ 오류가 있는 영수증 ${res.errors}건은 소계·총계에서 제외되었습니다. 해당 행을 확인하세요.`
+    : '';
+
+  // 검산
+  const ok = res.rawMatch && res.shownSum === res.totalUnits;
+  $('check').classList.toggle('fail', !ok);
+  $('checkLine').textContent =
+    `검산: 분류별 소계의 합 ${formatUnits(res.shownSum, d)} ${ok ? '=' : '≠'} 총계 ${formatUnits(res.totalUnits, d)} ${settle}`;
+  $('checkVerdict').textContent = ok
+    ? '✓ 일치 (반영된 영수증 ' + res.used + '건)'
+    : '✗ 불일치 — 계산 오류입니다. 결과를 사용하지 마세요.';
+}
+
+function resultTsv(res) {
+  const d = res.d;
+  const lines = [
+    `출장비 정산\t정산통화 ${res.settle}`,
+    '',
+    `분류\t소계 (${res.settle})`,
+    ...CATEGORIES.map((c, i) => `${c}\t${formatUnits(res.catUnits[i], d, false)}`),
+    `총계\t${formatUnits(res.totalUnits, d, false)}`,
+    '',
+    '통화\t원금액 소계 (환산 전)',
+    ...CURRENCIES.map(c => `${c}\t${formatUnits(res.origUnits[c], DECIMALS[c], false)}`),
+  ];
+  if (res.errors) lines.push('', `오류로 제외된 영수증\t${res.errors}`);
+  return lines.join('\n');
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    // file:// 등 클립보드 API를 쓸 수 없는 환경
+    const ta = el('textarea', { style: 'position:fixed;opacity:0' });
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    ta.remove();
+    return ok;
+  }
+}
+
+rowsEl.addEventListener('input', recalc);
+rowsEl.addEventListener('change', recalc);
+rowsEl.addEventListener('click', e => {
+  const btn = e.target.closest('.del');
+  if (!btn) return;
+  btn.closest('.row').remove();
+  recalc();
+});
+settleEl.addEventListener('change', () => { renderRates(); recalc(); });
+$('addRow').addEventListener('click', () => addRow().querySelector('.amt').focus());
+$('copy').addEventListener('click', async () => {
+  const ok = await copyText(resultTsv(lastResult));
+  $('copyStatus').textContent = ok ? '복사했습니다. 엑셀에 붙여넣으세요.' : '복사에 실패했습니다. 브라우저 권한을 확인하세요.';
+  setTimeout(() => { $('copyStatus').textContent = ''; }, 3000);
+});
+
+renderRates();
+addRow();
+</script>
+</body>
+</html>

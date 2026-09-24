@@ -86,7 +86,7 @@ export async function upsertUrlSource(
  */
 export function buildRawText(input: CaptureCreateInput): string {
   if (input.input_type === 'url') {
-    const url = input.url!.trim();
+    const url = input.url!; // 원문 보존: trim 하지 않는다(검증·정규화는 normalizeUrl 이 별도로 한다)
     return input.raw_text && input.raw_text.trim() !== '' ? `${url}\n${input.raw_text}` : url;
   }
   return input.raw_text!;

@@ -149,6 +149,18 @@ describe('POST /api/captures — 저장·멱등', () => {
     ).toBe(before.audit);
   });
 
+  it('URL 원문은 앞뒤 공백(ASCII·유니코드)까지 그대로 보존하고, 정규화·source 연결은 trim 된 값으로 한다', async () => {
+    const raw = '  https://example.com/keep-ws/?utm_source=x  ';
+    const saved = await createOk({ input_type: 'url', url: raw, command_key: key() });
+    expect(saved.capture.raw_text).toBe(raw);
+    const withNote = await createOk({ input_type: 'url', url: raw, raw_text: ' 메모 ', command_key: key() });
+    expect(withNote.capture.raw_text).toBe(`${raw}
+ 메모 `);
+    expect(withNote.capture.source_id).toBe(saved.capture.source_id); // 같은 정규화 URL → 같은 source
+    const [src] = await db.select().from(schema.sources).where(eq(schema.sources.id, saved.capture.source_id!));
+    expect(src!.normalizedUrl).toBe('https://example.com/keep-ws');
+  });
+
   it('URL 수집은 sources 1행을 만들고, 추적 파라미터만 다른 같은 URL 은 source 공유 + 정확 중복(url)', async () => {
     const sourcesBefore = await countWhere(schema.sources, ownerA);
     const first = await createOk({

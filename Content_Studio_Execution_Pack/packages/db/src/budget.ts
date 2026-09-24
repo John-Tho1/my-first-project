@@ -3,7 +3,7 @@
  * 모든 함수는 ownerId 를 WHERE 에 넣는다(A01). 계산은 @cs/domain budget.ts / writing.ts 의 순수 함수.
  * schema·queries 외 다른 모듈을 import 하지 않는다(writing.ts 와의 순환 방지).
  */
-import { and, asc, eq, gte, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import {
   AmountRangeError,
   BudgetCurrencyMismatchError,
@@ -13,6 +13,8 @@ import {
   costMicro,
   fromMicro,
   mskMonthStart,
+  mskNextMonthStart,
+  sumToMicro,
   reserveFor,
   toMicro,
   type BudgetPolicy,
@@ -54,10 +56,10 @@ const ledgerAmount = sql`case ${usageLedger.state}
  */
 export async function monthlyUsedMicro(tx: DbOrTx, ownerId: string, now: Date, currency: string): Promise<bigint> {
   const rows = await tx
-    .select({ total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::numeric(18, 6)::text` })
+    .select({ total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::text` })
     .from(usageLedger)
-    .where(and(eq(usageLedger.ownerId, ownerId), eq(usageLedger.currency, currency), gte(usageLedger.createdAt, mskMonthStart(now))));
-  return toMicro(rows[0]?.total ?? '0');
+    .where(and(eq(usageLedger.ownerId, ownerId), eq(usageLedger.currency, currency), gte(usageLedger.createdAt, mskMonthStart(now)), lt(usageLedger.createdAt, mskNextMonthStart(now))));
+  return sumToMicro(rows[0]?.total ?? '0');
 }
 
 /** 이번 달 원장에 있는 통화 목록(정렬). */
@@ -65,7 +67,7 @@ export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date):
   const rows = await tx
     .selectDistinct({ currency: usageLedger.currency })
     .from(usageLedger)
-    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now))));
+    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now)), lt(usageLedger.createdAt, mskNextMonthStart(now))));
   return rows.map((r) => r.currency).sort();
 }
 
@@ -186,23 +188,23 @@ export async function monthlyUsage(db: DbOrTx, ownerId: string, now: Date = new 
   const rows = await db
     .select({
       currency: usageLedger.currency,
-      total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::numeric(18, 6)::text`,
-      overage: sql<string>`coalesce(sum(${usageLedger.overageAmount}), 0)::numeric(18, 6)::text`,
+      total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::text`,
+      overage: sql<string>`coalesce(sum(${usageLedger.overageAmount}), 0)::text`,
       n: sql<number>`count(*)::int`,
       reserved: sql<number>`count(*) filter (where ${usageLedger.state} = 'reserved')::int`,
       over: sql<number>`count(*) filter (where ${usageLedger.overBudget})::int`,
     })
     .from(usageLedger)
-    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, since)))
+    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, since), lt(usageLedger.createdAt, mskNextMonthStart(now))))
     .groupBy(usageLedger.currency)
     .orderBy(asc(usageLedger.currency));
   return {
     since,
     byCurrency: rows.map((r) => ({
       currency: r.currency,
-      used: fromMicro(toMicro(r.total)),
-      usedMicro: toMicro(r.total),
-      overage: fromMicro(toMicro(r.overage)),
+      used: fromMicro(sumToMicro(r.total)),
+      usedMicro: sumToMicro(r.total),
+      overage: fromMicro(sumToMicro(r.overage)),
       runs: r.n,
       pending: r.reserved,
       overBudgetRuns: r.over,

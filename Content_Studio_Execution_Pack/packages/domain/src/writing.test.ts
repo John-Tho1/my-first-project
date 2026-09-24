@@ -477,3 +477,48 @@ describe('FIX-T09: 묶음의 파생본 AI 참조는 같은 파생본의 variant 
     );
   });
 });
+
+describe('FIX-T07 round 2: 출처 정제 범위(source_refs 에 기대지 않음)', () => {
+  const base = { result_type: 'draft' as const, input_version: 'v', proposed_tags: [] as string[], followup_questions: [] as string[], warnings: [] as string[] };
+
+  it('재현 1: source_refs [1] + 본문 [1], 허용 출처 없음 → unverifiable_citation(출력 전체 거부)', () => {
+    expect(() =>
+      sanitizeLlmOutput({ ...base, proposed_text: '보고서[1]에 따르면 시장이 컸다.', claims: [{ text: '시장이 컸다.', kind: 'fact', source_refs: ['[1]'], needs_user_confirmation: false }] }, []),
+    ).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+  });
+
+  it('[n] 은 허용 출처 수 안이면 그대로(프롬프트 번호), 밖이면 거부', () => {
+    const allowed = [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', locator: 'https://example.com/report' }];
+    const ok = sanitizeLlmOutput({ ...base, proposed_text: '보고서[1]에 따르면', claims: [{ text: 't', kind: 'fact', source_refs: ['[1]'], needs_user_confirmation: false }] }, allowed);
+    expect(ok.output.proposed_text).toBe('보고서[1]에 따르면');
+    expect(() => sanitizeLlmOutput({ ...base, proposed_text: '보고서[2]', claims: [] }, allowed)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+  });
+
+  it('재현 2: 가짜 URL 이 본문·경고에만 있고 source_refs 는 비어도 제거 + 확인 필요 경고', () => {
+    const r = sanitizeLlmOutput(
+      {
+        ...base,
+        proposed_text: '자세한 내용은 https://fake.example/x?y=1 와 www.other-fake.example 참고.',
+        warnings: ['참고 https://fake.example/x?y=1.'],
+        followup_questions: ['[출처: 가짜 보고서] 를 볼까요?'],
+        claims: [{ text: '근거 https://fake.example/x', kind: 'fact', source_refs: [], needs_user_confirmation: false }],
+      },
+      [],
+    );
+    const all = JSON.stringify(r.output);
+    expect(all).not.toMatch(/fake\.example|가짜 보고서/);
+    expect(r.redactedTotal).toBe(5);
+    expect(r.output.claims[0]!.needs_check).toBe(true);
+    expect(r.output.warnings).toContain('출처 미확인: 허용 목록으로 확인할 수 없는 URL·인용 5건을 글에서 뺐습니다 — 확인 필요');
+  });
+
+  it('허용 locator 와 같은 URL(끝 문장부호·슬래시·대소문자 무시)과 허용 id 를 담은 [출처] 는 남긴다', () => {
+    const id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const r = sanitizeLlmOutput(
+      { ...base, proposed_text: `출처: HTTPS://Example.com/report/. 그리고 [출처 ${id}]`, claims: [] },
+      [{ id, locator: 'https://example.com/report' }],
+    );
+    expect(r.output.proposed_text).toBe(`출처: HTTPS://Example.com/report/. 그리고 [출처 ${id}]`);
+    expect(r.redactedTotal).toBe(0);
+  });
+});

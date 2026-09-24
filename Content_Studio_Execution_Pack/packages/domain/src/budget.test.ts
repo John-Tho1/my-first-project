@@ -7,6 +7,8 @@ import {
   fromMicro,
   liveLlmReadiness,
   mskMonthStart,
+  mskNextMonthStart,
+  sumToMicro,
   outputAllowanceTokens,
   reserveFor,
   toMicro,
@@ -147,5 +149,18 @@ describe('FIX-T07 P2: bigint 금액', () => {
     // 1_000_003 토큰 × 999999999999999 micro / 1000 → 정확한 올림
     expect(costMicro(p, 1_000_003, 0)).toBe((1_000_003n * 999_999_999_999_999n + 999n) / 1000n);
     expect(costMicro(p, 0, 1)).toBe(1n); // 0.001 micro → 1 micro 로 올림
+  });
+});
+
+describe('FIX-T07 round 2: 합계 범위·월 상한', () => {
+  it('합계는 행 범위(numeric(18,6))를 넘어도 정확히 읽는다', () => {
+    expect(sumToMicro('1200000000000.000000')).toBe(1_200_000_000_000_000_000n);
+    expect(() => toMicro('1200000000000.000000')).toThrow(); // 행 하나로는 저장 불가
+    expect(sumToMicro('0')).toBe(0n);
+    expect(() => sumToMicro('1.0000001')).toThrow();
+  });
+  it('다음 달 시작(MSK)', () => {
+    expect(mskNextMonthStart(new Date('2026-09-15T00:00:00Z')).toISOString()).toBe('2026-09-30T21:00:00.000Z');
+    expect(mskNextMonthStart(new Date('2026-12-31T21:30:00Z')).toISOString()).toBe('2027-01-31T21:00:00.000Z'); // MSK 1월 1일
   });
 });

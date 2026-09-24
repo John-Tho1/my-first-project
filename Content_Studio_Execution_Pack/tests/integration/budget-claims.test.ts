@@ -26,6 +26,8 @@ import {
   ownerScope,
   promptBrand,
   runAssist,
+  runVariantAssist,
+  createContent,
   schema,
   seed,
   selectBundleRows,
@@ -40,6 +42,7 @@ import {
   costMicro,
   fromMicro,
   loadConfig,
+  mskNextMonthStart,
   pickDefaultSources,
   reserveFor,
   RESTORED_TABLES,
@@ -589,5 +592,103 @@ describe('FIX-T07(Codex review-T07)', () => {
       .orderBy(sql`${schema.generationRuns.createdAt} desc`)
       .limit(1);
     expect((lastRun!.inputVersionRefs as { source_version_ids: string[] }).source_version_ids).toEqual([pick.selected[0]!.id]);
+  });
+});
+
+describe('FIX-T07 round 2(Codex review-FIX-T07)', () => {
+  const PRICED = budgetPolicy(loadConfig({ LLM_PRICE_INPUT_PER_1K: '1', LLM_PRICE_OUTPUT_PER_1K: '2' }));
+  const FAKE = 'https://fake-only-in-text.example/report';
+  const mock = new MockLlmProvider();
+  const citing: AssistLlm = {
+    name: 'mock',
+    mode: 'mock',
+    generate: async (input) => ({
+      ...(await mock.generate(input)),
+      proposed_text: '보고서[1]에 따르면 시장이 컸다.',
+      claims: [{ text: '시장이 컸다.', kind: 'fact', source_refs: ['[1]'], needs_user_confirmation: false }],
+    }),
+  };
+  const urlOnlyInText: AssistLlm = {
+    name: 'mock',
+    mode: 'mock',
+    generate: async (input) => {
+      const out = await mock.generate(input);
+      return { ...out, proposed_text: `${out.proposed_text} 자세히: ${FAKE}`, warnings: [...out.warnings, `확인: ${FAKE}`], claims: [] };
+    },
+  };
+
+  async function freshOwner(identity: string) {
+    const owner = (await ensureOwner(db, identity)).id;
+    await db.insert(schema.brandProfiles).values({ ownerId: owner, version: 1, penName: 'p', audience: 'a', pillars: ['x'] });
+    return owner;
+  }
+  const failCode = async (p: Promise<unknown>) => {
+    try {
+      await p;
+      return 'ok';
+    } catch (e) {
+      return (e as AppError).code;
+    }
+  };
+
+  it('P1 원고: [1] 인용(허용 출처 없음) → 502 경로(llm_failed), run failed·error=unverifiable_citation, 제안 없음, 본문 그대로', async () => {
+    const { contentId } = await contentWithSource(ownerA, 'cite-1', 'https://example.com/cite1');
+    const before = await counts(contentId);
+    const body = (await db.select().from(schema.contents).where(eq(schema.contents.id, contentId)))[0]!.currentVersionId;
+    expect(await failCode(runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, citing))).toBe('llm_failed');
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, contentId));
+    expect(run).toMatchObject({ status: 'failed', error: 'unverifiable_citation', outputRef: null });
+    const after = await counts(contentId);
+    expect(after.versions).toBe(before.versions);
+    expect(after.claims).toBe(before.claims);
+    expect((await db.select().from(schema.contents).where(eq(schema.contents.id, contentId)))[0]!.currentVersionId).toBe(body);
+  });
+
+  it('P1 원고: 가짜 URL 이 본문·경고에만 있고 source_refs 가 비어도 저장·결과에서 제거, 확인 필요 경고', async () => {
+    const { contentId } = await contentWithSource(ownerA, 'cite-2', 'https://example.com/cite2');
+    const r = await runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, urlOnlyInText);
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, r.run.id));
+    const [proposal] = await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, r.proposal.id));
+    for (const v of [run!.outputJson, proposal!.body, r.output]) expect(JSON.stringify(v)).not.toContain('fake-only-in-text');
+    expect(r.output.warnings.some((w) => w.includes('확인 필요'))).toBe(true);
+  });
+
+  it('P1 채널 초안: 같은 두 입력 — [1] 은 실패(버전 없음), 가짜 URL 은 제거', async () => {
+    const id = (await createContent(db, ownerA, { title: '채널 인용', body: '본문 한 줄.' })).content.id;
+    expect(await failCode(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, citing))).toBe('llm_failed');
+    const [vr] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, id));
+    expect(vr).toMatchObject({ status: 'failed', error: 'unverifiable_citation' });
+    const [variant] = await db.select().from(schema.variants).where(eq(schema.variants.contentId, id));
+    expect((await db.select().from(schema.variantVersions).where(eq(schema.variantVersions.variantId, variant!.id))).length).toBe(0);
+    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, urlOnlyInText);
+    for (const v of [ok.proposal.body, ok.proposal.metadataJson, ok.output]) expect(JSON.stringify(v)).not.toContain('fake-only-in-text');
+  });
+
+  it('P2 합계: 행마다 600000000000.000000 인 원장 두 행의 합을 정확히 읽고, 예약 검사도 답한다(429)', async () => {
+    const owner = await freshOwner('fix-t07-r2-sum@example.local');
+    const { contentId } = await contentWithSource(owner, 'sum-1', 'https://example.com/sum1');
+    await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, new MockLlmProvider());
+    await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, new MockLlmProvider());
+    await db.execute(sql`update usage_ledger set reserved_amount = 600000000000.000000, actual_amount = 600000000000.000000 where owner_id = ${owner}::uuid`);
+    const u = (await monthlyUsage(db, owner)).byCurrency;
+    expect(u).toMatchObject([{ currency: 'USD', used: '1200000000000.000000', runs: 2 }]);
+    const policy: BudgetPolicy = { ...PRICED, monthlyLimitMicro: toMicro('999999999999') };
+    expect(await failCode(runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: policy }, new MockLlmProvider()))).toBe(
+      'budget_exceeded',
+    );
+  });
+
+  it('P2 월 상한: 다음 달 created_at 의 RUB 원장은 이번 달 USD 예약·사용량에 영향이 없다', async () => {
+    const owner = await freshOwner('fix-t07-r2-window@example.local');
+    const { contentId } = await contentWithSource(owner, 'win-1', 'https://example.com/win1');
+    await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, new MockLlmProvider());
+    const next = mskNextMonthStart(new Date());
+    await db.execute(sql`update usage_ledger set currency = 'RUB', created_at = ${next.toISOString()}::timestamptz + interval '1 hour' where owner_id = ${owner}::uuid`);
+    expect((await monthlyUsage(db, owner)).byCurrency).toEqual([]);
+    expect(await failCode(runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: PRICED }, new MockLlmProvider()))).toBe('ok');
+    expect((await monthlyUsage(db, owner)).byCurrency.map((c) => c.currency)).toEqual(['USD']);
+    // 다음 달 시점으로 보면 RUB 가 있어 USD 예약은 거부된다(그 달에만)
+    const nextMonthUsage = await monthlyUsage(db, owner, new Date(next.getTime() + 2 * 3600_000));
+    expect(nextMonthUsage.byCurrency.map((c) => c.currency)).toEqual(['RUB']);
   });
 });

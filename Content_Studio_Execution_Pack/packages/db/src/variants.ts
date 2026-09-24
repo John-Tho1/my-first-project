@@ -345,10 +345,13 @@ export async function runVariantAssist(
     maxOutputTokens: prep.reservation.tokensOutAllowance,
   };
   let output: LlmStructuredOutput;
+  let sanitized: ReturnType<typeof sanitizeLlmOutput>;
   try {
     output = llmStructuredOutputSchema.parse(await llm.generate(llmInput));
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
+    // FIX-T07 round 2: 채널 초안에는 허용 출처가 없다 — URL·[출처] 인용은 빼고, [n] 인용은 검증 실패.
+    sanitized = sanitizeLlmOutput(output, []);
   } catch (e) {
     const finished = new Date(Math.max(Date.now(), now.getTime()));
     const code = e instanceof Error && e.name === 'MockLlmFailure' ? 'mock_injected_failure' : e instanceof AppError ? e.code : 'provider_error';
@@ -373,7 +376,7 @@ export async function runVariantAssist(
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));
   // FIX-T07(P1): 정제한 출력 하나를 제안·output_json·claims·응답에 쓴다(채널 초안에는 허용 출처가 없으므로 모든 참조가 버려진다).
-  const { output: clean, droppedTotal } = sanitizeLlmOutput(output, []);
+  const { output: clean, droppedTotal } = sanitized;
   return db.transaction(async (tx) => {
     const { variant } = await lockVariant(tx, ownerId, prep.variant.id);
     const d = channelDraft(input.channel, prep.content.title, clean.proposed_text);

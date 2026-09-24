@@ -131,6 +131,22 @@ export function checkBudget(policy: BudgetPolicy, usedMicro: bigint, reserveMicr
   return { ok: true };
 }
 
+/** 다음 달(MSK) 시작 시각(UTC) — 월 조회의 상한(미만). FIX-T07 round 2. */
+export function mskNextMonthStart(now: Date): Date {
+  const msk = new Date(now.getTime() + 3 * 3600_000);
+  return new Date(Date.UTC(msk.getUTCFullYear(), msk.getUTCMonth() + 1, 1) - 3 * 3600_000);
+}
+
+/**
+ * 합계 문자열 → micro(bigint). 행 하나의 numeric(18,6) 범위(toMicro)를 적용하지 않는다 — 합계는 그보다 클 수 있다(FIX-T07 round 2).
+ * 형식: 음이 아닌 10진수, 소수 6자리 이하.
+ */
+export function sumToMicro(decimal: string): bigint {
+  const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(decimal);
+  if (!m) throw new AmountRangeError();
+  return BigInt(m[1]!) * MICRO + BigInt((m[2] ?? '').padEnd(6, '0'));
+}
+
 /** 이번 달(MSK = UTC+3, 서머타임 없음) 시작 시각(UTC). */
 export function mskMonthStart(now: Date): Date {
   const msk = new Date(now.getTime() + 3 * 3600_000);

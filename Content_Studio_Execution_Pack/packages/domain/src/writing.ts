@@ -323,48 +323,132 @@ interface LlmOutputLike {
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** 허용 출처(정제 기준): source_version id 와 그 출처의 locator(URL). 순서는 프롬프트의 번호([1], [2] …)와 같다(id 정렬). */
+export interface AllowedRef {
+  id: string;
+  locator?: string | null;
+}
+
+/** 모델 출력에 허용 목록으로 풀 수 없는 짧은 인용([n] 등)이 있어 안전하게 고칠 수 없음 → 출력 전체를 검증 실패로(FIX round 2). */
+export class UnverifiableCitationError extends AppError {
+  constructor() {
+    super('bad_request', 'unverifiable_citation', 'AI 출력에 확인할 수 없는 출처 인용이 있어 저장하지 않았습니다');
+  }
+}
+
+/** URL 형태(https?://, www.) — 공백·괄호·따옴표 전까지. */
+const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'()[\]{}]+/giu;
+/** 대괄호 인용: [n] 숫자, [출처…]. */
+const NUM_CITE_RE = /\[(\d{1,4})\]/gu;
+const SRC_CITE_RE = /\[출처[^\]]*\]/gu;
+
+const normUrl = (s: string) =>
+  s
+    .trim()
+    .toLowerCase()
+    .replace(/[.,;:!?…]+$/u, '')
+    .replace(/\/+$/u, '')
+    .replace(/^https?:\/\//u, '')
+    .replace(/^www\./u, '');
+
 /**
- * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지).
- * - claim.source_refs: 허용 목록 안만(filterClaimSources), 버린 개수·needs_check
- * - 버린 참조 문자열(길이 ≥ MIN_REDACT_LENGTH)이 제안 본문·경고·후속 질문·태그·claim 문장에 다시 나오면 DROPPED_REF_MARKER 로 바꾼다(대소문자 무시)
- * - 버린 것이 있으면 경고 한 줄 추가(개수만, 원문 없음)
- * 이 결과 하나를 output_json·claims 행·HTTP 응답에 똑같이 쓴다.
+ * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지). FIX-T07 round 2 — source_refs 에 기대지 않는다.
+ * - claim.source_refs: 허용 id 만(filterClaimSources), 버린 개수·needs_check
+ * - 제안 본문·경고·후속 질문·태그·claim 문장의 URL(https?://, www.)과 [출처…] 인용 중 허용 locator·id 로 풀리지 않는 것은
+ *   DROPPED_REF_MARKER 로 바꾸고 확인 필요 경고를 단다(바뀐 claim 은 needs_check)
+ * - [n] 숫자 인용은 1 ≤ n ≤ 허용 출처 수일 때만 그대로 둔다(프롬프트의 n 번째 허용 출처). 풀리지 않으면 안전하게 고칠 수 없으므로
+ *   UnverifiableCitationError(출력 전체 거부 → run failed, 제안 없음)
+ * - source_refs 에서 버린 참조 문자열이 글에 다시 나오면: 4자 이상은 바꾸고, 더 짧은 것(안전하게 바꿀 수 없음)은 UnverifiableCitationError
+ * 이 결과 하나를 제안 버전·output_json·claims 행·HTTP 응답에 똑같이 쓴다(원고 assist·채널 AI 초안).
  */
-export function sanitizeLlmOutput(output: LlmOutputLike, allowed: readonly string[]): { output: SanitizedOutput; droppedTotal: number } {
-  const ok = new Set(allowed.map((s) => s.toLowerCase()));
-  const dropped = [
+export function sanitizeLlmOutput(
+  output: LlmOutputLike,
+  allowedIn: ReadonlyArray<AllowedRef | string>,
+): { output: SanitizedOutput; droppedTotal: number; redactedTotal: number } {
+  const allowed: AllowedRef[] = allowedIn.map((a) => (typeof a === 'string' ? { id: a } : a));
+  const allowedIds = allowed.map((a) => a.id);
+  const okIds = new Set(allowedIds.map((s) => s.toLowerCase()));
+  const okUrls = new Set(allowed.flatMap((a) => (a.locator ? [normUrl(a.locator)] : [])));
+  const droppedRefs = [
     ...new Set(
       output.claims
         .flatMap((c) => c.source_refs)
         .map((r) => r.trim())
-        .filter((r) => r !== '' && !ok.has(r.toLowerCase())),
+        .filter((r) => r !== '' && !okIds.has(r.toLowerCase())),
     ),
-  ]
-    .filter((r) => r.length >= MIN_REDACT_LENGTH)
-    .sort((a, b) => b.length - a.length); // 긴 것부터(겹치는 참조의 일부만 남지 않게)
-  const res = dropped.map((d) => new RegExp(escapeRe(d), 'giu'));
-  const redact = (s: string) => res.reduce((acc, re) => acc.replace(re, DROPPED_REF_MARKER), s);
-  const filtered = filterClaimSources(output.claims, allowed);
+  ].sort((a, b) => b.length - a.length); // 긴 것부터(겹치는 참조의 일부만 남지 않게)
+  const longRes = droppedRefs.filter((r) => r.length >= MIN_REDACT_LENGTH).map((d) => new RegExp(escapeRe(d), 'giu'));
+  // [n] 모양은 아래 숫자 인용 규칙(허용 출처 번호로 풀리는지)으로 판정한다.
+  const shortRefs = droppedRefs.filter((r) => r.length < MIN_REDACT_LENGTH && !/^\[\d+\]$/u.test(r));
+
+  let redactedTotal = 0;
+  const resolves = (token: string) => {
+    const t = token.toLowerCase();
+    if (okUrls.has(normUrl(token))) return true;
+    for (const id of okIds) if (t.includes(id)) return true;
+    return false;
+  };
+  const clean = (s: string): { text: string; changed: boolean } => {
+    let changed = false;
+    let text = s;
+    for (const re of longRes) {
+      text = text.replace(re, () => {
+        changed = true;
+        redactedTotal++;
+        return DROPPED_REF_MARKER;
+      });
+    }
+    // 짧은 버린 참조가 남아 있으면 안전하게 바꿀 수 없다
+    for (const r of shortRefs) if (text.toLowerCase().includes(r.toLowerCase())) throw new UnverifiableCitationError();
+    text = text.replace(URL_RE, (m) => {
+      if (resolves(m)) return m;
+      changed = true;
+      redactedTotal++;
+      return DROPPED_REF_MARKER;
+    });
+    text = text.replace(SRC_CITE_RE, (m) => {
+      if (m === DROPPED_REF_MARKER || resolves(m)) return m;
+      changed = true;
+      redactedTotal++;
+      return DROPPED_REF_MARKER;
+    });
+    for (const m of text.matchAll(NUM_CITE_RE)) {
+      const n = Number(m[1]);
+      if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
+    }
+    return { text, changed };
+  };
+
+  const filtered = filterClaimSources(output.claims, allowedIds);
   const droppedTotal = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
-  const warnings = output.warnings.map(redact);
+  const proposed = clean(output.proposed_text);
+  const tags = output.proposed_tags.map((t) => clean(t).text);
+  const questions = output.followup_questions.map((q) => clean(q).text);
+  const claims = filtered.map((c) => {
+    const t = clean(c.text);
+    return {
+      text: t.text,
+      kind: c.kind,
+      source_refs: c.source_refs,
+      needs_user_confirmation: c.needs_user_confirmation,
+      dropped_source_refs: c.dropped_source_refs,
+      evidence_grade: c.evidence_grade,
+      needs_check: c.needs_check || t.changed,
+    };
+  });
+  const warnings = output.warnings.map((w) => clean(w).text);
+  if (redactedTotal > 0) warnings.push(`출처 미확인: 허용 목록으로 확인할 수 없는 URL·인용 ${redactedTotal}건을 글에서 뺐습니다 — 확인 필요`);
   if (droppedTotal > 0) warnings.push(`출처 미확인: 허용 목록에 없는 출처 ${droppedTotal}건을 버렸습니다`);
   return {
     droppedTotal,
+    redactedTotal,
     output: {
       result_type: output.result_type,
       input_version: output.input_version,
-      proposed_text: redact(output.proposed_text),
-      proposed_tags: output.proposed_tags.map(redact),
-      claims: filtered.map((c) => ({
-        text: redact(c.text),
-        kind: c.kind,
-        source_refs: c.source_refs,
-        needs_user_confirmation: c.needs_user_confirmation,
-        dropped_source_refs: c.dropped_source_refs,
-        evidence_grade: c.evidence_grade,
-        needs_check: c.needs_check,
-      })),
-      followup_questions: output.followup_questions.map(redact),
+      proposed_text: proposed.text,
+      proposed_tags: tags,
+      claims,
+      followup_questions: questions,
       warnings,
     },
   };

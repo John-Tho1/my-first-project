@@ -493,11 +493,17 @@ export async function runAssist(
     maxOutputTokens: prep.reservation.tokensOutAllowance,
   };
   let output: LlmStructuredOutput;
+  let sanitized: ReturnType<typeof sanitizeLlmOutput>;
   try {
     const raw = await llm.generate(llmInput);
     output = llmStructuredOutputSchema.parse(raw);
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
+    // FIX-T07 round 2: 정제도 검증의 일부 — 풀 수 없는 인용([n] 등)이면 unverifiable_citation 으로 실패(제안 없음, 본문 그대로).
+    sanitized = sanitizeLlmOutput(
+      output,
+      prep.sourceIds.map((id) => ({ id, locator: prep.locators.get(id) ?? null })),
+    );
   } catch (e) {
     const finished = new Date(Math.max(Date.now(), now.getTime()));
     await db.transaction(async (tx) => {
@@ -522,7 +528,7 @@ export async function runAssist(
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));
   // FIX-T07(P1): 정제한 출력 하나를 제안 본문·output_json·claims 행·응답에 똑같이 쓴다(버린 출처 원문이 어디에도 남지 않게).
-  const { output: clean, droppedTotal } = sanitizeLlmOutput(output, prep.sourceIds);
+  const { output: clean, droppedTotal } = sanitized;
   return db.transaction(async (tx) => {
     const { content, current } = await lockContentForWrite(tx, ownerId, contentId);
     const inserted = await tx

@@ -166,7 +166,8 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         const v = row[p.col];
         if (v === null || v === undefined) return true;
         const a = avail[p.table]?.get(String(v));
-        return a !== undefined && (!p.owned || a !== 'different');
+        // 부모가 묶음과 내용이 다른 기존 행('different')이면 그 밑에 자식·관계를 붙이지 않는다(묶음의 의미적 관계 보존).
+        return a !== undefined && a !== 'different';
       });
       if (!parentsOk) {
         conflict(row.id, 'dependency');
@@ -174,17 +175,14 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       }
       if (name === 'brand_profiles') {
         // (owner, version) unique: 같은 버전이 이미 있으면(예: seed) 내용이 같을 때만 "동일", 다르면 충돌. 덮어쓰지 않는다.
-        const r = row as unknown as { version: number; pen_name: string; audience: string; pillars: string[]; style_rules: string[] };
+        // 같은 (owner, version) 이 다른 ID 로 이미 있으면(예: seed) 내용이 같아도 충돌이다 — 묶음의 ID 가 보존되지 않기 때문(결정 D6: ID 보존).
+        // 같은 ID 인 경우는 위의 existing 분기에서 same/different 로 판정된다. 기존 행은 덮어쓰지 않는다.
+        const r = row as unknown as { version: number };
         const found = await tx.execute(
-          sql`select pen_name, audience, pillars, style_rules from brand_profiles where owner_id = ${ownerId}::uuid and version = ${r.version}`,
+          sql`select id from brand_profiles where owner_id = ${ownerId}::uuid and version = ${r.version}`,
         );
-        const cur = (found as unknown as { rows: Array<Record<string, unknown>> }).rows[0];
-        if (cur) {
-          const same =
-            rowHash({ a: cur.pen_name, b: cur.audience, c: cur.pillars, d: cur.style_rules }) ===
-            rowHash({ a: r.pen_name, b: r.audience, c: r.pillars, d: r.style_rules });
-          if (same) counts.existing_same++;
-          else conflict(row.id, 'version_exists');
+        if ((found as unknown as { rows: unknown[] }).rows.length > 0) {
+          conflict(row.id, 'version_exists');
           continue;
         }
       }

@@ -370,6 +370,74 @@ describe('M1 게이트: 입력 → 검색 → 원고 수정 → export → 빈 D
     const inserted = (await dbB.select().from(schema.captures).where(eq(schema.captures.id, newId)))[0]!;
     expect(inserted).toMatchObject({ ownerId: ownerB, rawText: '복원 때 새로 들어온 소재' });
   });
+
+  it('(7b) add_missing: 부모가 "different" 인 기존 소재에는 새 관계를 붙이지 않는다(dependency 충돌)', async () => {
+    const parsed = await parseBundleZip(zip);
+    const t = structuredClone(parsed.tables) as BundleTables;
+    expect(t.ideas.length).toBeGreaterThan(0);
+    expect(t.idea_captures.length).toBeGreaterThan(0);
+    // 묶음 쪽 fx007 은 내용이 달라져 'different' 가 되고, 새 카드가 fx007(다른 부모)과 fx001(같은 부모)을 각각 참조한다
+    t.captures.find((c) => c.id === fx007)!.user_note = '또 바뀐 메모';
+    const ideaId = randomUUID();
+    t.ideas.push({ ...t.ideas[0]!, id: ideaId, idea: '복원 때 새로 들어온 카드' });
+    const relBad = randomUUID();
+    const relOk = randomUUID();
+    t.idea_captures.push({ ...t.idea_captures[0]!, id: relBad, idea_id: ideaId, capture_id: fx007 });
+    t.idea_captures.push({ ...t.idea_captures[0]!, id: relOk, idea_id: ideaId, capture_id: fx001 });
+    const bundle = buildBundle({
+      exportId: randomUUID(),
+      exportedAt: new Date().toISOString(),
+      appVersion: parsed.manifest.app_version,
+      migrations: parsed.manifest.schema_migrations,
+      owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+      tables: t,
+      assetBytes: new Map(parsed.assetBytes),
+    });
+    const p = await createRestorePreview(dbB, ownerB, writeZip(bundle.entries), { restoresDir: dirs.restores, source: 'upload' });
+    expect(p.preview.tables.ideas).toMatchObject({ new: 1, existing_different: 0 });
+    expect(p.preview.tables.idea_captures).toMatchObject({ new: 1, existing_different: 1 });
+    expect(p.preview.conflicts).toEqual(
+      expect.arrayContaining([
+        { table: 'captures', id: fx007, reason: 'different' },
+        { table: 'idea_captures', id: relBad, reason: 'dependency' },
+      ]),
+    );
+    expect(p.preview.conflicts_total).toBe(2);
+    const r = await commitRestore(dbB, new LocalStorageAdapter(dirs.storageB), ownerB, p.restoreId, {
+      mode: 'add_missing',
+      confirm: true,
+      restoresDir: dirs.restores,
+    });
+    expect(r.restored.ideas).toBe(1);
+    expect(r.restored.idea_captures).toBe(1);
+    const rels = await dbB.select().from(schema.ideaCaptures).where(eq(schema.ideaCaptures.ideaId, ideaId));
+    expect(rels.map((x) => x.captureId)).toEqual([fx001]); // fx007 로의 관계는 만들어지지 않음
+  });
+
+  it('(7c) 같은 (owner, version) 의 브랜드 프로필이 다른 ID 로 이미 있으면 내용이 같아도 version_exists 충돌(ID 보존)', async () => {
+    const parsed = await parseBundleZip(zip);
+    const bp = parsed.tables.brand_profiles[0]!;
+    const fresh = await createTestDb(); // 빈 DB + 브랜드 프로필만 다른 ID 로 존재
+    const dbC = fresh.db;
+    const c = await ensureOwner(dbC, 'seeded-target@example.local');
+    await dbC.insert(schema.brandProfiles).values({
+      ownerId: c.id,
+      version: bp.version,
+      penName: bp.pen_name,
+      audience: bp.audience,
+      pillars: [...bp.pillars],
+      styleRules: [...bp.style_rules],
+    });
+    const p = await createRestorePreview(dbC, c.id, zip, { restoresDir: dirs.restores, source: 'upload' });
+    expect(p.preview.tables.brand_profiles).toMatchObject({ in_bundle: 1, new: 0, existing_same: 0, existing_different: 1 });
+    expect(p.preview.conflicts).toEqual([{ table: 'brand_profiles', id: bp.id, reason: 'version_exists' }]);
+    expect(p.preview.target.empty).toBe(true); // 브랜드 프로필은 범위 계산에 세지 않지만
+    expect(p.preview.can_commit_empty_only).toBe(false); // 충돌이 있으므로 empty_only 는 불가
+    const kept = await dbC.select().from(schema.brandProfiles).where(eq(schema.brandProfiles.ownerId, c.id));
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.id).not.toBe(bp.id);
+    await fresh.close();
+  });
 });
 
 describe('(8) API: owner 범위·CSRF·confirm', () => {

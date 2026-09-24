@@ -5,9 +5,10 @@
  * 외부 호출·게시 호출 없음. capture 본문은 자료로만 저장한다.
  */
 import { readFileSync } from 'node:fs';
-import { count, eq } from 'drizzle-orm';
+import { and, count, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
-import { fixtureCaptureSchema, type FixtureCapture } from '@cs/domain';
+import { contentHash, fixtureCaptureSchema, normalizeUrl, type FixtureCapture } from '@cs/domain';
+import { backfillContentHashes, upsertUrlSource } from './captures';
 import type { Db } from './client';
 import { brandProfiles, captures, users } from './schema';
 import { resolveFromRoot } from './paths';
@@ -57,19 +58,36 @@ export async function seed(db: Db, opts: { allowedIdentity: string; fixtures?: F
     const inserted = await tx
       .insert(captures)
       .values(
-        fixtures.map((f) => ({
-          ownerId: owner.id,
-          // URL 수집은 URL 을 원문으로 보존하고, 설명은 user_note/raw_text 로 둔다.
-          rawText: f.input_type === 'url' && f.url ? `${f.url}\n${f.raw_text}` : f.raw_text,
-          inputType: f.input_type,
-          receivedAt: new Date(f.received_at),
-          risk: f.risk,
-          userNote: f.user_note ?? null,
-          commandKey: f.command_key,
-        })),
+        fixtures.map((f) => {
+          // URL 수집은 URL 을 원문으로 보존하고, 설명은 user_note/raw_text 로 둔다(createCapture 와 같은 형식).
+          const rawText = f.input_type === 'url' && f.url ? `${f.url}\n${f.raw_text}` : f.raw_text;
+          return {
+            ownerId: owner.id,
+            rawText,
+            inputType: f.input_type,
+            receivedAt: new Date(f.received_at),
+            updatedAt: new Date(f.received_at),
+            risk: f.risk,
+            userNote: f.user_note ?? null,
+            commandKey: f.command_key,
+            contentHash: contentHash(rawText),
+          };
+        }),
       )
       .onConflictDoNothing({ target: [captures.ownerId, captures.commandKey] })
       .returning({ id: captures.id });
+
+    // T03: URL 픽스처는 sources(kind 'url') 행과 연결한다. 0002 이전에 seed 된 행도 여기서 연결된다(멱등).
+    for (const f of fixtures) {
+      if (f.input_type !== 'url' || !f.url) continue;
+      const source = await upsertUrlSource(tx, owner.id, normalizeUrl(f.url));
+      await tx
+        .update(captures)
+        .set({ sourceId: source.id })
+        .where(and(eq(captures.ownerId, owner.id), eq(captures.commandKey, f.command_key), isNull(captures.sourceId)));
+    }
+    // 0002 이전에 seed 된 행의 content_hash 를 채운다(원문은 바꾸지 않음).
+    await backfillContentHashes(tx, owner.id);
 
     const total = await tx.select({ n: count() }).from(captures).where(eq(captures.ownerId, owner.id));
     return { ownerId: owner.id, capturesInserted: inserted.length, capturesTotal: total[0]?.n ?? 0 };

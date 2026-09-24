@@ -1,21 +1,13 @@
+import { randomUUID } from 'node:crypto';
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { listAssets, listCaptures } from '@cs/db';
-import { describeModes, formatMsk, maskIdentity, MAX_UPLOAD_BYTES } from '@cs/domain';
+import { listAssets, listCaptures, listCapturesPage } from '@cs/db';
+import { describeModes, formatMsk, maskIdentity, MAX_RAW_TEXT, MAX_TITLE, MAX_UPLOAD_BYTES, MAX_USER_NOTE } from '@cs/domain';
 import { getSession } from '../lib/auth';
+import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
 import { getAppDb, getConfig } from '../lib/server';
 
 export const dynamic = 'force-dynamic';
-
-const INPUT_TYPE_LABEL: Record<string, string> = {
-  text: '텍스트',
-  url: 'URL',
-  file: '파일',
-  voice: '음성',
-};
-const RISK_LABEL: Record<string, string> = {
-  none: '위험 표시 없음',
-  needs_check: '확인 필요',
-};
 
 type CaptureRow = Awaited<ReturnType<typeof listCaptures>>[number];
 
@@ -30,6 +22,14 @@ const UPLOAD_ERROR_TEXT: Record<string, string> = {
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
   invalid: '파일을 선택한 뒤 다시 시도하세요.',
   server: '서버 오류가 발생했습니다.',
+};
+/** ?capture_error= 코드별 고정 문구(빠른 수집 실패). 입력값을 되돌려 보여 주지 않는다. */
+const CAPTURE_ERROR_TEXT: Record<string, string> = {
+  invalid: '저장하지 못했습니다. 원문(또는 URL)을 입력했는지 확인하세요.',
+  invalid_url: '저장하지 못했습니다. http:// 또는 https:// 로 시작하는 올바른 URL 을 입력하세요.',
+  too_large: '저장하지 못했습니다. 내용이 너무 깁니다.',
+  csrf: '요청 출처를 확인할 수 없어 거부했습니다. 이 화면에서 다시 시도하세요.',
+  server: '서버 오류로 저장하지 못했습니다. 잠시 후 다시 시도하세요.',
 };
 const RIGHTS_LABEL: Record<string, string> = {
   unknown: '권리 미확인',
@@ -51,7 +51,9 @@ function formatBytes(n: number): string {
 function CaptureItem({ c }: { c: CaptureRow }) {
   return (
     <li className="capture">
-      <p className="capture-text">{c.rawText}</p>
+      <p className="capture-text">
+        <Link href={`/captures/${c.id}`}>{c.title ?? preview(c.rawText)}</Link>
+      </p>
       <p className="meta">
         <span className="tag">{INPUT_TYPE_LABEL[c.inputType] ?? c.inputType}</span>
         <span className={c.risk === 'needs_check' ? 'tag warn' : 'tag'}>{RISK_LABEL[c.risk] ?? c.risk}</span>
@@ -78,6 +80,13 @@ export default async function TodayPage({
   const params = await searchParams;
   const uploadMsg = typeof params.upload === 'string' ? UPLOAD_TEXT[params.upload] : undefined;
   const uploadErr = typeof params.upload_error === 'string' ? (UPLOAD_ERROR_TEXT[params.upload_error] ?? UPLOAD_ERROR_TEXT.server) : undefined;
+  const captureErr =
+    typeof params.capture_error === 'string'
+      ? (CAPTURE_ERROR_TEXT[params.capture_error] ?? CAPTURE_ERROR_TEXT.server)
+      : undefined;
+  const recent = await listCapturesPage(handle.db, session.ownerId, { limit: 10 });
+  // 폼을 그릴 때마다 새 command_key: 같은 폼의 중복 제출(더블클릭·새로고침 재전송)은 한 건으로 저장된다.
+  const commandKey = randomUUID();
   const recommended = captures.slice(0, 2);
   const needsCheck = captures.filter((c) => c.risk === 'needs_check');
   const publishLabel = badges.find((b) => b.key === 'publish')?.label ?? '게시: 비활성';
@@ -106,6 +115,31 @@ export default async function TodayPage({
       </header>
 
       <h2 className="screen-title">오늘</h2>
+
+      <section className="card archive" aria-labelledby="quick-capture-title">
+        <h3 id="quick-capture-title">빠른 수집</h3>
+        {captureErr ? (
+          <p className="notice" role="alert">
+            {captureErr}
+          </p>
+        ) : null}
+        <form className="form" method="post" action="/api/captures">
+          <input type="hidden" name="command_key" value={commandKey} />
+          <label htmlFor="raw_text">원문</label>
+          <textarea id="raw_text" name="raw_text" rows={4} maxLength={MAX_RAW_TEXT} placeholder="한 문장이면 충분합니다" />
+          <label htmlFor="url">URL(선택)</label>
+          <input id="url" name="url" type="url" inputMode="url" placeholder="https://" maxLength={2048} />
+          <label htmlFor="user_note">메모(왜 저장했는지)</label>
+          <input id="user_note" name="user_note" type="text" maxLength={MAX_USER_NOTE} />
+          <label htmlFor="title">제목(선택)</label>
+          <input id="title" name="title" type="text" maxLength={MAX_TITLE} />
+          <button type="submit">서버에 저장</button>
+        </form>
+        <p className="note">
+          URL 을 넣으면 URL 수집으로 저장합니다(원문 추출은 M5 전까지 하지 않음). 저장 결과는 서버 확인 후 다음 화면에 표시됩니다.
+        </p>
+        <p className="note">이 화면은 서버 저장만 표시합니다. 기기 임시 저장(오프라인)은 아직 지원하지 않습니다.</p>
+      </section>
 
       {captures.length === 0 ? (
         <section className="card empty">
@@ -154,13 +188,18 @@ export default async function TodayPage({
       </div>
 
       <section className="card archive">
-        <h3>소재함 (가상 데이터 {captures.length}건)</h3>
-        {captures.length ? (
-          <ul className="list">
-            {captures.map((c) => (
-              <CaptureItem key={c.id} c={c} />
-            ))}
-          </ul>
+        <h3>소재함 (최근 {recent.items.length}건)</h3>
+        {recent.items.length ? (
+          <>
+            <ul className="list">
+              {recent.items.map((i) => (
+                <CaptureItem key={i.capture.id} c={i.capture} />
+              ))}
+            </ul>
+            <p className="pager">
+              <Link href="/captures">소재함 전체 보기</Link>
+            </p>
+          </>
         ) : (
           <p className="empty-text">
             <code>pnpm db:seed</code> 를 실행하세요

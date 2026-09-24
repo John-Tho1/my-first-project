@@ -60,11 +60,17 @@ export type AppErrorKind =
 export class AppError extends Error {
   readonly kind: AppErrorKind;
   readonly code: string;
-  constructor(kind: AppErrorKind, code: string, message: string) {
+  /**
+   * 응답 본문에 함께 내보낼 추가 필드(T03: 409 충돌의 current/yours).
+   * 사용자 본인의 데이터만 넣는다. 다른 owner 의 데이터·비밀·경로는 넣지 않는다.
+   */
+  readonly extra: Record<string, unknown> | undefined;
+  constructor(kind: AppErrorKind, code: string, message: string, extra?: Record<string, unknown>) {
     super(message);
     this.name = new.target.name;
     this.kind = kind;
     this.code = code;
+    this.extra = extra;
   }
 }
 
@@ -142,5 +148,49 @@ export class ObjectStorageNotImplementedError extends AppError {
       'object_storage_not_implemented',
       'STORAGE_DRIVER=object 는 아직 구현되지 않았습니다. 현재는 local 만 지원합니다.',
     );
+  }
+}
+
+// ---- T03: 수집(captures) ----
+
+/** http(s) 가 아니거나 해석할 수 없는 URL. */
+export class InvalidUrlError extends AppError {
+  constructor(message = 'http:// 또는 https:// 로 시작하는 올바른 URL 을 입력하세요') {
+    super('bad_request', 'invalid_url', message);
+  }
+}
+
+/** 내부망·로컬·메타데이터 주소(A05). 추출(fetch) 전에 거부한다. 저장된 capture 는 그대로 둔다. */
+export class UrlNotAllowedError extends AppError {
+  constructor() {
+    super('bad_request', 'url_not_allowed', '내부망·로컬 주소는 추출할 수 없습니다');
+  }
+}
+
+/** 원문(raw_text)은 저장 후 바꿀 수 없다. 메모·제목·위험 표시만 수정한다. */
+export class RawTextImmutableError extends AppError {
+  constructor() {
+    super('bad_request', 'raw_text_immutable', '원문은 수정할 수 없습니다. 메모·제목·위험 표시만 수정할 수 있습니다.');
+  }
+}
+
+/** 오래된 revision 으로 수정(A02). current(서버 값)와 yours(제출 값)를 함께 돌려줘 입력을 잃지 않게 한다. */
+export class ConflictError extends AppError {
+  constructor(extra: { current: Record<string, unknown>; yours?: Record<string, unknown> }) {
+    super('conflict', 'conflict', '다른 곳에서 먼저 수정되었습니다. 현재 내용과 비교한 뒤 다시 저장하세요.', extra);
+  }
+}
+
+/** COLLECTOR_MODE=disabled 에서의 추출 요청. 외부 fetch 를 하지 않는다. */
+export class CollectorNotEnabledError extends AppError {
+  constructor() {
+    super('forbidden', 'collector_disabled', '수집 기능이 비활성 상태입니다(M5에서 활성화)');
+  }
+}
+
+/** COLLECTOR_MODE=enabled 여도 실제 수집기는 아직 없다(T19). 외부 fetch 를 하지 않는다. */
+export class CollectorNotImplementedError extends AppError {
+  constructor() {
+    super('not_implemented', 'collector_not_implemented', '실제 수집기는 아직 구현되지 않았습니다(T19). 외부 자료를 가져오지 않았습니다.');
   }
 }

@@ -69,7 +69,8 @@ export function errorResponse(e: unknown, request: Request): Response {
       const config = safeConfig();
       if (config) headers.append('set-cookie', buildClearedSessionCookie(config));
     }
-    return Response.json({ error: e.code, message: e.message }, { status, headers });
+    // extra(예: 409 의 current/yours)는 error/message 를 덮어쓰지 못하게 먼저 펼친다.
+    return Response.json({ ...(e.extra ?? {}), error: e.code, message: e.message }, { status, headers });
   }
   console.error(`[api] 처리하지 못한 오류: ${e instanceof Error ? e.name : typeof e}`);
   return Response.json(

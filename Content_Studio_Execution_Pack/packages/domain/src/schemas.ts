@@ -27,24 +27,7 @@ export const brandProfileSchema = z.object({
 });
 export type BrandProfile = z.infer<typeof brandProfileSchema>;
 
-/** POST /api/captures 입력. command_key 는 중복 제출 방지용. */
-export const captureInputSchema = z
-  .object({
-    input_type: inputTypeSchema,
-    raw_text: z.string().max(20000).optional(),
-    url: z.url({ protocol: /^https?$/ }).optional(),
-    user_note: z.string().max(2000).optional(),
-    command_key: z.string().min(1).max(200),
-  })
-  .superRefine((v, ctx) => {
-    if (v.input_type === 'text' && !v.raw_text?.trim()) {
-      ctx.addIssue({ code: 'custom', path: ['raw_text'], message: '텍스트 수집에는 본문이 필요합니다' });
-    }
-    if (v.input_type === 'url' && !v.url) {
-      ctx.addIssue({ code: 'custom', path: ['url'], message: 'URL 수집에는 URL이 필요합니다' });
-    }
-  });
-export type CaptureInput = z.infer<typeof captureInputSchema>;
+// POST /api/captures 입력 계약은 T03 부터 capture.ts 의 captureCreateSchema 가 정본이다.
 
 export const claimSchema = z.object({
   text: z.string().min(1),

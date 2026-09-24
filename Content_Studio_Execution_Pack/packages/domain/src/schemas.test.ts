@@ -1,22 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { captureInputSchema, llmStructuredOutputSchema } from './schemas';
-
-describe('captureInputSchema', () => {
-  it('텍스트 수집', () => {
-    expect(captureInputSchema.parse({ input_type: 'text', raw_text: '메모', command_key: 'k1' })).toBeTruthy();
-  });
-  it('빈 텍스트는 거부', () => {
-    expect(captureInputSchema.safeParse({ input_type: 'text', raw_text: ' ', command_key: 'k1' }).success).toBe(false);
-  });
-  it('http(s) 외 URL 은 거부', () => {
-    expect(
-      captureInputSchema.safeParse({ input_type: 'url', url: 'file:///etc/passwd', command_key: 'k2' }).success,
-    ).toBe(false);
-  });
-  it('command_key 필수', () => {
-    expect(captureInputSchema.safeParse({ input_type: 'text', raw_text: 'a' }).success).toBe(false);
-  });
-});
+import { llmStructuredOutputSchema } from './schemas';
 
 describe('llmStructuredOutputSchema', () => {
   const base = {

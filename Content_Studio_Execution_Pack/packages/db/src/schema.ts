@@ -15,6 +15,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -61,22 +62,40 @@ export const sources = pgTable(
     checkedAt: ts('checked_at'),
     contentHash: text('content_hash'),
     rightsStatus: text('rights_status').notNull().default('unknown'),
+    /** T03: 중복 판정 키(@cs/domain normalizeUrl().normalized). URL 이 아닌 source 는 null. */
+    normalizedUrl: text('normalized_url'),
   },
-  // (id, owner_id) 복합 unique: captures 가 "같은 owner 의 source" 만 참조하도록 복합 FK 대상.
-  (t) => [unique('sources_id_owner_uq').on(t.id, t.ownerId)],
+  (t) => [
+    // (id, owner_id) 복합 unique: captures 가 "같은 owner 의 source" 만 참조하도록 복합 FK 대상.
+    unique('sources_id_owner_uq').on(t.id, t.ownerId),
+    // T03: owner 안에서 같은 정규화 URL 의 source 는 하나(부분 unique — null 은 제외).
+    uniqueIndex('sources_owner_normalized_url_uq')
+      .on(t.ownerId, t.normalizedUrl)
+      .where(sql`${t.normalizedUrl} is not null`),
+  ],
 );
 
+/**
+ * 원문 추출 시도·결과. T03: 추출이 차단되면(A05 내부 주소, 수집 비활성) extraction_state='blocked' 행만 남기고
+ * 가져온 내용이 없으므로 raw_hash 는 null 이다(0002 에서 nullable 로 변경).
+ */
 export const sourceVersions = pgTable('source_versions', {
   id: id(),
   sourceId: uuid('source_id')
     .notNull()
     .references(() => sources.id, { onDelete: 'restrict' }),
-  rawHash: text('raw_hash').notNull(),
+  rawHash: text('raw_hash'),
   fetchedAt: ts('fetched_at').notNull().defaultNow(),
   excerpt: text('excerpt'),
   extractionState: text('extraction_state').notNull().default('pending'),
 });
 
+/**
+ * 수집 원문. raw_text 는 불변(T03): 어떤 UPDATE 도 raw_text 를 바꾸지 않는다(query 계층에서 강제).
+ * 수정 가능한 필드(user_note, title, risk)는 revision 으로 낙관적 잠금을 하고, 매 수정은 capture_revisions 에 남긴다.
+ * content_hash: 정확 중복 판정용(@cs/domain contentHash). 0002 이전 행이 있을 수 있어 nullable 이며,
+ * 모든 insert 경로(createCapture, seed)는 값을 넣고 seed 는 null 인 기존 행을 채운다. 중복 조회는 null 을 무시한다.
+ */
 export const captures = pgTable(
   'captures',
   {
@@ -91,13 +110,51 @@ export const captures = pgTable(
     risk: text('risk').notNull().default('none'),
     userNote: text('user_note'),
     commandKey: text('command_key').notNull(),
+    title: text('title'),
+    revision: integer('revision').notNull().default(1),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+    contentHash: text('content_hash'),
   },
   (t) => [
     unique('captures_owner_command_key_uq').on(t.ownerId, t.commandKey),
+    // capture_revisions 가 "같은 owner 의 capture" 만 참조하도록 복합 FK 대상.
+    unique('captures_id_owner_uq').on(t.id, t.ownerId),
+    index('captures_owner_content_hash_idx').on(t.ownerId, t.contentHash),
+    index('captures_owner_received_idx').on(t.ownerId, t.receivedAt.desc(), t.id.desc()),
     foreignKey({
       name: 'captures_source_same_owner_fk',
       columns: [t.sourceId, t.ownerId],
       foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * capture 수정 이력(T03). revision 마다 한 행, 수정 가능한 필드의 그 시점 값을 담는다. raw_text 는 captures 에만 있다.
+ * 생성 시 revision 1 을 남기고, 수정 성공 시 새 revision 을 남긴다(0002 이전 행은 첫 수정 때 직전 값을 먼저 보존).
+ */
+export const captureRevisions = pgTable(
+  'capture_revisions',
+  {
+    id: id(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    revision: integer('revision').notNull(),
+    userNote: text('user_note'),
+    risk: text('risk').notNull(),
+    title: text('title'),
+    changedAt: ts('changed_at').notNull().defaultNow(),
+    /** 'owner'(사용자 수정) | 'system'(0002 이전 행의 직전 값 보존) */
+    changedBy: text('changed_by').notNull(),
+  },
+  (t) => [
+    unique('capture_revisions_capture_revision_uq').on(t.captureId, t.revision),
+    foreignKey({
+      name: 'capture_revisions_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
     }).onDelete('restrict'),
   ],
 );

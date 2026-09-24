@@ -15,3 +15,15 @@
 - Exact authorized scope (if applicable): 로컬 개발 환경(localhost) 한정. 외부 연결·운영 배포 없음.
 - Consequences: 인증 강도는 "localhost 에 접근할 수 있는 사람 = owner" 수준이다. 로그인 시도 횟수 제한(rate limit)은 구현하지 않았다. 인터넷에 노출되는 배포에는 쓸 수 없으며(서버 가드가 localhost 외 APP_BASE_URL 에서 dev 로그인을 거부) 운영 전 T13 이 선행되어야 한다.
 - When to revisit: T13(OIDC·비밀 암호화) 착수 시, 또는 localhost 밖에서 앱을 열어야 할 필요가 생길 때.
+
+## D4 — T03 유사 소재 판정은 문자 bigram Jaccard, 폼 충돌은 query 리다이렉트(+긴 입력은 409 HTML)
+- Decision ID / date: D4 / 2026-09-24 (Europe/Moscow)
+- Question: (1) 외부 라이브러리·AI 호출 없이 한국어 소재의 "주제 유사" 후보를 어떻게 고르는가? (2) HTML 폼 수정이 409 충돌일 때 사용자가 입력한 값을 어떻게 잃지 않는가?
+- Options: (1) 단어 단위 Jaccard / 문자 bigram Jaccard / 임베딩(외부 호출·비용) (2) 409 HTML 직접 렌더 / 입력값을 query 에 실어 303 / 세션 임시 저장
+- Chosen option: (1) NFC·소문자·URL·공백·문장부호 제거 후 문자 bigram Jaccard, 기준 0.45, 최근 200건 대상. 정확 중복(정규화 URL·content_hash)은 따로 판정하고 유사 목록에서 뺀다. (2) 제출 값을 `?conflict=1&y_…` 로 실어 303(퍼센트 인코딩 후 2000자 이하). 넘으면 잘라내지 않고 같은 비교표·폼을 담은 409 HTML 을 직접 응답한다.
+- Evidence / assumption: 한국어는 조사·띄어쓰기 차이로 단어 집합이 크게 달라져 단어 Jaccard 가 근사 중복을 놓친다. bigram 은 테스트 문장(근사 중복 ≥0.45, 무관 <0.45)에서 구분됐다. 기준값은 가정이며 실사용 데이터로 조정해야 한다. 한국어 메모 200자 정도면 인코딩 후 2000자를 넘기 쉬워 query 만으로는 입력 손실이 생긴다.
+- Reversible?: 예. 유사도 함수와 기준은 `packages/domain/src/similarity.ts` 한 곳, 충돌 처리는 `apps/web/app/api/captures/[id]/route.ts` 한 곳.
+- User decision required?: 아니오(구현 세부). 기준값 조정은 사용 후 확인.
+- Exact authorized scope (if applicable): 해당 없음(외부 연결 없음).
+- Consequences: 짧은 문장(몇 글자)은 점수가 불안정하다. 200건 밖의 오래된 소재는 유사 후보에서 빠진다. 충돌 query 에 메모 내용이 실려 브라우저 기록에 남는다(본인 브라우저·본인 데이터, 외부 링크는 no-referrer).
+- When to revisit: T04 검색(한국어 FTS) 도입 시, 또는 소재가 수천 건을 넘어 최근 200건 비교가 부족할 때.

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { countCaptures, createTestDb, loadFixtureCaptures, schema, seed, type DbHandle } from '@cs/db';
+import { contentHash } from '@cs/domain';
 
 describe('migrate + seed (PGlite memory)', () => {
   let h: DbHandle;
@@ -35,6 +36,35 @@ describe('migrate + seed (PGlite memory)', () => {
     expect(profiles).toHaveLength(1);
     expect(profiles[0]).toMatchObject({ version: 1, penName: '가칭: 해외영업 노트' });
     expect(profiles[0]!.pillars).toEqual(['해외 사업·영업 운영', '전문성의 AI 적용', '해외·러시아·주재원·조직 차이 경험']);
+  });
+
+  it('T03: 10건 모두 content_hash, URL 픽스처 3건은 sources(kind url) 와 연결 — 재실행해도 source 3개', async () => {
+    const rows = await h.db.select().from(schema.captures);
+    expect(rows).toHaveLength(10);
+    for (const r of rows) expect(r.contentHash).toBe(contentHash(r.rawText));
+    const urlRows = rows.filter((r) => r.inputType === 'url');
+    expect(urlRows).toHaveLength(3);
+    const srcs = await h.db.select().from(schema.sources);
+    expect(srcs).toHaveLength(3);
+    for (const r of urlRows) {
+      const s = srcs.find((x) => x.id === r.sourceId);
+      expect(s).toMatchObject({ kind: 'url', ownerId: r.ownerId });
+      expect(r.rawText.startsWith(`${s!.canonicalUrl}\n`)).toBe(true);
+    }
+    expect(rows.filter((r) => r.inputType === 'text').every((r) => r.sourceId === null)).toBe(true);
+    await seed(h.db, { allowedIdentity: 'owner@example.local' });
+    expect(await h.db.select().from(schema.sources)).toHaveLength(3);
+  });
+
+  it('T03: 0002 이전에 seed 된 행(content_hash·source 없음)도 재seed 로 채워진다(원문 불변)', async () => {
+    const [before] = await h.db.select().from(schema.captures).where(eq(schema.captures.commandKey, 'fx-003'));
+    await h.db
+      .update(schema.captures)
+      .set({ contentHash: null, sourceId: null })
+      .where(eq(schema.captures.commandKey, 'fx-003'));
+    await seed(h.db, { allowedIdentity: 'owner@example.local' });
+    const [after] = await h.db.select().from(schema.captures).where(eq(schema.captures.commandKey, 'fx-003'));
+    expect(after).toMatchObject({ rawText: before!.rawText, contentHash: before!.contentHash, sourceId: before!.sourceId });
   });
 
   it('시각은 UTC timestamptz 로 저장된다', async () => {

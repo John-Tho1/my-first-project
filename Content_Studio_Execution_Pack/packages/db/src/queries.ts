@@ -165,6 +165,9 @@ export async function revokeSession(db: Db, ownerId: string, sessionId: string, 
 
 // ---- audit ----
 
+/** db 또는 transaction 안의 tx — 같은 쿼리 헬퍼를 둘 다에서 쓴다. */
+export type DbOrTx = Db | Parameters<Parameters<Db['transaction']>[0]>[0];
+
 export interface AuditInput {
   /** 인증 전 이벤트(auth.login_denied)만 null */
   ownerId: string | null;
@@ -174,7 +177,10 @@ export interface AuditInput {
     | 'auth.login_denied'
     | 'asset.upload'
     | 'asset.download'
-    | 'asset.missing';
+    | 'asset.missing'
+    | 'capture.create'
+    | 'capture.update'
+    | 'capture.extract_blocked';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;
@@ -183,7 +189,7 @@ export interface AuditInput {
   at?: Date;
 }
 
-export async function recordAudit(db: Db, e: AuditInput): Promise<void> {
+export async function recordAudit(db: DbOrTx, e: AuditInput): Promise<void> {
   await db.insert(auditEvents).values({
     ownerId: e.ownerId,
     action: e.action,

@@ -21,3 +21,8 @@ export function formatMsk(date: Date | string | number): string {
   const parts = Object.fromEntries(mskFormatter.formatToParts(d).map((p) => [p.type, p.value]));
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} (MSK)`;
 }
+
+/** `YYYY-MM-DD HH:mm MSK` — 괄호 안에 넣어 쓰는 표기(예: "서버에 저장됨 ✓ (2026-09-24 17:00 MSK)"). */
+export function formatMskInline(date: Date | string | number): string {
+  return formatMsk(date).replace(' (MSK)', ' MSK');
+}

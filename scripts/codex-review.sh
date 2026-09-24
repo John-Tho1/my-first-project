@@ -6,7 +6,11 @@
 #   ./scripts/codex-review.sh --commit <SHA>   # 특정 커밋 하나를 리뷰
 #
 # 환경변수:
-#   CODEX_MODEL   사용할 모델 (미지정 시 Codex 기본값)
+#   CODEX_MODEL              검증에 쓰는 모델. 기본 gpt-6-astra (2026-09-24 사용자 결정: 검증 호출은 항상 GPT-6 Astra / Extra High)
+#   CODEX_REASONING_EFFORT   추론 강도. 기본 xhigh
+#   두 값은 ~/.codex/config.toml 의 기본값(model / model_reasoning_effort)과 무관하게 이 스크립트가 명시적으로 고정한다.
+#
+#   ./scripts/codex-review.sh --selftest       # 검증 경로 자체 점검: 고정 문구 1회 호출 후 실제 모델·강도 헤더를 출력
 #
 # 산출물: .ai/handoff/review-<timestamp>.md
 # Codex는 read-only 샌드박스로 돌기 때문에 이 스크립트는 코드를 고치지 않는다.
@@ -21,11 +25,29 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 127
 fi
 
+CODEX_MODEL="${CODEX_MODEL:-gpt-6-astra}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
+# -c 값은 TOML 로 해석되므로 문자열은 따옴표로 감싼다. 배열 원소로 넘겨 셸이 다시 쪼개지 않게 한다.
+MODEL_ARGS=(-m "$CODEX_MODEL" -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"")
+
 MODE="uncommitted"
 REF=""
 case "${1-}" in
   --base)   MODE="base";   REF="${2:?--base 뒤에 브랜치명이 필요합니다}" ;;
   --commit) MODE="commit"; REF="${2:?--commit 뒤에 SHA가 필요합니다}" ;;
+  --selftest)
+    # 검증 경로 점검: 같은 실행 인수(sandbox·모델·강도·출력)로 고정 문구만 보낸다. 업무 파일은 싣지 않는다.
+    mkdir -p .ai/handoff
+    OUT=".ai/handoff/selftest-$(date +%Y%m%d-%H%M%S).md"
+    LOG="${OUT%.md}.log"
+    echo "▶ Codex 검증 경로 자체 점검 (model=$CODEX_MODEL, effort=$CODEX_REASONING_EFFORT) — 모델 사용량이 발생합니다." >&2
+    codex exec --sandbox read-only "${MODEL_ARGS[@]}" -o "$OUT"       "Reply with exactly ASTRA_XHIGH_OK. Do not read or write files, execute commands, use tools, or invoke other agents."       </dev/null >"$LOG" 2>&1 || { echo "codex exec 실패 — $LOG 확인" >&2; exit 1; }
+    echo "요청값: model=$CODEX_MODEL effort=$CODEX_REASONING_EFFORT" >&2
+    echo "Codex 세션 헤더(실제 적용값):" >&2
+    grep -E '^(model|reasoning effort|provider|sandbox|session id):' "$LOG" >&2 || echo "  (헤더 없음 — $LOG 확인)" >&2
+    echo "응답: $(cat "$OUT")" >&2
+    echo "$OUT"
+    exit 0 ;;
   "")       ;;
   *)        echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
 esac
@@ -93,10 +115,9 @@ PASS 또는 CHANGES_REQUESTED 중 하나.
 - 샌드박스가 파일 읽기를 막을 수 있다. 차단되면 재시도하지 말고, 판단에 필요한 정보가
   <stdin>에 없는 항목은 '미확인'으로 표시한 뒤 나머지를 마저 검토하라."
 
-CMD=(codex exec --sandbox read-only -o "$OUT")
-[ -n "${CODEX_MODEL-}" ] && CMD+=(-m "$CODEX_MODEL")
+CMD=(codex exec --sandbox read-only "${MODEL_ARGS[@]}" -o "$OUT")
 
-echo "▶ Codex 리뷰 실행 중 ($SCOPE, ${DIFF_BYTES}B)..." >&2
+echo "▶ Codex 리뷰 실행 중 ($SCOPE, ${DIFF_BYTES}B, model=$CODEX_MODEL, effort=$CODEX_REASONING_EFFORT)..." >&2
 {
   if [ -n "$RULES" ]; then
     printf '===== AGENTS.md (프로젝트 규칙) =====\n%s\n\n' "$RULES"

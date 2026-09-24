@@ -13,6 +13,8 @@ import {
   buildAssistPrompt,
   claimNeedsConfirmation,
   isClaimResolved,
+  MAX_ASSIST_SOURCES,
+  pickDefaultSources,
   diffLines,
   formatMsk,
   INTERVIEW_QUESTIONS,
@@ -65,6 +67,9 @@ export function WritingPanel({
   const { brand, answers } = state;
   const answerByKey = new Map(answers.map((a) => [a.questionKey, a]));
   const answerIds = answers.map((a) => a.id).sort();
+  // FIX-T07(P1): 허용 출처가 50개를 넘어도 요청이 거부되지 않게 — 출처마다 최신 버전만 기본 선택(최대 50).
+  const defaultSources = pickDefaultSources(state.allowedSources);
+  const defaultIds = new Set(defaultSources.selected.map((s) => s.id));
   const resolutionRows = state.confirmations.map((c) => ({ runId: c.runId, claimIndex: c.claimIndex, resolution: c.resolution }));
   const prompt = brand
     ? buildAssistPrompt({
@@ -141,7 +146,21 @@ export function WritingPanel({
             <input type="hidden" name="base_version" value={current.version} />
             <input type="hidden" name="brand_profile_version" value={brand.version} />
             <input type="hidden" name="answer_ids" value={answerIds.join(',')} />
-            <input type="hidden" name="source_version_ids" value={state.allowedSources.map((s) => s.id).join(',')} />
+            {state.allowedSources.length ? (
+              <fieldset>
+                <legend>
+                  근거로 쓸 출처(최대 {MAX_ASSIST_SOURCES}개 — 기본은 출처마다 최신 버전
+                  {defaultSources.excluded > 0 ? `, ${defaultSources.excluded}개 버전은 기본 선택에서 뺐음` : ''})
+                </legend>
+                {state.allowedSources.map((s) => (
+                  <label key={s.id} className="inline">
+                    <input type="checkbox" name={`sv_${s.id}`} defaultChecked={defaultIds.has(s.id)} /> {s.locator ?? s.sourceId.slice(0, 8)} ·{' '}
+                    {formatMsk(s.fetchedAt)}
+                    {s.extractionState !== 'fetched' ? ` · ${s.extractionState}` : ''}
+                  </label>
+                ))}
+              </fieldset>
+            ) : null}
             <label htmlFor="assist_mode">모드</label>
             <select id="assist_mode" name="mode" defaultValue="outline">
               {ASSIST_MODES.map((m) => (

@@ -5,7 +5,10 @@
  */
 import { and, asc, eq, gte, inArray, sql } from 'drizzle-orm';
 import {
+  AmountRangeError,
+  BudgetCurrencyMismatchError,
   BudgetExceededError,
+  isStorableMicro,
   checkBudget,
   costMicro,
   fromMicro,
@@ -40,28 +43,46 @@ export async function lockOwnerForBudget(tx: DbOrTx, ownerId: string): Promise<v
   await tx.select({ id: users.id }).from(users).where(eq(users.id, ownerId)).for('update');
 }
 
-/** 이번 달(MSK) 사용액(micro): reserved → 예약액, settled → 실제액(없으면 예약액), released → 0. */
-export async function monthlyUsedMicro(tx: DbOrTx, ownerId: string, now: Date): Promise<number> {
-  const rows = await tx
-    .select({
-      total: sql<string>`coalesce(sum(case ${usageLedger.state}
+/** 월 합계 식(micro 가 아니라 numeric): reserved → 예약액, settled → 실제액(없으면 예약액), released → 0. */
+const ledgerAmount = sql`case ${usageLedger.state}
         when 'reserved' then ${usageLedger.reservedAmount}
         when 'settled' then coalesce(${usageLedger.actualAmount}, ${usageLedger.reservedAmount})
-        else 0 end), 0)::numeric(18, 6)::text`,
-    })
+        else 0 end`;
+
+/**
+ * 이번 달(MSK) 사용액(micro, bigint) — **이 통화의 원장만**(FIX-T07 P1: 통화를 섞지 않는다).
+ */
+export async function monthlyUsedMicro(tx: DbOrTx, ownerId: string, now: Date, currency: string): Promise<bigint> {
+  const rows = await tx
+    .select({ total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::numeric(18, 6)::text` })
     .from(usageLedger)
-    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now))));
+    .where(and(eq(usageLedger.ownerId, ownerId), eq(usageLedger.currency, currency), gte(usageLedger.createdAt, mskMonthStart(now))));
   return toMicro(rows[0]?.total ?? '0');
 }
 
+/** 이번 달 원장에 있는 통화 목록(정렬). */
+export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date): Promise<string[]> {
+  const rows = await tx
+    .selectDistinct({ currency: usageLedger.currency })
+    .from(usageLedger)
+    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now))));
+  return rows.map((r) => r.currency).sort();
+}
+
 /**
- * 호출 전 예약 검사(A15). owner 행을 잠그고(동시 예약 직렬화) 이번 달 사용액 + 예약액이 상한을 넘으면 BudgetExceededError(429).
+ * 호출 전 예약 검사(A15). owner 행을 잠그고(동시 예약·정산 직렬화)
+ * - 이번 달 원장에 설정과 다른 통화가 있으면 409 budget_currency_mismatch(통화를 섞어 비교하지 않는다)
+ * - 이번 달 사용액(같은 통화) + 예약액이 상한을 넘으면 429 budget_exceeded
  * 반드시 run·원장을 쓰는 트랜잭션 안에서 호출한다 — 거부되면 그 트랜잭션 전체가 되돌아가 아무것도 남지 않는다.
+ * 예약액은 "최대 가능 비용"(입력 추정 + 출력 상한 tokensOutAllowance)이며, provider 에 maxOutputTokens 로 그 상한을 넘긴다.
  */
 export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: BudgetPolicy, prompt: string, now: Date): Promise<Reservation> {
   const reservation = reserveFor(policy, prompt);
+  if (!isStorableMicro(reservation.reserveMicro)) throw new AmountRangeError();
   await lockOwnerForBudget(tx, ownerId);
-  const used = await monthlyUsedMicro(tx, ownerId, now);
+  const others = (await monthlyCurrencies(tx, ownerId, now)).filter((c) => c !== policy.currency);
+  if (others.length > 0) throw new BudgetCurrencyMismatchError({ configured: policy.currency, found: others });
+  const used = await monthlyUsedMicro(tx, ownerId, now, policy.currency);
   const decision = checkBudget(policy, used, reservation.reserveMicro);
   if (!decision.ok) {
     throw new BudgetExceededError({
@@ -71,7 +92,7 @@ export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: Budget
       reserve: fromMicro(reservation.reserveMicro),
       limit:
         decision.reason === 'per_run_max'
-          ? fromMicro(policy.perRunMaxMicro ?? 0)
+          ? fromMicro(policy.perRunMaxMicro ?? 0n)
           : policy.monthlyLimitMicro !== null
             ? fromMicro(policy.monthlyLimitMicro)
             : null,
@@ -105,15 +126,20 @@ export async function insertReservedLedger(
   return rows[0]!;
 }
 
-/** 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02). */
+/** 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02). owner 잠금 아래에서. */
 export async function settleLedgerFailed(tx: DbOrTx, ownerId: string, ledger: UsageLedgerRow, at: Date): Promise<void> {
+  await lockOwnerForBudget(tx, ownerId);
   await tx
     .update(usageLedger)
     .set({ state: 'settled', actualAmount: ledger.reservedAmount, failed: true, settledAt: at })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
 }
 
-/** 성공한 호출: 실제 토큰 × 단가로 확정. */
+/**
+ * 성공한 호출: 실제 토큰 × 단가로 확정 — 예약과 같은 owner 잠금 아래에서.
+ * 실제액 > 예약액이면(provider 가 상한을 어겼거나 추정이 모자람) 초과액을 overage_amount 에 그대로 기록하고 over_budget=true.
+ * 숨기거나 자르지 않는다. 그 결과 월 합계가 상한을 넘으면 다음 예약이 거부된다.
+ */
 export async function settleLedgerSucceeded(
   tx: DbOrTx,
   ownerId: string,
@@ -122,11 +148,18 @@ export async function settleLedgerSucceeded(
   usage: { tokensIn: number; tokensOut: number },
   at: Date,
 ): Promise<UsageLedgerRow> {
+  await lockOwnerForBudget(tx, ownerId);
+  const actual = costMicro(pricing, usage.tokensIn, usage.tokensOut);
+  if (!isStorableMicro(actual)) throw new AmountRangeError();
+  const reserved = toMicro(ledger.reservedAmount);
+  const overage = actual > reserved ? actual - reserved : 0n;
   const rows = await tx
     .update(usageLedger)
     .set({
       state: 'settled',
-      actualAmount: fromMicro(costMicro(pricing, usage.tokensIn, usage.tokensOut)),
+      actualAmount: fromMicro(actual),
+      overageAmount: fromMicro(overage),
+      overBudget: overage > 0n,
       tokensIn: usage.tokensIn,
       tokensOut: usage.tokensOut,
       settledAt: at,
@@ -137,13 +170,44 @@ export async function settleLedgerSucceeded(
   return rows[0];
 }
 
-export async function monthlyUsage(db: DbOrTx, ownerId: string, now: Date = new Date()) {
-  const usedMicro = await monthlyUsedMicro(db, ownerId, now);
+export interface CurrencyUsage {
+  currency: string;
+  used: string;
+  usedMicro: bigint;
+  overage: string;
+  runs: number;
+  pending: number;
+  overBudgetRuns: number;
+}
+
+/** 이번 달(MSK) 사용량 — 통화별(섞어 합산하지 않는다). */
+export async function monthlyUsage(db: DbOrTx, ownerId: string, now: Date = new Date()): Promise<{ since: Date; byCurrency: CurrencyUsage[] }> {
+  const since = mskMonthStart(now);
   const rows = await db
-    .select({ n: sql<number>`count(*)::int`, reserved: sql<number>`count(*) filter (where ${usageLedger.state} = 'reserved')::int` })
+    .select({
+      currency: usageLedger.currency,
+      total: sql<string>`coalesce(sum(${ledgerAmount}), 0)::numeric(18, 6)::text`,
+      overage: sql<string>`coalesce(sum(${usageLedger.overageAmount}), 0)::numeric(18, 6)::text`,
+      n: sql<number>`count(*)::int`,
+      reserved: sql<number>`count(*) filter (where ${usageLedger.state} = 'reserved')::int`,
+      over: sql<number>`count(*) filter (where ${usageLedger.overBudget})::int`,
+    })
     .from(usageLedger)
-    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now))));
-  return { used: fromMicro(usedMicro), usedMicro, runs: rows[0]?.n ?? 0, pending: rows[0]?.reserved ?? 0, since: mskMonthStart(now) };
+    .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, since)))
+    .groupBy(usageLedger.currency)
+    .orderBy(asc(usageLedger.currency));
+  return {
+    since,
+    byCurrency: rows.map((r) => ({
+      currency: r.currency,
+      used: fromMicro(toMicro(r.total)),
+      usedMicro: toMicro(r.total),
+      overage: fromMicro(toMicro(r.overage)),
+      runs: r.n,
+      pending: r.reserved,
+      overBudgetRuns: r.over,
+    })),
+  };
 }
 
 export async function getLedgerForRun(db: DbOrTx, ownerId: string, runId: string): Promise<UsageLedgerRow | null> {
@@ -166,6 +230,8 @@ export function usageLedgerView(l: UsageLedgerRow) {
     tokens_in: l.tokensIn,
     tokens_out: l.tokensOut,
     failed: l.failed,
+    overage_amount: l.overageAmount,
+    over_budget: l.overBudget,
     pricing_snapshot: l.pricingSnapshot,
     created_at: l.createdAt.toISOString(),
     settled_at: l.settledAt ? l.settledAt.toISOString() : null,
@@ -176,9 +242,11 @@ export function usageLedgerView(l: UsageLedgerRow) {
 
 export interface AllowedSource {
   id: string;
+  sourceId: string;
   locator: string | null;
   excerpt: string | null;
   extractionState: string;
+  fetchedAt: Date;
 }
 
 /**
@@ -189,9 +257,11 @@ export async function allowedSourceVersions(tx: DbOrTx, ownerId: string, content
   const rows = await tx
     .selectDistinct({
       id: sourceVersions.id,
+      sourceId: sourceVersions.sourceId,
       locator: sources.canonicalUrl,
       excerpt: sourceVersions.excerpt,
       extractionState: sourceVersions.extractionState,
+      fetchedAt: sourceVersions.fetchedAt,
     })
     .from(contentCaptures)
     .innerJoin(captures, and(eq(captures.id, contentCaptures.captureId), eq(captures.ownerId, contentCaptures.ownerId)))
@@ -210,13 +280,13 @@ export async function insertClaims(
   ownerId: string,
   runId: string,
   contentVersionId: string,
-  filtered: readonly FilteredClaim[],
+  filtered: ReadonlyArray<Pick<FilteredClaim, 'text' | 'kind' | 'evidence_grade' | 'needs_check' | 'source_refs'>>,
   locators: ReadonlyMap<string, string | null>,
   now: Date,
   /** T09: 채널 초안 run 이면 그 제안 variant_version(contentVersionId 는 파생 기준 원고 버전) */
   variantVersionId: string | null = null,
 ): Promise<void> {
-  for (const c of filtered) {
+  for (const [index, c] of filtered.entries()) {
     const inserted = await tx
       .insert(claims)
       .values({
@@ -224,7 +294,7 @@ export async function insertClaims(
         contentVersionId,
         runId,
         variantVersionId,
-        claimIndex: c.index,
+        claimIndex: index,
         statement: c.text,
         kind: c.kind,
         evidenceGrade: c.evidence_grade,

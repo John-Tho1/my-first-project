@@ -112,7 +112,7 @@ export const assistRequestSchema = z
     brand_profile_version: z.int().min(1),
     answer_ids: z.array(z.string()).max(20).default([]),
     /** T07: 이번 제안에서 근거로 허용할 source_version id(이 원고에 연결된 소재의 출처만). 없으면 근거 없음. */
-    source_version_ids: z.array(z.string()).max(50).default([]),
+    source_version_ids: z.array(z.string()).max(50).default([]), // = MAX_ASSIST_SOURCES
   })
   .strict();
 export type AssistRequest = z.infer<typeof assistRequestSchema>;
@@ -259,6 +259,115 @@ export function assistInputVersion(refs: {
   const base = `cv:${refs.contentVersionId};bp:${refs.brandProfileVersion};ans:${[...refs.answerIds].sort().join(',')}`;
   // T07: 허용 출처가 있을 때만 덧붙인다(없으면 T06 형식 그대로).
   return refs.sourceVersionIds?.length ? `${base};sv:${[...refs.sourceVersionIds].sort().join(',')}` : base;
+}
+
+// ---- FIX-T07: 허용 출처 기본 선택(순수) ----
+
+/** assist 요청 한 번에 보낼 수 있는 source_version 수(assistRequestSchema 와 같다). */
+export const MAX_ASSIST_SOURCES = 50;
+
+/**
+ * 작성실 기본 선택: 출처(source)마다 가장 최근 버전 하나(fetched_at, 같으면 id 큰 것), 최근 출처부터 최대 MAX_ASSIST_SOURCES 개.
+ * excluded = 기본 선택에서 빠진 버전 수(이전 버전 + 상한 초과). 사용자는 체크박스로 바꿀 수 있다.
+ */
+export function pickDefaultSources<T extends { id: string; sourceId: string; fetchedAt: Date }>(
+  all: readonly T[],
+  max = MAX_ASSIST_SOURCES,
+): { selected: T[]; excluded: number } {
+  const latest = new Map<string, T>();
+  for (const v of all) {
+    const cur = latest.get(v.sourceId);
+    if (!cur || v.fetchedAt > cur.fetchedAt || (v.fetchedAt.getTime() === cur.fetchedAt.getTime() && v.id > cur.id)) latest.set(v.sourceId, v);
+  }
+  const selected = [...latest.values()]
+    .sort((a, b) => b.fetchedAt.getTime() - a.fetchedAt.getTime() || (a.id < b.id ? 1 : -1))
+    .slice(0, max);
+  return { selected, excluded: all.length - selected.length };
+}
+
+// ---- FIX-T07: 출력 전체 정제(순수) ----
+
+export const DROPPED_REF_MARKER = '[출처 미확인 URL 제거]';
+/** 이 길이 미만의 버린 참조 문자열은 본문에서 찾아 바꾸지 않는다(짧은 조각이 일반 단어를 지우는 것을 막음). */
+export const MIN_REDACT_LENGTH = 4;
+
+export interface SanitizedClaim {
+  text: string;
+  kind: 'fact' | 'opinion' | 'experience';
+  source_refs: string[];
+  needs_user_confirmation: boolean;
+  dropped_source_refs: number;
+  evidence_grade: 'none' | 'source';
+  needs_check: boolean;
+}
+
+export interface SanitizedOutput {
+  result_type: LlmOutputLike['result_type'];
+  input_version: string;
+  proposed_text: string;
+  proposed_tags: string[];
+  claims: SanitizedClaim[];
+  followup_questions: string[];
+  warnings: string[];
+}
+
+interface LlmOutputLike {
+  result_type: 'idea' | 'outline' | 'draft' | 'revision' | 'questions';
+  input_version: string;
+  proposed_text: string;
+  proposed_tags: readonly string[];
+  claims: ReadonlyArray<{ text: string; kind: 'fact' | 'opinion' | 'experience'; source_refs: readonly string[]; needs_user_confirmation: boolean }>;
+  followup_questions: readonly string[];
+  warnings: readonly string[];
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지).
+ * - claim.source_refs: 허용 목록 안만(filterClaimSources), 버린 개수·needs_check
+ * - 버린 참조 문자열(길이 ≥ MIN_REDACT_LENGTH)이 제안 본문·경고·후속 질문·태그·claim 문장에 다시 나오면 DROPPED_REF_MARKER 로 바꾼다(대소문자 무시)
+ * - 버린 것이 있으면 경고 한 줄 추가(개수만, 원문 없음)
+ * 이 결과 하나를 output_json·claims 행·HTTP 응답에 똑같이 쓴다.
+ */
+export function sanitizeLlmOutput(output: LlmOutputLike, allowed: readonly string[]): { output: SanitizedOutput; droppedTotal: number } {
+  const ok = new Set(allowed.map((s) => s.toLowerCase()));
+  const dropped = [
+    ...new Set(
+      output.claims
+        .flatMap((c) => c.source_refs)
+        .map((r) => r.trim())
+        .filter((r) => r !== '' && !ok.has(r.toLowerCase())),
+    ),
+  ]
+    .filter((r) => r.length >= MIN_REDACT_LENGTH)
+    .sort((a, b) => b.length - a.length); // 긴 것부터(겹치는 참조의 일부만 남지 않게)
+  const res = dropped.map((d) => new RegExp(escapeRe(d), 'giu'));
+  const redact = (s: string) => res.reduce((acc, re) => acc.replace(re, DROPPED_REF_MARKER), s);
+  const filtered = filterClaimSources(output.claims, allowed);
+  const droppedTotal = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
+  const warnings = output.warnings.map(redact);
+  if (droppedTotal > 0) warnings.push(`출처 미확인: 허용 목록에 없는 출처 ${droppedTotal}건을 버렸습니다`);
+  return {
+    droppedTotal,
+    output: {
+      result_type: output.result_type,
+      input_version: output.input_version,
+      proposed_text: redact(output.proposed_text),
+      proposed_tags: output.proposed_tags.map(redact),
+      claims: filtered.map((c) => ({
+        text: redact(c.text),
+        kind: c.kind,
+        source_refs: c.source_refs,
+        needs_user_confirmation: c.needs_user_confirmation,
+        dropped_source_refs: c.dropped_source_refs,
+        evidence_grade: c.evidence_grade,
+        needs_check: c.needs_check,
+      })),
+      followup_questions: output.followup_questions.map(redact),
+      warnings,
+    },
+  };
 }
 
 // ---- T07: claim 출처 거르기(순수) ----

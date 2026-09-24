@@ -195,4 +195,50 @@ describe('0005 migration: 기존 데이터 위에 적용', () => {
     expect(await errorOf(client.query(`delete from claim_confirmations`))).toMatch(/append_only_immutable/);
     await client.close();
   });
+
+  it('0010: 기존 claims 의 user_confirmed 는 none 으로(파생 가능), CHECK·추가 전용 트리거 유지, 원장 초과 열 기본값', async () => {
+    const { client } = createDb({ driver: 'pglite', url: 'memory://' });
+    for (const tag of tags.filter((t) => t < '0010')) await applyTag(client, tag);
+    const u = await client.query<{ id: string }>("insert into users (allowed_identity) values ('m10@example.local') returning id");
+    const ownerId = u.rows[0]!.id;
+    const bp = await client.query<{ id: string }>(
+      `insert into brand_profiles (owner_id, version, pen_name, audience, pillars) values ($1, 1, 'p', 'a', '["x"]'::jsonb) returning id`,
+      [ownerId],
+    );
+    const c = await client.query<{ id: string }>(`insert into contents (owner_id, title) values ($1, 't') returning id`, [ownerId]);
+    const v = await client.query<{ id: string }>(
+      `insert into content_versions (content_id, version, body, created_by) values ($1, 1, 'b', 'owner') returning id`,
+      [c.rows[0]!.id],
+    );
+    const run = await client.query<{ id: string }>(
+      `insert into generation_runs (owner_id, content_id, mode, input_version_id, brand_profile_id, input_version_refs, prompt_version, provider, model, status)
+       values ($1, $2, 'draft', $3, $4, '{}'::jsonb, 'v', 'mock', 'mock', 'succeeded') returning id`,
+      [ownerId, c.rows[0]!.id, v.rows[0]!.id, bp.rows[0]!.id],
+    );
+    await client.query(
+      `insert into claims (owner_id, content_version_id, run_id, claim_index, statement, kind, evidence_grade, needs_check) values ($1, $2, $3, 0, 's', 'experience', 'user_confirmed', false)`,
+      [ownerId, v.rows[0]!.id, run.rows[0]!.id],
+    );
+    await client.query(
+      `insert into usage_ledger (owner_id, run_id, reserved_amount, currency, pricing_snapshot, state) values ($1, $2, 1, 'USD', '{}'::jsonb, 'settled')`,
+      [ownerId, run.rows[0]!.id],
+    );
+
+    await applyTag(client, tags.find((t) => t.startsWith('0010'))!);
+
+    expect((await client.query<{ evidence_grade: string }>('select evidence_grade from claims')).rows).toEqual([{ evidence_grade: 'none' }]);
+    expect((await client.query<{ overage_amount: string; over_budget: boolean }>('select overage_amount::text, over_budget from usage_ledger')).rows).toEqual([
+      { overage_amount: '0.000000', over_budget: false },
+    ]);
+    expect(await errorOf(client.query(`update claims set statement = 'x'`))).toMatch(/append_only_immutable/);
+    expect(
+      await errorOf(
+        client.query(
+          `insert into claims (owner_id, content_version_id, run_id, claim_index, statement, kind, evidence_grade, needs_check) values ($1, $2, $3, 1, 's', 'fact', 'user_confirmed', false)`,
+          [ownerId, v.rows[0]!.id, run.rows[0]!.id],
+        ),
+      ),
+    ).toMatch(/claims_evidence_grade_chk/);
+    await client.close();
+  });
 });

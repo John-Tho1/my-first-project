@@ -43,7 +43,12 @@ export function formToAssist(f: Record<string, string>) {
     base_version: Number(f.base_version),
     brand_profile_version: Number(f.brand_profile_version),
     answer_ids: csv(f.answer_ids),
-    source_version_ids: csv(f.source_version_ids),
+    // FIX-T07: 체크박스(sv_<id>=on)가 있으면 그것을, 없으면 쉼표 목록 칸을 쓴다.
+    source_version_ids: Object.keys(f).some((k) => k.startsWith('sv_'))
+      ? Object.keys(f)
+          .filter((k) => k.startsWith('sv_'))
+          .map((k) => k.slice(3))
+      : csv(f.source_version_ids),
   };
 }
 

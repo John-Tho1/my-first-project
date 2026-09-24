@@ -19,10 +19,10 @@ const priced = (extra: Record<string, string> = {}) =>
 
 describe('금액·토큰 계산(T07, D13)', () => {
   it('toMicro/fromMicro 는 소수 6자리까지 오차 없이 왕복', () => {
-    expect(toMicro('0')).toBe(0);
-    expect(toMicro('12.5')).toBe(12_500_000);
-    expect(toMicro('0.000001')).toBe(1);
-    expect(fromMicro(12_500_000)).toBe('12.500000');
+    expect(toMicro('0')).toBe(0n);
+    expect(toMicro('12.5')).toBe(12_500_000n);
+    expect(toMicro('0.000001')).toBe(1n);
+    expect(fromMicro(12_500_000n)).toBe('12.500000');
     expect(fromMicro(toMicro('123456789.123456'))).toBe('123456789.123456');
   });
 
@@ -40,24 +40,24 @@ describe('금액·토큰 계산(T07, D13)', () => {
     expect(r.tokensOutAllowance).toBe(500);
     expect(r.reserveMicro).toBe(toMicro('0.5') + toMicro('0.75'));
     expect(r.pricingSnapshot).toMatchObject({ currency: 'USD', input_per_1k: '0.500000', output_per_1k: '1.500000' });
-    expect(costMicro(priced().pricing, 1, 0)).toBe(500); // 0.0005 → 올림 없이 정확
-    expect(costMicro(null, 1000, 1000)).toBe(0);
+    expect(costMicro(priced().pricing, 1, 0)).toBe(500n); // 0.0005 → 올림 없이 정확
+    expect(costMicro(null, 1000, 1000)).toBe(0n);
   });
 
   it('가격 없음(mock) → 예약 0, 스냅숏 priced=false, 한도 검사 없음', () => {
     const p = budgetPolicy(loadConfig({ LLM_BUDGET_MONTHLY_LIMIT: '0.000001' }));
     const r = reserveFor(p, 'x'.repeat(3000));
-    expect(r.reserveMicro).toBe(0);
+    expect(r.reserveMicro).toBe(0n);
     expect(r.pricingSnapshot).toMatchObject({ mode: 'mock', priced: false });
-    expect(checkBudget(p, 10 ** 12, 10 ** 9)).toEqual({ ok: true });
+    expect(checkBudget(p, 10n ** 12n, 10n ** 9n)).toEqual({ ok: true });
   });
 
   it('상한: 1회 상한 초과 → per_run_max, 월 합계 초과 → monthly_limit, 경계값(=상한)은 허용', () => {
     const p = priced({ LLM_BUDGET_MONTHLY_LIMIT: '2', LLM_BUDGET_PER_RUN_MAX: '1' });
-    expect(checkBudget(p, 0, toMicro('1.000001'))).toEqual({ ok: false, reason: 'per_run_max' });
+    expect(checkBudget(p, 0n, toMicro('1.000001'))).toEqual({ ok: false, reason: 'per_run_max' });
     expect(checkBudget(p, toMicro('1.5'), toMicro('0.5'))).toEqual({ ok: true });
     expect(checkBudget(p, toMicro('1.5'), toMicro('0.500001'))).toEqual({ ok: false, reason: 'monthly_limit' });
-    expect(checkBudget(priced(), 10 ** 12, 1)).toEqual({ ok: true }); // 상한 미설정
+    expect(checkBudget(priced(), 10n ** 12n, 1n)).toEqual({ ok: true }); // 상한 미설정
   });
 
   it('월 시작은 MSK(UTC+3) 기준', () => {
@@ -129,5 +129,23 @@ describe('filterClaimSources(모델이 만든 출처 거르기)', () => {
   it('허용 목록이 비면 모든 출처를 버린다', () => {
     const [a] = filterClaimSources([{ text: 't', kind: 'opinion', source_refs: [SV], needs_user_confirmation: false }], []);
     expect(a).toMatchObject({ source_refs: [], dropped_source_refs: 1, needs_check: true });
+  });
+});
+
+describe('FIX-T07 P2: bigint 금액', () => {
+  it('Codex 경계값 9007199254.740993 를 정확히 왕복(Number 로는 불가)', () => {
+    expect(toMicro('9007199254.740993')).toBe(9_007_199_254_740_993n);
+    expect(fromMicro(toMicro('9007199254.740993'))).toBe('9007199254.740993');
+    expect(Number.isSafeInteger(Number('9007199254740993'))).toBe(false); // Number 로는 정확히 표현 불가
+  });
+  it('numeric(18,6) 최대값까지 허용, 넘거나 형식이 틀리면 거부', () => {
+    expect(fromMicro(toMicro('999999999999.999999'))).toBe('999999999999.999999');
+    for (const bad of ['1000000000000', '1.0000001', '-1', '1e3', '', '.5', '1.']) expect(() => toMicro(bad), bad).toThrow();
+  });
+  it('가격 × 토큰 곱을 중간 정밀도 손실 없이 올림', () => {
+    const p = { currency: 'USD', inputPer1kMicro: toMicro('999999999.999999'), outputPer1kMicro: 1n };
+    // 1_000_003 토큰 × 999999999999999 micro / 1000 → 정확한 올림
+    expect(costMicro(p, 1_000_003, 0)).toBe((1_000_003n * 999_999_999_999_999n + 999n) / 1000n);
+    expect(costMicro(p, 0, 1)).toBe(1n); // 0.001 micro → 1 micro 로 올림
   });
 });

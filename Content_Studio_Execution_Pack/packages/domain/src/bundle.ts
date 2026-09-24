@@ -292,7 +292,8 @@ export const ROW_SCHEMAS = {
     claim_index: int.min(0),
     statement: str,
     kind: z.enum(['fact', 'opinion', 'experience']),
-    evidence_grade: z.enum(['none', 'source', 'user_confirmed']),
+    // FIX-T07(P1): 'user_confirmed' 는 저장·복원하지 않는다(claim_confirmations 에서만 파생) — 묶음에 있으면 거부.
+    evidence_grade: z.enum(['none', 'source']),
     personal_experience_confirmed: z.boolean(),
     needs_check: z.boolean(),
     // 0009 열. 이전 묶음에는 없으므로 null.
@@ -311,6 +312,9 @@ export const ROW_SCHEMAS = {
     pricing_snapshot: z.record(z.string(), z.unknown()),
     state: z.enum(['reserved', 'settled', 'released']),
     failed: z.boolean(),
+    // 0010 열. 이전 묶음에는 없으므로 초과 없음.
+    overage_amount: amount.default('0.000000'),
+    over_budget: z.boolean().default(false),
     created_at: ts,
     settled_at: ts.nullable(),
   }),

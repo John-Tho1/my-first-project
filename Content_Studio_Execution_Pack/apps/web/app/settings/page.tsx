@@ -59,12 +59,27 @@ export default async function SettingsPage({
         <p className="meta">
           <span className={config.LLM_MODE === 'live' ? 'tag warn' : 'tag'}>AI: {config.LLM_MODE === 'mock' ? '모의(실제 호출 없음)' : '실제(live)'}</span>
           <span>
-            이번 달(MSK) 사용: {usage.used} {policy.currency}
-            {policy.monthlyLimitMicro !== null ? ` / 상한 ${fromMicro(policy.monthlyLimitMicro)} ${policy.currency}` : ' / 상한 미설정'}
+            상한: {policy.monthlyLimitMicro !== null ? `${fromMicro(policy.monthlyLimitMicro)} ${policy.currency}` : '미설정'}(설정 통화 {policy.currency})
           </span>
-          <span>실행 {usage.runs}건{usage.pending > 0 ? ` · 확정 전 ${usage.pending}건` : ''}</span>
           <span>{policy.pricing ? '가격 설정됨' : '가격 미설정(모의는 0 으로 기록, 실제 호출 차단)'}</span>
         </p>
+        {usage.byCurrency.length ? (
+          <ul className="list">
+            {usage.byCurrency.map((u) => (
+              <li key={u.currency}>
+                <span className={u.currency === policy.currency ? undefined : 'tag warn'}>
+                  이번 달(MSK) 사용: {u.used} {u.currency}
+                </span>
+                {` · 실행 ${u.runs}건`}
+                {u.pending > 0 ? ` · 확정 전 ${u.pending}건` : ''}
+                {u.overBudgetRuns > 0 ? ` · 예약 초과 ${u.overBudgetRuns}건(초과액 ${u.overage} ${u.currency})` : ''}
+                {u.currency !== policy.currency ? ' — 설정 통화와 달라 이번 달에는 AI 호출이 거부됩니다' : ''}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="empty-text">이번 달 AI 사용 기록이 없습니다.</p>
+        )}
         <p className="notice" role="note">
           live 준비 안 됨: {live.missing.join(', ')}
         </p>

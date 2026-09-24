@@ -72,7 +72,7 @@ const handle = await openDb(config).catch((e: unknown) => {
 try {
   const owner = await ensureOwner(handle.db, config.AUTH_ALLOWED_IDENTITY);
   const restoresDir = resolveFromRoot(config.RESTORE_LOCAL_DIR);
-  const { restoreId, preview } = await createRestorePreview(handle.db, owner.id, zip, { restoresDir, source: 'upload' });
+  const { restoreId, preview } = await createRestorePreview(handle.db, owner.id, zip, { restoresDir, source: 'upload', budgetCurrency: config.LLM_BUDGET_CURRENCY });
   if (action === 'preview') {
     console.log(JSON.stringify({ ok: true, action: 'restore.preview', restore_id: restoreId, preview }));
   } else {

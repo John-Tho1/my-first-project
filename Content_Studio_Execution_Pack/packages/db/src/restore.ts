@@ -320,7 +320,24 @@ export interface RestorePreview {
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
-export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBundle): Promise<RestorePreview> {
+/**
+ * FIX-T07(P1): 묶음의 비용 원장 통화가 현재 설정 통화와 다르면 미리보기 경고(복원은 허용 — 데이터이므로).
+ * 복원 뒤 그 달에 다른 통화 원장이 있으면 AI 예약이 budget_currency_mismatch 로 거부된다.
+ */
+export function ledgerCurrencyWarnings(bundle: ParsedBundle, budgetCurrency: string | undefined): BundleManifest['warnings'] {
+  if (!budgetCurrency) return [];
+  const others = [...new Set(bundle.tables.usage_ledger.map((l) => l.currency))].filter((c) => c !== budgetCurrency).sort();
+  return others.length
+    ? [
+        {
+          code: 'ledger_currency_mismatch',
+          message: `묶음의 AI 비용 원장 통화(${others.join(', ')})가 설정 통화(${budgetCurrency})와 다릅니다. 복원은 되지만, 같은 달에는 AI 호출이 통화 불일치로 거부됩니다.`,
+        },
+      ]
+    : [];
+}
+
+export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBundle, budgetCurrency?: string): Promise<RestorePreview> {
   const target = await ownerScopeCounts(db, ownerId);
   let report: ApplyReport | null = null;
   try {
@@ -359,7 +376,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
     can_commit_add_missing: true,
-    warnings: m.warnings,
+    warnings: [...m.warnings, ...ledgerCurrencyWarnings(bundle, budgetCurrency)],
   };
 }
 
@@ -374,6 +391,8 @@ export interface CreatePreviewOptions {
   restoresDir: string;
   source: 'upload' | 'export_run';
   now?: Date;
+  /** FIX-T07: 현재 설정 통화(LLM_BUDGET_CURRENCY) — 다른 통화 원장이 있으면 미리보기 경고 */
+  budgetCurrency?: string;
 }
 
 /**
@@ -387,7 +406,7 @@ export async function createRestorePreview(
   opts: CreatePreviewOptions,
 ): Promise<{ restoreId: string; preview: RestorePreview }> {
   const bundle = await parseBundleZip(zip);
-  const preview = await previewRestore(db, ownerId, bundle);
+  const preview = await previewRestore(db, ownerId, bundle, opts.budgetCurrency);
   const restoreId = randomUUID();
   await mkdir(opts.restoresDir, { recursive: true });
   const file = restoreZipPath(opts.restoresDir, restoreId);
@@ -429,7 +448,7 @@ export async function createRestorePreviewFromExport(
   db: Db,
   ownerId: string,
   exportId: string,
-  opts: { exportsDir: string; restoresDir: string; now?: Date },
+  opts: { exportsDir: string; restoresDir: string; now?: Date; budgetCurrency?: string },
 ): Promise<{ restoreId: string; preview: RestorePreview }> {
   const run = await getExportRun(db, ownerId, exportId.toLowerCase());
   if (!run || run.status !== 'completed') throw new NotFoundError('내보내기를 찾을 수 없습니다');
@@ -439,7 +458,12 @@ export async function createRestorePreviewFromExport(
   } catch {
     throw new NotFoundError('내보내기 파일이 서버에 없습니다');
   }
-  return createRestorePreview(db, ownerId, zip, { restoresDir: opts.restoresDir, source: 'export_run', now: opts.now });
+  return createRestorePreview(db, ownerId, zip, {
+    restoresDir: opts.restoresDir,
+    source: 'export_run',
+    now: opts.now,
+    budgetCurrency: opts.budgetCurrency,
+  });
 }
 
 export function restoreZipPath(restoresDir: string, restoreId: string): string {

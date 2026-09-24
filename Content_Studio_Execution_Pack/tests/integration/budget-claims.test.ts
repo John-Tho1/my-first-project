@@ -17,8 +17,10 @@ import {
   createTestDb,
   ensureOwner,
   exportOwner,
+  generationRunView,
   getBrandProfileByVersion,
   getDb,
+  getWritingState,
   listClaimsForRun,
   monthlyUsage,
   ownerScope,
@@ -38,6 +40,7 @@ import {
   costMicro,
   fromMicro,
   loadConfig,
+  pickDefaultSources,
   reserveFor,
   RESTORED_TABLES,
   toMicro,
@@ -47,7 +50,8 @@ import {
 import { LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
 import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/route';
-import { cookieHeader, jsonPost, login } from './helpers';
+import { assistResponse } from '../../apps/web/lib/writing';
+import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 const B = 'budget-other@example.local';
@@ -291,7 +295,7 @@ describe('비용 예약(A15)', () => {
     const { contentId } = await contentWithSource(owner, 'bud-c', 'https://example.com/bc');
     const base = budgetPolicy(loadConfig({ LLM_PRICE_INPUT_PER_1K: '1', LLM_PRICE_OUTPUT_PER_1K: '2' }));
     const r = await expectedReserve(owner, contentId, base);
-    const policy: BudgetPolicy = { ...base, monthlyLimitMicro: r.reserveMicro * 2 + Math.floor(r.reserveMicro / 2) };
+    const policy: BudgetPolicy = { ...base, monthlyLimitMicro: r.reserveMicro * 2n + r.reserveMicro / 2n };
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     let started = 0;
@@ -323,9 +327,10 @@ describe('비용 예약(A15)', () => {
     expect(ledger).toHaveLength(2);
     const runs = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.ownerId, owner));
     expect(runs).toHaveLength(2);
-    const u = await monthlyUsage(db, owner);
-    expect(u.usedMicro).toBeLessThanOrEqual(policy.monthlyLimitMicro!);
-    expect(u.pending).toBe(0);
+    const u = (await monthlyUsage(db, owner)).byCurrency;
+    expect(u.map((x) => x.currency)).toEqual(['USD']);
+    expect(u[0]!.usedMicro).toBeLessThanOrEqual(policy.monthlyLimitMicro!);
+    expect(u[0]!.pending).toBe(0);
   });
 });
 
@@ -417,9 +422,172 @@ describe('export → 빈 DB 복원: claims·claim_sources·usage_ledger 왕복',
       }
       const ledgerB = await h.db.select().from(schema.usageLedger).where(and(eq(schema.usageLedger.ownerId, target)));
       expect(ledgerB.length).toBe(exported.manifest.tables.usage_ledger!.rows);
-      expect((await monthlyUsage(h.db, target)).usedMicro).toBe((await monthlyUsage(db, ownerA)).usedMicro);
+      expect((await monthlyUsage(h.db, target)).byCurrency).toEqual((await monthlyUsage(db, ownerA)).byCurrency);
     } finally {
       await h.close();
     }
+  });
+});
+
+describe('FIX-T07(Codex review-T07)', () => {
+  const PRICED = budgetPolicy(loadConfig({ LLM_PRICE_INPUT_PER_1K: '1', LLM_PRICE_OUTPUT_PER_1K: '2' }));
+
+  async function freshOwner(identity: string) {
+    const owner = (await ensureOwner(db, identity)).id;
+    await db.insert(schema.brandProfiles).values({ ownerId: owner, version: 1, penName: 'p', audience: 'a', pillars: ['x'] });
+    return owner;
+  }
+
+  it('P1 예약 초과: provider 가 상한을 어기면 초과액을 그대로 기록(over_budget), 다음 예약은 거부, provider 는 maxOutputTokens 를 받는다', async () => {
+    const owner = await freshOwner('fix-t07-overage@example.local');
+    const { contentId } = await contentWithSource(owner, 'ov-1', 'https://example.com/ov1');
+    const r = await expectedReserve(owner, contentId, PRICED);
+    const policy: BudgetPolicy = { ...PRICED, monthlyLimitMicro: r.reserveMicro + r.reserveMicro / 2n };
+    const mock = new MockLlmProvider();
+    const seen: Array<number | undefined> = [];
+    const greedy: AssistLlm = {
+      name: 'mock',
+      mode: 'mock',
+      async generate(input) {
+        seen.push(input.maxOutputTokens);
+        return mock.generate(input);
+      },
+      // 상한의 10배를 썼다고 보고하는 provider(규칙 위반) — 숨기지 않고 기록해야 한다
+      usageOf: (i) => ({ tokensIn: r.tokensIn, tokensOut: (i.maxOutputTokens ?? 0) * 10 }),
+    };
+    const res = await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: policy }, greedy);
+    expect(seen).toEqual([r.tokensOutAllowance]);
+    const actual = costMicro(PRICED.pricing, r.tokensIn, r.tokensOutAllowance * 10);
+    expect(res.ledger).toMatchObject({ overBudget: true, reservedAmount: fromMicro(r.reserveMicro), actualAmount: fromMicro(actual) });
+    expect(res.ledger.overageAmount).toBe(fromMicro(actual - r.reserveMicro));
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, res.run.id));
+    expect((run!.outputJson as { over_budget?: boolean }).over_budget).toBe(true);
+    const u = (await monthlyUsage(db, owner)).byCurrency[0]!;
+    expect(u).toMatchObject({ currency: 'USD', overBudgetRuns: 1, overage: fromMicro(actual - r.reserveMicro), used: fromMicro(actual) });
+    // 월 합계가 상한을 넘었으므로 다음 예약은 거부(run 없음)
+    let code = '';
+    try {
+      await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: policy }, new MockLlmProvider());
+    } catch (e) {
+      code = (e as AppError).code;
+    }
+    expect(code).toBe('budget_exceeded');
+    expect((await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.ownerId, owner))).length).toBe(1);
+  });
+
+  it('P1 통화: 이번 달 원장에 다른 통화가 있으면 409 budget_currency_mismatch(아무것도 쓰지 않음), 사용량은 통화별, 복원 미리보기 경고', async () => {
+    const owner = await freshOwner('fix-t07-currency@example.local');
+    const { contentId } = await contentWithSource(owner, 'cur-1', 'https://example.com/cur1');
+    await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: { ...PRICED, currency: 'RUB', pricing: { ...PRICED.pricing!, currency: 'RUB' } } }, new MockLlmProvider());
+    const before = await counts(contentId);
+    let err: AppError | null = null;
+    try {
+      await runAssist(db, owner, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], budget: PRICED }, new MockLlmProvider());
+    } catch (e) {
+      err = e as AppError;
+    }
+    expect(err?.code).toBe('budget_currency_mismatch');
+    expect(err?.extra).toEqual({ configured: 'USD', found: ['RUB'] });
+    expect(await counts(contentId)).toEqual(before);
+    expect((await monthlyUsage(db, owner)).byCurrency.map((c) => c.currency)).toEqual(['RUB']);
+
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), owner, { outDir: path.join(tmp, 'exports-cur') });
+    const zip = new Uint8Array(readFileSync(exported.zipPath));
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'restore-cur@example.local')).id;
+      const p = await createRestorePreview(h.db, target, zip, { restoresDir: path.join(tmp, 'restores-cur'), source: 'upload', budgetCurrency: 'USD' });
+      expect(p.preview.warnings.map((w) => w.code)).toContain('ledger_currency_mismatch');
+      const same = await createRestorePreview(h.db, target, zip, { restoresDir: path.join(tmp, 'restores-cur'), source: 'upload', budgetCurrency: 'RUB' });
+      expect(same.preview.warnings.map((w) => w.code)).not.toContain('ledger_currency_mismatch');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('P1 버린 출처: 같은 가짜 URL 이 source_refs·warnings·proposed_text 에 있어도 저장·응답 어디에도 남지 않는다', async () => {
+    const FAKE = 'https://invented.example/fake-report-2026';
+    const { contentId, svId } = await contentWithSource(ownerA, 'fix-leak', 'https://example.com/leak');
+    const mock = new MockLlmProvider();
+    const leaky: AssistLlm = {
+      name: 'mock',
+      mode: 'mock',
+      async generate(input) {
+        const out = await mock.generate(input);
+        return {
+          ...out,
+          proposed_text: `${out.proposed_text} 출처: ${FAKE}`,
+          warnings: [...out.warnings, `확인 필요: ${FAKE}`],
+          followup_questions: [`${FAKE} 를 볼까요?`],
+          claims: [{ text: `보고서(${FAKE})에 따르면 시장이 컸다.`, kind: 'fact', source_refs: [FAKE, svId], needs_user_confirmation: false }],
+        } satisfies LlmStructuredOutput;
+      },
+    };
+    const r = await runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], sourceVersionIds: [svId] }, leaky);
+    const response = assistResponse(r, generationRunView(r.run));
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, r.run.id));
+    const [proposal] = await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, r.proposal.id));
+    const claimRows = await db.select().from(schema.claims).where(eq(schema.claims.runId, r.run.id));
+    for (const [label, v] of [
+      ['response', response],
+      ['output_json', run!.outputJson],
+      ['proposal', proposal!.body],
+      ['claims', claimRows],
+      ['result.output', r.output],
+    ] as const) {
+      expect(JSON.stringify(v), label).not.toContain('invented.example');
+    }
+    expect(proposal!.body).toContain('[출처 미확인 URL 제거]');
+    expect(response.claims[0]).toMatchObject({ source_refs: [svId], dropped_source_refs: 1, needs_check: true });
+  });
+
+  it('P1 user_confirmed 는 저장되지 않는다(DB CHECK) — 파생만', async () => {
+    const [anyClaim] = await db.select().from(schema.claims).limit(1);
+    const { id: _id, ...rest } = anyClaim!;
+    void _id;
+    let msg = '';
+    try {
+      await db.insert(schema.claims).values({ ...rest, claimIndex: 999, evidenceGrade: 'user_confirmed' });
+    } catch (e) {
+      const err = e as { message?: string; cause?: { message?: string } };
+      msg = `${err.message ?? ''} ${err.cause?.message ?? ''}`;
+    }
+    expect(msg).toMatch(/claims_evidence_grade_chk/);
+    // 같은 행을 'none' 으로는 넣을 수 있다(CHECK 만이 거부 이유)
+    await db.insert(schema.claims).values({ ...rest, claimIndex: 999, evidenceGrade: 'none' });
+  });
+
+  it('P1 허용 출처 51개 이상: 기본 선택은 출처마다 최신 버전(≤50), 그 선택으로 요청 성공(폼 체크박스 포함)', async () => {
+    const { contentId, svId } = await contentWithSource(ownerA, 'many-sv', 'https://example.com/many');
+    const [first] = await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.id, svId));
+    for (let i = 0; i < 50; i++) {
+      await db.insert(schema.sourceVersions).values({ sourceId: first!.sourceId, excerpt: `v${i}`, extractionState: 'fetched', fetchedAt: new Date(Date.UTC(2026, 8, 1, 0, i)) });
+    }
+    const w = await getWritingState(db, ownerA, contentId);
+    expect(w.allowedSources.length).toBe(51);
+    const pick = pickDefaultSources(w.allowedSources);
+    expect(pick.selected.length).toBeLessThanOrEqual(50);
+    expect(pick.selected).toHaveLength(1);
+    expect(pick.excluded).toBe(50);
+    // 전부 보내면 400(서버 상한 50 그대로), 기본 선택은 201
+    expect((await assist(contentId, { mode: 'draft', base_version: 1, brand_profile_version: 1, source_version_ids: w.allowedSources.map((s) => s.id) })).status).toBe(400);
+    expect((await assist(contentId, { mode: 'draft', base_version: 1, brand_profile_version: 1, source_version_ids: pick.selected.map((s) => s.id) })).status).toBe(201);
+    const form = await assistPOST(
+      new Request(`${BASE}/api/contents/${contentId}/assist`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(tokenA) },
+        body: new URLSearchParams({ mode: 'outline', base_version: '1', brand_profile_version: '1', answer_ids: '', [`sv_${pick.selected[0]!.id}`]: 'on' }).toString(),
+      }),
+      ctx(contentId),
+    );
+    expect(form.status).toBe(303);
+    expect(form.headers.get('location')).toMatch(/\?run=/);
+    const [lastRun] = await db
+      .select()
+      .from(schema.generationRuns)
+      .where(eq(schema.generationRuns.contentId, contentId))
+      .orderBy(sql`${schema.generationRuns.createdAt} desc`)
+      .limit(1);
+    expect((lastRun!.inputVersionRefs as { source_version_ids: string[] }).source_version_ids).toEqual([pick.selected[0]!.id]);
   });
 });

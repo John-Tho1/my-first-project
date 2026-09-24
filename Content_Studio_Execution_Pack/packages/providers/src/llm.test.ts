@@ -65,3 +65,13 @@ describe('LiveLlmProvider(T07 경계, HTTP 없음)', () => {
     expect(m.usageOf(input, out)).toEqual({ tokensIn: 10, tokensOut: Math.ceil(out.proposed_text.length / 3) });
   });
 });
+
+describe('FIX-T07: maxOutputTokens', () => {
+  it('모의 provider 는 제안을 출력 상한(글자/3) 안으로 자른다', async () => {
+    const m = new MockLlmProvider();
+    const input = { task: 'draft' as const, inputVersion: 'v', text: '아주 긴 문장입니다 '.repeat(50), maxOutputTokens: 5 };
+    const out = await m.generate(input);
+    expect(out.proposed_text.length).toBeLessThanOrEqual(15);
+    expect(m.usageOf(input, out).tokensOut).toBeLessThanOrEqual(5);
+  });
+});

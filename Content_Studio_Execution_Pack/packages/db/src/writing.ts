@@ -31,9 +31,10 @@ import {
   NotFoundError,
   promptVersionFor,
   estimateTokens,
-  filterClaimSources,
+  sanitizeLlmOutput,
   type BudgetPolicy,
-  type FilteredClaim,
+  type SanitizedClaim,
+  type SanitizedOutput,
   type Reservation,
   AppError,
   StaleBaseError,
@@ -313,6 +314,8 @@ export interface AssistLlmInput {
   prompt?: string;
   /** T07: 허용된 source_version id. claim.source_refs 는 이 안에서만 채택된다(밖은 저장 전에 버림). */
   allowedSourceRefs?: string[];
+  /** FIX-T07: 출력 토큰 상한 = 예약의 출력 여유분(최대 비용 예약의 근거). */
+  maxOutputTokens?: number;
 }
 
 /** 가격 없는 모의 정책(예약 0, 한도 검사 없음) — 호출자가 정책을 넘기지 않을 때. */
@@ -333,9 +336,10 @@ export interface AssistResult {
   run: GenerationRunRow;
   proposal: ContentVersionRow;
   current: ContentVersionRow;
-  output: LlmStructuredOutput;
-  /** T07: 허용 목록으로 거른 claim(저장된 claims 와 같은 내용) */
-  claims: FilteredClaim[];
+  /** FIX-T07: 정제한 출력(버린 출처 원문 없음) */
+  output: SanitizedOutput;
+  /** T07: 정제한 claim(저장된 claims·output_json 과 같은 내용) */
+  claims: SanitizedClaim[];
   ledger: UsageLedgerRow;
 }
 
@@ -480,6 +484,7 @@ export async function runAssist(
     text: prep.material,
     prompt: prep.prompt,
     allowedSourceRefs: prep.sourceIds,
+    maxOutputTokens: prep.reservation.tokensOutAllowance,
   };
   let output: LlmStructuredOutput;
   try {
@@ -510,6 +515,8 @@ export async function runAssist(
   }
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));
+  // FIX-T07(P1): 정제한 출력 하나를 제안 본문·output_json·claims 행·응답에 똑같이 쓴다(버린 출처 원문이 어디에도 남지 않게).
+  const { output: clean, droppedTotal } = sanitizeLlmOutput(output, prep.sourceIds);
   return db.transaction(async (tx) => {
     const { content, current } = await lockContentForWrite(tx, ownerId, contentId);
     const inserted = await tx
@@ -517,7 +524,7 @@ export async function runAssist(
       .values({
         contentId: content.id,
         version: await nextVersionNumber(tx, content.id),
-        body: output.proposed_text,
+        body: clean.proposed_text,
         createdBy: `ai:${llm.mode}`,
         aiRunId: runId,
         note: `AI 제안(${llm.mode === 'mock' ? '모의' : llm.name}) · ${input.mode}`,
@@ -525,15 +532,15 @@ export async function runAssist(
       })
       .returning();
     const proposal = inserted[0]!;
-    // T07: 허용 목록 밖 출처(모델이 만든 URL 등)는 저장하지 않는다 — 개수만 남기고 경고, claim 은 needs_check.
-    const filtered = filterClaimSources(output.claims, prep.sourceIds);
-    const droppedTotal = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
-    const warnings = droppedTotal > 0 ? [...output.warnings, `출처 미확인: 허용 목록에 없는 출처 ${droppedTotal}건을 버렸습니다`] : output.warnings;
+    await insertClaims(tx, ownerId, runId, proposal.id, clean.claims, prep.locators, finished);
+    // T07: 실제 사용량으로 확정(모의는 결정적 추정). 예약을 넘으면 초과액을 기록한다(FIX-T07).
+    const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
+    const settled = await settleLedgerSucceeded(tx, ownerId, prep.ledger, prep.policy.pricing, usage, finished);
     const outputJson = {
-      result_type: output.result_type,
-      input_version: output.input_version,
-      proposed_tags: output.proposed_tags,
-      claims: filtered.map((c) => ({
+      result_type: clean.result_type,
+      input_version: clean.input_version,
+      proposed_tags: clean.proposed_tags,
+      claims: clean.claims.map((c) => ({
         text: c.text,
         kind: c.kind,
         source_refs: c.source_refs,
@@ -541,13 +548,10 @@ export async function runAssist(
         dropped_source_refs: c.dropped_source_refs,
         needs_check: c.needs_check,
       })),
-      followup_questions: output.followup_questions,
-      warnings,
+      followup_questions: clean.followup_questions,
+      warnings: clean.warnings,
+      ...(settled.overBudget ? { over_budget: true } : {}),
     };
-    await insertClaims(tx, ownerId, runId, proposal.id, filtered, prep.locators, finished);
-    // T07: 실제 사용량으로 확정(모의는 결정적 추정).
-    const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
-    const settled = await settleLedgerSucceeded(tx, ownerId, prep.ledger, prep.policy.pricing, usage, finished);
     const updated = await tx
       .update(generationRuns)
       .set({ status: 'succeeded', outputRef: proposal.id, outputJson, finishedAt: finished })
@@ -565,14 +569,15 @@ export async function runAssist(
         status: 'succeeded',
         provider: llm.name,
         proposal_version: proposal.version,
-        claims: output.claims.length,
-        experience_claims: output.claims.filter((c) => c.kind === 'experience').length,
+        claims: clean.claims.length,
+        experience_claims: clean.claims.filter((c) => c.kind === 'experience').length,
         dropped_source_refs: droppedTotal,
         actual_amount: settled.actualAmount,
+        over_budget: settled.overBudget,
       },
       at: finished,
     });
-    return { run: updated[0], proposal, current, output: { ...output, warnings }, claims: filtered, ledger: settled };
+    return { run: updated[0], proposal, current, output: clean, claims: clean.claims, ledger: settled };
   });
 }
 

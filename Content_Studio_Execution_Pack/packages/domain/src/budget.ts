@@ -1,7 +1,8 @@
 /**
  * T07 AI 비용 예약(A15, 결정 D13) — 순수 함수. DB·네트워크 없음.
  *
- * - 금액은 부동소수 오차를 피하려고 micro 단위(1e-6 통화) 정수로 계산한다. DB 에는 numeric(18,6) 문자열로 저장한다.
+ * - 금액은 micro 단위(1e-6 통화) **bigint** 로 계산한다(FIX-T07 P2 — numeric(18,6) 전체 범위를 정확히). DB 에는 numeric(18,6) 문자열.
+ *   numeric(18,6) 을 넘는 값(정수부 13자리 이상·소수 7자리 이상)은 AmountRangeError.
  * - 토큰 추정: 프롬프트 글자 수 / 3(올림). 한국어·영어가 섞인 글에서 보수적으로(많게) 잡는 경험칙이다 — 실제 토크나이저가 아니다.
  * - 출력 여유분: max(256, 입력 추정의 절반) 토큰.
  * - 예약액 = 입력 추정 × 입력 단가 + 출력 여유분 × 출력 단가(각각 1K 토큰당, 올림).
@@ -13,20 +14,33 @@ import { AppError } from './errors';
 
 export const TOKEN_CHARS = 3;
 export const MIN_OUTPUT_ALLOWANCE_TOKENS = 256;
-const MICRO = 1_000_000;
+const MICRO = 1_000_000n;
+/** numeric(18,6) 의 최대값(micro): 999999999999.999999 */
+export const MAX_AMOUNT_MICRO = 999_999_999_999_999_999n;
+const AMOUNT_RE = /^(\d{1,12})(?:\.(\d{1,6}))?$/;
 
-/** "12.345678" → 12345678(micro). 형식은 config 스키마가 이미 검사했다. */
-export function toMicro(decimal: string): number {
-  const [int, frac = ''] = decimal.split('.');
-  return Number(int) * MICRO + Number((frac + '000000').slice(0, 6));
+export class AmountRangeError extends AppError {
+  constructor() {
+    super('bad_request', 'amount_out_of_range', '금액이 numeric(18,6) 범위를 벗어났거나 형식이 올바르지 않습니다');
+  }
 }
 
-/** 12345678 → "12.345678" */
-export function fromMicro(micro: number): string {
-  const sign = micro < 0 ? '-' : '';
-  const abs = Math.abs(Math.round(micro));
-  return `${sign}${Math.floor(abs / MICRO)}.${String(abs % MICRO).padStart(6, '0')}`;
+/** "12.345678" → 12345678n(micro). numeric(18,6) 범위·형식이 아니면 AmountRangeError. */
+export function toMicro(decimal: string): bigint {
+  const m = AMOUNT_RE.exec(decimal);
+  if (!m) throw new AmountRangeError();
+  return BigInt(m[1]!) * MICRO + BigInt((m[2] ?? '').padEnd(6, '0'));
 }
+
+/** 12345678n → "12.345678"(음수는 '-' 부호). */
+export function fromMicro(micro: bigint): string {
+  const sign = micro < 0n ? '-' : '';
+  const abs = micro < 0n ? -micro : micro;
+  return `${sign}${abs / MICRO}.${String(abs % MICRO).padStart(6, '0')}`;
+}
+
+/** 저장 가능한 금액인가(0 ≤ x ≤ numeric(18,6) 최대). */
+export const isStorableMicro = (micro: bigint) => micro >= 0n && micro <= MAX_AMOUNT_MICRO;
 
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / TOKEN_CHARS);
@@ -38,8 +52,8 @@ export function outputAllowanceTokens(inputTokens: number): number {
 
 export interface Pricing {
   currency: string;
-  inputPer1kMicro: number;
-  outputPer1kMicro: number;
+  inputPer1kMicro: bigint;
+  outputPer1kMicro: bigint;
 }
 
 export interface BudgetPolicy {
@@ -47,8 +61,8 @@ export interface BudgetPolicy {
   currency: string;
   /** 가격이 없으면 null(mock: 0 원 기록, live: 차단) */
   pricing: Pricing | null;
-  monthlyLimitMicro: number | null;
-  perRunMaxMicro: number | null;
+  monthlyLimitMicro: bigint | null;
+  perRunMaxMicro: bigint | null;
 }
 
 export function budgetPolicy(config: AppConfig): BudgetPolicy {
@@ -69,15 +83,20 @@ export function budgetPolicy(config: AppConfig): BudgetPolicy {
   };
 }
 
-export function costMicro(pricing: Pricing | null, tokensIn: number, tokensOut: number): number {
-  if (!pricing) return 0;
-  return Math.ceil((tokensIn * pricing.inputPer1kMicro) / 1000) + Math.ceil((tokensOut * pricing.outputPer1kMicro) / 1000);
+/** ⌈a / b⌉ (a, b ≥ 0, bigint) */
+const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
+
+/** 토큰 × 1K 단가(micro) — bigint 로 곱하고 1000 으로 올림 나눗셈(중간값 정밀도 손실 없음). */
+export function costMicro(pricing: Pricing | null, tokensIn: number, tokensOut: number): bigint {
+  if (!pricing) return 0n;
+  return ceilDiv(BigInt(tokensIn) * pricing.inputPer1kMicro, 1000n) + ceilDiv(BigInt(tokensOut) * pricing.outputPer1kMicro, 1000n);
 }
 
 export interface Reservation {
   tokensIn: number;
+  /** 출력 상한(토큰). provider 에 maxOutputTokens 로 넘겨 이보다 많이 쓰지 못하게 한다(FIX-T07 P1). */
   tokensOutAllowance: number;
-  reserveMicro: number;
+  reserveMicro: bigint;
   /** 원장에 남기는 가격 스냅숏(값만 — 키·비밀 없음) */
   pricingSnapshot: Record<string, unknown>;
 }
@@ -105,7 +124,7 @@ export type BudgetDecision = { ok: true } | { ok: false; reason: 'per_run_max' |
  * 예약 가능 여부. 가격이 없으면(mock 전용 — live 는 그 전에 차단) 한도를 검사하지 않는다.
  * usedMicro = 이번 달 원장 합계(예약 중 + 확정). 경계값(합계 = 상한)은 허용한다.
  */
-export function checkBudget(policy: BudgetPolicy, usedMicro: number, reserveMicro: number): BudgetDecision {
+export function checkBudget(policy: BudgetPolicy, usedMicro: bigint, reserveMicro: bigint): BudgetDecision {
   if (!policy.pricing) return { ok: true };
   if (policy.perRunMaxMicro !== null && reserveMicro > policy.perRunMaxMicro) return { ok: false, reason: 'per_run_max' };
   if (policy.monthlyLimitMicro !== null && usedMicro + reserveMicro > policy.monthlyLimitMicro) return { ok: false, reason: 'monthly_limit' };
@@ -116,6 +135,18 @@ export function checkBudget(policy: BudgetPolicy, usedMicro: number, reserveMicr
 export function mskMonthStart(now: Date): Date {
   const msk = new Date(now.getTime() + 3 * 3600_000);
   return new Date(Date.UTC(msk.getUTCFullYear(), msk.getUTCMonth(), 1) - 3 * 3600_000);
+}
+
+/** 이번 달 원장에 설정과 다른 통화가 있으면 예약을 거부한다(통화를 섞어 합산·비교하지 않는다, FIX-T07 P1). */
+export class BudgetCurrencyMismatchError extends AppError {
+  constructor(extra: { configured: string; found: string[] }) {
+    super(
+      'conflict',
+      'budget_currency_mismatch',
+      `이번 달 비용 원장에 설정 통화(${extra.configured})와 다른 통화(${extra.found.join(', ')})가 있어 AI 를 호출하지 않았습니다. 통화 설정을 확인하세요.`,
+      extra,
+    );
+  }
 }
 
 export class BudgetExceededError extends AppError {

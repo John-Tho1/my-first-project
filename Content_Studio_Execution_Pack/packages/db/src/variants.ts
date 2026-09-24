@@ -19,7 +19,7 @@ import {
   channelDraft,
   CHANNEL_LABEL,
   estimateTokens,
-  filterClaimSources,
+  sanitizeLlmOutput,
   isUuid,
   isVariantStale,
   LlmFailedError,
@@ -37,7 +37,8 @@ import {
   VariantVersionConflictError,
   type BudgetPolicy,
   type Channel,
-  type FilteredClaim,
+  type SanitizedClaim,
+  type SanitizedOutput,
   type LlmStructuredOutput,
   type MediaCompleteness,
   type VariantRole,
@@ -260,8 +261,8 @@ export interface VariantAssistResult {
   variant: VariantRow;
   run: GenerationRunRow;
   proposal: VariantVersionRow;
-  output: LlmStructuredOutput;
-  claims: FilteredClaim[];
+  output: SanitizedOutput;
+  claims: SanitizedClaim[];
   ledger: UsageLedgerRow;
 }
 
@@ -327,10 +328,17 @@ export async function runVariantAssist(
       .returning();
     const run = runs[0]!;
     const ledger = await insertReservedLedger(tx, ownerId, run.id, policy, reservation, now);
-    return { content, current, variant, run, ledger, inputVersion, prompt };
+    return { content, current, variant, run, ledger, inputVersion, prompt, reservation };
   });
 
-  const llmInput: AssistLlmInput = { task: 'draft', inputVersion: prep.inputVersion, text: prep.current.body, prompt: prep.prompt, allowedSourceRefs: [] };
+  const llmInput: AssistLlmInput = {
+    task: 'draft',
+    inputVersion: prep.inputVersion,
+    text: prep.current.body,
+    prompt: prep.prompt,
+    allowedSourceRefs: [],
+    maxOutputTokens: prep.reservation.tokensOutAllowance,
+  };
   let output: LlmStructuredOutput;
   try {
     output = llmStructuredOutputSchema.parse(await llm.generate(llmInput));
@@ -359,9 +367,11 @@ export async function runVariantAssist(
   }
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));
+  // FIX-T07(P1): 정제한 출력 하나를 제안·output_json·claims·응답에 쓴다(채널 초안에는 허용 출처가 없으므로 모든 참조가 버려진다).
+  const { output: clean, droppedTotal } = sanitizeLlmOutput(output, []);
   return db.transaction(async (tx) => {
     const { variant } = await lockVariant(tx, ownerId, prep.variant.id);
-    const d = channelDraft(input.channel, prep.content.title, output.proposed_text);
+    const d = channelDraft(input.channel, prep.content.title, clean.proposed_text);
     const inserted = await tx
       .insert(variantVersions)
       .values({
@@ -377,10 +387,7 @@ export async function runVariantAssist(
       })
       .returning();
     const proposal = inserted[0]!;
-    const filtered = filterClaimSources(output.claims, []);
-    const dropped = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
-    const warnings = dropped > 0 ? [...output.warnings, `출처 미확인: 허용 목록에 없는 출처 ${dropped}건을 버렸습니다`] : output.warnings;
-    await insertClaims(tx, ownerId, prep.run.id, prep.current.id, filtered, new Map(), finished, proposal.id);
+    await insertClaims(tx, ownerId, prep.run.id, prep.current.id, clean.claims, new Map(), finished, proposal.id);
     const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
     const ledger = await settleLedgerSucceeded(tx, ownerId, prep.ledger, policy.pricing, usage, finished);
     const updated = await tx
@@ -388,10 +395,10 @@ export async function runVariantAssist(
       .set({
         status: 'succeeded',
         outputJson: {
-          result_type: output.result_type,
-          input_version: output.input_version,
-          proposed_tags: output.proposed_tags,
-          claims: filtered.map((c) => ({
+          result_type: clean.result_type,
+          input_version: clean.input_version,
+          proposed_tags: clean.proposed_tags,
+          claims: clean.claims.map((c) => ({
             text: c.text,
             kind: c.kind,
             source_refs: c.source_refs,
@@ -399,9 +406,10 @@ export async function runVariantAssist(
             dropped_source_refs: c.dropped_source_refs,
             needs_check: c.needs_check,
           })),
-          followup_questions: output.followup_questions,
-          warnings,
+          followup_questions: clean.followup_questions,
+          warnings: clean.warnings,
           variant_version_id: proposal.id,
+          ...(ledger.overBudget ? { over_budget: true } : {}),
         },
         finishedAt: finished,
       })
@@ -414,10 +422,18 @@ export async function runVariantAssist(
       entity: 'variant',
       entityId: variant.id,
       versionOrHash: prep.run.id,
-      details: { channel: input.channel, status: 'succeeded', provider: llm.name, proposal_version: proposal.version, claims: filtered.length },
+      details: {
+        channel: input.channel,
+        status: 'succeeded',
+        provider: llm.name,
+        proposal_version: proposal.version,
+        claims: clean.claims.length,
+        dropped_source_refs: droppedTotal,
+        over_budget: ledger.overBudget,
+      },
       at: finished,
     });
-    return { variant, run: updated[0], proposal, output: { ...output, warnings }, claims: filtered, ledger };
+    return { variant, run: updated[0], proposal, output: clean, claims: clean.claims, ledger };
   });
 }
 

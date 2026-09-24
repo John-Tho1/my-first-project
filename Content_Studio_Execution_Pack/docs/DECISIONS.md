@@ -119,6 +119,7 @@
 - Exact authorized scope (if applicable): 외부 호출 0, 과금 0, 비밀 0. `LiveLlmProvider` 에는 HTTP 코드가 없다(`// T07: 실제 호출은 별도 승인 후 구현(D8)`).
 - Consequences: 모의에서도 가격을 설정하면 한도 때문에 제안이 거부될 수 있다. 프로세스가 provider 호출 중 죽으면 원장은 reserved 로 남아 이번 달 합계에 예약액으로 계속 잡힌다(정리 경로 없음, released 는 아직 쓰지 않음). 실제 비용이 예약보다 클 수 있다(추정 초과) — 상한은 예약 시점에만 검사한다.
 - When to revisit: D8(공급자·모델) 결정과 live 어댑터 구현 승인 시.
+- FIX round 1(Codex review-T07, 2026-09-25): (P1) 예약액은 "최대 가능 비용"(입력 추정 + 출력 상한)이며 출력 상한을 provider 계약 `maxOutputTokens` 로 넘긴다(모의는 지키고, live 골격은 값을 그대로 전달해야 함). 그래도 실제액이 예약을 넘으면 `usage_ledger.overage_amount`·`over_budget=true`(migration 0010)로 **숨기거나 자르지 않고** 기록하고, run output_json·감사에도 표시한다. 그 결과 월 합계가 상한을 넘으면 다음 예약이 거부된다. 확정(성공·실패)도 예약과 같은 owner 행 잠금 아래에서 한다. (P1) 통화: 합계·검사는 통화별이고, 이번 달 원장에 설정과 다른 통화가 있으면 예약을 409 `budget_currency_mismatch` 로 거부한다(가격 설정 여부와 무관 — 명시적 단일 통화). 설정 화면은 통화별 사용액·초과액을 보여 주고, 다른 통화 원장이 든 묶음 복원은 허용하되 미리보기 경고(`ledger_currency_mismatch`). (P1) 모델 출력은 `sanitizeLlmOutput` 한 번으로 정제해(허용 목록 밖 참조 제거, 그 문자열(4자 이상)이 제안 본문·경고·질문·태그·claim 문장에 다시 나오면 `[출처 미확인 URL 제거]`) 제안 버전·output_json·claims 행·HTTP 응답에 같은 객체를 쓴다(원고 assist·채널 AI 초안 모두). (P1) `claims.evidence_grade` 는 'none'|'source' 만 저장·복원(DB CHECK, 0010 에서 기존 'user_confirmed' 는 'none' 으로), 'user_confirmed' 는 claim_confirmations 에서만 파생. (P1) 작성실은 허용 출처를 체크박스로 고르게 하고, 기본은 출처마다 최신 버전(최대 50, 빠진 버전 수 표시) — 서버 상한 50 은 그대로. (P2) 금액은 bigint micro 로 계산하고 numeric(18,6) 범위·형식 밖 값은 거부.
 
 ## D14 — T09 채널 초안: stale 은 파생 값, 채널 모양은 결정적 변환(잠정 한도), 배포 파일은 승인·게시가 아님, 게시 어댑터 없음
 - Decision ID / date: D14 / 2026-09-25 (Europe/Moscow)

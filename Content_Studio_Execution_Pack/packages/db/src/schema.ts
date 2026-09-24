@@ -554,7 +554,8 @@ export const claims = pgTable(
     unique('claims_id_owner_uq').on(t.id, t.ownerId),
     // T09: 한 원고 버전에서 여러 run(원고 제안·채널 초안)이 나올 수 있어 run 기준으로 바꿨다.
     unique('claims_run_index_uq').on(t.runId, t.claimIndex),
-    check('claims_evidence_grade_chk', sql`${t.evidenceGrade} in ('none', 'source', 'user_confirmed')`),
+    // FIX-T07(P1): 'user_confirmed' 는 저장하지 않는다 — claim_confirmations(confirmed)에서만 파생(0010 에서 기존 값은 'none' 으로).
+    check('claims_evidence_grade_chk', sql`${t.evidenceGrade} in ('none', 'source')`),
     check('claims_kind_chk', sql`${t.kind} in ('fact', 'opinion', 'experience')`),
     foreignKey({
       name: 'claims_run_same_owner_fk',
@@ -610,6 +611,10 @@ export const usageLedger = pgTable(
     pricingSnapshot: jsonb('pricing_snapshot').$type<Record<string, unknown>>().notNull(),
     state: text('state').notNull(),
     failed: boolean('failed').notNull().default(false),
+    /** FIX-T07(P1, 0010): 실제액이 예약액을 넘은 만큼(숨기거나 자르지 않는다). 넘지 않았으면 0. */
+    overageAmount: numeric('overage_amount', { precision: 18, scale: 6 }).notNull().default('0'),
+    /** 실제액 > 예약액 이었으면 true */
+    overBudget: boolean('over_budget').notNull().default(false),
     createdAt: ts('created_at').notNull().defaultNow(),
     settledAt: ts('settled_at'),
   },

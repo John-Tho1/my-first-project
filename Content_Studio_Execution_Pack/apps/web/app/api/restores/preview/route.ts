@@ -42,6 +42,7 @@ export async function POST(request: Request): Promise<Response> {
       out = await createRestorePreviewFromExport(owner.db, owner.ownerId, exportId, {
         exportsDir: exportsDir(config),
         restoresDir: restoresDir(config),
+        budgetCurrency: config.LLM_BUDGET_CURRENCY,
       });
     } else if (type.startsWith('multipart/form-data') || type.startsWith('application/zip') || type.startsWith('application/octet-stream')) {
       const multipart = type.startsWith('multipart/form-data');
@@ -61,7 +62,11 @@ export async function POST(request: Request): Promise<Response> {
       } else {
         zip = new Uint8Array(await readFile(/*turbopackIgnore: true*/ tmp));
       }
-      out = await createRestorePreview(owner.db, owner.ownerId, zip, { restoresDir: restoresDir(config), source: 'upload' });
+      out = await createRestorePreview(owner.db, owner.ownerId, zip, {
+        restoresDir: restoresDir(config),
+        source: 'upload',
+        budgetCurrency: config.LLM_BUDGET_CURRENCY,
+      });
     } else {
       throw new BadRequestError('multipart/form-data(file), application/zip 또는 application/json(export_id)으로 보내야 합니다');
     }

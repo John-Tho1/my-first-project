@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   estimateTokens,
   liveLlmReadiness,
+  TOKEN_CHARS,
   LiveProviderNotConfiguredError,
   llmStructuredOutputSchema,
   type AppConfig,
@@ -15,6 +16,11 @@ export interface LlmGenerateInput {
   text: string;
   /** 허용된 source_version ID 목록. claim.source_refs 는 이 안에서만 채운다. */
   allowedSourceRefs?: string[];
+  /**
+   * FIX-T07: 출력 토큰 상한(예약한 최대 비용의 근거). provider 는 이보다 많이 생성하면 안 된다.
+   * 모의는 제안 글자 수를 상한×3 으로 자른다. live 어댑터(D8 이후)는 이 값을 공급자 요청의 최대 출력 토큰으로 보내야 한다.
+   */
+  maxOutputTokens?: number;
   /**
    * T06: provider 가 받는 정확한 프롬프트(@cs/domain buildAssistPrompt). live provider(T07)는 이것을 보낸다.
    * 모의 provider 는 결정성을 위해 text 만으로 제안을 만든다(프롬프트는 결과에 영향 없음).
@@ -97,10 +103,13 @@ export class MockLlmProvider implements LlmProvider {
       '직접 겪은 사례가 있다면 공개 가능한 범위에서 알려 주세요.',
       '이 주장을 뒷받침할 공개 자료가 있나요?',
     ];
+    const full = `[모의 제안 #${seed.toString(16).slice(0, 6)}] ${sentences[0] ?? ''}`.trim();
+    // 출력 상한을 지킨다(글자/3 추정 기준).
+    const proposed = input.maxOutputTokens !== undefined ? full.slice(0, Math.max(0, input.maxOutputTokens) * TOKEN_CHARS) : full;
     const output: LlmStructuredOutput = {
       result_type: input.task,
       input_version: input.inputVersion,
-      proposed_text: `[모의 제안 #${seed.toString(16).slice(0, 6)}] ${sentences[0] ?? ''}`.trim(),
+      proposed_text: proposed,
       proposed_tags: tags,
       claims,
       followup_questions: questions.slice(0, 1 + (seed % 3)),

@@ -13,6 +13,7 @@ import {
   isClaimResolved,
   linesToList,
   PROMPT_VERSION,
+  sanitizeLlmOutput,
   unconfirmedExperienceClaims,
   type AssistPromptInput,
 } from './writing';
@@ -354,5 +355,77 @@ describe('FIX-T06 round 2: 본문 포함 검사와 제외 해결', () => {
     const removed = [{ runId: 'r', claimIndex: 0, resolution: 'removed' }];
     expect(unconfirmedExperienceClaims(runs, removed, '뺀 본문')).toEqual([]);
     expect(unconfirmedExperienceClaims(runs, removed, claim)).toEqual([{ run_id: 'r', claim_index: 0, text: claim }]);
+  });
+});
+
+describe('FIX-T07: 출력 정제·user_confirmed 복원 거부', () => {
+  const FAKE = 'https://fake.example/report-2026';
+  it('버린 출처 원문이 제안 본문·경고·질문·태그·claim 문장 어디에도 남지 않는다', () => {
+    const { output, droppedTotal } = sanitizeLlmOutput(
+      {
+        result_type: 'draft',
+        input_version: 'v',
+        proposed_text: `근거는 ${FAKE} 입니다. HTTPS://FAKE.EXAMPLE/REPORT-2026 도.`,
+        proposed_tags: [FAKE],
+        claims: [{ text: `시장 규모(${FAKE})`, kind: 'fact', source_refs: [FAKE, 'ok-id-1'], needs_user_confirmation: false }],
+        followup_questions: [`${FAKE} 를 확인할까요?`],
+        warnings: [`참고: ${FAKE}`],
+      },
+      ['ok-id-1'],
+    );
+    expect(droppedTotal).toBe(1);
+    const all = JSON.stringify(output);
+    expect(all).not.toMatch(/fake\.example/i);
+    expect(output.proposed_text).toContain('[출처 미확인 URL 제거]');
+    expect(output.claims[0]).toMatchObject({ source_refs: ['ok-id-1'], dropped_source_refs: 1, needs_check: true, evidence_grade: 'source' });
+    expect(output.warnings.at(-1)).toBe('출처 미확인: 허용 목록에 없는 출처 1건을 버렸습니다');
+  });
+
+  it('묶음의 claims.evidence_grade=user_confirmed 는 거부(확인은 claim_confirmations 에서만 파생)', () => {
+    const OWNER = '11111111-1111-4111-8111-111111111111';
+    const CT = '33333333-3333-4333-8333-333333333333';
+    const CV = '44444444-4444-4444-8444-444444444444';
+    const BP = '22222222-2222-4222-8222-222222222222';
+    const RN = '55555555-5555-4555-8555-555555555555';
+    const CL = '66666666-6666-4666-8666-666666666666';
+    const TS = '2026-09-01T06:10:00.123456Z';
+    const tables = {
+      users: [{ id: OWNER, identity_masked: 'ow***@example.local' }],
+      brand_profiles: [{ id: BP, version: 1, pen_name: 'p', audience: 'a', pillars: ['x'], style_rules: [], created_at: TS }],
+      sources: [],
+      source_versions: [],
+      captures: [],
+      capture_revisions: [],
+      ideas: [],
+      idea_captures: [],
+      contents: [{ id: CT, idea_id: null, series: null, title: 't', audience: null, tags: [], revision: 1, current_version_id: CV, lifecycle: 'draft', created_at: TS, updated_at: TS }],
+      content_versions: [{ id: CV, content_id: CT, version: 1, body: 'b', created_by: 'owner', ai_run_id: null, created_at: TS, note: null }],
+      content_captures: [],
+      variants: [],
+      variant_versions: [],
+      interview_answers: [],
+      generation_runs: [
+        { id: RN, content_id: CT, mode: 'draft', input_version_id: CV, brand_profile_id: BP, input_version_refs: {}, prompt_version: 'v', provider: 'mock', model: 'mock', status: 'succeeded', output_ref: CV, output_json: { claims: [] }, error: null, created_at: TS, finished_at: TS, variant_id: null },
+      ],
+      claim_confirmations: [],
+      claims: [
+        { id: CL, content_version_id: CV, run_id: RN, claim_index: 0, statement: 's', kind: 'experience', evidence_grade: 'user_confirmed', personal_experience_confirmed: true, needs_check: false, created_at: TS, variant_version_id: null },
+      ],
+      claim_sources: [],
+      usage_ledger: [],
+      assets: [],
+      variant_assets: [],
+      audit_events: [],
+    } as unknown as BundleTables;
+    const b = buildBundle({
+      exportId: '77777777-7777-4777-8777-777777777777',
+      exportedAt: '2026-09-24T12:00:00.000Z',
+      appVersion: '0.1.0',
+      migrations: ['0000_a'],
+      owner: { id: OWNER, identityMasked: 'ow***@example.local' },
+      tables,
+      assetBytes: new Map(),
+    });
+    expect(() => parseBundle(b.entries, { migrations: ['0000_a'] })).toThrow(expect.objectContaining({ code: 'invalid_rows' }));
   });
 });

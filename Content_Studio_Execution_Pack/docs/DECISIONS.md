@@ -51,3 +51,45 @@
 - Exact authorized scope (if applicable): 해당 없음(로컬 파일만, 외부 전송 없음).
 - Consequences: 다른 도구로 압축해 다시 묶은 ZIP(deflate)은 거부된다 — 이 앱이 만든 ZIP 만 복원 가능. 업로드 미리보기는 ZIP 전체를 메모리에 올린다(≤256MB, multipart 는 임시 파일 → 메모리). 같은 DB 안에서 다른 owner 에게 같은 묶음을 복원하면 ID 가 이미 쓰이고 있어 전부 충돌(id_in_use)이 된다 — 새 ID 발급 복원은 없다. 커밋 도중 실패하면 DB 는 rollback 되지만 이미 쓴 asset 파일은 고아로 남을 수 있다. users(식별자 원문)·audit_events 는 복원하지 않는다.
 - When to revisit: 대용량 asset(M2 T08) 또는 운영 백업·복원 drill(T20)에서 암호화·스트리밍 ZIP·ZIP64 가 필요해질 때, 또는 여러 owner 를 한 DB 에 합칠 필요가 생길 때.
+
+## D7 — M2 의 AI 는 모의(mock)로 진행, live 경계는 T07 에서 구현하되 실제 키·호출은 별도 승인
+- Decision ID / date: D7 / 2026-09-24 (Europe/Moscow)
+- Question: M2(T06~T09) 작성 지원 기능을 실제 LLM 호출 없이 어디까지 만들 것인가?
+- Options: (1) 처음부터 live provider 연결 (2) 전부 모의 (3) T06·T09 는 모의만, T07 에서 provider adapter·예산 예약·차단(fail-closed)까지 구현하고 실제 키·호출은 별도 승인 후.
+- Chosen option: (3). 저장소·브라우저·프롬프트·로그에 키를 두지 않는다. 기본값은 LLM_MODE=mock 유지.
+- Evidence / assumption: M1 의 MockLlmProvider(결정적, experience claim → needs_user_confirmation)와 assertLiveLlmAllowed 가 이미 있다.
+- Reversible?: 예. live 전환은 환경변수와 승인으로만.
+- User decision required?: 확정됨(사용자, 2026-09-24).
+- Exact authorized scope: 외부 호출 0, 과금 0.
+- Consequences: T07 의 live 경로는 모의 provider 로만 검증된다. 실제 모델 품질·비용은 승인 뒤에야 측정된다.
+- When to revisit: T07 완료 후 사용자가 D8 을 정할 때.
+
+## D8 — 첫 live LLM 공급자·모델은 T07 착수 시 결정(미정)
+- Decision ID / date: D8 / 2026-09-24 (Europe/Moscow)
+- Question: 어떤 공급자·모델을 첫 live 연결로 쓰는가?
+- Chosen option: 미정. 후보·모델 ID·요금 상한은 사용자가 그 시점 공식 자료로 확인해 정한다. 문서에 요금·모델 ID 숫자를 미리 고정하지 않는다.
+- User decision required?: 예 — T07 착수 시.
+- When to revisit: T07 착수.
+
+## D9 — T08 음성 전사는 업로드·job·진행 상태까지 모의, 실제 STT 는 승인 후
+- Decision ID / date: D9 / 2026-09-24 (Europe/Moscow)
+- Chosen option: 업로드 세션·job 상태·진행 표시·지원 기기 fallback·원음 보존(선택)을 모의 전사기로 구현한다. 외부 STT 연결은 공급자·범위·비용을 적은 승인 뒤에만.
+- User decision required?: 확정됨(사용자, 2026-09-24). 외부 STT 는 별도 승인.
+- Consequences: 전사 품질은 M2 에서 측정되지 않는다.
+
+## D10 — Content Studio 는 M2 동안 현 위치(my-first-project/Content_Studio_Execution_Pack/) 유지
+- Decision ID / date: D10 / 2026-09-24 (Europe/Moscow)
+- Chosen option: 별도 저장소 분리는 M3 전에 재검토(docs/ENVIRONMENT.md §7). 상위 저장소의 Codex 스크립트·규칙과 공존한다.
+- User decision required?: 확정됨(사용자, 2026-09-24).
+- When to revisit: M3 착수 전.
+
+## D11 — M1 Codex 잔존 P1(파일 복구 감사의 COMMIT 실패 창)은 잔존 위험으로 기록, VERIFIED 상태 분리는 T08 로 이관
+- Decision ID / date: D11 / 2026-09-24 (Europe/Moscow)
+- Question: Codex 재검증(GPT-6 Astra / xhigh)에서 남은 P1 — `POST /api/assets/uploads` 의 유실 파일 복구에서 `storage.put` 성공 뒤 DB COMMIT 이 실패하면 파일만 남고 `asset.restore` 감사가 영구 누락 — 을 M2 전에 해결할 것인가? "서명 몇 바이트로 VERIFIED" 지적은 상태값을 나눌 것인가?
+- Options: (a) 잔존 위험으로 기록하고 M2 착수, 파일 저장소–DB 정합성(outbox/reconciliation)은 T08 업로드 세션·job 설계와 함께 (b) M2 전에 asset 복구 outbox 를 구현·재검증.
+- Chosen option: (a). VERIFIED 는 상태값·명세를 유지하고 UI 라벨을 "서버 확인됨(형식 서명·크기·checksum)" 으로 바꿔 실제 검증 범위를 표시(16a9e5b). 상태 분리·구조 검증 도입 여부는 T08 결정으로 이관.
+- Evidence / assumption: 로컬 PGlite 는 단일 연결·단일 프로세스라 put 성공 뒤 COMMIT 만 실패하는 경우는 프로세스 크래시 수준의 장애에서만 발생한다고 가정(측정 없음). 복구 자체는 행 잠금 트랜잭션으로 직렬화되어 동시 복구·감사 중복은 막힌다(테스트 있음).
+- Reversible?: 예. T08 에서 복구 의도 테이블을 추가하면 해소된다.
+- User decision required?: 확정됨(사용자, 2026-09-24, 권고안 채택).
+- Consequences: 그 장애 창에서는 파일은 복구되지만 감사 이력이 없다. 화면 체크리스트 12항목은 M2 착수 뒤 사용자가 확인한다(.handoffs/screen-notes.md).
+- When to revisit: T08 착수 시(업로드 세션·job 상태 설계).

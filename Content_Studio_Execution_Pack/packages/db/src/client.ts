@@ -117,3 +117,12 @@ export function getDb(config: Pick<AppConfig, 'DB_DRIVER' | 'DATABASE_URL'>): Pr
   });
   return promise;
 }
+
+/** getDb 싱글턴을 닫고 캐시를 비운다(테스트 정리·프로세스 종료용). 열려 있지 않으면 아무것도 하지 않는다. */
+export async function closeDb(): Promise<void> {
+  const cached = globalForDb.__contentStudioDb;
+  if (!cached) return;
+  globalForDb.__contentStudioDb = undefined;
+  const handle = await cached.promise.catch(() => null);
+  await handle?.close();
+}

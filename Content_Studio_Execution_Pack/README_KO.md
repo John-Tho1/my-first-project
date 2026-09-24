@@ -134,6 +134,26 @@ pnpm dev                                  # http://localhost:3000 , 상태: http
 ~~~
 `pnpm dev`는 첫 요청에서 migration을 자동 적용하므로 `db:seed` 없이도 뜬다(이때 화면에 `pnpm db:seed 를 실행하세요`가 보인다).
 
+### 로그인 (M1, T02)
+M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`AUTH_MODE=dev`)** 만 제공한다(결정 D3, `docs/DECISIONS.md`). 비밀번호 없이 허용된 식별자 1개(`AUTH_ALLOWED_IDENTITY`)만 접속할 수 있고, `APP_BASE_URL` 이 `localhost`/`127.0.0.1` 일 때만 동작한다.
+
+1. `.env.local` 에서 `AUTH_ALLOWED_IDENTITY` 를 본인이 쓸 식별자로 바꾼다(기본 placeholder: `owner@example.local`).
+2. `pnpm dev` 후 http://localhost:3000 을 열면 `/login` 으로 이동한다. 식별자를 입력하면 `/`(오늘)로 돌아간다.
+3. 오늘 화면 상단에 `로그인: ow***@example.local`(가린 식별자)·`세션 만료: … (MSK)`·로그아웃 버튼이 보인다. `파일` 섹션에서 PNG·JPEG·WebP·PDF·텍스트(UTF-8, Markdown 포함)를 최대 10MB 까지 올리고 내려받을 수 있다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용). `oidc` = 운영 인증(T13 예정) — 지금은 모든 로그인을 `운영 인증 공급자는 아직 설정되지 않았습니다(T13)` 로 거부 |
+| `AUTH_ALLOWED_IDENTITY` | `owner@example.local` | 로그인 가능한 유일한 식별자. 바꾸면 기존 세션도 무효 |
+| `AUTH_SESSION_TTL_MINUTES` | `720` | 세션 유효 시간(분, 5~43200). 연장(sliding) 없음 |
+| `AUTH_COOKIE_SECURE` | `auto` | `auto` = `http://localhost`·`127.0.0.1` 이면 Secure 끔, 그 외 켬 |
+| `STORAGE_DRIVER` / `STORAGE_LOCAL_DIR` | `local` / `./data/assets` | 업로드 파일 저장 위치(워크스페이스 루트 기준, gitignore). `object` 는 미구현 |
+
+- 세션: 쿠키 `cs_session`(HttpOnly, SameSite=Lax, Path=/). 토큰 원문은 쿠키에만 있고 DB(`sessions`)에는 sha256 해시만 저장한다. 로그아웃은 POST 로만 가능하다.
+- 상태를 바꾸는 요청(로그인·로그아웃·업로드)은 `Origin`(없으면 `Referer`)이 `APP_BASE_URL` 과 같아야 한다. 그래서 `APP_BASE_URL=http://localhost:3000` 이면 `http://127.0.0.1:3000` 으로 열었을 때 403 이 난다 — 주소창 주소를 `APP_BASE_URL` 과 맞춘다.
+- 다른 사용자의 capture·파일 ID 로는 조회·다운로드할 수 없다(항상 404).
+- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 로그인 시도 횟수 제한은 없다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영 인증(OIDC)은 T13 에서 추가한다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

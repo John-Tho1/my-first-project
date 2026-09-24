@@ -18,6 +18,9 @@ const LABELS: Record<string, string> = {
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
   AUTH_ALLOWED_IDENTITY: 'AUTH_ALLOWED_IDENTITY(허용 사용자)',
+  AUTH_MODE: 'AUTH_MODE(인증 방식)',
+  AUTH_SESSION_TTL_MINUTES: 'AUTH_SESSION_TTL_MINUTES(세션 유효 시간, 분)',
+  AUTH_COOKIE_SECURE: 'AUTH_COOKIE_SECURE(쿠키 Secure 속성)',
   STORAGE_DRIVER: 'STORAGE_DRIVER(파일 저장소)',
   STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
 };
@@ -39,6 +42,19 @@ export const configSchema = z.object({
   COLLECTOR_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
   WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),
   AUTH_ALLOWED_IDENTITY: opt(z.string().min(3).default('owner@example.local')),
+  /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T13, 미구현 → 로그인 거부). */
+  AUTH_MODE: opt(z.enum(['dev', 'oidc']).default('dev')),
+  /** 세션 유효 시간(분). 5분 ~ 30일. */
+  AUTH_SESSION_TTL_MINUTES: opt(
+    z
+      .string()
+      .regex(/^\d{1,5}$/)
+      .transform(Number)
+      .pipe(z.int().min(5).max(43200))
+      .default(720),
+  ),
+  /** auto: APP_BASE_URL 이 http://localhost·127.0.0.1 이면 Secure 없이, 그 외에는 Secure. */
+  AUTH_COOKIE_SECURE: opt(z.enum(['auto', 'true', 'false']).default('auto')),
   STORAGE_DRIVER: opt(z.enum(['local', 'object']).default('local')),
   STORAGE_LOCAL_DIR: opt(z.string().min(1).default('./data/assets')),
 });

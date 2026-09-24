@@ -7,6 +7,7 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   foreignKey,
+  index,
   integer,
   jsonb,
   pgEnum,
@@ -162,25 +163,35 @@ export const contentVersions = pgTable(
   (t) => [unique('content_versions_content_version_uq').on(t.contentId, t.version)],
 );
 
-export const assets = pgTable('assets', {
-  id: id(),
-  ownerId: uuid('owner_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'restrict' }),
-  key: text('key').notNull().unique(),
-  mime: text('mime').notNull(),
-  bytes: bigint('bytes', { mode: 'number' }).notNull(),
-  checksum: text('checksum').notNull(),
-  rightsStatus: text('rights_status').notNull().default('unknown'),
-  verificationState: text('verification_state').notNull().default('pending'),
-  createdAt: ts('created_at').notNull().defaultNow(),
-});
+/**
+ * 파일 메타데이터. 파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
+ * (owner_id, checksum) unique: 같은 owner 의 동일 파일은 한 행만(T02: 중복 업로드는 기존 asset 반환).
+ */
+export const assets = pgTable(
+  'assets',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    key: text('key').notNull().unique(),
+    mime: text('mime').notNull(),
+    bytes: bigint('bytes', { mode: 'number' }).notNull(),
+    checksum: text('checksum').notNull(),
+    rightsStatus: text('rights_status').notNull().default('unknown'),
+    verificationState: text('verification_state').notNull().default('pending'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [unique('assets_owner_checksum_uq').on(t.ownerId, t.checksum)],
+);
 
+/**
+ * 감사 기록. owner_id 는 인증 전 이벤트(예: auth.login_denied — 아직 owner 가 확인되지 않음)에 한해 null(T02).
+ * owner 범위 조회는 owner_id 로 필터하므로 null 행은 어떤 owner 의 목록에도 나타나지 않는다.
+ */
 export const auditEvents = pgTable('audit_events', {
   id: id(),
-  ownerId: uuid('owner_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'restrict' }),
+  ownerId: uuid('owner_id').references(() => users.id, { onDelete: 'restrict' }),
   action: text('action').notNull(),
   entity: text('entity').notNull(),
   entityId: uuid('entity_id'),
@@ -188,3 +199,25 @@ export const auditEvents = pgTable('audit_events', {
   at: ts('at').notNull().defaultNow(),
   sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
 });
+
+/**
+ * 로그인 세션(T02, 결정 D3). 토큰 원문은 쿠키에만 있고 DB 에는 sha256 hex(token_hash)만 저장한다.
+ * 유효 조건: expires_at > now AND revoked_at IS NULL.
+ * 주의(T05): export/restore 대상에서 제외한다 — 세션은 인증 비밀과 같은 등급이며 이식 대상이 아니다.
+ */
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    tokenHash: text('token_hash').notNull().unique(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    expiresAt: ts('expires_at').notNull(),
+    lastSeenAt: ts('last_seen_at').notNull().defaultNow(),
+    revokedAt: ts('revoked_at'),
+    userAgentHash: text('user_agent_hash'),
+  },
+  (t) => [index('sessions_owner_idx').on(t.ownerId)],
+);

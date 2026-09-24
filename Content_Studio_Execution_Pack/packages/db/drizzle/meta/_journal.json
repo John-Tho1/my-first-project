@@ -8,6 +8,13 @@
       "when": 1790258630313,
       "tag": "0000_t01_m1_core",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790259531341,
+      "tag": "0001_t02_sessions",
+      "breakpoints": true
     }
   ]
 }

@@ -92,3 +92,7 @@ export const fixtureCaptureSchema = z.object({
   received_at: z.iso.datetime(),
 });
 export type FixtureCapture = z.infer<typeof fixtureCaptureSchema>;
+
+/** POST /api/auth/login 입력(T02). identity 값은 로그·감사 기록에 남기지 않는다. */
+export const loginInputSchema = z.object({ identity: z.string().min(1).max(320) });
+export type LoginInput = z.infer<typeof loginInputSchema>;

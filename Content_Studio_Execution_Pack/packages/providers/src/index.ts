@@ -6,6 +6,7 @@ import { DisabledPublisher, type Publisher } from './publisher';
 export * from './collector';
 export * from './llm';
 export * from './publisher';
+export * from './storage';
 
 export interface Providers {
   llm: LlmProvider;

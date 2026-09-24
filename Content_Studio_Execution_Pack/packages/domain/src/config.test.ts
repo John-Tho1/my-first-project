@@ -16,6 +16,9 @@ describe('loadConfig', () => {
       AUTH_ALLOWED_IDENTITY: 'owner@example.local',
       STORAGE_DRIVER: 'local',
       STORAGE_LOCAL_DIR: './data/assets',
+      AUTH_MODE: 'dev',
+      AUTH_SESSION_TTL_MINUTES: 720,
+      AUTH_COOKIE_SECURE: 'auto',
     });
     expect(c.LLM_PROVIDER).toBeUndefined();
     expect(c.LLM_MODEL).toBeUndefined();
@@ -40,10 +43,28 @@ describe('loadConfig', () => {
     ['APP_TIMEZONE', 'Asia/Seoul'],
     ['APP_BASE_URL', 'not a url'],
     ['STORAGE_DRIVER', 's3'],
+    ['AUTH_MODE', 'password'],
+    ['AUTH_MODE', 'DEV'],
+    ['AUTH_SESSION_TTL_MINUTES', '4'],
+    ['AUTH_SESSION_TTL_MINUTES', '43201'],
+    ['AUTH_SESSION_TTL_MINUTES', '12.5'],
+    ['AUTH_SESSION_TTL_MINUTES', '-10'],
+    ['AUTH_SESSION_TTL_MINUTES', 'abc'],
+    ['AUTH_COOKIE_SECURE', 'yes'],
   ])('%s=%s 이면 한국어 메시지로 실패한다', (key, value) => {
     expect(() => loadConfig({ [key]: value })).toThrow(ConfigError);
     expect(() => loadConfig({ [key]: value })).toThrow(/환경변수 설정이 올바르지 않습니다/);
     expect(() => loadConfig({ [key]: value })).toThrow(new RegExp(key));
+  });
+
+  it('AUTH_* 새 변수를 파싱한다', () => {
+    const c = loadConfig({ AUTH_MODE: 'oidc', AUTH_SESSION_TTL_MINUTES: '60', AUTH_COOKIE_SECURE: 'true' });
+    expect(c.AUTH_MODE).toBe('oidc');
+    expect(c.AUTH_SESSION_TTL_MINUTES).toBe(60);
+    expect(c.AUTH_COOKIE_SECURE).toBe('true');
+    expect(loadConfig({ AUTH_SESSION_TTL_MINUTES: '5' }).AUTH_SESSION_TTL_MINUTES).toBe(5);
+    expect(loadConfig({ AUTH_SESSION_TTL_MINUTES: '43200' }).AUTH_SESSION_TTL_MINUTES).toBe(43200);
+    expect(loadConfig({ AUTH_SESSION_TTL_MINUTES: '' }).AUTH_SESSION_TTL_MINUTES).toBe(720);
   });
 
   it('오류 메시지에 입력값을 노출하지 않는다', () => {

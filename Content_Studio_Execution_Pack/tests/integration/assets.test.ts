@@ -55,6 +55,41 @@ function upload(
   });
 }
 
+/**
+ * multipart 본문을 바이트로 직접 만든다(FormData 원본 아님).
+ * Node 24 의 undici 는 FormData 로 만든 Request 본문을 서버가 중간에 cancel 하면(413 경로)
+ * 닫힌 스트림에 enqueue 를 시도해 미처리 거부(ERR_INVALID_STATE)를 낸다. 실제 서버의 요청 본문은 소켓 바이트
+ * 스트림이므로 그 경로와 같은 바이트 원본으로 413 을 검증한다.
+ */
+function rawMultipartUpload(token: string, file: { bytes: Uint8Array; name: string }): Request {
+  const boundary = 'cs-it-boundary';
+  const enc = new TextEncoder();
+  const head = enc.encode(
+    `--${boundary}
+Content-Disposition: form-data; name="file"; filename="${file.name}"
+Content-Type: application/octet-stream
+
+`,
+  );
+  const tail = enc.encode(`
+--${boundary}--
+`);
+  const body = new Uint8Array(head.byteLength + file.bytes.byteLength + tail.byteLength);
+  body.set(head, 0);
+  body.set(file.bytes, head.byteLength);
+  body.set(tail, head.byteLength + file.bytes.byteLength);
+  return new Request(`${BASE}/api/assets/uploads`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      origin: BASE,
+      ...cookieHeader(token),
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  });
+}
+
 const filesOnDisk = () => {
   try {
     return readdirSync(storageDir, { recursive: true, withFileTypes: true }).filter((d) => d.isFile()).length;
@@ -139,7 +174,9 @@ describe('POST /api/assets/uploads', () => {
     const files = filesOnDisk();
     const big = new Uint8Array(11 * 1024 * 1024);
     big.set(PNG);
-    const res = await uploadPOST(upload(tokenA, { bytes: big, name: 'big.png' }));
+    const req = rawMultipartUpload(tokenA, { bytes: big, name: 'big.png' });
+    expect(req.headers.get('content-length')).toBeNull(); // 선언 길이 없이 스트리밍 상한에서 끊기는 경로
+    const res = await uploadPOST(req);
     expect(res.status).toBe(413);
     expect((await res.json()).error).toBe('payload_too_large');
     expect(filesOnDisk()).toBe(files);

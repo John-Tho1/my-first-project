@@ -10,3 +10,6 @@
 # OS / 에디터
 .DS_Store
 *.swp
+
+# 설계 패키지 원본 ZIP (압축 해제본이 Content_Studio_Execution_Pack/ 에 커밋됨)
+Content_Studio_Execution_Pack_*.zip

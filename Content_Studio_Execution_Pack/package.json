@@ -1,0 +1,42 @@
+{
+  "name": "content-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "node apps/web/scripts/next.mjs dev",
+    "build": "node apps/web/scripts/next.mjs build",
+    "start": "node apps/web/scripts/next.mjs start",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json && node apps/web/scripts/next.mjs typegen && tsc -p apps/web/tsconfig.json",
+    "test": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "node scripts/e2e-not-run.mjs",
+    "db:generate": "pnpm --filter @cs/db db:generate",
+    "db:migrate": "tsx packages/db/scripts/migrate.ts",
+    "db:seed": "tsx packages/db/scripts/seed.ts",
+    "worker": "tsx apps/worker/src/cli.ts"
+  },
+  "devDependencies": {
+    "@cs/db": "workspace:*",
+    "@cs/domain": "workspace:*",
+    "@cs/providers": "workspace:*",
+    "@cs/web": "workspace:*",
+    "@cs/worker": "workspace:*",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.2",
+    "drizzle-orm": "0.45.3",
+    "eslint": "10.11.0",
+    "eslint-config-next": "16.3.6",
+    "globals": "17.12.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.1",
+    "vite": "8.3.0",
+    "vitest": "5.0.1"
+  }
+}

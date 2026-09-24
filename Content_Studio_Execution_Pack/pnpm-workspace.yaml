@@ -1,3 +1,12 @@
 packages:
   - apps/*
   - packages/*
+
+# pnpm 11+ 는 설정을 이 파일에서 읽는다(.npmrc 의 engine-strict 와 동일 의도).
+engineStrict: true
+
+# 의존성 설치 스크립트는 실행하지 않는다. esbuild·unrs-resolver 는 플랫폼별 optional 패키지로 바이너리를 받으므로
+# postinstall 없이 동작한다(T01 에서 tsx·drizzle-kit·vitest·eslint 실행으로 확인).
+allowBuilds:
+  esbuild: false
+  unrs-resolver: false

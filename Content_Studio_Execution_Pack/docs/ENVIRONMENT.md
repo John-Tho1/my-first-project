@@ -82,3 +82,25 @@ Claude Code는 작업 폴더에 가장 가까운 CLAUDE.md/AGENTS.md를 우선 �
 | 웹 | Next.js(App Router) + TypeScript | 설계 권고. 정확한 버전은 T01 lockfile에 고정 |
 | 테스트 | vitest(단위·통합). E2E(Playwright)는 브라우저 바이너리 다운로드 승인이 필요해 M0에서는 `not_run` | 다운로드는 사용자 승인 사항 |
 | 저장소 위치 | `my-first-project/Content_Studio_Execution_Pack/` 하위 유지, 상위 AGENTS.md에 범위 예외 1줄 추가(사용자 승인) | 사용자 지시("추가한 폴더 기준"). 별도 저장소 분리는 후속 결정 |
+
+## 8. T01 고정 버전
+정확한 버전은 `pnpm-lock.yaml`이 정본이다(모두 exact pin, `^`/`~` 없음).
+
+| 패키지 | 버전 | 비고 |
+| --- | --- | --- |
+| pnpm | 12.6.0 | `packageManager` 필드, corepack으로 선택 |
+| Node.js | `>=22.12` (`engines`) | 사용자 PC v24.21.0, 클라우드 검증 v22.22.2. `engineStrict: true` |
+| next / eslint-config-next | 16.3.6 / 16.3.6 | App Router, Turbopack |
+| react / react-dom | 19.3.0 / 19.3.0 | |
+| typescript | 5.9.3 | 7.x 아님 |
+| @types/node / @types/react / @types/react-dom | 26.6.2 / 19.3.0 / 19.3.0 | |
+| zod | 4.6.5 | |
+| @electric-sql/pglite | 0.5.8 | `serverExternalPackages`로 번들 제외 |
+| drizzle-orm / drizzle-kit | 0.45.3 / 0.31.11 | PostgreSQL 방언 migration(`packages/db/drizzle/`) |
+| vitest / vite | 5.0.1 / 8.3.0 | vite는 vitest peer. 8.3.1은 설치 당일 공개본이라 pnpm `minimumReleaseAge`에 걸려 8.3.0 사용 |
+| tsx | 4.23.15 | CLI 스크립트(db:*, worker) |
+| eslint / @eslint/js / typescript-eslint / globals | 10.11.0 / 10.0.1 / 8.70.1 / 17.12.0 | |
+
+- eslint-config-next 16.3.6의 하위 플러그인(eslint-plugin-react 7.37.5, jsx-a11y 6.10.2, import 2.32.0)은 peer 범위가 eslint ≤9로 선언돼 있어 설치 시 peer 경고가 난다. `settings.react.version`을 명시하면(버전 자동 감지 경로 회피) eslint 10에서 정상 동작함을 확인했다.
+- 설치 스크립트: `pnpm-workspace.yaml`의 `allowBuilds`에서 esbuild·unrs-resolver 빌드 스크립트를 실행하지 않도록 명시(바이너리는 플랫폼별 optional 패키지로 설치됨).
+- Node 22(클라우드)와 24(사용자 PC) 모두 `engines`를 만족한다. 사용자 PC에서의 실제 실행 결과는 아직 기록되지 않았다(클라우드 컨테이너 결과만 있음).

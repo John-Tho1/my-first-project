@@ -13,3 +13,6 @@ dist/
 .env.*.local
 data/
 *.log
+
+# Next 가 dev/build/typegen 때마다 재생성(.next/types 참조)하므로 커밋하지 않는다
+next-env.d.ts

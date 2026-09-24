@@ -117,3 +117,44 @@ Codex “문제 없음”은 테스트 통과나 사용자 발행 승인과 같�
 - prompts/: 시작·검증·수정 지시문
 - templates/, review/: 인계·결정·검증 양식
 
+
+## 실행 방법 (M0, T01)
+T01은 앱 뼈대(web·worker·DB·모의 provider·가상 데이터)다. 외부 키 없이 동작하며 **기본 모드에서 외부 쓰기는 0**이다(AI 모의, 게시 비활성, 수집 비활성). 게시·수집 가드는 서버/worker 코드(`packages/domain/src/guards.ts`)에서 기본 거부로 강제된다.
+
+### 준비
+- Node.js ≥ 22.12 (사용자 PC: v24.21.0, 클라우드 검증: v22.22.2)
+- pnpm 12.6.0 — 루트 `package.json`의 `packageManager`로 고정. `corepack pnpm …`으로 실행하면 이 버전이 자동 선택된다. 아래 `pnpm`은 모두 `corepack pnpm`으로 바꿔 써도 된다.
+
+### 설치·실행
+~~~bash
+corepack pnpm install --frozen-lockfile   # lockfile 고정 설치
+cp .env.example .env.local                # placeholder 만 있음. 기본값으로도 동작
+pnpm db:seed                              # migration + owner·brand profile·가상 소재 10건 (재실행해도 중복 없음)
+pnpm dev                                  # http://localhost:3000 , 상태: http://localhost:3000/api/health
+~~~
+`pnpm dev`는 첫 요청에서 migration을 자동 적용하므로 `db:seed` 없이도 뜬다(이때 화면에 `pnpm db:seed 를 실행하세요`가 보인다).
+
+### 검증 명령
+| 명령 | 내용 | 기대 |
+| --- | --- | --- |
+| `pnpm lint` | ESLint(flat config, typescript-eslint + eslint-config-next) | exit 0 |
+| `pnpm typecheck` | `tsc --noEmit`(패키지·worker·테스트) + `next typegen && tsc`(web) | exit 0 |
+| `pnpm test` | vitest 단위 테스트(`packages/**`, `apps/**`) | exit 0 |
+| `pnpm test:integration` | vitest 통합 테스트(`tests/integration`, PGlite 메모리 DB) | exit 0 |
+| `pnpm test:e2e` | Playwright E2E — M0에서는 실행하지 않음 | **exit 2 = NOT_RUN** (통과 아님) |
+| `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
+| `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
+| `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
+| `pnpm worker` | worker tick 1회(M0: DB 연결 확인만) 후 종료 | exit 0, JSON 출력 |
+
+### PGlite 단일 연결 주의
+- 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.
+- PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline`, `/api/health` 호출 시 tick 1회).
+- `pnpm dev`/`pnpm start`가 켜져 있는 동안 `pnpm db:seed`·`pnpm db:migrate`·`pnpm worker`는 잠금 파일(`data/pglite/.content-studio.lock`) 때문에 한국어 안내와 함께 exit 1로 거부된다. 서버를 끄고 실행한다.
+- `WORKER_MODE=separate`는 `DB_DRIVER=postgres`(M3 예정, 아직 미구현)에서만 허용된다.
+
+### 기본 모드에서 외부 쓰기 0
+- LLM: `MockLlmProvider`(결정적, 네트워크 없음, 경고 `모의 응답: 실제 AI 호출 아님`). `LLM_MODE=live`는 M0에 공급자가 없어 거부된다.
+- 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 기능이 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
+- 수집: `DisabledCollector`는 항상 CollectorDisabledError.
+- Next.js 텔레메트리는 `apps/web/scripts/next.mjs`에서 `NEXT_TELEMETRY_DISABLED=1`로 끈다(사용자 전역 설정은 변경하지 않음).

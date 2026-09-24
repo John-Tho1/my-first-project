@@ -210,6 +210,7 @@ export interface AuditInput {
     | 'variant.adopt_ai'
     | 'variant.assets'
     | 'variant.lifecycle'
+    | 'content.proposal_dismiss'
     | 'package.create'
     | 'package.download'
     | 'export.create'

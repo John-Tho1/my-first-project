@@ -1,7 +1,7 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
-import { packageZipPath, recordAudit } from '@cs/db';
+import { findPackageZip, recordAudit } from '@cs/db';
 import { NotFoundError } from '@cs/domain';
 import { apiHandler } from '../../../../lib/api';
 import { exportsDir } from '../../../../lib/backup';
@@ -19,9 +19,10 @@ const NOT_FOUND = '배포 파일을 찾을 수 없습니다';
 export const GET = apiHandler<{ params: Promise<{ id: string }> }>(async (request, ctx) => {
   const owner = await requireOwner(request);
   const { id } = await ctx.params;
-  const file = packageZipPath(exportsDir(owner.config), owner.ownerId, id.toLowerCase());
+  const file = await findPackageZip(exportsDir(owner.config), owner.ownerId, id.toLowerCase());
   let size: number;
   try {
+    if (!file) throw new Error('not found');
     const s = await stat(/*turbopackIgnore: true*/ file);
     if (!s.isFile()) throw new Error('not a file');
     size = s.size;

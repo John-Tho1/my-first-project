@@ -1,6 +1,7 @@
 /**
  * T09 배포 파일 묶음(결정 D14). **승인도 게시도 아니다** — 사람이 직접 올리기 위한 파일(수동 게시용).
- * store-only ZIP(@cs/domain writeZip) 한 개: `<EXPORT_LOCAL_DIR>/packages/<owner_id>/<package_id>.zip`.
+ * store-only ZIP(@cs/domain writeZip) 한 개: `<EXPORT_LOCAL_DIR>/packages/<owner_id>/<content_id>/<package_id>.zip`
+ * (FIX-T09 P2: 원고별 폴더 — 작성실에는 그 원고의 배포 파일만 보인다. T09 첫 버전의 `packages/<owner_id>/<id>.zip` 도 내려받기는 된다).
  * 표를 따로 두지 않는다 — owner 폴더 경로가 곧 owner 범위이며, 다른 owner 의 id 로는 파일을 찾지 못해 404 가 된다.
  *
  * 내용(채널 파생본의 현재 버전만):
@@ -11,7 +12,19 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { AppError, extensionForMime, isUuid, NotFoundError, sha256Hex, stableStringify, writeZip, type ZipEntry } from '@cs/domain';
+import {
+  AppError,
+  extensionForMime,
+  isUuid,
+  mediaCompleteness,
+  NotFoundError,
+  renderVariantText,
+  sha256Hex,
+  stableStringify,
+  writeZip,
+  type Channel,
+  type ZipEntry,
+} from '@cs/domain';
 import type { Db } from './client';
 import { getContentDetail } from './contents';
 import type { BlobStore } from './export';
@@ -20,14 +33,39 @@ import { listVariantStates } from './variants';
 
 export const PACKAGE_NOTICE = '배포 파일(수동 게시용). 자동 게시 아님 — 이 파일은 승인이나 게시 기록이 아닙니다.';
 
-export function packagesDir(exportsDir: string, ownerId: string): string {
-  if (!isUuid(ownerId)) throw new Error('잘못된 owner');
-  return path.join(exportsDir, 'packages', ownerId);
+export function packagesDir(exportsDir: string, ownerId: string, contentId?: string): string {
+  if (!isUuid(ownerId) || (contentId !== undefined && !isUuid(contentId))) throw new Error('잘못된 owner·원고');
+  return contentId ? path.join(exportsDir, 'packages', ownerId, contentId) : path.join(exportsDir, 'packages', ownerId);
 }
 
-export function packageZipPath(exportsDir: string, ownerId: string, packageId: string): string {
+/** 새 배포 파일의 경로(원고 폴더). */
+export function packageZipPath(exportsDir: string, ownerId: string, contentId: string, packageId: string): string {
   if (!isUuid(packageId)) throw new NotFoundError('배포 파일을 찾을 수 없습니다');
-  return path.join(packagesDir(exportsDir, ownerId), `${packageId}.zip`);
+  return path.join(packagesDir(exportsDir, ownerId, contentId), `${packageId}.zip`);
+}
+
+/**
+ * 내려받기용: owner 폴더 안에서 id 로 찾는다(원고 폴더들 → T09 첫 버전의 owner 폴더 바로 아래). 없으면 null.
+ * owner 폴더 밖은 보지 않으므로 다른 owner 의 파일은 찾지 못한다.
+ */
+export async function findPackageZip(exportsDir: string, ownerId: string, packageId: string): Promise<string | null> {
+  if (!isUuid(packageId)) return null;
+  const base = packagesDir(exportsDir, ownerId);
+  let names: string[];
+  try {
+    names = await readdir(base);
+  } catch {
+    return null;
+  }
+  const candidates = [...names.filter((n) => isUuid(n)).map((n) => path.join(base, n, `${packageId}.zip`)), path.join(base, `${packageId}.zip`)];
+  for (const c of candidates) {
+    try {
+      if ((await stat(c)).isFile()) return c;
+    } catch {
+      // 다음 후보
+    }
+  }
+  return null;
 }
 
 export interface PackageResult {
@@ -62,6 +100,9 @@ export async function buildVariantPackage(
     const ch = s.variant.channel;
     files.push({ path: `${ch}/${ch === 'blog' ? 'body.md' : 'body.txt'}`, bytes: utf8(v.body) });
     files.push({ path: `${ch}/metadata.json`, bytes: utf8(stableStringify(v.metadataJson)) });
+    // FIX-T09(P0): 검토 게이트가 검사한 바로 그 글(본문 + 채널 메타데이터 전체)
+    const output = renderVariantText(ch as Channel, v.body, v.metadataJson);
+    files.push({ path: `${ch}/output.txt`, bytes: utf8(output) });
     const assetList: Record<string, unknown>[] = [];
     for (const a of s.assets) {
       const p = `${ch}/assets/${String(a.position).padStart(2, '0')}-${a.role}.${extensionForMime(a.mime)}`;
@@ -81,6 +122,12 @@ export async function buildVariantPackage(
       lifecycle: s.variant.lifecycle,
       stale: s.stale,
       media: s.media,
+      // 실제로 묶음에 들어간 파일만으로 본 미디어 완성 여부(누락·checksum 불일치로 빠진 파일 제외)
+      media_included: mediaCompleteness(
+        ch as Channel,
+        s.assets.filter((a) => assetList.some((x) => x.asset_id === a.assetId && x.position === a.position && x.missing === false)),
+      ),
+      output_text_sha256: sha256Hex(utf8(output)),
       created_by: v.createdBy,
       ai_derived: v.aiRunId !== null,
       assets_included: assetList.filter((a) => !a.missing).length,
@@ -107,9 +154,9 @@ export async function buildVariantPackage(
   };
   const manifestBytes = utf8(stableStringify(manifest));
   const zip = writeZip([{ path: 'manifest.json', bytes: manifestBytes }, ...files], now);
-  const dir = packagesDir(opts.exportsDir, ownerId);
+  const dir = packagesDir(opts.exportsDir, ownerId, d.content.id);
   await mkdir(dir, { recursive: true });
-  const zipPath = packageZipPath(opts.exportsDir, ownerId, packageId);
+  const zipPath = packageZipPath(opts.exportsDir, ownerId, d.content.id, packageId);
   await writeFile(zipPath, zip, { flag: 'wx' });
   const manifestSha256 = sha256Hex(manifestBytes);
   await recordAudit(db, {
@@ -124,11 +171,17 @@ export async function buildVariantPackage(
   return { packageId, zipPath, zipBytes: zip.byteLength, manifest, manifestSha256, warnings };
 }
 
-/** owner 의 배포 파일 목록(최근 순, 최대 limit). 폴더가 없으면 빈 목록. */
-export async function listPackages(exportsDir: string, ownerId: string, limit = 10): Promise<Array<{ id: string; bytes: number; createdAt: Date }>> {
+/** 이 원고의 배포 파일 목록(최근 순, 최대 limit). 폴더가 없으면 빈 목록. */
+export async function listPackages(
+  exportsDir: string,
+  ownerId: string,
+  contentId: string,
+  limit = 10,
+): Promise<Array<{ id: string; bytes: number; createdAt: Date }>> {
+  if (!isUuid(contentId)) return [];
   let names: string[];
   try {
-    names = await readdir(packagesDir(exportsDir, ownerId));
+    names = await readdir(packagesDir(exportsDir, ownerId, contentId));
   } catch {
     return [];
   }
@@ -136,7 +189,7 @@ export async function listPackages(exportsDir: string, ownerId: string, limit = 
   for (const n of names) {
     const id = n.replace(/\.zip$/u, '');
     if (!n.endsWith('.zip') || !isUuid(id)) continue;
-    const s = await stat(path.join(packagesDir(exportsDir, ownerId), n));
+    const s = await stat(path.join(packagesDir(exportsDir, ownerId, contentId), n));
     out.push({ id, bytes: s.size, createdAt: s.mtime });
   }
   return out.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);

@@ -95,7 +95,8 @@ export function WritingPanel({
   const run = selectedRun;
   const claims = run ? claimsOf(run.outputJson) : [];
   const adopted = run ? state.adopted.has(run.id) : false;
-  const canAdopt = run?.status === 'succeeded' && proposal !== null && run.inputVersionId === current.id && !adopted;
+  // FIX-T09(P1): 채택·무시 여부는 run.proposal_status 로 본다.
+  const canAdopt = run?.status === 'succeeded' && proposal !== null && run.inputVersionId === current.id && !adopted && run.proposalStatus === 'proposed';
 
   return (
     <>
@@ -223,12 +224,16 @@ export function WritingPanel({
                   <form className="form inline" method="post" action={`/api/contents/${contentId}/assist/${run.id}/adopt`}>
                     <input type="hidden" name="base_version" value={current.version} />
                     <button type="submit">제안 채택(새 버전으로 저장)</button>{' '}
-                    <Link href={`/contents/${contentId}?run=none`}>무시</Link>
+                    <button type="submit" formAction={`/api/contents/${contentId}/assist/${run.id}/dismiss`}>
+                      무시(목록에서 빼기)
+                    </button>
                   </form>
                 ) : (
                   <p className="note">
                     {adopted
                       ? '이 제안은 채택되었습니다.'
+                      : run.proposalStatus === 'dismissed'
+                        ? '무시한 제안입니다(버전 목록에는 남아 있습니다).'
                       : '이 제안은 지금 본문이 아닌 이전 버전을 기준으로 만들어져 채택할 수 없습니다. 새로 요청하세요.'}
                   </p>
                 )}

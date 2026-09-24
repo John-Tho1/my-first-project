@@ -25,6 +25,9 @@ export const YOUTUBE_DESCRIPTION_MAX = 5000;
 export const YOUTUBE_MAX_TAGS = 30;
 export const BLOG_TITLE_MAX = 200;
 export const VARIANT_BODY_MAX = 100_000;
+/** FIX-T09(P2): 파생본 버전 하나의 첨부 상한(개수·순서 번호). JSON·폼·DB 함수가 모두 같은 값을 쓴다. */
+export const MAX_VARIANT_ASSETS = 20;
+export const MAX_ASSET_POSITION = 50;
 
 export const VARIANT_ROLES = ['image', 'video', 'thumbnail', 'attachment'] as const;
 export type VariantRole = (typeof VARIANT_ROLES)[number];
@@ -165,6 +168,64 @@ export function channelDraft(channel: Channel, title: string, coreBody: string):
   }
 }
 
+// ---- FIX-T09: 실제로 나가는 글 전체 ----
+
+const str = (v: unknown) => (typeof v === 'string' ? v : '');
+const strs = (v: unknown) => (Array.isArray(v) ? v.map(str) : []);
+
+/**
+ * 채널별로 사용자에게 실제로 보이는(배포 파일에 들어가는) 모든 글을 하나로 합친다(순수, 결정적).
+ * threads: 본문 + text + 이어지는 글 / instagram: 본문 + 캡션 + 카드 / youtube: 본문 + 제목 + 설명 + 대본 + 태그 / blog: 본문 + 제목 + Markdown.
+ * 'removed'(본문에서 뺐음) 검사·파생본 claim 게이트·배포 파일의 검사 대상은 모두 이 결과다(검사한 것 = 나가는 것).
+ */
+export function renderVariantText(channel: Channel, body: string, metadata: Record<string, unknown>): string {
+  const parts: string[] = [body];
+  switch (channel) {
+    case 'threads':
+      parts.push(str(metadata.text), ...strs(metadata.thread_parts));
+      break;
+    case 'instagram':
+      parts.push(str(metadata.caption), ...(Array.isArray(metadata.cards) ? metadata.cards.map((c) => str((c as { text?: unknown })?.text)) : []));
+      break;
+    case 'youtube':
+      parts.push(str(metadata.title), str(metadata.description), str(metadata.script), ...strs(metadata.tags));
+      break;
+    case 'blog':
+      parts.push(str(metadata.title), str(metadata.markdown));
+      break;
+  }
+  return parts.filter((p) => p !== '').join('\n');
+}
+
+/**
+ * 본문과 중복되는 메타데이터 칸이 본문과 같은가(FIX-T09 P0 — 사용자 수정은 둘이 같아야 저장된다).
+ * threads: 이어지는 글을 빈 줄로 이은 것 = 본문, text = 첫 글 / instagram: 캡션 = 본문 / youtube: 대본 = 본문 / blog: Markdown = 본문.
+ */
+export function variantBodyMismatch(channel: Channel, body: string, metadata: Record<string, unknown>): boolean {
+  switch (channel) {
+    case 'threads': {
+      const parts = strs(metadata.thread_parts);
+      return parts.join('\n\n') !== body || str(metadata.text) !== (parts[0] ?? '');
+    }
+    case 'instagram':
+      return str(metadata.caption) !== body;
+    case 'youtube':
+      return str(metadata.script) !== body;
+    case 'blog':
+      return str(metadata.markdown) !== body;
+  }
+}
+
+export class MetadataBodyMismatchError extends AppError {
+  constructor(channel: Channel) {
+    super(
+      'bad_request',
+      'metadata_body_mismatch',
+      `${CHANNEL_LABEL[channel]} 채널 형식의 본문 칸(${channel === 'threads' ? 'thread_parts·text' : channel === 'instagram' ? 'caption' : channel === 'youtube' ? 'script' : 'markdown'})이 본문과 다릅니다. 같게 맞춘 뒤 저장하세요.`,
+    );
+  }
+}
+
 // ---- stale·미디어 완성 여부 ----
 
 /** 파생본 버전이 원고의 현재 버전에서 나오지 않았으면 stale(저장하지 않는 파생 값). */
@@ -215,8 +276,8 @@ export const variantAssetsSchema = z
   .object({
     base_version: z.int().min(1),
     assets: z
-      .array(z.object({ asset_id: z.string().min(1), position: z.int().min(1).max(50), role: z.enum(VARIANT_ROLES) }).strict())
-      .max(20),
+      .array(z.object({ asset_id: z.string().min(1), position: z.int().min(1).max(MAX_ASSET_POSITION), role: z.enum(VARIANT_ROLES) }).strict())
+      .max(MAX_VARIANT_ASSETS),
   })
   .strict();
 

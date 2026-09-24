@@ -69,7 +69,7 @@ export default async function ContentPage({
   // T09: 채널 초안·owner 파일·배포 파일
   const variantStates = await listVariantStates(db, session.ownerId, c.id, current.id);
   const ownerAssets = await listAssets(db, session.ownerId, 50);
-  const packages = await listPackages(exportsDir(config), session.ownerId, 5);
+  const packages = await listPackages(exportsDir(config), session.ownerId, c.id, 5);
   const newPackage = str(q.package);
   let proposal: ProposalView | null = null;
   if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {
@@ -195,6 +195,7 @@ export default async function ContentPage({
             assets={ownerAssets}
             packages={packages}
             savedChannel={str(q.variant_saved) ?? str(q.variant_proposal) ?? null}
+            contentTitle={c.title}
             newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}
           />
 

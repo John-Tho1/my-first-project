@@ -245,6 +245,8 @@ export const ROW_SCHEMAS = {
     finished_at: ts.nullable(),
     // 0009 열(채널 초안 run). 이전 묶음에는 없으므로 null.
     variant_id: uuid.nullable().default(null),
+    // 0011 열. 이전 묶음에는 없으므로 'proposed'(채택 여부는 버전 행으로 따로 남아 있다).
+    proposal_status: z.enum(['proposed', 'adopted', 'dismissed']).default('proposed'),
   }),
   claim_confirmations: z.strictObject({
     id: uuid,
@@ -929,6 +931,33 @@ export function checkIntegrity(t: BundleTables): void {
     }
   }
   for (const r of t.claims) need('claims', 'variant_version_id', r.variant_version_id, 'variant_versions');
+  // FIX-T09(P1): AI 참조는 같은 파생본·같은 run 이어야 한다(같은 원고의 다른 채널 run 으로 바꿔치기한 묶음 거부).
+  const runById = new Map(t.generation_runs.map((r) => [r.id, r]));
+  const vvById = new Map(t.variant_versions.map((v) => [v.id, v]));
+  for (const v of t.variant_versions) {
+    if (v.ai_run_id === null) {
+      if (v.created_by.startsWith('ai:')) problems.push('variant_versions.ai_run_id 누락(AI 제안 버전)');
+      continue;
+    }
+    const run = runById.get(v.ai_run_id);
+    if (run && (run.mode !== 'variant' || run.variant_id !== v.variant_id)) problems.push('variant_versions.ai_run_id → generation_runs(같은 파생본의 variant run)');
+  }
+  for (const v of t.content_versions) {
+    const run = v.ai_run_id !== null ? runById.get(v.ai_run_id) : undefined;
+    if (run && run.mode === 'variant') problems.push('content_versions.ai_run_id → generation_runs(원고 run)');
+  }
+  for (const c of t.claims) {
+    const run = runById.get(c.run_id);
+    if (!run) continue;
+    if (c.variant_version_id !== null) {
+      const vv = vvById.get(c.variant_version_id);
+      if (run.mode !== 'variant' || (vv && (vv.ai_run_id !== c.run_id || vv.variant_id !== run.variant_id)) || c.content_version_id !== run.input_version_id) {
+        problems.push('claims.variant_version_id → 그 run 의 파생본 제안 버전');
+      }
+    } else if (run.mode === 'variant' || (run.output_ref !== null && c.content_version_id !== run.output_ref)) {
+      problems.push('claims.content_version_id → 그 run 의 원고 제안 버전');
+    }
+  }
   for (const r of t.variant_assets) {
     need('variant_assets', 'variant_version_id', r.variant_version_id, 'variant_versions');
     need('variant_assets', 'asset_id', r.asset_id, 'assets');

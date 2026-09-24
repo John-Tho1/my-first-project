@@ -21,6 +21,9 @@ import {
   exportOwner,
   getDb,
   insertAsset,
+  listPackages,
+  parseBundleZip,
+  setVariantAssets,
   ownerScope,
   runAssist,
   saveInterviewAnswers,
@@ -29,16 +32,19 @@ import {
   selectBundleRows,
   type Db,
 } from '@cs/db';
-import { buildAssetKey, loadConfig, readZip, RESTORED_TABLES } from '@cs/domain';
+import { buildAssetKey, buildBundle, loadConfig, readZip, RESTORED_TABLES, writeZip, type BundleTables } from '@cs/domain';
 import { LocalStorageAdapter, MOCK_WARNING, MockLlmProvider } from '@cs/providers';
+import { POST as dismissContentPOST } from '../../apps/web/app/api/contents/[id]/assist/[runId]/dismiss/route';
+import { POST as confirmPOST } from '../../apps/web/app/api/contents/[id]/claims/confirm/route';
 import { POST as packagePOST } from '../../apps/web/app/api/contents/[id]/package/route';
 import { GET as variantsGET, POST as variantsPOST } from '../../apps/web/app/api/contents/[id]/variants/route';
 import { GET as packageGET } from '../../apps/web/app/api/packages/[id]/route';
 import { POST as adoptPOST } from '../../apps/web/app/api/variants/[id]/adopt/[versionId]/route';
 import { POST as assetsPOST } from '../../apps/web/app/api/variants/[id]/assets/route';
 import { POST as lifecyclePOST } from '../../apps/web/app/api/variants/[id]/lifecycle/route';
+import { POST as dismissVariantPOST } from '../../apps/web/app/api/variants/[id]/proposals/[runId]/dismiss/route';
 import { POST as versionsPOST } from '../../apps/web/app/api/variants/[id]/versions/route';
-import { BASE, cookieHeader, jsonPost, login } from './helpers';
+import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 const B = 'variants-other@example.local';
@@ -334,8 +340,8 @@ describe('배포 파일(수동 게시용)', () => {
     expect((await post(packagePOST, `/api/contents/${id}/package`, {}, ctx(id), tokenB)).status).toBe(404);
     as(A);
     expect((await packageGET(new Request(`${BASE}/api/packages/not-a-uuid`, { headers: cookieHeader(tokenA) }), ctx('not-a-uuid'))).status).toBe(404);
-    // 저장 위치는 EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip
-    expect(readFileSync(path.join(tmp, 'exports', 'packages', ownerA, `${out.package_id}.zip`)).byteLength).toBe(out.zip_bytes);
+    // 저장 위치는 EXPORT_LOCAL_DIR/packages/<owner>/<content>/<id>.zip(FIX-T09 P2: 원고별 폴더)
+    expect(readFileSync(path.join(tmp, 'exports', 'packages', ownerA, id, `${out.package_id}.zip`)).byteLength).toBe(out.zip_bytes);
   });
 });
 
@@ -358,15 +364,230 @@ describe('export → 빈 DB 복원: variants·variant_versions·variant_assets �
         restoresDir,
       });
       expect(r.conflicts_total).toBe(0);
+      // FIX-T09(P1): review 조건을 못 채우는 파생본(여기서는 원고가 바뀐 뒤 stale 인 threads 초안)은 draft 로 낮아지고 결과에 남는다.
+      const downgraded = new Set(r.downgraded_variants.map((d) => d.variant_id));
+      expect(r.downgraded_variants.length).toBeGreaterThan(0);
+      expect(r.downgraded_variants.every((d) => d.reasons.length > 0)).toBe(true);
+      expect(p.preview.downgraded_variants).toEqual(r.downgraded_variants);
       for (const t of RESTORED_TABLES) {
         const a = (await selectBundleRows(db, t, ownerScope(t, ownerA))).map((x) => x.row);
         const b = (await selectBundleRows(h.db, t, ownerScope(t, target))).map((x) => x.row);
-        expect(b, t).toEqual(a);
+        const expected = t === 'variants' ? a.map((row) => (downgraded.has(row.id as string) ? { ...row, lifecycle: 'draft' } : row)) : a;
+        expect(b, t).toEqual(expected);
       }
       const vs = await h.db.select().from(schema.variants).where(and(eq(schema.variants.ownerId, target)));
       expect(vs.some((v) => v.currentVersionId !== null)).toBe(true);
     } finally {
       await h.close();
     }
+  });
+});
+
+describe('FIX-T09(Codex review-T09)', () => {
+  const EXP = '제가 직접 대리점 대표를 설득했습니다.';
+  const EXP_BODY = `${EXP}\n\n두 번째 문단입니다.`;
+  const confirmVariant = (contentId: string, body: unknown) =>
+    confirmPOST(jsonPost(`/api/contents/${contentId}/claims/confirm`, body, cookieHeader(tokenA)), ctx(contentId));
+
+  it('P0: 경험 문장을 본문(캡션)에서만 빼고 카드에 남기면 removed 409·검토 409, 카드에서도 빼면 둘 다 통과', async () => {
+    const id = await newContent(ownerA, EXP_BODY);
+    const ai = await (await createVariant(id, { channel: 'instagram', mode: 'ai_draft', base_version: 1 })).json();
+    const v = ai.variant.id as string;
+    expect((await adopt(v, ai.proposal.id, { base_version: 0 })).status).toBe(201);
+    expect((await attach(v, { base_version: 2, assets: [{ asset_id: pngA, position: 1, role: 'image' }] })).status).toBe(201); // v3
+    const cur = (await (await variantsGET(new Request(`${BASE}/api/contents/${id}/variants`, { headers: cookieHeader(tokenA) }), ctx(id))).json()).items[0];
+    expect(cur.current_version.body).toContain(EXP);
+    const expIdx = (ai.claims as Array<{ kind: string }>).map((c, i) => (c.kind === 'experience' ? i : -1)).filter((i) => i >= 0);
+    expect(expIdx.length).toBeGreaterThan(0);
+    const blocked0 = await lifecycle(v, { lifecycle: 'review', base_version: 3 });
+    expect((await blocked0.json()).error).toBe('unconfirmed_experience_claims');
+
+    // 본문(=캡션)에서만 빼고 카드에는 남긴다
+    const e1 = await edit(v, { base_version: 3, body: '경험 문장을 뺀 캡션', metadata: { caption: '경험 문장을 뺀 캡션', cards: [{ index: 1, text: EXP }] } });
+    expect(e1.status).toBe(201);
+    const r1 = await confirmVariant(id, { run_id: ai.run.id, claim_indexes: expIdx, resolution: 'removed' });
+    expect(r1.status).toBe(409);
+    expect((await r1.json()).error).toBe('claim_still_in_body');
+    const b1 = await lifecycle(v, { lifecycle: 'review', base_version: 4 });
+    expect(b1.status).toBe(409);
+    expect((await b1.json()).error).toBe('unconfirmed_experience_claims');
+
+    // 카드에서도 빼면 제외가 되고 검토로 갈 수 있다
+    expect((await edit(v, { base_version: 4, body: '경험 문장을 뺀 캡션', metadata: { caption: '경험 문장을 뺀 캡션', cards: [{ index: 1, text: '다른 카드' }] } })).status).toBe(201);
+    expect((await confirmVariant(id, { run_id: ai.run.id, claim_indexes: expIdx, resolution: 'removed' })).status).toBe(200);
+    expect((await lifecycle(v, { lifecycle: 'review', base_version: 5 })).status).toBe(200);
+
+    // 배포 파일의 output.txt = 검사한 글(본문 + 메타데이터)
+    const pk = await (await post(packagePOST, `/api/contents/${id}/package`, {}, ctx(id))).json();
+    const entries = readZip(new Uint8Array(await (await packageGET(new Request(`${BASE}${pk.download_url}`, { headers: cookieHeader(tokenA) }), ctx(pk.package_id))).arrayBuffer()));
+    const out = Buffer.from(entries.find((e) => e.path === 'instagram/output.txt')!.bytes).toString('utf8');
+    expect(out).toBe('경험 문장을 뺀 캡션\n경험 문장을 뺀 캡션\n다른 카드');
+    expect(out).not.toContain(EXP);
+  });
+
+  it('P0: 본문과 중복 칸(blog markdown 등)이 다르면 400 metadata_body_mismatch', async () => {
+    const id = await newContent();
+    const v = (await (await createVariant(id, { channel: 'blog', mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    const res = await edit(v, { base_version: 1, body: '새 본문', metadata: { title: 't', markdown: `새 본문\n\n${EXP}` } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('metadata_body_mismatch');
+    expect((await edit(v, { base_version: 1, body: '새 본문', metadata: { title: 't', markdown: '새 본문' } })).status).toBe(201);
+  });
+
+  it('P1: 미채택 AI 제안은 뒤의 수정·첨부 후에도 보이고 채택 가능, 무시하면 사라지고 무시한 제안 채택 → 409', async () => {
+    const id = await newContent();
+    const v = (await (await createVariant(id, { channel: 'threads', mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    const ai = await (await createVariant(id, { channel: 'threads', mode: 'ai_draft', base_version: 1 })).json();
+    expect(ai.proposal.version).toBe(2);
+    await edit(v, { base_version: 1, body: '사용자 수정', metadata: { text: '사용자 수정', thread_parts: ['사용자 수정'] } }); // v3
+    const list = async () => (await (await variantsGET(new Request(`${BASE}/api/contents/${id}/variants`, { headers: cookieHeader(tokenA) }), ctx(id))).json()).items[0];
+    expect((await list()).proposal?.id).toBe(ai.proposal.id);
+    // 두 번째 제안을 만들고 무시 → 첫 제안이 다시 보인다(가장 최근 미처리 제안)
+    const ai2 = await (await createVariant(id, { channel: 'threads', mode: 'ai_draft', base_version: 1 })).json();
+    expect((await list()).proposal?.id).toBe(ai2.proposal.id);
+    const dis = await dismissVariantPOST(
+      jsonPost(`/api/variants/${v}/proposals/${ai2.run.id}/dismiss`, {}, cookieHeader(tokenA)),
+      { params: Promise.resolve({ id: v, runId: ai2.run.id }) },
+    );
+    expect(dis.status).toBe(200);
+    expect((await list()).proposal?.id).toBe(ai.proposal.id);
+    expect((await adopt(v, ai2.proposal.id, { base_version: 3 })).status).toBe(409);
+    // 첫 제안은 수정 뒤에도 채택 가능 → 채택하면 목록에서 빠지고 다시 채택 → 409
+    expect((await adopt(v, ai.proposal.id, { base_version: 3 })).status).toBe(201);
+    expect((await list()).proposal).toBeNull();
+    expect((await adopt(v, ai.proposal.id, { base_version: 4 })).status).toBe(409);
+    // 다른 owner 는 무시할 수 없다
+    as(B);
+    const other = await dismissVariantPOST(
+      jsonPost(`/api/variants/${v}/proposals/${ai.run.id}/dismiss`, {}, cookieHeader(tokenB)),
+      { params: Promise.resolve({ id: v, runId: ai.run.id }) },
+    );
+    expect(other.status).toBe(404);
+    as(A);
+  });
+
+  it('P1: 원고 AI 제안도 무시하면 채택 불가(409), 이미 무시 → 409', async () => {
+    const id = await newContent();
+    const r = await runAssist(db, ownerA, id, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, new MockLlmProvider());
+    const dis = (token = tokenA) =>
+      dismissContentPOST(jsonPost(`/api/contents/${id}/assist/${r.run.id}/dismiss`, {}, cookieHeader(token)), { params: Promise.resolve({ id, runId: r.run.id }) });
+    expect((await dis()).status).toBe(200);
+    expect((await dis()).status).toBe(409);
+    let code = '';
+    try {
+      await adoptProposal(db, ownerA, id, r.run.id, 1);
+    } catch (e) {
+      code = (e as { code?: string }).code ?? '';
+    }
+    expect(code).toBe('run_not_adoptable');
+  });
+
+  it('P1: 묶음의 Threads 버전 ai_run_id 를 같은 원고의 Blog run 으로 바꾸면 복원 미리보기 거부', async () => {
+    const id = await newContent();
+    const t = await (await createVariant(id, { channel: 'threads', mode: 'ai_draft', base_version: 1 })).json();
+    const b = await (await createVariant(id, { channel: 'blog', mode: 'ai_draft', base_version: 1 })).json();
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'swap-exports') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const tables = structuredClone(parsed.tables) as BundleTables;
+    tables.variant_versions.find((v) => v.id === t.proposal.id)!.ai_run_id = b.run.id;
+    const zip = writeZip(
+      buildBundle({
+        exportId: randomUUID(),
+        exportedAt: new Date().toISOString(),
+        appVersion: parsed.manifest.app_version,
+        migrations: parsed.manifest.schema_migrations,
+        owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+        tables,
+        assetBytes: new Map(parsed.assetBytes),
+      }).entries,
+    );
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'swap-t09@example.local')).id;
+      await expect(createRestorePreview(h.db, target, zip, { restoresDir: path.join(tmp, 'swap-restores'), source: 'upload' })).rejects.toMatchObject({
+        code: 'integrity',
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('P1: 첨부 없는 review Instagram 파생본을 복원하면 draft 로 낮추고 이유를 남긴다', async () => {
+    const cid = await newContent();
+    const iv = (await (await createVariant(cid, { channel: 'instagram', mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    await attach(iv, { base_version: 1, assets: [{ asset_id: pngA, position: 1, role: 'image' }] });
+    expect((await lifecycle(iv, { lifecycle: 'review', base_version: 2 })).status).toBe(200);
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'dg-exports') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const tables = structuredClone(parsed.tables) as BundleTables;
+    const reviewIg = tables.variants.find((v) => v.id === iv && v.lifecycle === 'review');
+    expect(reviewIg).toBeDefined();
+    tables.variant_assets = [];
+    const zip = writeZip(
+      buildBundle({
+        exportId: randomUUID(),
+        exportedAt: new Date().toISOString(),
+        appVersion: parsed.manifest.app_version,
+        migrations: parsed.manifest.schema_migrations,
+        owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+        tables,
+        assetBytes: new Map(parsed.assetBytes),
+      }).entries,
+    );
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'downgrade-t09@example.local')).id;
+      const restoresDir = path.join(tmp, 'dg-restores');
+      const p = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+      const r = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-dg')), target, p.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      const d = r.downgraded_variants.find((x) => x.variant_id === reviewIg!.id);
+      expect(d).toMatchObject({ channel: 'instagram', reasons: expect.arrayContaining(['media_incomplete:image(이미지 1개 이상)']) });
+      const [row] = await h.db.select().from(schema.variants).where(eq(schema.variants.id, reviewIg!.id));
+      expect(row!.lifecycle).toBe('draft');
+      expect(p.preview.downgraded_variants.map((x) => x.variant_id)).toContain(reviewIg!.id);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('P2: 폼 첨부도 개수 20·순서 50 상한(DB 함수도 검사)', async () => {
+    const id = await newContent();
+    const v = (await (await createVariant(id, { channel: 'blog', mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    const formAttach = () =>
+      assetsPOST(
+        new Request(`${BASE}/api/variants/${v}/assets`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(tokenA) },
+          body: new URLSearchParams({ asset_id: pngA, role: 'attachment' }).toString(),
+        }),
+        ctx(v),
+      );
+    // position 50 에 하나를 두면 폼 덧붙이기(51)는 거부
+    expect((await attach(v, { base_version: 1, assets: [{ asset_id: pngA, position: 50, role: 'attachment' }] })).status).toBe(201);
+    const over = await formAttach();
+    expect(over.status).toBe(303);
+    expect(over.headers.get('location')).toBe(`/contents/${id}?error=invalid`);
+    // 20개까지는 되고 21번째는 거부
+    await attach(v, { base_version: 2, assets: Array.from({ length: 19 }, (_, i) => ({ asset_id: pngA, position: i + 1, role: 'attachment' as const })) });
+    expect((await formAttach()).headers.get('location')).toMatch(/variant_saved=blog/); // 20번째
+    const r21 = await formAttach();
+    expect(r21.headers.get('location')).toBe(`/contents/${id}?error=invalid`);
+    await expect(
+      setVariantAssets(db, ownerA, v, { baseVersion: 4, assets: Array.from({ length: 21 }, (_, i) => ({ assetId: pngA, position: i + 1, role: 'attachment' as const })) }),
+    ).rejects.toMatchObject({ code: 'bad_request' });
+  });
+
+  it('P2: 작성실 배포 파일 목록은 그 원고의 것만', async () => {
+    const a = await newContent();
+    const b = await newContent();
+    await createVariant(a, { channel: 'blog', mode: 'draft', base_version: 1 });
+    await createVariant(b, { channel: 'blog', mode: 'draft', base_version: 1 });
+    const pa = await (await post(packagePOST, `/api/contents/${a}/package`, {}, ctx(a))).json();
+    const pb = await (await post(packagePOST, `/api/contents/${b}/package`, {}, ctx(b))).json();
+    const listA = await listPackages(path.join(tmp, 'exports'), ownerA, a);
+    expect(listA.map((p) => p.id)).toEqual([pa.package_id]);
+    expect((await listPackages(path.join(tmp, 'exports'), ownerA, b)).map((p) => p.id)).toEqual([pb.package_id]);
+    // 다른 원고의 배포 파일도 owner 는 id 로 내려받을 수 있다(owner 범위)
+    expect((await packageGET(new Request(`${BASE}/api/packages/${pb.package_id}`, { headers: cookieHeader(tokenA) }), ctx(pb.package_id))).status).toBe(200);
   });
 });

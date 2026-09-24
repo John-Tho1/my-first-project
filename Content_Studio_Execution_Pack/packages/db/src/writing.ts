@@ -32,6 +32,8 @@ import {
   promptVersionFor,
   estimateTokens,
   sanitizeLlmOutput,
+  renderVariantText,
+  type Channel,
   type BudgetPolicy,
   type SanitizedClaim,
   type SanitizedOutput,
@@ -71,15 +73,19 @@ import {
   variantVersions,
 } from './schema';
 
-/** T09: 파생본의 현재 버전 본문(owner 범위). 없으면 undefined. */
+/**
+ * T09: 파생본의 현재 버전에서 실제로 나가는 글 전체(owner 범위). 없으면 undefined.
+ * FIX-T09(P0): 본문만이 아니라 채널 메타데이터(캡션·카드·Markdown·설명·태그 등)까지 합친 renderVariantText.
+ */
 export async function variantCurrentBody(tx: DbOrTx, ownerId: string, variantId: string): Promise<string | undefined> {
   const rows = await tx
-    .select({ body: variantVersions.body })
+    .select({ body: variantVersions.body, metadata: variantVersions.metadataJson, channel: variants.channel })
     .from(variants)
     .innerJoin(variantVersions, and(eq(variantVersions.id, variants.currentVersionId), eq(variantVersions.variantId, variants.id)))
     .where(and(eq(variants.id, variantId), eq(variants.ownerId, ownerId)))
     .limit(1);
-  return rows[0]?.body;
+  const r = rows[0];
+  return r ? renderVariantText(r.channel as Channel, r.body, r.metadata) : undefined;
 }
 
 export type BrandProfileRow = typeof brandProfiles.$inferSelect;
@@ -671,6 +677,8 @@ export async function adoptProposal(
         yours: { base_version: baseVersion, run_id: run.id },
       });
     }
+    // FIX-T09(P1): 무시한 제안은 채택할 수 없다(proposal_status). 재채택은 위의 stale_base 가 먼저 막는다.
+    if (run.proposalStatus !== 'proposed') throw new AppError('conflict', 'run_not_adoptable', '이미 채택했거나 무시한 AI 제안입니다');
     const proposalRows = await tx
       .select()
       .from(contentVersions)
@@ -692,6 +700,10 @@ export async function adoptProposal(
       const pending = await listUnconfirmedExperienceClaims(tx, ownerId, content.id);
       if (pending.length > 0) throw new UnconfirmedExperienceClaimsError(pending);
     }
+    await tx
+      .update(generationRuns)
+      .set({ proposalStatus: 'adopted' })
+      .where(and(eq(generationRuns.id, run.id), eq(generationRuns.ownerId, ownerId)));
     const unconfirmed = claimsOf(run.outputJson).filter(claimNeedsConfirmation).length;
     await recordAudit(tx, {
       ownerId,

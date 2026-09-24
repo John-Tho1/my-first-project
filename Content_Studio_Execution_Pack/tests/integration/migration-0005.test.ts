@@ -241,4 +241,39 @@ describe('0005 migration: 기존 데이터 위에 적용', () => {
     ).toMatch(/claims_evidence_grade_chk/);
     await client.close();
   });
+
+  it('0011: 이미 채택된 run 은 proposal_status=adopted, 나머지는 proposed, CHECK', async () => {
+    const { client } = createDb({ driver: 'pglite', url: 'memory://' });
+    for (const tag of tags.filter((t) => t < '0011')) await applyTag(client, tag);
+    const u = await client.query<{ id: string }>("insert into users (allowed_identity) values ('m11@example.local') returning id");
+    const ownerId = u.rows[0]!.id;
+    const bp = await client.query<{ id: string }>(
+      `insert into brand_profiles (owner_id, version, pen_name, audience, pillars) values ($1, 1, 'p', 'a', '["x"]'::jsonb) returning id`,
+      [ownerId],
+    );
+    const c = await client.query<{ id: string }>(`insert into contents (owner_id, title) values ($1, 't') returning id`, [ownerId]);
+    const v = await client.query<{ id: string }>(
+      `insert into content_versions (content_id, version, body, created_by) values ($1, 1, 'b', 'owner') returning id`,
+      [c.rows[0]!.id],
+    );
+    const mkRun = async () =>
+      (
+        await client.query<{ id: string }>(
+          `insert into generation_runs (owner_id, content_id, mode, input_version_id, brand_profile_id, input_version_refs, prompt_version, provider, model, status)
+           values ($1, $2, 'draft', $3, $4, '{}'::jsonb, 'v', 'mock', 'mock', 'succeeded') returning id`,
+          [ownerId, c.rows[0]!.id, v.rows[0]!.id, bp.rows[0]!.id],
+        )
+      ).rows[0]!.id;
+    const adopted = await mkRun();
+    const open = await mkRun();
+    await client.query(`insert into content_versions (content_id, version, body, created_by, ai_run_id) values ($1, 2, 'b', 'ai:mock', $2)`, [c.rows[0]!.id, open]);
+    await client.query(`insert into content_versions (content_id, version, body, created_by, ai_run_id) values ($1, 3, 'b', 'owner', $2)`, [c.rows[0]!.id, adopted]);
+
+    await applyTag(client, tags.find((t) => t.startsWith('0011'))!);
+
+    const rows = (await client.query<{ id: string; proposal_status: string }>('select id, proposal_status from generation_runs')).rows;
+    expect(Object.fromEntries(rows.map((r) => [r.id, r.proposal_status]))).toEqual({ [adopted]: 'adopted', [open]: 'proposed' });
+    expect(await errorOf(client.query(`update generation_runs set proposal_status = 'maybe'`))).toMatch(/generation_runs_proposal_status_chk/);
+    await client.close();
+  });
 });

@@ -1,5 +1,13 @@
 import { appendedAssetList, setVariantAssets, variantVersionView } from '@cs/db';
-import { assertSameOrigin, BadRequestError, VARIANT_ROLES, variantAssetsSchema, type VariantRole } from '@cs/domain';
+import {
+  assertSameOrigin,
+  BadRequestError,
+  MAX_ASSET_POSITION,
+  MAX_VARIANT_ASSETS,
+  VARIANT_ROLES,
+  variantAssetsSchema,
+  type VariantRole,
+} from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
 import { getConfig } from '../../../../../lib/server';
@@ -30,7 +38,14 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     if (body.kind === 'form') {
       const role = body.data.role as VariantRole;
       if (!(VARIANT_ROLES as readonly string[]).includes(role) || !body.data.asset_id) throw new BadRequestError('파일과 역할을 고르세요');
-      input = await appendedAssetList(owner.db, owner.ownerId, id.toLowerCase(), body.data.asset_id, role);
+      const appended = await appendedAssetList(owner.db, owner.ownerId, id.toLowerCase(), body.data.asset_id, role);
+      // FIX-T09(P2): 폼으로 만든 전체 목록도 JSON 과 같은 스키마(개수 ≤20, position ≤50)로 검사한다.
+      const parsed = variantAssetsSchema.safeParse({
+        base_version: appended.baseVersion,
+        assets: appended.assets.map((a) => ({ asset_id: a.assetId, position: a.position, role: a.role })),
+      });
+      if (!parsed.success) throw new BadRequestError(`첨부는 ${MAX_VARIANT_ASSETS}개, 순서 번호는 ${MAX_ASSET_POSITION}까지입니다`);
+      input = appended;
     } else {
       const parsed = variantAssetsSchema.safeParse(body.data);
       if (!parsed.success) throw validationError(parsed.error);

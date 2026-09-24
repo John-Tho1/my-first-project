@@ -19,6 +19,7 @@ export function VariantsPanel({
   packages,
   savedChannel,
   newPackageId,
+  contentTitle,
 }: {
   contentId: string;
   coreVersion: number;
@@ -27,6 +28,7 @@ export function VariantsPanel({
   packages: Array<{ id: string; bytes: number; createdAt: Date }>;
   savedChannel: string | null;
   newPackageId: string | null;
+  contentTitle: string;
 }) {
   const byChannel = new Map(states.map((s) => [s.variant.channel, s]));
   return (
@@ -131,6 +133,11 @@ export function VariantsPanel({
                   <input type="hidden" name="base_version" value={cur?.version ?? 0} />
                   <button type="submit">AI 초안 채택(새 버전)</button>
                 </form>
+                {s.proposal.aiRunId ? (
+                  <form className="form inline" method="post" action={`/api/variants/${s.variant.id}/proposals/${s.proposal.aiRunId}/dismiss`}>
+                    <button type="submit">무시(목록에서 빼기)</button>
+                  </form>
+                ) : null}
               </div>
             ) : null}
             <form className="form inline" method="post" action={`/api/contents/${contentId}/variants`}>
@@ -148,7 +155,7 @@ export function VariantsPanel({
           </div>
         );
       })}
-      <h4>배포 파일</h4>
+      <h4>배포 파일 — {contentTitle}</h4>
       <p className="notice" role="note">
         배포 파일(수동 게시용). 자동 게시 아님 — 파일을 받는 것은 승인이나 게시가 아닙니다.
       </p>

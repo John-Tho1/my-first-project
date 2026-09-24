@@ -274,6 +274,7 @@ describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
           created_at: TS,
           finished_at: TS,
           variant_id: null,
+          proposal_status: 'proposed',
         },
       ],
       claim_confirmations: [],
@@ -427,5 +428,52 @@ describe('FIX-T07: 출력 정제·user_confirmed 복원 거부', () => {
       assetBytes: new Map(),
     });
     expect(() => parseBundle(b.entries, { migrations: ['0000_a'] })).toThrow(expect.objectContaining({ code: 'invalid_rows' }));
+  });
+});
+
+describe('FIX-T09: 묶음의 파생본 AI 참조는 같은 파생본의 variant run', () => {
+  const OWNER = '11111111-1111-4111-8111-111111111111';
+  const BP = '22222222-2222-4222-8222-222222222222';
+  const CT = '33333333-3333-4333-8333-333333333333';
+  const CV = '44444444-4444-4444-8444-444444444444';
+  const VT = '55555555-5555-4555-8555-55555555555a';
+  const VB = '55555555-5555-4555-8555-55555555555b';
+  const VTV = '66666666-6666-4666-8666-66666666666a';
+  const VBV = '66666666-6666-4666-8666-66666666666b';
+  const RT = '77777777-7777-4777-8777-77777777777a';
+  const RB = '77777777-7777-4777-8777-77777777777b';
+  const TS = '2026-09-01T06:10:00.123456Z';
+  const run = (id: string, variant: string) => ({
+    id, content_id: CT, mode: 'variant', input_version_id: CV, brand_profile_id: BP, input_version_refs: {}, prompt_version: 'v', provider: 'mock', model: 'mock',
+    status: 'succeeded', output_ref: null, output_json: { claims: [] }, error: null, created_at: TS, finished_at: TS, variant_id: variant, proposal_status: 'proposed',
+  });
+  const vv = (id: string, variant: string, runId: string) => ({ id, variant_id: variant, version: 1, content_version_id: CV, body: 'b', metadata_json: {}, created_by: 'ai:mock', ai_run_id: runId, created_at: TS });
+  function build(threadsRun: string) {
+    const tables = {
+      users: [{ id: OWNER, identity_masked: 'ow***@example.local' }],
+      brand_profiles: [{ id: BP, version: 1, pen_name: 'p', audience: 'a', pillars: ['x'], style_rules: [], created_at: TS }],
+      sources: [], source_versions: [], captures: [], capture_revisions: [], ideas: [], idea_captures: [],
+      contents: [{ id: CT, idea_id: null, series: null, title: 't', audience: null, tags: [], revision: 1, current_version_id: CV, lifecycle: 'draft', created_at: TS, updated_at: TS }],
+      content_versions: [{ id: CV, content_id: CT, version: 1, body: 'b', created_by: 'owner', ai_run_id: null, created_at: TS, note: null }],
+      content_captures: [],
+      variants: [
+        { id: VT, content_id: CT, channel: 'threads', current_version_id: null, lifecycle: 'draft', created_at: TS, updated_at: TS },
+        { id: VB, content_id: CT, channel: 'blog', current_version_id: null, lifecycle: 'draft', created_at: TS, updated_at: TS },
+      ],
+      variant_versions: [vv(VTV, VT, threadsRun), vv(VBV, VB, RB)],
+      interview_answers: [],
+      generation_runs: [run(RT, VT), run(RB, VB)],
+      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], audit_events: [],
+    } as unknown as BundleTables;
+    return buildBundle({
+      exportId: '88888888-8888-4888-8888-888888888888', exportedAt: '2026-09-24T12:00:00.000Z', appVersion: '0.1.0', migrations: ['0000_a'],
+      owner: { id: OWNER, identityMasked: 'ow***@example.local' }, tables, assetBytes: new Map(),
+    }).entries;
+  }
+  it('정상 연결은 통과, Threads 버전이 같은 원고의 Blog run 을 가리키면 integrity 거부', () => {
+    expect(() => parseBundle(build(RT), { migrations: ['0000_a'] })).not.toThrow();
+    expect(() => parseBundle(build(RB), { migrations: ['0000_a'] })).toThrow(
+      expect.objectContaining({ code: 'integrity', extra: { problems: expect.arrayContaining(['variant_versions.ai_run_id → generation_runs(같은 파생본의 variant run)']) } }),
+    );
   });
 });

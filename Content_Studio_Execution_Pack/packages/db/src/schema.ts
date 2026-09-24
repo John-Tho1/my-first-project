@@ -455,6 +455,11 @@ export const generationRuns = pgTable(
     outputJson: jsonb('output_json').$type<Record<string, unknown>>(),
     /** T09: 채널 초안 run 의 대상 파생본(mode='variant' 일 때만). */
     variantId: uuid('variant_id'),
+    /**
+     * FIX-T09(P1, 0011): 제안의 처리 상태 — 'proposed'(채택·무시 전) | 'adopted' | 'dismissed'. 버전 번호 선후가 아니라 이 값으로
+     * 미채택 제안을 찾는다(뒤에 수정·첨부 변경이 있어도 제안이 사라지지 않게).
+     */
+    proposalStatus: text('proposal_status').notNull().default('proposed'),
     error: text('error'),
     createdAt: ts('created_at').notNull().defaultNow(),
     finishedAt: ts('finished_at'),
@@ -464,6 +469,7 @@ export const generationRuns = pgTable(
     index('generation_runs_content_idx').on(t.contentId, t.createdAt.desc()),
     // T09: 'variant' = 채널 초안 AI 제안(variant_id 필수). 결과는 variant_versions(created_by='ai:mock', ai_run_id)이고 output_ref 는 null.
     check('generation_runs_mode_chk', sql`${t.mode} in ('outline', 'draft', 'revise', 'variant')`),
+    check('generation_runs_proposal_status_chk', sql`${t.proposalStatus} in ('proposed', 'adopted', 'dismissed')`),
     check('generation_runs_variant_chk', sql`(${t.mode} = 'variant') = (${t.variantId} is not null)`),
     foreignKey({
       name: 'generation_runs_variant_same_owner_fk',

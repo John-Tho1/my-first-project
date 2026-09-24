@@ -27,6 +27,11 @@ import {
   MAX_PROPOSAL_BODY,
   MediaIncompleteError,
   mediaCompleteness,
+  MAX_ASSET_POSITION,
+  MAX_VARIANT_ASSETS,
+  MetadataBodyMismatchError,
+  renderVariantText,
+  variantBodyMismatch,
   NotFoundError,
   parseChannelMetadata,
   roleMatchesMime,
@@ -451,6 +456,8 @@ export async function appendVariantVersion(
     const { variant, contentCurrent, current } = await lockVariant(tx, ownerId, variantId);
     assertBase(current, input.baseVersion, { body: input.body, metadata: input.metadata });
     const metadata = parseChannelMetadata(variant.channel as Channel, input.metadata);
+    // FIX-T09(P0): 본문과 중복되는 메타데이터 칸은 본문과 같아야 한다(검사한 글 = 나가는 글). 다르면 400.
+    if (variantBodyMismatch(variant.channel as Channel, input.body, metadata)) throw new MetadataBodyMismatchError(variant.channel as Channel);
     const version = await insertCurrentVariantVersion(
       tx,
       ownerId,
@@ -494,9 +501,17 @@ export async function adoptVariantProposal(
     const { variant, contentCurrent, current } = await lockVariant(tx, ownerId, variantId);
     const proposal = await getVersionRow(tx, ownerId, proposalId.toLowerCase());
     if (!proposal || proposal.variantId !== variant.id) throw new NotFoundError('AI 제안을 찾을 수 없습니다');
-    if (!proposal.createdBy.startsWith('ai:') || proposal.id === current?.id) {
+    if (!proposal.createdBy.startsWith('ai:') || proposal.id === current?.id || !proposal.aiRunId) {
       throw new AppError('conflict', 'run_not_adoptable', '채택할 수 있는 AI 제안이 아닙니다');
     }
+    // FIX-T09(P1): 채택 여부는 run 의 proposal_status 로 판단한다(버전 번호 선후 아님). 이미 채택·무시한 제안 → 409.
+    const pr = await tx
+      .select({ status: generationRuns.proposalStatus })
+      .from(generationRuns)
+      .where(and(eq(generationRuns.id, proposal.aiRunId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.variantId, variant.id)))
+      .for('update')
+      .limit(1);
+    if (pr[0]?.status !== 'proposed') throw new AppError('conflict', 'run_not_adoptable', '이미 채택했거나 무시한 AI 제안입니다');
     assertBase(current, baseVersion, { proposal_id: proposal.id });
     if (proposal.contentVersionId !== contentCurrent.id) {
       throw new StaleBaseError({
@@ -512,6 +527,10 @@ export async function adoptVariantProposal(
       await carriedAssets(tx, ownerId, current),
       now,
     );
+    await tx
+      .update(generationRuns)
+      .set({ proposalStatus: 'adopted' })
+      .where(and(eq(generationRuns.id, proposal.aiRunId), eq(generationRuns.ownerId, ownerId)));
     await recordAudit(tx, {
       ownerId,
       action: 'variant.adopt_ai',
@@ -542,6 +561,11 @@ export async function setVariantAssets(
     assertBase(current, input.baseVersion, { assets: input.assets });
     const ids = input.assets.map((a) => a.assetId.toLowerCase());
     if (ids.some((i) => !isUuid(i))) throw new BadRequestError('asset_id 형식이 올바르지 않습니다');
+    // FIX-T09(P2): 개수·순서 상한은 JSON·폼 모두 이 함수에서도 검사한다.
+    if (input.assets.length > MAX_VARIANT_ASSETS) throw new BadRequestError(`첨부는 ${MAX_VARIANT_ASSETS}개까지입니다`);
+    if (input.assets.some((a) => !Number.isInteger(a.position) || a.position < 1 || a.position > MAX_ASSET_POSITION)) {
+      throw new BadRequestError(`첨부 순서(position)는 1~${MAX_ASSET_POSITION} 입니다`);
+    }
     if (new Set(input.assets.map((a) => a.position)).size !== input.assets.length) throw new BadRequestError('첨부 순서(position)가 겹칩니다');
     const found = ids.length
       ? await tx
@@ -593,12 +617,19 @@ export async function appendedAssetList(db: DbOrTx, ownerId: string, variantId: 
 // ---- 검토 상태·게이트 ----
 
 /** 파생본 현재 버전의 AI run(채택으로 이어진 run)에 미해결 경험 claim 이 있는가 — 판정은 이 파생본의 현재 본문 기준. */
-async function unresolvedVariantClaims(tx: DbOrTx, ownerId: string, current: VariantVersionRow) {
+async function unresolvedVariantClaims(tx: DbOrTx, ownerId: string, channel: Channel, current: VariantVersionRow) {
   if (!current.aiRunId) return [];
   const runRows = await tx
     .select({ id: generationRuns.id, outputJson: generationRuns.outputJson })
     .from(generationRuns)
-    .where(and(eq(generationRuns.id, current.aiRunId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'succeeded')))
+    .where(
+      and(
+        eq(generationRuns.id, current.aiRunId),
+        eq(generationRuns.ownerId, ownerId),
+        eq(generationRuns.status, 'succeeded'),
+        eq(generationRuns.variantId, current.variantId),
+      ),
+    )
     .limit(1);
   const run = runRows[0];
   if (!run) return [];
@@ -606,7 +637,12 @@ async function unresolvedVariantClaims(tx: DbOrTx, ownerId: string, current: Var
     .select({ runId: claimConfirmations.runId, claimIndex: claimConfirmations.claimIndex, resolution: claimConfirmations.resolution })
     .from(claimConfirmations)
     .where(and(eq(claimConfirmations.ownerId, ownerId), eq(claimConfirmations.runId, run.id)));
-  return unconfirmedExperienceClaims([{ runId: run.id, adopted: true, claims: claimsOf(run.outputJson) }], confirmations, current.body);
+  // FIX-T09(P0): 'removed' 는 본문만이 아니라 이 채널에서 실제로 나가는 글 전체(메타데이터 포함)에 없을 때만 해결.
+  return unconfirmedExperienceClaims(
+    [{ runId: run.id, adopted: true, claims: claimsOf(run.outputJson) }],
+    confirmations,
+    renderVariantText(channel, current.body, current.metadataJson),
+  );
 }
 
 /**
@@ -628,7 +664,7 @@ export async function setVariantLifecycle(
       if (isVariantStale(current.contentVersionId, contentCurrent.id)) throw new StaleVariantError();
       const media = mediaCompleteness(variant.channel as Channel, await attachedAssets(tx, ownerId, current.id));
       if (!media.complete) throw new MediaIncompleteError(media.missing);
-      const pending = [...(await listUnconfirmedExperienceClaims(tx, ownerId, content.id)), ...(await unresolvedVariantClaims(tx, ownerId, current))];
+      const pending = [...(await listUnconfirmedExperienceClaims(tx, ownerId, content.id)), ...(await unresolvedVariantClaims(tx, ownerId, variant.channel as Channel, current))];
       if (pending.length > 0) throw new UnconfirmedExperienceClaimsError(pending);
     }
     const updated = await tx
@@ -657,7 +693,7 @@ export interface VariantState {
   assets: AttachedAsset[];
   stale: boolean;
   media: MediaCompleteness;
-  /** 현재 버전보다 나중의(채택하지 않은) AI 제안 중 가장 최근 */
+  /** 채택·무시하지 않은(proposal_status='proposed') AI 제안 중 가장 최근 */
   proposal: VariantVersionRow | null;
   unresolvedClaims: Array<{ run_id: string; claim_index: number; text: string }>;
 }
@@ -674,21 +710,31 @@ export async function listVariantStates(db: DbOrTx, ownerId: string, contentId: 
   for (const variant of rows) {
     const current = await getVersionRow(db, ownerId, variant.currentVersionId);
     const list = current ? await attachedAssets(db, ownerId, current.id) : [];
+    // FIX-T09(P1): 미채택 제안 = run.proposal_status='proposed' 인 성공 run 의 제안 버전(버전 번호와 무관, 가장 최근 run).
     const proposals = await db
-      .select()
-      .from(variantVersions)
-      .where(and(eq(variantVersions.variantId, variant.id), eq(variantVersions.ownerId, ownerId), sql`${variantVersions.createdBy} like 'ai:%'`))
-      .orderBy(desc(variantVersions.version))
+      .select({ v: variantVersions })
+      .from(generationRuns)
+      .innerJoin(variantVersions, and(eq(variantVersions.aiRunId, generationRuns.id), eq(variantVersions.variantId, variant.id), eq(variantVersions.ownerId, ownerId)))
+      .where(
+        and(
+          eq(generationRuns.ownerId, ownerId),
+          eq(generationRuns.variantId, variant.id),
+          eq(generationRuns.status, 'succeeded'),
+          eq(generationRuns.proposalStatus, 'proposed'),
+          sql`${variantVersions.createdBy} like 'ai:%'`,
+        ),
+      )
+      .orderBy(desc(generationRuns.createdAt), desc(variantVersions.version))
       .limit(1);
-    const p = proposals[0] ?? null;
+    const p = proposals[0]?.v ?? null;
     out.push({
       variant,
       current,
       assets: list,
       stale: current ? isVariantStale(current.contentVersionId, contentCurrentVersionId) : false,
       media: mediaCompleteness(variant.channel as Channel, list),
-      proposal: p && (!current || p.version > current.version) ? p : null,
-      unresolvedClaims: current ? await unresolvedVariantClaims(db, ownerId, current) : [],
+      proposal: p,
+      unresolvedClaims: current ? await unresolvedVariantClaims(db, ownerId, variant.channel as Channel, current) : [],
     });
   }
   return out;
@@ -733,4 +779,43 @@ export function variantStateView(s: VariantState) {
 /** 원고 id 로 파생본이 속한 원고를 찾는다(라우트에서 현재 원고 버전을 얻을 때). */
 export async function variantContentId(db: DbOrTx, ownerId: string, variantId: string): Promise<string | null> {
   return (await getVariantRow(db, ownerId, variantId))?.contentId ?? null;
+}
+
+/**
+ * FIX-T09(P1): AI 제안 무시 — run.proposal_status 를 'dismissed' 로(버전 행은 불변으로 남는다). 이미 채택·무시 → 409.
+ * 채널 초안 run 이면 그 파생본, 원고 run 이면 그 원고의 것만(다른 owner·다른 원고·다른 파생본 → 404).
+ */
+export async function dismissProposal(
+  db: Db,
+  ownerId: string,
+  scope: { contentId: string; variantId?: string },
+  runId: string,
+  now: Date = new Date(),
+): Promise<void> {
+  const rid = runId.toLowerCase();
+  if (!isUuid(rid) || !isUuid(scope.contentId) || (scope.variantId !== undefined && !isUuid(scope.variantId))) {
+    throw new NotFoundError('AI 제안을 찾을 수 없습니다');
+  }
+  await db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(generationRuns)
+      .where(and(eq(generationRuns.id, rid), eq(generationRuns.ownerId, ownerId), eq(generationRuns.contentId, scope.contentId)))
+      .for('update')
+      .limit(1);
+    const run = rows[0];
+    if (!run || run.status !== 'succeeded') throw new NotFoundError('AI 제안을 찾을 수 없습니다');
+    if (scope.variantId !== undefined ? run.variantId !== scope.variantId : run.variantId !== null) throw new NotFoundError('AI 제안을 찾을 수 없습니다');
+    if (run.proposalStatus !== 'proposed') throw new AppError('conflict', 'run_not_adoptable', '이미 채택했거나 무시한 AI 제안입니다');
+    await tx.update(generationRuns).set({ proposalStatus: 'dismissed' }).where(and(eq(generationRuns.id, run.id), eq(generationRuns.ownerId, ownerId)));
+    await recordAudit(tx, {
+      ownerId,
+      action: 'content.proposal_dismiss',
+      entity: run.variantId ? 'variant' : 'content',
+      entityId: run.variantId ?? run.contentId,
+      versionOrHash: run.id,
+      details: { mode: run.mode },
+      at: now,
+    });
+  });
 }

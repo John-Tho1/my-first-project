@@ -32,11 +32,15 @@ import {
   type BundleManifest,
   type ParsedBundle,
   type RestoredTable,
+  isVariantStale,
+  mediaCompleteness,
+  type Channel,
 } from '@cs/domain';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
 import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
+import { attachedAssets } from './variants';
 import { assets, captures, contents, ideas, restoreRuns, sources } from './schema';
 
 export type RestoreMode = 'empty_only' | 'add_missing';
@@ -92,11 +96,19 @@ export interface RestoreConflict {
   reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists';
 }
 
+export interface DowngradedVariant {
+  variant_id: string;
+  channel: string;
+  reasons: string[];
+}
+
 export interface ApplyReport {
   tables: Record<RestoredTable, TableCounts>;
   conflicts: RestoreConflict[];
   /** 이번 실행에서 새로 넣은 assets 행 id */
   insertedAssetIds: string[];
+  /** FIX-T09(P1): review 조건(현재 버전·stale 아님·채널 미디어)을 못 채워 draft 로 낮춘 파생본 */
+  downgradedVariants: DowngradedVariant[];
 }
 
 const MAX_CONFLICTS_LISTED = 200;
@@ -279,7 +291,28 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED),
     });
   }
-  return { tables, conflicts, insertedAssetIds };
+  // FIX-T09(P1): 이번에 넣은 review 파생본을 복원된 행(현재 버전·원고 현재 버전·실제 첨부 관계)으로 다시 검사하고,
+  // 조건을 못 채우면 draft 로 낮춘다(검토 상태를 조건 없이 들여오지 않는다). 결과·미리보기에 이유와 함께 남긴다.
+  const downgradedVariants: DowngradedVariant[] = [];
+  const vvById = new Map(bundle.tables.variant_versions.map((v) => [v.id, v]));
+  for (const v of bundle.tables.variants) {
+    if (avail.variants!.get(v.id) !== 'inserted' || v.lifecycle !== 'review') continue;
+    const reasons: string[] = [];
+    const vv = v.current_version_id ? vvById.get(v.current_version_id) : undefined;
+    if (!vv) reasons.push('no_current_version');
+    else {
+      const cur = await tx.execute(sql`select current_version_id from contents where id = ${v.content_id}::uuid and owner_id = ${ownerId}::uuid`);
+      const contentCurrent = ((cur as unknown as { rows: Array<{ current_version_id: string | null }> }).rows[0]?.current_version_id) ?? null;
+      if (isVariantStale(vv.content_version_id, contentCurrent)) reasons.push('stale');
+      const media = mediaCompleteness(v.channel as Channel, await attachedAssets(tx, ownerId, vv.id));
+      if (!media.complete) reasons.push(...media.missing.map((m) => `media_incomplete:${m}`));
+    }
+    if (reasons.length) {
+      await tx.execute(sql`update variants set lifecycle = 'draft' where id = ${v.id}::uuid and owner_id = ${ownerId}::uuid`);
+      downgradedVariants.push({ variant_id: v.id, channel: v.channel, reasons });
+    }
+  }
+  return { tables, conflicts, insertedAssetIds, downgradedVariants };
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
@@ -317,6 +350,8 @@ export interface RestorePreview {
   can_commit_empty_only: boolean;
   can_commit_add_missing: boolean;
   warnings: BundleManifest['warnings'];
+  /** FIX-T09: 복원하면 draft 로 낮아질 review 파생본 */
+  downgraded_variants: DowngradedVariant[];
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
@@ -372,6 +407,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     tables,
     conflicts: r.conflicts.slice(0, MAX_CONFLICTS_LISTED),
     conflicts_total: r.conflicts.length,
+    downgraded_variants: r.downgradedVariants,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
@@ -499,6 +535,7 @@ export interface CommitResult {
   assets_verified: number;
   assets_missing: number;
   committed_at: string;
+  downgraded_variants: DowngradedVariant[];
 }
 
 async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
@@ -598,6 +635,7 @@ export async function commitRestore(
         skipped_identical: skipped,
         conflicts: report.conflicts.slice(0, MAX_CONFLICTS_LISTED),
         conflicts_total: report.conflicts.length,
+        downgraded_variants: report.downgradedVariants,
         assets_written: written,
         assets_verified: verified,
         assets_missing: missing,

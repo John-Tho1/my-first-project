@@ -5,6 +5,8 @@ import {
   isVariantStale,
   mediaCompleteness,
   paragraphs,
+  renderVariantText,
+  variantBodyMismatch,
   parseChannelMetadata,
   roleMatchesMime,
   splitByLength,
@@ -120,5 +122,27 @@ describe('미디어 완성 여부', () => {
     expect(roleMatchesMime('thumbnail', 'application/pdf')).toBe(false);
     expect(roleMatchesMime('video', 'image/png')).toBe(false);
     expect(roleMatchesMime('attachment', 'application/pdf')).toBe(true);
+  });
+});
+
+describe('FIX-T09: 나가는 글 전체·본문 중복 칸 일치', () => {
+  it('renderVariantText 는 채널의 모든 사용자 노출 글을 담는다', () => {
+    expect(renderVariantText('threads', 'b', { text: 't', thread_parts: ['p1', 'p2'] })).toBe('b\nt\np1\np2');
+    expect(renderVariantText('instagram', 'b', { caption: 'c', cards: [{ index: 1, text: '카드' }] })).toBe('b\nc\n카드');
+    expect(renderVariantText('youtube', 'b', { title: 'T', description: 'D', script: 'S', tags: ['x', 'y'] })).toBe('b\nT\nD\nS\nx\ny');
+    expect(renderVariantText('blog', 'b', { title: 'T', markdown: 'M' })).toBe('b\nT\nM');
+  });
+  it('variantBodyMismatch: 본문과 중복 칸이 다르면 true', () => {
+    expect(variantBodyMismatch('blog', 'x', { title: 't', markdown: 'x' })).toBe(false);
+    expect(variantBodyMismatch('blog', 'x', { title: 't', markdown: 'y' })).toBe(true);
+    expect(variantBodyMismatch('instagram', 'c', { caption: 'c', cards: [{ index: 1, text: '다른 글' }] })).toBe(false);
+    expect(variantBodyMismatch('instagram', 'c', { caption: 'd', cards: [] })).toBe(true);
+    expect(variantBodyMismatch('youtube', 's', { title: 't', description: '', script: 'z', tags: [] })).toBe(true);
+    expect(variantBodyMismatch('threads', 'a\n\nb', { text: 'a', thread_parts: ['a', 'b'] })).toBe(false);
+    expect(variantBodyMismatch('threads', 'a\n\nb', { text: 'b', thread_parts: ['a', 'b'] })).toBe(true);
+    for (const ch of ['threads', 'instagram', 'youtube', 'blog'] as const) {
+      const d = channelDraft(ch, 't', '첫 문단\n\n둘째 문단');
+      expect(variantBodyMismatch(ch, d.body, d.metadata), ch).toBe(false);
+    }
   });
 });

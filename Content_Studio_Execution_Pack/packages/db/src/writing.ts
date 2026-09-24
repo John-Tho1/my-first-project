@@ -11,7 +11,7 @@
  * - 채택: 제안 본문으로 새 사용자 버전(created_by='owner', ai_run_id=run)을 만들고 현재 버전으로 옮긴다.
  *   run 의 입력 버전이 현재 버전이 아니면(그 사이 본문이 바뀜·이미 채택) 409 stale_base.
  */
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, ne } from 'drizzle-orm';
 import {
   ASSIST_RESULT_TYPE,
   assistInputVersion,
@@ -30,13 +30,8 @@ import {
   MAX_PROPOSAL_BODY,
   NotFoundError,
   promptVersionFor,
-  BudgetExceededError,
-  checkBudget,
-  costMicro,
   estimateTokens,
   filterClaimSources,
-  fromMicro,
-  reserveFor,
   type BudgetPolicy,
   type FilteredClaim,
   type Reservation,
@@ -52,11 +47,39 @@ import {
   type UnconfirmedClaim,
 } from '@cs/domain';
 import type { Db } from './client';
-import { allowedSourceVersions, insertClaims, lockOwnerForBudget, monthlyUsedMicro, type UsageLedgerRow } from './budget';
+import {
+  allowedSourceVersions,
+  insertClaims,
+  insertReservedLedger,
+  reserveOrThrow,
+  settleLedgerFailed,
+  settleLedgerSucceeded,
+  type UsageLedgerRow,
+} from './budget';
 import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
 import { insertCurrentVersion, lockContentForWrite, nextVersionNumber, type ContentRow, type ContentVersionRow } from './contents';
 import { recordAudit, type DbOrTx } from './queries';
-import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers, usageLedger, users } from './schema';
+import {
+  brandProfiles,
+  claimConfirmations,
+  contentVersions,
+  generationRuns,
+  interviewAnswers,
+  users,
+  variants,
+  variantVersions,
+} from './schema';
+
+/** T09: 파생본의 현재 버전 본문(owner 범위). 없으면 undefined. */
+export async function variantCurrentBody(tx: DbOrTx, ownerId: string, variantId: string): Promise<string | undefined> {
+  const rows = await tx
+    .select({ body: variantVersions.body })
+    .from(variants)
+    .innerJoin(variantVersions, and(eq(variantVersions.id, variants.currentVersionId), eq(variantVersions.variantId, variants.id)))
+    .where(and(eq(variants.id, variantId), eq(variants.ownerId, ownerId)))
+    .limit(1);
+  return rows[0]?.body;
+}
 
 export type BrandProfileRow = typeof brandProfiles.$inferSelect;
 export type InterviewAnswerRow = typeof interviewAnswers.$inferSelect;
@@ -385,24 +408,7 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
 
     // T07(A15): 호출 전 예약. owner 행을 잠그고(동시 예약 직렬화) 이번 달 사용액 + 예약액이 상한을 넘으면 429 — run·원장·버전 없음.
     const policy = input.budget ?? MOCK_UNPRICED;
-    const reservation = reserveFor(policy, prompt);
-    await lockOwnerForBudget(tx, ownerId);
-    const used = await monthlyUsedMicro(tx, ownerId, now);
-    const decision = checkBudget(policy, used, reservation.reserveMicro);
-    if (!decision.ok) {
-      throw new BudgetExceededError({
-        reason: decision.reason,
-        currency: policy.currency,
-        used: fromMicro(used),
-        reserve: fromMicro(reservation.reserveMicro),
-        limit:
-          decision.reason === 'per_run_max'
-            ? fromMicro(policy.perRunMaxMicro ?? 0)
-            : policy.monthlyLimitMicro !== null
-              ? fromMicro(policy.monthlyLimitMicro)
-              : null,
-      });
-    }
+    const reservation = await reserveOrThrow(tx, ownerId, policy, prompt, now);
 
     const inserted = await tx
       .insert(generationRuns)
@@ -429,20 +435,7 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
       })
       .returning();
     const run = inserted[0]!;
-    const ledgerRows = await tx
-      .insert(usageLedger)
-      .values({
-        ownerId,
-        runId: run.id,
-        reservedAmount: fromMicro(reservation.reserveMicro),
-        currency: policy.currency,
-        tokensIn: null,
-        tokensOut: null,
-        pricingSnapshot: reservation.pricingSnapshot,
-        state: 'reserved',
-        createdAt: now,
-      })
-      .returning();
+    const ledger = await insertReservedLedger(tx, ownerId, run.id, policy, reservation, now);
     return {
       run,
       inputVersion,
@@ -450,7 +443,7 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
       prompt,
       sourceIds,
       locators: new Map(chosen.map((c) => [c.id, c.locator])),
-      ledger: ledgerRows[0]!,
+      ledger,
       reservation,
       policy,
     };
@@ -502,10 +495,7 @@ export async function runAssist(
         .set({ status: 'failed', error: failureCode(e), finishedAt: finished })
         .where(and(eq(generationRuns.id, runId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'running')));
       // T07: 실패한 호출도 비용이 났을 수 있으므로 예약액 전체를 실제액으로 확정한다(docs/02: 실패 재시도도 예약량에 반영).
-      await tx
-        .update(usageLedger)
-        .set({ state: 'settled', actualAmount: prep.ledger.reservedAmount, failed: true, settledAt: finished })
-        .where(and(eq(usageLedger.id, prep.ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
+      await settleLedgerFailed(tx, ownerId, prep.ledger, finished);
       await recordAudit(tx, {
         ownerId,
         action: 'content.assist',
@@ -557,18 +547,7 @@ export async function runAssist(
     await insertClaims(tx, ownerId, runId, proposal.id, filtered, prep.locators, finished);
     // T07: 실제 사용량으로 확정(모의는 결정적 추정).
     const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
-    const settled = await tx
-      .update(usageLedger)
-      .set({
-        state: 'settled',
-        actualAmount: fromMicro(costMicro(prep.policy.pricing, usage.tokensIn, usage.tokensOut)),
-        tokensIn: usage.tokensIn,
-        tokensOut: usage.tokensOut,
-        settledAt: finished,
-      })
-      .where(and(eq(usageLedger.id, prep.ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')))
-      .returning();
-    if (!settled[0]) throw new Error('비용 원장 확정에 실패했습니다');
+    const settled = await settleLedgerSucceeded(tx, ownerId, prep.ledger, prep.policy.pricing, usage, finished);
     const updated = await tx
       .update(generationRuns)
       .set({ status: 'succeeded', outputRef: proposal.id, outputJson, finishedAt: finished })
@@ -589,11 +568,11 @@ export async function runAssist(
         claims: output.claims.length,
         experience_claims: output.claims.filter((c) => c.kind === 'experience').length,
         dropped_source_refs: droppedTotal,
-        actual_amount: settled[0].actualAmount,
+        actual_amount: settled.actualAmount,
       },
       at: finished,
     });
-    return { run: updated[0], proposal, current, output: { ...output, warnings }, claims: filtered, ledger: settled[0] };
+    return { run: updated[0], proposal, current, output: { ...output, warnings }, claims: filtered, ledger: settled };
   });
 }
 
@@ -614,7 +593,8 @@ export async function listGenerationRuns(db: DbOrTx, ownerId: string, contentId:
   return db
     .select()
     .from(generationRuns)
-    .where(and(eq(generationRuns.ownerId, ownerId), eq(generationRuns.contentId, contentId)))
+    // T09: 채널 초안 run(mode='variant')은 원고 작성 보조 목록에 넣지 않는다(채널 초안 카드에서 따로 보인다).
+    .where(and(eq(generationRuns.ownerId, ownerId), eq(generationRuns.contentId, contentId), ne(generationRuns.mode, 'variant')))
     .orderBy(desc(generationRuns.createdAt), desc(generationRuns.id))
     .limit(limit);
 }
@@ -754,7 +734,9 @@ export async function confirmClaims(
       if (!c || !claimNeedsConfirmation(c)) throw new BadRequestError('확인이 필요한 경험 주장이 아닙니다');
     }
     if (resolution === 'removed') {
-      const still = idx.filter((i) => bodyContainsClaim(current.body, claims[i]!.text));
+      // T09: 채널 초안 run 의 claim 은 그 파생본의 현재 본문에서 빠졌는지 본다(원고 본문이 아니라).
+      const body = run.variantId ? await variantCurrentBody(tx, ownerId, run.variantId) : current.body;
+      const still = idx.filter((i) => body === undefined || bodyContainsClaim(body, claims[i]!.text));
       if (still.length > 0) throw new ClaimStillInBodyError(still);
     }
     const inserted = await tx

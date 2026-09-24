@@ -4,7 +4,18 @@
  * schema·queries 외 다른 모듈을 import 하지 않는다(writing.ts 와의 순환 방지).
  */
 import { and, asc, eq, gte, inArray, sql } from 'drizzle-orm';
-import { fromMicro, mskMonthStart, toMicro, type FilteredClaim } from '@cs/domain';
+import {
+  BudgetExceededError,
+  checkBudget,
+  costMicro,
+  fromMicro,
+  mskMonthStart,
+  reserveFor,
+  toMicro,
+  type BudgetPolicy,
+  type FilteredClaim,
+  type Reservation,
+} from '@cs/domain';
 import type { DbOrTx } from './queries';
 import {
   captures,
@@ -41,6 +52,89 @@ export async function monthlyUsedMicro(tx: DbOrTx, ownerId: string, now: Date): 
     .from(usageLedger)
     .where(and(eq(usageLedger.ownerId, ownerId), gte(usageLedger.createdAt, mskMonthStart(now))));
   return toMicro(rows[0]?.total ?? '0');
+}
+
+/**
+ * 호출 전 예약 검사(A15). owner 행을 잠그고(동시 예약 직렬화) 이번 달 사용액 + 예약액이 상한을 넘으면 BudgetExceededError(429).
+ * 반드시 run·원장을 쓰는 트랜잭션 안에서 호출한다 — 거부되면 그 트랜잭션 전체가 되돌아가 아무것도 남지 않는다.
+ */
+export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: BudgetPolicy, prompt: string, now: Date): Promise<Reservation> {
+  const reservation = reserveFor(policy, prompt);
+  await lockOwnerForBudget(tx, ownerId);
+  const used = await monthlyUsedMicro(tx, ownerId, now);
+  const decision = checkBudget(policy, used, reservation.reserveMicro);
+  if (!decision.ok) {
+    throw new BudgetExceededError({
+      reason: decision.reason,
+      currency: policy.currency,
+      used: fromMicro(used),
+      reserve: fromMicro(reservation.reserveMicro),
+      limit:
+        decision.reason === 'per_run_max'
+          ? fromMicro(policy.perRunMaxMicro ?? 0)
+          : policy.monthlyLimitMicro !== null
+            ? fromMicro(policy.monthlyLimitMicro)
+            : null,
+    });
+  }
+  return reservation;
+}
+
+export async function insertReservedLedger(
+  tx: DbOrTx,
+  ownerId: string,
+  runId: string,
+  policy: BudgetPolicy,
+  reservation: Reservation,
+  now: Date,
+): Promise<UsageLedgerRow> {
+  const rows = await tx
+    .insert(usageLedger)
+    .values({
+      ownerId,
+      runId,
+      reservedAmount: fromMicro(reservation.reserveMicro),
+      currency: policy.currency,
+      tokensIn: null,
+      tokensOut: null,
+      pricingSnapshot: reservation.pricingSnapshot,
+      state: 'reserved',
+      createdAt: now,
+    })
+    .returning();
+  return rows[0]!;
+}
+
+/** 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02). */
+export async function settleLedgerFailed(tx: DbOrTx, ownerId: string, ledger: UsageLedgerRow, at: Date): Promise<void> {
+  await tx
+    .update(usageLedger)
+    .set({ state: 'settled', actualAmount: ledger.reservedAmount, failed: true, settledAt: at })
+    .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
+}
+
+/** 성공한 호출: 실제 토큰 × 단가로 확정. */
+export async function settleLedgerSucceeded(
+  tx: DbOrTx,
+  ownerId: string,
+  ledger: UsageLedgerRow,
+  pricing: BudgetPolicy['pricing'],
+  usage: { tokensIn: number; tokensOut: number },
+  at: Date,
+): Promise<UsageLedgerRow> {
+  const rows = await tx
+    .update(usageLedger)
+    .set({
+      state: 'settled',
+      actualAmount: fromMicro(costMicro(pricing, usage.tokensIn, usage.tokensOut)),
+      tokensIn: usage.tokensIn,
+      tokensOut: usage.tokensOut,
+      settledAt: at,
+    })
+    .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')))
+    .returning();
+  if (!rows[0]) throw new Error('비용 원장 확정에 실패했습니다');
+  return rows[0];
 }
 
 export async function monthlyUsage(db: DbOrTx, ownerId: string, now: Date = new Date()) {
@@ -119,6 +213,8 @@ export async function insertClaims(
   filtered: readonly FilteredClaim[],
   locators: ReadonlyMap<string, string | null>,
   now: Date,
+  /** T09: 채널 초안 run 이면 그 제안 variant_version(contentVersionId 는 파생 기준 원고 버전) */
+  variantVersionId: string | null = null,
 ): Promise<void> {
   for (const c of filtered) {
     const inserted = await tx
@@ -127,6 +223,7 @@ export async function insertClaims(
         ownerId,
         contentVersionId,
         runId,
+        variantVersionId,
         claimIndex: c.index,
         statement: c.text,
         kind: c.kind,

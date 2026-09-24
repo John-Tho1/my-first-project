@@ -37,6 +37,9 @@ export const EXPORTED_TABLES = [
   'contents',
   'content_versions',
   'content_captures',
+  // T09: variants 는 generation_runs(variant_id) 보다, variant_versions 는 claims(variant_version_id) 보다 먼저.
+  'variants',
+  'variant_versions',
   'interview_answers',
   'generation_runs',
   'claim_confirmations',
@@ -44,6 +47,7 @@ export const EXPORTED_TABLES = [
   'claim_sources',
   'usage_ledger',
   'assets',
+  'variant_assets',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -59,6 +63,9 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   claims: '0008_t07_budget_claims',
   claim_sources: '0008_t07_budget_claims',
   usage_ledger: '0008_t07_budget_claims',
+  variants: '0009_t09_variants',
+  variant_versions: '0009_t09_variants',
+  variant_assets: '0009_t09_variants',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -223,7 +230,7 @@ export const ROW_SCHEMAS = {
   generation_runs: z.strictObject({
     id: uuid,
     content_id: uuid,
-    mode: z.enum(['outline', 'draft', 'revise']),
+    mode: z.enum(['outline', 'draft', 'revise', 'variant']),
     input_version_id: uuid,
     brand_profile_id: uuid,
     input_version_refs: z.record(z.string(), z.unknown()),
@@ -236,6 +243,8 @@ export const ROW_SCHEMAS = {
     error: nstr,
     created_at: ts,
     finished_at: ts.nullable(),
+    // 0009 열(채널 초안 run). 이전 묶음에는 없으므로 null.
+    variant_id: uuid.nullable().default(null),
   }),
   claim_confirmations: z.strictObject({
     id: uuid,
@@ -246,6 +255,34 @@ export const ROW_SCHEMAS = {
     resolution: z.enum(['confirmed', 'removed']).default('confirmed'),
     // 0007 열. 이전 묶음에는 없으므로 null(게이트는 'removed' 를 현재 본문으로 다시 검사한다).
     body_version_id: uuid.nullable().default(null),
+  }),
+  // T09(0009)
+  variants: z.strictObject({
+    id: uuid,
+    content_id: uuid,
+    channel: z.enum(['threads', 'instagram', 'youtube', 'blog']),
+    current_version_id: uuid.nullable(),
+    lifecycle: z.enum(['draft', 'review']),
+    created_at: ts,
+    updated_at: ts,
+  }),
+  variant_versions: z.strictObject({
+    id: uuid,
+    variant_id: uuid,
+    version: int.min(1),
+    content_version_id: uuid,
+    body: str,
+    metadata_json: z.record(z.string(), z.unknown()),
+    created_by: str,
+    ai_run_id: uuid.nullable(),
+    created_at: ts,
+  }),
+  variant_assets: z.strictObject({
+    id: uuid,
+    variant_version_id: uuid,
+    asset_id: uuid,
+    position: int.min(1),
+    role: z.enum(['image', 'video', 'thumbnail', 'attachment']),
   }),
   // T07(0008)
   claims: z.strictObject({
@@ -258,6 +295,8 @@ export const ROW_SCHEMAS = {
     evidence_grade: z.enum(['none', 'source', 'user_confirmed']),
     personal_experience_confirmed: z.boolean(),
     needs_check: z.boolean(),
+    // 0009 열. 이전 묶음에는 없으므로 null.
+    variant_version_id: uuid.nullable().default(null),
     created_at: ts,
   }),
   claim_sources: z.strictObject({ id: uuid, claim_id: uuid, source_version_id: uuid, locator: nstr, support_note: nstr }),
@@ -860,6 +899,36 @@ export function checkIntegrity(t: BundleTables): void {
     need('claim_sources', 'source_version_id', r.source_version_id, 'source_versions');
   }
   for (const r of t.usage_ledger) need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
+  // T09: 파생본은 같은 원고, 버전은 그 파생본·그 원고의 원고 버전, 현재 버전은 그 파생본의 버전, 첨부는 묶음 안 파일.
+  const variantContent = new Map(t.variants.map((v) => [v.id, v.content_id]));
+  const vvVariant = new Map(t.variant_versions.map((v) => [v.id, v.variant_id]));
+  for (const r of t.variants) {
+    need('variants', 'content_id', r.content_id, 'contents');
+    if (r.current_version_id !== null && vvVariant.get(r.current_version_id) !== r.id) {
+      problems.push('variants.current_version_id → variant_versions(같은 파생본)');
+    }
+  }
+  for (const r of t.variant_versions) {
+    need('variant_versions', 'variant_id', r.variant_id, 'variants');
+    need('variant_versions', 'content_version_id', r.content_version_id, 'content_versions');
+    need('variant_versions', 'ai_run_id', r.ai_run_id, 'generation_runs');
+    const vc = variantContent.get(r.variant_id);
+    if (vc !== undefined && versionContent.get(r.content_version_id) !== vc) problems.push('variant_versions.content_version_id → content_versions(같은 원고)');
+    if (r.ai_run_id !== null && runContent.has(r.ai_run_id) && runContent.get(r.ai_run_id) !== vc) {
+      problems.push('variant_versions.ai_run_id → generation_runs(같은 원고)');
+    }
+  }
+  for (const r of t.generation_runs) {
+    need('generation_runs', 'variant_id', r.variant_id, 'variants');
+    if (r.variant_id !== null && variantContent.get(r.variant_id) !== undefined && variantContent.get(r.variant_id) !== r.content_id) {
+      problems.push('generation_runs.variant_id → variants(같은 원고)');
+    }
+  }
+  for (const r of t.claims) need('claims', 'variant_version_id', r.variant_version_id, 'variant_versions');
+  for (const r of t.variant_assets) {
+    need('variant_assets', 'variant_version_id', r.variant_version_id, 'variant_versions');
+    need('variant_assets', 'asset_id', r.asset_id, 'assets');
+  }
   for (const r of t.content_captures) {
     need('content_captures', 'content_id', r.content_id, 'contents');
     need('content_captures', 'capture_id', r.capture_id, 'captures');

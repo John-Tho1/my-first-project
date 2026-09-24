@@ -138,6 +138,16 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'source_version_id', table: 'source_versions' },
   ],
   usage_ledger: [{ col: 'run_id', table: 'generation_runs', owned: true }],
+  // T09
+  variants: [{ col: 'content_id', table: 'contents', owned: true }],
+  variant_versions: [
+    { col: 'variant_id', table: 'variants', owned: true },
+    { col: 'content_version_id', table: 'content_versions' },
+  ],
+  variant_assets: [
+    { col: 'variant_version_id', table: 'variant_versions', owned: true },
+    { col: 'asset_id', table: 'assets' },
+  ],
 };
 
 type Avail = 'inserted' | 'same' | 'different';
@@ -152,6 +162,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   const conflicts: RestoreConflict[] = [];
   const insertedAssetIds: string[] = [];
   const insertedContents: Array<{ id: string; currentVersionId: string | null }> = [];
+  const insertedVariants: Array<{ id: string; currentVersionId: string | null }> = [];
 
   for (const name of RESTORED_TABLES) {
     const rows = bundle.tables[name] as unknown as Array<Record<string, unknown> & { id: string }>;
@@ -208,12 +219,13 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
           continue;
         }
       }
-      const overrides = name === 'contents' ? { current_version_id: null } : {};
+      const overrides = name === 'contents' || name === 'variants' ? { current_version_id: null } : {};
       if (await insertBundleRow(tx, name, row, ownerId, overrides)) {
         counts.new++;
         map.set(row.id, 'inserted');
         if (name === 'assets') insertedAssetIds.push(row.id);
         if (name === 'contents') insertedContents.push({ id: row.id, currentVersionId: (row.current_version_id as string | null) ?? null });
+        if (name === 'variants') insertedVariants.push({ id: row.id, currentVersionId: (row.current_version_id as string | null) ?? null });
       } else {
         conflict(row.id, 'unique');
       }
@@ -236,18 +248,35 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     }
   }
 
+  // T09: 이번에 넣은 파생본의 현재 버전을 연결한다(원고와 같은 규칙 — 버전이 들어가지 못했으면 전체 중단).
+  for (const v of insertedVariants) {
+    if (v.currentVersionId === null) continue;
+    if (avail.variant_versions!.get(v.currentVersionId) !== 'inserted') {
+      throw new AppError('conflict', 'restore_conflict', '채널 초안의 현재 버전을 복원할 수 없어 복원을 중단했습니다', {
+        conflicts: [{ table: 'variants', id: v.id, reason: 'dependency' }],
+      });
+    }
+    await tx.execute(
+      sql`update variants set current_version_id = ${v.currentVersionId}::uuid where id = ${v.id}::uuid and owner_id = ${ownerId}::uuid and current_version_id is null`,
+    );
+  }
+
   // FIX-T06(P0): content_versions.ai_run_id ↔ generation_runs(input_version_id/output_ref) 는 서로 참조하는 순환이라 PARENTS 로
   // 표현하지 않고, 모든 표를 적용한 뒤 확인한다. 이번에 넣은 버전의 run 이 "이번에 넣음" 또는 "동일"이 아니면(충돌·의존성 실패로
   // 빠졌거나 내용이 다른 기존 행) 채택 이력이 A03 게이트에서 사라지므로 복원 전체를 중단한다.
-  const versionRows = bundle.tables.content_versions;
-  const orphaned = versionRows.filter((v) => {
-    if (v.ai_run_id === null || avail.content_versions!.get(v.id) !== 'inserted') return false;
-    const a = avail.generation_runs!.get(v.ai_run_id);
-    return a !== 'inserted' && a !== 'same';
-  });
+  // T09: variant_versions.ai_run_id 도 같은 규칙.
+  const orphanOf = (table: 'content_versions' | 'variant_versions') =>
+    (bundle.tables[table] as Array<{ id: string; ai_run_id: string | null }>)
+      .filter((v) => {
+        if (v.ai_run_id === null || avail[table]!.get(v.id) !== 'inserted') return false;
+        const a = avail.generation_runs!.get(v.ai_run_id);
+        return a !== 'inserted' && a !== 'same';
+      })
+      .map((v) => ({ table, id: v.id, reason: 'dependency' as const }));
+  const orphaned = [...orphanOf('content_versions'), ...orphanOf('variant_versions')];
   if (orphaned.length > 0) {
     throw new AppError('conflict', 'restore_conflict', 'AI 제안·채택 버전의 실행 기록을 복원할 수 없어 복원을 중단했습니다', {
-      conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED).map((v) => ({ table: 'content_versions', id: v.id, reason: 'dependency' })),
+      conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED),
     });
   }
   return { tables, conflicts, insertedAssetIds };

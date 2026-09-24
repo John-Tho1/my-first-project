@@ -87,6 +87,13 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   brand_missing: '브랜드 프로필이 없습니다. 먼저 Brand Profile 을 저장하세요.',
   not_adoptable: '이 제안은 채택할 수 없습니다.',
   budget_exceeded: '이번 달 AI 예산 상한(또는 1회 상한)을 넘게 되어 AI 를 호출하지 않았습니다. 설정에서 사용량을 확인하세요.',
+  // T09 채널 초안
+  media_incomplete: '검토로 보내려면 채널에 필요한 미디어가 더 있어야 합니다(Instagram: 이미지 1개 이상, YouTube: 완성 영상 1개).',
+  stale_variant: '원문이 바뀌었습니다. "현재 원문으로 다시 초안"을 만든 뒤 검토로 보내세요.',
+  no_variants: '배포 파일을 만들 채널 초안이 없습니다. 먼저 채널 초안을 만드세요.',
+  no_current_version: '먼저 채널 초안을 만드세요.',
+  asset_role_mismatch: '파일 형식이 역할과 맞지 않습니다(이미지·썸네일은 이미지 파일, 영상은 영상 파일).',
+  invalid_metadata: '채널 형식(글자 수 등)이 맞지 않아 저장하지 않았습니다.',
   claim_still_in_body: '그 문장이 아직 현재 본문에 있어 "본문에서 뺐음"으로 처리하지 않았습니다. 본문에서 빼거나 고쳐 저장한 뒤 다시 누르세요.',
   unconfirmed_claims: '"준비됨" 원고에는 확인하지 않은 1인칭 경험 주장이 있는 제안을 채택할 수 없습니다. 먼저 주장을 확인하거나 상태를 "검토 중"으로 바꾸세요.',
   conflict: '다른 곳에서 먼저 저장되었습니다. 현재 내용을 확인한 뒤 다시 저장하세요.',
@@ -95,6 +102,9 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   too_large: '내용이 너무 깁니다.',
   server: '서버 오류로 처리하지 못했습니다.',
 };
+
+/** 폼 오류 코드로 그대로 쓰는 AppError 코드(T09). */
+const PASS_THROUGH_CODES = new Set(['media_incomplete', 'stale_variant', 'no_variants', 'no_current_version', 'asset_role_mismatch', 'invalid_metadata']);
 
 /** 폼 실패 공통(작성 지원): 401 → /login, 404 → notFoundHref, 그 외 → back?error=<code>. */
 export function writingFormFailure(e: unknown, request: Request, back: string, notFoundHref: string): Response {
@@ -115,6 +125,7 @@ export function writingFormFailure(e: unknown, request: Request, back: string, n
     else if (e.code === 'unconfirmed_experience_claims') code = 'unconfirmed_claims';
     else if (e.code === 'claim_still_in_body') code = 'claim_still_in_body';
     else if (e.code === 'budget_exceeded') code = 'budget_exceeded';
+    else if (PASS_THROUGH_CODES.has(e.code)) code = e.code;
     else if (e.kind === 'conflict') code = 'conflict';
     else if (e.kind === 'csrf') code = 'csrf';
     else if (e.kind === 'payload_too_large') code = 'too_large';

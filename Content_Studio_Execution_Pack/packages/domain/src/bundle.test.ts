@@ -79,6 +79,9 @@ function tables(): BundleTables {
     claims: [],
     claim_sources: [],
     usage_ledger: [],
+    variants: [],
+    variant_versions: [],
+    variant_assets: [],
     assets: [
       {
         id: ASSET,

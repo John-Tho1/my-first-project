@@ -280,6 +280,25 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **live 경계**: `LLM_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`LLM_LIVE_APPROVAL_REF`)이 모두 있어도 T07 에는 어댑터가 없어 503 으로 거부된다(아무것도 기록하지 않음). `GET /api/health` 의 `llm.live_ready`(항상 false)와 `llm.missing`(빠진 조건 이름만), 설정 화면의 "AI 모드·비용"(이번 달 사용액/상한, live 준비 안 됨 목록)으로 확인한다.
 - migration `0008_t07_budget_claims`(claims·claim_sources·usage_ledger). 새 표는 내보내기·복원에 포함된다.
 
+### 채널 초안·배포 파일 (M2, T09)
+결정 D14(docs/DECISIONS.md). **게시하지 않는다**(PUBLISH_MODE=disabled, 채널 어댑터·OAuth 없음). 작성실 `/contents/{id}` 의 "채널 초안" 영역.
+
+- **초안 만들기**: Threads·Instagram·YouTube·블로그마다 원고 현재 버전을 채널 모양으로 바꾼 초안(결정적). "AI 초안(모의)"은 채택하기 전까지 현재 초안이 아니다(예산 원장·claim 저장은 T07 규칙). 편집은 본문 + 채널 형식(JSON), 첨부는 올린 파일 중에서 역할(이미지·영상·썸네일·첨부)을 골라 붙인다.
+- **stale**: 원고가 바뀌면 "원문이 바뀜 — 재검토 필요". 저장 값이 아니라 파생 판정이며, 수정만으로는 풀리지 않는다 — "현재 원문으로 다시 초안". AI 가 자동으로 다시 만들지 않는다.
+- **검토로**: stale 이 아니고, 채널 필수 미디어(Instagram 이미지 1개 이상, YouTube 완성 영상 1개)가 있고, 미해결 1인칭 경험 주장이 없을 때만. 완성 영상 업로드는 아직 없다(D14 사용자 결정 필요).
+- **배포 파일 만들기**: 채널별 현재 초안의 본문·메타데이터·첨부 파일(sha256 확인)·manifest 를 ZIP 으로 — "배포 파일(수동 게시용). 자동 게시 아님". 승인·게시 기록이 아니다. 위치 `EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip`.
+
+| API | 설명 |
+| --- | --- |
+| `GET`·`POST /api/contents/{id}/variants` | 파생본 목록 · `{channel, mode: draft\|ai_draft, base_version(원고 현재 버전)}` → 201, 원고 버전 불일치 409 `stale_base` |
+| `POST /api/variants/{id}/versions` | `{base_version, body, metadata}` → 201 새 현재 버전(draft), 오래된 base 409, 채널 형식 위반 400 `invalid_metadata` |
+| `POST /api/variants/{id}/adopt/{versionId}` | AI 초안 채택 `{base_version}` → 201 |
+| `POST /api/variants/{id}/assets` | `{base_version, assets:[{asset_id, position, role}]}` → 201, 다른 사용자 파일 404, 역할·형식 불일치 400 |
+| `POST /api/variants/{id}/lifecycle` | `{lifecycle: draft\|review, base_version}` → 200, `stale_variant`·`media_incomplete`·`unconfirmed_experience_claims` 409 |
+| `POST /api/contents/{id}/package` · `GET /api/packages/{id}` | 배포 파일 ZIP 생성 → 201 · 내려받기(다른 사용자·없는 ID 404) |
+
+- migration `0009_t09_variants`(variants·variant_versions·variant_assets, generation_runs.variant_id, claims.variant_version_id). 새 표는 내보내기·복원에 포함된다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

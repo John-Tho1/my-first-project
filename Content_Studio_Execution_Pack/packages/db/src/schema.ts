@@ -271,6 +271,73 @@ export const contentVersions = pgTable(
   ],
 );
 
+/**
+ * 채널별 파생본(T09, 결정 D14). 원고 하나에 채널마다 하나(unique(content_id, channel)).
+ * lifecycle 은 draft | review 만(APPROVED 는 M3). stale 은 저장하지 않고 "현재 버전의 content_version_id ≠ 원고의 현재 버전"으로 파생한다.
+ * current_version_id 는 variant_versions.id — 순환 FK 를 피하려고 앱에서 검증한다(contents 와 같은 방식).
+ */
+export const variants = pgTable(
+  'variants',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    channel: text('channel').notNull(),
+    currentVersionId: uuid('current_version_id'),
+    lifecycle: text('lifecycle').notNull().default('draft'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('variants_content_channel_uq').on(t.contentId, t.channel),
+    unique('variants_id_owner_uq').on(t.id, t.ownerId),
+    check('variants_channel_chk', sql`${t.channel} in ('threads', 'instagram', 'youtube', 'blog')`),
+    check('variants_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review')`),
+    foreignKey({
+      name: 'variants_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 파생본 버전(T09, 불변 — 추가 전용 트리거). content_version_id = 이 버전을 만든 원고 버전(stale 판정 기준).
+ * metadata_json = 채널별 필드(@cs/domain channel.ts). created_by 'owner' | 'ai:mock'(AI 제안은 채택 전까지 현재 버전이 아니다).
+ */
+export const variantVersions = pgTable(
+  'variant_versions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    variantId: uuid('variant_id').notNull(),
+    version: integer('version').notNull(),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    body: text('body').notNull(),
+    metadataJson: jsonb('metadata_json').$type<Record<string, unknown>>().notNull(),
+    createdBy: text('created_by').notNull(),
+    aiRunId: uuid('ai_run_id'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('variant_versions_variant_version_uq').on(t.variantId, t.version),
+    unique('variant_versions_id_owner_uq').on(t.id, t.ownerId),
+    check('variant_versions_created_by_chk', sql`${t.createdBy} = 'owner' or ${t.createdBy} like 'ai:%'`),
+    check('variant_versions_version_chk', sql`${t.version} >= 1`),
+    foreignKey({
+      name: 'variant_versions_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
 /** 원고 ↔ 원문(수집) 관계(T04). 같은 owner 끼리만(두 복합 FK). role: 'origin'(원고의 출처 소재). */
 export const contentCaptures = pgTable(
   'content_captures',
@@ -386,6 +453,8 @@ export const generationRuns = pgTable(
     status: text('status').notNull(),
     outputRef: uuid('output_ref').references(() => contentVersions.id, { onDelete: 'restrict' }),
     outputJson: jsonb('output_json').$type<Record<string, unknown>>(),
+    /** T09: 채널 초안 run 의 대상 파생본(mode='variant' 일 때만). */
+    variantId: uuid('variant_id'),
     error: text('error'),
     createdAt: ts('created_at').notNull().defaultNow(),
     finishedAt: ts('finished_at'),
@@ -393,7 +462,14 @@ export const generationRuns = pgTable(
   (t) => [
     unique('generation_runs_id_owner_uq').on(t.id, t.ownerId),
     index('generation_runs_content_idx').on(t.contentId, t.createdAt.desc()),
-    check('generation_runs_mode_chk', sql`${t.mode} in ('outline', 'draft', 'revise')`),
+    // T09: 'variant' = 채널 초안 AI 제안(variant_id 필수). 결과는 variant_versions(created_by='ai:mock', ai_run_id)이고 output_ref 는 null.
+    check('generation_runs_mode_chk', sql`${t.mode} in ('outline', 'draft', 'revise', 'variant')`),
+    check('generation_runs_variant_chk', sql`(${t.mode} = 'variant') = (${t.variantId} is not null)`),
+    foreignKey({
+      name: 'generation_runs_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
     check('generation_runs_status_chk', sql`${t.status} in ('running', 'succeeded', 'failed')`),
     foreignKey({
       name: 'generation_runs_content_same_owner_fk',
@@ -464,6 +540,8 @@ export const claims = pgTable(
       .notNull()
       .references(() => contentVersions.id, { onDelete: 'restrict' }),
     runId: uuid('run_id').notNull(),
+    /** T09: 채널 초안 run 의 claim 이면 그 제안 variant_version(content_version_id 는 파생 기준 원고 버전). */
+    variantVersionId: uuid('variant_version_id').references(() => variantVersions.id, { onDelete: 'restrict' }),
     claimIndex: integer('claim_index').notNull(),
     statement: text('statement').notNull(),
     kind: text('kind').notNull(),
@@ -474,7 +552,8 @@ export const claims = pgTable(
   },
   (t) => [
     unique('claims_id_owner_uq').on(t.id, t.ownerId),
-    unique('claims_version_index_uq').on(t.contentVersionId, t.claimIndex),
+    // T09: 한 원고 버전에서 여러 run(원고 제안·채널 초안)이 나올 수 있어 run 기준으로 바꿨다.
+    unique('claims_run_index_uq').on(t.runId, t.claimIndex),
     check('claims_evidence_grade_chk', sql`${t.evidenceGrade} in ('none', 'source', 'user_confirmed')`),
     check('claims_kind_chk', sql`${t.kind} in ('fact', 'opinion', 'experience')`),
     foreignKey({
@@ -565,7 +644,44 @@ export const assets = pgTable(
     verificationState: text('verification_state').notNull().default('pending'),
     createdAt: ts('created_at').notNull().defaultNow(),
   },
-  (t) => [unique('assets_owner_checksum_uq').on(t.ownerId, t.checksum)],
+  (t) => [
+    unique('assets_owner_checksum_uq').on(t.ownerId, t.checksum),
+    // T09: variant_assets 가 "같은 owner 의 파일" 만 참조하도록 복합 FK 대상.
+    unique('assets_id_owner_uq').on(t.id, t.ownerId),
+  ],
+);
+
+/**
+ * 채널 초안 버전의 첨부 파일(T09). 버전과 함께 불변(추가 전용 트리거). 순서(position)는 버전 안에서 unique.
+ * role: image | video | thumbnail | attachment — 역할과 파일 형식이 맞는지는 앱이 검사한다(image/thumbnail 은 image/*, video 는 video/*).
+ */
+export const variantAssets = pgTable(
+  'variant_assets',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    variantVersionId: uuid('variant_version_id').notNull(),
+    assetId: uuid('asset_id').notNull(),
+    position: integer('position').notNull(),
+    role: text('role').notNull(),
+  },
+  (t) => [
+    unique('variant_assets_version_position_uq').on(t.variantVersionId, t.position),
+    check('variant_assets_role_chk', sql`${t.role} in ('image', 'video', 'thumbnail', 'attachment')`),
+    check('variant_assets_position_chk', sql`${t.position} >= 1`),
+    foreignKey({
+      name: 'variant_assets_version_same_owner_fk',
+      columns: [t.variantVersionId, t.ownerId],
+      foreignColumns: [variantVersions.id, variantVersions.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'variant_assets_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
 );
 
 /**

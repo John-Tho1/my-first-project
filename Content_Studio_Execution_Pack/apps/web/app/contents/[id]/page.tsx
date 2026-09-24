@@ -1,6 +1,15 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { getContentDetail, getContentVersion, getLedgerForRun, getWritingState, listClaimsForRun } from '@cs/db';
+import {
+  getContentDetail,
+  getContentVersion,
+  getLedgerForRun,
+  getWritingState,
+  listAssets,
+  listClaimsForRun,
+  listPackages,
+  listVariantStates,
+} from '@cs/db';
 import {
   allowedLifecycleOptions,
   contentLifecycleSchema,
@@ -15,7 +24,9 @@ import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { normalizeRunParam, selectRun, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
 import { WritingPanel, type ProposalView } from './writing-panel';
 import { preview } from '../../../lib/labels';
+import { exportsDir } from '../../../lib/backup';
 import { getAppDb, getConfig } from '../../../lib/server';
+import { VariantsPanel } from './variants-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -40,7 +51,8 @@ export default async function ContentPage({
   if (!session) redirect('/login');
   const { id } = await params;
   const q = await searchParams;
-  const { db } = await getAppDb(getConfig());
+  const config = getConfig();
+  const { db } = await getAppDb(config);
   const d = await getContentDetail(db, session.ownerId, id.toLowerCase());
   if (!d) notFound();
   const { content: c, current, versions } = d;
@@ -54,6 +66,11 @@ export default async function ContentPage({
   // T07: 선택한 run 의 저장된 claim(출처·근거 등급)과 비용 원장
   const claimViews = selectedRun ? await listClaimsForRun(db, session.ownerId, selectedRun.id) : [];
   const ledger = selectedRun ? await getLedgerForRun(db, session.ownerId, selectedRun.id) : null;
+  // T09: 채널 초안·owner 파일·배포 파일
+  const variantStates = await listVariantStates(db, session.ownerId, c.id, current.id);
+  const ownerAssets = await listAssets(db, session.ownerId, 50);
+  const packages = await listPackages(exportsDir(config), session.ownerId, 5);
+  const newPackage = str(q.package);
   let proposal: ProposalView | null = null;
   if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {
     const summary = versions.find((v) => v.id === selectedRun.outputRef);
@@ -169,6 +186,16 @@ export default async function ContentPage({
             proposal={proposal}
             answeredCount={Number.isInteger(Number(str(q.answered))) && str(q.answered) !== undefined ? Number(str(q.answered)) : null}
             confirmedCount={str(q.confirmed) !== undefined ? Number(str(q.confirmed)) : null}
+          />
+
+          <VariantsPanel
+            contentId={c.id}
+            coreVersion={current.version}
+            states={variantStates}
+            assets={ownerAssets}
+            packages={packages}
+            savedChannel={str(q.variant_saved) ?? str(q.variant_proposal) ?? null}
+            newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}
           />
 
           <section className="card archive" aria-labelledby="versions-title">

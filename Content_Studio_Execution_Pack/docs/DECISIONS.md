@@ -119,3 +119,15 @@
 - Exact authorized scope (if applicable): 외부 호출 0, 과금 0, 비밀 0. `LiveLlmProvider` 에는 HTTP 코드가 없다(`// T07: 실제 호출은 별도 승인 후 구현(D8)`).
 - Consequences: 모의에서도 가격을 설정하면 한도 때문에 제안이 거부될 수 있다. 프로세스가 provider 호출 중 죽으면 원장은 reserved 로 남아 이번 달 합계에 예약액으로 계속 잡힌다(정리 경로 없음, released 는 아직 쓰지 않음). 실제 비용이 예약보다 클 수 있다(추정 초과) — 상한은 예약 시점에만 검사한다.
 - When to revisit: D8(공급자·모델) 결정과 live 어댑터 구현 승인 시.
+
+## D14 — T09 채널 초안: stale 은 파생 값, 채널 모양은 결정적 변환(잠정 한도), 배포 파일은 승인·게시가 아님, 게시 어댑터 없음
+- Decision ID / date: D14 / 2026-09-25 (Europe/Moscow)
+- Question: 게시 없이(PUBLISH_MODE=disabled, M3 이전) 채널별 초안·stale·미디어 완성·배포 파일을 어떻게 저장·판정하고, 무엇을 "준비됨"으로 보여 줄 것인가?
+- Options: (1) stale: 저장 플래그(원고 수정 시 갱신) / **파생(현재 버전의 content_version_id ≠ 원고 현재 버전)**. (2) 파생본 상태: DRAFT/REVIEW/APPROVED / **draft·review 만(APPROVED 는 M3)**. (3) 초안 만들기: AI 만 / **결정적 변환 + 선택적 모의 AI 제안(채택 전 비현재)**. (4) 배포 파일 기록: 새 표 / **표 없이 owner 폴더(`EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip`)** — 표를 늘리지 않고 owner 범위를 경로로 강제. (5) 영상: 아무 파일이나 역할만 video / **역할과 실제 형식(video/*)이 맞아야 인정**.
+- Chosen option: 각 굵은 선택. 세부: 채널 모양 — threads 문단별 글(각 ≤500 코드 포인트, 긴 문단은 공백에서 잘라 이어짐, 최대 20), instagram 첫 문단 캡션(≤2200) + 문단별 카드(≤10, 각 ≤300), youtube 첫 줄(#·> 제거) 제목(≤100) + 나머지 설명(≤5000) + 원고 전체 대본 + 빈 태그, blog 첫 줄 제목(≤200) + 원고 Markdown. **이 한도는 잠정값**(게시 어댑터 M4 전에 공식 자료로 재확인). 사용자 수정·첨부 변경·AI 제안 채택은 새 현재 버전을 만들고 lifecycle 을 draft 로 되돌린다(docs/03 "수정 시 재검토"). 수정만으로는 stale 이 풀리지 않는다 — "현재 원문으로 다시 초안"(결정적 변환)을 새로 만들어야 한다. AI 가 자동으로 다시 만드는 경로는 없다. review 조건: 현재 버전·stale 아님(409 stale_variant)·채널 필수 미디어(instagram 이미지 ≥1, youtube 영상 1, 409 media_incomplete)·원고의 미해결 경험 claim 없음 + 이 파생본이 채택한 AI 제안의 미해결 경험 claim 없음(409 unconfirmed_experience_claims, 이 파생본 본문 기준). 채널 초안 AI run 은 generation_runs(mode='variant', variant_id)·원장(T07)·claims(variant_version_id, content_version_id = 파생 기준 원고 버전)을 그대로 쓰고, 원고 작성 보조 목록에는 나오지 않는다. claims unique 는 (run_id, claim_index) 로 바꿨다(한 원고 버전에서 여러 run). 배포 파일 ZIP 에는 채널별 현재 버전의 본문·메타데이터·첨부(저장소 파일 sha256 = assets.checksum 일 때만, 아니면 missing + 경고)와 manifest(`is_approval:false`, `is_publication:false`, `publish_mode`, `mock`, 파생본별 stale·미디어 완성·lifecycle, 모든 파일 sha256)가 들어간다.
+- Evidence / assumption: `tests/integration/variants.test.ts`(13개) — 네 채널 초안, stale → 검토 409 → 다시 초안 → 검토, AI 초안(비현재·run·원장·claims)·채택·오래된 제안 409, 실패 주입, 미디어 409·역할/형식 400, 다른 owner 파일·파생본·배포 파일 404, A03, 배포 ZIP 내용·sha256·manifest, export→복원 왕복. `packages/domain/src/channel.test.ts`(25개).
+- Reversible?: 예. 변환·한도는 `packages/domain/src/channel.ts` 한 곳, 파생본 버전은 불변이라 이력이 남는다.
+- User decision required?: 예 — (a) 채널 한도·모양(잠정값) 확인, (b) **완성 영상 업로드가 아직 없어(허용 형식: 이미지·PDF·텍스트) YouTube 파생본은 검토로 갈 수 없다** — 영상 업로드를 T08(업로드 세션)에서 열지, YouTube 를 대본 패키지만으로 검토 가능하게 할지, (c) 수정 시 draft 로 되돌리는 규칙 유지 여부, (d) 배포 파일 보관 기간·정리(현재 자동 삭제 없음).
+- Exact authorized scope (if applicable): 외부 호출 0, 게시 0(채널 어댑터·OAuth·배포 작업 표 없음 — M3 이후).
+- Consequences: 원고가 바뀌어도 이미 review 인 파생본은 review 로 남되 stale 로 보인다(보류·재승인은 M3 배포 작업에서 강제). 배포 파일은 DB 기록이 없어 export 묶음에 들어가지 않는다(감사 기록만). 채널 초안 AI 의 claim 은 파생본 검토 게이트에만 걸리고 원고 `ready` 게이트에는 영향이 없다.
+- When to revisit: M3(승인 스냅샷·배포 작업)·M4(채널 어댑터) 착수 시, 또는 T08 에서 영상 업로드를 열 때.

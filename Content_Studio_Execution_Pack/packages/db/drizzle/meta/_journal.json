@@ -50,6 +50,13 @@
       "when": 1790282141567,
       "tag": "0006_t06_claim_resolution",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790283617014,
+      "tag": "0007_t06_removed_binding",
+      "breakpoints": true
     }
   ]
 }

@@ -37,6 +37,7 @@ import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/
 import { POST as confirmPOST } from '../../apps/web/app/api/contents/[id]/claims/confirm/route';
 import { PATCH as contentPATCH } from '../../apps/web/app/api/contents/[id]/route';
 import { POST as versionsPOST } from '../../apps/web/app/api/contents/[id]/versions/route';
+import { normalizeRunParam, selectRun } from '../../apps/web/lib/writing';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
@@ -623,5 +624,112 @@ describe('FIX-T06(Codex review-T06)', () => {
     } finally {
       await h.close();
     }
+  });
+});
+
+describe('FIX-T06 round 2(Codex review-FIX-T06)', () => {
+  async function adopted(title: string) {
+    const id = (await createContent(db, ownerA, { title, body: '원문' })).content.id;
+    const ans = await (await answersPost(id, { answers: { judgment: '제가 직접 현지 법인을 설득했습니다.' } })).json();
+    const r = await (await assist(id, { mode: 'draft', base_version: 1, brand_profile_version: 2, answer_ids: [ans.current[0].id] })).json();
+    expect((await adopt(id, r.run.id, { base_version: 1 })).status).toBe(201);
+    const claims = r.claims as Array<{ kind: string; text: string }>;
+    const expIdx = claims.map((c, i) => (c.kind === 'experience' ? i : -1)).filter((i) => i >= 0);
+    expect(expIdx.length).toBeGreaterThan(0);
+    return { id, runId: r.run.id as string, expIdx, claimText: claims[expIdx[0]!]!.text };
+  }
+  const saveBody = async (id: string, body: string) => {
+    const cur = await currentBody(id);
+    const res = await versionsPOST(jsonPost(`/api/contents/${id}/versions`, { base_version: cur.version, body }, cookieHeader(tokenA)), ctx(id));
+    expect(res.status).toBe(201);
+  };
+  const rowsFor = (runId: string) => db.select().from(schema.claimConfirmations).where(eq(schema.claimConfirmations.runId, runId));
+
+  it('P1: 문장이 본문에 남아 있으면 removed → 409 claim_still_in_body, 행 없음', async () => {
+    const { id, runId, expIdx, claimText } = await adopted('제외 거부 원고');
+    expect((await currentBody(id)).body).toContain(claimText);
+    const res = await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'removed' });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ error: 'claim_still_in_body', claim_indexes: expIdx });
+    expect(await rowsFor(runId)).toEqual([]);
+    // 공백·문장부호만 바꿔 둔 경우도 "남아 있음"
+    await saveBody(id, `앞 문장. ${claimText.replace(/\s+/g, '   ').replace(/\.$/, '!')} 뒤 문장`);
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'removed' })).status).toBe(409);
+    expect(await rowsFor(runId)).toEqual([]);
+  });
+
+  it('P1: 뺀 뒤 removed → body_version_id 기록·ready 가능, 문장을 다시 넣으면 ready 다시 차단, 확인하면 다시 가능', async () => {
+    const { id, runId, expIdx, claimText } = await adopted('재삽입 원고');
+    await saveBody(id, '경험 문장을 뺀 본문');
+    const cur = await currentBody(id);
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'removed' })).status).toBe(200);
+    const rows = await rowsFor(runId);
+    expect(rows.every((r) => r.resolution === 'removed' && r.bodyVersionId === cur.id)).toBe(true);
+    expect((await setLifecycle(id, 'review')).status).toBe(200);
+    expect((await setLifecycle(id, 'ready')).status).toBe(200);
+    // 준비됨에서 되돌린 뒤 같은 문장을 다시 넣으면 다시 미해결
+    expect((await setLifecycle(id, 'review')).status).toBe(200);
+    await saveBody(id, `경험 문장을 뺀 본문\n${claimText}`);
+    const unresolved = await listUnconfirmedExperienceClaims(db, ownerA, id);
+    expect(unresolved.map((u) => u.claim_index).sort()).toEqual([...expIdx].sort());
+    const blocked = await setLifecycle(id, 'ready');
+    expect(blocked.status).toBe(409);
+    expect((await blocked.json()).error).toBe('unconfirmed_experience_claims');
+    // 이번에는 실제 경험이라고 확인 → 확인 행이 따로 추가되고 ready 가능
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'confirmed' })).status).toBe(200);
+    expect((await rowsFor(runId)).map((r) => r.resolution).sort()).toEqual([...expIdx.map(() => 'confirmed'), ...expIdx.map(() => 'removed')].sort());
+    expect((await setLifecycle(id, 'ready')).status).toBe(200);
+  });
+
+  it('P1: confirmed 는 본문 변경과 무관하게 해결 상태 유지', async () => {
+    const { id, runId, expIdx, claimText } = await adopted('확인 유지 원고');
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx })).status).toBe(200);
+    await saveBody(id, `다른 본문\n${claimText}\n또 다른 줄`);
+    await saveBody(id, '문장을 뺀 본문');
+    expect(await listUnconfirmedExperienceClaims(db, ownerA, id)).toEqual([]);
+    expect((await setLifecycle(id, 'review')).status).toBe(200);
+    expect((await setLifecycle(id, 'ready')).status).toBe(200);
+  });
+
+  it('P2: 잘못된 resolution — JSON 400, 폼 303 ?error=invalid(빈 값 포함), 행 없음. 폼에 칸이 없으면 confirmed', async () => {
+    const { id, runId, expIdx } = await adopted('폼 resolution 원고');
+    const form = (fields: Record<string, string>) =>
+      confirmPOST(
+        new Request(`${BASE}/api/contents/${id}/claims/confirm`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(tokenA) },
+          body: new URLSearchParams(fields).toString(),
+        }),
+        ctx(id),
+      );
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: '' })).status).toBe(400);
+    for (const bad of ['bogus', '', 'CONFIRMED']) {
+      const res = await form({ run_id: runId, claim_indexes: expIdx.join(','), resolution: bad });
+      expect(res.status).toBe(303);
+      expect(res.headers.get('location')).toBe(`/contents/${id}?error=invalid`);
+    }
+    expect(await rowsFor(runId)).toEqual([]);
+    const ok = await form({ run_id: runId, claim_indexes: expIdx.join(',') });
+    expect(ok.status).toBe(303);
+    expect((await rowsFor(runId)).map((r) => r.resolution)).toEqual(expIdx.map(() => 'confirmed'));
+  });
+
+  it('P2: 대문자 ?run= UUID 도 그 run 을 조회·선택한다', async () => {
+    const { id, runId } = await adopted('대문자 run 원고');
+    const base = (await currentBody(id)).version;
+    for (let i = 0; i < 11; i++) {
+      expect((await assist(id, { mode: 'outline', base_version: base, brand_profile_version: 2, answer_ids: [] })).status).toBe(201);
+    }
+    const all = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, id));
+    const oldestOther = all.filter((r) => r.id !== runId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0]!;
+    const param = normalizeRunParam(oldestOther.id.toUpperCase());
+    expect(param).toBe(oldestOther.id);
+    const w = await getWritingState(db, ownerA, id, param);
+    expect(selectRun(w.runs, param)?.id).toBe(oldestOther.id);
+    expect(normalizeRunParam('none')).toBe('none');
+    expect(selectRun(w.runs, 'none')).toBeUndefined();
+    expect(normalizeRunParam('not-a-uuid')).toBeUndefined();
+    expect(selectRun(w.runs, undefined)?.id).toBe(w.runs[0]!.id);
   });
 });

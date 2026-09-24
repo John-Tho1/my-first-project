@@ -236,6 +236,8 @@ export const ROW_SCHEMAS = {
     confirmed_at: ts,
     // 0006 열. 이전 묶음은 확인만 있었으므로 'confirmed'.
     resolution: z.enum(['confirmed', 'removed']).default('confirmed'),
+    // 0007 열. 이전 묶음에는 없으므로 null(게이트는 'removed' 를 현재 본문으로 다시 검사한다).
+    body_version_id: uuid.nullable().default(null),
   }),
   assets: z.strictObject({
     id: uuid,
@@ -802,7 +804,13 @@ export function checkIntegrity(t: BundleTables): void {
       problems.push('generation_runs.output_ref → content_versions(같은 원고)');
     }
   }
-  for (const r of t.claim_confirmations) need('claim_confirmations', 'run_id', r.run_id, 'generation_runs');
+  for (const r of t.claim_confirmations) {
+    need('claim_confirmations', 'run_id', r.run_id, 'generation_runs');
+    need('claim_confirmations', 'body_version_id', r.body_version_id, 'content_versions');
+    if (r.body_version_id !== null && runContent.has(r.run_id) && versionContent.get(r.body_version_id) !== runContent.get(r.run_id)) {
+      problems.push('claim_confirmations.body_version_id → content_versions(run 과 같은 원고)');
+    }
+  }
   for (const r of t.content_captures) {
     need('content_captures', 'content_id', r.content_id, 'contents');
     need('content_captures', 'capture_id', r.capture_id, 'captures');

@@ -124,7 +124,10 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'input_version_id', table: 'content_versions' },
     { col: 'output_ref', table: 'content_versions' },
   ],
-  claim_confirmations: [{ col: 'run_id', table: 'generation_runs', owned: true }],
+  claim_confirmations: [
+    { col: 'run_id', table: 'generation_runs', owned: true },
+    { col: 'body_version_id', table: 'content_versions' },
+  ],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

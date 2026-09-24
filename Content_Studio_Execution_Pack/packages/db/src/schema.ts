@@ -424,10 +424,16 @@ export const claimConfirmations = pgTable(
      * 둘 다 사용자 주장이며 AI 가 만들지 않는다. A03 게이트는 둘 다 "해결됨"으로 본다.
      */
     resolution: text('resolution').notNull().default('confirmed'),
+    /**
+     * FIX-T06 round 2: 해결을 기록할 때의 현재 본문 버전(0007). 'removed' 는 이 버전에 claim 문장이 없음을 서버가 확인한 뒤에만 저장되고,
+     * 이후에도 "현재 본문에 없을 때만" 해결로 본다(다시 넣으면 다시 미해결). 0007 이전 행은 null.
+     */
+    bodyVersionId: uuid('body_version_id').references(() => contentVersions.id, { onDelete: 'restrict' }),
     confirmedAt: ts('confirmed_at').notNull().defaultNow(),
   },
   (t) => [
-    unique('claim_confirmations_run_claim_uq').on(t.runId, t.claimIndex),
+    // 0007: claim 하나에 해결 방식별 한 행(확인·제외가 각각 한 번씩 가능 — 제외 후 다시 넣은 문장을 나중에 확인할 수 있게).
+    unique('claim_confirmations_run_claim_resolution_uq').on(t.runId, t.claimIndex, t.resolution),
     check('claim_confirmations_claim_index_chk', sql`${t.claimIndex} >= 0`),
     check('claim_confirmations_resolution_chk', sql`${t.resolution} in ('confirmed', 'removed')`),
     foreignKey({

@@ -12,7 +12,7 @@ import {
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
-import { versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
+import { normalizeRunParam, selectRun, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
 import { WritingPanel, type ProposalView } from './writing-panel';
 import { preview } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -47,9 +47,10 @@ export default async function ContentPage({
   const lc = contentLifecycleSchema.safeParse(c.lifecycle);
   const options = lc.success ? allowedLifecycleOptions(lc.data) : [];
   const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
-  const runParam = str(q.run);
-  const w = await getWritingState(db, session.ownerId, c.id, runParam && runParam !== 'none' ? runParam : undefined);
-  const selectedRun = runParam === 'none' ? undefined : (w.runs.find((r) => r.id === runParam) ?? w.runs[0]);
+  // 조회와 선택에 같은 정규화 값(소문자 UUID 또는 'none')을 쓴다(FIX-T06 round 2).
+  const runParam = normalizeRunParam(str(q.run));
+  const w = await getWritingState(db, session.ownerId, c.id, runParam !== 'none' ? runParam : undefined);
+  const selectedRun = selectRun(w.runs, runParam);
   let proposal: ProposalView | null = null;
   if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {
     const summary = versions.find((v) => v.id === selectedRun.outputRef);

@@ -149,4 +149,50 @@ describe('0005 migration: 기존 데이터 위에 적용', () => {
     ).toMatch(/interview_answers_content_seq_uq/);
     await client.close();
   });
+
+  it('0007: 기존 확인 행은 body_version_id null, 해결 방식별 한 행(확인+제외 가능, 같은 방식 중복 불가), 트리거 유지', async () => {
+    const { client } = createDb({ driver: 'pglite', url: 'memory://' });
+    for (const tag of tags.filter((t) => t < '0007')) await applyTag(client, tag);
+    const u = await client.query<{ id: string }>("insert into users (allowed_identity) values ('r@example.local') returning id");
+    const ownerId = u.rows[0]!.id;
+    const bp = await client.query<{ id: string }>(
+      `insert into brand_profiles (owner_id, version, pen_name, audience, pillars) values ($1, 1, 'p', 'a', '["x"]'::jsonb) returning id`,
+      [ownerId],
+    );
+    const c = await client.query<{ id: string }>(`insert into contents (owner_id, title) values ($1, 't') returning id`, [ownerId]);
+    const v = await client.query<{ id: string }>(
+      `insert into content_versions (content_id, version, body, created_by) values ($1, 1, 'b', 'owner') returning id`,
+      [c.rows[0]!.id],
+    );
+    const run = await client.query<{ id: string }>(
+      `insert into generation_runs (owner_id, content_id, mode, input_version_id, brand_profile_id, input_version_refs, prompt_version, provider, model, status)
+       values ($1, $2, 'draft', $3, $4, '{}'::jsonb, 'v', 'mock', 'mock', 'succeeded') returning id`,
+      [ownerId, c.rows[0]!.id, v.rows[0]!.id, bp.rows[0]!.id],
+    );
+    const runId = run.rows[0]!.id;
+    await client.query(`insert into claim_confirmations (owner_id, run_id, claim_index, resolution) values ($1, $2, 0, 'removed')`, [ownerId, runId]);
+
+    await applyTag(client, tags.find((t) => t.startsWith('0007'))!);
+
+    const before = await client.query<{ body_version_id: string | null }>('select body_version_id from claim_confirmations');
+    expect(before.rows).toEqual([{ body_version_id: null }]);
+    await client.query(`insert into claim_confirmations (owner_id, run_id, claim_index, resolution, body_version_id) values ($1, $2, 0, 'confirmed', $3)`, [
+      ownerId,
+      runId,
+      v.rows[0]!.id,
+    ]);
+    expect(
+      await errorOf(client.query(`insert into claim_confirmations (owner_id, run_id, claim_index, resolution) values ($1, $2, 0, 'removed')`, [ownerId, runId])),
+    ).toMatch(/claim_confirmations_run_claim_resolution_uq/);
+    expect(
+      await errorOf(
+        client.query(`insert into claim_confirmations (owner_id, run_id, claim_index, body_version_id) values ($1, $2, 1, '00000000-0000-4000-8000-000000000000')`, [
+          ownerId,
+          runId,
+        ]),
+      ),
+    ).toMatch(/claim_confirmations_body_version_id_content_versions_id_fk/);
+    expect(await errorOf(client.query(`delete from claim_confirmations`))).toMatch(/append_only_immutable/);
+    await client.close();
+  });
 });

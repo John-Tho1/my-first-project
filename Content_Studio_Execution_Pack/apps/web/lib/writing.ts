@@ -2,7 +2,7 @@
  * T06 작성 지원 — 폼 → API 입력 변환, 응답 모양, 폼 오류 문구(서버 전용). JSON 필드는 snake_case(docs/04).
  */
 import type { AssistResult } from '@cs/db';
-import { AppError, blocksToList, diffLines, diffStats, linesToList } from '@cs/domain';
+import { AppError, blocksToList, diffLines, diffStats, isUuid, linesToList } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { errorResponse, seeOther } from './api';
 
@@ -50,7 +50,8 @@ export function formToClaimConfirm(f: Record<string, string>) {
   return {
     run_id: f.run_id ?? '',
     claim_indexes: csv(f.claim_indexes).map(Number),
-    resolution: f.resolution === 'removed' ? 'removed' : 'confirmed',
+    // FIX-T06 round 2: 제출된 값을 그대로 스키마에 넘긴다(잘못된 값은 400). 칸이 없을 때만 스키마 기본값(confirmed).
+    ...(f.resolution !== undefined ? { resolution: f.resolution } : {}),
   };
 }
 
@@ -75,6 +76,7 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   llm_blocked: '실제 AI 호출은 허용되지 않은 상태입니다(LLM_MODE). 아무것도 보내지 않았습니다.',
   brand_missing: '브랜드 프로필이 없습니다. 먼저 Brand Profile 을 저장하세요.',
   not_adoptable: '이 제안은 채택할 수 없습니다.',
+  claim_still_in_body: '그 문장이 아직 현재 본문에 있어 "본문에서 뺐음"으로 처리하지 않았습니다. 본문에서 빼거나 고쳐 저장한 뒤 다시 누르세요.',
   unconfirmed_claims: '"준비됨" 원고에는 확인하지 않은 1인칭 경험 주장이 있는 제안을 채택할 수 없습니다. 먼저 주장을 확인하거나 상태를 "검토 중"으로 바꾸세요.',
   conflict: '다른 곳에서 먼저 저장되었습니다. 현재 내용을 확인한 뒤 다시 저장하세요.',
   invalid: '저장하지 못했습니다. 입력값을 확인하세요.',
@@ -100,6 +102,7 @@ export function writingFormFailure(e: unknown, request: Request, back: string, n
     else if (e.code === 'llm_failed') code = 'llm_failed';
     else if (e.code === 'run_not_adoptable') code = 'not_adoptable';
     else if (e.code === 'unconfirmed_experience_claims') code = 'unconfirmed_claims';
+    else if (e.code === 'claim_still_in_body') code = 'claim_still_in_body';
     else if (e.kind === 'conflict') code = 'conflict';
     else if (e.kind === 'csrf') code = 'csrf';
     else if (e.kind === 'payload_too_large') code = 'too_large';
@@ -115,4 +118,21 @@ export function versionAuthorLabel(createdBy: string, aiRunId: string | null): s
   if (createdBy.startsWith('ai:')) return 'AI 제안';
   if (createdBy === 'owner') return aiRunId ? '사용자 저장(AI 제안 채택)' : '사용자 저장';
   return createdBy;
+}
+
+/**
+ * URL 의 `?run=` 값 정규화(FIX-T06 round 2): 'none' 은 그대로, UUID 는 소문자, 그 밖의 값은 무시(undefined).
+ * 조회(getWritingState)와 선택(selectRun)에 같은 값을 쓴다.
+ */
+export function normalizeRunParam(v: string | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  if (v === 'none') return 'none';
+  const id = v.trim().toLowerCase();
+  return isUuid(id) ? id : undefined;
+}
+
+/** 작성실에서 보여 줄 run: 'none' → 없음, 지정한 id 가 목록에 있으면 그것, 아니면 가장 최근. */
+export function selectRun<T extends { id: string }>(runs: readonly T[], normalized: string | undefined): T | undefined {
+  if (normalized === 'none') return undefined;
+  return (normalized ? runs.find((r) => r.id === normalized) : undefined) ?? runs[0];
 }

@@ -259,17 +259,61 @@ export interface UnconfirmedClaim {
  */
 export function unconfirmedExperienceClaims(
   runs: readonly GateRun[],
-  confirmations: ReadonlyArray<{ runId: string; claimIndex: number }>,
+  confirmations: ReadonlyArray<ClaimResolutionRecord>,
+  currentBody?: string,
 ): UnconfirmedClaim[] {
-  const confirmed = new Set(confirmations.map((c) => `${c.runId}#${c.claimIndex}`));
   const out: UnconfirmedClaim[] = [];
   for (const r of runs) {
     if (!r.adopted) continue;
     r.claims.forEach((c, i) => {
-      if (claimNeedsConfirmation(c) && !confirmed.has(`${r.runId}#${i}`)) out.push({ run_id: r.runId, claim_index: i, text: c.text });
+      if (claimNeedsConfirmation(c) && !isClaimResolved(r.runId, i, c.text, confirmations, currentBody)) {
+        out.push({ run_id: r.runId, claim_index: i, text: c.text });
+      }
     });
   }
   return out;
+}
+
+/** 해결 기록 한 행(resolution 이 없으면 0006 이전 확인 = 'confirmed'). */
+export interface ClaimResolutionRecord {
+  runId: string;
+  claimIndex: number;
+  resolution?: string;
+}
+
+/**
+ * claim 이 해결됐는가(FIX-T06 round 2).
+ * - 'confirmed' 행이 있으면 해결(사용자가 사실이라고 영구히 주장).
+ * - 'removed' 행은 **현재 본문에 그 문장이 없을 때만** 해결. 다시 넣으면 다시 미해결. 현재 본문을 모르면(undefined) 미해결(fail closed).
+ */
+export function isClaimResolved(
+  runId: string,
+  claimIndex: number,
+  claimText: string,
+  confirmations: ReadonlyArray<ClaimResolutionRecord>,
+  currentBody: string | undefined,
+): boolean {
+  const rows = confirmations.filter((c) => c.runId === runId && c.claimIndex === claimIndex);
+  if (rows.some((c) => (c.resolution ?? 'confirmed') === 'confirmed')) return true;
+  if (rows.some((c) => c.resolution === 'removed')) return currentBody !== undefined && !bodyContainsClaim(currentBody, claimText);
+  return false;
+}
+
+/**
+ * 비교용 정규화: NFKC → 소문자 → 글자(\p{L})·숫자(\p{N})만 남김(공백·문장부호·기호 제거). 유사도·형태소 비교는 하지 않는다.
+ */
+export function normalizeForClaimMatch(s: string): string {
+  return s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+/**
+ * 본문에 claim 문장이 (공백·문장부호 차이를 무시하고) 그대로 들어 있는가. 퍼지 일치 아님 — 한 글자라도 바꾸면 "없음".
+ * claim 이 정규화 후 비어 있으면(문장부호만) 비교할 수 없으므로 "있음"으로 본다(제외를 허용하지 않음).
+ */
+export function bodyContainsClaim(body: string, claimText: string): boolean {
+  const needle = normalizeForClaimMatch(claimText);
+  if (needle === '') return true;
+  return normalizeForClaimMatch(body).includes(needle);
 }
 
 // ---- 오류 ----
@@ -292,6 +336,15 @@ export class BrandVersionConflictError extends AppError {
 export class LlmFailedError extends AppError {
   constructor() {
     super('llm_failed', 'llm_failed', 'AI 제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다. 잠시 뒤 다시 시도하세요.');
+  }
+}
+
+/** 'removed'(본문에서 뺐음)인데 현재 본문에 그 문장이 아직 있음(409). 기록을 남기지 않는다. */
+export class ClaimStillInBodyError extends AppError {
+  constructor(claimIndexes: number[]) {
+    super('conflict', 'claim_still_in_body', '그 문장이 아직 현재 본문에 있습니다. 본문에서 빼거나 고쳐 저장한 뒤 "본문에서 뺐음"을 누르세요.', {
+      claim_indexes: claimIndexes,
+    });
   }
 }
 

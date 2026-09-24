@@ -12,6 +12,7 @@ import {
   BRAND_TONE_LABEL,
   buildAssistPrompt,
   claimNeedsConfirmation,
+  isClaimResolved,
   diffLines,
   formatMsk,
   INTERVIEW_QUESTIONS,
@@ -59,7 +60,7 @@ export function WritingPanel({
   const { brand, answers } = state;
   const answerByKey = new Map(answers.map((a) => [a.questionKey, a]));
   const answerIds = answers.map((a) => a.id).sort();
-  const resolved = new Map(state.confirmations.map((c) => [`${c.runId}#${c.claimIndex}`, c.resolution]));
+  const resolutionRows = state.confirmations.map((c) => ({ runId: c.runId, claimIndex: c.claimIndex, resolution: c.resolution }));
   const prompt = brand
     ? buildAssistPrompt({
         mode: 'draft',
@@ -205,14 +206,17 @@ export function WritingPanel({
                 <ul className="list">
                   {claims.map((cl, i) => {
                     const needs = claimNeedsConfirmation(cl);
-                    const resolution = resolved.get(`${run.id}#${i}`);
-                    const done = resolution !== undefined;
+                    // 게이트와 같은 판정: 확인은 영구, 제외는 현재 본문에 그 문장이 없을 때만(FIX-T06 round 2).
+                    const confirmedRow = resolutionRows.some((c) => c.runId === run.id && c.claimIndex === i && c.resolution === 'confirmed');
+                    const removedRow = resolutionRows.some((c) => c.runId === run.id && c.claimIndex === i && c.resolution === 'removed');
+                    const done = isClaimResolved(run.id, i, cl.text, resolutionRows, current.body);
+                    const reinserted = removedRow && !done;
                     return (
                       <li key={i} className="capture">
                         <p className="meta">
                           <span className={needs && !done ? 'tag warn' : 'tag'}>{KIND_LABEL[cl.kind] ?? cl.kind}</span>
                           {needs ? (
-                            <span>{done ? (resolution === 'removed' ? '본문에서 뺐다고 표시함' : '사용자 확인됨') : '미확인 — 사실인지 확인 필요'}</span>
+                            <span>{done ? (confirmedRow ? '사용자 확인됨' : '본문에서 빠짐(제외)') : reinserted ? '제외했던 문장이 본문에 다시 있음 — 다시 확인 필요' : '미확인 — 사실인지 확인 필요'}</span>
                           ) : null}
                         </p>
                         <p>{cl.text}</p>
@@ -237,9 +241,9 @@ export function WritingPanel({
                   })}
                 </ul>
                 <p className="note">
-                  실제 경험이면 &quot;내 경험이 맞음&quot;, 사실이 아니면 본문에서 그 문장을 빼거나 고쳐 저장한 뒤 &quot;본문에서 뺐음&quot;을 누르세요. 둘 중 하나를
-                  고르기 전에는 &quot;준비됨&quot;으로 바꿀 수 없습니다. 앱은 본문에서 실제로 뺐는지 대조하지 않습니다(사용자 표시). 제안 문장을 채택하지 않고 직접
-                  복사해 붙인 경우는 추적하지 않습니다.
+                  실제 경험이면 &quot;내 경험이 맞음&quot;, 사실이 아니면 본문에서 그 문장을 빼거나 고쳐 저장한 뒤 &quot;본문에서 뺐음&quot;을 누르세요. 둘 중 하나로
+                  해결하기 전에는 &quot;준비됨&quot;으로 바꿀 수 없습니다. 제외는 문장이 현재 본문에 없을 때만 되고(공백·문장부호 차이는 무시), 다시 넣으면 다시 확인이
+                  필요합니다. 제안 문장을 채택하지 않고 직접 복사해 붙인 경우는 추적하지 않습니다.
                 </p>
               </>
             ) : null}

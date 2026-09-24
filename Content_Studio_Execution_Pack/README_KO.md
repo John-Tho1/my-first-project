@@ -266,10 +266,10 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `GET`·`POST /api/contents/{id}/answers` | `{questions, current, history}` · `{answers:{situation?, judgment?, takeaway?}}` → 201 `{inserted, current}` |
 | `POST /api/contents/{id}/assist` | `{mode, base_version, brand_profile_version, answer_ids[]}` → 201 `{run, proposal_version, diff, claims, followup_questions, warnings, mock_warning}`. 현재가 아닌 base → 409 `stale_base`, 실패 → 502 `llm_failed`, `LLM_MODE=live` → 503(fail-closed, 실행 기록 없음) |
 | `POST /api/contents/{id}/assist/{run_id}/adopt` | `{base_version}` → 201 새 사용자 버전(현재). 제안의 기준 버전이 현재가 아니면 409 `stale_base` |
-| `POST /api/contents/{id}/claims/confirm` | `{run_id, claim_indexes[], resolution?: "confirmed"|"removed"}` → 200 `{confirmed, unconfirmed}`. `removed` = 그 문장을 본문에서 뺐다는 사용자 표시(본문 대조 없음) |
+| `POST /api/contents/{id}/claims/confirm` | `{run_id, claim_indexes[], resolution?: "confirmed"|"removed"}` → 200 `{confirmed, unconfirmed}`. `removed` = 그 문장을 본문에서 뺐다는 표시 — 현재 본문에 문장(공백·문장부호 무시)이 남아 있으면 409 `claim_still_in_body`, 나중에 다시 넣으면 다시 미해결 |
 
 - 다른 사용자의 원고·실행 기록·답변은 404. 새 표(`interview_answers`·`generation_runs`·`claim_confirmations`)와 Brand Profile 새 열은 내보내기·복원에 포함된다(M1 묶음은 새 표를 빈 표로 읽는다).
-- migration `0005_t06_writing`·`0006_t06_claim_resolution` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
+- migration `0005_t06_writing`·`0006_t06_claim_resolution`·`0007_t06_removed_binding` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
 
 ### 검증 명령
 | 명령 | 내용 | 기대 |

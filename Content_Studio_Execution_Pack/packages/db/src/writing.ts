@@ -18,7 +18,9 @@ import {
   assistMaterial,
   BadRequestError,
   BrandVersionConflictError,
+  bodyContainsClaim,
   buildAssistPrompt,
+  ClaimStillInBodyError,
   claimNeedsConfirmation,
   interviewQuestion,
   INTERVIEW_KEYS,
@@ -41,7 +43,7 @@ import {
 } from '@cs/domain';
 import type { Db } from './client';
 import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
-import { getContentRow, insertCurrentVersion, lockContentForWrite, nextVersionNumber, type ContentRow, type ContentVersionRow } from './contents';
+import { insertCurrentVersion, lockContentForWrite, nextVersionNumber, type ContentRow, type ContentVersionRow } from './contents';
 import { recordAudit, type DbOrTx } from './queries';
 import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers, users } from './schema';
 
@@ -596,7 +598,9 @@ export async function adoptProposal(
  * - 'confirmed': "내 실제 경험이 맞다"
  * - 'removed'  : "그 문장을 본문에서 뺐거나 고쳤다"(FIX-T06 P1 — 거짓 확인 없이 검토를 끝낼 수 있게). 서버는 본문을 대조하지 않는다.
  * 둘 다 사용자 주장이며 AI 는 이 경로를 호출하지 않는다. 성공한 run 의 확인 필요 claim 만(아니면 400).
- * 이미 해결한 index 는 그대로 둔다(중복 행 없음, 처음 선택한 resolution 유지).
+ * - FIX round 2: 'removed' 는 원고 잠금 안에서 현재 본문에 그 문장이 없을 때만 저장(있으면 409 claim_still_in_body, 행 없음),
+ *   body_version_id = 그때의 현재 버전. 게이트는 이후에도 현재 본문을 다시 검사한다(다시 넣으면 다시 미해결).
+ * 같은 (run, index, resolution) 은 한 행(중복 없음). 확인과 제외는 각각 한 번씩 기록할 수 있다.
  */
 export async function confirmClaims(
   db: Db,
@@ -609,8 +613,8 @@ export async function confirmClaims(
 ): Promise<{ confirmed: number[]; unconfirmed: UnconfirmedClaim[] }> {
   if (!isUuid(contentId)) throw new NotFoundError(CONTENT_NOT_FOUND);
   return db.transaction(async (tx) => {
-    const content = await getContentRow(tx, ownerId, contentId);
-    if (!content) throw new NotFoundError(CONTENT_NOT_FOUND);
+    // FIX-T06 round 2: 원고 잠금 안에서 현재 본문을 읽어 'removed' 를 그 본문 버전에 묶는다(본문 저장·채택과 직렬화).
+    const { content, current } = await lockContentForWrite(tx, ownerId, contentId);
     const run = await getGenerationRun(tx, ownerId, content.id, runId.toLowerCase());
     if (!run || run.status !== 'succeeded') throw new NotFoundError(RUN_NOT_FOUND);
     const claims = claimsOf(run.outputJson);
@@ -619,10 +623,14 @@ export async function confirmClaims(
       const c = claims[i];
       if (!c || !claimNeedsConfirmation(c)) throw new BadRequestError('확인이 필요한 경험 주장이 아닙니다');
     }
+    if (resolution === 'removed') {
+      const still = idx.filter((i) => bodyContainsClaim(current.body, claims[i]!.text));
+      if (still.length > 0) throw new ClaimStillInBodyError(still);
+    }
     const inserted = await tx
       .insert(claimConfirmations)
-      .values(idx.map((claimIndex) => ({ ownerId, runId: run.id, claimIndex, resolution, confirmedAt: now })))
-      .onConflictDoNothing({ target: [claimConfirmations.runId, claimConfirmations.claimIndex] })
+      .values(idx.map((claimIndex) => ({ ownerId, runId: run.id, claimIndex, resolution, bodyVersionId: current.id, confirmedAt: now })))
+      .onConflictDoNothing({ target: [claimConfirmations.runId, claimConfirmations.claimIndex, claimConfirmations.resolution] })
       .returning({ claimIndex: claimConfirmations.claimIndex });
     if (inserted.length > 0) {
       await recordAudit(tx, {
@@ -631,7 +639,7 @@ export async function confirmClaims(
         entity: 'content',
         entityId: content.id,
         versionOrHash: run.id,
-        details: { count: inserted.length, indexes: inserted.map((r) => r.claimIndex).join(','), resolution },
+        details: { count: inserted.length, indexes: inserted.map((r) => r.claimIndex).join(','), resolution, body_version: current.version },
         at: now,
       });
     }

@@ -5,10 +5,12 @@ import {
   assistMaterial,
   assistRequestSchema,
   blocksToList,
+  bodyContainsClaim,
   brandProfileCreateSchema,
   buildAssistPrompt,
   claimNeedsConfirmation,
   interviewAnswersSchema,
+  isClaimResolved,
   linesToList,
   PROMPT_VERSION,
   unconfirmedExperienceClaims,
@@ -299,5 +301,45 @@ describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
     const p = parseBundle(build(tables(null, rows)), { migrations: ['0000_a'] });
     const seqOf = Object.fromEntries(p.tables.interview_answers.map((r) => [r.id.slice(-1), r.seq]));
     expect(seqOf).toEqual({ '1': 1, '2': 2, '0': 3 });
+  });
+});
+
+describe('FIX-T06 round 2: 본문 포함 검사와 제외 해결', () => {
+  const claim = '제가 직접 현지 법인을 설득했습니다.';
+
+  it('bodyContainsClaim: 공백·문장부호·대소문자·전각 차이는 무시', () => {
+    expect(bodyContainsClaim(`앞 문장.\n${claim}\n뒤`, claim)).toBe(true);
+    expect(bodyContainsClaim('제가   직접\n현지 법인을, 설득했습니다!!', claim)).toBe(true);
+    expect(bodyContainsClaim('I SAID: "Hello, World"', 'i said hello world')).toBe(true);
+    expect(bodyContainsClaim('ＡＢＣ１２３', 'abc 123')).toBe(true);
+  });
+
+  it('bodyContainsClaim: 퍼지 일치가 아니다 — 한 글자만 달라도, 일부만 있어도 "없음"', () => {
+    expect(bodyContainsClaim('제가 직접 현지 법인을 설득했어요.', claim)).toBe(false);
+    expect(bodyContainsClaim('제가 직접 현지 법인을', claim)).toBe(false);
+    expect(bodyContainsClaim('', claim)).toBe(false);
+  });
+
+  it('bodyContainsClaim: 문장부호뿐인 claim 은 비교할 수 없으므로 "있음"(제외 불가)', () => {
+    expect(bodyContainsClaim('아무 본문', '...!?')).toBe(true);
+  });
+
+  it('isClaimResolved: confirmed 는 영구, removed 는 현재 본문에 없을 때만, 본문을 모르면 미해결', () => {
+    const removed = [{ runId: 'r', claimIndex: 0, resolution: 'removed' }];
+    const confirmed = [{ runId: 'r', claimIndex: 0, resolution: 'confirmed' }];
+    expect(isClaimResolved('r', 0, claim, confirmed, claim)).toBe(true);
+    expect(isClaimResolved('r', 0, claim, [{ runId: 'r', claimIndex: 0 }], claim)).toBe(true); // 0006 이전 행 = confirmed
+    expect(isClaimResolved('r', 0, claim, removed, '뺀 본문')).toBe(true);
+    expect(isClaimResolved('r', 0, claim, removed, `다시 넣음 ${claim}`)).toBe(false);
+    expect(isClaimResolved('r', 0, claim, removed, undefined)).toBe(false);
+    expect(isClaimResolved('r', 1, claim, removed, '뺀 본문')).toBe(false);
+    expect(isClaimResolved('r', 0, claim, [...removed, ...confirmed], `다시 넣음 ${claim}`)).toBe(true);
+  });
+
+  it('unconfirmedExperienceClaims: 제외한 문장을 다시 넣으면 다시 미해결', () => {
+    const runs = [{ runId: 'r', adopted: true, claims: [{ text: claim, kind: 'experience', needs_user_confirmation: true }] }];
+    const removed = [{ runId: 'r', claimIndex: 0, resolution: 'removed' }];
+    expect(unconfirmedExperienceClaims(runs, removed, '뺀 본문')).toEqual([]);
+    expect(unconfirmedExperienceClaims(runs, removed, claim)).toEqual([{ run_id: 'r', claim_index: 0, text: claim }]);
   });
 });

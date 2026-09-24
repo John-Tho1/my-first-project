@@ -249,6 +249,38 @@ describe('POST /api/assets/uploads', () => {
         .where(and(eq(schema.auditEvents.action, 'asset.missing'), eq(schema.auditEvents.entityId, id)));
       expect(missing).toHaveLength(1);
     });
+
+    it('파일이 사라진 asset 에 같은 바이트를 다시 올리면 duplicate 응답과 함께 파일이 복구되고 asset.restore 감사 기록이 남는다', async () => {
+      const bytes = new TextEncoder().encode('vanish then restore');
+      const first = await uploadPOST(upload(tokenA, { bytes, name: 'r.txt' }));
+      expect(first.status).toBe(201);
+      const { id, checksum } = await first.json();
+      const row = await getAssetById(db, ownerA, id);
+      const storage = new LocalStorageAdapter(storageDir);
+      await storage.delete(row!.key);
+      expect((await assetGET(...assetGet(id, tokenA))).status).toBe(404);
+
+      const files = filesOnDisk();
+      const again = await uploadPOST(upload(tokenA, { bytes, name: 'other-name.txt' }));
+      expect(again.status).toBe(200);
+      expect(await again.json()).toMatchObject({ id, checksum, duplicate: true });
+      expect(await storage.exists(row!.key)).toBe(true);
+      expect(filesOnDisk()).toBe(files + 1);
+      const dl = await assetGET(...assetGet(id, tokenA));
+      expect(dl.status).toBe(200);
+      expect(new Uint8Array(await dl.arrayBuffer())).toEqual(bytes);
+      const restoredAudit = () =>
+        db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.action, 'asset.restore'), eq(schema.auditEvents.entityId, id)));
+      const restored = await restoredAudit();
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).toMatchObject({ ownerId: ownerA, versionOrHash: checksum });
+
+      // 파일이 있는 정상 중복은 복구 기록을 남기지 않는다
+      const third = await uploadPOST(upload(tokenA, { bytes, name: 'r.txt' }));
+      expect(third.status).toBe(200);
+      expect(filesOnDisk()).toBe(files + 1);
+      expect(await restoredAudit()).toHaveLength(1);
+    });
   });
 });
 

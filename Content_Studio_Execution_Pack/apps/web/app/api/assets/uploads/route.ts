@@ -81,7 +81,21 @@ export async function POST(request: Request): Promise<Response> {
     const checksum = createHash('sha256').update(bytes).digest('hex');
 
     const existing = await findAssetByChecksum(owner.db, owner.ownerId, checksum);
-    if (existing) return done(existing, true);
+    if (existing) {
+      // 메타데이터는 있는데 저장 파일이 사라진 asset(다운로드 404) 은 같은 바이트가 다시 올라왔을 때 그 자리에 복구한다.
+      if (!(await storage.exists(existing.key))) {
+        await storage.put(existing.key, bytes);
+        await recordAudit(owner.db, {
+          ownerId: owner.ownerId,
+          action: 'asset.restore',
+          entity: 'asset',
+          entityId: existing.id,
+          versionOrHash: checksum,
+          details: { mime: existing.mime, bytes: bytes.byteLength },
+        });
+      }
+      return done(existing, true);
+    }
 
     const id = randomUUID();
     const key = buildAssetKey(owner.ownerId, id);

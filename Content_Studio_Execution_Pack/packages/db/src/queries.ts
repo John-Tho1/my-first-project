@@ -178,6 +178,7 @@ export interface AuditInput {
     | 'asset.upload'
     | 'asset.download'
     | 'asset.missing'
+    | 'asset.restore'
     | 'capture.create'
     | 'capture.update'
     | 'capture.extract_blocked'

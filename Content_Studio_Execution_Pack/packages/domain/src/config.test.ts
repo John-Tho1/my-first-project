@@ -16,6 +16,8 @@ describe('loadConfig', () => {
       AUTH_ALLOWED_IDENTITY: 'owner@example.local',
       STORAGE_DRIVER: 'local',
       STORAGE_LOCAL_DIR: './data/assets',
+      EXPORT_LOCAL_DIR: './data/exports',
+      RESTORE_LOCAL_DIR: './data/restores',
       AUTH_MODE: 'dev',
       AUTH_SESSION_TTL_MINUTES: 720,
       AUTH_COOKIE_SECURE: 'auto',

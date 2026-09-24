@@ -23,6 +23,8 @@ const LABELS: Record<string, string> = {
   AUTH_COOKIE_SECURE: 'AUTH_COOKIE_SECURE(쿠키 Secure 속성)',
   STORAGE_DRIVER: 'STORAGE_DRIVER(파일 저장소)',
   STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
+  EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
+  RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
 };
 
 /** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
@@ -57,6 +59,10 @@ export const configSchema = z.object({
   AUTH_COOKIE_SECURE: opt(z.enum(['auto', 'true', 'false']).default('auto')),
   STORAGE_DRIVER: opt(z.enum(['local', 'object']).default('local')),
   STORAGE_LOCAL_DIR: opt(z.string().min(1).default('./data/assets')),
+  /** T05: 내보내기 묶음(<id>/ 폴더 + <id>.zip)을 두는 곳. 개인 원문이 들어 있으므로 gitignore 된 data/ 아래를 쓴다. */
+  EXPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/exports')),
+  /** T05: 복원 미리보기에 올린 ZIP(<restore_id>.zip)을 두는 곳. */
+  RESTORE_LOCAL_DIR: opt(z.string().min(1).default('./data/restores')),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

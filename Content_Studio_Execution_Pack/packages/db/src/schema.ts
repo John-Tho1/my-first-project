@@ -372,3 +372,57 @@ export const sessions = pgTable(
   },
   (t) => [index('sessions_owner_idx').on(t.ownerId)],
 );
+
+/**
+ * 내보내기 실행 기록(T05). path 는 워크스페이스 루트 기준 상대 경로(루트 밖이면 파일 이름만) — 비밀·절대 경로를 넣지 않는다.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES) — 환경마다 다른 운영 기록이다.
+ */
+export const exportRuns = pgTable(
+  'export_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    formatVersion: integer('format_version').notNull(),
+    manifestSha256: text('manifest_sha256').notNull(),
+    zipBytes: bigint('zip_bytes', { mode: 'number' }).notNull(),
+    path: text('path').notNull(),
+    status: text('status').notNull(),
+    totals: jsonb('totals').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    check('export_runs_status_chk', sql`${t.status} in ('completed', 'failed')`),
+    index('export_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 복원 실행 기록(T05). preview 는 미리보기 결과(표별 건수·경고), result 는 커밋 결과(표별 건수). 올린 ZIP 은 data/restores/<id>.zip.
+ * status: previewed → committed | rejected(커밋 시 재검증 실패) | failed(커밋 중 오류). 커밋은 한 번만.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES).
+ */
+export const restoreRuns = pgTable(
+  'restore_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    source: text('source').notNull(),
+    manifestSha256: text('manifest_sha256').notNull(),
+    preview: jsonb('preview').$type<Record<string, unknown>>().notNull(),
+    status: text('status').notNull(),
+    committedAt: ts('committed_at'),
+    mode: text('mode'),
+    result: jsonb('result').$type<Record<string, unknown>>(),
+  },
+  (t) => [
+    check('restore_runs_source_chk', sql`${t.source} in ('upload', 'export_run')`),
+    check('restore_runs_status_chk', sql`${t.status} in ('previewed', 'committed', 'rejected', 'failed')`),
+    check('restore_runs_mode_chk', sql`${t.mode} is null or ${t.mode} in ('empty_only', 'add_missing')`),
+    index('restore_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);

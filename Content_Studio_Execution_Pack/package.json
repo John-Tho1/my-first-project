@@ -19,6 +19,9 @@
     "db:generate": "pnpm --filter @cs/db db:generate",
     "db:migrate": "tsx packages/db/scripts/migrate.ts",
     "db:seed": "tsx packages/db/scripts/seed.ts",
+    "export": "tsx packages/db/scripts/export.ts",
+    "restore:preview": "tsx packages/db/scripts/restore.ts preview",
+    "restore:commit": "tsx packages/db/scripts/restore.ts commit",
     "worker": "tsx apps/worker/src/cli.ts"
   },
   "devDependencies": {

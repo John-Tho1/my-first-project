@@ -10,3 +10,5 @@ export * from './schemas';
 export * from './similarity';
 export * from './time';
 export * from './url';
+export * from './bundle';
+export * from './zip';

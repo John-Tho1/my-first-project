@@ -39,3 +39,15 @@
 - Exact authorized scope (if applicable): 해당 없음(외부 연결·새 의존성 없음 — pg_trgm 은 이미 설치된 PGlite 패키지에 포함).
 - Consequences: 오타·띄어쓰기 변형("재고리스")은 못 찾는다. 관련도 순 정렬이 아니라 최근 순이다. 2글자 이하 질의는 trigram 색인을 못 타고 순차 검색이 된다(개인용 데이터량에서는 문제 없다고 가정). 종류를 섞은 한 줄 순위는 없다.
 - When to revisit: 소재·원고가 수천 건을 넘어 검색이 느려질 때, 또는 관련도 순·오타 허용이 필요해질 때(M2 이후).
+
+## D6 — T05 내보내기 묶음은 store-only ZIP, owner 재지정·ID 보존, asset key 유지, add_missing 은 덮어쓰지 않음
+- Decision ID / date: D6 / 2026-09-24 (Europe/Moscow)
+- Question: 새 의존성 없이(ZIP 라이브러리 금지) 이식 가능한 export 를 어떤 형식으로 만들고, 다른 환경(다른 owner id)으로 복원할 때 ID·관계·파일을 어떻게 다루는가? 이미 데이터가 있는 곳에 복원하면 무엇을 하는가?
+- Options: (1) 형식: 폴더만 / tar / deflate ZIP(직접 구현) / **store-only ZIP**(method 0, `zlib.crc32`). (2) owner: 원래 owner id 로 users 행까지 복원 / **현재 로그인 owner 로 재지정**. (3) 엔터티 ID: 새로 발급(관계 재매핑) / **그대로 보존**. (4) asset 저장 key: 새 owner 로 다시 만들기 / **원래 key(`assets/<원래 owner>/<uuid>`) 그대로**. (5) 기존 데이터: 덮어쓰기 / **빈 환경에만(empty_only)** / **없는 것만 추가(add_missing, 덮어쓰기 없음)**.
+- Chosen option: store-only ZIP(ZIP64·암호화·압축 없음, 2 GiB 상한) + 같은 내용을 풀어 둔 폴더. 표 JSON 은 owner_id 열 없이(owner 는 manifest.owner) 키 정렬·2칸 들여쓰기로 직렬화해, 같은 데이터면 다른 owner 로 복원한 뒤 다시 내보내도 표 sha256 이 같다(users·audit_events 제외). 복원은 모든 행의 owner_id 를 현재 owner 로 바꾸고 ID 는 그대로 둔다. asset key 는 그대로 쓴다 — 저장소 adapter 는 owner 를 모르고 접근 권한은 `assets.owner_id` 로 강제되며, key 는 전역 unique 라 충돌하지 않는다. 기본은 empty_only(소재·카드·원고·파일·출처 0건 + 충돌 0). add_missing 은 없는 ID 만 INSERT(`ON CONFLICT DO NOTHING`), 같은 행은 건너뛰고, 다른 행·다른 owner 가 쓰는 ID·부모가 복원되지 않은 행·다른 unique 충돌은 모두 "충돌"로 보고만 한다. 기존 행 UPDATE 는 없다(예외: 이번에 넣은 원고의 current_version_id null → 버전 id). 미리보기는 커밋과 같은 코드를 트랜잭션 안에서 실행하고 rollback 해서 계산한다.
+- Evidence / assumption: `tests/integration/export-restore.test.ts` 가 빈 DB 복원 후 11개 복원 표의 모든 행(ID·값·관계·원고 본문 바이트·current_version_id·asset checksum·저장소 파일 sha256)과 한국어 검색 결과가 일치함을, 한 바이트 변조가 `manifest_mismatch` 로 거부되고 DB 가 그대로임을, add_missing 이 바뀐 행을 덮어쓰지 않음을 확인한다. 시각은 마이크로초까지 보존한다(JS Date 를 거치지 않음). Node 22.12+ 의 `zlib.crc32` 사용.
+- Reversible?: 예. 형식은 `format_version` 으로 구분하고(v1 외 거부), 복원 규칙은 `packages/db/src/restore.ts` 한 곳.
+- User decision required?: 확인 요청 — 묶음은 암호화하지 않는다(docs/02 "backup 의 개인 데이터는 암호화"는 운영 백업(T20) 범위로 남김). 보관 위치·보존 기간은 사용자가 정한다.
+- Exact authorized scope (if applicable): 해당 없음(로컬 파일만, 외부 전송 없음).
+- Consequences: 다른 도구로 압축해 다시 묶은 ZIP(deflate)은 거부된다 — 이 앱이 만든 ZIP 만 복원 가능. 업로드 미리보기는 ZIP 전체를 메모리에 올린다(≤256MB, multipart 는 임시 파일 → 메모리). 같은 DB 안에서 다른 owner 에게 같은 묶음을 복원하면 ID 가 이미 쓰이고 있어 전부 충돌(id_in_use)이 된다 — 새 ID 발급 복원은 없다. 커밋 도중 실패하면 DB 는 rollback 되지만 이미 쓴 asset 파일은 고아로 남을 수 있다. users(식별자 원문)·audit_events 는 복원하지 않는다.
+- When to revisit: 대용량 asset(M2 T08) 또는 운영 백업·복원 drill(T20)에서 암호화·스트리밍 ZIP·ZIP64 가 필요해질 때, 또는 여러 owner 를 한 DB 에 합칠 필요가 생길 때.

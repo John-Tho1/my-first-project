@@ -20,6 +20,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <Link href="/ideas">카드</Link>
           <Link href="/contents">아카이브</Link>
           <Link href="/search">검색</Link>
+          <Link href="/settings">설정</Link>
         </nav>
         {children}
       </body>

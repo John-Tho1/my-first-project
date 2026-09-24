@@ -185,7 +185,11 @@ export interface AuditInput {
     | 'idea.update'
     | 'content.create'
     | 'content.update'
-    | 'content.version_append';
+    | 'content.version_append'
+    | 'export.create'
+    | 'export.download'
+    | 'restore.preview'
+    | 'restore.commit';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

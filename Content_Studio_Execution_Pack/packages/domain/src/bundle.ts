@@ -37,10 +37,23 @@ export const EXPORTED_TABLES = [
   'contents',
   'content_versions',
   'content_captures',
+  'interview_answers',
+  'generation_runs',
+  'claim_confirmations',
   'assets',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
+
+/**
+ * 나중 migration 에서 생긴 표(T06~). 그 migration 이전에 만든 묶음에는 표 파일이 없으므로 빈 표로 읽는다
+ * (묶음의 schema_migrations 에 그 태그가 없을 때만 — 있으면 표 파일이 반드시 있어야 한다).
+ */
+export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
+  interview_answers: '0005_t06_writing',
+  generation_runs: '0005_t06_writing',
+  claim_confirmations: '0005_t06_writing',
+};
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   sessions: '로그인 세션 — 인증 비밀과 같은 등급이며 다른 환경으로 옮기지 않는다',
@@ -100,6 +113,11 @@ export const ROW_SCHEMAS = {
     pillars: strArr,
     style_rules: strArr,
     created_at: ts,
+    // T06(0005) 열: 이전 묶음에는 없으므로 DB 기본값과 같은 값으로 채운다.
+    tone: z.enum(['formal', 'casual']).default('formal'),
+    avoid_phrases: strArr.default([]),
+    cta_rules: strArr.default([]),
+    sample_texts: strArr.default([]),
   }),
   sources: z.strictObject({
     id: uuid,
@@ -184,6 +202,32 @@ export const ROW_SCHEMAS = {
     note: nstr,
   }),
   content_captures: z.strictObject({ id: uuid, content_id: uuid, capture_id: uuid, role: str, created_at: ts }),
+  interview_answers: z.strictObject({
+    id: uuid,
+    content_id: uuid,
+    question_key: z.enum(['situation', 'judgment', 'takeaway']),
+    question: str,
+    answer: str,
+    created_at: ts,
+  }),
+  generation_runs: z.strictObject({
+    id: uuid,
+    content_id: uuid,
+    mode: z.enum(['outline', 'draft', 'revise']),
+    input_version_id: uuid,
+    brand_profile_id: uuid,
+    input_version_refs: z.record(z.string(), z.unknown()),
+    prompt_version: str,
+    provider: str,
+    model: str,
+    status: z.enum(['running', 'succeeded', 'failed']),
+    output_ref: uuid.nullable(),
+    output_json: z.record(z.string(), z.unknown()).nullable(),
+    error: nstr,
+    created_at: ts,
+    finished_at: ts.nullable(),
+  }),
+  claim_confirmations: z.strictObject({ id: uuid, run_id: uuid, claim_index: int.min(0), confirmed_at: ts }),
   assets: z.strictObject({
     id: uuid,
     key: str.refine(isValidStorageKey, '저장 키 형식이 올바르지 않습니다'),
@@ -606,6 +650,12 @@ export function parseBundle(entries: readonly ZipEntry[], opts: ParseBundleOptio
     const p = `data/${name}.json`;
     const bytes = byPath.get(p);
     const meta = manifest.tables[name];
+    const since = TABLE_INTRODUCED_IN[name];
+    if (!bytes && !meta && since !== undefined && !bm.includes(since)) {
+      // 이 표가 생기기 전의 묶음(예: M1 내보내기) — 빈 표로 읽는다.
+      (tables as Record<string, unknown[]>)[name] = [];
+      continue;
+    }
     if (!bytes || !meta) throw new BundleError('invalid_rows', '필요한 표 파일이 없습니다', { tables: [name] });
     if (meta.sha256 !== sha256Hex(bytes)) throw new BundleError('manifest_mismatch', '표 파일이 manifest 와 다릅니다', { paths: [p] });
     let rowsRaw: unknown;
@@ -704,7 +754,22 @@ export function checkIntegrity(t: BundleTables): void {
       problems.push('contents.current_version_id → content_versions(같은 원고)');
     }
   }
-  for (const r of t.content_versions) need('content_versions', 'content_id', r.content_id, 'contents');
+  for (const r of t.content_versions) {
+    need('content_versions', 'content_id', r.content_id, 'contents');
+    need('content_versions', 'ai_run_id', r.ai_run_id, 'generation_runs');
+  }
+  for (const r of t.interview_answers) need('interview_answers', 'content_id', r.content_id, 'contents');
+  for (const r of t.generation_runs) {
+    need('generation_runs', 'content_id', r.content_id, 'contents');
+    need('generation_runs', 'brand_profile_id', r.brand_profile_id, 'brand_profiles');
+    need('generation_runs', 'input_version_id', r.input_version_id, 'content_versions');
+    need('generation_runs', 'output_ref', r.output_ref, 'content_versions');
+    if (versionContent.get(r.input_version_id) !== r.content_id) problems.push('generation_runs.input_version_id → content_versions(같은 원고)');
+    if (r.output_ref !== null && versionContent.get(r.output_ref) !== r.content_id) {
+      problems.push('generation_runs.output_ref → content_versions(같은 원고)');
+    }
+  }
+  for (const r of t.claim_confirmations) need('claim_confirmations', 'run_id', r.run_id, 'generation_runs');
   for (const r of t.content_captures) {
     need('content_captures', 'content_id', r.content_id, 'contents');
     need('content_captures', 'capture_id', r.capture_id, 'captures');

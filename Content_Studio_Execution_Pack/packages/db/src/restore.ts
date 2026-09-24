@@ -116,6 +116,15 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'content_id', table: 'contents' },
     { col: 'capture_id', table: 'captures' },
   ],
+  // T06: 답변·AI 실행 기록·경험 확인은 부모(원고·버전·브랜드 프로필·run)가 이번에 들어갔거나 같은 행일 때만.
+  interview_answers: [{ col: 'content_id', table: 'contents', owned: true }],
+  generation_runs: [
+    { col: 'content_id', table: 'contents', owned: true },
+    { col: 'brand_profile_id', table: 'brand_profiles' },
+    { col: 'input_version_id', table: 'content_versions' },
+    { col: 'output_ref', table: 'content_versions' },
+  ],
+  claim_confirmations: [{ col: 'run_id', table: 'generation_runs', owned: true }],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

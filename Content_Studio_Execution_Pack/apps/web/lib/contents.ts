@@ -67,6 +67,7 @@ export function versionView(v: ContentVersionRow) {
     body: v.body,
     note: v.note,
     created_by: v.createdBy,
+    ai_run_id: v.aiRunId,
     created_at: v.createdAt.toISOString(),
   };
 }
@@ -79,6 +80,7 @@ export function versionSummaryView(v: VersionSummary) {
     created_by: v.createdBy,
     bytes: v.bytes,
     note: v.note,
+    ai_run_id: v.aiRunId,
   };
 }
 
@@ -154,7 +156,9 @@ export function formFailure(e: unknown, request: Request, back: string, notFound
     e instanceof AppError
       ? e.code === 'invalid_transition'
         ? 'invalid_transition'
-        : e.kind === 'csrf'
+        : e.code === 'unconfirmed_experience_claims'
+          ? 'unconfirmed_claims'
+          : e.kind === 'csrf'
           ? 'csrf'
           : e.kind === 'payload_too_large'
             ? 'too_large'
@@ -168,6 +172,8 @@ export function formFailure(e: unknown, request: Request, back: string, notFound
 export const FORM_ERROR_TEXT: Record<string, string> = {
   invalid: '저장하지 못했습니다. 입력값을 확인하세요.',
   invalid_transition: '그 상태로는 바로 바꿀 수 없습니다. 허용된 다음 상태만 고를 수 있습니다.',
+  unconfirmed_claims:
+    '채택한 AI 제안에 확인하지 않은 1인칭 경험 주장이 있어 "준비됨"으로 바꿀 수 없습니다. 아래 "AI 작성 보조"에서 사실인지 확인하세요.',
   csrf: '요청 출처를 확인할 수 없어 거부했습니다. 이 화면에서 다시 시도하세요.',
   too_large: '내용이 너무 깁니다.',
   server: '서버 오류로 저장하지 못했습니다.',

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { getContentDetail } from '@cs/db';
+import { getContentDetail, getContentVersion, getWritingState } from '@cs/db';
 import {
   allowedLifecycleOptions,
   contentLifecycleSchema,
@@ -12,6 +12,8 @@ import {
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
+import { versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
+import { WritingPanel, type ProposalView } from './writing-panel';
 import { preview } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
 
@@ -44,7 +46,16 @@ export default async function ContentPage({
   const { content: c, current, versions } = d;
   const lc = contentLifecycleSchema.safeParse(c.lifecycle);
   const options = lc.success ? allowedLifecycleOptions(lc.data) : [];
-  const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  const w = await getWritingState(db, session.ownerId, c.id);
+  const runParam = str(q.run);
+  const selectedRun = runParam === 'none' ? undefined : (w.runs.find((r) => r.id === runParam) ?? w.runs[0]);
+  let proposal: ProposalView | null = null;
+  if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {
+    const summary = versions.find((v) => v.id === selectedRun.outputRef);
+    const pv = summary ? await getContentVersion(db, session.ownerId, c.id, summary.version) : null;
+    if (pv) proposal = { id: pv.version.id, version: pv.version.version, body: pv.version.body };
+  }
   const savedVersion = Number(str(q.saved_version));
   const savedRow = Number.isInteger(savedVersion) ? versions.find((v) => v.version === savedVersion) : undefined;
   const prev = current.version > 1 ? current.version - 1 : null;
@@ -73,6 +84,12 @@ export default async function ContentPage({
       {err ? (
         <p className="notice" role="alert">
           {err}
+        </p>
+      ) : null}
+      {w.unconfirmed.length > 0 ? (
+        <p className="notice" role="alert">
+          {`채택한 AI 제안에 확인하지 않은 1인칭 경험 주장이 ${w.unconfirmed.length}개 있습니다. 확인하기 전에는 "준비됨"으로 바꿀 수 없습니다.`}{' '}
+          <a href="#assist">확인하러 가기</a>
         </p>
       ) : null}
       <p className="meta">
@@ -137,6 +154,17 @@ export default async function ContentPage({
             <p className="note">파생본: M2에서 채널별 초안 추가</p>
           </section>
 
+          <WritingPanel
+            contentId={c.id}
+            title={c.title}
+            current={{ id: current.id, version: current.version, body: current.body }}
+            state={w}
+            selectedRun={selectedRun ?? null}
+            proposal={proposal}
+            answeredCount={Number.isInteger(Number(str(q.answered))) && str(q.answered) !== undefined ? Number(str(q.answered)) : null}
+            confirmedCount={str(q.confirmed) !== undefined ? Number(str(q.confirmed)) : null}
+          />
+
           <section className="card archive" aria-labelledby="versions-title">
             <h3 id="versions-title">버전</h3>
             <ul className="list">
@@ -145,6 +173,9 @@ export default async function ContentPage({
                   <p className="meta">
                     <Link href={`/contents/${c.id}/versions/${v.version}`}>버전 {v.version}</Link>
                     {v.version === current.version ? <span className="tag">현재</span> : null}
+                    {v.createdBy.startsWith('ai:') || v.aiRunId ? (
+                      <span className={v.createdBy.startsWith('ai:') ? 'tag warn' : 'tag'}>{versionAuthorLabel(v.createdBy, v.aiRunId)}</span>
+                    ) : null}
                     <time dateTime={v.createdAt.toISOString()}>{formatMsk(v.createdAt)}</time>
                     <span>{formatBytes(v.bytes)}</span>
                     {v.version > 1 ? (

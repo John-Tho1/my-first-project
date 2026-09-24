@@ -8,6 +8,11 @@ export interface LlmGenerateInput {
   text: string;
   /** 허용된 source_version ID 목록. claim.source_refs 는 이 안에서만 채운다. */
   allowedSourceRefs?: string[];
+  /**
+   * T06: provider 가 받는 정확한 프롬프트(@cs/domain buildAssistPrompt). live provider(T07)는 이것을 보낸다.
+   * 모의 provider 는 결정성을 위해 text 만으로 제안을 만든다(프롬프트는 결과에 영향 없음).
+   */
+  prompt?: string;
 }
 
 export interface LlmProvider {
@@ -17,6 +22,19 @@ export interface LlmProvider {
 }
 
 export const MOCK_WARNING = '모의 응답: 실제 AI 호출 아님';
+
+/** 모의 provider 의 실패 주입(테스트 전용). 사용자 본문 보존·run failed 경로를 검증한다. */
+export class MockLlmFailure extends Error {
+  constructor() {
+    super('모의 AI 실패(주입)');
+    this.name = 'MockLlmFailure';
+  }
+}
+
+export interface MockLlmOptions {
+  /** true 면 generate 가 항상 MockLlmFailure 로 실패한다(테스트 전용 — 앱은 NODE_ENV=test 에서만 켠다). */
+  fail?: boolean;
+}
 
 /** 1인칭 경험 표현(한국어). 걸리면 experience + 사용자 확인 필요로 분류한다. */
 const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|저의|제 |우리는|우리가|직접 )/;
@@ -35,8 +53,14 @@ function splitSentences(text: string): string[] {
 export class MockLlmProvider implements LlmProvider {
   readonly name = 'mock';
   readonly mode = 'mock' as const;
+  private readonly fail: boolean;
+
+  constructor(opts: MockLlmOptions = {}) {
+    this.fail = opts.fail === true;
+  }
 
   async generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
+    if (this.fail) throw new MockLlmFailure();
     const hash = createHash('sha256').update(`${input.task}\u0000${input.inputVersion}\u0000${input.text}`).digest();
     const seed = hash.readUInt32BE(0);
     const tagPool = ['해외영업', '조직문화', 'AI활용', '주재원', '실무팁', '커뮤니케이션'];

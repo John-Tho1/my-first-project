@@ -4,6 +4,8 @@ import { getContentVersion } from '@cs/db';
 import { formatMsk } from '@cs/domain';
 import { getSession } from '../../../../../lib/auth';
 import { getAppDb, getConfig } from '../../../../../lib/server';
+import { MOCK_WARNING } from '@cs/providers';
+import { versionAuthorLabel } from '../../../../../lib/writing';
 
 export const dynamic = 'force-dynamic';
 
@@ -29,10 +31,15 @@ export default async function VersionPage({ params }: { params: Promise<{ id: st
       </h2>
       <p className="meta">
         <time dateTime={v.createdAt.toISOString()}>{formatMsk(v.createdAt)}</time>
-        <span>{v.createdBy === 'owner' ? '사용자 저장' : v.createdBy}</span>
+        <span className={v.createdBy.startsWith('ai:') ? 'tag warn' : undefined}>{versionAuthorLabel(v.createdBy, v.aiRunId)}</span>
         {v.version > 1 ? <Link href={`/contents/${c.id}/diff?from=${v.version - 1}&to=${v.version}`}>이전 버전과 비교</Link> : null}
       </p>
       {v.note ? <p className="note">메모: {v.note}</p> : null}
+      {v.createdBy === 'ai:mock' ? (
+        <p className="notice" role="note">
+          {MOCK_WARNING} — 이 버전은 AI 제안이며 현재 본문이 아닙니다. 채택은 작성실에서 합니다.
+        </p>
+      ) : null}
       <section className="card archive" aria-label="본문(읽기 전용)">
         <pre className="raw-text">{v.body || '(빈 본문)'}</pre>
         <p className="note">저장된 버전은 바꿀 수 없습니다. 고치려면 작성실에서 새 버전으로 저장하세요.</p>

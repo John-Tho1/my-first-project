@@ -93,3 +93,15 @@
 - User decision required?: 확정됨(사용자, 2026-09-24, 권고안 채택).
 - Consequences: 그 장애 창에서는 파일은 복구되지만 감사 이력이 없다. 화면 체크리스트 12항목은 M2 착수 뒤 사용자가 확인한다(.handoffs/screen-notes.md).
 - When to revisit: T08 착수 시(업로드 세션·job 상태 설계).
+
+## D12 — T06 작성 지원: 제안은 현재가 아닌 ai:mock 버전, 질문 3개 고정, 채택 = 새 사용자 버전, A03 은 `ready` 전이에서 서버 차단
+- Decision ID / date: D12 / 2026-09-24 (Europe/Moscow)
+- Question: 모의 AI 로 outline/draft/revise 를 만들 때 제안을 어디에 두고, 사용자 원문 보존·입력 버전 고정·A03(미확인 1인칭 경험 차단)을 어떻게 서버에서 강제하는가?
+- Options: (1) 제안 저장: 별도 proposals 표 / run 의 jsonb 에만 / **content_versions 의 현재가 아닌 불변 버전**(created_by='ai:mock', ai_run_id). (2) 인터뷰 질문: AI 가 생성 / **고정 3개**(상황·판단·독자에게 남길 한 가지). (3) 채택: current_version_id 를 제안 버전으로 옮김 / **제안 본문으로 새 사용자 버전 추가**. (4) A03 차단 지점: 화면 경고만 / 게시 승인(M3) / **상태 `ready` 전이(서버)**.
+- Chosen option: 제안은 `content_versions` 에 현재가 아닌 버전으로 저장(버전 번호 = 최대+1, `contents.current_version_id` 불변). 기존 본문 저장도 번호를 "현재+1" 에서 "최대+1" 로 바꿨다(제안 번호와 충돌 방지). `generation_runs` 에 입력 버전(현재 본문 버전 id·브랜드 프로필 id/버전·답변 id 정렬 목록)·prompt_version(`t06-assist-v1`)·provider/model(mock)·status(running→succeeded|failed)·output_ref·output_json(claims·followup_questions·warnings)을 남긴다. 채택은 제안 본문으로 `created_by='owner'`, `ai_run_id=<run>` 인 새 버전을 만들어 현재로 옮긴다(작업 지시의 'user' 대신 기존 사용자 버전 값 `owner` 를 그대로 사용 — 사용자 문장 판정이 한 값으로 유지됨). 채택 조건: base_version = 현재 **그리고** run 의 입력 버전 = 현재(그 사이 본문이 바뀌었거나 이미 채택했으면 409 `stale_base`). A03: 채택한 **모든** run(마지막 run 만이 아님)의 `experience` 또는 `needs_user_confirmation` claim 중 `claim_confirmations` 에 없는 것이 있으면 `updateContentMeta` 가 잠금 안에서 `ready` 전이를 409 `unconfirmed_experience_claims` 로 거부하고, 이미 `ready` 인 원고에서 그런 제안을 채택하는 것도 같은 409 로 거부한다(우회 방지 — 확인은 채택 전에도 할 수 있다). 확인은 사용자 요청(`POST /claims/confirm`)으로만 저장한다. `interview_answers`·`claim_confirmations` 는 DB 트리거로 UPDATE·DELETE 금지. live 모드는 `getLlm` 이 `assertLiveLlmAllowed` 후에도 `LiveProviderNotConfiguredError` 로 거부(503, run 없음). 실패 주입은 `NODE_ENV=test` 이고 `LLM_MOCK_FAIL_NEXT=1` 일 때만.
+- Evidence / assumption: `tests/integration/writing.test.ts`(18개)가 브랜드 append·409·owner 범위, 답변 append·최신·불변, assist 성공(현재 버전 불변·ai:mock·MOCK_WARNING)·stale 409(run·버전 0)·실패 주입(run failed·본문 그대로)·live 503(run 0), 채택·재채택 409, A03 409 → 확인 → ready 200, 새 표 export→빈 DB 복원 왕복을 확인한다. 모의 provider 는 답변→본문 순 자료의 앞 3문장으로 claim 을 만든다(1인칭 표현 → experience).
+- Reversible?: 예. 제안·채택·확인은 모두 추가 행이라 되돌릴 데이터 변환이 없다. 게이트 위치는 `packages/db/src/claims-gate.ts` 한 곳.
+- User decision required?: 확인 요청 — (a) 채택 버전 created_by 를 `owner` 로 둔 것, (b) A03 을 `ready` 전이에서 막는 것(게시 승인은 M3), (c) 제안을 채택하지 않고 본문에 직접 복사해 넣으면 게이트가 걸리지 않는다는 한계.
+- Exact authorized scope (if applicable): 외부 호출 0, 과금 0(D7).
+- Consequences: 버전 목록에 AI 제안 버전이 섞여 보인다("AI 제안(모의)" 표시). 채택하지 않은 제안의 경험 claim 은 막지 않는다. 복원(add_missing)에서 run 이 충돌로 빠지고 채택 버전만 들어가면 게이트가 그 run 을 보지 못한다. 프롬프트 내보내기는 보기만 있고, 결과 붙여넣기 가져오기는 T06 범위 밖. run 이 `running` 인 채로 프로세스가 죽으면 그대로 남는다(재시도는 새 run).
+- When to revisit: T07(claim–source 연결·user_confirmed 근거·live provider 경계·비용 예약) 착수 시.

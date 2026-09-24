@@ -18,9 +18,11 @@ import {
   draftTitleFromIdea,
   isUuid,
   NotFoundError,
+  UnconfirmedExperienceClaimsError,
   type ContentLifecycle,
   type ContentMetaPatchInput,
 } from '@cs/domain';
+import { listUnconfirmedExperienceClaims } from './claims-gate';
 import type { Db } from './client';
 import { getCaptureById, recordAudit, type DbOrTx } from './queries';
 import { assertCapturesOwned, getIdeaRow, keysetBefore, listIdeaCaptures, microsText, type IdeaRow, type TimeCursor } from './ideas';
@@ -154,7 +156,7 @@ export async function getContentRow(db: DbOrTx, ownerId: string, id: string): Pr
   return rows[0] ?? null;
 }
 
-async function getCurrentVersion(db: DbOrTx, content: ContentRow): Promise<ContentVersionRow> {
+export async function getCurrentVersion(db: DbOrTx, content: ContentRow): Promise<ContentVersionRow> {
   if (!content.currentVersionId) throw new Error('현재 버전이 없는 원고입니다');
   const rows = await db
     .select()
@@ -166,6 +168,39 @@ async function getCurrentVersion(db: DbOrTx, content: ContentRow): Promise<Conte
   return v;
 }
 
+/**
+ * 원고 행을 잠그고(FOR UPDATE) 현재 버전과 함께 돌려준다. 다른 owner·없는 ID 면 NotFoundError.
+ * 버전 추가·AI 제안 저장·채택은 모두 이 잠금 안에서 번호를 정한다(버전 번호 경합 방지).
+ */
+export async function lockContentForWrite(
+  tx: DbOrTx,
+  ownerId: string,
+  contentId: string,
+): Promise<{ content: ContentRow; current: ContentVersionRow }> {
+  if (!isUuid(contentId)) throw new NotFoundError(NOT_FOUND);
+  const rows0 = await tx
+    .select()
+    .from(contents)
+    .where(and(eq(contents.id, contentId), eq(contents.ownerId, ownerId)))
+    .for('update')
+    .limit(1);
+  const content = rows0[0];
+  if (!content) throw new NotFoundError(NOT_FOUND);
+  return { content, current: await getCurrentVersion(tx, content) };
+}
+
+/**
+ * 다음 버전 번호 = 이 원고의 최대 버전 + 1. T06 부터 AI 제안(현재 버전이 아닌 버전)이 있으므로
+ * "현재 버전 + 1" 이 아니다. 반드시 lockContentForWrite 잠금 안에서 호출한다.
+ */
+export async function nextVersionNumber(tx: DbOrTx, contentId: string): Promise<number> {
+  const rows = await tx
+    .select({ max: sql<number>`coalesce(max(${contentVersions.version}), 0)::int` })
+    .from(contentVersions)
+    .where(eq(contentVersions.contentId, contentId));
+  return (rows[0]?.max ?? 0) + 1;
+}
+
 export interface VersionSummary {
   id: string;
   version: number;
@@ -173,6 +208,8 @@ export interface VersionSummary {
   createdBy: string;
   bytes: number;
   note: string | null;
+  /** T06: AI 제안 버전·채택 버전이면 generation_runs.id */
+  aiRunId: string | null;
 }
 
 export async function listContentVersions(db: DbOrTx, contentId: string): Promise<VersionSummary[]> {
@@ -184,6 +221,7 @@ export async function listContentVersions(db: DbOrTx, contentId: string): Promis
       createdBy: contentVersions.createdBy,
       bytes: sql<number>`octet_length(${contentVersions.body})::int`,
       note: contentVersions.note,
+      aiRunId: contentVersions.aiRunId,
     })
     .from(contentVersions)
     .where(eq(contentVersions.contentId, contentId))
@@ -277,6 +315,11 @@ export async function updateContentMeta(
       throw new ConflictError({ current: contentMetaView(current), yours: { expected_revision: expectedRevision, ...patch } });
     }
     if (patch.lifecycle !== undefined) assertLifecycleTransition(current.lifecycle, patch.lifecycle);
+    // A03(T06): 채택한 AI 제안의 미확인 1인칭 경험 claim 이 있으면 `ready` 로 바꾸지 않는다(잠금 안에서 검사).
+    if (patch.lifecycle === 'ready' && current.lifecycle !== 'ready') {
+      const unconfirmed = await listUnconfirmedExperienceClaims(tx, ownerId, id);
+      if (unconfirmed.length > 0) throw new UnconfirmedExperienceClaimsError(unconfirmed);
+    }
 
     const set: PgUpdateSetSource<typeof contents> = { revision: sql`${contents.revision} + 1`, updatedAt: now };
     if (patch.title !== undefined) set.title = patch.title;
@@ -324,7 +367,8 @@ export interface AppendVersionInput {
 /**
  * 본문 새 버전 추가. baseVersion 이 현재 버전과 다르면 ConflictError(409):
  * { current: { version, body, created_at }, yours: { base_version, body, note } } — 두 본문 모두 돌려줘 잃지 않는다(A02).
- * 같으면 version = current+1 행을 추가하고 contents.current_version_id·updated_at 을 옮긴다. 기존 버전 행은 건드리지 않는다.
+ * 같으면 version = (최대 버전)+1 행을 추가하고 contents.current_version_id·updated_at 을 옮긴다. 기존 버전 행은 건드리지 않는다.
+ * T06: AI 제안 버전(현재가 아닌 버전)이 있을 수 있어 새 번호는 "현재+1" 이 아니라 "최대+1" 이다.
  */
 export async function appendContentVersion(
   db: Db,
@@ -335,50 +379,59 @@ export async function appendContentVersion(
 ): Promise<{ content: ContentRow; version: ContentVersionRow }> {
   if (!isUuid(contentId)) throw new NotFoundError(NOT_FOUND);
   return db.transaction(async (tx) => {
-    const rows0 = await tx
-      .select()
-      .from(contents)
-      .where(and(eq(contents.id, contentId), eq(contents.ownerId, ownerId)))
-      .for('update')
-      .limit(1);
-    const content = rows0[0];
-    if (!content) throw new NotFoundError(NOT_FOUND);
-    const current = await getCurrentVersion(tx, content);
+    const { content, current } = await lockContentForWrite(tx, ownerId, contentId);
     if (input.baseVersion !== current.version) {
       throw new ConflictError({
         current: { version: current.version, body: current.body, created_at: current.createdAt.toISOString() },
         yours: { base_version: input.baseVersion, body: input.body, note: input.note ?? null },
       });
     }
-    const inserted = await tx
-      .insert(contentVersions)
-      .values({
-        contentId: content.id,
-        version: current.version + 1,
-        body: input.body,
-        createdBy: 'owner',
-        note: emptyToNull(input.note),
-        createdAt: now,
-      })
-      .returning();
-    const version = inserted[0]!;
-    const updated = await tx
-      .update(contents)
-      .set({ currentVersionId: version.id, updatedAt: now })
-      .where(and(eq(contents.id, content.id), eq(contents.ownerId, ownerId), eq(contents.currentVersionId, current.id)))
-      .returning();
-    if (!updated[0]) throw new Error('현재 버전 갱신에 실패했습니다');
+    const r = await insertCurrentVersion(tx, ownerId, content, current, { body: input.body, note: input.note ?? null, aiRunId: null }, now);
     await recordAudit(tx, {
       ownerId,
       action: 'content.version_append',
       entity: 'content',
       entityId: content.id,
-      versionOrHash: String(version.version),
-      details: { version: version.version, base_version: input.baseVersion, body_bytes: Buffer.byteLength(input.body, 'utf8') },
+      versionOrHash: String(r.version.version),
+      details: { version: r.version.version, base_version: input.baseVersion, body_bytes: Buffer.byteLength(input.body, 'utf8') },
       at: now,
     });
-    return { content: updated[0], version };
+    return r;
   });
+}
+
+/**
+ * 잠금(lockContentForWrite) 안에서: 사용자 버전(created_by='owner')을 최대+1 번호로 추가하고 현재 버전으로 옮긴다.
+ * aiRunId 는 AI 제안 채택일 때만(출처 기록). 감사 기록은 호출자가 남긴다.
+ */
+export async function insertCurrentVersion(
+  tx: DbOrTx,
+  ownerId: string,
+  content: ContentRow,
+  current: ContentVersionRow,
+  v: { body: string; note: string | null; aiRunId: string | null },
+  now: Date,
+): Promise<{ content: ContentRow; version: ContentVersionRow }> {
+  const inserted = await tx
+    .insert(contentVersions)
+    .values({
+      contentId: content.id,
+      version: await nextVersionNumber(tx, content.id),
+      body: v.body,
+      createdBy: 'owner',
+      aiRunId: v.aiRunId,
+      note: emptyToNull(v.note),
+      createdAt: now,
+    })
+    .returning();
+  const version = inserted[0]!;
+  const updated = await tx
+    .update(contents)
+    .set({ currentVersionId: version.id, updatedAt: now })
+    .where(and(eq(contents.id, content.id), eq(contents.ownerId, ownerId), eq(contents.currentVersionId, current.id)))
+    .returning();
+  if (!updated[0]) throw new Error('현재 버전 갱신에 실패했습니다');
+  return { content: updated[0], version };
 }
 
 export interface ContentListFilters {

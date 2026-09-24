@@ -73,6 +73,9 @@ function tables(): BundleTables {
       { id: V2, content_id: CONTENT, version: 2, body: '둘째 본문', created_by: 'owner', ai_run_id: null, created_at: TS, note: '고침' },
     ],
     content_captures: [{ id: CC, content_id: CONTENT, capture_id: CAP, role: 'origin', created_at: TS }],
+    interview_answers: [],
+    generation_runs: [],
+    claim_confirmations: [],
     assets: [
       {
         id: ASSET,

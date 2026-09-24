@@ -55,7 +55,9 @@ export type AppErrorKind =
   | 'payload_too_large'
   | 'unsupported_media_type'
   | 'not_implemented'
-  | 'service_unavailable';
+  | 'service_unavailable'
+  /** T06: AI(모의 포함) 호출 실패 → 502 */
+  | 'llm_failed';
 
 export class AppError extends Error {
   readonly kind: AppErrorKind;

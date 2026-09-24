@@ -7,6 +7,7 @@
 import {
   AppError,
   buildClearedSessionCookie,
+  GuardError,
   PayloadTooLargeError,
   readCookie,
   SESSION_COOKIE_NAME,
@@ -26,6 +27,7 @@ const STATUS: Record<AppErrorKind, number> = {
   unsupported_media_type: 415,
   not_implemented: 501,
   service_unavailable: 503,
+  llm_failed: 502,
 };
 
 export function statusForError(e: AppError): number {
@@ -72,7 +74,11 @@ export function errorResponse(e: unknown, request: Request): Response {
     // extra(예: 409 의 current/yours)는 error/message 를 덮어쓰지 못하게 먼저 펼친다.
     return Response.json({ ...(e.extra ?? {}), error: e.code, message: e.message }, { status, headers });
   }
-  console.error(`[api] 처리하지 못한 오류: ${e instanceof Error ? e.name : typeof e}`);
+  if (e instanceof GuardError) {
+    // T06: 외부 효과 가드(fail-closed — 실제 AI·게시·수집). 503 + 가드 코드. 설정 값은 넣지 않는다.
+    return Response.json({ error: e.code.toLowerCase(), message: e.message }, { status: 503, headers: NO_STORE });
+  }
+  console.error(`[api] 처리하지 못한 오류:${e instanceof Error ? e.name : typeof e}`);
   return Response.json(
     { error: 'internal', message: '서버 오류가 발생했습니다' },
     { status: 500, headers: NO_STORE },

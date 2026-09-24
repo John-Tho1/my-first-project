@@ -3,6 +3,8 @@ export * from './queries';
 export * from './captures';
 export * from './ideas';
 export * from './contents';
+export * from './claims-gate';
+export * from './writing';
 export * from './search';
 export * from './bundle-tables';
 export * from './export';

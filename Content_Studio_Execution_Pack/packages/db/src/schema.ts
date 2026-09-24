@@ -44,8 +44,21 @@ export const brandProfiles = pgTable(
     pillars: jsonb('pillars').$type<string[]>().notNull(),
     styleRules: jsonb('style_rules').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
     createdAt: ts('created_at').notNull().defaultNow(),
+    /** T06: 말투 — 'formal'(존댓말) | 'casual'(평어). 0005 이전 행은 기본값 formal. */
+    tone: text('tone').notNull().default('formal'),
+    /** T06: 피하고 싶은 표현 */
+    avoidPhrases: jsonb('avoid_phrases').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    /** T06: CTA 원칙 */
+    ctaRules: jsonb('cta_rules').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    /** T06: 사용자가 직접 제공한 작성 예문(말투 참고용 — 예문 속 사건을 새 글 사실로 옮기지 않는다) */
+    sampleTexts: jsonb('sample_texts').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   },
-  (t) => [unique('brand_profiles_owner_version_uq').on(t.ownerId, t.version)],
+  (t) => [
+    unique('brand_profiles_owner_version_uq').on(t.ownerId, t.version),
+    // T06: generation_runs 가 "같은 owner 의 브랜드 프로필" 만 참조하도록 복합 FK 대상.
+    unique('brand_profiles_id_owner_uq').on(t.id, t.ownerId),
+    check('brand_profiles_tone_chk', sql`${t.tone} in ('formal', 'casual')`),
+  ],
 );
 
 export const sources = pgTable(
@@ -315,7 +328,109 @@ export const ideaCaptures = pgTable(
 );
 
 /**
- * 파일 메타데이터. 파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
+ * 인터뷰 답변(T06, 결정 D12). 불변: 행은 추가만 한다(트리거 interview_answers_immutable). 다시 답하면 새 행,
+ * 같은 question_key 의 가장 최근 행이 "현재 답변"이다. 답변은 사용자만 입력한다(AI 가 채우지 않음).
+ */
+export const interviewAnswers = pgTable(
+  'interview_answers',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    questionKey: text('question_key').notNull(),
+    question: text('question').notNull(),
+    answer: text('answer').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    // generation_runs 입력 확인 시 "같은 owner·같은 원고의 답변" 조회용
+    index('interview_answers_content_idx').on(t.contentId, t.questionKey, t.createdAt.desc()),
+    check('interview_answers_question_key_chk', sql`${t.questionKey} in ('situation', 'judgment', 'takeaway')`),
+    foreignKey({
+      name: 'interview_answers_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * AI 작성 보조 실행 기록(T06). 입력 버전(현재 본문 버전·브랜드 프로필 버전·답변 ID)을 고정해 남긴다.
+ * status: running → succeeded | failed. 성공하면 output_ref = 제안 버전(content_versions, created_by='ai:mock', 현재 버전 아님).
+ * output_json = { claims, followup_questions, warnings, proposed_tags, result_type }(모델 출력 — 승인·출처 증거 아님).
+ */
+export const generationRuns = pgTable(
+  'generation_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    mode: text('mode').notNull(),
+    inputVersionId: uuid('input_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    brandProfileId: uuid('brand_profile_id').notNull(),
+    inputVersionRefs: jsonb('input_version_refs').$type<Record<string, unknown>>().notNull(),
+    promptVersion: text('prompt_version').notNull(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    status: text('status').notNull(),
+    outputRef: uuid('output_ref').references(() => contentVersions.id, { onDelete: 'restrict' }),
+    outputJson: jsonb('output_json').$type<Record<string, unknown>>(),
+    error: text('error'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    finishedAt: ts('finished_at'),
+  },
+  (t) => [
+    unique('generation_runs_id_owner_uq').on(t.id, t.ownerId),
+    index('generation_runs_content_idx').on(t.contentId, t.createdAt.desc()),
+    check('generation_runs_mode_chk', sql`${t.mode} in ('outline', 'draft', 'revise')`),
+    check('generation_runs_status_chk', sql`${t.status} in ('running', 'succeeded', 'failed')`),
+    foreignKey({
+      name: 'generation_runs_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'generation_runs_brand_same_owner_fk',
+      columns: [t.brandProfileId, t.ownerId],
+      foreignColumns: [brandProfiles.id, brandProfiles.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 경험 claim 확인(T06, A03). 사용자가 "이 1인칭 경험은 사실"이라고 확인한 기록 — AI 가 만들지 않는다.
+ * 불변(트리거 claim_confirmations_immutable). (run_id, claim_index) unique.
+ */
+export const claimConfirmations = pgTable(
+  'claim_confirmations',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    claimIndex: integer('claim_index').notNull(),
+    confirmedAt: ts('confirmed_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('claim_confirmations_run_claim_uq').on(t.runId, t.claimIndex),
+    check('claim_confirmations_claim_index_chk', sql`${t.claimIndex} >= 0`),
+    foreignKey({
+      name: 'claim_confirmations_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 파일 메타데이터.파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
  * (owner_id, checksum) unique: 같은 owner 의 동일 파일은 한 행만(T02: 중복 업로드는 기존 asset 반환).
  */
 export const assets = pgTable(

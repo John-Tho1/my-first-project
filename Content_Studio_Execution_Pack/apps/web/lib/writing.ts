@@ -1,0 +1,114 @@
+/**
+ * T06 작성 지원 — 폼 → API 입력 변환, 응답 모양, 폼 오류 문구(서버 전용). JSON 필드는 snake_case(docs/04).
+ */
+import type { AssistResult } from '@cs/db';
+import { AppError, blocksToList, diffLines, diffStats, linesToList } from '@cs/domain';
+import { MOCK_WARNING } from '@cs/providers';
+import { errorResponse, seeOther } from './api';
+
+export const MAX_WRITING_REQUEST = 64 * 1024;
+
+/** /brand 폼 → brandProfileCreateSchema 입력. 목록 칸은 한 줄에 하나, 예문은 빈 줄로 구분. */
+export function formToBrandCreate(f: Record<string, string>) {
+  return {
+    base_version: Number(f.base_version),
+    pen_name: f.pen_name ?? '',
+    audience: f.audience ?? '',
+    pillars: linesToList(f.pillars),
+    style_rules: linesToList(f.style_rules),
+    tone: f.tone === 'casual' ? 'casual' : 'formal',
+    avoid_phrases: linesToList(f.avoid_phrases),
+    cta_rules: linesToList(f.cta_rules),
+    sample_texts: blocksToList(f.sample_texts),
+  };
+}
+
+/** 작성실 인터뷰 폼 → interviewAnswersSchema 입력. */
+export function formToAnswers(f: Record<string, string>) {
+  const answers: Record<string, string> = {};
+  for (const k of ['situation', 'judgment', 'takeaway']) if (f[`answer_${k}`] !== undefined) answers[k] = f[`answer_${k}`]!;
+  return { answers };
+}
+
+/** 쉼표로 구분한 목록(폼 hidden 칸). */
+export const csv = (v: string | undefined) =>
+  (v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+export function formToAssist(f: Record<string, string>) {
+  return {
+    mode: f.mode ?? '',
+    base_version: Number(f.base_version),
+    brand_profile_version: Number(f.brand_profile_version),
+    answer_ids: csv(f.answer_ids),
+  };
+}
+
+export function formToClaimConfirm(f: Record<string, string>) {
+  return { run_id: f.run_id ?? '', claim_indexes: csv(f.claim_indexes).map(Number) };
+}
+
+export function assistResponse(r: AssistResult, runView: Record<string, unknown>) {
+  const lines = diffLines(r.current.body, r.proposal.body);
+  return {
+    run: runView,
+    proposal_version: { id: r.proposal.id, version: r.proposal.version, body: r.proposal.body, created_by: r.proposal.createdBy },
+    current_version: { id: r.current.id, version: r.current.version },
+    diff: { stats: diffStats(lines), lines },
+    claims: r.output.claims,
+    followup_questions: r.output.followup_questions,
+    warnings: r.output.warnings,
+    mock_warning: r.run.provider === 'mock' ? MOCK_WARNING : null,
+  };
+}
+
+/** 작성 지원 폼 오류 코드 → 고정 문구(쿼리 값을 그대로 출력하지 않는다). */
+export const WRITING_ERROR_TEXT: Record<string, string> = {
+  stale: '그 사이 본문이 바뀌었습니다. 최신 본문을 기준으로 다시 시도하세요. (AI 제안은 만들지 않았습니다)',
+  llm_failed: 'AI 제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다.',
+  llm_blocked: '실제 AI 호출은 허용되지 않은 상태입니다(LLM_MODE). 아무것도 보내지 않았습니다.',
+  brand_missing: '브랜드 프로필이 없습니다. 먼저 Brand Profile 을 저장하세요.',
+  not_adoptable: '이 제안은 채택할 수 없습니다.',
+  unconfirmed_claims: '"준비됨" 원고에는 확인하지 않은 1인칭 경험 주장이 있는 제안을 채택할 수 없습니다. 먼저 주장을 확인하거나 상태를 "검토 중"으로 바꾸세요.',
+  conflict: '다른 곳에서 먼저 저장되었습니다. 현재 내용을 확인한 뒤 다시 저장하세요.',
+  invalid: '저장하지 못했습니다. 입력값을 확인하세요.',
+  csrf: '요청 출처를 확인할 수 없어 거부했습니다. 이 화면에서 다시 시도하세요.',
+  too_large: '내용이 너무 깁니다.',
+  server: '서버 오류로 처리하지 못했습니다.',
+};
+
+/** 폼 실패 공통(작성 지원): 401 → /login, 404 → notFoundHref, 그 외 → back?error=<code>. */
+export function writingFormFailure(e: unknown, request: Request, back: string, notFoundHref: string): Response {
+  const res = errorResponse(e, request);
+  if (res.status === 401) {
+    const headers = new Headers();
+    const cookie = res.headers.get('set-cookie');
+    if (cookie) headers.set('set-cookie', cookie);
+    return seeOther('/login', headers);
+  }
+  if (res.status === 404) return seeOther(notFoundHref);
+  let code = 'server';
+  if (res.status === 503) code = 'llm_blocked';
+  else if (e instanceof AppError) {
+    if (e.code === 'stale_base') code = 'stale';
+    else if (e.code === 'llm_failed') code = 'llm_failed';
+    else if (e.code === 'run_not_adoptable') code = 'not_adoptable';
+    else if (e.code === 'unconfirmed_experience_claims') code = 'unconfirmed_claims';
+    else if (e.kind === 'conflict') code = 'conflict';
+    else if (e.kind === 'csrf') code = 'csrf';
+    else if (e.kind === 'payload_too_large') code = 'too_large';
+    else code = 'invalid';
+  }
+  const sep = back.includes('?') ? '&' : '?';
+  return seeOther(`${back}${sep}error=${code}`);
+}
+
+/** 버전 작성자 표시: AI 제안(모의)과 사용자 문장을 구분한다(docs/01 §4). */
+export function versionAuthorLabel(createdBy: string, aiRunId: string | null): string {
+  if (createdBy === 'ai:mock') return 'AI 제안(모의)';
+  if (createdBy.startsWith('ai:')) return 'AI 제안';
+  if (createdBy === 'owner') return aiRunId ? '사용자 저장(AI 제안 채택)' : '사용자 저장';
+  return createdBy;
+}

@@ -50,6 +50,14 @@ export default async function SettingsPage({
         </p>
       ) : null}
 
+      <section className="card archive" aria-labelledby="brand-title">
+        <h3 id="brand-title">Brand Profile</h3>
+        <p className="note">필명·독자·연재 축·말투·피할 표현·CTA 원칙·직접 쓴 예문. 저장할 때마다 새 버전이 추가됩니다.</p>
+        <p>
+          <Link href="/brand">Brand Profile 보기·새 버전 저장</Link>
+        </p>
+      </section>
+
       <section className="card archive" aria-labelledby="export-title">
         <h3 id="export-title">내보내기</h3>
         <p className="note">

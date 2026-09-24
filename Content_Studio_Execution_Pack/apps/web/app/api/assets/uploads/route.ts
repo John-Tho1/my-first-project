@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { findAssetByChecksum, insertAsset, recordAudit, type AssetRow } from '@cs/db';
+import { findAssetByChecksum, insertAsset, lockAssetRow, recordAudit, type AssetRow } from '@cs/db';
 import {
   AppError,
   assertSameOrigin,
@@ -83,9 +83,12 @@ export async function POST(request: Request): Promise<Response> {
     const existing = await findAssetByChecksum(owner.db, owner.ownerId, checksum);
     if (existing) {
       // 메타데이터는 있는데 저장 파일이 사라진 asset(다운로드 404) 은 같은 바이트가 다시 올라왔을 때 그 자리에 복구한다.
-      if (!(await storage.exists(existing.key))) {
-        await storage.put(existing.key, bytes);
-        await recordAudit(owner.db, {
+      // asset 행을 잠근 트랜잭션 안에서 "없음 확인 → 감사 기록 → 파일 저장" 순으로 한 요청만 수행한다:
+      // 동시 재업로드는 잠금 뒤 파일이 있는 것을 보고 복구·감사를 건너뛰고, 파일 저장이 실패하면 감사 기록도 함께 되돌아간다.
+      await owner.db.transaction(async (tx) => {
+        await lockAssetRow(tx, owner.ownerId, existing.id);
+        if (await storage.exists(existing.key)) return;
+        await recordAudit(tx, {
           ownerId: owner.ownerId,
           action: 'asset.restore',
           entity: 'asset',
@@ -93,7 +96,8 @@ export async function POST(request: Request): Promise<Response> {
           versionOrHash: checksum,
           details: { mime: existing.mime, bytes: bytes.byteLength },
         });
-      }
+        await storage.put(existing.key, bytes);
+      });
       return done(existing, true);
     }
 

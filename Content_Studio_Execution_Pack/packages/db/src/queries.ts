@@ -72,6 +72,19 @@ export async function getAssetById(db: Db, ownerId: string, id: string): Promise
   return rows[0] ?? null;
 }
 
+/**
+ * asset 행을 트랜잭션 안에서 잠근다(SELECT … FOR UPDATE). 같은 asset 의 파일 복구처럼 "확인 → 저장 → 감사" 를
+ * 한 요청만 수행하게 직렬화할 때 쓴다. 트랜잭션 밖에서 호출하면 잠금이 즉시 풀리므로 반드시 tx 로 호출한다.
+ */
+export async function lockAssetRow(tx: DbOrTx, ownerId: string, id: string): Promise<AssetRow | null> {
+  const rows = await tx
+    .select()
+    .from(assets)
+    .where(and(eq(assets.id, id), eq(assets.ownerId, ownerId)))
+    .for('update');
+  return rows[0] ?? null;
+}
+
 export async function findAssetByChecksum(db: Db, ownerId: string, checksum: string): Promise<AssetRow | null> {
   const rows = await db
     .select()

@@ -39,7 +39,7 @@ const RIGHTS_LABEL: Record<string, string> = {
   public_domain: '공공 영역',
 };
 const VERIFICATION_LABEL: Record<string, string> = {
-  VERIFIED: '검증됨',
+  VERIFIED: '서버 확인됨(형식 서명·크기·checksum)',
   pending: '검증 대기',
 };
 

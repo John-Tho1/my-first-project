@@ -280,6 +280,13 @@ describe('POST /api/assets/uploads', () => {
       expect(third.status).toBe(200);
       expect(filesOnDisk()).toBe(files + 1);
       expect(await restoredAudit()).toHaveLength(1);
+
+      // 같은 유실 asset 에 동시 재업로드 → 복구는 한 번, asset.restore 감사도 한 건만 추가
+      await storage.delete(row!.key);
+      const results = await Promise.all([1, 2, 3].map(() => uploadPOST(upload(tokenA, { bytes, name: 'c.txt' }))));
+      expect(results.map((r) => r.status)).toEqual([200, 200, 200]);
+      expect(await storage.exists(row!.key)).toBe(true);
+      expect(await restoredAudit()).toHaveLength(2);
     });
   });
 });

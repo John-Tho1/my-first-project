@@ -59,7 +59,7 @@ export function WritingPanel({
   const { brand, answers } = state;
   const answerByKey = new Map(answers.map((a) => [a.questionKey, a]));
   const answerIds = answers.map((a) => a.id).sort();
-  const confirmedSet = new Set(state.confirmations.map((c) => `${c.runId}#${c.claimIndex}`));
+  const resolved = new Map(state.confirmations.map((c) => [`${c.runId}#${c.claimIndex}`, c.resolution]));
   const prompt = brand
     ? buildAssistPrompt({
         mode: 'draft',
@@ -205,26 +205,42 @@ export function WritingPanel({
                 <ul className="list">
                   {claims.map((cl, i) => {
                     const needs = claimNeedsConfirmation(cl);
-                    const done = confirmedSet.has(`${run.id}#${i}`);
+                    const resolution = resolved.get(`${run.id}#${i}`);
+                    const done = resolution !== undefined;
                     return (
                       <li key={i} className="capture">
                         <p className="meta">
                           <span className={needs && !done ? 'tag warn' : 'tag'}>{KIND_LABEL[cl.kind] ?? cl.kind}</span>
-                          {needs ? <span>{done ? '사용자 확인됨' : '미확인 — 사실인지 확인 필요'}</span> : null}
+                          {needs ? (
+                            <span>{done ? (resolution === 'removed' ? '본문에서 뺐다고 표시함' : '사용자 확인됨') : '미확인 — 사실인지 확인 필요'}</span>
+                          ) : null}
                         </p>
                         <p>{cl.text}</p>
                         {needs && !done ? (
-                          <form className="form inline" method="post" action={`/api/contents/${contentId}/claims/confirm`}>
-                            <input type="hidden" name="run_id" value={run.id} />
-                            <input type="hidden" name="claim_indexes" value={String(i)} />
-                            <button type="submit">내가 실제로 겪은 일이 맞습니다(확인)</button>
-                          </form>
+                          <>
+                            <form className="form inline" method="post" action={`/api/contents/${contentId}/claims/confirm`}>
+                              <input type="hidden" name="run_id" value={run.id} />
+                              <input type="hidden" name="claim_indexes" value={String(i)} />
+                              <input type="hidden" name="resolution" value="confirmed" />
+                              <button type="submit">내 경험이 맞음(확인)</button>
+                            </form>
+                            <form className="form inline" method="post" action={`/api/contents/${contentId}/claims/confirm`}>
+                              <input type="hidden" name="run_id" value={run.id} />
+                              <input type="hidden" name="claim_indexes" value={String(i)} />
+                              <input type="hidden" name="resolution" value="removed" />
+                              <button type="submit">본문에서 뺐음(제외)</button>
+                            </form>
+                          </>
                         ) : null}
                       </li>
                     );
                   })}
                 </ul>
-                <p className="note">사실이 아니면 확인하지 말고 본문에서 그 문장을 고치세요. 확인은 &quot;준비됨&quot; 전환 조건입니다.</p>
+                <p className="note">
+                  실제 경험이면 &quot;내 경험이 맞음&quot;, 사실이 아니면 본문에서 그 문장을 빼거나 고쳐 저장한 뒤 &quot;본문에서 뺐음&quot;을 누르세요. 둘 중 하나를
+                  고르기 전에는 &quot;준비됨&quot;으로 바꿀 수 없습니다. 앱은 본문에서 실제로 뺐는지 대조하지 않습니다(사용자 표시). 제안 문장을 채택하지 않고 직접
+                  복사해 붙인 경우는 추적하지 않습니다.
+                </p>
               </>
             ) : null}
             {outputList(run, 'followup_questions').length > 0 ? (

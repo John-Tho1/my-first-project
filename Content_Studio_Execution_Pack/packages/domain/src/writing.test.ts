@@ -197,3 +197,107 @@ describe('묶음 호환: 0005 이전 묶음', () => {
     );
   });
 });
+
+describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
+  const OWNER = '11111111-1111-4111-8111-111111111111';
+  const BP = '22222222-2222-4222-8222-222222222222';
+  const CA = '33333333-3333-4333-8333-33333333333a';
+  const CB = '33333333-3333-4333-8333-33333333333b';
+  const VA = '44444444-4444-4444-8444-44444444444a';
+  const VB = '44444444-4444-4444-8444-44444444444b';
+  const VA2 = '44444444-4444-4444-8444-4444444444a2';
+  const RB = '55555555-5555-4555-8555-55555555555b';
+  const TS = '2026-09-01T06:10:00.123456Z';
+  const content = (id: string, v: string) => ({
+    id,
+    idea_id: null,
+    series: null,
+    title: 't',
+    audience: null,
+    tags: [],
+    revision: 1,
+    current_version_id: v,
+    lifecycle: 'draft' as const,
+    created_at: TS,
+    updated_at: TS,
+  });
+  const version = (id: string, contentId: string, n: number, aiRunId: string | null) => ({
+    id,
+    content_id: contentId,
+    version: n,
+    body: 'b',
+    created_by: 'owner',
+    ai_run_id: aiRunId,
+    created_at: TS,
+    note: null,
+  });
+  function tables(adoptedRun: string | null, answers: BundleTables['interview_answers'] = []): BundleTables {
+    return {
+      users: [{ id: OWNER, identity_masked: 'ow***@example.local' }],
+      brand_profiles: [
+        { id: BP, version: 1, pen_name: 'p', audience: 'a', pillars: ['x'], style_rules: [], created_at: TS, tone: 'formal', avoid_phrases: [], cta_rules: [], sample_texts: [] },
+      ],
+      sources: [],
+      source_versions: [],
+      captures: [],
+      capture_revisions: [],
+      ideas: [],
+      idea_captures: [],
+      contents: [content(CA, VA2), content(CB, VB)],
+      content_versions: [version(VA, CA, 1, null), version(VA2, CA, 2, adoptedRun), version(VB, CB, 1, null)],
+      content_captures: [],
+      interview_answers: answers,
+      generation_runs: [
+        {
+          id: RB,
+          content_id: CB,
+          mode: 'draft',
+          input_version_id: VB,
+          brand_profile_id: BP,
+          input_version_refs: {},
+          prompt_version: 'v',
+          provider: 'mock',
+          model: 'mock',
+          status: 'succeeded',
+          output_ref: VB,
+          output_json: { claims: [] },
+          error: null,
+          created_at: TS,
+          finished_at: TS,
+        },
+      ],
+      claim_confirmations: [],
+      assets: [],
+      audit_events: [],
+    };
+  }
+  const build = (t: BundleTables) =>
+    buildBundle({
+      exportId: '77777777-7777-4777-8777-777777777777',
+      exportedAt: '2026-09-24T12:00:00.000Z',
+      appVersion: '0.1.0',
+      migrations: ['0000_a'],
+      owner: { id: OWNER, identityMasked: 'ow***@example.local' },
+      tables: t,
+      assetBytes: new Map(),
+    }).entries;
+
+  it('다른 원고의 run 을 가리키는 ai_run_id → integrity 로 거부', () => {
+    expect(() => parseBundle(build(tables(RB)), { migrations: ['0000_a'] })).toThrow(
+      expect.objectContaining({ code: 'integrity', extra: { problems: ['content_versions.ai_run_id → generation_runs(같은 원고)'] } }),
+    );
+    expect(() => parseBundle(build(tables(null)), { migrations: ['0000_a'] })).not.toThrow();
+  });
+
+  it('seq 가 없는 0005 묶음의 답변은 원고별 (created_at, id) 순서로 1..n', () => {
+    const a = (id: string, at: string) => ({ id, content_id: CA, question_key: 'situation' as const, question: 'q', answer: id, created_at: at });
+    const rows = [
+      a('66666666-6666-4666-8666-666666666662', TS),
+      a('66666666-6666-4666-8666-666666666661', TS),
+      a('66666666-6666-4666-8666-666666666660', '2026-09-02T00:00:00.000000Z'),
+    ];
+    const p = parseBundle(build(tables(null, rows)), { migrations: ['0000_a'] });
+    const seqOf = Object.fromEntries(p.tables.interview_answers.map((r) => [r.id.slice(-1), r.seq]));
+    expect(seqOf).toEqual({ '1': 1, '2': 2, '0': 3 });
+  });
+});

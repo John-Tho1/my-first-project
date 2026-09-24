@@ -43,6 +43,13 @@
       "when": 1790279661586,
       "tag": "0005_t06_writing",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790282141567,
+      "tag": "0006_t06_claim_resolution",
+      "breakpoints": true
     }
   ]
 }

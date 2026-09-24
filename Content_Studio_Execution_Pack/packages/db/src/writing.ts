@@ -43,12 +43,13 @@ import type { Db } from './client';
 import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
 import { getContentRow, insertCurrentVersion, lockContentForWrite, nextVersionNumber, type ContentRow, type ContentVersionRow } from './contents';
 import { recordAudit, type DbOrTx } from './queries';
-import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers } from './schema';
+import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers, users } from './schema';
 
 export type BrandProfileRow = typeof brandProfiles.$inferSelect;
 export type InterviewAnswerRow = typeof interviewAnswers.$inferSelect;
 export type GenerationRunRow = typeof generationRuns.$inferSelect;
 export type ClaimConfirmationRow = typeof claimConfirmations.$inferSelect;
+export type ClaimResolution = 'confirmed' | 'removed';
 
 const CONTENT_NOT_FOUND = '원고를 찾을 수 없습니다';
 const RUN_NOT_FOUND = 'AI 제안 기록을 찾을 수 없습니다';
@@ -107,12 +108,17 @@ export async function createBrandProfileVersion(
   now: Date = new Date(),
 ): Promise<BrandProfileRow> {
   return db.transaction(async (tx) => {
+    // FIX-T06(P2): owner 행을 잠가 "현재 버전 읽기 → 번호 할당"을 직렬화한다(프로필이 아직 없을 때도 잠글 대상이 있음).
+    await tx.select({ id: users.id }).from(users).where(eq(users.id, ownerId)).for('update');
     const current = await getCurrentBrandProfile(tx, ownerId);
     const currentVersion = current?.version ?? 0;
     const { base_version, ...fields } = input;
-    const conflict = () =>
-      new BrandVersionConflictError({ current: current ? brandProfileView(current) : null, yours: { base_version, ...fields } });
-    if (base_version !== currentVersion) throw conflict();
+    // 409 본문의 current 는 항상 응답 시점에 다시 읽은 최신 버전이다.
+    const conflict = async () => {
+      const latest = await getCurrentBrandProfile(tx, ownerId);
+      return new BrandVersionConflictError({ current: latest ? brandProfileView(latest) : null, yours: { base_version, ...fields } });
+    };
+    if (base_version !== currentVersion) throw await conflict();
     const inserted = await tx
       .insert(brandProfiles)
       .values({
@@ -131,7 +137,7 @@ export async function createBrandProfileVersion(
       .onConflictDoNothing({ target: [brandProfiles.ownerId, brandProfiles.version] })
       .returning();
     const row = inserted[0];
-    if (!row) throw conflict();
+    if (!row) throw await conflict();
     await recordAudit(tx, {
       ownerId,
       action: 'brand.version_create',
@@ -160,17 +166,15 @@ export async function listInterviewAnswers(db: DbOrTx, ownerId: string, contentI
     .select()
     .from(interviewAnswers)
     .where(and(eq(interviewAnswers.ownerId, ownerId), eq(interviewAnswers.contentId, contentId)))
-    .orderBy(desc(interviewAnswers.createdAt), desc(interviewAnswers.id));
+    .orderBy(desc(interviewAnswers.seq));
 }
 
-/** 질문 키별 가장 최근 답변(질문 순서대로, 답이 없는 키는 빠짐). */
+/** 질문 키별 가장 최근 답변(질문 순서대로, 답이 없는 키는 빠짐). 최신 = 원고 안 저장 순번(seq)이 가장 큰 행(FIX-T06 P2). */
 export function latestAnswers(rows: readonly InterviewAnswerRow[]): InterviewAnswerRow[] {
   const byKey = new Map<string, InterviewAnswerRow>();
   for (const r of rows) {
     const prev = byKey.get(r.questionKey);
-    if (!prev || r.createdAt > prev.createdAt || (r.createdAt.getTime() === prev.createdAt.getTime() && r.id > prev.id)) {
-      byKey.set(r.questionKey, r);
-    }
+    if (!prev || r.seq > prev.seq) byKey.set(r.questionKey, r);
   }
   return INTERVIEW_KEYS.map((k) => byKey.get(k)).filter((r): r is InterviewAnswerRow => r !== undefined);
 }
@@ -182,6 +186,7 @@ export function interviewAnswerView(a: InterviewAnswerRow) {
     question_key: a.questionKey,
     question: a.question,
     answer: a.answer,
+    seq: a.seq,
     created_at: a.createdAt.toISOString(),
   };
 }
@@ -200,7 +205,10 @@ export async function saveInterviewAnswers(
   if (!isUuid(contentId)) throw new NotFoundError(CONTENT_NOT_FOUND);
   return db.transaction(async (tx) => {
     const { content } = await lockContentForWrite(tx, ownerId, contentId);
-    const current = latestAnswers(await listInterviewAnswers(tx, ownerId, content.id));
+    const history = await listInterviewAnswers(tx, ownerId, content.id);
+    const current = latestAnswers(history);
+    // 원고 잠금 안에서 순번을 정한다(최대+1). 시각이 같아도 저장 순서가 최신 판정을 결정한다.
+    let seq = history.reduce((m, r) => Math.max(m, r.seq), 0);
     const inserted: InterviewAnswerRow[] = [];
     for (const key of INTERVIEW_KEYS) {
       const raw = input.answers[key];
@@ -210,7 +218,7 @@ export async function saveInterviewAnswers(
       if (current.find((c) => c.questionKey === key)?.answer === answer) continue;
       const rows = await tx
         .insert(interviewAnswers)
-        .values({ ownerId, contentId: content.id, questionKey: key, question: interviewQuestion(key), answer, createdAt: now })
+        .values({ ownerId, contentId: content.id, questionKey: key, question: interviewQuestion(key), answer, seq: ++seq, createdAt: now })
         .returning();
       inserted.push(rows[0]!);
     }
@@ -584,8 +592,11 @@ export async function adoptProposal(
 // ---- 경험 claim 확인(A03) ----
 
 /**
- * 사용자가 "이 1인칭 경험은 사실"이라고 확인한다. 성공한 run 의 claim 중 확인이 필요한 것만(아니면 400).
- * 이미 확인한 index 는 그대로 둔다(중복 행 없음). AI 는 이 경로를 호출하지 않는다 — 사용자 요청만.
+ * 사용자가 경험 claim 을 해결한다(A03). resolution:
+ * - 'confirmed': "내 실제 경험이 맞다"
+ * - 'removed'  : "그 문장을 본문에서 뺐거나 고쳤다"(FIX-T06 P1 — 거짓 확인 없이 검토를 끝낼 수 있게). 서버는 본문을 대조하지 않는다.
+ * 둘 다 사용자 주장이며 AI 는 이 경로를 호출하지 않는다. 성공한 run 의 확인 필요 claim 만(아니면 400).
+ * 이미 해결한 index 는 그대로 둔다(중복 행 없음, 처음 선택한 resolution 유지).
  */
 export async function confirmClaims(
   db: Db,
@@ -593,6 +604,7 @@ export async function confirmClaims(
   contentId: string,
   runId: string,
   claimIndexes: readonly number[],
+  resolution: ClaimResolution = 'confirmed',
   now: Date = new Date(),
 ): Promise<{ confirmed: number[]; unconfirmed: UnconfirmedClaim[] }> {
   if (!isUuid(contentId)) throw new NotFoundError(CONTENT_NOT_FOUND);
@@ -609,7 +621,7 @@ export async function confirmClaims(
     }
     const inserted = await tx
       .insert(claimConfirmations)
-      .values(idx.map((claimIndex) => ({ ownerId, runId: run.id, claimIndex, confirmedAt: now })))
+      .values(idx.map((claimIndex) => ({ ownerId, runId: run.id, claimIndex, resolution, confirmedAt: now })))
       .onConflictDoNothing({ target: [claimConfirmations.runId, claimConfirmations.claimIndex] })
       .returning({ claimIndex: claimConfirmations.claimIndex });
     if (inserted.length > 0) {
@@ -619,7 +631,7 @@ export async function confirmClaims(
         entity: 'content',
         entityId: content.id,
         versionOrHash: run.id,
-        details: { count: inserted.length, indexes: inserted.map((r) => r.claimIndex).join(',') },
+        details: { count: inserted.length, indexes: inserted.map((r) => r.claimIndex).join(','), resolution },
         at: now,
       });
     }
@@ -628,13 +640,26 @@ export async function confirmClaims(
 }
 
 /** 작성실 화면용 묶음: 현재 브랜드, 최신 답변, 최근 run(+채택 여부·확인), 미확인 경험 claim. */
-export async function getWritingState(db: DbOrTx, ownerId: string, contentId: string) {
+export async function getWritingState(db: DbOrTx, ownerId: string, contentId: string, selectedRunId?: string) {
   const brand = await getCurrentBrandProfile(db, ownerId);
   const answers = latestAnswers(await listInterviewAnswers(db, ownerId, contentId));
-  const runs = await listGenerationRuns(db, ownerId, contentId, 10);
+  const unconfirmed = await listUnconfirmedExperienceClaims(db, ownerId, contentId);
+  // FIX-T06(P1): 최근 10개 + 미해결 경험 claim 이 남은 run(최근 목록 밖이어도) + URL 로 지정한 run(owner·원고 범위 직접 조회).
+  const recent = await listGenerationRuns(db, ownerId, contentId, 10);
+  const runs = [...recent];
+  const have = new Set(recent.map((r) => r.id));
+  const extraIds = [...new Set(unconfirmed.map((u) => u.run_id))];
+  if (selectedRunId && isUuid(selectedRunId.toLowerCase())) extraIds.push(selectedRunId.toLowerCase());
+  for (const id of extraIds) {
+    if (have.has(id)) continue;
+    const r = await getGenerationRun(db, ownerId, contentId, id);
+    if (r) {
+      runs.push(r);
+      have.add(r.id);
+    }
+  }
   const runIds = runs.map((r) => r.id);
   const adopted = await adoptedRunIds(db, contentId, runIds);
   const confirmations = await listClaimConfirmations(db, ownerId, runIds);
-  const unconfirmed = await listUnconfirmedExperienceClaims(db, ownerId, contentId);
   return { brand, answers, runs, adopted, confirmations, unconfirmed };
 }

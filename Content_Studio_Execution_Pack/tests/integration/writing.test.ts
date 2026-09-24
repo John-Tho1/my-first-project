@@ -4,7 +4,7 @@
  * 채택(새 사용자 버전·감사·재채택 409), A03(채택한 경험 claim 미확인 → ready 409 → 확인 후 허용),
  * owner 범위(다른 owner 의 원고·run·답변 404), export → 빈 DB 복원 왕복(새 표 포함).
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,14 +18,17 @@ import {
   ensureOwner,
   exportOwner,
   getDb,
+  getWritingState,
   listUnconfirmedExperienceClaims,
   ownerScope,
+  parseBundleZip,
+  saveInterviewAnswers,
   schema,
   seed,
   selectBundleRows,
   type Db,
 } from '@cs/db';
-import { loadConfig, RESTORED_TABLES } from '@cs/domain';
+import { AppError, buildBundle, loadConfig, RESTORED_TABLES, writeZip, type BundleTables } from '@cs/domain';
 import { LocalStorageAdapter, MOCK_WARNING } from '@cs/providers';
 import { GET as brandGET, POST as brandPOST } from '../../apps/web/app/api/brand/route';
 import { GET as answersGET, POST as answersPOST } from '../../apps/web/app/api/contents/[id]/answers/route';
@@ -455,7 +458,6 @@ describe('export → 빈 DB 복원: 새 표 왕복', () => {
     expect(exported.manifest.tables.interview_answers!.rows).toBeGreaterThanOrEqual(3);
     expect(exported.manifest.tables.generation_runs!.rows).toBeGreaterThanOrEqual(3);
     expect(exported.manifest.tables.claim_confirmations!.rows).toBeGreaterThanOrEqual(1);
-    const { readFileSync } = await import('node:fs');
     const zip = new Uint8Array(readFileSync(exported.zipPath));
 
     const h = await createTestDb();
@@ -480,6 +482,144 @@ describe('export → 빈 DB 복원: 새 표 왕복', () => {
       const runsB = await dbB.select().from(schema.generationRuns);
       expect(runsB.every((x) => x.ownerId === target)).toBe(true);
       expect(await listUnconfirmedExperienceClaims(dbB, target, contentA)).toEqual(await listUnconfirmedExperienceClaims(db, ownerA, contentA));
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('FIX-T06(Codex review-T06)', () => {
+  let tmp: string;
+  beforeAll(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), 'cs-t06-fix-'));
+  });
+  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+
+  /** 새 원고 + 경험 답변 + assist + 채택. 채택한 run 을 돌려준다. */
+  async function adoptedWithExperience(title: string) {
+    const id = (await createContent(db, ownerA, { title, body: '원문' })).content.id;
+    const ans = await (await answersPost(id, { answers: { judgment: '제가 직접 현지 법인을 설득했습니다.' } })).json();
+    const r = await (await assist(id, { mode: 'draft', base_version: 1, brand_profile_version: 2, answer_ids: [ans.current[0].id] })).json();
+    expect((await adopt(id, r.run.id, { base_version: 1 })).status).toBe(201);
+    const expIdx = (r.claims as Array<{ kind: string }>).map((c, i) => (c.kind === 'experience' ? i : -1)).filter((i) => i >= 0);
+    expect(expIdx.length).toBeGreaterThan(0);
+    return { id, runId: r.run.id as string, expIdx };
+  }
+
+  it('P1 claims-gate: 거짓 경험 문장을 뺐다고 표시(resolution=removed)하면 ready 가능, 감사에 resolution 기록', async () => {
+    const { id, runId, expIdx } = await adoptedWithExperience('제외 표시 원고');
+    const cur = await currentBody(id);
+    const saved = await versionsPOST(
+      jsonPost(`/api/contents/${id}/versions`, { base_version: cur.version, body: '경험 문장을 뺀 본문' }, cookieHeader(tokenA)),
+      ctx(id),
+    );
+    expect(saved.status).toBe(201);
+    expect((await setLifecycle(id, 'review')).status).toBe(200);
+    expect((await setLifecycle(id, 'ready')).status).toBe(409);
+    expect((await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'bogus' })).status).toBe(400);
+    const res = await confirm(id, { run_id: runId, claim_indexes: expIdx, resolution: 'removed' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).unconfirmed).toEqual([]);
+    const rows = await db.select().from(schema.claimConfirmations).where(eq(schema.claimConfirmations.runId, runId));
+    expect(rows.map((r) => r.resolution)).toEqual(expIdx.map(() => 'removed'));
+    const audit = await db
+      .select()
+      .from(schema.auditEvents)
+      .where(and(eq(schema.auditEvents.action, 'content.claim_confirm'), eq(schema.auditEvents.versionOrHash, runId)));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.sanitizedDetails).toMatchObject({ resolution: 'removed', count: expIdx.length });
+    expect((await setLifecycle(id, 'ready')).status).toBe(200);
+  });
+
+  it('P1 최근 10개 밖: 미해결 경험 claim 이 있는 run 은 11개 실행 뒤에도 목록에 있고, URL run 은 직접 조회된다', async () => {
+    const { id, runId } = await adoptedWithExperience('실행 많은 원고');
+    const base = (await currentBody(id)).version;
+    for (let i = 0; i < 11; i++) {
+      expect((await assist(id, { mode: 'outline', base_version: base, brand_profile_version: 2, answer_ids: [] })).status).toBe(201);
+    }
+    const all = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, id));
+    expect(all).toHaveLength(12);
+    const w = await getWritingState(db, ownerA, id);
+    expect(w.runs.map((r) => r.id)).toContain(runId);
+    expect(w.runs).toHaveLength(11); // 최근 10 + 미해결 1
+    expect(w.unconfirmed.length).toBeGreaterThan(0);
+    expect(w.unconfirmed.every((u) => u.run_id === runId)).toBe(true);
+    // 미해결이 없는 오래된 run 도 URL 로 지정하면 조회된다(owner·원고 범위)
+    const others = all.filter((r) => r.id !== runId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    const oldest = others[0]!;
+    expect(w.runs.map((r) => r.id)).not.toContain(oldest.id);
+    expect((await getWritingState(db, ownerA, id, oldest.id)).runs.map((r) => r.id)).toContain(oldest.id);
+    // 다른 원고·다른 owner 로는 그 run 이 들어오지 않는다
+    expect((await getWritingState(db, ownerA, contentA, oldest.id)).runs.map((r) => r.id)).not.toContain(oldest.id);
+    expect((await getWritingState(db, ownerB, id, runId)).runs).toEqual([]);
+  });
+
+  it('P2 답변 seq: 같은 시각에 저장해도 나중 저장이 최신', async () => {
+    const id = (await createContent(db, ownerA, { title: '같은 시각 답변', body: '원문' })).content.id;
+    const at = new Date('2026-09-24T10:00:00.000Z');
+    await saveInterviewAnswers(db, ownerA, id, { answers: { situation: '첫 답' } }, at);
+    await saveInterviewAnswers(db, ownerA, id, { answers: { situation: '둘째 답' } }, at);
+    await saveInterviewAnswers(db, ownerA, id, { answers: { situation: '셋째 답' } }, at);
+    const g = await (await answersGET(new Request(`${BASE}/api/contents/${id}/answers`, { headers: cookieHeader(tokenA) }), ctx(id))).json();
+    expect(g.current[0]).toMatchObject({ answer: '셋째 답', seq: 3 });
+    expect(g.history.map((h: { seq: number }) => h.seq)).toEqual([3, 2, 1]);
+  });
+
+  it('P2 브랜드 동시 저장: 409 본문의 current 는 방금 저장된 최신 버전', async () => {
+    const rows = await db.select().from(schema.brandProfiles).where(eq(schema.brandProfiles.ownerId, ownerA));
+    const cur = rows.reduce((m, r) => Math.max(m, r.version), 0);
+    const body = { base_version: cur, pen_name: '동시', audience: 'a', pillars: ['x'] };
+    const [r1, r2] = await Promise.all([brandPost(body), brandPost(body)]);
+    expect([r1.status, r2.status].sort()).toEqual([201, 409]);
+    const conflict = await (r1.status === 409 ? r1 : r2).json();
+    expect(conflict.current.version).toBe(cur + 1);
+  });
+
+  it('P0 복원: 채택 버전의 run 이 복원되지 않으면(내용이 다른 기존 run) 복원 전체 중단, DB 그대로', async () => {
+    const { runId } = await adoptedWithExperience('복원 순환 원고');
+    const storage = new LocalStorageAdapter(path.join(tmp, 'assets'));
+    const exported = await exportOwner(db, storage, ownerA, { outDir: path.join(tmp, 'exports') });
+    const zip = new Uint8Array(readFileSync(exported.zipPath));
+    const h = await createTestDb();
+    try {
+      const dbC = h.db;
+      const target = (await ensureOwner(dbC, 'restore-fix@example.local')).id;
+      const restoresDir = path.join(tmp, 'restores');
+      const first = await createRestorePreview(dbC, target, zip, { restoresDir, source: 'upload' });
+      await commitRestore(dbC, new LocalStorageAdapter(path.join(tmp, 'assets-c')), target, first.restoreId, {
+        mode: 'empty_only',
+        confirm: true,
+        restoresDir,
+      });
+
+      // 묶음 쪽: 그 run 의 내용이 달라지고(기존 행과 different), 그 run 을 가리키는 새 채택 버전이 추가됨
+      const parsed = await parseBundleZip(zip);
+      const t = structuredClone(parsed.tables) as BundleTables;
+      t.generation_runs.find((r) => r.id === runId)!.error = '변조';
+      const adoptedV = t.content_versions.find((v) => v.ai_run_id === runId && v.created_by === 'owner')!;
+      const newV = { ...adoptedV, id: '99999999-9999-4999-8999-999999999999', version: 999 };
+      t.content_versions.push(newV);
+      const modified = writeZip(
+        buildBundle({
+          exportId: '88888888-8888-4888-8888-888888888888',
+          exportedAt: new Date().toISOString(),
+          appVersion: parsed.manifest.app_version,
+          migrations: parsed.manifest.schema_migrations,
+          owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+          tables: t,
+          assetBytes: new Map(parsed.assetBytes),
+        }).entries,
+      );
+      let err: unknown;
+      try {
+        await createRestorePreview(dbC, target, modified, { restoresDir, source: 'upload' });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(AppError);
+      expect((err as AppError).code).toBe('restore_conflict');
+      expect((err as AppError).extra).toEqual({ conflicts: [{ table: 'content_versions', id: newV.id, reason: 'dependency' }] });
+      expect(await dbC.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, newV.id))).toEqual([]);
     } finally {
       await h.close();
     }

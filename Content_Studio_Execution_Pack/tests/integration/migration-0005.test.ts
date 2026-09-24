@@ -34,7 +34,7 @@ async function errorOf(p: Promise<unknown>): Promise<string | null> {
 }
 
 describe('0005 migration: 기존 데이터 위에 적용', () => {
-  it('기존 브랜드 프로필은 기본값을 받고, 새 표는 owner 복합 FK·추가 전용 트리거를 가진다', async () => {
+  it('0005: 기존 브랜드 프로필은 기본값을 받고, 새 표는 owner 복합 FK·추가 전용 트리거를 가진다', async () => {
     const { client } = createDb({ driver: 'pglite', url: 'memory://' });
     for (const tag of tags.filter((t) => t < '0005')) await applyTag(client, tag);
 
@@ -92,6 +92,61 @@ describe('0005 migration: 기존 데이터 위에 적용', () => {
     ]);
     expect(await errorOf(client.query(`update interview_answers set answer = 'y'`))).toMatch(/append_only_immutable/);
     expect(await errorOf(client.query(`update brand_profiles set tone = 'rude'`))).toMatch(/brand_profiles_tone_chk/);
+    await client.close();
+  });
+
+  it('0006: 기존 답변은 원고별 (created_at, id) 순으로 seq 를 받고, resolution 은 confirmed, 추가 전용 트리거는 유지된다', async () => {
+    const { client } = createDb({ driver: 'pglite', url: 'memory://' });
+    for (const tag of tags.filter((t) => t < '0006')) await applyTag(client, tag);
+    const u = await client.query<{ id: string }>("insert into users (allowed_identity) values ('s@example.local') returning id");
+    const ownerId = u.rows[0]!.id;
+    const bp = await client.query<{ id: string }>(
+      `insert into brand_profiles (owner_id, version, pen_name, audience, pillars) values ($1, 1, 'p', 'a', '["x"]'::jsonb) returning id`,
+      [ownerId],
+    );
+    const c = await client.query<{ id: string }>(`insert into contents (owner_id, title) values ($1, 't') returning id`, [ownerId]);
+    const contentId = c.rows[0]!.id;
+    const v = await client.query<{ id: string }>(
+      `insert into content_versions (content_id, version, body, created_by) values ($1, 1, 'b', 'owner') returning id`,
+      [contentId],
+    );
+    const ids = ['00000000-0000-4000-8000-000000000003', '00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'];
+    const times = ['2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z'];
+    for (let i = 0; i < 3; i++) {
+      await client.query(
+        `insert into interview_answers (id, owner_id, content_id, question_key, question, answer, created_at) values ($1, $2, $3, 'situation', 'q', $4, $5)`,
+        [ids[i], ownerId, contentId, `a${i}`, times[i]],
+      );
+    }
+    const run = await client.query<{ id: string }>(
+      `insert into generation_runs (owner_id, content_id, mode, input_version_id, brand_profile_id, input_version_refs, prompt_version, provider, model, status)
+       values ($1, $2, 'draft', $3, $4, '{}'::jsonb, 'v', 'mock', 'mock', 'succeeded') returning id`,
+      [ownerId, contentId, v.rows[0]!.id, bp.rows[0]!.id],
+    );
+    await client.query('insert into claim_confirmations (owner_id, run_id, claim_index) values ($1, $2, 0)', [ownerId, run.rows[0]!.id]);
+
+    await applyTag(client, tags.find((t) => t.startsWith('0006'))!);
+
+    const seqs = await client.query<{ id: string; seq: number }>('select id, seq from interview_answers order by seq');
+    expect(seqs.rows.map((r) => r.id)).toEqual([ids[0], ids[1], ids[2]]);
+    expect(seqs.rows.map((r) => r.seq)).toEqual([1, 2, 3]);
+    const cc = await client.query<{ resolution: string }>('select resolution from claim_confirmations');
+    expect(cc.rows).toEqual([{ resolution: 'confirmed' }]);
+    expect(await errorOf(client.query(`update interview_answers set answer = 'y'`))).toMatch(/append_only_immutable/);
+    expect(await errorOf(client.query(`update claim_confirmations set resolution = 'removed'`))).toMatch(/append_only_immutable/);
+    expect(
+      await errorOf(
+        client.query(`insert into claim_confirmations (owner_id, run_id, claim_index, resolution) values ($1, $2, 1, 'maybe')`, [ownerId, run.rows[0]!.id]),
+      ),
+    ).toMatch(/claim_confirmations_resolution_chk/);
+    expect(
+      await errorOf(
+        client.query(`insert into interview_answers (owner_id, content_id, question_key, question, answer, seq) values ($1, $2, 'judgment', 'q', 'x', 3)`, [
+          ownerId,
+          contentId,
+        ]),
+      ),
+    ).toMatch(/interview_answers_content_seq_uq/);
     await client.close();
   });
 });

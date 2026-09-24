@@ -222,6 +222,21 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       }
     }
   }
+
+  // FIX-T06(P0): content_versions.ai_run_id ↔ generation_runs(input_version_id/output_ref) 는 서로 참조하는 순환이라 PARENTS 로
+  // 표현하지 않고, 모든 표를 적용한 뒤 확인한다. 이번에 넣은 버전의 run 이 "이번에 넣음" 또는 "동일"이 아니면(충돌·의존성 실패로
+  // 빠졌거나 내용이 다른 기존 행) 채택 이력이 A03 게이트에서 사라지므로 복원 전체를 중단한다.
+  const versionRows = bundle.tables.content_versions;
+  const orphaned = versionRows.filter((v) => {
+    if (v.ai_run_id === null || avail.content_versions!.get(v.id) !== 'inserted') return false;
+    const a = avail.generation_runs!.get(v.ai_run_id);
+    return a !== 'inserted' && a !== 'same';
+  });
+  if (orphaned.length > 0) {
+    throw new AppError('conflict', 'restore_conflict', 'AI 제안·채택 버전의 실행 기록을 복원할 수 없어 복원을 중단했습니다', {
+      conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED).map((v) => ({ table: 'content_versions', id: v.id, reason: 'dependency' })),
+    });
+  }
   return { tables, conflicts, insertedAssetIds };
 }
 

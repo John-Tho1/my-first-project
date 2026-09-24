@@ -47,7 +47,11 @@ export function formToAssist(f: Record<string, string>) {
 }
 
 export function formToClaimConfirm(f: Record<string, string>) {
-  return { run_id: f.run_id ?? '', claim_indexes: csv(f.claim_indexes).map(Number) };
+  return {
+    run_id: f.run_id ?? '',
+    claim_indexes: csv(f.claim_indexes).map(Number),
+    resolution: f.resolution === 'removed' ? 'removed' : 'confirmed',
+  };
 }
 
 export function assistResponse(r: AssistResult, runView: Record<string, unknown>) {

@@ -340,6 +340,8 @@ export const interviewAnswers = pgTable(
       .references(() => users.id, { onDelete: 'restrict' }),
     contentId: uuid('content_id').notNull(),
     questionKey: text('question_key').notNull(),
+    /** FIX-T06(P2): 원고 안 저장 순번(원고 잠금 안에서 최대+1). 질문별 최신 판정은 created_at 이 아니라 이 값으로 한다. */
+    seq: integer('seq').notNull(),
     question: text('question').notNull(),
     answer: text('answer').notNull(),
     createdAt: ts('created_at').notNull().defaultNow(),
@@ -348,6 +350,7 @@ export const interviewAnswers = pgTable(
     // generation_runs 입력 확인 시 "같은 owner·같은 원고의 답변" 조회용
     index('interview_answers_content_idx').on(t.contentId, t.questionKey, t.createdAt.desc()),
     check('interview_answers_question_key_chk', sql`${t.questionKey} in ('situation', 'judgment', 'takeaway')`),
+    unique('interview_answers_content_seq_uq').on(t.contentId, t.seq),
     foreignKey({
       name: 'interview_answers_content_same_owner_fk',
       columns: [t.contentId, t.ownerId],
@@ -416,11 +419,17 @@ export const claimConfirmations = pgTable(
       .references(() => users.id, { onDelete: 'restrict' }),
     runId: uuid('run_id').notNull(),
     claimIndex: integer('claim_index').notNull(),
+    /**
+     * FIX-T06(P1): 'confirmed' = 사용자가 실제 경험이라고 확인, 'removed' = 사용자가 그 문장을 본문에서 뺐거나 고쳤다고 표시.
+     * 둘 다 사용자 주장이며 AI 가 만들지 않는다. A03 게이트는 둘 다 "해결됨"으로 본다.
+     */
+    resolution: text('resolution').notNull().default('confirmed'),
     confirmedAt: ts('confirmed_at').notNull().defaultNow(),
   },
   (t) => [
     unique('claim_confirmations_run_claim_uq').on(t.runId, t.claimIndex),
     check('claim_confirmations_claim_index_chk', sql`${t.claimIndex} >= 0`),
+    check('claim_confirmations_resolution_chk', sql`${t.resolution} in ('confirmed', 'removed')`),
     foreignKey({
       name: 'claim_confirmations_run_same_owner_fk',
       columns: [t.runId, t.ownerId],

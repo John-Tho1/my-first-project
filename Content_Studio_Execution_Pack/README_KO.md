@@ -257,7 +257,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 1. **Brand Profile**(상단 메뉴 `브랜드`, 또는 `설정` → `/brand`): 필명·독자·연재 축·말투(존댓말/평어)·문체 원칙·피할 표현·CTA 원칙·직접 쓴 예문. 저장할 때마다 **새 버전**이 추가되고 이전 버전은 바뀌지 않는다(seed 는 v1). 회사 문서·다른 프로젝트 메모리 자동 가져오기는 없다.
 2. **인터뷰 질문 3개**(작성실 `/contents/{id}`): 상황 / 판단 / 독자에게 남길 한 가지. 답변은 직접 쓰고, 다시 답하면 새 행이 추가된다(질문별 최신이 현재). AI 는 답변을 채우지 않는다.
 3. **AI 작성 보조**(작성실): 모드 개요/초안/다듬기 → 입력(현재 본문 버전·Brand Profile 버전·답변 ID)을 고정해 실행 기록(`generation_runs`)을 남기고, 제안을 **현재가 아닌 버전**(`AI 제안(모의)`)으로 저장한다. 본문은 바뀌지 않는다. 화면에서 현재 본문 ↔ 제안 diff, `제안 채택`(새 사용자 버전) 또는 `무시`. 실패해도 본문은 그대로이고 실행 기록은 `실패`.
-4. **A03**: 채택한 제안에 1인칭 경험 주장(모의는 "저는/제가…" 문장)이 있으면, 작성실에서 `내가 실제로 겪은 일이 맞습니다(확인)` 를 누르기 전에는 상태를 `준비됨` 으로 바꿀 수 없다(서버 409).
+4. **A03**: 채택한 제안에 1인칭 경험 주장(모의는 "저는/제가…" 문장)이 있으면, 작성실에서 `내 경험이 맞음(확인)` 또는 (문장을 본문에서 뺀 뒤) `본문에서 뺐음(제외)` 을 누르기 전에는 상태를 `준비됨` 으로 바꿀 수 없다(서버 409).
 5. **프롬프트 복사용 보기**(작성실 `<details>`): 모의·실제 AI 가 받을 프롬프트 원문(읽기 전용). 다른 AI 결과를 붙여 넣어 가져오는 기능은 아직 없다(T06 범위 밖).
 
 | API | 설명 |
@@ -266,10 +266,10 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `GET`·`POST /api/contents/{id}/answers` | `{questions, current, history}` · `{answers:{situation?, judgment?, takeaway?}}` → 201 `{inserted, current}` |
 | `POST /api/contents/{id}/assist` | `{mode, base_version, brand_profile_version, answer_ids[]}` → 201 `{run, proposal_version, diff, claims, followup_questions, warnings, mock_warning}`. 현재가 아닌 base → 409 `stale_base`, 실패 → 502 `llm_failed`, `LLM_MODE=live` → 503(fail-closed, 실행 기록 없음) |
 | `POST /api/contents/{id}/assist/{run_id}/adopt` | `{base_version}` → 201 새 사용자 버전(현재). 제안의 기준 버전이 현재가 아니면 409 `stale_base` |
-| `POST /api/contents/{id}/claims/confirm` | `{run_id, claim_indexes[]}` → 200 `{confirmed, unconfirmed}` |
+| `POST /api/contents/{id}/claims/confirm` | `{run_id, claim_indexes[], resolution?: "confirmed"|"removed"}` → 200 `{confirmed, unconfirmed}`. `removed` = 그 문장을 본문에서 뺐다는 사용자 표시(본문 대조 없음) |
 
 - 다른 사용자의 원고·실행 기록·답변은 404. 새 표(`interview_answers`·`generation_runs`·`claim_confirmations`)와 Brand Profile 새 열은 내보내기·복원에 포함된다(M1 묶음은 새 표를 빈 표로 읽는다).
-- migration `0005_t06_writing` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
+- migration `0005_t06_writing`·`0006_t06_claim_resolution` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
 
 ### 검증 명령
 | 명령 | 내용 | 기대 |

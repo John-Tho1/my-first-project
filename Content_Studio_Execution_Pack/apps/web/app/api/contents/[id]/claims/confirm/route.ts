@@ -12,7 +12,8 @@ export const runtime = 'nodejs';
 type Ctx = { params: Promise<{ id: string }> };
 
 /**
- * POST /api/contents/{id}/claims/confirm — body { run_id, claim_indexes[] }. 사용자가 AI 제안의 1인칭 경험 claim 이 사실임을 확인(A03).
+ * POST /api/contents/{id}/claims/confirm — body { run_id, claim_indexes[], resolution?: 'confirmed'|'removed' }(기본 confirmed).
+ * 사용자가 AI 제안의 1인칭 경험 claim 을 해결(A03): 사실임을 확인하거나, 본문에서 뺐다고 표시한다.
  * 200 { confirmed, unconfirmed }. 확인이 필요한 claim 이 아니면 400, 다른 owner·다른 원고의 run → 404.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
@@ -24,7 +25,14 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const body = await readRequestFields(request, MAX_WRITING_REQUEST);
     const parsed = claimConfirmSchema.safeParse(body.kind === 'form' ? formToClaimConfirm(body.data) : body.data);
     if (!parsed.success) throw validationError(parsed.error);
-    const r = await confirmClaims(owner.db, owner.ownerId, id.toLowerCase(), parsed.data.run_id, parsed.data.claim_indexes);
+    const r = await confirmClaims(
+      owner.db,
+      owner.ownerId,
+      id.toLowerCase(),
+      parsed.data.run_id,
+      parsed.data.claim_indexes,
+      parsed.data.resolution,
+    );
     if (html) {
       return seeOther(`/contents/${id.toLowerCase()}?confirmed=${r.confirmed.length}&run=${encodeURIComponent(parsed.data.run_id)}#assist`);
     }

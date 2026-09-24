@@ -209,6 +209,8 @@ export const ROW_SCHEMAS = {
     question: str,
     answer: str,
     created_at: ts,
+    // 0006 열. 0005 묶음에는 없으므로 parseBundle 이 원고별 (created_at, id) 순서로 채운다(migration 0006 의 채움과 같은 규칙).
+    seq: int.min(1).optional(),
   }),
   generation_runs: z.strictObject({
     id: uuid,
@@ -227,7 +229,14 @@ export const ROW_SCHEMAS = {
     created_at: ts,
     finished_at: ts.nullable(),
   }),
-  claim_confirmations: z.strictObject({ id: uuid, run_id: uuid, claim_index: int.min(0), confirmed_at: ts }),
+  claim_confirmations: z.strictObject({
+    id: uuid,
+    run_id: uuid,
+    claim_index: int.min(0),
+    confirmed_at: ts,
+    // 0006 열. 이전 묶음은 확인만 있었으므로 'confirmed'.
+    resolution: z.enum(['confirmed', 'removed']).default('confirmed'),
+  }),
   assets: z.strictObject({
     id: uuid,
     key: str.refine(isValidStorageKey, '저장 키 형식이 올바르지 않습니다'),
@@ -688,6 +697,7 @@ export function parseBundle(entries: readonly ZipEntry[], opts: ParseBundleOptio
     throw new BundleError('integrity', '묶음의 owner 정보가 올바르지 않습니다', { tables: ['users'] });
   }
 
+  fillAnswerSeq(tables.interview_answers);
   checkIntegrity(tables);
 
   // asset: manifest 목록 = assets 표, 파일 바이트 checksum = assets.checksum
@@ -725,6 +735,24 @@ export function parseBundle(entries: readonly ZipEntry[], opts: ParseBundleOptio
   };
 }
 
+/** 0006 이전 묶음의 interview_answers.seq 를 원고별 (created_at, id) 순서로 1..n 채운다. 이미 있으면 그대로 둔다. */
+export function fillAnswerSeq(rows: Array<{ id: string; content_id: string; created_at: string; seq?: number | undefined }>): void {
+  if (rows.every((r) => r.seq !== undefined)) return;
+  const sorted = [...rows].sort((a, b) =>
+    a.content_id !== b.content_id
+      ? a.content_id < b.content_id ? -1 : 1
+      : a.created_at !== b.created_at
+        ? a.created_at < b.created_at ? -1 : 1
+        : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
+  const next = new Map<string, number>();
+  for (const r of sorted) {
+    const n = (next.get(r.content_id) ?? 0) + 1;
+    next.set(r.content_id, n);
+    if (r.seq === undefined) r.seq = n;
+  }
+}
+
 /** 묶음 안 참조 무결성: PK 중복 없음, 모든 FK 대상이 묶음 안에 있음, 현재 버전은 그 원고의 버전. */
 export function checkIntegrity(t: BundleTables): void {
   const problems: string[] = [];
@@ -748,6 +776,7 @@ export function checkIntegrity(t: BundleTables): void {
     need('idea_captures', 'capture_id', r.capture_id, 'captures');
   }
   const versionContent = new Map(t.content_versions.map((v) => [v.id, v.content_id]));
+  const runContent = new Map(t.generation_runs.map((r) => [r.id, r.content_id]));
   for (const r of t.contents) {
     need('contents', 'idea_id', r.idea_id, 'ideas');
     if (r.current_version_id !== null && versionContent.get(r.current_version_id) !== r.id) {
@@ -757,6 +786,10 @@ export function checkIntegrity(t: BundleTables): void {
   for (const r of t.content_versions) {
     need('content_versions', 'content_id', r.content_id, 'contents');
     need('content_versions', 'ai_run_id', r.ai_run_id, 'generation_runs');
+    // FIX-T06(P0): AI 제안·채택 버전은 같은 원고의 run 만 가리킨다(다른 원고의 run 이면 A03 게이트가 그 claim 을 보지 못함).
+    if (r.ai_run_id !== null && runContent.has(r.ai_run_id) && runContent.get(r.ai_run_id) !== r.content_id) {
+      problems.push('content_versions.ai_run_id → generation_runs(같은 원고)');
+    }
   }
   for (const r of t.interview_answers) need('interview_answers', 'content_id', r.content_id, 'contents');
   for (const r of t.generation_runs) {

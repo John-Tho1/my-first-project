@@ -47,8 +47,8 @@ export default async function ContentPage({
   const lc = contentLifecycleSchema.safeParse(c.lifecycle);
   const options = lc.success ? allowedLifecycleOptions(lc.data) : [];
   const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
-  const w = await getWritingState(db, session.ownerId, c.id);
   const runParam = str(q.run);
+  const w = await getWritingState(db, session.ownerId, c.id, runParam && runParam !== 'none' ? runParam : undefined);
   const selectedRun = runParam === 'none' ? undefined : (w.runs.find((r) => r.id === runParam) ?? w.runs[0]);
   let proposal: ProposalView | null = null;
   if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {

@@ -118,6 +118,8 @@ export const claimConfirmSchema = z
   .object({
     run_id: z.string().min(1),
     claim_indexes: z.array(z.int().min(0).max(99)).min(1).max(20),
+    /** 'confirmed' = 내 실제 경험이 맞음, 'removed' = 본문에서 그 문장을 뺐거나 고침(FIX-T06). 둘 다 사용자 주장. */
+    resolution: z.enum(['confirmed', 'removed']).default('confirmed'),
   })
   .strict();
 

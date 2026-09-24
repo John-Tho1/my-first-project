@@ -2,7 +2,9 @@
 -- 손으로 조정한 부분(drizzle-kit 출력 대비):
 --  1) pg_trgm 확장 생성(맨 앞). PGlite 는 createDb 에서 contrib/pg_trgm 을 등록해야 한다.
 --  2) contents_id_owner_uq 를 content_captures 복합 FK 보다 먼저 만들도록 옮겼다.
---  3) ideas.source_capture_ids(jsonb) 를 지우기 전에 같은 owner 의 capture 만 idea_captures 로 옮긴다(T04 이전에는 idea 생성 경로가 없어 보통 0행).
+--  3) ideas.source_capture_ids(jsonb) 를 지우기 전에 idea_captures 로 옮긴다(T04 이전에는 idea 생성 경로가 없어 보통 0행).
+--     배열 항목이 하나라도 같은 owner 의 capture 로 해석되지 않으면(삭제된 소재·타 owner·잘못된 UUID·배열이 아닌 JSON) 조용히
+--     버리지 않고 migration 을 실패시켜 수동 정리를 요구한다(원문·관계 보존 불변 조건).
 --  4) content_versions UPDATE·DELETE 를 막는 트리거 content_versions_immutable(맨 끝).
 CREATE EXTENSION IF NOT EXISTS pg_trgm;--> statement-breakpoint
 CREATE TABLE "content_captures" (
@@ -50,6 +52,22 @@ CREATE INDEX "contents_title_trgm_idx" ON "contents" USING gin ("title" gin_trgm
 CREATE INDEX "ideas_owner_updated_idx" ON "ideas" USING btree ("owner_id","updated_at" DESC NULLS LAST,"id" DESC NULLS LAST);--> statement-breakpoint
 CREATE INDEX "ideas_idea_trgm_idx" ON "ideas" USING gin ("idea" gin_trgm_ops);--> statement-breakpoint
 ALTER TABLE "contents" ADD CONSTRAINT "contents_lifecycle_chk" CHECK ("contents"."lifecycle" in ('draft', 'review', 'ready', 'archived'));--> statement-breakpoint
+DO $$
+DECLARE
+  bad_count integer;
+  bad_sample text;
+BEGIN
+  SELECT count(*), min(i."id"::text || ' -> ' || s.cid)
+    INTO bad_count, bad_sample
+    FROM "ideas" i
+    CROSS JOIN LATERAL jsonb_array_elements_text(i."source_capture_ids") AS s(cid)
+    LEFT JOIN "captures" c ON c."id"::text = s.cid AND c."owner_id" = i."owner_id"
+   WHERE c."id" IS NULL;
+  IF bad_count > 0 THEN
+    RAISE EXCEPTION 'T04 migration 중단: ideas.source_capture_ids 항목 %개가 같은 owner 의 capture 로 해석되지 않습니다(예: %). 수동 정리 후 다시 실행하세요.', bad_count, bad_sample
+      USING ERRCODE = 'data_exception';
+  END IF;
+END $$;--> statement-breakpoint
 INSERT INTO "idea_captures" ("idea_id", "capture_id", "owner_id")
 SELECT i."id", c."id", i."owner_id"
   FROM "ideas" i

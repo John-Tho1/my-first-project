@@ -1,8 +1,9 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { computeDuplicates, getCaptureDetail, getCapturesByIds } from '@cs/db';
-import { formatMsk, formatMskInline, isFetchableUrl, MAX_TITLE, MAX_USER_NOTE } from '@cs/domain';
+import { computeDuplicates, getCaptureDetail, getCapturesByIds, listCaptureDerivations } from '@cs/db';
+import { formatMsk, formatMskInline, ideaSeedFromCapture, isFetchableUrl, MAX_IDEA, MAX_TITLE, MAX_USER_NOTE } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
 
@@ -46,6 +47,7 @@ export default async function CaptureDetailPage({
   if (!detail) notFound();
   const { capture: c, source, revisions, extractions } = detail;
   const dups = await computeDuplicates(db, session.ownerId, c, source);
+  const derived = await listCaptureDerivations(db, session.ownerId, c.id);
   const related = await getCapturesByIds(db, session.ownerId, [
     ...dups.exact.map((d) => d.id),
     ...dups.similar.map((d) => d.id),
@@ -56,6 +58,7 @@ export default async function CaptureDetailPage({
   const updatedRev = Number(str(q.updated));
   const updatedRow = Number.isInteger(updatedRev) ? revisions.find((r) => r.revision === updatedRev) : undefined;
   const extractMsg = str(q.extract) ? (EXTRACT_TEXT[str(q.extract)!] ?? EXTRACT_TEXT.server) : undefined;
+  const formErr = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
   const editErr = str(q.edit_error) ? (EDIT_ERROR_TEXT[str(q.edit_error)!] ?? EDIT_ERROR_TEXT.server) : undefined;
 
   // 409 충돌: 리다이렉트 query 에 실려 온 "내가 입력한 내용"(yours). 폼 기본값으로 다시 채워 입력을 잃지 않게 한다.
@@ -118,6 +121,47 @@ export default async function CaptureDetailPage({
             {fetchable ? null : ' (내부망·로컬 주소 — 추출할 수 없음)'}
           </p>
         ) : null}
+      </section>
+
+      <section className="card archive" aria-labelledby="develop-title">
+        <h3 id="develop-title">발전시키기</h3>
+        {formErr ? (
+          <p className="notice" role="alert">
+            {formErr}
+          </p>
+        ) : null}
+        <form className="form" method="post" action={`/api/captures/${c.id}/ideas`}>
+          <label htmlFor="idea">핵심 아이디어(카드 문구)</label>
+          <textarea id="idea" name="idea" rows={2} maxLength={MAX_IDEA} required defaultValue={ideaSeedFromCapture(c.title, c.rawText)} />
+          <button type="submit">카드로 발전</button>
+        </form>
+        <form className="form inline" method="post" action={`/api/captures/${c.id}/contents`}>
+          <button type="submit">원고 시작</button>
+        </form>
+        <p className="note">원고 시작은 이 원문을 인용한 초안(버전 1)을 만들고 원문(수집)으로 연결합니다. 원문은 바뀌지 않습니다.</p>
+        {derived.ideas.length || derived.contents.length ? (
+          <ul className="list">
+            {derived.ideas.map((i) => (
+              <li key={i.id} className="capture">
+                <p className="meta">
+                  <span className="tag">카드</span>
+                  <Link href={`/ideas/${i.id}`}>{preview(i.idea, 60)}</Link>
+                </p>
+              </li>
+            ))}
+            {derived.contents.map((ct) => (
+              <li key={ct.id} className="capture">
+                <p className="meta">
+                  <span className="tag">원고</span>
+                  <Link href={`/contents/${ct.id}`}>{ct.title}</Link>
+                  <span>{LIFECYCLE_LABEL[ct.lifecycle] ?? ct.lifecycle}</span>
+                </p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="empty-text">이 소재에서 나온 카드·원고가 없습니다</p>
+        )}
       </section>
 
       {c.inputType === 'url' ? (

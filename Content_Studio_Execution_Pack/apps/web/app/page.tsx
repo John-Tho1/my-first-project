@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { listAssets, listCaptures, listCapturesPage } from '@cs/db';
+import { latestDraft, listAssets, listCaptures, listCapturesPage } from '@cs/db';
 import { describeModes, formatMsk, maskIdentity, MAX_RAW_TEXT, MAX_TITLE, MAX_UPLOAD_BYTES, MAX_USER_NOTE } from '@cs/domain';
 import { getSession } from '../lib/auth';
+import { LIFECYCLE_LABEL } from '../lib/contents';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
 import { getAppDb, getConfig } from '../lib/server';
 
@@ -85,6 +86,7 @@ export default async function TodayPage({
       ? (CAPTURE_ERROR_TEXT[params.capture_error] ?? CAPTURE_ERROR_TEXT.server)
       : undefined;
   const recent = await listCapturesPage(handle.db, session.ownerId, { limit: 10 });
+  const draft = await latestDraft(handle.db, session.ownerId);
   // 폼을 그릴 때마다 새 command_key: 같은 폼의 중복 제출(더블클릭·새로고침 재전송)은 한 건으로 저장된다.
   const commandKey = randomUUID();
   const recommended = captures.slice(0, 2);
@@ -152,7 +154,19 @@ export default async function TodayPage({
       <div className="grid">
         <section className="card">
           <h3>이어 쓸 초안</h3>
-          <p className="empty-text">아직 초안이 없습니다</p>
+          {draft ? (
+            <>
+              <p className="capture-text">
+                <Link href={`/contents/${draft.id}`}>{draft.title}</Link>
+              </p>
+              <p className="meta">
+                <span className="tag">{LIFECYCLE_LABEL[draft.lifecycle] ?? draft.lifecycle}</span>
+                <time dateTime={draft.updatedAt.toISOString()}>최근 수정 {formatMsk(draft.updatedAt)}</time>
+              </p>
+            </>
+          ) : (
+            <p className="empty-text">아직 초안이 없습니다</p>
+          )}
         </section>
 
         <section className="card">

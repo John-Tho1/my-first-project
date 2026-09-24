@@ -27,3 +27,15 @@
 - Exact authorized scope (if applicable): 해당 없음(외부 연결 없음).
 - Consequences: 짧은 문장(몇 글자)은 점수가 불안정하다. 200건 밖의 오래된 소재는 유사 후보에서 빠진다. 충돌 query 에 메모 내용이 실려 브라우저 기록에 남는다(본인 브라우저·본인 데이터, 외부 링크는 no-referrer).
 - When to revisit: T04 검색(한국어 FTS) 도입 시, 또는 소재가 수천 건을 넘어 최근 200건 비교가 부족할 때.
+
+## D5 — T04 검색은 pg_trgm 색인 + ILIKE 부분 문자열 일치, 페이지는 종류별 cursor
+- Decision ID / date: D5 / 2026-09-24 (Europe/Moscow)
+- Question: 외부 검색 엔진·형태소 분석기 없이(PGlite, 새 의존성 금지) 한국어 소재·원고·카드를 어떻게 찾고, 세 종류를 섞은 결과를 어떻게 페이지로 나누는가? docs/05 M1 은 "영문 FTS 만으로 충분하다고 가정하지 않음"을 요구한다.
+- Options: (1) PostgreSQL `to_tsvector('simple')` FTS — 한국어는 띄어쓰기 단위 토큰이라 "주재원"으로 "주재원으로"를 못 찾음. (2) pg_trgm 유사도(`%`) 일치 — 오타를 허용하지만 관련 없는 결과가 섞이고, 짧은 한국어 질의는 유사도가 낮아 놓칠 수 있음. (3) ILIKE 부분 문자열 일치 + pg_trgm GIN 색인으로 가속, 유사도는 점수로만. 페이지: (a) 세 종류 UNION + 합성 cursor (b) 종류별 keyset cursor.
+- Chosen option: (3) + (b). PGlite 0.5.8 의 `@electric-sql/pglite/contrib/pg_trgm` 이 동작함을 확인했다(한국어 trigram 생성, GIN 색인, plpgsql 트리거 포함). `createDb` 가 메모리·파일 DB 모두에 확장을 등록하고 migration 0003 이 `CREATE EXTENSION IF NOT EXISTS pg_trgm` 과 GIN(gin_trgm_ops) 색인(captures.raw_text, contents.title, content_versions.body, ideas.idea)을 만든다. 일치 = 검색어를 공백으로 나눈 조각이 모두 대상 필드 중 하나에 ILIKE 로 포함(`%`·`_`·`\` 는 escape). `word_similarity` 는 `score` 로만 돌려주고 정렬·일치에 쓰지 않는다. 결과는 종류별 (시각 desc, id desc) keyset: `type=all` 은 종류별 첫 limit 건(+ 종류별 다음 cursor), `type=<종류>` 는 `next_cursor` 로 이어 본다. 필터가 그 종류에 없는 속성이면(소재의 연재·상태, 원고의 위험 등) 그 종류는 빈 결과. 날짜 필터는 MSK(UTC+3) 하루 경계.
+- Evidence / assumption: 통합 테스트(tests/integration/search.test.ts)가 `주재원`→fx-007, `재고 리스`→fx-001, `ai`→"AI" 2건 이상, 무관 질의 0건, 다른 owner 행 미포함, 종류별 cursor 누락·중복 없음을 확인한다. 색인 효과(실행 계획)는 소량 데이터라 측정하지 않았다 — 가정. 원고 본문은 현재 버전만 검색한다(이전 버전 문구는 안 걸림).
+- Reversible?: 예. 검색은 `packages/db/src/search.ts` 한 곳, 색인은 migration 으로 추가/삭제 가능. PostgreSQL(M3 DB_DRIVER=postgres) 에서도 pg_trgm 은 표준 contrib 확장이다(운영 DB 에 확장 설치 권한 필요 — 확인 필요).
+- User decision required?: 아니오(구현 세부).
+- Exact authorized scope (if applicable): 해당 없음(외부 연결·새 의존성 없음 — pg_trgm 은 이미 설치된 PGlite 패키지에 포함).
+- Consequences: 오타·띄어쓰기 변형("재고리스")은 못 찾는다. 관련도 순 정렬이 아니라 최근 순이다. 2글자 이하 질의는 trigram 색인을 못 타고 순차 검색이 된다(개인용 데이터량에서는 문제 없다고 가정). 종류를 섞은 한 줄 순위는 없다.
+- When to revisit: 소재·원고가 수천 건을 넘어 검색이 느려질 때, 또는 관련도 순·오타 허용이 필요해질 때(M2 이후).

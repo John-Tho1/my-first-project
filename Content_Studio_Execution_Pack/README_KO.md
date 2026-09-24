@@ -177,6 +177,33 @@ M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`A
 | `PATCH /api/captures/{id}` | 메모·제목·위험만. `raw_text` 를 보내면 400 `raw_text_immutable`, 오래된 revision 은 409 |
 | `POST /api/captures/{id}/extract` | 내부 주소 400 `url_not_allowed`, 기본 모드 403 `collector_disabled`. 어떤 경우에도 외부 접속 없음 |
 
+### 카드·원고·검색 (M1, T04)
+상단 메뉴: `오늘 · 소재함 · 카드 · 아카이브 · 검색`.
+
+1. **소재 → 카드**: 소재 상세(`/captures/{id}`)의 `발전시키기`에서 카드 문구(원문 앞 100자가 채워져 있음)를 고치고 `카드로 발전`. 카드(`/ideas/{id}`)는 **Idea(핵심 아이디어) / Audience(독자) / Evidence(근거) / Risk(위험) / Next Decision(다음 결정)** 과 태그를 담고, 연결된 소재는 `원문(수집)`에 링크로 남는다. AI 제안은 없다(M2).
+2. **원고 시작**: 소재 상세나 카드에서 `원고 시작`. 소재에서 시작하면 원문이 `> 원문:` 인용 블록으로 들어간 초안(버전 1)이, 카드에서 시작하면 카드 항목을 인용한 초안이 만들어지고 소재가 원고의 `원문(수집)`으로 연결된다. 원문 자체는 바뀌지 않는다.
+3. **작성실**(`/contents/{id}`): 본문을 고쳐 `새 버전으로 저장`하면 이전 버전은 그대로 두고 버전이 하나 늘어난다(버전은 DB 에서도 수정·삭제 불가). 버전 목록에서 각 버전을 읽기 전용으로 열고 `이전과 비교`로 줄 단위 차이(+ 추가 / − 삭제)를 본다.
+4. **본문 충돌**: 두 탭에서 같은 원고를 고치면 늦게 저장한 쪽은 저장되지 않고 **현재 서버 본문과 내 본문을 둘 다 전부 보여 주는 비교 화면**(차이 표시 포함)이 나온다. 내 본문은 그 화면의 폼에 그대로 있으니 확인 후 `내 본문으로 새 버전 저장`을 누른다(A02).
+5. **원고 정보**: 제목·연재·독자·태그·상태. 상태는 `초안 → 검토 중 → 준비됨 → 보관`이며 한 단계씩 되돌릴 수 있다(보관 → 초안 가능). 건너뛰기(예: 초안 → 준비됨)는 거부된다. "게시됨" 상태는 없다 — 실제 배포 여부는 채널·버전별로 M3 배포함에서 따로 기록한다.
+6. **아카이브**(`/contents`): 최근 수정 순, 연재·태그·상태 필터. 오늘 화면의 `이어 쓸 초안`은 가장 최근에 고친 초안/검토 중 원고 1건을 보여 준다.
+7. **검색**(`/search`): 소재(원문·메모·제목)·원고(제목·현재 버전 본문)·카드(아이디어·근거·다음 결정)를 **글자 그대로** 찾는다. 한국어는 형태소 분석 없이 부분 문자열로 찾으므로 `주재원`은 “주재원으로”도, `재고 리스`는 “재고 리스크”도 찾는다. 영문은 대소문자를 구분하지 않는다. 공백으로 나눈 여러 단어는 모두 들어 있는 항목만 나온다. 연재·상태 필터는 원고에만, 위험 필터는 소재·카드에만 적용된다(결정 D5). 날짜 필터는 MSK 기준.
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/ideas` · `GET /api/ideas?cursor=&limit=` | 카드 생성 `{idea, audience?, evidence?, risk?, next_question?, next_decision?, tags?, capture_ids?}` → 201 · 목록 |
+| `GET/PATCH /api/ideas/{id}` | 카드 + 연결 소재 + 파생 원고(ETag = revision). PATCH 는 `If-Match` 또는 `expected_revision`, 오래되면 409 `current`/`yours` |
+| `POST /api/captures/{id}/ideas` | 소재가 연결된 카드 생성 → 201 |
+| `POST /api/captures/{id}/contents` · `POST /api/ideas/{id}/contents` | 소재/카드에서 원고 시작 → 201 `{content, version, capture_ids}` |
+| `POST /api/contents` · `GET /api/contents?series=&tag=&lifecycle=&cursor=` | 원고 생성(버전 1) · 아카이브 목록 |
+| `GET /api/contents/{id}` | 원고 + 현재 본문 + 버전 목록(바이트 길이) + 원문(수집) + 카드 (ETag = 정보 revision) |
+| `PATCH /api/contents/{id}` | 제목·연재·독자·태그·상태만(본문은 400). 잘못된 전이 400 `invalid_transition`, 오래된 revision 409 |
+| `POST /api/contents/{id}/versions` | `{base_version, body, note?}` → 201 새 버전. `base_version` 이 현재가 아니면 409 `{current:{version, body}, yours:{base_version, body}}` |
+| `GET /api/contents/{id}/versions/{n}` · `GET /api/contents/{id}/diff?from=&to=` | 버전 본문(불변) · 줄 단위 diff `{stats, lines:[{type, text}]}` |
+| `GET /api/search?q=&type=&series=&tag=&risk=&lifecycle=&from=&to=&cursor=&limit=` | `type=all` 은 종류별 첫 `limit` 건 + `more`/`next_cursors`, `type=captures\|contents\|ideas` 는 `next_cursor` 로 이어 보기 |
+
+- 다른 사용자의 카드·원고·소재 ID 는 모두 404 이며, 다른 사용자의 소재를 카드·원고에 연결하는 것은 DB 복합 FK 로도 막힌다(A01).
+- 같은 폼을 두 번 제출하면 카드·원고가 두 개 생길 수 있다(수집과 달리 `command_key` 없음).
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

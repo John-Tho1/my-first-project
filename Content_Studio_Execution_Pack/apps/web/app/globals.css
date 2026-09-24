@@ -320,3 +320,130 @@ a {
 .pager {
   margin: 12px 0 0;
 }
+
+/* T04: 내비게이션·카드·작성실·diff·검색 */
+.site-nav {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 10px 16px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 0.9375rem;
+}
+
+.site-nav a {
+  text-decoration: none;
+}
+
+.site-nav a:hover,
+.site-nav a:focus-visible {
+  text-decoration: underline;
+}
+
+.idea-card {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.idea-card dt {
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.idea-card dt small {
+  color: var(--muted);
+  font-weight: 400;
+  margin-left: 6px;
+}
+
+.idea-card dd {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}
+
+.form select,
+.form input[type='date'],
+.form input[type='search'] {
+  font: inherit;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.form input[type='search'] {
+  width: 100%;
+}
+
+.editor {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  min-height: 50vh;
+}
+
+.filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  align-items: end;
+}
+
+.filters label {
+  display: grid;
+  gap: 4px;
+}
+
+.diff {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 0;
+  overflow-x: auto;
+  margin: 0 0 12px;
+}
+
+.diff-line {
+  display: block;
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff-line.add {
+  background: var(--badge-bg);
+  border-left: 3px solid var(--accent);
+}
+
+.diff-line.del {
+  background: var(--live-bg);
+  color: var(--live-text);
+  border-left: 3px solid var(--live-text);
+  text-decoration: line-through;
+}
+
+.cols {
+  display: grid;
+  gap: 12px;
+}
+
+@media (min-width: 720px) {
+  .cols {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.result-group h3 small {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+mark {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-radius: 3px;
+}

@@ -10,6 +10,7 @@
  */
 import { mkdirSync } from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
+import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import { drizzle, type PgliteDatabase } from 'drizzle-orm/pglite';
 import { migrate as pgliteMigrate } from 'drizzle-orm/pglite/migrator';
 import type { AppConfig } from '@cs/domain';
@@ -48,14 +49,16 @@ export function createDb(opts: CreateDbOptions): DbHandle {
   if (opts.driver !== 'pglite') throw new DbDriverNotImplementedError();
   let client: PGlite;
   let release = () => {};
+  // T04: 검색 색인용 pg_trgm(0003 migration 의 CREATE EXTENSION)을 메모리·파일 DB 모두에 등록한다.
+  const extensions = { pg_trgm };
   if (opts.url === 'memory://') {
-    client = new PGlite();
+    client = new PGlite({ extensions });
   } else {
     const dir = resolveFromRoot(opts.url);
     mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
     release = acquireDirLock(dir);
     try {
-      client = new PGlite(dir);
+      client = new PGlite(dir, { extensions });
     } catch (e) {
       release();
       throw e;

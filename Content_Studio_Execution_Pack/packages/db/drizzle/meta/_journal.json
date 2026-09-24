@@ -22,6 +22,13 @@
       "when": 1790260683068,
       "tag": "0002_t03_captures",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790261715334,
+      "tag": "0003_t04_contents",
+      "breakpoints": true
     }
   ]
 }

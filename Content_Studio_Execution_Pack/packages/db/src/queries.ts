@@ -180,7 +180,12 @@ export interface AuditInput {
     | 'asset.missing'
     | 'capture.create'
     | 'capture.update'
-    | 'capture.extract_blocked';
+    | 'capture.extract_blocked'
+    | 'idea.create'
+    | 'idea.update'
+    | 'content.create'
+    | 'content.update'
+    | 'content.version_append';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

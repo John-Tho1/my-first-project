@@ -6,6 +6,7 @@
 import { sql } from 'drizzle-orm';
 import {
   bigint,
+  check,
   foreignKey,
   index,
   integer,
@@ -121,6 +122,8 @@ export const captures = pgTable(
     unique('captures_id_owner_uq').on(t.id, t.ownerId),
     index('captures_owner_content_hash_idx').on(t.ownerId, t.contentHash),
     index('captures_owner_received_idx').on(t.ownerId, t.receivedAt.desc(), t.id.desc()),
+    // T04 검색: pg_trgm GIN — ILIKE '%…%'(한국어 부분 문자열 포함)를 색인으로 가속한다.
+    index('captures_raw_text_trgm_idx').using('gin', t.rawText.op('gin_trgm_ops')),
     foreignKey({
       name: 'captures_source_same_owner_fk',
       columns: [t.sourceId, t.ownerId],
@@ -159,51 +162,79 @@ export const captureRevisions = pgTable(
   ],
 );
 
+/**
+ * 콘텐츠 카드(T04): Idea / Audience / Evidence / Risk / Next Decision.
+ * 수정은 revision 낙관적 잠금(stale → 409). 출처 소재 연결은 idea_captures(복합 FK) — 0003 에서 jsonb source_capture_ids 를 없앴다.
+ */
 export const ideas = pgTable(
   'ideas',
   {
-  id: id(),
-  ownerId: uuid('owner_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'restrict' }),
-  idea: text('idea').notNull(),
-  audience: text('audience'),
-  nextQuestion: text('next_question'),
-  risk: text('risk').notNull().default('none'),
-  lifecycle: text('lifecycle').notNull().default('candidate'),
-  sourceCaptureIds: jsonb('source_capture_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
-  createdAt: ts('created_at').notNull().defaultNow(),
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    idea: text('idea').notNull(),
+    audience: text('audience'),
+    evidence: text('evidence'),
+    nextQuestion: text('next_question'),
+    nextDecision: text('next_decision'),
+    risk: text('risk').notNull().default('none'),
+    lifecycle: text('lifecycle').notNull().default('candidate'),
+    tags: jsonb('tags').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    revision: integer('revision').notNull().default(1),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
   },
-  (t) => [unique('ideas_id_owner_uq').on(t.id, t.ownerId)],
+  (t) => [
+    unique('ideas_id_owner_uq').on(t.id, t.ownerId),
+    index('ideas_owner_updated_idx').on(t.ownerId, t.updatedAt.desc(), t.id.desc()),
+    index('ideas_idea_trgm_idx').using('gin', t.idea.op('gin_trgm_ops')),
+  ],
 );
 
+/**
+ * 원고(T04). 본문은 content_versions(불변)에만 있고, current_version_id 가 현재 버전을 가리킨다.
+ * revision 은 메타데이터(제목·연재·독자·태그·상태) 수정용 낙관적 잠금 — 본문 버전과 별개다.
+ * lifecycle: draft|review|ready|archived(CHECK). "게시됨" 같은 단일 published 플래그는 두지 않는다(docs/04, 배포는 M3 별도 테이블).
+ */
 export const contents = pgTable(
   'contents',
   {
-  id: id(),
-  ownerId: uuid('owner_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'restrict' }),
-  ideaId: uuid('idea_id'),
-  series: text('series'),
-  title: text('title').notNull(),
-  /** content_versions.id — 순환 FK 를 피하려고 애플리케이션 계층에서 검증한다(M1 T04). */
-  currentVersionId: uuid('current_version_id'),
-  lifecycle: text('lifecycle').notNull().default('draft'),
-  createdAt: ts('created_at').notNull().defaultNow(),
-  updatedAt: ts('updated_at').notNull().defaultNow(),
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ideaId: uuid('idea_id'),
+    series: text('series'),
+    title: text('title').notNull(),
+    audience: text('audience'),
+    tags: jsonb('tags').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    revision: integer('revision').notNull().default(1),
+    /** content_versions.id — 순환 FK 를 피하려고 애플리케이션 계층에서 검증한다(M1 T04). */
+    currentVersionId: uuid('current_version_id'),
+    lifecycle: text('lifecycle').notNull().default('draft'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
   },
   (t) => [
+    // content_captures 가 "같은 owner 의 content" 만 참조하도록 복합 FK 대상.
+    unique('contents_id_owner_uq').on(t.id, t.ownerId),
     // 같은 owner 의 idea 만 연결(복합 FK). idea_id 가 null 이면 검사하지 않는다(MATCH SIMPLE).
     foreignKey({
       name: 'contents_idea_same_owner_fk',
       columns: [t.ideaId, t.ownerId],
       foreignColumns: [ideas.id, ideas.ownerId],
     }).onDelete('restrict'),
+    check('contents_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review', 'ready', 'archived')`),
+    index('contents_owner_updated_idx').on(t.ownerId, t.updatedAt.desc(), t.id.desc()),
+    index('contents_title_trgm_idx').using('gin', t.title.op('gin_trgm_ops')),
   ],
 );
 
-/** 불변(immutable) 버전. 수정은 새 version 행으로만 한다. */
+/**
+ * 불변(immutable) 버전. 수정은 새 version 행으로만 한다.
+ * DB 트리거 content_versions_immutable(0003)이 UPDATE·DELETE 를 예외로 막는다.
+ */
 export const contentVersions = pgTable(
   'content_versions',
   {
@@ -216,8 +247,71 @@ export const contentVersions = pgTable(
     createdBy: text('created_by').notNull(),
     aiRunId: uuid('ai_run_id'),
     createdAt: ts('created_at').notNull().defaultNow(),
+    /** T04: 저장 메모(선택). 버전과 함께 불변. */
+    note: text('note'),
   },
-  (t) => [unique('content_versions_content_version_uq').on(t.contentId, t.version)],
+  (t) => [
+    unique('content_versions_content_version_uq').on(t.contentId, t.version),
+    index('content_versions_body_trgm_idx').using('gin', t.body.op('gin_trgm_ops')),
+  ],
+);
+
+/** 원고 ↔ 원문(수집) 관계(T04). 같은 owner 끼리만(두 복합 FK). role: 'origin'(원고의 출처 소재). */
+export const contentCaptures = pgTable(
+  'content_captures',
+  {
+    id: id(),
+    contentId: uuid('content_id').notNull(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    role: text('role').notNull().default('origin'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('content_captures_content_capture_uq').on(t.contentId, t.captureId),
+    index('content_captures_capture_idx').on(t.captureId),
+    foreignKey({
+      name: 'content_captures_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'content_captures_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 카드 ↔ 원문(수집) 관계(T04). 같은 owner 끼리만(두 복합 FK). */
+export const ideaCaptures = pgTable(
+  'idea_captures',
+  {
+    id: id(),
+    ideaId: uuid('idea_id').notNull(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    role: text('role').notNull().default('origin'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('idea_captures_idea_capture_uq').on(t.ideaId, t.captureId),
+    index('idea_captures_capture_idx').on(t.captureId),
+    foreignKey({
+      name: 'idea_captures_idea_same_owner_fk',
+      columns: [t.ideaId, t.ownerId],
+      foreignColumns: [ideas.id, ideas.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'idea_captures_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
 );
 
 /**

@@ -1,6 +1,9 @@
 export * from './client';
 export * from './queries';
 export * from './captures';
+export * from './ideas';
+export * from './contents';
+export * from './search';
 export * as schema from './schema';
 export { BRAND_PROFILE_V1, defaultFixturePath, loadFixtureCaptures, seed, type SeedResult } from './seed';
 export * from './paths';

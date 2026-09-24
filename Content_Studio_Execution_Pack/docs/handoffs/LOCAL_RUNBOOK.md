@@ -35,6 +35,10 @@ corepack pnpm dev                        # http://localhost:3000
 | T04 | 55be710 | 97dd427 | T04_IMPLEMENTATION_HANDOFF.md |
 | T05 | 97dd427 | be3fd8f | T05_IMPLEMENTATION_HANDOFF.md |
 
+> **로컬 확인(2026-09-24, Windows)**: `codex --sandbox read-only review --commit` 은 이 PC 에서 read-only 샌드박스가 셸 명령을 모두 막아
+> 빈 결과("confidence is low")만 나온다. 대신 `./scripts/codex-review-commit.sh <SHA> <작업명> [인계문서]` (codex exec + stdin diff,
+> GPT-6 Astra / xhigh 고정)를 쓴다. 결과는 `.handoffs/review-<작업명>.md`, 실제 model/effort 헤더는 `.log`.
+>
 docs/06 절차대로 **별도 worktree**에서 read-only 로 돌린다. 상위 저장소의 `scripts/codex-review.sh`는 diff를 stdin에 싣는 방식이라 200KB 한도(lockfile 포함 T01 diff가 초과)에 걸리므로 쓰지 않는다.
 ```bash
 # 저장소 루트에서

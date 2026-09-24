@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContentStudioReview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "base_sha",
+    "reviewed_head",
+    "verdict",
+    "head_unchanged",
+    "scope",
+    "findings",
+    "acceptance_results",
+    "tests_run",
+    "tests_not_run",
+    "external_calls_performed",
+    "live_status",
+    "residual_risks"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "base_sha": {
+      "type": "string",
+      "minLength": 7
+    },
+    "reviewed_head": {
+      "type": "string",
+      "minLength": 7
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "head_unchanged": {
+      "type": "boolean"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "location",
+          "evidence",
+          "reproduction",
+          "impact",
+          "suggested_fix"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ]
+          },
+          "location": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "reproduction": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          },
+          "suggested_fix": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "acceptance_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "result",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "pass",
+              "fail",
+              "not_run",
+              "not_applicable"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tests_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "result",
+          "evidence"
+        ],
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "pass",
+              "fail"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tests_not_run": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "external_calls_performed": {
+      "type": "boolean"
+    },
+    "live_status": {
+      "enum": [
+        "mock_only",
+        "approved_live_test_passed",
+        "not_tested"
+      ]
+    },
+    "residual_risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

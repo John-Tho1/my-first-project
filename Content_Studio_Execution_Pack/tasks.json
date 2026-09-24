@@ -1,0 +1,322 @@
+{
+  "schema_version": "1.0",
+  "project": "Personal Content Studio",
+  "status": "planned_not_implemented",
+  "created_at": "2026-09-24",
+  "timezone": "Europe/Moscow",
+  "default_modes": {
+    "llm": "mock",
+    "publish": "disabled",
+    "collectors": "disabled"
+  },
+  "tasks": [
+    {
+      "id": "T00",
+      "milestone": "M0",
+      "title": "환경·저장소·CLI 확인",
+      "depends_on": [],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T01",
+      "milestone": "M0",
+      "title": "앱·worker·DB·mock 뼈대",
+      "depends_on": [
+        "T00"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T02",
+      "milestone": "M1",
+      "title": "로그인·owner·파일 접근제어",
+      "depends_on": [
+        "T01"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T03",
+      "milestone": "M1",
+      "title": "메모·URL 수집과 원문 보존",
+      "depends_on": [
+        "T02"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T04",
+      "milestone": "M1",
+      "title": "콘텐츠 카드·검색·버전",
+      "depends_on": [
+        "T03"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T05",
+      "milestone": "M1",
+      "title": "export·restore",
+      "depends_on": [
+        "T04"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T06",
+      "milestone": "M2",
+      "title": "브랜드·질문·작성실·mock AI",
+      "depends_on": [
+        "T05"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T07",
+      "milestone": "M2",
+      "title": "근거·버전·비용·live AI 경계",
+      "depends_on": [
+        "T06"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T08",
+      "milestone": "M2",
+      "title": "음성 파일 전사",
+      "depends_on": [
+        "T07"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T09",
+      "milestone": "M2",
+      "title": "채널별 초안·미디어·export",
+      "depends_on": [
+        "T07"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T10",
+      "milestone": "M3",
+      "title": "승인 스냅샷·무효화·실행",
+      "depends_on": [
+        "T09"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T11",
+      "milestone": "M3",
+      "title": "DB 작업함·lease·재시도·재확인",
+      "depends_on": [
+        "T10"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T12",
+      "milestone": "M3",
+      "title": "mock 배포 장애 시나리오",
+      "depends_on": [
+        "T11"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T13",
+      "milestone": "M4",
+      "title": "OAuth·계정·비밀 보호",
+      "depends_on": [
+        "T12"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T14",
+      "milestone": "M4",
+      "title": "Threads 텍스트",
+      "depends_on": [
+        "T13"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T15",
+      "milestone": "M4",
+      "title": "YouTube 재개 업로드",
+      "depends_on": [
+        "T14"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T16",
+      "milestone": "M4",
+      "title": "Instagram 조건부 연결",
+      "depends_on": [
+        "T15"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T17",
+      "milestone": "M4_optional",
+      "title": "추가 채널 검토",
+      "depends_on": [
+        "T13"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T18",
+      "milestone": "M5",
+      "title": "Notion·Drive 선택 가져오기",
+      "depends_on": [
+        "T05"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T19",
+      "milestone": "M5",
+      "title": "허용 소스 수집·재추천",
+      "depends_on": [
+        "T07"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T20",
+      "milestone": "M5",
+      "title": "모니터링·백업 복원·비용",
+      "depends_on": [
+        "T12"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": false,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    },
+    {
+      "id": "T21",
+      "milestone": "M5",
+      "title": "운영 배포·사용성 검증",
+      "depends_on": [
+        "T14",
+        "T15",
+        "T20"
+      ],
+      "status": "planned",
+      "implementer": "Claude Code",
+      "reviewer": "Codex",
+      "acceptance_reference": "docs/05_BACKLOG_AND_ACCEPTANCE.md",
+      "external_action_approval_required": true,
+      "note": "approval_required applies only to live/external actions; local mock implementation may proceed"
+    }
+  ]
+}

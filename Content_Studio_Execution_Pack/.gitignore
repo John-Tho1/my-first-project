@@ -1,0 +1,15 @@
+# 인계·검증 산출물 (커밋 대상 아님)
+.handoffs/
+
+# 의존성·빌드
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+
+# 로컬 환경·비밀·데이터
+.env
+.env.local
+.env.*.local
+data/
+*.log

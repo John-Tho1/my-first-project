@@ -11,6 +11,7 @@
 - 내용: 단일 HTML 견적 계산기(`quote-calculator.html`) — USD/RUB 환율 기반 견적 산출
 - 스택: 의존성 없는 순수 HTML + CSS + 바닐라 JS (빌드 도구·패키지 매니저 없음)
 - 배포: 파일을 브라우저에서 직접 열면 동작해야 한다
+- **범위 예외**: `Content_Studio_Execution_Pack/` 하위는 별개 프로젝트(Content Studio)이며 그 폴더의 자체 `AGENTS.md`/`CLAUDE.md`를 따른다. 아래 규칙(의존성 금지·검증 방법 등)은 그 폴더에 적용하지 않는다.
 
 ## 2. 코딩 규칙
 

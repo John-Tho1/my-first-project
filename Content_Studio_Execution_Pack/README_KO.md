@@ -271,6 +271,15 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 다른 사용자의 원고·실행 기록·답변은 404. 새 표(`interview_answers`·`generation_runs`·`claim_confirmations`)와 Brand Profile 새 열은 내보내기·복원에 포함된다(M1 묶음은 새 표를 빈 표로 읽는다).
 - migration `0005_t06_writing`·`0006_t06_claim_resolution`·`0007_t06_removed_binding` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
 
+### 근거·비용·live 경계 (M2, T07 — 모의 경계까지)
+결정 D13(docs/DECISIONS.md). **외부 호출·과금·비밀 0.** 실제 AI 호출은 사용자의 별도 승인 뒤에만 연결한다(D7·D8).
+
+- **허용 출처**: 작성실의 AI 작성 보조는 이 원고에 연결된 소재의 출처(source_version)만 근거로 넘긴다(`source_version_ids`, 그 밖이면 404). 입력 버전(`generation_runs.input_version_refs`)에 함께 고정된다.
+- **claim–근거**: 제안의 주장마다 `claims` 행(불변)과 허용 출처 연결 `claim_sources`(locator)가 남는다. AI 가 목록 밖 출처(만든 URL 등)를 내면 저장하지 않고 "출처 미확인"·확인 필요로만 표시한다. 경험 주장을 사용자가 확인하면 근거 등급이 "사용자 확인"으로 보인다(파생).
+- **비용 예약(A15)**: 호출 전 `usage_ledger` 에 예약(프롬프트 글자/3 토큰 추정 × 단가 + 출력 여유분), 호출 후 실제 사용량으로 확정. 이번 달(MSK) 합계 + 예약이 `LLM_BUDGET_MONTHLY_LIMIT` 또는 1회 예약이 `LLM_BUDGET_PER_RUN_MAX` 를 넘으면 429 `budget_exceeded`(아무것도 기록하지 않음). 실패한 호출은 예약액 전체를 비용으로 확정. 가격(`LLM_PRICE_*`)이 비어 있으면 모의는 0 으로 기록만, live 는 차단.
+- **live 경계**: `LLM_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`LLM_LIVE_APPROVAL_REF`)이 모두 있어도 T07 에는 어댑터가 없어 503 으로 거부된다(아무것도 기록하지 않음). `GET /api/health` 의 `llm.live_ready`(항상 false)와 `llm.missing`(빠진 조건 이름만), 설정 화면의 "AI 모드·비용"(이번 달 사용액/상한, live 준비 안 됨 목록)으로 확인한다.
+- migration `0008_t07_budget_claims`(claims·claim_sources·usage_ledger). 새 표는 내보내기·복원에 포함된다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

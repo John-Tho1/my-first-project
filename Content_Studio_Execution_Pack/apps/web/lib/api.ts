@@ -28,6 +28,7 @@ const STATUS: Record<AppErrorKind, number> = {
   not_implemented: 501,
   service_unavailable: 503,
   llm_failed: 502,
+  budget_exceeded: 429,
 };
 
 export function statusForError(e: AppError): number {

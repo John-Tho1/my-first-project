@@ -57,6 +57,13 @@
       "when": 1790283617014,
       "tag": "0007_t06_removed_binding",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790285010436,
+      "tag": "0008_t07_budget_claims",
+      "breakpoints": true
     }
   ]
 }

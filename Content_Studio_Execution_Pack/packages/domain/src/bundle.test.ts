@@ -76,6 +76,9 @@ function tables(): BundleTables {
     interview_answers: [],
     generation_runs: [],
     claim_confirmations: [],
+    claims: [],
+    claim_sources: [],
+    usage_ledger: [],
     assets: [
       {
         id: ASSET,

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { getContentDetail, getContentVersion, getWritingState } from '@cs/db';
+import { getContentDetail, getContentVersion, getLedgerForRun, getWritingState, listClaimsForRun } from '@cs/db';
 import {
   allowedLifecycleOptions,
   contentLifecycleSchema,
@@ -51,6 +51,9 @@ export default async function ContentPage({
   const runParam = normalizeRunParam(str(q.run));
   const w = await getWritingState(db, session.ownerId, c.id, runParam !== 'none' ? runParam : undefined);
   const selectedRun = selectRun(w.runs, runParam);
+  // T07: 선택한 run 의 저장된 claim(출처·근거 등급)과 비용 원장
+  const claimViews = selectedRun ? await listClaimsForRun(db, session.ownerId, selectedRun.id) : [];
+  const ledger = selectedRun ? await getLedgerForRun(db, session.ownerId, selectedRun.id) : null;
   let proposal: ProposalView | null = null;
   if (selectedRun?.status === 'succeeded' && selectedRun.outputRef) {
     const summary = versions.find((v) => v.id === selectedRun.outputRef);
@@ -161,6 +164,8 @@ export default async function ContentPage({
             current={{ id: current.id, version: current.version, body: current.body }}
             state={w}
             selectedRun={selectedRun ?? null}
+            claimViews={claimViews}
+            ledger={ledger}
             proposal={proposal}
             answeredCount={Number.isInteger(Number(str(q.answered))) && str(q.answered) !== undefined ? Number(str(q.answered)) : null}
             confirmedCount={str(q.confirmed) !== undefined ? Number(str(q.confirmed)) : null}

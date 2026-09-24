@@ -1,5 +1,5 @@
 import { countCaptures, getDb } from '@cs/db';
-import { DISPLAY_TIMEZONE, formatMsk, getModes, loadConfig } from '@cs/domain';
+import { DISPLAY_TIMEZONE, formatMsk, getModes, liveLlmReadiness, loadConfig } from '@cs/domain';
 import { getLastTick, runWorkerTick } from '@cs/worker';
 import pkg from '../../../package.json';
 
@@ -28,6 +28,9 @@ export async function GET(): Promise<Response> {
   }
 
   const modes = getModes(config);
+  // T07: live AI 준비 상태 — 빠진 조건 이름만(값 없음). T07 에는 어댑터가 없어 항상 false.
+  const live = liveLlmReadiness(config);
+  const llm = { mode: config.LLM_MODE, live_ready: live.ready, missing: live.missing };
   try {
     const handle = await getDb(config);
     const captures = await countCaptures(handle.db);
@@ -38,6 +41,7 @@ export async function GET(): Promise<Response> {
         status: 'ok',
         ...base,
         modes,
+        llm,
         db: { driver: handle.driver, ok: true, migrated: handle.migrated, captures },
         worker: { mode: config.WORKER_MODE, last_tick_utc: last?.ranAt ?? null },
       },
@@ -49,6 +53,7 @@ export async function GET(): Promise<Response> {
         status: 'degraded',
         ...base,
         modes,
+        llm,
         db: { driver: config.DB_DRIVER, ok: false, migrated: false, captures: null },
         worker: { mode: config.WORKER_MODE, last_tick_utc: getLastTick()?.ranAt ?? null },
       },

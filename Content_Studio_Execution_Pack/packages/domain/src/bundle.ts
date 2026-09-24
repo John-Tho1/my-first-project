@@ -40,6 +40,9 @@ export const EXPORTED_TABLES = [
   'interview_answers',
   'generation_runs',
   'claim_confirmations',
+  'claims',
+  'claim_sources',
+  'usage_ledger',
   'assets',
   'audit_events',
 ] as const;
@@ -53,6 +56,9 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   interview_answers: '0005_t06_writing',
   generation_runs: '0005_t06_writing',
   claim_confirmations: '0005_t06_writing',
+  claims: '0008_t07_budget_claims',
+  claim_sources: '0008_t07_budget_claims',
+  usage_ledger: '0008_t07_budget_claims',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -102,6 +108,8 @@ const str = z.string();
 const nstr = z.string().nullable();
 const int = z.int();
 const strArr = z.array(z.string());
+/** numeric(18,6) 문자열(T07 원장 금액). */
+const amount = z.string().regex(/^\d{1,12}(\.\d{1,6})?$/);
 
 export const ROW_SCHEMAS = {
   users: z.strictObject({ id: uuid, identity_masked: str }),
@@ -238,6 +246,34 @@ export const ROW_SCHEMAS = {
     resolution: z.enum(['confirmed', 'removed']).default('confirmed'),
     // 0007 열. 이전 묶음에는 없으므로 null(게이트는 'removed' 를 현재 본문으로 다시 검사한다).
     body_version_id: uuid.nullable().default(null),
+  }),
+  // T07(0008)
+  claims: z.strictObject({
+    id: uuid,
+    content_version_id: uuid,
+    run_id: uuid,
+    claim_index: int.min(0),
+    statement: str,
+    kind: z.enum(['fact', 'opinion', 'experience']),
+    evidence_grade: z.enum(['none', 'source', 'user_confirmed']),
+    personal_experience_confirmed: z.boolean(),
+    needs_check: z.boolean(),
+    created_at: ts,
+  }),
+  claim_sources: z.strictObject({ id: uuid, claim_id: uuid, source_version_id: uuid, locator: nstr, support_note: nstr }),
+  usage_ledger: z.strictObject({
+    id: uuid,
+    run_id: uuid,
+    reserved_amount: amount,
+    actual_amount: amount.nullable(),
+    currency: z.string().regex(/^[A-Z]{3}$/),
+    tokens_in: int.min(0).nullable(),
+    tokens_out: int.min(0).nullable(),
+    pricing_snapshot: z.record(z.string(), z.unknown()),
+    state: z.enum(['reserved', 'settled', 'released']),
+    failed: z.boolean(),
+    created_at: ts,
+    settled_at: ts.nullable(),
   }),
   assets: z.strictObject({
     id: uuid,
@@ -811,6 +847,19 @@ export function checkIntegrity(t: BundleTables): void {
       problems.push('claim_confirmations.body_version_id → content_versions(run 과 같은 원고)');
     }
   }
+  // T07: claim 은 같은 원고의 run·버전에, 출처는 묶음 안 source_version 에, 원장은 run 에 붙는다.
+  for (const r of t.claims) {
+    need('claims', 'content_version_id', r.content_version_id, 'content_versions');
+    need('claims', 'run_id', r.run_id, 'generation_runs');
+    if (runContent.has(r.run_id) && versionContent.get(r.content_version_id) !== runContent.get(r.run_id)) {
+      problems.push('claims.content_version_id → content_versions(run 과 같은 원고)');
+    }
+  }
+  for (const r of t.claim_sources) {
+    need('claim_sources', 'claim_id', r.claim_id, 'claims');
+    need('claim_sources', 'source_version_id', r.source_version_id, 'source_versions');
+  }
+  for (const r of t.usage_ledger) need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
   for (const r of t.content_captures) {
     need('content_captures', 'content_id', r.content_id, 'contents');
     need('content_captures', 'capture_id', r.capture_id, 'captures');

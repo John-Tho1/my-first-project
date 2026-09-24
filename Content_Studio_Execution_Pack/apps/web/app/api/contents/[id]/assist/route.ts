@@ -1,5 +1,5 @@
 import { generationRunView, runAssist } from '@cs/db';
-import { assertSameOrigin, assistRequestSchema } from '@cs/domain';
+import { assertSameOrigin, assistRequestSchema, budgetPolicy } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
 import { getConfig, getLlm } from '../../../../../lib/server';
@@ -17,7 +17,8 @@ type Ctx = { params: Promise<{ id: string }> };
  * - provider 를 먼저 확인한다: LLM_MODE=live 는 fail-closed(503) — run·버전을 남기지 않는다.
  * - base_version ≠ 현재 → 409 stale_base(run·버전 없음). 브랜드 버전 없음 → 400. 이 원고의 답변이 아님 → 404.
  * - 성공 201 { run, proposal_version, diff, claims, followup_questions, warnings, mock_warning } — 제안은 현재 버전이 아니다.
- * - provider 실패 → 502 llm_failed(run=failed, 버전 없음, 본문 그대로).
+ * - provider 실패 → 502 llm_failed(run=failed, 버전 없음, 본문 그대로, 원장은 예약액 전체를 실제액으로 확정).
+ * - T07: source_version_ids(이 원고 소재의 출처만, 아니면 404) → 허용 출처. 예산 초과 → 429 budget_exceeded(run·원장·버전 없음).
  * 폼: 303 → /contents/{id}?run=<run_id>#assist.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
@@ -40,6 +41,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
         baseVersion: parsed.data.base_version,
         brandProfileVersion: parsed.data.brand_profile_version,
         answerIds: parsed.data.answer_ids,
+        sourceVersionIds: parsed.data.source_version_ids,
+        budget: budgetPolicy(config),
       },
       llm,
     );

@@ -29,7 +29,17 @@ import {
   LlmFailedError,
   MAX_PROPOSAL_BODY,
   NotFoundError,
-  PROMPT_VERSION,
+  promptVersionFor,
+  BudgetExceededError,
+  checkBudget,
+  costMicro,
+  estimateTokens,
+  filterClaimSources,
+  fromMicro,
+  reserveFor,
+  type BudgetPolicy,
+  type FilteredClaim,
+  type Reservation,
   AppError,
   StaleBaseError,
   UnconfirmedExperienceClaimsError,
@@ -42,10 +52,11 @@ import {
   type UnconfirmedClaim,
 } from '@cs/domain';
 import type { Db } from './client';
+import { allowedSourceVersions, insertClaims, lockOwnerForBudget, monthlyUsedMicro, type UsageLedgerRow } from './budget';
 import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
 import { insertCurrentVersion, lockContentForWrite, nextVersionNumber, type ContentRow, type ContentVersionRow } from './contents';
 import { recordAudit, type DbOrTx } from './queries';
-import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers, users } from './schema';
+import { brandProfiles, claimConfirmations, contentVersions, generationRuns, interviewAnswers, usageLedger, users } from './schema';
 
 export type BrandProfileRow = typeof brandProfiles.$inferSelect;
 export type InterviewAnswerRow = typeof interviewAnswers.$inferSelect;
@@ -267,19 +278,32 @@ export const promptAnswer = (a: InterviewAnswerRow): PromptAnswer => ({
 export interface AssistLlm {
   readonly name: string;
   readonly mode: 'mock' | 'live';
-  generate(input: {
-    task: LlmStructuredOutput['result_type'];
-    inputVersion: string;
-    text: string;
-    prompt?: string;
-  }): Promise<LlmStructuredOutput>;
+  generate(input: AssistLlmInput): Promise<LlmStructuredOutput>;
+  /** T07: 실제 사용량(토큰). 없으면 글자/3 추정(D13). */
+  usageOf?(input: AssistLlmInput, output: LlmStructuredOutput): { tokensIn: number; tokensOut: number };
 }
+
+export interface AssistLlmInput {
+  task: LlmStructuredOutput['result_type'];
+  inputVersion: string;
+  text: string;
+  prompt?: string;
+  /** T07: 허용된 source_version id. claim.source_refs 는 이 안에서만 채택된다(밖은 저장 전에 버림). */
+  allowedSourceRefs?: string[];
+}
+
+/** 가격 없는 모의 정책(예약 0, 한도 검사 없음) — 호출자가 정책을 넘기지 않을 때. */
+const MOCK_UNPRICED: BudgetPolicy = { mode: 'mock', currency: 'USD', pricing: null, monthlyLimitMicro: null, perRunMaxMicro: null };
 
 export interface AssistInput {
   mode: AssistMode;
   baseVersion: number;
   brandProfileVersion: number;
   answerIds: readonly string[];
+  /** T07: 근거로 허용할 source_version id(이 원고에 연결된 소재의 출처만, 아니면 404). */
+  sourceVersionIds?: readonly string[];
+  /** T07: 예산 정책(@cs/domain budgetPolicy(config)). 생략하면 가격 없는 모의. */
+  budget?: BudgetPolicy;
 }
 
 export interface AssistResult {
@@ -287,6 +311,9 @@ export interface AssistResult {
   proposal: ContentVersionRow;
   current: ContentVersionRow;
   output: LlmStructuredOutput;
+  /** T07: 허용 목록으로 거른 claim(저장된 claims 와 같은 내용) */
+  claims: FilteredClaim[];
+  ledger: UsageLedgerRow;
 }
 
 interface PreparedAssist {
@@ -294,6 +321,11 @@ interface PreparedAssist {
   inputVersion: string;
   material: string;
   prompt: string;
+  sourceIds: string[];
+  locators: Map<string, string | null>;
+  ledger: UsageLedgerRow;
+  reservation: Reservation;
+  policy: BudgetPolicy;
 }
 
 /**
@@ -324,8 +356,22 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
       : [];
     if (answers.length !== ids.length) throw new NotFoundError('인터뷰 답변을 찾을 수 없습니다');
 
+    // T07: 근거로 허용할 source_version — 이 원고에 연결된 소재의 출처만(형식 오류 400, 목록 밖 404).
+    const svIds = [...new Set((input.sourceVersionIds ?? []).map((s) => s.toLowerCase()))];
+    if (svIds.some((s) => !isUuid(s))) throw new BadRequestError('source_version_ids 형식이 올바르지 않습니다');
+    const allowed = svIds.length ? await allowedSourceVersions(tx, ownerId, content.id) : [];
+    const allowedById = new Map(allowed.map((a) => [a.id, a]));
+    if (svIds.some((s) => !allowedById.has(s))) throw new NotFoundError('이 원고의 출처를 찾을 수 없습니다');
+    const sourceIds = [...svIds].sort();
+    const chosen = sourceIds.map((s) => allowedById.get(s)!);
+
     const answerIds = answers.map((a) => a.id).sort();
-    const inputVersion = assistInputVersion({ contentVersionId: current.id, brandProfileVersion: brand.version, answerIds });
+    const inputVersion = assistInputVersion({
+      contentVersionId: current.id,
+      brandProfileVersion: brand.version,
+      answerIds,
+      sourceVersionIds: sourceIds,
+    });
     const promptAnswers = answers.map(promptAnswer);
     const prompt = buildAssistPrompt({
       mode: input.mode,
@@ -334,7 +380,30 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
       answers: promptAnswers,
       title: content.title,
       body: current.body,
+      sources: chosen.map((c) => ({ id: c.id, locator: c.locator, excerpt: c.excerpt })),
     });
+
+    // T07(A15): 호출 전 예약. owner 행을 잠그고(동시 예약 직렬화) 이번 달 사용액 + 예약액이 상한을 넘으면 429 — run·원장·버전 없음.
+    const policy = input.budget ?? MOCK_UNPRICED;
+    const reservation = reserveFor(policy, prompt);
+    await lockOwnerForBudget(tx, ownerId);
+    const used = await monthlyUsedMicro(tx, ownerId, now);
+    const decision = checkBudget(policy, used, reservation.reserveMicro);
+    if (!decision.ok) {
+      throw new BudgetExceededError({
+        reason: decision.reason,
+        currency: policy.currency,
+        used: fromMicro(used),
+        reserve: fromMicro(reservation.reserveMicro),
+        limit:
+          decision.reason === 'per_run_max'
+            ? fromMicro(policy.perRunMaxMicro ?? 0)
+            : policy.monthlyLimitMicro !== null
+              ? fromMicro(policy.monthlyLimitMicro)
+              : null,
+      });
+    }
+
     const inserted = await tx
       .insert(generationRuns)
       .values({
@@ -349,16 +418,42 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
           brand_profile_id: brand.id,
           brand_profile_version: brand.version,
           answer_ids: answerIds,
+          source_version_ids: sourceIds,
           input_version: inputVersion,
         },
-        promptVersion: PROMPT_VERSION,
+        promptVersion: promptVersionFor(sourceIds.length),
         provider: llm.name,
         model: llm.mode === 'mock' ? 'mock' : llm.name,
         status: 'running',
         createdAt: now,
       })
       .returning();
-    return { run: inserted[0]!, inputVersion, material: assistMaterial(promptAnswers, current.body), prompt };
+    const run = inserted[0]!;
+    const ledgerRows = await tx
+      .insert(usageLedger)
+      .values({
+        ownerId,
+        runId: run.id,
+        reservedAmount: fromMicro(reservation.reserveMicro),
+        currency: policy.currency,
+        tokensIn: null,
+        tokensOut: null,
+        pricingSnapshot: reservation.pricingSnapshot,
+        state: 'reserved',
+        createdAt: now,
+      })
+      .returning();
+    return {
+      run,
+      inputVersion,
+      material: assistMaterial(promptAnswers, current.body),
+      prompt,
+      sourceIds,
+      locators: new Map(chosen.map((c) => [c.id, c.locator])),
+      ledger: ledgerRows[0]!,
+      reservation,
+      policy,
+    };
   });
 }
 
@@ -386,14 +481,16 @@ export async function runAssist(
   const prep = await prepareAssist(db, ownerId, contentId, input, llm, now);
   const runId = prep.run.id;
 
+  const llmInput: AssistLlmInput = {
+    task: ASSIST_RESULT_TYPE[input.mode],
+    inputVersion: prep.inputVersion,
+    text: prep.material,
+    prompt: prep.prompt,
+    allowedSourceRefs: prep.sourceIds,
+  };
   let output: LlmStructuredOutput;
   try {
-    const raw = await llm.generate({
-      task: ASSIST_RESULT_TYPE[input.mode],
-      inputVersion: prep.inputVersion,
-      text: prep.material,
-      prompt: prep.prompt,
-    });
+    const raw = await llm.generate(llmInput);
     output = llmStructuredOutputSchema.parse(raw);
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
@@ -404,6 +501,11 @@ export async function runAssist(
         .update(generationRuns)
         .set({ status: 'failed', error: failureCode(e), finishedAt: finished })
         .where(and(eq(generationRuns.id, runId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'running')));
+      // T07: 실패한 호출도 비용이 났을 수 있으므로 예약액 전체를 실제액으로 확정한다(docs/02: 실패 재시도도 예약량에 반영).
+      await tx
+        .update(usageLedger)
+        .set({ state: 'settled', actualAmount: prep.ledger.reservedAmount, failed: true, settledAt: finished })
+        .where(and(eq(usageLedger.id, prep.ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
       await recordAudit(tx, {
         ownerId,
         action: 'content.assist',
@@ -433,14 +535,40 @@ export async function runAssist(
       })
       .returning();
     const proposal = inserted[0]!;
+    // T07: 허용 목록 밖 출처(모델이 만든 URL 등)는 저장하지 않는다 — 개수만 남기고 경고, claim 은 needs_check.
+    const filtered = filterClaimSources(output.claims, prep.sourceIds);
+    const droppedTotal = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
+    const warnings = droppedTotal > 0 ? [...output.warnings, `출처 미확인: 허용 목록에 없는 출처 ${droppedTotal}건을 버렸습니다`] : output.warnings;
     const outputJson = {
       result_type: output.result_type,
       input_version: output.input_version,
       proposed_tags: output.proposed_tags,
-      claims: output.claims,
+      claims: filtered.map((c) => ({
+        text: c.text,
+        kind: c.kind,
+        source_refs: c.source_refs,
+        needs_user_confirmation: c.needs_user_confirmation,
+        dropped_source_refs: c.dropped_source_refs,
+        needs_check: c.needs_check,
+      })),
       followup_questions: output.followup_questions,
-      warnings: output.warnings,
+      warnings,
     };
+    await insertClaims(tx, ownerId, runId, proposal.id, filtered, prep.locators, finished);
+    // T07: 실제 사용량으로 확정(모의는 결정적 추정).
+    const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
+    const settled = await tx
+      .update(usageLedger)
+      .set({
+        state: 'settled',
+        actualAmount: fromMicro(costMicro(prep.policy.pricing, usage.tokensIn, usage.tokensOut)),
+        tokensIn: usage.tokensIn,
+        tokensOut: usage.tokensOut,
+        settledAt: finished,
+      })
+      .where(and(eq(usageLedger.id, prep.ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')))
+      .returning();
+    if (!settled[0]) throw new Error('비용 원장 확정에 실패했습니다');
     const updated = await tx
       .update(generationRuns)
       .set({ status: 'succeeded', outputRef: proposal.id, outputJson, finishedAt: finished })
@@ -460,10 +588,12 @@ export async function runAssist(
         proposal_version: proposal.version,
         claims: output.claims.length,
         experience_claims: output.claims.filter((c) => c.kind === 'experience').length,
+        dropped_source_refs: droppedTotal,
+        actual_amount: settled[0].actualAmount,
       },
       at: finished,
     });
-    return { run: updated[0], proposal, current, output };
+    return { run: updated[0], proposal, current, output: { ...output, warnings }, claims: filtered, ledger: settled[0] };
   });
 }
 
@@ -669,5 +799,7 @@ export async function getWritingState(db: DbOrTx, ownerId: string, contentId: st
   const runIds = runs.map((r) => r.id);
   const adopted = await adoptedRunIds(db, contentId, runIds);
   const confirmations = await listClaimConfirmations(db, ownerId, runIds);
-  return { brand, answers, runs, adopted, confirmations, unconfirmed };
+  // T07: 이 원고 소재의 출처(assist 근거 후보)
+  const allowedSources = await allowedSourceVersions(db, ownerId, contentId);
+  return { brand, answers, runs, adopted, confirmations, unconfirmed, allowedSources };
 }

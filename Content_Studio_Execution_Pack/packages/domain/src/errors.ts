@@ -36,8 +36,14 @@ export class LiveLlmNotAllowedError extends GuardError {
 }
 
 export class LiveProviderNotConfiguredError extends GuardError {
-  constructor() {
-    super('LIVE_PROVIDER_NOT_CONFIGURED', 'M0에는 실제 AI 공급자가 구현되어 있지 않습니다. LLM_MODE=mock 으로 실행하세요.');
+  /** T07: 빠진 전제 조건 이름(값 없음). */
+  readonly missing: string[];
+  constructor(missing: string[] = []) {
+    super(
+      'LIVE_PROVIDER_NOT_CONFIGURED',
+      `실제 AI 공급자가 구현·승인되어 있지 않습니다. LLM_MODE=mock 으로 실행하세요.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
+    );
+    this.missing = missing;
   }
 }
 
@@ -57,7 +63,9 @@ export type AppErrorKind =
   | 'not_implemented'
   | 'service_unavailable'
   /** T06: AI(모의 포함) 호출 실패 → 502 */
-  | 'llm_failed';
+  | 'llm_failed'
+  /** T07: AI 예산 상한 초과 → 429 */
+  | 'budget_exceeded';
 
 export class AppError extends Error {
   readonly kind: AppErrorKind;

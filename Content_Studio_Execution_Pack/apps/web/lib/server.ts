@@ -1,7 +1,7 @@
 /** 서버 전용 헬퍼(route handler / server component 에서만 import). */
 import { getDb, resolveFromRoot, type DbHandle } from '@cs/db';
-import { assertLiveLlmAllowed, LiveProviderNotConfiguredError, loadConfig, type AppConfig } from '@cs/domain';
-import { createStorage, MockLlmProvider, type LlmProvider, type StorageAdapter } from '@cs/providers';
+import { assertLiveLlmAllowed, loadConfig, type AppConfig } from '@cs/domain';
+import { createStorage, LiveLlmProvider, MockLlmProvider, type LlmProvider, type StorageAdapter } from '@cs/providers';
 
 export function getConfig(): AppConfig {
   return loadConfig(process.env);
@@ -25,7 +25,10 @@ export function getStorage(config: AppConfig = getConfig()): StorageAdapter {
 export function getLlm(config: AppConfig = getConfig()): LlmProvider {
   if (config.LLM_MODE === 'live') {
     assertLiveLlmAllowed(config);
-    throw new LiveProviderNotConfiguredError();
+    // T07: live provider 경계. 승인 기록·가격·상한이 모두 있어도 어댑터가 없어 assertReady 가 항상 거부한다(외부 호출 0).
+    const live = new LiveLlmProvider(config);
+    live.assertReady();
+    return live;
   }
   const fail = process.env.NODE_ENV === 'test' && process.env.LLM_MOCK_FAIL_NEXT === '1';
   return new MockLlmProvider({ fail });

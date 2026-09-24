@@ -14,6 +14,12 @@ const LABELS: Record<string, string> = {
   LLM_MODE: 'LLM_MODE(AI 모드)',
   LLM_PROVIDER: 'LLM_PROVIDER(AI 공급자)',
   LLM_MODEL: 'LLM_MODEL(AI 모델)',
+  LLM_LIVE_APPROVAL_REF: 'LLM_LIVE_APPROVAL_REF(실제 AI 호출 승인 기록)',
+  LLM_BUDGET_CURRENCY: 'LLM_BUDGET_CURRENCY(예산 통화)',
+  LLM_BUDGET_MONTHLY_LIMIT: 'LLM_BUDGET_MONTHLY_LIMIT(월 예산 상한)',
+  LLM_BUDGET_PER_RUN_MAX: 'LLM_BUDGET_PER_RUN_MAX(1회 예약 상한)',
+  LLM_PRICE_INPUT_PER_1K: 'LLM_PRICE_INPUT_PER_1K(입력 1K 토큰 가격)',
+  LLM_PRICE_OUTPUT_PER_1K: 'LLM_PRICE_OUTPUT_PER_1K(출력 1K 토큰 가격)',
   PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
@@ -32,6 +38,9 @@ const emptyToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === 
 
 const opt = <T extends z.ZodType>(schema: T) => z.preprocess(emptyToUndefined, schema);
 
+/** 0 이상, 소수 6자리까지의 10진 문자열(부동소수 오차 없이 micro 단위 정수로 바꾼다 — budget.ts). */
+const decimalString = z.string().regex(/^\d{1,9}(\.\d{1,6})?$/);
+
 export const configSchema = z.object({
   APP_BASE_URL: opt(z.url().default('http://localhost:3000')),
   APP_TIMEZONE: opt(z.literal('Europe/Moscow').default('Europe/Moscow')),
@@ -40,6 +49,17 @@ export const configSchema = z.object({
   LLM_MODE: opt(z.enum(['mock', 'live']).default('mock')),
   LLM_PROVIDER: opt(z.string().min(1).optional()),
   LLM_MODEL: opt(z.string().min(1).optional()),
+  /**
+   * T07(결정 D13): 실제 AI 호출 승인 기록 참조(예: 결정 ID). 사용자가 명시적으로 승인한 뒤에만 설정한다.
+   * 값 자체는 비밀이 아니지만 화면·로그·health 에는 "설정됨/없음"만 보인다. 이것만으로 호출이 열리지는 않는다(T07 에는 어댑터 없음).
+   */
+  LLM_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /** T07 예산(A15). 금액은 소수 6자리까지의 10진 문자열. 가격이 없으면 live 는 차단, mock 은 0 으로 기록. */
+  LLM_BUDGET_CURRENCY: opt(z.string().regex(/^[A-Z]{3}$/).default('USD')),
+  LLM_BUDGET_MONTHLY_LIMIT: opt(decimalString.optional()),
+  LLM_BUDGET_PER_RUN_MAX: opt(decimalString.optional()),
+  LLM_PRICE_INPUT_PER_1K: opt(decimalString.optional()),
+  LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
   PUBLISH_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
   COLLECTOR_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
   WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),

@@ -3,7 +3,7 @@
  * 모든 쓰기는 plain HTML 폼 POST → API(303 리다이렉트). AI 는 답변·확인을 채우지 않는다 — 사용자가 누른 폼만 저장된다.
  */
 import Link from 'next/link';
-import type { GenerationRunRow, getWritingState } from '@cs/db';
+import type { ClaimView, GenerationRunRow, getWritingState, UsageLedgerRow } from '@cs/db';
 import { claimsOf } from '@cs/db';
 import {
   ASSIST_MODE_LABEL,
@@ -32,6 +32,7 @@ type WritingState = Awaited<ReturnType<typeof getWritingState>>;
 
 const RUN_STATUS_LABEL: Record<string, string> = { running: '진행 중(끝나지 않음)', succeeded: '제안 생성됨', failed: '실패' };
 const KIND_LABEL: Record<string, string> = { experience: '1인칭 경험', opinion: '의견', fact: '사실 주장' };
+const EVIDENCE_LABEL: Record<string, string> = { none: '없음', source: '허용 출처', user_confirmed: '사용자 확인' };
 
 function outputList(run: GenerationRunRow, key: 'followup_questions' | 'warnings'): string[] {
   const v = run.outputJson?.[key];
@@ -44,6 +45,8 @@ export function WritingPanel({
   current,
   state,
   selectedRun,
+  claimViews,
+  ledger,
   proposal,
   answeredCount,
   confirmedCount,
@@ -53,6 +56,8 @@ export function WritingPanel({
   current: { id: string; version: number; body: string };
   state: WritingState;
   selectedRun: GenerationRunRow | null;
+  claimViews: ClaimView[];
+  ledger: UsageLedgerRow | null;
   proposal: ProposalView | null;
   answeredCount: number | null;
   confirmedCount: number | null;
@@ -136,6 +141,7 @@ export function WritingPanel({
             <input type="hidden" name="base_version" value={current.version} />
             <input type="hidden" name="brand_profile_version" value={brand.version} />
             <input type="hidden" name="answer_ids" value={answerIds.join(',')} />
+            <input type="hidden" name="source_version_ids" value={state.allowedSources.map((s) => s.id).join(',')} />
             <label htmlFor="assist_mode">모드</label>
             <select id="assist_mode" name="mode" defaultValue="outline">
               {ASSIST_MODES.map((m) => (
@@ -147,7 +153,10 @@ export function WritingPanel({
             <button type="submit">모의 제안 만들기 (버전 {current.version} 기준)</button>
           </form>
         ) : null}
-        <p className="note">입력은 현재 본문(버전 {current.version})·Brand Profile·저장된 답변 {answers.length}개로 고정됩니다.</p>
+        <p className="note">
+          입력은 현재 본문(버전 {current.version})·Brand Profile·저장된 답변 {answers.length}개·연결된 소재의 출처 {state.allowedSources.length}개로
+          고정됩니다. AI 가 이 목록 밖의 출처를 내놓으면 저장하지 않고 &quot;출처 미확인&quot;으로 표시합니다.
+        </p>
 
         {run ? (
           <div className="assist-run">
@@ -159,6 +168,17 @@ export function WritingPanel({
               <time dateTime={run.createdAt.toISOString()}>{formatMsk(run.createdAt)}</time>
               {adopted ? <span className="tag">채택함</span> : null}
             </p>
+            {ledger ? (
+              <p className="meta">
+                <span>
+                  비용({ledger.currency}): 예약 {ledger.reservedAmount}
+                  {ledger.actualAmount !== null ? ` · 실제 ${ledger.actualAmount}` : ' · 확정 전'}
+                  {ledger.failed ? ' · 실패(예약액 전체 반영)' : ''}
+                </span>
+                {ledger.tokensIn !== null ? <span>토큰 입력 {ledger.tokensIn} · 출력 {ledger.tokensOut}(추정)</span> : null}
+                {(ledger.pricingSnapshot as { priced?: boolean }).priced === false ? <span>가격 미설정(모의 0)</span> : null}
+              </p>
+            ) : null}
             {run.status === 'failed' ? <p className="note">제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다.</p> : null}
             {run.status === 'running' ? <p className="note">끝나지 않은 실행입니다. 결과를 기다리지 말고 다시 요청하세요.</p> : null}
             {run.provider === 'mock' && run.status === 'succeeded' ? (
@@ -220,6 +240,20 @@ export function WritingPanel({
                           ) : null}
                         </p>
                         <p>{cl.text}</p>
+                        {(() => {
+                          const view = claimViews.find((v) => v.claim_index === i);
+                          const dropped = Number((run.outputJson?.claims as Array<{ dropped_source_refs?: number }> | undefined)?.[i]?.dropped_source_refs ?? 0);
+                          return (
+                            <p className="meta">
+                              {view ? <span className="tag">근거: {EVIDENCE_LABEL[view.evidence_grade] ?? view.evidence_grade}</span> : null}
+                              {view?.sources.map((s) => (
+                                <span key={s.source_version_id}>출처: {s.locator ?? `source_version ${s.source_version_id.slice(0, 8)}`}</span>
+                              ))}
+                              {dropped > 0 ? <span className="tag warn">출처 미확인(허용 목록 밖 {dropped}건 — 저장하지 않음)</span> : null}
+                              {view?.needs_check ? <span className="tag warn">확인 필요</span> : null}
+                            </p>
+                          );
+                        })()}
                         {needs && !done ? (
                           <>
                             <form className="form inline" method="post" action={`/api/contents/${contentId}/claims/confirm`}>

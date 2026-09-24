@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { listExportRuns, listRestoreRuns } from '@cs/db';
-import { formatMsk } from '@cs/domain';
+import { listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
+import { budgetPolicy, formatMsk, fromMicro, liveLlmReadiness } from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { getAppDb, getConfig } from '../../lib/server';
@@ -29,7 +29,11 @@ export default async function SettingsPage({
   const session = await getSession();
   if (!session) redirect('/login');
   const q = await searchParams;
-  const { db } = await getAppDb(getConfig());
+  const config = getConfig();
+  const { db } = await getAppDb(config);
+  const usage = await monthlyUsage(db, session.ownerId);
+  const policy = budgetPolicy(config);
+  const live = liveLlmReadiness(config);
   const exports = await listExportRuns(db, session.ownerId, 20);
   const restores = await listRestoreRuns(db, session.ownerId, 10);
   const exported = str(q.exported) ? exports.find((e) => e.id === str(q.exported)) : undefined;
@@ -49,6 +53,23 @@ export default async function SettingsPage({
           {err}
         </p>
       ) : null}
+
+      <section className="card archive" aria-labelledby="ai-title">
+        <h3 id="ai-title">AI 모드·비용</h3>
+        <p className="meta">
+          <span className={config.LLM_MODE === 'live' ? 'tag warn' : 'tag'}>AI: {config.LLM_MODE === 'mock' ? '모의(실제 호출 없음)' : '실제(live)'}</span>
+          <span>
+            이번 달(MSK) 사용: {usage.used} {policy.currency}
+            {policy.monthlyLimitMicro !== null ? ` / 상한 ${fromMicro(policy.monthlyLimitMicro)} ${policy.currency}` : ' / 상한 미설정'}
+          </span>
+          <span>실행 {usage.runs}건{usage.pending > 0 ? ` · 확정 전 ${usage.pending}건` : ''}</span>
+          <span>{policy.pricing ? '가격 설정됨' : '가격 미설정(모의는 0 으로 기록, 실제 호출 차단)'}</span>
+        </p>
+        <p className="notice" role="note">
+          live 준비 안 됨: {live.missing.join(', ')}
+        </p>
+        <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D8·D13). 설정 값·키는 이 화면에 보이지 않습니다.</p>
+      </section>
 
       <section className="card archive" aria-labelledby="brand-title">
         <h3 id="brand-title">Brand Profile</h3>

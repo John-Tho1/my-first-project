@@ -164,6 +164,9 @@ describe('묶음 호환: 0005 이전 묶음', () => {
       interview_answers: [],
       generation_runs: [],
       claim_confirmations: [],
+      claims: [],
+      claim_sources: [],
+      usage_ledger: [],
       assets: [],
       audit_events: [],
     } as unknown as BundleTables;
@@ -269,6 +272,9 @@ describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
         },
       ],
       claim_confirmations: [],
+      claims: [],
+      claim_sources: [],
+      usage_ledger: [],
       assets: [],
       audit_events: [],
     };

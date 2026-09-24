@@ -101,6 +101,9 @@ export const ASSIST_RESULT_TYPE = { outline: 'outline', draft: 'draft', revise: 
 
 /** 프롬프트 형식 버전. 프롬프트 문구를 바꾸면 올린다(generation_runs.prompt_version). */
 export const PROMPT_VERSION = 't06-assist-v1';
+/** T07: 허용 출처 목록이 들어간 프롬프트의 형식 버전(출처가 없으면 t06-assist-v1 과 바이트 단위로 같다). */
+export const PROMPT_VERSION_WITH_SOURCES = 't07-assist-v2';
+export const promptVersionFor = (sourceCount: number) => (sourceCount > 0 ? PROMPT_VERSION_WITH_SOURCES : PROMPT_VERSION);
 
 export const assistRequestSchema = z
   .object({
@@ -108,6 +111,8 @@ export const assistRequestSchema = z
     base_version: z.int().min(1),
     brand_profile_version: z.int().min(1),
     answer_ids: z.array(z.string()).max(20).default([]),
+    /** T07: 이번 제안에서 근거로 허용할 source_version id(이 원고에 연결된 소재의 출처만). 없으면 근거 없음. */
+    source_version_ids: z.array(z.string()).max(50).default([]),
   })
   .strict();
 export type AssistRequest = z.infer<typeof assistRequestSchema>;
@@ -149,6 +154,14 @@ export interface AssistPromptInput {
   answers: readonly PromptAnswer[];
   title: string;
   body: string;
+  /** T07: 허용 출처(이 목록의 id 만 claim.source_refs 에 쓸 수 있다). */
+  sources?: readonly PromptSource[];
+}
+
+export interface PromptSource {
+  id: string;
+  locator: string | null;
+  excerpt: string | null;
 }
 
 const MODE_INSTRUCTION: Record<AssistMode, string> = {
@@ -179,7 +192,7 @@ export function buildAssistPrompt(input: AssistPromptInput): string {
     ? b.sampleTexts.map((s, i) => `[예문 ${i + 1}]\n${s}`).join('\n\n')
     : '(없음)';
   return [
-    `# Content Studio 작성 보조 (${PROMPT_VERSION}, 모드: ${input.mode})`,
+    `# Content Studio 작성 보조 (${promptVersionFor(input.sources?.length ?? 0)}, 모드: ${input.mode})`,
     `입력 버전: ${input.inputVersion}`,
     '',
     '## 지시',
@@ -211,7 +224,19 @@ export function buildAssistPrompt(input: AssistPromptInput): string {
     `## 현재 본문 — 제목: ${input.title}`,
     input.body === '' ? '(비어 있음)' : input.body,
     '',
+    ...sourceSection(input.sources ?? []),
   ].join('\n');
+}
+
+/** 허용 출처 절(출처가 없으면 빈 배열 — t06 프롬프트와 같아진다). id 순 정렬(결정적). */
+function sourceSection(sources: readonly PromptSource[]): string[] {
+  if (sources.length === 0) return [];
+  const sorted = [...sources].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return [
+    '## 허용 출처(source_refs 에는 아래 id 만 쓰세요 — 목록에 없는 URL·문헌을 만들지 마세요)',
+    ...sorted.map((s) => `- ${s.id}${s.locator ? ` · ${s.locator}` : ''}${s.excerpt ? ` · ${s.excerpt}` : ''}`),
+    '',
+  ];
 }
 
 /**
@@ -225,8 +250,61 @@ export function assistMaterial(answers: readonly PromptAnswer[], body: string): 
 }
 
 /** input_version 문자열: 현재 본문 버전 id + 브랜드 버전 + 답변 id(정렬). 출력의 input_version 이 이것과 같아야 한다. */
-export function assistInputVersion(refs: { contentVersionId: string; brandProfileVersion: number; answerIds: readonly string[] }): string {
-  return `cv:${refs.contentVersionId};bp:${refs.brandProfileVersion};ans:${[...refs.answerIds].sort().join(',')}`;
+export function assistInputVersion(refs: {
+  contentVersionId: string;
+  brandProfileVersion: number;
+  answerIds: readonly string[];
+  sourceVersionIds?: readonly string[];
+}): string {
+  const base = `cv:${refs.contentVersionId};bp:${refs.brandProfileVersion};ans:${[...refs.answerIds].sort().join(',')}`;
+  // T07: 허용 출처가 있을 때만 덧붙인다(없으면 T06 형식 그대로).
+  return refs.sourceVersionIds?.length ? `${base};sv:${[...refs.sourceVersionIds].sort().join(',')}` : base;
+}
+
+// ---- T07: claim 출처 거르기(순수) ----
+
+export interface FilteredClaim {
+  index: number;
+  text: string;
+  kind: 'fact' | 'opinion' | 'experience';
+  needs_user_confirmation: boolean;
+  /** 허용 목록 안의 출처(소문자, 중복 제거, 순서 유지) */
+  source_refs: string[];
+  /** 허용 목록 밖이라 버린 출처 개수(값은 저장하지 않는다) */
+  dropped_source_refs: number;
+  evidence_grade: 'none' | 'source';
+  needs_check: boolean;
+}
+
+/**
+ * 모델 출력 claim 의 source_refs 를 허용 source_version 목록으로 거른다(docs/04: 모델이 만든 URL 은 확인 전 채택 금지).
+ * 목록 밖 값은 버리고 개수만 남긴다. needs_check = 경험 claim | 확인 필요 표시 | 근거 없는 사실 claim | 버린 출처가 있음.
+ */
+export function filterClaimSources(
+  claims: ReadonlyArray<{ text: string; kind: 'fact' | 'opinion' | 'experience'; source_refs: readonly string[]; needs_user_confirmation: boolean }>,
+  allowed: readonly string[],
+): FilteredClaim[] {
+  const ok = new Set(allowed.map((s) => s.toLowerCase()));
+  return claims.map((c, index) => {
+    const kept: string[] = [];
+    let dropped = 0;
+    for (const ref of c.source_refs) {
+      const r = ref.trim().toLowerCase();
+      if (ok.has(r)) {
+        if (!kept.includes(r)) kept.push(r);
+      } else dropped++;
+    }
+    return {
+      index,
+      text: c.text,
+      kind: c.kind,
+      needs_user_confirmation: c.needs_user_confirmation,
+      source_refs: kept,
+      dropped_source_refs: dropped,
+      evidence_grade: kept.length > 0 ? 'source' : 'none',
+      needs_check: c.kind === 'experience' || c.needs_user_confirmation || dropped > 0 || (c.kind === 'fact' && kept.length === 0),
+    };
+  });
 }
 
 // ---- A03 게이트(순수) ----

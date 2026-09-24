@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto';
-import { llmStructuredOutputSchema, type LlmStructuredOutput } from '@cs/domain';
+import {
+  estimateTokens,
+  liveLlmReadiness,
+  LiveProviderNotConfiguredError,
+  llmStructuredOutputSchema,
+  type AppConfig,
+  type LlmStructuredOutput,
+} from '@cs/domain';
 
 export interface LlmGenerateInput {
   task: LlmStructuredOutput['result_type'];
@@ -15,10 +22,17 @@ export interface LlmGenerateInput {
   prompt?: string;
 }
 
+export interface LlmUsage {
+  tokensIn: number;
+  tokensOut: number;
+}
+
 export interface LlmProvider {
   readonly name: string;
   readonly mode: 'mock' | 'live';
   generate(input: LlmGenerateInput): Promise<LlmStructuredOutput>;
+  /** T07: 실제 사용량(토큰). 모의는 결정적 추정(글자/3), live 는 공급자 응답에서 읽는다(T07 미구현). */
+  usageOf?(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage;
 }
 
 export const MOCK_WARNING = '모의 응답: 실제 AI 호출 아님';
@@ -73,8 +87,8 @@ export class MockLlmProvider implements LlmProvider {
       return {
         text: s,
         kind: firstPerson ? ('experience' as const) : ('opinion' as const),
-        // 모의 응답은 출처를 만들어내지 않는다.
-        source_refs: [] as string[],
+        // 모의 응답은 출처를 만들어내지 않는다. 허용 목록(allowedSourceRefs)이 있으면 의견 claim 에 그 첫 항목만 붙인다(T07 표시 확인용).
+        source_refs: !firstPerson && input.allowedSourceRefs?.length ? [input.allowedSourceRefs[0]!] : ([] as string[]),
         needs_user_confirmation: firstPerson,
       };
     });
@@ -93,5 +107,37 @@ export class MockLlmProvider implements LlmProvider {
       warnings: [MOCK_WARNING],
     };
     return llmStructuredOutputSchema.parse(output);
+  }
+
+  /** 결정적 사용량: 입력 = 프롬프트(없으면 자료) 글자/3, 출력 = 제안 글자/3(D13 경험칙). */
+  usageOf(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage {
+    return { tokensIn: estimateTokens(input.prompt ?? input.text), tokensOut: estimateTokens(output.proposed_text) };
+  }
+}
+
+/**
+ * T07 live provider 경계(공급자 중립, D8 미정). **HTTP 호출이 없다.**
+ * - assertReady(): 전제 조건(LLM_MODE=live·공급자·모델·가격·월 상한·승인 기록 LLM_LIVE_APPROVAL_REF)과 무관하게
+ *   T07 에서는 어댑터가 없으므로 항상 LiveProviderNotConfiguredError(빠진 조건 이름만 포함).
+ * - generate(): 방어적으로 같은 오류. 환경변수만으로 실제 호출이 열리는 경로는 없다.
+ */
+export class LiveLlmProvider implements LlmProvider {
+  readonly name: string;
+  readonly mode = 'live' as const;
+  private readonly config: AppConfig;
+
+  constructor(config: AppConfig) {
+    this.config = config;
+    this.name = config.LLM_PROVIDER ?? 'live';
+  }
+
+  assertReady(): void {
+    throw new LiveProviderNotConfiguredError(liveLlmReadiness(this.config).missing);
+  }
+
+  async generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
+    void input;
+    // T07: 실제 호출은 별도 승인 후 구현(D8)
+    throw new LiveProviderNotConfiguredError(liveLlmReadiness(this.config).missing);
   }
 }

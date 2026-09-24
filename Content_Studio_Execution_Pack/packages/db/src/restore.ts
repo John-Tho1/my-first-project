@@ -128,6 +128,16 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'run_id', table: 'generation_runs', owned: true },
     { col: 'body_version_id', table: 'content_versions' },
   ],
+  // T07
+  claims: [
+    { col: 'content_version_id', table: 'content_versions' },
+    { col: 'run_id', table: 'generation_runs', owned: true },
+  ],
+  claim_sources: [
+    { col: 'claim_id', table: 'claims', owned: true },
+    { col: 'source_version_id', table: 'source_versions' },
+  ],
+  usage_ledger: [{ col: 'run_id', table: 'generation_runs', owned: true }],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

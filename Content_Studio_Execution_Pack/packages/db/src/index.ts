@@ -5,6 +5,7 @@ export * from './ideas';
 export * from './contents';
 export * from './claims-gate';
 export * from './writing';
+export * from './budget';
 export * from './search';
 export * from './bundle-tables';
 export * from './export';

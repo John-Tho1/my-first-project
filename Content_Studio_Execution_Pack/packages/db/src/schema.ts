@@ -6,11 +6,13 @@
 import { sql } from 'drizzle-orm';
 import {
   bigint,
+  boolean,
   check,
   foreignKey,
   index,
   integer,
   jsonb,
+  numeric,
   pgEnum,
   pgTable,
   text,
@@ -445,7 +447,107 @@ export const claimConfirmations = pgTable(
 );
 
 /**
- * 파일 메타데이터.파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
+ * 주장(claim)과 근거(T07, 결정 D13). AI 제안 버전(content_versions)마다 출력 claim 을 한 행씩 남긴다(불변, 추가 전용 트리거).
+ * - evidence_grade: 저장 시점 판정 'none' | 'source'(허용 목록 안 출처가 있음). 'user_confirmed' 는 저장하지 않고
+ *   claim_confirmations(resolution='confirmed')에서 화면·API 가 파생한다(claims 는 불변).
+ * - needs_check: 경험 claim, 근거 없는 사실 claim, 허용 목록 밖 출처를 버린 claim.
+ * - 모델이 만든(허용 목록에 없는) 출처는 claim_sources 에 저장하지 않는다.
+ */
+export const claims = pgTable(
+  'claims',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    claimIndex: integer('claim_index').notNull(),
+    statement: text('statement').notNull(),
+    kind: text('kind').notNull(),
+    evidenceGrade: text('evidence_grade').notNull(),
+    personalExperienceConfirmed: boolean('personal_experience_confirmed').notNull().default(false),
+    needsCheck: boolean('needs_check').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('claims_id_owner_uq').on(t.id, t.ownerId),
+    unique('claims_version_index_uq').on(t.contentVersionId, t.claimIndex),
+    check('claims_evidence_grade_chk', sql`${t.evidenceGrade} in ('none', 'source', 'user_confirmed')`),
+    check('claims_kind_chk', sql`${t.kind} in ('fact', 'opinion', 'experience')`),
+    foreignKey({
+      name: 'claims_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** claim ↔ 허용된 source_version(T07). locator = 출처 위치(URL 등, 사용자 소재에서 온 값). 불변. */
+export const claimSources = pgTable(
+  'claim_sources',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    claimId: uuid('claim_id').notNull(),
+    sourceVersionId: uuid('source_version_id')
+      .notNull()
+      .references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    locator: text('locator'),
+    supportNote: text('support_note'),
+  },
+  (t) => [
+    unique('claim_sources_claim_source_uq').on(t.claimId, t.sourceVersionId),
+    foreignKey({
+      name: 'claim_sources_claim_same_owner_fk',
+      columns: [t.claimId, t.ownerId],
+      foreignColumns: [claims.id, claims.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * AI 비용 원장(T07, A15). run 마다 한 행: 호출 전 reserved(예약액) → 호출 후 settled(실제액).
+ * 실패한 호출도 settled + actual = reserved + failed=true 로 남긴다(docs/02: 실패 재시도도 예약량에 반영). released 는 예약 취소(현재 경로 없음).
+ * 금액은 numeric(18,6) 문자열. pricing_snapshot 에는 단가 값만(키·비밀 없음).
+ */
+export const usageLedger = pgTable(
+  'usage_ledger',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    reservedAmount: numeric('reserved_amount', { precision: 18, scale: 6 }).notNull(),
+    actualAmount: numeric('actual_amount', { precision: 18, scale: 6 }),
+    currency: text('currency').notNull(),
+    tokensIn: integer('tokens_in'),
+    tokensOut: integer('tokens_out'),
+    pricingSnapshot: jsonb('pricing_snapshot').$type<Record<string, unknown>>().notNull(),
+    state: text('state').notNull(),
+    failed: boolean('failed').notNull().default(false),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    settledAt: ts('settled_at'),
+  },
+  (t) => [
+    unique('usage_ledger_run_uq').on(t.runId),
+    check('usage_ledger_state_chk', sql`${t.state} in ('reserved', 'settled', 'released')`),
+    index('usage_ledger_owner_created_idx').on(t.ownerId, t.createdAt),
+    foreignKey({
+      name: 'usage_ledger_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 파일 메타데이터. 파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
  * (owner_id, checksum) unique: 같은 owner 의 동일 파일은 한 행만(T02: 중복 업로드는 기존 asset 반환).
  */
 export const assets = pgTable(

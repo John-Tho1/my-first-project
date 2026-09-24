@@ -1,7 +1,7 @@
 /**
  * T06 작성 지원 — 폼 → API 입력 변환, 응답 모양, 폼 오류 문구(서버 전용). JSON 필드는 snake_case(docs/04).
  */
-import type { AssistResult } from '@cs/db';
+import { usageLedgerView, type AssistResult } from '@cs/db';
 import { AppError, blocksToList, diffLines, diffStats, isUuid, linesToList } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { errorResponse, seeOther } from './api';
@@ -43,6 +43,7 @@ export function formToAssist(f: Record<string, string>) {
     base_version: Number(f.base_version),
     brand_profile_version: Number(f.brand_profile_version),
     answer_ids: csv(f.answer_ids),
+    source_version_ids: csv(f.source_version_ids),
   };
 }
 
@@ -62,7 +63,16 @@ export function assistResponse(r: AssistResult, runView: Record<string, unknown>
     proposal_version: { id: r.proposal.id, version: r.proposal.version, body: r.proposal.body, created_by: r.proposal.createdBy },
     current_version: { id: r.current.id, version: r.current.version },
     diff: { stats: diffStats(lines), lines },
-    claims: r.output.claims,
+    claims: r.claims.map((c) => ({
+      text: c.text,
+      kind: c.kind,
+      source_refs: c.source_refs,
+      needs_user_confirmation: c.needs_user_confirmation,
+      dropped_source_refs: c.dropped_source_refs,
+      evidence_grade: c.evidence_grade,
+      needs_check: c.needs_check,
+    })),
+    usage: usageLedgerView(r.ledger),
     followup_questions: r.output.followup_questions,
     warnings: r.output.warnings,
     mock_warning: r.run.provider === 'mock' ? MOCK_WARNING : null,
@@ -76,6 +86,7 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   llm_blocked: '실제 AI 호출은 허용되지 않은 상태입니다(LLM_MODE). 아무것도 보내지 않았습니다.',
   brand_missing: '브랜드 프로필이 없습니다. 먼저 Brand Profile 을 저장하세요.',
   not_adoptable: '이 제안은 채택할 수 없습니다.',
+  budget_exceeded: '이번 달 AI 예산 상한(또는 1회 상한)을 넘게 되어 AI 를 호출하지 않았습니다. 설정에서 사용량을 확인하세요.',
   claim_still_in_body: '그 문장이 아직 현재 본문에 있어 "본문에서 뺐음"으로 처리하지 않았습니다. 본문에서 빼거나 고쳐 저장한 뒤 다시 누르세요.',
   unconfirmed_claims: '"준비됨" 원고에는 확인하지 않은 1인칭 경험 주장이 있는 제안을 채택할 수 없습니다. 먼저 주장을 확인하거나 상태를 "검토 중"으로 바꾸세요.',
   conflict: '다른 곳에서 먼저 저장되었습니다. 현재 내용을 확인한 뒤 다시 저장하세요.',
@@ -103,6 +114,7 @@ export function writingFormFailure(e: unknown, request: Request, back: string, n
     else if (e.code === 'run_not_adoptable') code = 'not_adoptable';
     else if (e.code === 'unconfirmed_experience_claims') code = 'unconfirmed_claims';
     else if (e.code === 'claim_still_in_body') code = 'claim_still_in_body';
+    else if (e.code === 'budget_exceeded') code = 'budget_exceeded';
     else if (e.kind === 'conflict') code = 'conflict';
     else if (e.kind === 'csrf') code = 'csrf';
     else if (e.kind === 'payload_too_large') code = 'too_large';

@@ -27,9 +27,12 @@ async function upTo0002(): Promise<PGlite> {
   return client;
 }
 
+/** drizzle migrator 와 같이 migration 전체를 한 트랜잭션으로 적용한다(실패하면 DDL 까지 되돌아간다). */
 async function apply0003(client: PGlite): Promise<void> {
   const tag = tags.find((t) => t.startsWith('0003'))!;
-  for (const stmt of sqlFor(tag)) await client.exec(stmt);
+  await client.transaction(async (tx) => {
+    for (const stmt of sqlFor(tag)) await tx.exec(stmt);
+  });
 }
 
 async function seedOwner(client: PGlite, identity: string, captureText: string) {
@@ -75,9 +78,16 @@ describe('0003 migration: source_capture_ids 이관은 유실 없이', () => {
     const b = await seedOwner(client, 'b@example.local', 'B');
     await insertIdea(client, a.ownerId, ids(a, b));
     await expect(apply0003(client)).rejects.toThrow(/T04 migration 중단/);
-    // 컬럼과 원본 값은 그대로 남아 수동 정리가 가능하다
+    // 컬럼과 원본 값은 그대로 남아 수동 정리가 가능하고, 트랜잭션이므로 앞선 DDL 도 남지 않는다
     const still = await client.query<{ source_capture_ids: unknown }>('select source_capture_ids from ideas');
     expect(still.rows[0]!.source_capture_ids).toEqual(ids(a, b));
+    const leftover = await client.query<{ n: number }>("select count(*)::int as n from information_schema.tables where table_name = 'idea_captures'");
+    expect(leftover.rows[0]!.n).toBe(0);
+    // 수동 정리(잘못된 항목 제거) 후 같은 DB 에서 재실행하면 성공한다
+    await client.query('update ideas set source_capture_ids = $1::jsonb', [JSON.stringify([a.captureId])]);
+    await apply0003(client);
+    const rel = await client.query<{ capture_id: string }>('select capture_id from idea_captures');
+    expect(rel.rows).toEqual([{ capture_id: a.captureId }]);
     await client.close();
   });
 });

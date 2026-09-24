@@ -4,7 +4,8 @@
 --  2) contents_id_owner_uq 를 content_captures 복합 FK 보다 먼저 만들도록 옮겼다.
 --  3) ideas.source_capture_ids(jsonb) 를 지우기 전에 idea_captures 로 옮긴다(T04 이전에는 idea 생성 경로가 없어 보통 0행).
 --     배열 항목이 하나라도 같은 owner 의 capture 로 해석되지 않으면(삭제된 소재·타 owner·잘못된 UUID·배열이 아닌 JSON) 조용히
---     버리지 않고 migration 을 실패시켜 수동 정리를 요구한다(원문·관계 보존 불변 조건).
+--     버리지 않고 migration 을 실패시켜 수동 정리를 요구한다(원문·관계 보존 불변 조건). 검증→이관→컬럼 삭제 사이에 다른 세션이
+--     ideas/captures 를 바꾸지 못하도록 두 테이블을 먼저 잠근다(drizzle migrator 는 migration 전체를 한 트랜잭션으로 실행한다).
 --  4) content_versions UPDATE·DELETE 를 막는 트리거 content_versions_immutable(맨 끝).
 CREATE EXTENSION IF NOT EXISTS pg_trgm;--> statement-breakpoint
 CREATE TABLE "content_captures" (
@@ -52,6 +53,7 @@ CREATE INDEX "contents_title_trgm_idx" ON "contents" USING gin ("title" gin_trgm
 CREATE INDEX "ideas_owner_updated_idx" ON "ideas" USING btree ("owner_id","updated_at" DESC NULLS LAST,"id" DESC NULLS LAST);--> statement-breakpoint
 CREATE INDEX "ideas_idea_trgm_idx" ON "ideas" USING gin ("idea" gin_trgm_ops);--> statement-breakpoint
 ALTER TABLE "contents" ADD CONSTRAINT "contents_lifecycle_chk" CHECK ("contents"."lifecycle" in ('draft', 'review', 'ready', 'archived'));--> statement-breakpoint
+LOCK TABLE "ideas", "captures" IN SHARE ROW EXCLUSIVE MODE;--> statement-breakpoint
 DO $$
 DECLARE
   bad_count integer;

@@ -318,7 +318,7 @@ export async function deleteOriginal(
       });
       return null;
     }
-    await tx.update(assets).set({ deletedAt: now, pendingDeleteKey: a.key, pendingDeleteAttempts: 0, pendingDeleteNextAt: null }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
+    await tx.update(assets).set({ deletedAt: now, pendingDeleteKey: a.key, pendingDeleteAttempts: 0, pendingDeleteNextAt: now }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
     await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id }, at: now });
     return true;
   });

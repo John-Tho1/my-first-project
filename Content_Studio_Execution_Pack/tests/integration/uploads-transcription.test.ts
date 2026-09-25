@@ -627,7 +627,8 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
   const realOpen = (file: string) => open(file, 'w');
   const assetsWith = async (checksum: string) => db.select().from(schema.assets).where(and(eq(schema.assets.ownerId, ownerA), eq(schema.assets.checksum, checksum)));
 
-  it('P0 부분 쓰기: 한 번에 777바이트만 쓰는 핸들이어도 끝까지 반복해 원본과 같은 파일이 된다', async () => {
+  // 조각 파일을 777바이트씩 수천 번 쓰므로 전체 스위트 동시 실행·콜드 스타트에서는 30초 기본 제한을 넘길 수 있다(단독 실행 수 초).
+  it('P0 부분 쓰기: 한 번에 777바이트만 쓰는 핸들이어도 끝까지 반복해 원본과 같은 파일이 된다', { timeout: 120_000 }, async () => {
     const f = media('mp3', CHUNK + 5000, 61);
     const id = await openSession(f);
     let calls = 0;
@@ -892,4 +893,95 @@ describe('FIX-T08 round 3(Codex review-FIX2-T08): 정리 재시도 backoff', () 
     expect(cleared).toMatchObject({ pendingDeleteKey: null, pendingDeleteAttempts: 0, pendingDeleteNextAt: null });
   });
   const storage = () => new LocalStorageAdapter(storageDir);
+});
+
+describe('FIX-T08 round 4(Codex review-FIX3-T08): 정리 순서·동시성', () => {
+  const mk = (id: string, nextAt: Date, attempts = 0) => ({
+    id,
+    ownerId: ownerA,
+    key: `assets/${ownerA}/${id}`,
+    mime: 'audio/mpeg',
+    bytes: 1,
+    checksum: sha(new TextEncoder().encode(`r4-${id}`)),
+    verificationState: 'VERIFIED',
+    deletedAt: new Date(),
+    pendingDeleteKey: `assets/${ownerA}/${id}`,
+    pendingDeleteAttempts: attempts,
+    pendingDeleteNextAt: nextAt,
+  });
+  const idOf = (prefix: string, i: number) => `${prefix}-0000-4000-8000-${String(i).padStart(12, '0')}`;
+
+  it('새 의도가 tick 마다 60개씩 들어와도 기한이 지난 실패 의도는 다음 tick 에 처리된다(한 시간축)', async () => {
+    const t0 = new Date(Date.now() + 10 * 3600_000);
+    const overdue = 'eeeeeeee-0000-4000-8000-000000000001';
+    await db.insert(schema.assets).values(mk(overdue, new Date(t0.getTime() - 10 * 60_000), 3));
+    const seen: string[] = [];
+    const files = {
+      delete: async (key: string) => {
+        seen.push(key);
+      },
+    };
+    // tick 1: 새 의도 60개가 t0 에 생김(만든 시각 = t0) — 기한이 지난 의도(t0-10분)가 먼저
+    await db.insert(schema.assets).values(Array.from({ length: 60 }, (_, i) => mk(idOf('aaaaaaaa', i), t0)));
+    await cleanupPendingDeletes(db, files, t0);
+    expect(seen).toContain(`assets/${ownerA}/${overdue}`);
+    expect(seen[0]).toBe(`assets/${ownerA}/${overdue}`);
+    expect((await db.select().from(schema.assets).where(eq(schema.assets.id, overdue)))[0]!.pendingDeleteKey).toBeNull();
+    // tick 2: 새 60개가 더 들어와도, tick 1 에서 못 한 10개(t0)가 새 것(t1)보다 먼저
+    const t1 = new Date(t0.getTime() + 60_000);
+    await db.insert(schema.assets).values(Array.from({ length: 60 }, (_, i) => mk(idOf('bbbbbbbb', i), t1)));
+    seen.length = 0;
+    await cleanupPendingDeletes(db, files, t1);
+    expect(seen.slice(0, 10).every((k) => k.includes('/aaaaaaaa-'))).toBe(true);
+    await cleanupPendingDeletes(db, files, new Date(t1.getTime() + 60_000));
+  });
+
+  it('동시 tick 두 개가 같은 실패 의도를 잡으면 한 번만 시도하고 횟수는 한 번만 오르며 다음 시각은 뒤로 가지 않는다', async () => {
+    const id = 'dddddddd-0000-4000-8000-000000000001';
+    const t = new Date(Date.now() + 20 * 3600_000);
+    await db.insert(schema.assets).values(mk(id, t));
+    let calls = 0;
+    const failing = {
+      delete: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 20));
+        throw new Error('EBUSY');
+      },
+    };
+    const [a, b] = await Promise.all([cleanupPendingDeletes(db, failing, t), cleanupPendingDeletes(db, failing, t)]);
+    expect(a.failed + b.failed).toBe(1);
+    expect(calls).toBe(1);
+    let row = (await db.select().from(schema.assets).where(eq(schema.assets.id, id)))[0]!;
+    expect(row.pendingDeleteAttempts).toBe(1);
+    expect(row.pendingDeleteNextAt!.getTime()).toBe(t.getTime() + 2 * 60_000);
+    // 늦게 도착한(과거 시각의) 실패 기록도 다음 시각을 앞당기지 못한다: 기한이 된 뒤 과거 now 로 두 번째 시도
+    const t2 = new Date(t.getTime() + 3 * 60_000);
+    await cleanupPendingDeletes(db, failing, t2);
+    row = (await db.select().from(schema.assets).where(eq(schema.assets.id, id)))[0]!;
+    expect(row.pendingDeleteAttempts).toBe(2);
+    const after2 = row.pendingDeleteNextAt!.getTime();
+    expect(after2).toBe(t2.getTime() + 4 * 60_000);
+    await db.update(schema.assets).set({ pendingDeleteNextAt: new Date(t.getTime()) }).where(eq(schema.assets.id, id)); // 다시 기한 도래로
+    await cleanupPendingDeletes(db, failing, t); // 과거 시각 t 의 실패: t + 8분 < 이전 값이어도 GREATEST 로 단조
+    row = (await db.select().from(schema.assets).where(eq(schema.assets.id, id)))[0]!;
+    expect(row.pendingDeleteAttempts).toBe(3);
+    expect(row.pendingDeleteNextAt!.getTime()).toBeGreaterThanOrEqual(t.getTime() + 8 * 60_000);
+    expect(calls).toBe(3);
+    // 정리(성공)
+    await cleanupPendingDeletes(db, new LocalStorageAdapter(storageDir), new Date(t.getTime() + 24 * 3600_000));
+    expect((await db.select().from(schema.assets).where(eq(schema.assets.id, id)))[0]!).toMatchObject({ pendingDeleteKey: null, pendingDeleteAttempts: 0 });
+  });
+
+  it('새 의도는 다음 시도 시각이 비어 있지 않다(만든 시각)', async () => {
+    const f = media('mp3', 8000, 81);
+    const { res } = await uploadAll(f);
+    const asset = (await res.json()).asset;
+    const before = Date.now();
+    const failing = { delete: async () => Promise.reject(new Error('EBUSY')) };
+    await deleteOriginal(db, failing, { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date());
+    const row = (await db.select().from(schema.assets).where(eq(schema.assets.id, asset.id)))[0]!;
+    expect(row.pendingDeleteNextAt).not.toBeNull();
+    expect(row.pendingDeleteNextAt!.getTime()).toBeGreaterThanOrEqual(before);
+    await cleanupPendingDeletes(db, new LocalStorageAdapter(storageDir), new Date(Date.now() + 3600_000));
+  });
 });

@@ -571,11 +571,15 @@ export async function setVariantAssets(
       throw new BadRequestError(`첨부 순서(position)는 1~${MAX_ASSET_POSITION} 입니다`);
     }
     if (new Set(input.assets.map((a) => a.position)).size !== input.assets.length) throw new BadRequestError('첨부 순서(position)가 겹칩니다');
+    // FIX-T08(P0): 붙일 asset 행을 id 오름차순으로 잠근 뒤 deleted_at 을 본다 — 원음 삭제(deleteOriginal)도 같은 행을 잠그고
+    // "첨부 없음"을 다시 확인하므로 첨부와 삭제가 직렬화된다(잠금 순서: 파생본 → asset, 삭제는 asset 만).
     const found = ids.length
       ? await tx
           .select({ id: assets.id, mime: assets.mime, deletedAt: assets.deletedAt })
           .from(assets)
           .where(and(eq(assets.ownerId, ownerId), inArray(assets.id, [...new Set(ids)])))
+          .orderBy(asc(assets.id))
+          .for('update')
       : [];
     const mimeOf = new Map(found.map((f) => [f.id, f.mime]));
     if (ids.some((i) => !mimeOf.has(i))) throw new NotFoundError('파일을 찾을 수 없습니다');

@@ -6,7 +6,8 @@
  *   localStorage 에 두어, 새로고침 뒤 같은 파일을 다시 고르면 GET 으로 받은 위치부터 이어 올린다(A14).
  * - 전사 목록: 진행 중 작업이 있으면 1.5초마다 GET(inline worker 가 그때 한 단계씩 진행).
  */
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { resumeDecision, Sha256, startPolling, type ServerSessionLike } from '../../lib/upload-client';
 
 const ALLOWED = ['audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'video/mp4', 'video/webm', 'video/quicktime'];
 const STATE_LABEL: Record<string, string> = {
@@ -61,8 +62,29 @@ const jsonInit = (method: string, body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
-function resumeKey(f: File): string {
-  return `cs-upload:${f.name}:${f.size}:${f.lastModified}`;
+/** FIX-T08(P1): 이어 올리기 키는 파일 내용(sha256)이다 — 이름·크기·수정 시각이 같아도 내용이 다르면 다른 세션. */
+function resumeKey(sha256: string): string {
+  return `cs-upload:sha256:${sha256}`;
+}
+
+const CHUNK_BYTES = 8 * 1024 * 1024;
+
+const toHex = (buf: ArrayBuffer) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+
+/** 파일 전체 sha256(8MiB 씩 읽어 증분 해시 — 전체를 메모리에 올리지 않음) */
+async function fileSha256(file: File, onProgress: (pct: number) => void): Promise<string> {
+  const h = new Sha256();
+  for (let off = 0; off < file.size; off += CHUNK_BYTES) {
+    h.update(new Uint8Array(await file.slice(off, Math.min(file.size, off + CHUNK_BYTES)).arrayBuffer()));
+    onProgress(Math.floor((Math.min(file.size, off + CHUNK_BYTES) * 100) / Math.max(1, file.size)));
+  }
+  return h.hex();
+}
+
+/** 이 파일의 index 번째 조각 범위 sha256(WebCrypto — 조각은 8MiB 이하) */
+async function chunkSha256(file: File, index: number, chunkSize: number): Promise<string> {
+  const part = await file.slice(index * chunkSize, Math.min(file.size, (index + 1) * chunkSize)).arrayBuffer();
+  return toHex(await crypto.subtle.digest('SHA-256', part));
 }
 
 function readStored(key: string): string | null {
@@ -82,12 +104,13 @@ function writeStored(key: string, value: string | null): void {
   }
 }
 
-/** 저장해 둔 세션이 아직 open 이면 그 상태(받은 위치 포함), 아니면 null */
-async function resumeSession(id: string | null): Promise<SessionView | null> {
+/** 저장해 둔 세션이 open 이고 **같은 내용의 파일**(전체 sha256·받은 조각별 sha256 일치)이면 그 상태, 아니면 null */
+async function resumeSession(id: string | null, file: File, sha256: string): Promise<SessionView | null> {
   if (!id) return null;
   try {
-    const r = await call<{ session: SessionView }>(`/api/uploads/sessions/${id}`);
-    return r.session.state === 'open' ? r.session : null;
+    const r = await call<{ session: SessionView & ServerSessionLike }>(`/api/uploads/sessions/${id}`);
+    const d = await resumeDecision(r.session, { size: file.size, sha256 }, (i, size) => chunkSha256(file, i, size));
+    return d.resume ? r.session : null;
   } catch {
     return null;
   }
@@ -109,22 +132,30 @@ export default function RecordClient() {
   const [progress, setProgress] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [jobs, setJobs] = useState<JobView[] | null>(null);
+  const [pollError, setPollError] = useState<string>('');
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const loadJobs = useCallback(async () => {
-    try {
-      const r = await call<{ jobs: JobView[] }>('/api/transcription-jobs');
-      setJobs(r.jobs);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }, []);
+  const poller = useRef<{ stop: () => void; poke: () => void } | null>(null);
 
-  // 처음 한 번, 그 뒤 진행 중 작업이 있으면 1.5초마다 다시 조회(조회할 때마다 inline worker 가 한 단계 진행)
+  // FIX-T08(P1): 폴링 루프 — 실패해도 항상 다음 조회를 예약(2초→10초 backoff), 진행 중이면 1.5초, 없으면 10초. 화면을 떠나면 멈춘다.
   useEffect(() => {
-    if (jobs !== null && !jobs.some((j) => j.state === 'queued' || j.state === 'running')) return;
-    const t = setTimeout(() => void loadJobs(), jobs === null ? 0 : 1500);
-    return () => clearTimeout(t);
-  }, [jobs, loadJobs]);
+    const p = startPolling(async () => {
+      try {
+        const r = await call<{ jobs: JobView[] }>('/api/transcription-jobs');
+        setJobs(r.jobs);
+        setPollError('');
+        return { active: r.jobs.some((j) => j.state === 'queued' || j.state === 'running') };
+      } catch (e) {
+        setPollError(`전사 목록을 불러오지 못했습니다: ${(e as Error).message} — 자동으로 다시 시도합니다.`);
+        throw e;
+      }
+    });
+    poller.current = p;
+    return () => {
+      p.stop();
+      poller.current = null;
+    };
+  }, []);
+  const loadJobs = async () => poller.current?.poke();
 
   async function upload() {
     if (!file) return;
@@ -135,9 +166,11 @@ export default function RecordClient() {
       return;
     }
     setBusy(true);
-    const key = resumeKey(file);
     try {
-      const resumed = await resumeSession(readStored(key));
+      setStatus('파일 내용을 확인하는 중입니다(sha256)…');
+      const sha256 = await fileSha256(file, (pct) => setProgress(pct));
+      const key = resumeKey(sha256);
+      const resumed = await resumeSession(readStored(key), file, sha256);
       let session: SessionView;
       if (resumed) {
         session = resumed;
@@ -145,7 +178,7 @@ export default function RecordClient() {
       } else {
         const created = await call<{ session: SessionView }>(
           '/api/uploads/sessions',
-          jsonInit('POST', { kind: mime.startsWith('audio/') ? 'audio' : 'video', mime, bytes: file.size }),
+          jsonInit('POST', { kind: mime.startsWith('audio/') ? 'audio' : 'video', mime, bytes: file.size, sha256, chunk_size: CHUNK_BYTES }),
         );
         session = created.session;
         writeStored(key, session.id);
@@ -265,6 +298,11 @@ export default function RecordClient() {
 
       <section className="card" aria-labelledby="jobs-title">
         <h3 id="jobs-title">전사 작업</h3>
+        {pollError ? (
+          <p className="notice" role="status">
+            {pollError}
+          </p>
+        ) : null}
         {jobs !== null && jobs.length === 0 ? <p className="empty-text">아직 전사 작업이 없습니다.</p> : null}
         <ul className="list">
           {(jobs ?? []).map((j) => (

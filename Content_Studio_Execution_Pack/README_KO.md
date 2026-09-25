@@ -302,7 +302,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 ### 음성 전사·큰 파일 업로드 (M2, T08 — 모의 전사)
 결정 D9·D15(docs/DECISIONS.md). **외부 호출·과금·비밀 0.** 전사는 모의(`STT_MODE=mock`, 파일 checksum 으로 정해지는 자리표시 문장 — 실제 음성 인식 아님). 화면 `/record`(상단 "음성").
 
-- **업로드 세션(A14)**: 음성(MP3·M4A·WAV·WebM, 최대 200MB)·영상(MP4·WebM·MOV, 최대 2GB)을 4–8MiB 조각(기본 8MiB)으로 올린다. 끊기면 같은 세션을 `GET` 해 받은 위치(`next_index`)부터 이어 올린다(화면은 파일별로 세션 ID 를 브라우저에 기억). 같은 조각 재전송은 그대로(200), 다른 내용이면 409. 세션은 24시간 뒤 만료되고 worker 가 조각을 지운다.
+- **업로드 세션(A14)**: 음성(MP3·M4A·WAV·WebM, 최대 200MB)·영상(MP4·WebM·MOV, 최대 2GB)을 4–8MiB 조각(기본 8MiB)으로 올린다. 끊기면 같은 세션을 `GET` 해 받은 위치(`next_index`)부터 이어 올린다. 화면은 먼저 파일 전체 sha256 을 계산해 세션에 신고하고(`sha256`), 이어 올릴 때는 신고 sha256·크기·이미 받은 조각별 sha256(`GET` 의 `chunks`)이 이 파일과 모두 같을 때만 재사용한다(다르면 새 세션). 같은 조각 재전송은 그대로(200), 다른 내용이면 409. 세션은 24시간 뒤 만료되고 worker 가 조각을 지운다.
 - **완료 검사**: 서버가 조각을 이어 붙이며(메모리에 전체를 올리지 않음) 크기·앞부분 형식 서명·sha256 을 확인한다. 통과하면 asset `VERIFIED`(`verification_scope=signature_size_checksum` — 재생 가능 여부·디코딩은 확인하지 않음). 실패하면 세션 rejected + 조각 삭제(415 형식, 400 크기·checksum).
 - **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(`/api/health`·전사 목록 조회 때). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
 - **전사 본문**: 버전 불변. 수정은 새 버전(`base_version` 이 최신이 아니면 409). "이 버전을 소재로 보내기" → 소재(원문 = 전사 본문, 메모 "음성 전사(모의)").

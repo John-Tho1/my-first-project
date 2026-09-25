@@ -3,8 +3,9 @@
  * 취소·전사 수정 버전·소재로 보내기·원음 삭제(410)·만료 정리·owner 격리·live STT 차단·export → 빈 DB 복원.
  * 외부 호출 없음: 전사기는 MockTranscriber(결정적), live 는 어댑터가 없어 항상 거부.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +13,13 @@ import { and, count, eq, sql } from 'drizzle-orm';
 import {
   closeDb,
   commitRestore,
+  completeUploadSession,
+  createContent,
+  createVariantDraft,
+  deleteOriginal,
+  expireUploadSessions,
+  setVariantAssets,
+  type WriteHandle,
   createRestorePreview,
   createTestDb,
   ensureOwner,
@@ -601,5 +609,169 @@ describe('내보내기 → 빈 DB 복원(전사 job·버전·원장·소재 연�
       await h.close();
       await cancelPOST(bare(`/api/transcription-jobs/${jid}/cancel`, tokenA), ctx(jid));
     }
+  });
+});
+
+describe('FIX-T08 round 1(Codex review-T08)', () => {
+  const storage = () => new LocalStorageAdapter(storageDir);
+  /** 조각을 모두 올린 open 세션(완료 전) */
+  async function openSession(file: Uint8Array<ArrayBuffer>, mime = 'audio/mpeg', extra: Record<string, unknown> = {}) {
+    const s = await (await createSession({ kind: mime.startsWith('audio/') ? 'audio' : 'video', mime, bytes: file.byteLength, chunk_size: CHUNK, ...extra })).json();
+    const id = s.session.id as string;
+    for (let i = 0; i * CHUNK < file.byteLength; i++) expect((await putChunk(id, i, file.slice(i * CHUNK, (i + 1) * CHUNK))).status).toBe(201);
+    return id;
+  }
+  const realOpen = (file: string) => open(file, 'w');
+  const assetsWith = async (checksum: string) => db.select().from(schema.assets).where(and(eq(schema.assets.ownerId, ownerA), eq(schema.assets.checksum, checksum)));
+
+  it('P0 부분 쓰기: 한 번에 777바이트만 쓰는 핸들이어도 끝까지 반복해 원본과 같은 파일이 된다', async () => {
+    const f = media('mp3', CHUNK + 5000, 61);
+    const id = await openSession(f);
+    let calls = 0;
+    const partial = async (file: string): Promise<WriteHandle> => {
+      const fh = await realOpen(file);
+      return {
+        write: (buf, off, len) => {
+          calls++;
+          return fh.write(buf, off, Math.min(len, 777));
+        },
+        close: () => fh.close(),
+      };
+    };
+    const r = await completeUploadSession(db, uploadStoreFor(loadConfig()), storage(), ownerA, id, new Date(), { openWrite: partial });
+    expect(calls).toBeGreaterThan(Math.floor(f.byteLength / 777));
+    expect(r.asset).toMatchObject({ checksum: sha(f), bytes: f.byteLength });
+    const bytes = await storage().get(r.asset.key);
+    expect(sha(bytes!)).toBe(sha(f));
+  });
+
+  it('P0 쓰기 진행 0 → assembly_failed(rejected·asset 없음), 쓴 척만 하는 핸들(크기 불일치)도 거부', async () => {
+    const f = media('mp3', 9000, 62);
+    const id = await openSession(f);
+    const stuck = async (file: string): Promise<WriteHandle> => {
+      const fh = await realOpen(file);
+      return { write: async () => ({ bytesWritten: 0 }), close: () => fh.close() };
+    };
+    await expect(completeUploadSession(db, uploadStoreFor(loadConfig()), storage(), ownerA, id, new Date(), { openWrite: stuck })).rejects.toMatchObject({
+      code: 'upload_rejected',
+      extra: { reason: 'assembly_failed' },
+    });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!.state).toBe('rejected');
+    expect(await assetsWith(sha(f))).toHaveLength(0);
+
+    const g = media('mp3', 9000, 63);
+    const id2 = await openSession(g);
+    const liar = async (file: string): Promise<WriteHandle> => {
+      const fh = await realOpen(file);
+      return {
+        write: async (buf, off, len) => {
+          await fh.write(buf, off, Math.max(1, len >> 1)); // 절반만 쓰고
+          return { bytesWritten: len }; // 다 썼다고 보고
+        },
+        close: () => fh.close(),
+      };
+    };
+    await expect(completeUploadSession(db, uploadStoreFor(loadConfig()), storage(), ownerA, id2, new Date(), { openWrite: liar })).rejects.toMatchObject({
+      extra: { reason: 'assembly_failed' },
+    });
+    expect(await assetsWith(sha(g))).toHaveLength(0);
+  });
+
+  it('P1 완료 중 만료: 조립 뒤 만료되면 asset 을 만들지 않고 세션은 expired(409 upload_expired), 옮긴 파일 없음', async () => {
+    const f = media('mp3', 7000, 64);
+    const id = await openSession(f);
+    const store = uploadStoreFor(loadConfig());
+    const assetsDir = path.join(storageDir, 'assets', ownerA);
+    const before = filesUnder(assetsDir);
+    await expect(
+      completeUploadSession(db, store, storage(), ownerA, id, new Date(), {
+        beforeFinish: async () => {
+          expect(await expireUploadSessions(db, store, new Date(Date.now() + 25 * 3600_000))).toBeGreaterThanOrEqual(1);
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'upload_expired' });
+    const s = (await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!;
+    expect(s).toMatchObject({ state: 'expired', assetId: null });
+    expect(await assetsWith(sha(f))).toHaveLength(0);
+    expect(filesUnder(assetsDir)).toBe(before);
+    expect(existsSync(path.join(uploadsRoot(), ownerA, id))).toBe(false);
+  });
+
+  it('P0 원음 삭제 뒤 재업로드는 새 key 로 되살리고, 옛 key 에 대한 늦은 삭제가 새 파일을 지우지 못한다', async () => {
+    const f = media('mp4', 12_000, 65);
+    const { res } = await uploadAll(f, 'video/mp4');
+    const asset = (await res.json()).asset;
+    const oldKey = `assets/${ownerA}/${asset.id}`;
+    expect(await deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date())).toBe(true);
+    expect(await storage().exists(oldKey)).toBe(false);
+    expect((await assetsWith(sha(f)))[0]!.deletedAt).not.toBeNull();
+    // 같은 바이트 재업로드 → 같은 asset, 새 key, deleted_at 해제
+    const again = await uploadAll(f, 'video/mp4');
+    const body = await again.res.json();
+    expect(body).toMatchObject({ duplicate: true, asset: { id: asset.id, deleted_at: null } });
+    const row = (await assetsWith(sha(f)))[0]!;
+    expect(row.key).not.toBe(oldKey);
+    expect(row.deletedAt).toBeNull();
+    // 삭제 작업이 옛 key 로 늦게 도착해도 새 파일은 그대로
+    await storage().delete(oldKey);
+    expect(await storage().exists(row.key)).toBe(true);
+    const dl = await assetGET(...assetGet(asset.id, tokenA));
+    expect(dl.status).toBe(200);
+    expect(sha(new Uint8Array(await dl.arrayBuffer()))).toBe(sha(f));
+  });
+
+  it('P0 파일 삭제가 실패하면 deleted_at 도 남지 않는다(한 트랜잭션, DB 와 파일 일치)', async () => {
+    const f = media('mp3', 8000, 66);
+    const { res } = await uploadAll(f);
+    const asset = (await res.json()).asset;
+    const failing = { delete: async () => Promise.reject(new Error('EBUSY')) };
+    await expect(deleteOriginal(db, failing, { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date())).rejects.toThrow('EBUSY');
+    const row = (await assetsWith(sha(f)))[0]!;
+    expect(row.deletedAt).toBeNull();
+    expect(await storage().exists(row.key)).toBe(true);
+  });
+
+  it('P0 첨부 ↔ 삭제: 지운 파일은 첨부 410, 첨부된 파일은 삭제하지 않음(둘 다 asset 행 잠금 아래 재확인)', async () => {
+    const vid = media('mp4', 9000, 67);
+    const kept = media('mp4', 9000, 68);
+    const a1 = (await (await uploadAll(vid, 'video/mp4')).res.json()).asset.id as string;
+    const a2 = (await (await uploadAll(kept, 'video/mp4')).res.json()).asset.id as string;
+    const contentId = (await createContent(db, ownerA, { title: '첨부 경합', body: '본문.' })).content.id;
+    const { variant } = await createVariantDraft(db, ownerA, contentId, { channel: 'youtube', baseVersion: 1 });
+    expect(await deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId: a1 }, new Date())).toBe(true);
+    await expect(setVariantAssets(db, ownerA, variant.id, { baseVersion: 1, assets: [{ assetId: a1, position: 1, role: 'video' }] })).rejects.toMatchObject({
+      code: 'asset_deleted',
+    });
+    await setVariantAssets(db, ownerA, variant.id, { baseVersion: 1, assets: [{ assetId: a2, position: 1, role: 'video' }] });
+    expect(await deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId: a2 }, new Date())).toBe(false);
+    const row = (await db.select().from(schema.assets).where(eq(schema.assets.id, a2)))[0]!;
+    expect(row.deletedAt).toBeNull();
+    expect(await storage().exists(row.key)).toBe(true);
+    // 동시에 요청해도(잠금으로 직렬화) 첨부된 파일이 지워지거나 지운 파일이 첨부되는 결과는 없다
+    const a3 = (await (await uploadAll(media('mp4', 9000, 69), 'video/mp4')).res.json()).asset.id as string;
+    const [att, del] = await Promise.allSettled([
+      setVariantAssets(db, ownerA, variant.id, { baseVersion: 2, assets: [{ assetId: a3, position: 1, role: 'video' }] }),
+      deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId: a3 }, new Date()),
+    ]);
+    const r3 = (await db.select().from(schema.assets).where(eq(schema.assets.id, a3)))[0]!;
+    const attached = (await db.select().from(schema.variantAssets).where(eq(schema.variantAssets.assetId, a3))).length > 0;
+    expect(attached && r3.deletedAt !== null).toBe(false);
+    expect(att.status === 'fulfilled' || del.status === 'fulfilled').toBe(true);
+  });
+
+  it('P1 이어 올리기 확인용: GET 은 받은 조각별 sha256·신고 checksum·resumable 을 돌려준다, 신고 sha 가 다르면 완료 거부', async () => {
+    const f = media('mp3', CHUNK + 100, 70);
+    const s = await (await createSession({ kind: 'audio', mime: 'audio/mpeg', bytes: f.byteLength, chunk_size: CHUNK, sha256: sha(f) })).json();
+    expect(s.session).toMatchObject({ checksum_expected: sha(f), resumable: true, chunks: [] });
+    expect((await putChunk(s.session.id, 0, f.slice(0, CHUNK))).status).toBe(201);
+    const g = await (await sessionGET(get(`/api/uploads/sessions/${s.session.id}`), ctx(s.session.id))).json();
+    expect(g.session.chunks).toEqual([{ index: 0, sha256: sha(f.slice(0, CHUNK)) }]);
+    const noSha = await (await createSession({ kind: 'audio', mime: 'audio/mpeg', bytes: 100, chunk_size: CHUNK })).json();
+    expect(noSha.session).toMatchObject({ checksum_expected: null, resumable: false });
+    // 다른 파일의 뒷조각을 섞으면 신고 sha 와 달라 거부
+    expect((await putChunk(s.session.id, 1, media('mp3', 100, 71))).status).toBe(201);
+    const r = await complete(s.session.id);
+    expect(r.status).toBe(400);
+    expect((await r.json()).reason).toBe('checksum_mismatch');
   });
 });

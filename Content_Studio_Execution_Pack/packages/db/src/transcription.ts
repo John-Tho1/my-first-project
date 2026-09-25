@@ -275,8 +275,14 @@ function actualFromSnapshot(snapshot: Record<string, unknown>, currency: string,
   return sttCostMicro({ currency, perMinuteMicro: toMicro(per) }, seconds);
 }
 
-async function deleteOriginal(db: Db, files: AssetDeleter, job: TranscriptionJobRow, now: Date): Promise<boolean> {
-  const key = await db.transaction(async (tx) => {
+/**
+ * FIX-T08(P0): asset 행 잠금을 쥔 한 트랜잭션 안에서 "첨부 없음 재확인 → 파일 삭제 → deleted_at 기록" 순으로 한다.
+ * 파일 삭제가 실패하면 트랜잭션 전체가 되돌아가 deleted_at 이 남지 않는다(DB 와 파일이 어긋나지 않게).
+ * 재업로드 복구는 같은 행 잠금 아래 **새 key** 로 쓰므로, 이 삭제가 복구한 파일에 닿을 수 없다.
+ * 첨부(setVariantAssets)도 같은 asset 행을 잠그고 deleted_at 을 다시 보므로 첨부와 삭제는 직렬화된다.
+ */
+export async function deleteOriginal(db: Db, files: AssetDeleter, job: Pick<TranscriptionJobRow, 'id' | 'ownerId' | 'assetId'>, now: Date): Promise<boolean> {
+  const done = await db.transaction(async (tx) => {
     const a = (await tx.select().from(assets).where(and(eq(assets.id, job.assetId), eq(assets.ownerId, job.ownerId))).for('update'))[0];
     if (!a || a.deletedAt !== null) return null;
     if (await assetInUse(tx, job.ownerId, a.id)) {
@@ -290,14 +296,12 @@ async function deleteOriginal(db: Db, files: AssetDeleter, job: TranscriptionJob
       });
       return null;
     }
+    await files.delete(a.key); // 실패하면 throw → 롤백
     await tx.update(assets).set({ deletedAt: now }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
     await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id }, at: now });
-    return a.key;
+    return true;
   });
-  if (!key) return false;
-  // 기록을 먼저 확정한 뒤 파일을 지운다. 파일 삭제가 실패하면 파일만 남고(다운로드는 이미 410) 다음 요청에 영향 없음.
-  await files.delete(key).catch(() => undefined);
-  return true;
+  return done === true;
 }
 
 /**
@@ -408,7 +412,8 @@ export async function advanceTranscriptionJobs(
     });
     if (outcome === 'succeeded') {
       res.succeeded++;
-      if (!job.keepOriginal && opts.files && (await deleteOriginal(db, opts.files, job, now))) res.originalsDeleted++;
+      // 원본 삭제 실패(파일 삭제 오류)는 전사 결과와 별개 — 원본은 그대로 남고(deleted_at 없음) 감사만 남긴다.
+      if (!job.keepOriginal && opts.files && (await deleteOriginal(db, opts.files, job, now).catch(() => false))) res.originalsDeleted++;
     } else if (outcome === 'failed') {
       res.failed++;
     }

@@ -34,7 +34,7 @@ export const PUT = apiHandler<Ctx>(async (request, ctx) => {
   });
   const chunks = await listChunkRows(owner.db, owner.ownerId, r.session.id);
   return json(
-    { index: r.index, sha256: r.sha256, duplicate: r.duplicate, session: uploadSessionView(r.session, chunks.map((c) => c.index)) },
+    { index: r.index, sha256: r.sha256, duplicate: r.duplicate, session: uploadSessionView(r.session, chunks) },
     { status: r.duplicate ? 200 : 201 },
   );
 });

@@ -195,10 +195,16 @@ export interface UploadSessionView {
   asset_id: string | null;
   expires_at: string;
   created_at: string;
+  /** FIX-T08(P1): 신고한 전체 sha256 — 이어 올리기는 이 값이 있을 때만(resumable) */
+  checksum_expected: string | null;
+  resumable: boolean;
+  /** 받은 조각별 sha256 — 클라이언트가 같은 파일인지 로컬 조각과 비교한다 */
+  chunks: Array<{ index: number; sha256: string }>;
 }
 
-export function uploadSessionView(s: UploadSessionRow, received: readonly number[]): UploadSessionView {
+export function uploadSessionView(s: UploadSessionRow, chunks: ReadonlyArray<{ index: number; sha256: string }>): UploadSessionView {
   const total = chunkCount(s.declaredBytes, s.chunkSize);
+  const received = chunks.map((c) => c.index);
   const gaps = missingChunks(total, received);
   return {
     id: s.id,
@@ -217,6 +223,9 @@ export function uploadSessionView(s: UploadSessionRow, received: readonly number
     asset_id: s.assetId,
     expires_at: s.expiresAt.toISOString(),
     created_at: s.createdAt.toISOString(),
+    checksum_expected: s.checksumExpected,
+    resumable: s.state === 'open' && s.checksumExpected !== null,
+    chunks: chunks.map((c) => ({ index: c.index, sha256: c.sha256 })),
   };
 }
 
@@ -224,10 +233,7 @@ export async function getUploadSessionView(db: DbOrTx, ownerId: string, id: stri
   const s = await getUploadSession(db, ownerId, id);
   if (!s) return null;
   const chunks = await listChunkRows(db, ownerId, s.id);
-  return uploadSessionView(
-    s,
-    chunks.map((c) => c.index),
-  );
+  return uploadSessionView(s, chunks);
 }
 
 // ---- 생성 ----
@@ -341,12 +347,45 @@ interface Assembled {
   head: Uint8Array;
 }
 
-/** 조각을 번호 순서로 스트림으로 이어 붙인다. 조각 파일이 없거나 조각 sha256 이 기록과 다르면 null. */
+/** 조립 파일 쓰기 핸들(node FileHandle 이 만족). 테스트는 부분 쓰기·0 진행을 주입한다. */
+export interface WriteHandle {
+  write(buffer: Uint8Array, offset: number, length: number): Promise<{ bytesWritten: number }>;
+  close(): Promise<void>;
+}
+
+/** 테스트용 주입 지점(운영 경로는 쓰지 않음). */
+export interface CompleteHooks {
+  /** 조립 파일 열기 — 기본은 fs.open(file, 'w') */
+  openWrite?: (file: string) => Promise<WriteHandle>;
+  /** 조립·검사가 끝난 뒤, 최종 커밋 전(만료 경합 재현) */
+  beforeFinish?: () => Promise<void>;
+}
+
+/**
+ * FIX-T08(P0): 버퍼 전체를 쓸 때까지 반복한다(부분 쓰기). 진행이 0 이면 실패. onWritten 은 **실제로 쓴 바이트**로만 호출된다
+ * — 크기·sha256·앞부분 서명은 이 바이트로 계산한다.
+ */
+export async function writeFully(fh: WriteHandle, buf: Uint8Array, onWritten: (written: Uint8Array) => void): Promise<void> {
+  let off = 0;
+  while (off < buf.byteLength) {
+    const { bytesWritten } = await fh.write(buf, off, buf.byteLength - off);
+    if (!Number.isInteger(bytesWritten) || bytesWritten <= 0) throw new Error('조립 파일 쓰기가 진행되지 않았습니다');
+    const n = Math.min(bytesWritten, buf.byteLength - off);
+    onWritten(buf.subarray(off, off + n));
+    off += n;
+  }
+}
+
+/**
+ * 조각을 번호 순서로 스트림으로 이어 붙인다. 조각 파일이 없거나 조각 sha256 이 기록과 다르거나, 쓰기가 끝나지 않았거나,
+ * 닫은 뒤 파일 크기가 실제로 쓴 바이트 수와 다르면 null(→ assembly_failed).
+ */
 async function assemble(
   store: UploadStore,
   ownerId: string,
   sessionId: string,
   chunks: ReadonlyArray<{ index: number; sha256: string }>,
+  openWrite: (file: string) => Promise<WriteHandle>,
 ): Promise<Assembled | null> {
   const dir = store.dirFor(ownerId, sessionId);
   const file = path.join(/*turbopackIgnore: true*/ dir, 'assembled.part');
@@ -354,7 +393,16 @@ async function assemble(
   const head = new Uint8Array(SNIFF_HEAD_BYTES);
   let headLen = 0;
   let total = 0;
-  const fh = await open(/*turbopackIgnore: true*/ file, 'w');
+  const onWritten = (w: Uint8Array) => {
+    whole.update(w);
+    if (headLen < SNIFF_HEAD_BYTES) {
+      const take = Math.min(SNIFF_HEAD_BYTES - headLen, w.byteLength);
+      head.set(w.subarray(0, take), headLen);
+      headLen += take;
+    }
+    total += w.byteLength;
+  };
+  const fh = await openWrite(file);
   try {
     for (const c of chunks) {
       const part = createHash('sha256');
@@ -362,14 +410,7 @@ async function assemble(
         for await (const buf of createReadStream(/*turbopackIgnore: true*/ store.chunkPath(ownerId, sessionId, c.index))) {
           const b = buf as Buffer;
           part.update(b);
-          whole.update(b);
-          if (headLen < SNIFF_HEAD_BYTES) {
-            const take = Math.min(SNIFF_HEAD_BYTES - headLen, b.byteLength);
-            head.set(b.subarray(0, take), headLen);
-            headLen += take;
-          }
-          total += b.byteLength;
-          await fh.write(b);
+          await writeFully(fh, b, onWritten);
         }
       } catch {
         return null;
@@ -378,6 +419,11 @@ async function assemble(
     }
   } finally {
     await fh.close();
+  }
+  try {
+    if ((await stat(/*turbopackIgnore: true*/ file)).size !== total) return null;
+  } catch {
+    return null;
   }
   return { file, bytes: total, sha256: whole.digest('hex'), head: head.subarray(0, headLen) };
 }
@@ -388,26 +434,40 @@ export interface CompleteResult {
   duplicate: boolean;
 }
 
+/** 완료 처리 중 세션이 다른 상태(만료·중단)가 됨 — asset 을 만들지 않는다. */
+function sessionChangedError(state: string | undefined): AppError {
+  return state === 'expired'
+    ? new AppError('conflict', 'upload_expired', '완료 처리 중에 업로드 세션이 만료되어 파일을 저장하지 않았습니다. 새 세션으로 다시 올리세요.', { state })
+    : new AppError('conflict', 'upload_not_open', `완료 처리 중에 업로드 세션 상태가 바뀌었습니다(상태: ${state ?? '없음'})`, { state: state ?? null });
+}
+
+/** 검사 실패 → 세션 행을 먼저 잠그고(만료와 같은 순서), 아직 completed 일 때만 rejected + 조각 삭제. */
 async function rejectSession(db: Db, store: UploadStore, s: UploadSessionRow, reason: UploadRejectReason, actual: string | null, now: Date): Promise<never> {
-  await db.transaction(async (tx) => {
+  const state = await db.transaction(async (tx) => {
+    const cur = await lockSession(tx, s.ownerId, s.id);
+    if (!cur || cur.state !== 'completed') return cur?.state;
     await tx.delete(uploadChunks).where(and(eq(uploadChunks.sessionId, s.id), eq(uploadChunks.ownerId, s.ownerId)));
     await tx
       .update(uploadSessions)
       .set({ state: 'rejected', rejectReason: reason, checksumActual: actual, updatedAt: now })
       .where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, s.ownerId)));
     await recordAudit(tx, { ownerId: s.ownerId, action: 'upload.reject', entity: 'upload_session', entityId: s.id, versionOrHash: actual, details: { reason }, at: now });
+    return 'rejected';
   });
-  await store.removeSession(s.ownerId, s.id);
+  await store.removeSession(s.ownerId, s.id).catch(() => undefined);
+  if (state !== 'rejected') throw sessionChangedError(state);
   throw new UploadRejectedError(reason);
 }
 
+/** 세션 행 잠금을 쥔 트랜잭션 안에서만 부른다(세션 → 조각 순서). */
 async function finishVerified(tx: DbOrTx, s: UploadSessionRow, asset: AssetRow, sha: string, now: Date, duplicate: boolean): Promise<UploadSessionRow> {
-  await tx.delete(uploadChunks).where(and(eq(uploadChunks.sessionId, s.id), eq(uploadChunks.ownerId, s.ownerId)));
   const rows = await tx
     .update(uploadSessions)
     .set({ state: 'verified', assetId: asset.id, checksumActual: sha, updatedAt: now })
-    .where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, s.ownerId)))
+    .where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, s.ownerId), eq(uploadSessions.state, 'completed')))
     .returning();
+  if (!rows[0]) throw sessionChangedError(undefined);
+  await tx.delete(uploadChunks).where(and(eq(uploadChunks.sessionId, s.id), eq(uploadChunks.ownerId, s.ownerId)));
   await recordAudit(tx, {
     ownerId: s.ownerId,
     action: 'upload.complete',
@@ -417,7 +477,13 @@ async function finishVerified(tx: DbOrTx, s: UploadSessionRow, asset: AssetRow, 
     details: { asset_duplicate: duplicate, mime: asset.mime, bytes: asset.bytes },
     at: now,
   });
-  return rows[0]!;
+  return rows[0];
+}
+
+class SessionChanged extends Error {
+  constructor(readonly state: string | undefined) {
+    super('session changed');
+  }
 }
 
 export async function completeUploadSession(
@@ -427,8 +493,9 @@ export async function completeUploadSession(
   ownerId: string,
   sessionId: string,
   now: Date = new Date(),
+  hooks: CompleteHooks = {},
 ): Promise<CompleteResult> {
-  // 1) 잠금 아래 상태 확인·open → completed(동시 완료는 하나만 진행)
+  // 1) 세션 행 잠금 → 상태 확인 → 조각 목록 → open → completed(처리 중 표시, 동시 완료는 하나만 진행)
   const claimed = await db.transaction(async (tx) => {
     const s = await lockSession(tx, ownerId, sessionId);
     if (!s) throw new NotFoundError(NOT_FOUND);
@@ -463,10 +530,11 @@ export async function completeUploadSession(
   if ('done' in claimed) return claimed.done!;
   const s = claimed.session!;
 
-  // 2) 트랜잭션 밖에서 스트림 조립·검사
+  // 2) 트랜잭션 밖에서 스트림 조립·검사(크기·sha256·서명은 실제로 쓴 바이트 기준)
+  const openWrite = hooks.openWrite ?? ((file: string) => open(/*turbopackIgnore: true*/ file, 'w'));
   let built: Assembled | null;
   try {
-    built = await assemble(store, ownerId, s.id, claimed.chunks!);
+    built = await assemble(store, ownerId, s.id, claimed.chunks!, openWrite);
   } catch {
     built = null;
   }
@@ -476,69 +544,83 @@ export async function completeUploadSession(
   if (family === null) return rejectSession(db, store, s, 'unsupported_signature', built.sha256, now);
   if (!mediaMatches(s.declaredMime as MediaMime, family)) return rejectSession(db, store, s, 'mime_mismatch', built.sha256, now);
   if (s.checksumExpected && s.checksumExpected !== built.sha256) return rejectSession(db, store, s, 'checksum_mismatch', built.sha256, now);
+  await hooks.beforeFinish?.();
 
-  // 3) asset: 같은 owner 의 같은 checksum 이 있으면 그 asset(지워진 원본이면 이 파일로 되살림), 없으면 새로 만든다.
+  // 3) 최종 커밋: 세션 행을 다시 잠가 아직 completed 인지 확인한 뒤에만 파일을 asset key 로 옮기고 기록한다(FIX-T08 P1).
+  //    같은 owner 의 같은 checksum asset 이 있으면 그 asset — 지운 원본·없는 파일이면 **새 key** 로 되살린다(FIX-T08 P0:
+  //    이전 key 에 대한 늦은 삭제가 새 파일에 닿지 않게).
   const sha = built.sha256;
+  let movedKey: string | null = null;
   try {
-    const existing = (await db.select().from(assets).where(and(eq(assets.ownerId, ownerId), eq(assets.checksum, sha))).limit(1))[0];
-    if (existing) {
-      const out = await db.transaction(async (tx) => {
-        const a = (await tx.select().from(assets).where(and(eq(assets.id, existing.id), eq(assets.ownerId, ownerId))).for('update'))[0]!;
-        let asset = a;
-        if (a.deletedAt !== null || !(await files.exists(a.key))) {
-          await files.putFile(a.key, built.file);
-          const rows = await tx.update(assets).set({ deletedAt: null }).where(and(eq(assets.id, a.id), eq(assets.ownerId, ownerId))).returning();
+    return await db.transaction(async (tx) => {
+      const cur = await lockSession(tx, ownerId, s.id);
+      if (!cur || cur.state !== 'completed') throw new SessionChanged(cur?.state);
+      const existing = (
+        await tx.select().from(assets).where(and(eq(assets.ownerId, ownerId), eq(assets.checksum, sha))).for('update')
+      )[0];
+      if (existing) {
+        let asset = existing;
+        if (existing.deletedAt !== null || !(await files.exists(existing.key))) {
+          const key = buildAssetKey(ownerId, randomUUID());
+          await files.putFile(key, built.file);
+          movedKey = key;
+          const rows = await tx
+            .update(assets)
+            .set({ key, deletedAt: null })
+            .where(and(eq(assets.id, existing.id), eq(assets.ownerId, ownerId)))
+            .returning();
           asset = rows[0]!;
-          await recordAudit(tx, { ownerId, action: 'asset.restore', entity: 'asset', entityId: a.id, versionOrHash: sha, details: { via: 'upload_session' }, at: now });
+          await recordAudit(tx, { ownerId, action: 'asset.restore', entity: 'asset', entityId: existing.id, versionOrHash: sha, details: { via: 'upload_session', new_key: true }, at: now });
         }
-        const session = await finishVerified(tx, s, asset, sha, now, true);
+        const session = await finishVerified(tx, cur, asset, sha, now, true);
         return { session, asset, duplicate: true };
-      });
-      return out;
-    }
-    const id = randomUUID();
-    const key = buildAssetKey(ownerId, id);
-    await files.putFile(key, built.file);
-    try {
-      return await db.transaction(async (tx) => {
-        const rows = await tx
-          .insert(assets)
-          .values({
-            id,
-            ownerId,
-            key,
-            mime: s.declaredMime,
-            bytes: built.bytes,
-            checksum: sha,
-            rightsStatus: 'unknown',
-            verificationState: 'VERIFIED',
-            verificationScope: VERIFICATION_SCOPE,
-            createdAt: now,
-          })
-          .returning();
-        const asset = rows[0]!;
-        await recordAudit(tx, {
+      }
+      const id = randomUUID();
+      const key = buildAssetKey(ownerId, id);
+      await files.putFile(key, built.file);
+      movedKey = key;
+      const rows = await tx
+        .insert(assets)
+        .values({
+          id,
           ownerId,
-          action: 'asset.upload',
-          entity: 'asset',
-          entityId: asset.id,
-          versionOrHash: sha,
-          details: { mime: asset.mime, bytes: asset.bytes, via: 'upload_session' },
-          at: now,
-        });
-        const session = await finishVerified(tx, s, asset, sha, now, false);
-        return { session, asset, duplicate: false };
+          key,
+          mime: s.declaredMime,
+          bytes: built.bytes,
+          checksum: sha,
+          rightsStatus: 'unknown',
+          verificationState: 'VERIFIED',
+          verificationScope: VERIFICATION_SCOPE,
+          createdAt: now,
+        })
+        .returning();
+      const asset = rows[0]!;
+      await recordAudit(tx, {
+        ownerId,
+        action: 'asset.upload',
+        entity: 'asset',
+        entityId: asset.id,
+        versionOrHash: sha,
+        details: { mime: asset.mime, bytes: asset.bytes, via: 'upload_session' },
+        at: now,
       });
-    } catch (e) {
-      await files.delete(key).catch(() => undefined);
-      throw e;
-    }
+      const session = await finishVerified(tx, cur, asset, sha, now, false);
+      return { session, asset, duplicate: false };
+    });
   } catch (e) {
-    // asset 기록에 실패하면 세션을 open 으로 되돌려 같은 조각으로 다시 완료할 수 있게 한다(조각은 그대로).
-    await db
-      .update(uploadSessions)
-      .set({ state: 'open', updatedAt: now })
-      .where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, ownerId), eq(uploadSessions.state, 'completed')));
+    // 기록이 되돌아갔으므로 옮긴 파일도 지운다(DB 와 파일이 어긋나지 않게).
+    if (movedKey) await files.delete(movedKey).catch(() => undefined);
+    if (e instanceof SessionChanged) {
+      await store.removeSession(ownerId, s.id).catch(() => undefined);
+      throw sessionChangedError(e.state);
+    }
+    // 그 밖의 실패는 세션을 open 으로 되돌려 같은 조각으로 다시 완료할 수 있게 한다(세션 행 잠금 아래, 아직 completed 일 때만).
+    await db.transaction(async (tx) => {
+      const cur = await lockSession(tx, ownerId, s.id);
+      if (cur?.state === 'completed') {
+        await tx.update(uploadSessions).set({ state: 'open', updatedAt: now }).where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, ownerId)));
+      }
+    });
     throw e;
   } finally {
     await rm(/*turbopackIgnore: true*/ built.file, { force: true }).catch(() => undefined);

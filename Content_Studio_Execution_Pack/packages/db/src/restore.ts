@@ -94,7 +94,7 @@ export interface RestoreConflict {
   table: RestoredTable;
   id: string;
   /** different: 같은 owner 의 같은 ID 가 내용이 다름 / id_in_use: 다른 owner 가 쓰는 ID / dependency: 부모 행이 복원되지 않음 / unique: 다른 unique 값 충돌 / version_exists: 같은 버전의 브랜드 프로필이 다름 */
-  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version';
+  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version' | 'snapshot_referenced';
 }
 
 export interface DowngradedVariant {
@@ -262,6 +262,16 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         conflict(row.id, 'immutable_version');
         continue;
       }
+      // FIX-T10 round 2(P1, Codex review-FIX-T10 0019:31): add_missing 이 기존 파생본에 옛 버전과 그 첨부를 보충하는 경우 — 트리거(0019·0021)에
+      // 닿기 전에 같은 규칙으로 명시적 충돌로 남긴다(복원 전체를 DB 오류로 중단하지 않음): 그 버전을 배포 항목이 참조하면 snapshot_referenced,
+      // 파생본의 현재 버전(대상 DB)이 이 버전보다 새것이면 immutable_version.
+      if (name === 'variant_assets') {
+        const reason = await variantAssetRestoreBlocker(tx, String(row.variant_version_id));
+        if (reason) {
+          conflict(row.id, reason);
+          continue;
+        }
+      }
       if (name === 'brand_profiles') {
         // (owner, version) unique: 같은 버전이 이미 있으면(예: seed) 내용이 같을 때만 "동일", 다르면 충돌. 덮어쓰지 않는다.
         // 같은 (owner, version) 이 다른 ID 로 이미 있으면(예: seed) 내용이 같아도 충돌이다 — 묶음의 ID 가 보존되지 않기 때문(결정 D6: ID 보존).
@@ -291,7 +301,20 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         overrides.heartbeat_at = null;
         overrides.restored_needs_review = true;
       }
-      if (await insertBundleRow(tx, name, row, ownerId, overrides)) {
+      // variant_assets 는 트리거가 남은 경합(사전 검사 뒤 변경)에서 거부할 수 있으므로 savepoint 안에서 넣고, 그 거부는 같은 충돌로 바꾼다.
+      let inserted: boolean;
+      if (name === 'variant_assets') {
+        try {
+          inserted = await tx.transaction(async (sp) => insertBundleRow(sp, name, row, ownerId, overrides));
+        } catch (e) {
+          if (!pgErrorText(e).includes('variant_assets_version_open')) throw e;
+          conflict(row.id, pgErrorText(e).includes('배포 스냅샷') ? 'snapshot_referenced' : 'immutable_version');
+          continue;
+        }
+      } else {
+        inserted = await insertBundleRow(tx, name, row, ownerId, overrides);
+      }
+      if (inserted) {
         if (restoredStatus === 'BLOCKED') blockedItems.push(row.id);
         if (restoredStatus === 'UNKNOWN') unknownItems.push(row.id);
         counts.new++;
@@ -435,6 +458,35 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
   }
   return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, unknownItems, unverifiedConfirmedItems, revokedApprovals };
+}
+
+/** 드라이버가 감싼 오류의 메시지 사슬(cause 포함). */
+function pgErrorText(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; i < 5 && cur; i++) {
+    parts.push(String((cur as { message?: unknown }).message ?? ''));
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return parts.join(' | ');
+}
+
+/**
+ * FIX-T10 round 2: 복원이 넣으려는 첨부의 파생본 버전이 대상 DB 에서 "닫힌" 버전인지(트리거 variant_assets_version_open 과 같은 규칙).
+ * 이번 복원에서 새로 넣은 파생본은 current_version_id 가 아직 NULL 이라 통과한다(복원이 모든 표를 넣은 뒤 연결).
+ */
+async function variantAssetRestoreBlocker(tx: DbOrTx, variantVersionId: string): Promise<'snapshot_referenced' | 'immutable_version' | null> {
+  const r = await tx.execute(sql`
+    select
+      exists (select 1 from distribution_items di where di.variant_version_id = vv.id) as referenced,
+      (select cv.version from variants v join variant_versions cv on cv.id = v.current_version_id where v.id = vv.variant_id) as current_version,
+      vv.version as version
+    from variant_versions vv where vv.id = ${variantVersionId}::uuid`);
+  const row = (r as unknown as { rows: Array<{ referenced: boolean; current_version: number | null; version: number }> }).rows[0];
+  if (!row) return null;
+  if (row.referenced) return 'snapshot_referenced';
+  if (row.current_version !== null && Number(row.current_version) > Number(row.version)) return 'immutable_version';
+  return null;
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */

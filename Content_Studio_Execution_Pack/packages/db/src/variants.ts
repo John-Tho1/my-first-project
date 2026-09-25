@@ -57,7 +57,7 @@ import type { Db } from './client';
 import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './contents';
 import { invalidateApprovalsForVariant } from './approval-invalidation';
 import { recordAudit, type DbOrTx } from './queries';
-import { assets, claimConfirmations, contents, generationRuns, variantAssets, variants, variantVersions } from './schema';
+import { assets, claimConfirmations, contents, distributionItems, generationRuns, variantAssets, variants, variantVersions } from './schema';
 import { getCurrentBrandProfile, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
 
 export type VariantRow = typeof variants.$inferSelect;
@@ -206,6 +206,7 @@ async function insertCurrentVariantVersion(
     })
     .returning();
   const version = inserted[0]!;
+  if (attach.length) await assertVersionAttachable(tx, ownerId, variant.id, version.id);
   for (const a of attach) {
     await tx.insert(variantAssets).values({ ownerId, variantVersionId: version.id, assetId: a.assetId, position: a.position, role: a.role });
   }
@@ -217,6 +218,37 @@ async function insertCurrentVariantVersion(
   if (!updated[0]) throw new Error('채널 초안 갱신에 실패했습니다');
   await invalidateApprovalsForVariant(tx, ownerId, variant.id, change, now);
   return version;
+}
+
+/**
+ * FIX-T10 round 2(P1, Codex review-FIX-T10 0019:26): 첨부 INSERT 전의 실제 직렬화. 전역 잠금 순서대로 파생본 행 FOR UPDATE(호출자가 이미 잠갔으면
+ * 재진입) → 버전 행 FOR UPDATE 를 잡는다 — createPlan 의 파생본 FOR SHARE·항목 INSERT 의 버전 FK KEY SHARE 와 충돌하므로 둘은 서로 기다린다.
+ * 잠금 뒤 다시 검사: 배포 항목이 이 버전을 참조하지 않고(409 variant_version_referenced), 이 버전이 현재 버전보다 옛 버전이 아니다
+ * (409 variant_version_superseded). DB 트리거 variant_assets_version_open(0019·0021)은 앱 밖 INSERT 에 대한 마지막 방어선이다.
+ */
+async function assertVersionAttachable(tx: DbOrTx, ownerId: string, variantId: string, versionId: string): Promise<void> {
+  const v = await tx
+    .select({ currentVersionId: variants.currentVersionId })
+    .from(variants)
+    .where(and(eq(variants.id, variantId), eq(variants.ownerId, ownerId)))
+    .for('update')
+    .limit(1);
+  if (!v[0]) throw new NotFoundError(VARIANT_NOT_FOUND);
+  const vv = await tx
+    .select({ version: variantVersions.version })
+    .from(variantVersions)
+    .where(and(eq(variantVersions.id, versionId), eq(variantVersions.ownerId, ownerId)))
+    .for('update')
+    .limit(1);
+  if (!vv[0]) throw new NotFoundError(VARIANT_NOT_FOUND);
+  const used = await tx.select({ id: distributionItems.id }).from(distributionItems).where(eq(distributionItems.variantVersionId, versionId)).limit(1);
+  if (used.length) throw new AppError('conflict', 'variant_version_referenced', '배포 스냅샷이 쓰는 채널 초안 버전에는 첨부를 추가할 수 없습니다');
+  if (v[0].currentVersionId) {
+    const cur = await tx.select({ version: variantVersions.version }).from(variantVersions).where(eq(variantVersions.id, v[0].currentVersionId)).limit(1);
+    if (cur[0] && cur[0].version > vv[0].version) {
+      throw new AppError('conflict', 'variant_version_superseded', '지나간 채널 초안 버전에는 첨부를 추가할 수 없습니다');
+    }
+  }
 }
 
 async function carriedAssets(tx: DbOrTx, ownerId: string, current: VariantVersionRow | null) {

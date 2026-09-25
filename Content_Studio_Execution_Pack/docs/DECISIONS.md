@@ -270,3 +270,8 @@
   - **복원 이력(T11 P1, D17(6) 개정)**: jobs·send_intents·publications 를 **읽기 전용 이력**으로 복원한다(job_events·execute_commands·mock_scenarios 는 계속 내보내기만). 작업은 끝난 상태·BLOCKED·UNKNOWN 으로만(`restoredJobState`), lease 없이, `jobs.restored_needs_review = true`(0020) — worker 는 lease 하지 않고 재시도는 거부, 재확인(조회만)은 복원된 전송 의도 key 로 가능. CONFIRMED 인데 원격 결과가 묶음에 없는 항목은 UNKNOWN(+표시), 그 CONFIRMED 작업도 UNKNOWN.
   - **계획 상태(T12 P1)**: migration 0020 이 모든 계획을 `planStatusFrom` 과 같은 규칙(SQL)으로 다시 계산한다(0018 의 부분 재분류 보완).
   - **화면(T11·T12 P2)**: 승인 철회 안내는 저장된 결과 수(BLOCKED 된 작업·CANCEL_REQUESTED 로 기록된 작업)로만 말한다. 보류 이유는 구조화된 코드(이벤트 event·lastErrorCode)로 판단하고 상세 사유(`invalidated:…`·사용자 사유)는 따로 보이며, 스냅샷이 바뀐 PLANNED 항목에는 "새 계획 만들기"를 안내한다. 실제 PostgreSQL 동시 실행 검증은 not_run.
+- **Follow-up (M3 FIX round 2, Codex review-FIX-T10, 2026-09-25) — 첨부 트리거는 마지막 방어선, 실제 직렬화는 잠금**:
+  - 첨부 INSERT 의 실제 직렬화는 앱 경로다: `insertCurrentVariantVersion` 이 첨부를 넣기 전에 전역 순서대로 파생본 행 FOR UPDATE → 버전 행 FOR UPDATE 를 잡고, 잠금 뒤 "이 버전을 참조하는 배포 항목 없음"(409 `variant_version_referenced`)·"현재보다 옛 버전 아님"(409 `variant_version_superseded`)을 다시 검사한다. `createPlan` 의 파생본 FOR SHARE·항목 INSERT 의 버전 FK KEY SHARE 와 충돌하므로 둘은 서로 기다리고, 뒤에 온 쪽은 커밋된 결과를 본다.
+  - `variant_assets_version_open` 트리거(migration 0021 로 교체)는 같은 순서로 파생본·버전 행을 FOR UPDATE 로 잠근 뒤 0019 규칙을 검사한다 — 앱 밖 INSERT 에 대한 **backstop** 이다.
+  - 복원(`add_missing`)이 기존 파생본에 옛 버전의 첨부를 보충하려 하면 사전 검사가 명시적 충돌(`immutable_version` — 대상의 현재 버전이 더 새것, `snapshot_referenced` — 배포 항목이 그 버전을 참조)로 남기고 나머지 복원은 진행한다. 사전 검사 뒤 경합으로 트리거가 거부해도 savepoint 로 같은 충돌로 바꾼다(원시 DB 오류로 중단하지 않음). 옛 버전 행 자체는 보충된다(첨부 없는 버전 — 검토 조건은 현재 버전으로만 판단).
+  - 실제 PostgreSQL 두 연결 교차 실행 검증은 not_run(PGlite 는 연결 하나 — 시험은 두 순서의 결과와 잠금 흔적(xmax)만 확인).

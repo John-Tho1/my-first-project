@@ -362,3 +362,69 @@ describe('D19-b(D20) — 0019 트리거', () => {
     expect(attached).toHaveLength(2);
   });
 });
+
+describe('FIX round 2 (Codex review-FIX-T10) — 첨부 추가와 계획 생성 직렬화, add_missing 옛 버전 첨부 보충', () => {
+  it('두 순서(직렬): 첨부 → 계획은 스냅샷에 첨부가 들어가고, 계획 → 참조 버전에 첨부 INSERT 는 거부; 트리거는 검사 전에 파생본 행을 잠근다(xmax)', async () => {
+    const o = await newOwner();
+    const { content } = await createContent(db, o.id, { title: 'FIX2 직렬', body: BODY });
+    const { variant } = await createVariantDraft(db, o.id, content.id, { channel: 'instagram', baseVersion: 1 });
+    // 순서 1: 첨부(앱 경로 — 파생본·버전 FOR UPDATE 뒤 재검사) → 계획: 스냅샷이 첨부를 본다
+    const img = await putAsset(o.id);
+    await setVariantAssets(db, o.id, variant.id, { baseVersion: 1, assets: [{ assetId: img, position: 1, role: 'image' }] });
+    await setVariantLifecycle(db, o.id, variant.id, { lifecycle: 'review', baseVersion: 2 });
+    const { items } = await createPlan(db, o.id, { items: [{ variant_id: variant.id, channel_account_id: o.accounts.instagram }] });
+    expect((items[0]!.payloadJson as { assets: Array<{ id: string }> }).assets.map((a) => a.id)).toEqual([img]);
+    // 순서 2: 계획 → 그 버전에 첨부 INSERT(앱 밖) → 거부(스냅샷 불변)
+    await expectDbError(
+      db.insert(schema.variantAssets).values({ ownerId: o.id, variantVersionId: items[0]!.variantVersionId, assetId: await putAsset(o.id), position: 2, role: 'image' }),
+      'variant_assets_version_open',
+    );
+    // 트리거가 검사 전에 파생본 행을 잠근다(0021) — 참조 없는 현재 버전에 대한 허용된 INSERT 뒤 파생본 xmax 가 바뀐다(variant_assets 는 variants 를 FK 로 참조하지 않음)
+    const { content: c2 } = await createContent(db, o.id, { title: 'FIX2 잠금', body: BODY });
+    const { variant: v2 } = await createVariantDraft(db, o.id, c2.id, { channel: 'instagram', baseVersion: 1 });
+    const [cur] = await db.select().from(schema.variants).where(eq(schema.variants.id, v2.id));
+    const x = async () => String(((await db.execute(sql`select xmax::text as x from variants where id = ${v2.id}::uuid`)) as unknown as { rows: Array<{ x: string }> }).rows[0]!.x);
+    const before = await x();
+    await db.insert(schema.variantAssets).values({ ownerId: o.id, variantVersionId: cur!.currentVersionId!, assetId: await putAsset(o.id), position: 1, role: 'image' });
+    expect(await x()).not.toBe(before);
+  });
+
+  it('add_missing: 대상에 같은 파생본(현재 v3)이 있고 묶음에만 옛 v2 와 그 첨부가 있으면 → 첨부는 immutable_version 충돌로 남고 나머지 복원은 진행', async () => {
+    const o = await newOwner();
+    const { content } = await createContent(db, o.id, { title: 'FIX2 보충', body: BODY });
+    const { variant } = await createVariantDraft(db, o.id, content.id, { channel: 'instagram', baseVersion: 1 });
+    await setVariantAssets(db, o.id, variant.id, { baseVersion: 1, assets: [{ assetId: await putAsset(o.id), position: 1, role: 'image' }] });
+    await setVariantAssets(db, o.id, variant.id, { baseVersion: 2, assets: [{ assetId: await putAsset(o.id), position: 1, role: 'image' }] });
+    const extra = await createContent(db, o.id, { title: 'FIX2 나머지', body: BODY });
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), o.id, { outDir: path.join(tmp, 'exports-fix2') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const v2 = parsed.tables.variant_versions.find((v) => v.variant_id === variant.id && v.version === 2)!;
+    const v2Assets = parsed.tables.variant_assets.filter((a) => a.variant_version_id === v2.id);
+    expect(v2Assets).toHaveLength(1);
+    // 대상 준비: v2(와 그 첨부)·"나머지" 원고가 빠진 묶음을 먼저 복원 → 대상 파생본은 v1·v3, 현재 v3
+    const partial = structuredClone(parsed.tables) as BundleTables;
+    partial.variant_versions = partial.variant_versions.filter((v) => v.id !== v2.id);
+    partial.variant_assets = partial.variant_assets.filter((a) => a.variant_version_id !== v2.id);
+    partial.contents = partial.contents.filter((c) => c.id !== extra.content.id);
+    partial.content_versions = partial.content_versions.filter((c) => c.content_id !== extra.content.id);
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'restore-fix2@example.local')).id;
+      const restoresDir = path.join(tmp, 'restores-fix2');
+      const storage = new LocalStorageAdapter(path.join(tmp, 'assets-fix2'));
+      const p1 = await createRestorePreview(h.db, target, rebuild(parsed, partial), { restoresDir, source: 'upload' });
+      await commitRestore(h.db, storage, target, p1.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      // 전체 묶음 add_missing: 수정 전에는 v2 첨부 INSERT 에서 트리거 restrict_violation 으로 복원 전체가 중단됐다
+      const p2 = await createRestorePreview(h.db, target, rebuild(parsed, structuredClone(parsed.tables) as BundleTables), { restoresDir, source: 'upload' });
+      expect(p2.preview.conflicts).toContainEqual({ table: 'variant_assets', id: v2Assets[0]!.id, reason: 'immutable_version' });
+      const r = await commitRestore(h.db, storage, target, p2.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+      expect(r.conflicts).toContainEqual({ table: 'variant_assets', id: v2Assets[0]!.id, reason: 'immutable_version' });
+      // 나머지는 들어왔다(옛 버전 행 자체와 빠졌던 원고)
+      expect((await h.db.select().from(schema.variantVersions).where(eq(schema.variantVersions.id, v2.id)))).toHaveLength(1);
+      expect((await h.db.select().from(schema.contents).where(eq(schema.contents.id, extra.content.id)))).toHaveLength(1);
+      expect(await h.db.select().from(schema.variantAssets).where(eq(schema.variantAssets.variantVersionId, v2.id))).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+});

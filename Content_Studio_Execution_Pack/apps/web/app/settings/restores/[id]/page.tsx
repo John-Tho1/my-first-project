@@ -32,6 +32,8 @@ const REASON_LABEL: Record<string, string> = {
   dependency: '연결된 항목이 복원되지 않음',
   unique: '다른 고유 값 충돌',
   version_exists: '같은 버전이 이미 있음(내용 다름)',
+  immutable_version: '이미 확정된(지나간) 채널 초안 버전에는 첨부를 보충하지 않음',
+  snapshot_referenced: '배포 스냅샷이 쓰는 채널 초안 버전에는 첨부를 보충하지 않음',
 };
 
 /** 복원 미리보기 → (확인) → 복원 결과. 결과가 있으면 표별 복원 건수와 파일 checksum 확인 결과를 보여 준다. */

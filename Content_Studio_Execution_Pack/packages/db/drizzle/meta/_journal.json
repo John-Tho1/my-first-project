@@ -148,6 +148,13 @@
       "when": 1790325063018,
       "tag": "0020_t11_t12_fix_restore_history_plan_status",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790327820831,
+      "tag": "0021_t10_fix2_variant_assets_lock",
+      "breakpoints": true
     }
   ]
 }

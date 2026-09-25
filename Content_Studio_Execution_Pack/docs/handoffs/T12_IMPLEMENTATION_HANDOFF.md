@@ -36,3 +36,42 @@
   5. RETRY_WAIT 즉시 철회로, 의도가 pending(이미 보냈을 수 있음)인 job 을 `revokeActiveApprovalsLocked` 가 BLOCKED 로 만드는 경로가 있는가?
   6. 브랜드 무효화가 복원(대상 환경의 현재 브랜드 버전이 다름)에서 `restore_stale` 을 과도하게 만드는가?
 - Next authorized task: 없음. M3 완료(T10~T12). M4(T13 OAuth·비밀 암호화)는 실계정·외부 승인 필요 — 사용자 결정 후.
+
+---
+
+# FIX round 1 (Codex review-T12)
+- Review input: `.handoffs/review-T12.md` (CHANGES_REQUESTED). Instruction: `prompts/CLAUDE_FIX.md`. Done together with the T11 FIX round (same working tree; see `.handoffs/T11_IMPLEMENTATION_HANDOFF.md`).
+- BASE_SHA: 5319cc7 (`content-studio/m3`, FIX T10 committed)
+- HEAD_SHA: TBD (orchestrator commits; uncommitted working tree at hand-off)
+- Reproduction: the P0 case in `m3-hardening` B failed on HEAD, because the old test and code expected `snapshot_stale` with the approval still active. `migration-0020.test.ts` failed with a column-only 0020 (`case 0: expected 'draft' to be 'partial'`). The P2 lib test targets new exports; on HEAD the old `blockReasonOf` returned `invalidated:assets_changed` as the reason, which is how the Codex repro failed.
+
+| Finding | Change | Test |
+|---|---|---|
+| P0 approval-invalidation.ts:44 editing a BLOCKED item keeps its approval | `REVOCABLE_ITEM_STATUSES` now includes BLOCKED, so every edit hook (variant/content/brand/account) and `invalidateItems` revokes the approval with `invalidated:<reason>` (audit `approval.invalidate`). The item goes BLOCKED → PLANNED unless it has `restored_needs_review`. The job **stays BLOCKED**, so an unconfirmed send is not made runnable again. This reverses D19(d); recorded in the D20 follow-up paragraph in `docs/DECISIONS.md`. | `m3-hardening` B: 401-BLOCKED item + `appendVariantVersion` → approval `invalidated:body_changed`, item PLANNED, job BLOCKED, retry → 409 `approval_required`. The `snapshot_stale` retry branch is still covered through a change that bypasses the hooks (direct account UPDATE). |
+| P1 0018:22 incomplete plan backfill | Migration `0020_t11_t12_fix_restore_history_plan_status` recomputes **every** plan's status in SQL with the same priority as `planStatusFrom` (no items → draft; in-flight → executing; all PLANNED → by active-approval count; all CONFIRMED → completed; all CANCELED → canceled; any CONFIRMED/PARTIAL → partial; any BLOCKED/UNKNOWN/PLANNED → attention; else failed). Only changed plans get `revision + 1`. | `tests/integration/migration-0020.test.ts` (new): DB at 0019 with stale rows (PLANNED+CONFIRMED stored draft/approved → partial; PLANNED+CANCELED draft → attention; PLANNED+FAILED → attention; all-CONFIRMED stored executing → completed; empty → draft; unchanged cases keep revision 1). Each case is also checked against `planStatusFrom`. |
+| P2 lib/distribution.ts:269 reason hides the standard code | New `blockInfoOf(events, job)` returns `{ code, detail }`. The code is the first approval code found in event `event` / `lastErrorCode` / `reason`, otherwise the reason. The detail (`invalidated:…`, `user: …`) is shown separately via `blockDetailLabel`. `itemHeadline` for PLANNED + BLOCKED job: an approval code **or** no active approval counts as an approval problem. If the snapshot changed (`problems`), the headline says "승인 무효 (…) — … 새 계획 만들기"; otherwise "승인 없음 (…) — 다시 승인 후 실행". The page uses these instead of the old `blockReasonOf`. | `apps/web/lib/distribution.test.ts` (new, unit): the RETRY_WAIT `assets_changed` repro gives code `approval_invalidated` and headline "승인 없음 (첨부 파일이 바뀜)…"; user-revocation detail; `approval_missing`/`auth` codes unchanged; 401-then-edit gives the new-plan guidance; plain PLANNED stays "계획됨". |
+
+- Changed files (T12 part): `packages/db/src/approval-invalidation.ts`, `packages/db/drizzle/0020_…sql`, `apps/web/lib/{distribution.ts,distribution.test.ts}`, `apps/web/app/distribute/[id]/page.tsx`, `tests/integration/{m3-hardening.test.ts,migration-0020.test.ts (new)}`, `docs/DECISIONS.md` (shared with T11 — see that handoff for the full list).
+- Commands (Windows 10, Git Bash, `source tools/env.sh`, Node v24.21.0, pnpm 12.6.0; dev server stopped): `corepack pnpm lint` pass · `typecheck` pass · `test` pass, 30 files / 548 tests · `test:integration` pass, 23 files / 325 tests, 196 s · `build` pass · `drill:mock` exit 0, 불변식 위반 0건.
+- Remaining risks: `retryItem` still checks only the intent for `job.attempt` (Codex Q1/missed case: no intent for the current attempt while an older one is pending/ambiguous) — not changed. Restoring into an environment whose current brand differs still revokes as `restore_stale`/`brand_changed` (Codex Q6) — behaviour unchanged and not separately tested. Real PostgreSQL concurrency not_run.
+- Questions specifically for Codex:
+  1. Revoking a BLOCKED item's approval while leaving its job BLOCKED: can any path (`retryItem`, `executePlan` with a new command key, `cancelItem`) now send for that item without a fresh approval, or leave two active jobs?
+  2. Is it right to keep a BLOCKED item with `restored_needs_review` in BLOCKED (approval revoked, item not PLANNED), or should it also go to PLANNED?
+  3. Does the SQL in 0020 match `planStatusFrom` for every combination, including legacy `PARTIAL` items and plans with zero items?
+  4. `blockInfoOf` gives approval codes priority over a later non-approval reason from the same event. Can an item that is BLOCKED for `auth` and later had its approval invalidated show the wrong headline (the item is PLANNED then; is "승인 무효/새 계획" always correct)?
+
+---
+
+# FIX round 2 (Codex review-FIX-T11T12)
+- Review input: `.handoffs/review-FIX-T11T12.md`. The T12-side item is P2 lib/distribution.ts:332; the P1 and page.tsx:28 are in `.handoffs/T11_IMPLEMENTATION_HANDOFF.md`.
+- BASE_SHA: d67dde9 · HEAD_SHA: TBD (uncommitted working tree)
+- Reproduction: the new matrix test in `apps/web/lib/distribution.test.ts` fails with the HEAD `apps/web/lib/distribution.ts` (a re-approved item with a historical `approval_revoked` block showed "승인 없음").
+
+| Finding | Change | Test |
+|---|---|---|
+| P2 lib/distribution.ts:332 re-approved item shows "승인 없음" | In `itemHeadline`'s PLANNED branch, `activeApproval === true` returns "계획됨(실행 전)" before any historical block reason is considered. The "승인 없음/승인 무효" headline only applies when there is no active approval. | Matrix of `activeApproval` ∈ {true, false} × every `APPROVAL_BLOCK_REASONS` code: true → "계획됨(실행 전)", false → "승인 없음 — 다시 승인 후 실행". |
+
+- Commands: same run as T11 round 2 — lint/typecheck pass, unit 30 files / 550, integration 23 files / 330, build pass, drill:mock exit 0.
+- Questions specifically for Codex:
+  1. With an active approval now taking precedence, is there a state where a PLANNED item has an active approval and yet cannot be executed (e.g. the job is still BLOCKED because of `auth`), and should the headline then say something other than "계획됨"?
+  2. Should an item with an active approval but snapshot `problems` (the approval will be refused at execute) show the "새 계획 만들기" guidance instead of "계획됨"?

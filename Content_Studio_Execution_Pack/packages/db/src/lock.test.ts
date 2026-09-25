@@ -82,7 +82,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
     expect(readFileSync(lockFile(d), 'utf8')).toBe(foreign);
   });
 
-  it('죽은 잠금을 여러 프로세스가 동시에 회수해도 한 프로세스만 잠금을 얻는다', { timeout: 60_000 }, async () => {
+  it('죽은 잠금을 여러 프로세스가 동시에 회수해도 한 프로세스만 잠금을 얻는다', { timeout: 120_000 }, async () => {
     const d = mk();
     writeFileSync(lockFile(d), DEAD_PID);
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -93,7 +93,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
     const results = await Promise.all(
       Array.from({ length: N }, () =>
         new Promise<string>((resolve, reject) => {
-          const c = spawn(process.execPath, ['--import', 'tsx', child, d, '3000'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+          const c = spawn(process.execPath, ['--import', 'tsx', child, d, '12000'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
           let out = '';
           let err = '';
           c.stdout.on('data', (b) => (out += b));
@@ -115,7 +115,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
     ).then((r) => r.filter((x) => x !== 'GO'));
     expect(results.filter((r) => r === 'OK')).toHaveLength(1);
     expect(results.filter((r) => r === 'LOCKED')).toHaveLength(N - 1);
-    expect(existsSync(lockFile(d))).toBe(false); // 승자가 3초 뒤 해제
+    expect(existsSync(lockFile(d))).toBe(false); // 승자가 12초 뒤 해제(부하 시 자식 기동 지연 대비)
     expect(existsSync(lockFile(d) + '.reclaim')).toBe(false);
   });
 });

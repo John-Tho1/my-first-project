@@ -7,7 +7,9 @@ import { getSession } from '../../../lib/auth';
 import {
   DISTRIBUTE_ERROR_TEXT,
   ITEM_STATUS_LABEL,
+  itemHeadline,
   jobStatusText,
+  MOCK_SCENARIO_OPTIONS,
   PLAN_STATUS_LABEL,
   problemLabel,
   RESULT_KIND_LABEL,
@@ -70,16 +72,64 @@ function OutgoingText({ channel, text }: { channel: string; text: CanonicalPaylo
   }
 }
 
+const FINISHED = ['CONFIRMED', 'CANCELED', 'FAILED'];
+
+function blockReasonOf(x: PlanItemDetail): string | null {
+  const blockEvent = x.events.find((e) => e.stateAfter === 'BLOCKED');
+  if (!blockEvent) return null;
+  const d = blockEvent.sanitizedDetails as { reason?: unknown; event?: unknown };
+  return String(d.reason ?? d.event ?? '') || null;
+}
+
+/** T12: 개발용 모의 시나리오 선택(모의 계정·끝나지 않은 항목만). 승인 스냅샷 밖 — hash·승인 상태가 바뀌지 않는다. */
+function ScenarioForm({ x }: { x: PlanItemDetail }) {
+  if (x.account?.kind !== 'mock' || FINISHED.includes(x.item.status)) return null;
+  const current = x.mockScenario?.scenario ?? '';
+  return (
+    <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/mock-scenario`} aria-label="모의 시나리오">
+      <input type="hidden" name="plan_id" value={x.item.planId} />
+      <label>
+        모의 시나리오 <span className="note">개발용 · 모의 결과 선택 (실제 채널 없음)</span>{' '}
+        <select name="scenario" defaultValue={current || 'success'}>
+          {MOCK_SCENARIO_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        지연(ms) <input type="number" name="delay_ms" min={0} max={5000} step={100} defaultValue={x.mockScenario?.delayMs ?? 0} />
+      </label>
+      <button type="submit">모의 시나리오 저장</button>
+      <span className="note">{current ? `현재: ${current}` : '현재: 기본값(success)'}</span>
+    </form>
+  );
+}
+
 function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean }) {
   const p = x.payload;
   const channel = x.variant?.channel ?? p.channel;
   const scheduled = x.item.scheduledAtUtc;
+  const latest = x.jobs.at(-1) ?? null;
+  const latestPub = latest ? (x.publications.find((q) => q.jobId === latest.id) ?? x.publications.at(-1) ?? null) : (x.publications.at(-1) ?? null);
+  const headline = itemHeadline({ status: x.item.status, channel, job: latest, pub: latestPub, blockReason: blockReasonOf(x) });
+  const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
       <h3>
         {CHANNEL_LABEL[channel as Channel] ?? channel} — {x.account?.displayName ?? '(계정 없음)'}{' '}
         {x.account?.kind === 'mock' ? <span className="tag warn">MOCK</span> : null}
       </h3>
+      <p className="status-line" role="status">
+        <strong>{headline}</strong>
+        {x.item.status === 'CONFIRMED' ? (
+          <>
+            {' '}
+            <span className="tag warn">MOCK</span> <strong>실제 발행 실적 아님</strong>
+          </>
+        ) : null}
+      </p>
       <p className="meta">
         <span className="tag">{ITEM_STATUS_LABEL[x.item.status] ?? x.item.status}</span>
         <span>공개 범위: {VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility}</span>
@@ -143,8 +193,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
-              const blockEvent = x.events.find((e) => e.stateAfter === 'BLOCKED');
-              const reason = blockEvent ? String((blockEvent.sanitizedDetails as { reason?: unknown; event?: unknown }).reason ?? (blockEvent.sanitizedDetails as { event?: unknown }).event ?? '') : null;
+              const reason = blockReasonOf(x);
               return (
                 <li key={j.id} className="hash">
                   <strong>{jobStatusText(j, pub, reason)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
@@ -162,6 +211,12 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
                 <button type="submit">취소</button>
               </form>
             ) : null}
+            {retryable ? (
+              <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/retry`}>
+                <input type="hidden" name="plan_id" value={x.item.planId} />
+                <button type="submit">재시도</button>
+              </form>
+            ) : null}
             {['RECONCILING', 'UNKNOWN', 'REMOTE_PROCESSING'].includes(x.jobs.at(-1)?.state ?? '') ? (
               <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/reconcile`}>
                 <input type="hidden" name="plan_id" value={x.item.planId} />
@@ -170,8 +225,10 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
             ) : null}
           </div>
           <p className="note">취소는 아직 보내지 않은 작업만 바로 확정됩니다. 전송 중이면 &quot;취소 확인 중&quot;으로 남고, 원격이 이미 받았으면 취소할 수 없습니다.</p>
+          {retryable ? <p className="note">재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
         </>
       ) : null}
+      <ScenarioForm x={x} />
       {x.publications.length ? (
         <>
           <h4>원격 결과</h4>
@@ -280,6 +337,16 @@ export default async function PlanPage({
       {q.cancel_requested === '1' ? (
         <p className="notice" role="status">
           취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.
+        </p>
+      ) : null}
+      {q.retried === '1' ? (
+        <p className="saved" role="status">
+          보류된 작업을 다시 대기열에 넣었습니다(MOCK — 새 시도). &quot;작업 처리 실행(모의 1회)&quot;을 누르면 처리합니다.
+        </p>
+      ) : null}
+      {q.scenario_saved === '1' ? (
+        <p className="saved" role="status">
+          모의 시나리오를 저장했습니다(개발용 · 실제 채널 없음). 승인·배포 내용(hash)은 바뀌지 않습니다.
         </p>
       ) : null}
       {str(q.reconciled) ? (

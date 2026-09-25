@@ -28,7 +28,23 @@ export type DistributionItemRow = typeof distributionItems.$inferSelect;
 export type ApprovalRow = typeof approvals.$inferSelect;
 export type JobRow = typeof jobs.$inferSelect;
 
-export type InvalidationReason = 'body_changed' | 'assets_changed' | 'content_changed' | 'account_changed' | 'schedule_passed' | 'snapshot_changed';
+export type InvalidationReason =
+  | 'body_changed'
+  | 'assets_changed'
+  | 'content_changed'
+  | 'account_changed'
+  | 'brand_changed'
+  | 'schedule_passed'
+  | 'snapshot_changed';
+
+/**
+ * 승인 무효화·철회가 곧바로 막는 항목 상태: 실행 전(PLANNED)·대기(QUEUED)·재시도 대기(RETRY_WAIT, T12 D19 — 다음 전송 시점이 아니라 즉시).
+ * 전송 단계(LEASED 이후)는 철회가 CANCEL_REQUESTED 로 추적하고, 보류(BLOCKED)는 재시도(retryItem)가 승인·스냅샷을 다시 검사한다.
+ */
+export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT'] as const;
+/** 철회 시 BLOCKED 로 막는 작업 상태(아직 보내지 않은 대기 작업). */
+const BLOCK_ON_REVOKE_JOB_STATES = ['QUEUED', 'RETRY_WAIT'] as const;
+const isRevocable = (status: string) => (REVOCABLE_ITEM_STATUSES as readonly string[]).includes(status);
 
 const sortIds = (ids: Iterable<string>) => [...new Set(ids)].sort();
 
@@ -157,9 +173,10 @@ export interface RevokedApproval {
 }
 
 /**
- * 잠근 항목들의 활성 승인을 철회한다(없으면 건너뜀). QUEUED 작업 → BLOCKED(+event), QUEUED 항목 → PLANNED.
- * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록하고,
- * RETRY_WAIT 는 worker 가 다음 전송 직전 재검사에서 BLOCKED(approval_missing)로 막는다(A10, T11 D18).
+ * 잠근 항목들의 활성 승인을 철회한다(없으면 건너뜀). QUEUED·RETRY_WAIT 작업 → BLOCKED(+event), QUEUED·RETRY_WAIT 항목 → PLANNED
+ * (아직 보내지 않았거나 보내지 않았음이 확인된 작업 — 다시 승인하거나 새 계획). T12(D19): RETRY_WAIT 도 다음 전송을 기다리지 않고 즉시 막는다(A10).
+ * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록한다.
+ * worker 의 전송 직전 재검사(beginSend)는 그대로 최종 방어선이다.
  */
 export async function revokeActiveApprovalsLocked(
   tx: DbOrTx,
@@ -188,17 +205,25 @@ export async function revokeActiveApprovalsLocked(
     const queued = await tx
       .select({ id: jobs.id, state: jobs.state })
       .from(jobs)
-      .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id), eq(jobs.state, 'QUEUED')))
+      .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id), inArray(jobs.state, [...BLOCK_ON_REVOKE_JOB_STATES])))
       .orderBy(asc(jobs.id))
       .for('update');
     for (const j of queued) {
-      await transitionJob(tx, ownerId, j, 'blocked', { event: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated', reason, approval_id: a.id }, now);
+      await transitionJob(
+        tx,
+        ownerId,
+        j,
+        'blocked',
+        { event: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated', reason, approval_id: a.id, from: j.state },
+        now,
+        { leaseOwner: null, leaseUntil: null, lastErrorCode: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated' },
+      );
     }
-    if (item.status === 'QUEUED') {
+    if (item.status === 'QUEUED' || item.status === 'RETRY_WAIT') {
       await tx
         .update(distributionItems)
         .set({ status: 'PLANNED', updatedAt: now })
-        .where(and(eq(distributionItems.id, item.id), eq(distributionItems.ownerId, ownerId), eq(distributionItems.status, 'QUEUED')));
+        .where(and(eq(distributionItems.id, item.id), eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, ['QUEUED', 'RETRY_WAIT'])));
     }
     await recordAudit(tx, {
       ownerId,
@@ -276,7 +301,7 @@ export async function settleApprovedVariants(
   return changed;
 }
 
-/** 공통: 조건에 맞는 항목(활성 승인 있음, PLANNED·QUEUED)을 잠그고 철회 → 계획 재계산 → 파생본 정리. */
+/** 공통: 조건에 맞는 항목(활성 승인 있음, PLANNED·QUEUED·RETRY_WAIT)을 잠그고 철회 → 계획 재계산 → 파생본 정리. */
 async function invalidateWhere(
   tx: DbOrTx,
   ownerId: string,
@@ -290,7 +315,7 @@ async function invalidateWhere(
   const revoked = await revokeActiveApprovalsLocked(
     tx,
     ownerId,
-    items.filter((i) => i.status === 'PLANNED' || i.status === 'QUEUED'),
+    items.filter((i) => isRevocable(i.status)),
     () => `invalidated:${reason}`,
     now,
     { action: 'approval.invalidate' },
@@ -312,7 +337,7 @@ async function itemsWithActiveApproval(tx: DbOrTx, ownerId: string, where: Retur
     .from(distributionItems)
     .innerJoin(approvals, and(eq(approvals.distributionItemId, distributionItems.id), eq(approvals.ownerId, distributionItems.ownerId), isNull(approvals.revokedAt)))
     .innerJoin(variants, and(eq(variants.id, distributionItems.variantId), eq(variants.ownerId, distributionItems.ownerId)))
-    .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, ['PLANNED', 'QUEUED']), where));
+    .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, [...REVOCABLE_ITEM_STATUSES]), where));
   return rows.map((r) => r.id);
 }
 
@@ -346,6 +371,20 @@ export async function invalidateApprovalsForAccount(tx: DbOrTx, ownerId: string,
   return invalidateWhere(tx, ownerId, ids, 'account_changed', 'review', now);
 }
 
+/**
+ * T12(D19) A06 훅(브랜드 프로필): 새 브랜드 프로필 버전을 만든 트랜잭션 안에서 부른다. 승인 스냅샷의 brand_profile_version_id 는
+ * payload hash 에 들어가므로, 활성 승인이 가리키는 브랜드가 새 현재 브랜드와 다르면 그 승인을 `invalidated:brand_changed` 로 철회한다.
+ * 파생본 본문은 그대로라 승인됨 → review(다시 승인하려면 새 계획 — 스냅샷이 옛 브랜드를 가리킨다).
+ */
+export async function invalidateApprovalsForBrandProfile(tx: DbOrTx, ownerId: string, currentBrandProfileId: string, now: Date): Promise<RevokedApproval[]> {
+  const ids = await itemsWithActiveApproval(
+    tx,
+    ownerId,
+    sql`${distributionItems.brandProfileId} is distinct from ${currentBrandProfileId}::uuid`,
+  );
+  return invalidateWhere(tx, ownerId, ids, 'brand_changed', 'review', now);
+}
+
 /** 실행 시점 재검사에서 stale 로 판정된 항목(별도 트랜잭션): 사유별로 철회한다. */
 export async function invalidateItems(
   tx: DbOrTx,
@@ -358,7 +397,7 @@ export async function invalidateItems(
   const revoked = await revokeActiveApprovalsLocked(
     tx,
     ownerId,
-    items.filter((i) => i.status === 'PLANNED' || i.status === 'QUEUED'),
+    items.filter((i) => isRevocable(i.status)),
     (i) => `invalidated:${reasonOf.get(i.id) ?? 'snapshot_changed'}`,
     now,
     { action: 'approval.invalidate' },

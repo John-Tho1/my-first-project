@@ -241,6 +241,8 @@ export interface AuditInput {
     | 'approval.invalidate'
     | 'item.cancel'
     | 'item.reconcile'
+    | 'item.retry'
+    | 'item.mock_scenario'
     | 'worker.tick';
   entity: string;
   entityId?: string | null;

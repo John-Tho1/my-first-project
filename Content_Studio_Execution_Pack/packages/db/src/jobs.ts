@@ -31,6 +31,8 @@ import {
   NotCancellableError,
   NotFoundError,
   NothingToReconcileError,
+  NotRetryableError,
+  SnapshotStaleError,
   RECONCILE_BASE_MS,
   RECONCILE_MAX_ATTEMPTS,
   reconcileDelay,
@@ -45,6 +47,7 @@ import {
   type ChannelAdapterRegistry,
   type JobEvent,
   type JobState,
+  type MockScenarioSetting,
   type PublishSnapshot,
   type ReconcileResult,
   type RemoteReference,
@@ -63,8 +66,9 @@ import {
 } from './approval-invalidation';
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
+import { mockScenarioFor } from './mock-scenarios';
 import { recordAudit, type DbOrTx } from './queries';
-import { channelAccounts, distributionItems, jobEvents, jobs, publications, sendIntents, variants } from './schema';
+import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
 export type SendIntentRow = typeof sendIntents.$inferSelect;
 export type PublicationRow = typeof publications.$inferSelect;
@@ -374,6 +378,7 @@ function makeContext(
   intentKey: string,
   opts: JobRunOptions,
   signal: AbortSignal,
+  mockScenario: MockScenarioSetting | null = null,
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
   return {
@@ -386,6 +391,7 @@ function makeContext(
     heartbeat: async () => {
       await heartbeatJob(db, job.id, opts.workerId, clock(), opts.leaseTtlMs);
     },
+    mockScenario,
   };
 }
 
@@ -414,6 +420,8 @@ interface SendPlan {
   snapshot: PublishSnapshot;
   intentKey: string;
   job: JobRow;
+  /** T12: 모의 계정 항목의 시나리오(개발·시험 전용, 승인 스냅샷 밖) */
+  mockScenario: MockScenarioSetting | null;
 }
 
 /** 1단계(한 트랜잭션): 재검사 + SENDING + 전송 의도. 보낼 수 없으면 상태를 정하고 null. */
@@ -492,6 +500,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       });
     }
     const intentKey = `${job.id}:${job.attempt}`;
+    const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(tx, ownerId, item.id) : null;
     await transitionJob(tx, ownerId, job, 'send_start', { attempt: job.attempt, intent_key: intentKey, mode, approval_id: approval.id }, now);
     await syncItemStatus(tx, ownerId, item.id, 'SENDING', now);
     await tx.insert(sendIntents).values({
@@ -504,7 +513,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind },
     });
     await recomputePlanStatus(tx, ownerId, item.planId, now);
-    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING' } } satisfies SendPlan;
+    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING' }, mockScenario } satisfies SendPlan;
   });
 }
 
@@ -568,7 +577,7 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
   // 2단계: DB 잠금 없이 외부(모의) 호출. 시간 초과·예외 = 결과 불명(보냈을 수도 있음).
   const timeoutMs = opts.submitTimeoutMs ?? 30_000;
   const r = await withTimeout(timeoutMs, async (signal) => {
-    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal);
+    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario);
     let prepared;
     try {
       prepared = await begun.adapter.prepare(begun.snapshot, ctx);
@@ -653,7 +662,8 @@ async function remoteCheck(
   } catch {
     return { r: { status: 'unsupported', error_code: 'adapter_unavailable' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
   }
-  const caps = adapter.capabilities(adapterAccount(acc));
+  const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(db, ownerId, item.id) : null;
+  const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
   const intent = (job.attempt > 0 ? await intentFor(db, ownerId, job.id, job.attempt) : null) ?? (await latestIntent(db, ownerId, job.id));
   if (!intent) return { r: { status: 'not_found', error_code: 'no_intent' }, caps: { definitive_not_found: true, mock: caps.mock }, cancel: null };
   const ref: RemoteReference = {
@@ -664,7 +674,7 @@ async function remoteCheck(
   };
   let cancel: CancelResult | null = null;
   const res = await withTimeout(signalMs, async (signal) => {
-    const ctx = makeContext(db as Db, job, intent.intentKey, { ...opts, config: { PUBLISH_MODE: 'disabled' } }, signal);
+    const ctx = makeContext(db as Db, job, intent.intentKey, { ...opts, config: { PUBLISH_MODE: 'disabled' } }, signal, mockScenario);
     if (opts.tryCancel && caps.cancel && ref.external_id) {
       cancel = await adapter.cancel(ref, ctx);
       if (cancel.status === 'canceled') return { status: 'not_found' } satisfies ReconcileResult;
@@ -841,6 +851,71 @@ export async function reconcileItem(
   return { item_id: item.id, job_id: job.id, state_before: job.state, state, found: r.status === 'found', remote: r.status };
 }
 
+// ---- 사용자 동작: 보류 항목 재시도(T12 D19) ----
+
+export interface RetryOutcome {
+  item_id: string;
+  job_id: string;
+  state: 'QUEUED';
+  attempt_next: number;
+  message: string;
+}
+
+/**
+ * 보류(BLOCKED) 항목 재시도 — 명시적 사용자 동작(감사 기록). 같은 작업을 BLOCKED → QUEUED(unblock)로 되돌린다: 다음 lease 가 새 시도
+ * (attempt + 1) = 새 전송 의도. 조건(한 트랜잭션, 항목·승인·작업 잠금):
+ * - 항목·최근 작업이 모두 BLOCKED(보내지 않았음이 확실한 보류: 401 거절·실행 모드·계정). 작업이 없는 보류(복원된 진행 중 항목)는 409 not_retryable —
+ *   원격 결과를 모르므로 맹목 재전송 금지.
+ * - 최근 전송 의도가 결과 불명(pending·ambiguous)이면 409 outcome_unknown(재확인 먼저).
+ * - 활성 승인 hash = 항목 hash(아니면 409 approval_required — 승인 없음 보류는 항목이 PLANNED 로 돌아가 있으므로 다시 승인 후 실행).
+ * - 스냅샷 재검사(예약 시각 경과 제외 — 사용자가 지금 다시 보내기로 한 것) 문제 있으면 409 snapshot_stale(아무것도 바꾸지 않음).
+ * - 시도 한도(attempt >= max_attempts) 409 attempts_exhausted.
+ * worker 는 보내기 직전에 승인·스냅샷을 다시 검사한다(beginSend) — 이 검사는 사용자에게 바로 알려 주기 위한 것이다.
+ */
+export async function retryItem(db: Db, ownerId: string, itemId: string, now: Date = new Date()): Promise<RetryOutcome> {
+  if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
+  return db.transaction(async (tx) => {
+    const item = await lockItem(tx, ownerId, itemId);
+    const active = await activeApprovalsFor(tx, ownerId, [item.id]);
+    const job = await latestJobForItem(tx, ownerId, item.id, true);
+    if (item.status === 'PLANNED' && job?.state === 'BLOCKED') {
+      throw new NotRetryableError('approval_required', '승인 없음 — 다시 승인한 뒤 실행하세요(새 실행 키로 이 항목만 대기열에 들어갑니다)');
+    }
+    if (!job || item.status !== 'BLOCKED' || job.state !== 'BLOCKED') {
+      throw new NotRetryableError('not_retryable', '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다', { status: item.status, job_state: job?.state ?? null });
+    }
+    const last = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt) : null;
+    if (last && (last.outcome === 'pending' || last.outcome === 'ambiguous')) {
+      throw new NotRetryableError('outcome_unknown', '마지막 전송 결과를 알 수 없어 다시 보내지 않습니다. 재확인을 먼저 하세요.');
+    }
+    const approval = active.get(item.id);
+    if (!approval || approval.payloadHash !== item.payloadHash) {
+      throw new NotRetryableError('approval_required', '유효한 승인이 없어 재시도하지 않았습니다(다시 승인하거나 새 계획을 만드세요)');
+    }
+    if (job.attempt >= job.maxAttempts) {
+      throw new NotRetryableError('attempts_exhausted', `시도 한도(${job.maxAttempts}회)에 이르렀습니다. 새 배포 계획을 만드세요.`);
+    }
+    const problems = (await snapshotProblems(tx, ownerId, item, now)).filter((p) => p !== 'schedule_passed');
+    if (problems.length) throw new SnapshotStaleError([{ item_id: item.id, reasons: problems }]);
+    await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id }, now, {
+      ...CLEAR_LEASE,
+      nextRunAt: now,
+      lastErrorCode: null,
+      lastRetryClass: null,
+      reconcileCount: 0,
+    });
+    await recordAudit(tx, {
+      ownerId,
+      action: 'item.retry',
+      entity: 'distribution_item',
+      entityId: item.id,
+      details: { job_id: job.id, previous_error: job.lastErrorCode, attempt_next: job.attempt + 1, mode: 'MOCK' },
+      at: now,
+    });
+    return { item_id: item.id, job_id: job.id, state: 'QUEUED' as const, attempt_next: job.attempt + 1, message: '다시 대기열에 넣었습니다(MOCK — 새 시도·새 전송 의도)' };
+  });
+}
+
 // ---- 조회 ----
 
 export async function getJobRow(db: DbOrTx, ownerId: string, jobId: string): Promise<JobRow | null> {
@@ -934,5 +1009,15 @@ export async function jobStateCounts(db: DbOrTx) {
     reconciling: (by.get('RECONCILING') ?? 0) + (by.get('REMOTE_PROCESSING') ?? 0) + (by.get('CANCEL_REQUESTED') ?? 0),
     unknown: by.get('UNKNOWN') ?? 0,
     blocked: by.get('BLOCKED') ?? 0,
+    attention_plans: await attentionPlanCount(db),
   };
+}
+
+/** T12(D19): 사용자 확인이 필요한 계획(status='attention') 개수. */
+export async function attentionPlanCount(db: DbOrTx): Promise<number> {
+  const rows = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(distributionPlans)
+    .where(eq(distributionPlans.status, 'attention'));
+  return Number(rows[0]?.n ?? 0);
 }

@@ -2,7 +2,7 @@
  * T10 배포함 — 폼 → API 입력, 폼 오류 리다이렉트, 화면 문구(서버 전용).
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
-import { AppError, formatMsk } from '@cs/domain';
+import { AppError, MOCK_SCENARIO_VALUES } from '@cs/domain';
 import { errorResponse, seeOther } from './api';
 
 export const MAX_DISTRIBUTION_REQUEST = 64 * 1024;
@@ -12,7 +12,8 @@ export const PLAN_STATUS_LABEL: Record<string, string> = {
   partially_approved: '일부 승인',
   approved: '승인됨(실행 전)',
   executing: '처리 중(MOCK)',
-  partial: '일부 처리(PARTIAL — 확인 필요 항목 포함)',
+  partial: '부분 성공(MOCK — 성공한 항목은 다시 보내지 않음)',
+  attention: '확인 필요',
   completed: '처리 끝(MOCK — 실제 발행 아님)',
   canceled: '취소됨',
   failed: '실패',
@@ -27,7 +28,7 @@ export const ITEM_STATUS_LABEL: Record<string, string> = {
   CONFIRMED: 'CONFIRMED · MOCK 확인(실제 발행 아님)',
   RETRY_WAIT: 'RETRY_WAIT · 재시도 대기',
   RECONCILING: 'RECONCILING · 등록 여부 확인 필요',
-  UNKNOWN: 'UNKNOWN · 확인 불가 — 자동 재전송 안 함',
+  UNKNOWN: 'UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요',
   CANCEL_REQUESTED: 'CANCEL_REQUESTED · 취소 확인 중',
   CANCELED: '취소됨',
   FAILED: '실패',
@@ -44,6 +45,7 @@ export const PROBLEM_LABEL: Record<string, string> = {
   account_changed: '계정 상태·연결이 바뀜',
   payload_changed: '배포 내용이 스냅샷과 다름',
   schedule_passed: '예약 시각이 지남',
+  brand_changed: '브랜드 프로필이 새 버전으로 바뀜',
 };
 
 export function problemLabel(p: string): string {
@@ -81,6 +83,11 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   not_cancellable: '이미 끝났거나 실행 전인 항목은 취소할 수 없습니다.',
   cancel_unknown: '결과를 확인할 수 없는 항목(UNKNOWN)은 취소를 확정할 수 없습니다. 먼저 재확인하세요(자동 재전송은 하지 않습니다).',
   nothing_to_reconcile: '재확인할 작업이 없습니다(확인 중·결과 불명·원격 처리 중인 항목만 재확인합니다).',
+  not_retryable: '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.',
+  attempts_exhausted: '시도 한도에 이르렀습니다. 새 배포 계획을 만드세요.',
+  outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
+  not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
+  item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -176,7 +183,7 @@ interface PubLike {
 }
 
 /**
- * 작업 상태 한 줄(docs/03 상태 분리 문구). 예: `RETRY_WAIT · 재시도 대기 (2/5, 다음 2026-09-25 18:04 (MSK))`,
+ * 작업 상태 한 줄(docs/03 상태 분리 문구). 예: `RETRY_WAIT · 재시도 대기 (2/5, 다음 18:04 MSK)`,
  * `CONFIRMED · MOCK 게시 확인 (mock://threads/…)`. 모의 결과는 항상 MOCK 을 붙이고 "게시 완료"라고 하지 않는다.
  */
 export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: string | null): string {
@@ -190,11 +197,11 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     case 'REMOTE_PROCESSING':
       return 'REMOTE_PROCESSING · 원격 처리 중(확인 대기)';
     case 'RETRY_WAIT':
-      return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${formatMsk(job.nextRunAt)})`;
+      return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})`;
     case 'RECONCILING':
       return 'RECONCILING · 등록 여부 확인 필요';
     case 'UNKNOWN':
-      return 'UNKNOWN · 확인 불가 — 자동 재전송 안 함';
+      return 'UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
     case 'CANCEL_REQUESTED':
       return 'CANCEL_REQUESTED · 취소 확인 중';
     case 'CANCELED':
@@ -210,5 +217,92 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     }
     default:
       return job.state;
+  }
+}
+
+// ---- T12(D19): 항목 상태 문구·모의 시나리오 ----
+
+/** 개발용 모의 시나리오 선택지(값 → 설명). 실제 채널 개념이 아니다. */
+export const MOCK_SCENARIO_LABEL: Record<(typeof MOCK_SCENARIO_VALUES)[number], string> = {
+  success: '성공(공개 범위 그대로, YouTube 는 비공개 업로드 → 확인)',
+  success_public: '공개 결과(payload 가 public 일 때만, 아니면 거절)',
+  processing_then_confirm: '원격 처리 중 → 조회에서 확인',
+  transient: '일시 오류(503, 보내지 않음) 반복',
+  transient_then_success: '첫 시도 일시 오류 → 재시도 성공',
+  rate_limited: '요청 제한(429, Retry-After 5초) 반복',
+  server_error_no_side_effect: '서버 오류(503, 부작용 없음) 반복',
+  server_error_side_effect_unknown: '서버 오류(쓰기 뒤 5xx — 결과 불명, 조회)',
+  permanent: '형식 오류(400) — 재시도 안 함',
+  auth: '인증 만료(401) — 계정 다시 연결 필요',
+  ambiguous_sent: '응답 유실(원격은 받음) — 조회로 확인',
+  ambiguous_not_sent: '연결 끊김(원격에 없음) — 조회 뒤 재시도',
+  hang: '응답 없음(시간 초과) — 조회',
+  cancel_supported: '원격 취소 지원(처리 중 → 취소 가능)',
+  reconcile_unsupported: '원격 조회 불가 — 3회 뒤 확인 불가(UNKNOWN)',
+};
+
+export const MOCK_SCENARIO_OPTIONS = MOCK_SCENARIO_VALUES.map((v) => ({ value: v, label: `${v} — ${MOCK_SCENARIO_LABEL[v]}` }));
+
+const mskClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit', hour12: false });
+
+/** `HH:mm MSK` (재시도 대기 표시). */
+export function mskHourMinute(d: Date): string {
+  return `${mskClock.format(d)} MSK`;
+}
+
+/** 승인 문제로 보류된 이유(항목은 PLANNED 로 돌아가 있다 — 다시 승인 후 실행). */
+export const APPROVAL_BLOCK_REASONS = new Set(['approval_missing', 'approval_revoked', 'approval_invalidated', 'snapshot_stale']);
+
+export interface ItemHeadlineInput {
+  status: string;
+  channel: string;
+  job: (JobLike & { lastRetryClass?: string | null }) | null;
+  pub: PubLike | null;
+  blockReason: string | null;
+}
+
+/**
+ * 항목 상태 한 줄(docs/03·docs/05 문구). 성공은 항상 MOCK 결과이며 "게시 완료"·"공개 게시 성공"이라고 하지 않는다.
+ * YouTube 비공개 업로드는 `비공개 업로드 완료, 공개 전환 확인 필요`(A12).
+ */
+export function itemHeadline(x: ItemHeadlineInput): string {
+  const job = x.job;
+  const reason = x.blockReason ?? job?.lastErrorCode ?? '';
+  switch (x.status) {
+    case 'PLANNED':
+      if (job && job.state === 'BLOCKED' && APPROVAL_BLOCK_REASONS.has(reason)) return '승인 없음 — 다시 승인 후 실행';
+      return '계획됨(실행 전)';
+    case 'QUEUED':
+      return '대기 중(QUEUED)';
+    case 'SENDING':
+      return '전송 중(MOCK)';
+    case 'REMOTE_PROCESSING':
+      return x.channel === 'youtube' ? '비공개 업로드 처리 중 — 확인 대기' : '원격 처리 중 — 확인 대기';
+    case 'RETRY_WAIT':
+      return job ? `재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})` : '재시도 대기';
+    case 'RECONCILING':
+      return '등록 여부 확인 필요';
+    case 'UNKNOWN':
+      return '확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
+    case 'CANCEL_REQUESTED':
+      return '취소 확인 중';
+    case 'CANCELED':
+      return '취소됨';
+    case 'FAILED':
+      return `실패${job?.lastErrorCode ? ` (${job.lastErrorCode})` : ''} — 자동 재시도 안 함`;
+    case 'BLOCKED':
+      if (!job) return '보류 — 복원된 항목(원격 결과 확인 필요, 자동 재전송 안 함)';
+      if (reason === 'auth' || job.lastRetryClass === 'auth' || reason === 'mock_401_unauthorized') return '계정 다시 연결 필요';
+      if (APPROVAL_BLOCK_REASONS.has(reason)) return '승인 없음 — 다시 승인 후 실행';
+      return `보류 — ${BLOCK_REASON_LABEL[reason] ?? reason ?? '확인 필요'}`;
+    case 'CONFIRMED': {
+      const kind = x.pub?.resultKind;
+      if (kind === 'UPLOADED_PRIVATE') return x.channel === 'youtube' ? '비공개 업로드 완료, 공개 전환 확인 필요' : 'MOCK 비공개 결과 확인';
+      if (kind === 'SCHEDULED_REMOTE') return 'MOCK 원격 예약 확인';
+      if (kind === 'PUBLISHED') return 'MOCK 공개 결과 확인';
+      return 'MOCK 결과 확인';
+    }
+    default:
+      return ITEM_STATUS_LABEL[x.status] ?? x.status;
   }
 }

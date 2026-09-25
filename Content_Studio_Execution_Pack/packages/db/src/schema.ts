@@ -1018,7 +1018,7 @@ export const distributionPlans = pgTable(
     unique('distribution_plans_id_owner_uq').on(t.id, t.ownerId),
     check(
       'distribution_plans_status_chk',
-      sql`${t.status} in ('draft', 'partially_approved', 'approved', 'executing', 'partial', 'completed', 'canceled', 'failed')`,
+      sql`${t.status} in ('draft', 'partially_approved', 'approved', 'executing', 'partial', 'attention', 'completed', 'canceled', 'failed')`,
     ),
     index('distribution_plans_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
   ],
@@ -1318,6 +1318,41 @@ export const publications = pgTable(
       name: 'publications_job_same_owner_fk',
       columns: [t.jobId, t.ownerId],
       foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T12 모의 시나리오(결정 D19, migration 0018) ----
+
+/**
+ * 항목별 모의 결과 시나리오(개발·시험 전용 — 실제 채널 개념이 아니다). 승인 스냅샷(payload)·계정 capability_snapshot 에 넣지 않는다 —
+ * 넣으면 payload hash 가 바뀌고 승인이 무효가 된다. 항목당 1행(distribution_item_id unique), 트리거 mock_scenarios_mock_only 가
+ * 항목의 계정이 kind='mock' 일 때만 INSERT·UPDATE 를 허용한다. 내보내기만(복원 안 함).
+ */
+export const mockScenarios = pgTable(
+  'mock_scenarios',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    distributionItemId: uuid('distribution_item_id').notNull(),
+    scenario: text('scenario').notNull(),
+    delayMs: integer('delay_ms').notNull().default(0),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('mock_scenarios_item_uq').on(t.distributionItemId),
+    check(
+      'mock_scenarios_scenario_chk',
+      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported')`,
+    ),
+    check('mock_scenarios_delay_chk', sql`${t.delayMs} between 0 and 5000`),
+    foreignKey({
+      name: 'mock_scenarios_item_same_owner_fk',
+      columns: [t.distributionItemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
     }).onDelete('restrict'),
   ],
 );

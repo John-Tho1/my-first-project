@@ -308,7 +308,8 @@ describe('A08·A20 — 결과 불명·lease 만료', () => {
     expect((await tick(o, 11 + 21)).results).toEqual({ RECONCILING: 1 });
     expect((await tick(o, 11 + 21 + 41)).results).toEqual({ UNKNOWN: 1 });
     expect((await itemRow(x.itemIds[0]!)).status).toBe('UNKNOWN');
-    expect((await planRow(x.planId)).status).toBe('partial');
+    // D19: CONFIRMED 없이 UNKNOWN 만 → attention(확인 필요) — 실패로도, 부분 성공으로도 부르지 않는다
+    expect((await planRow(x.planId)).status).toBe('attention');
     for (const off of [3600, 86_400]) expect((await tick(o, off)).leased).toBe(0);
     expect(adapter.calls.submit).toBe(1);
     // 취소는 확정할 수 없다(원격에 있을 수 있음)
@@ -401,11 +402,12 @@ describe('재시도·실패·보류', () => {
     expect((await itemRow(x.byChannel.threads)).status).toBe('FAILED');
     expect((await itemRow(x.byChannel.blog)).status).toBe('BLOCKED');
     expect((await jobOf(x.byChannel.blog)).lastRetryClass).toBe('auth');
-    expect((await planRow(x.planId)).status).toBe('failed');
+    // D19: 보류(계정 다시 연결 필요)가 있으면 failed 가 아니라 attention(확인 필요)
+    expect((await planRow(x.planId)).status).toBe('attention');
     expect(adapter.calls.submit).toBe(2);
   });
 
-  it('A10: 재시도 대기 중 승인 철회 → 다음 tick 에서 BLOCKED(approval_missing), 새 전송 의도 없음', async () => {
+  it('A10(D19): 재시도 대기 중 승인 철회 → 즉시 BLOCKED(approval_revoked), 항목 PLANNED, 이후 tick 은 lease 0·새 전송 의도 없음', async () => {
     const o = await newOwner();
     const token = await tokenFor(o);
     const x = await executed(o);
@@ -415,15 +417,16 @@ describe('재시도·실패·보류', () => {
     const { POST: revokePOST } = await import('../../apps/web/app/api/approvals/[id]/revoke/route');
     const rv = await revokePOST(jsonPost(`/api/approvals/${x.approvals[0]!.id}/revoke`, {}, cookieHeader(token)), ctx(x.approvals[0]!.id));
     expect(rv.status).toBe(200);
-    useScenario('success');
-    const r = await tick(o, 20 * 60);
-    expect(r.results).toEqual({ BLOCKED: 1 });
+    expect(await rv.json()).toMatchObject({ blocked_job_ids: [x.jobIds[0]], cancel_requested_job_ids: [] });
     const j = await jobRow(x.jobIds[0]!);
-    expect(j.lastErrorCode).toBe('approval_missing');
-    expect((await eventsOf(j.id)).at(-1)!.sanitizedDetails).toMatchObject({ event: 'blocked', reason: 'approval_missing' });
+    expect(j.state).toBe('BLOCKED');
+    expect(j.lastErrorCode).toBe('approval_revoked');
+    expect((await eventsOf(j.id)).at(-1)!.sanitizedDetails).toMatchObject({ event: 'approval_revoked', transition: 'blocked', from: 'RETRY_WAIT' });
+    expect((await itemRow(x.itemIds[0]!)).status).toBe('PLANNED');
+    useScenario('success');
+    expect((await tick(o, 20 * 60)).leased).toBe(0);
     expect(await intentsOf(j.id)).toHaveLength(1);
     expect(adapter.calls.submit).toBe(1);
-    expect((await itemRow(x.itemIds[0]!)).status).toBe('PLANNED');
   });
 });
 
@@ -603,7 +606,7 @@ describe('API·owner·비밀 제거', () => {
 
     const h = await healthGET();
     const hb = await h.json();
-    expect(Object.keys(hb.jobs).sort()).toEqual(['blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown']);
+    expect(Object.keys(hb.jobs).sort()).toEqual(['attention_plans', 'blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown']);
     expect(Object.values(hb.jobs).every((v) => typeof v === 'number')).toBe(true);
   });
 

@@ -49,6 +49,7 @@ import {
   type PromptBrand,
   type UnconfirmedClaim,
 } from '@cs/domain';
+import { invalidateApprovalsForBrandProfile } from './approval-invalidation';
 import type { Db } from './client';
 import {
   allowedSourceVersions,
@@ -181,6 +182,8 @@ export async function createBrandProfileVersion(
       .returning();
     const row = inserted[0];
     if (!row) throw await conflict();
+    // T12(D19) A06: 승인 스냅샷의 brand_profile_version_id 는 payload hash 에 들어간다 — 새 브랜드 버전은 옛 브랜드를 가리키는 활성 승인을 철회한다.
+    const revoked = await invalidateApprovalsForBrandProfile(tx, ownerId, row.id, now);
     await recordAudit(tx, {
       ownerId,
       action: 'brand.version_create',
@@ -193,6 +196,7 @@ export async function createBrandProfileVersion(
         pillars: row.pillars.length,
         sample_texts: row.sampleTexts.length,
         tone: row.tone,
+        revoked_approvals: revoked.length,
       },
       at: now,
     });

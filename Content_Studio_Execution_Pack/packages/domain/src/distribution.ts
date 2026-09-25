@@ -21,7 +21,7 @@ export type AccountKind = (typeof ACCOUNT_KINDS)[number];
 export const ACCOUNT_STATES = ['mock_ready', 'connected', 'disconnected', 'revoked'] as const;
 export type AccountState = (typeof ACCOUNT_STATES)[number];
 
-export const PLAN_STATUSES = ['draft', 'partially_approved', 'approved', 'executing', 'partial', 'completed', 'canceled', 'failed'] as const;
+export const PLAN_STATUSES = ['draft', 'partially_approved', 'approved', 'executing', 'partial', 'attention', 'completed', 'canceled', 'failed'] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
 export const ITEM_STATUSES = [

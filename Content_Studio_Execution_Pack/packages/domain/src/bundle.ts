@@ -63,6 +63,8 @@ export const EXPORTED_TABLES = [
   // T11(0017, 결정 D18): 전송 의도·원격 결과는 내보내기만 — 복원한 환경은 원격을 다시 확인해야지 기록을 믿고 이어 가지 않는다.
   'send_intents',
   'publications',
+  // T12(0018, 결정 D19): 항목별 모의 시나리오(개발·시험용) — 내보내기만. 복원 환경의 모의 결과를 미리 정해 두지 않는다.
+  'mock_scenarios',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -92,6 +94,7 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   execute_commands: '0016_t10_distribution',
   send_intents: '0017_t11_jobs',
   publications: '0017_t11_jobs',
+  mock_scenarios: '0018_t12_mock_scenarios',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -105,9 +108,9 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
 /**
  * users·audit_events 는 내보내기만. T10(D17): jobs·job_events·execute_commands 도 내보내기만 — 복원 환경에서 작업을 다시 돌리지 않는다
  * (진행 중이던 항목은 BLOCKED 로 들여온다, 맹목 재전송 금지). T11(D18): send_intents·publications 도 내보내기만 — 원격 결과는 복원 환경에서
- * 다시 확인할 사실이지 믿고 이어 갈 기록이 아니다.
+ * 다시 확인할 사실이지 믿고 이어 갈 기록이 아니다. T12(D19): mock_scenarios(개발용 모의 결과 선택)도 내보내기만.
  */
-export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands', 'send_intents', 'publications'] as const satisfies readonly ExportedTable[];
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands', 'send_intents', 'publications', 'mock_scenarios'] as const satisfies readonly ExportedTable[];
 export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
   (typeof NON_RESTORED_TABLES)[number]
@@ -526,6 +529,15 @@ export const ROW_SCHEMAS = {
     is_mock: z.boolean(),
     verified_at: ts.nullable(),
     created_at: ts,
+  }),
+  // T12(0018)
+  mock_scenarios: z.strictObject({
+    id: uuid,
+    distribution_item_id: uuid,
+    scenario: str,
+    delay_ms: int.min(0),
+    created_at: ts,
+    updated_at: ts,
   }),
   audit_events: z.strictObject({
     id: uuid,
@@ -1304,6 +1316,7 @@ function checkDistributionIntegrity(
       problems.push('publications: 모의 결과는 mock: 외부 ID·mock:// 링크');
     }
   }
+  for (const m of t.mock_scenarios) need('mock_scenarios', 'distribution_item_id', m.distribution_item_id, 'distribution_items');
 }
 
 /** owner 를 뺀 행 비교용 해시(같은 ID 의 기존 행과 내용이 같은지). */

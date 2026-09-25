@@ -281,6 +281,36 @@ export interface RemoteReference {
   provider_request_id: string | null;
 }
 
+/**
+ * T12(D19): 모의 결과 시나리오(개발·시험 전용 — 실제 채널 개념이 아니다). 승인 스냅샷·payload 에 넣지 않고 별도 표(mock_scenarios)에 둔다
+ * (hash·승인 상태가 바뀌지 않게). DB CHECK(0018)와 같은 목록이어야 한다.
+ */
+export const MOCK_SCENARIO_VALUES = [
+  'success',
+  'success_public',
+  'processing_then_confirm',
+  'transient',
+  'transient_then_success',
+  'rate_limited',
+  'server_error_no_side_effect',
+  'server_error_side_effect_unknown',
+  'permanent',
+  'auth',
+  'ambiguous_sent',
+  'ambiguous_not_sent',
+  'hang',
+  'cancel_supported',
+  'reconcile_unsupported',
+] as const;
+export type MockScenarioValue = (typeof MOCK_SCENARIO_VALUES)[number];
+export const MOCK_SCENARIO_MAX_DELAY_MS = 5000;
+
+/** 항목별 모의 시나리오(작업 처리기가 mock 계정 항목에 대해서만 mock_scenarios 표에서 읽어 넣는다). */
+export interface MockScenarioSetting {
+  scenario: MockScenarioValue;
+  delay_ms: number;
+}
+
 export interface AdapterContext {
   /** 멱등 토큰(= 전송 의도 key `<job_id>:<attempt>`) */
   intentKey: string;
@@ -292,11 +322,14 @@ export interface AdapterContext {
   signal: AbortSignal;
   /** lease 연장(작은 별도 트랜잭션) */
   heartbeat(): Promise<void>;
+  /** T12: 항목별 모의 시나리오(모의 계정 항목만, 없으면 null). live 어댑터는 무시한다. */
+  mockScenario?: MockScenarioSetting | null;
 }
 
 export interface ChannelAdapter {
   readonly kind: 'mock' | 'live';
-  capabilities(account: AdapterAccount): AdapterCapabilities;
+  /** ctx.mockScenario 는 모의 어댑터가 항목별 capabilities(cancel 등)를 정할 때만 쓴다. */
+  capabilities(account: AdapterAccount, ctx?: Pick<AdapterContext, 'mockScenario'>): AdapterCapabilities;
   validate(snapshot: PublishSnapshot): { ok: true } | { ok: false; error_code: string };
   prepare(snapshot: PublishSnapshot, ctx: AdapterContext): Promise<PreparedSubmission>;
   submit(prepared: PreparedSubmission, ctx: AdapterContext): Promise<AdapterResult>;
@@ -355,26 +388,33 @@ export function itemStatusForJob(state: JobState): string {
 /** 계획 상태에서 "진행 중"으로 보는 항목 상태(UNKNOWN 은 자동으로 움직이지 않으므로 넣지 않는다). */
 export const PLAN_IN_FLIGHT_ITEM_STATUSES = ['QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'CANCEL_REQUESTED'] as const;
 
-export type PlanStatusValue = 'draft' | 'partially_approved' | 'approved' | 'executing' | 'partial' | 'completed' | 'canceled' | 'failed';
+export type PlanStatusValue = 'draft' | 'partially_approved' | 'approved' | 'executing' | 'partial' | 'attention' | 'completed' | 'canceled' | 'failed';
+
+/** 사용자가 움직여야 하는 항목 상태(자동으로는 더 진행하지 않음): 보류(재연결·재시도)·결과 불명(재확인)·실행 전(다시 승인). */
+export const PLAN_NEEDS_USER_ITEM_STATUSES = ['BLOCKED', 'UNKNOWN', 'PLANNED'] as const;
 
 /**
- * 항목 상태·활성 승인에서 계획 상태(T10 computePlanStatus 와 T11 이 함께 쓰는 유일한 규칙).
- * 1) 진행 중 항목 → executing 2) PLANNED 항목 → 승인 수로 draft/partially_approved/approved
- * 3) 모두 CONFIRMED → completed, 모두 CANCELED → canceled 4) CONFIRMED(또는 PARTIAL)가 있거나 UNKNOWN 이 있으면 partial
- *    (UNKNOWN 은 원격에 있을 수도 있으므로 failed 로 부르지 않는다) 5) 나머지(FAILED·CANCELED·BLOCKED 만) → failed.
+ * 항목 상태·활성 승인에서 계획 상태(T10 computePlanStatus 와 T11·T12 가 함께 쓰는 유일한 규칙, D19).
+ * 1) 항목 없음 → draft 2) 진행 중 항목(자동으로 움직임) → executing
+ * 3) 모두 PLANNED(아직 실행 안 함) → 승인 수로 draft/partially_approved/approved
+ * 4) 모두 CONFIRMED → completed, 모두 CANCELED → canceled
+ * 5) CONFIRMED(또는 레거시 PARTIAL)가 하나라도 있고 나머지가 끝났거나 멈춤 → partial(부분 성공, 성공한 항목은 다시 보내지 않는다)
+ * 6) CONFIRMED 없음 + 사용자 조치가 필요한 항목(BLOCKED·UNKNOWN·다시 승인할 PLANNED) → attention(확인 필요)
+ *    — "failed" 라고 부르면 원격에 있을 수 있는 UNKNOWN·재연결로 풀리는 BLOCKED 를 실패로 오해하게 된다.
+ * 7) 나머지(FAILED·CANCELED 만) → failed.
  */
 export function planStatusFrom(items: ReadonlyArray<{ status: string; activeApproval: boolean }>): PlanStatusValue {
   if (items.length === 0) return 'draft';
   if (items.some((i) => (PLAN_IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(i.status))) return 'executing';
-  const planned = items.filter((i) => i.status === 'PLANNED');
-  if (planned.length > 0) {
-    const approved = planned.filter((i) => i.activeApproval).length;
+  if (items.every((i) => i.status === 'PLANNED')) {
+    const approved = items.filter((i) => i.activeApproval).length;
     if (approved === 0) return 'draft';
-    return approved === planned.length ? 'approved' : 'partially_approved';
+    return approved === items.length ? 'approved' : 'partially_approved';
   }
   if (items.every((i) => i.status === 'CONFIRMED')) return 'completed';
   if (items.every((i) => i.status === 'CANCELED')) return 'canceled';
-  if (items.some((i) => i.status === 'CONFIRMED' || i.status === 'PARTIAL' || i.status === 'UNKNOWN')) return 'partial';
+  if (items.some((i) => i.status === 'CONFIRMED' || i.status === 'PARTIAL')) return 'partial';
+  if (items.some((i) => (PLAN_NEEDS_USER_ITEM_STATUSES as readonly string[]).includes(i.status))) return 'attention';
   return 'failed';
 }
 
@@ -382,6 +422,15 @@ export function planStatusFrom(items: ReadonlyArray<{ status: string; activeAppr
 
 export const cancelSchema = z.object({});
 export const reconcileSchema = z.object({});
+export const retrySchema = z.object({});
+/** PUT /api/distribution-items/{id}/mock-scenario(개발용 — 모의 계정 항목만). */
+export const mockScenarioSchema = z
+  .object({
+    scenario: z.enum(MOCK_SCENARIO_VALUES),
+    delay_ms: z.coerce.number().int().min(0).max(MOCK_SCENARIO_MAX_DELAY_MS).optional(),
+  })
+  .strict();
+export type MockScenarioInput = z.infer<typeof mockScenarioSchema>;
 export const WORKER_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const tickSchema = z.object({
   max_jobs: z.coerce.number().int().min(1).max(20).optional(),
@@ -407,6 +456,20 @@ export class NotCancellableError extends AppError {
 export class NothingToReconcileError extends AppError {
   constructor() {
     super('conflict', 'nothing_to_reconcile', '원격 재확인이 필요한 작업이 없습니다(확인 중·결과 불명·원격 처리 중인 항목만 재확인합니다)');
+  }
+}
+
+/** T12(D19): 보류(BLOCKED) 항목 재시도 불가. code 로 이유를 구분한다. */
+export class NotRetryableError extends AppError {
+  constructor(code: 'not_retryable' | 'approval_required' | 'attempts_exhausted' | 'outcome_unknown', message: string, details?: Record<string, unknown>) {
+    super('conflict', code, message, details);
+  }
+}
+
+/** T12: 모의 시나리오는 모의(MOCK) 계정 항목에만. */
+export class NotMockAccountError extends AppError {
+  constructor() {
+    super('bad_request', 'not_mock_account', '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다(실제 채널에는 없는 개념)');
   }
 }
 

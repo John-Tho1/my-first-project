@@ -354,8 +354,8 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **재시도**: 부작용 없는 일시 오류만 자동 재시도(30초 × 2^(n-1), 상한 15분, ±20% jitter, `Retry-After` 존중, 최대 5회 → `FAILED`, Retry-After 1시간 초과는 바로 `FAILED`). 부작용 불명(시간 초과·응답 유실·불명확한 5xx)은 재시도가 아니라 **원격 조회**(`RECONCILING`). 인증 오류(401)는 `BLOCKED`(M3 에는 refresh 없음), 형식·권한 오류는 `FAILED` — 자동 반복하지 않는다. 숫자는 잠정값(D18).
 - **결과 불명(A08·A20)**: 전송 의도가 있는데 결과를 모르면 다시 보내지 않고 조회한다 — 찾으면 `CONFIRMED`, "확실히 없음"이면 새 시도(새 의도), 확인 불가 3회면 `UNKNOWN`. `UNKNOWN` 은 자동으로 다시 보내지 않는다(사용자 "재확인"만). worker 가 죽어 lease 가 만료되면 의도 전 작업은 `QUEUED` 로, 의도 뒤 작업은 `RECONCILING` 으로 간다.
 - **취소(A11)**: 아직 보내지 않은 작업(`QUEUED`·`RETRY_WAIT`·`BLOCKED`)만 바로 `CANCELED`. 전송 단계면 `취소 확인 중`(CANCEL_REQUESTED) — 원격이 이미 받았으면 `CONFIRMED`(이력 `cancel_too_late`, 화면 "취소 불가(이미 전송됨)")이고 취소 성공이라고 하지 않는다. `UNKNOWN` 은 409 `cancel_unknown`. 전송 단계 작업의 승인을 철회해도 같은 방식(CANCEL_REQUESTED).
-- **승인 철회(A10)**: 재시도 대기 중 승인을 철회하면 다음 tick 의 재검사가 `BLOCKED`(`approval_missing`)로 막고 새 전송 의도를 만들지 않는다.
-- **계획 상태**: 모두 확인 → `completed`, 일부 확인 + 실패·취소·보류·불명 → `partial`, 모두 취소 → `canceled`, 나머지 끝남 → `failed`(`UNKNOWN` 이 있으면 `partial`).
+- **승인 철회(A10)**: 재시도 대기 중 승인을 철회하면 **즉시** `BLOCKED`(항목은 `PLANNED` — 다시 승인 후 실행, T12 D19). 훅을 거치지 않은 변경도 다음 전송 직전 재검사가 `BLOCKED`(`approval_missing`)로 막고 새 전송 의도를 만들지 않는다.
+- **계획 상태**(T12 D19 에서 정리): 모두 확인 → `completed`, 확인 1개 이상 + 나머지 끝남·멈춤 → `partial`(부분 성공), 확인 없이 보류·불명·다시 승인할 항목 → `attention`(확인 필요), 모두 취소 → `canceled`, 실패·취소만 → `failed`.
 - **화면**: `/distribute/{id}` 항목 카드에 작업 상태 한 줄, `취소`·`재확인(조회만 — 다시 보내지 않음)` 버튼, 원격 결과(`MOCK` 배지 + **실제 발행 실적 아님**), 작업 이력 최근 10개. 계획 아래 `작업 처리 실행(모의 1회)`(내 작업 최대 5개).
 - **처리기 실행**: web(`WORKER_MODE=inline`)은 `/api/health` 호출마다 배포 작업을 최대 5개 처리한다. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
 
@@ -369,6 +369,23 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - migration `0017_t11_jobs`: jobs 열(heartbeat_at·last_error_code·last_retry_class·max_attempts·reconcile_count·cancel_requested_at·done_at), 상태 CHECK 확장(`DONE` → `CONFIRMED`), `send_intents`(결과 한 번만 기록·삭제 금지 트리거), `publications`(모의 CHECK·재확인 열만 변경·삭제 금지 트리거). 둘 다 **내보내기만**(복원 안 함) — 복원한 환경은 원격을 다시 확인해야 한다.
 
+### 모의 배포 시나리오·M3 게이트 (T12)
+결정 D19(docs/DECISIONS.md). **MOCK 결과는 어떤 경우에도 실제 발행 실적이 아니다** — 모의 계정·모의 어댑터만 쓰고 외부로 아무것도 보내지 않으며, 성공 화면에는 항상 `MOCK` 배지와 `실제 발행 실적 아님`이 붙는다(`publications.verification = 'MOCK'` 로만 저장).
+
+- **항목별 모의 시나리오(개발용)**: `/distribute/{id}` 의 실행 전·진행 중 항목(모의 계정만)에 `모의 시나리오` 선택 + `모의 시나리오 저장` — 라벨 `개발용 · 모의 결과 선택 (실제 채널 없음)`. 값: `success`(공개 범위 그대로, **YouTube 는 비공개 업로드 → 조회에서 확인**, A12) · `success_public`(payload 가 public 일 때만 공개 결과, 비공개 승인이면 `visibility_not_approved` 로 거절) · `processing_then_confirm` · `transient` · `transient_then_success` · `rate_limited`(429 + Retry-After 5초) · `server_error_no_side_effect`(503) · `server_error_side_effect_unknown`(쓰기 뒤 5xx = 결과 불명 → 조회) · `permanent`(400) · `auth`(401) · `ambiguous_sent` · `ambiguous_not_sent` · `hang`(시간 초과) · `cancel_supported`(원격 취소 가능) · `reconcile_unsupported`(조회 불가 → 3회 뒤 UNKNOWN) + 지연 `delay_ms`(0~5000). 시나리오는 승인 스냅샷 **밖** 별도 표(`mock_scenarios`)에 저장되므로 **payload hash·승인 상태가 바뀌지 않는다**. 우선순위: 항목별 → `MOCK_CHANNEL_SCENARIO`(개발·테스트만) → `success`.
+- **화면 문구**: `비공개 업로드 완료, 공개 전환 확인 필요`(YouTube 비공개 — "공개 게시"가 아님) · `등록 여부 확인 필요`(RECONCILING) · `확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요`(UNKNOWN) · `취소 확인 중` · `취소됨` · `승인 없음 — 다시 승인 후 실행` · `계정 다시 연결 필요`(401 보류) · `재시도 대기 (n/5, 다음 HH:mm MSK)`. 버튼: `재시도`(보류 + 유효 승인) · `재확인` · `취소` · `모의 시나리오 저장` · `작업 처리 실행(모의 1회)`. 배포함 목록에 `부분 성공`·`확인 필요`.
+- **부분 성공(A09)**: 여러 채널 중 일부만 확인되면 계획은 `partial`(부분 성공). 성공한 항목은 더 돌려도·재확인해도 다시 보내지 않는다. 401 로 보류된 항목은 계정을 다시 연결(모의: 시나리오를 바꿈)한 뒤 **`재시도`** — 같은 작업이 새 시도·새 전송 의도로 대기열에 들어간다(승인·내용이 그대로일 때만, 감사 기록). 승인 문제로 보류된 항목(`PLANNED` 로 돌아감)은 다시 승인한 뒤 새 실행 키로 실행하면 그 항목만 새 작업이 된다.
+- **재시작**: 모의 "원격"은 프로세스 메모리라 서버를 다시 켜면 결과 불명(`RECONCILING`) 작업은 3회 확인 불가 뒤 `UNKNOWN` 으로 끝난다 — **다시 보내지 않는다**(예상된 동작). 원격을 다시 볼 수 있으면 `재확인` 으로 `CONFIRMED`.
+- **`pnpm drill:mock`**(서버를 끈 상태 불필요 — 버리는 메모리 DB): 모든 시나리오 × 항목 1개, PARTIAL 계획(threads·instagram 401 → 재시도·youtube·blog), 더블 실행, worker 2개, lease 만료, 재시작, A10(철회 → 재승인·재실행)을 끝까지 돌리고 표를 찍는다. 열: `시나리오 | 최종 job 상태 | 항목 상태 | intent 수(전송 의도 = 원격으로 보내려 한 횟수) | publication(MOCK)(모의 결과 종류/원격 공개 범위, 없으면 "없음") | 재전송 여부(없음 · 재시도 N회(보내지 않음 확인 뒤) · 새 작업)`. 불변식(확인된 항목의 중복 전송·MOCK 아닌 결과·결과 불명 뒤 맹목 재전송·결과 없는 CONFIRMED·`fetch` 호출)이나 기대 상태와 다르면 **exit 1**. `tests/integration/m3-gate.test.ts` 가 같은 표를 확인한다.
+
+| API | 설명 |
+| --- | --- |
+| `PUT /api/distribution-items/{id}/mock-scenario` | `{scenario, delay_ms?}` → `{item_id, scenario, delay_ms, notice:'개발용 · 모의 결과 선택 (실제 채널 없음)'}`. 모의 계정 아님 400 `not_mock_account`, 끝난 항목 409 `item_finished`(POST = HTML 폼) |
+| `POST /api/distribution-items/{id}/retry` | `{}` → `{state:'QUEUED', attempt_next, mode:'MOCK'}`. 보류 아님 409 `not_retryable`, 승인 없음 409 `approval_required`, 결과 불명 409 `outcome_unknown`, 한도 409 `attempts_exhausted`, 내용 변경 409 `snapshot_stale` |
+| `GET /api/health` | `jobs.attention_plans`(확인 필요 계획 수) 추가 |
+
+- migration `0018_t12_mock_scenarios`: `mock_scenarios`(항목당 1행, 시나리오 CHECK, 지연 0~5000, 모의 계정 항목만 트리거) — **내보내기만**. 계획 상태 CHECK 에 `attention` 추가(기존 `failed`·`partial` 중 확인 없이 보류·불명이 있는 계획은 `attention` 으로 재분류). 브랜드 프로필 새 버전은 옛 브랜드를 가리키는 활성 승인을 `invalidated:brand_changed` 로 철회한다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -381,6 +398,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
+| `pnpm drill:mock` | T12 M3 게이트 훈련(버리는 메모리 DB, 모의 어댑터 — 외부 호출 없음) 표 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 
 ### PGlite 단일 연결 주의

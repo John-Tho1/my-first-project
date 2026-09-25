@@ -145,6 +145,88 @@ describe('MockChannelAdapter', () => {
   });
 });
 
+describe('T12 항목별 시나리오(ctx.mockScenario)', () => {
+  const yt = (over: Partial<PublishSnapshot> = {}) =>
+    snapshot({ channel: 'youtube', account: { id: 'y', kind: 'mock', platform: 'youtube', external_account_id: 'mock:youtube:x' }, ...over });
+  const withS = (scenario: MockScenario, over: Partial<AdapterContext> = {}) => ctx({ mockScenario: { scenario, delay_ms: 0 }, ...over });
+
+  it('항목별 시나리오가 프로그램 설정·환경변수보다 먼저', async () => {
+    vi.stubEnv('MOCK_CHANNEL_SCENARIO', 'permanent');
+    const a = new MockChannelAdapter({ scenario: 'transient' });
+    expect((await submit(a, withS('auth'))).error_code).toBe('mock_401_unauthorized');
+    expect((await submit(a)).error_code).toBe('mock_503_not_sent');
+  });
+
+  it('A12: YouTube success → 처리 중(UPLOADED_PRIVATE·private) → 조회에서 확인, 여전히 private(공개 게시 아님)', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    const c = withS('success');
+    const r = await submit(a, c, yt({ visibility: 'public' }));
+    expect(r).toMatchObject({ status: 'processing', result_kind: 'UPLOADED_PRIVATE', remote_visibility: 'private' });
+    const f = await a.reconcile({ ...ref(c), platform: 'youtube' }, c);
+    expect(f).toMatchObject({ status: 'found', result_kind: 'UPLOADED_PRIVATE', remote_visibility: 'private' });
+  });
+
+  it('success_public: payload 가 public 일 때만 PUBLISHED, 비공개 승인이면 visibility_not_approved(영구 거절)', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    expect(await submit(a, withS('success_public'), snapshot({ visibility: 'public' }))).toMatchObject({ status: 'accepted', result_kind: 'PUBLISHED', remote_visibility: 'public' });
+    expect(await submit(a, withS('success_public'), snapshot({ visibility: 'private' }))).toMatchObject({
+      status: 'rejected',
+      retry_class: 'permanent',
+      error_code: 'visibility_not_approved',
+    });
+    expect(a.remoteEntries().filter((e) => e.visibility === 'public')).toHaveLength(1);
+  });
+
+  it.each<[MockScenario, Record<string, unknown>]>([
+    ['rate_limited', { status: 'rejected', retry_class: 'transient_no_side_effect', retry_after_sec: 5, error_code: 'mock_429_rate_limited' }],
+    ['server_error_no_side_effect', { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'mock_503_no_side_effect' }],
+    ['server_error_side_effect_unknown', { status: 'rejected', retry_class: 'transient_unknown_side_effect', error_code: 'mock_502_after_write' }],
+    ['permanent', { status: 'rejected', retry_class: 'permanent' }],
+    ['auth', { status: 'rejected', retry_class: 'auth' }],
+    ['reconcile_unsupported', { status: 'ambiguous' }],
+    ['cancel_supported', { status: 'processing' }],
+  ])('%s → %o', async (scenario, want) => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    expect(await submit(a, withS(scenario))).toMatchObject(want);
+  });
+
+  it('5xx 뒤 부작용 불명: 원격에는 썼다 → 조회로 찾는다(재전송 대상이 아님)', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    const c = withS('server_error_side_effect_unknown');
+    await submit(a, c);
+    expect((await a.reconcile(ref(c), c)).status).toBe('found');
+  });
+
+  it('transient_then_success: 첫 시도만 일시 오류', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    expect((await submit(a, withS('transient_then_success', { attempt: 1 }))).status).toBe('rejected');
+    expect((await submit(a, withS('transient_then_success', { attempt: 2 }))).status).toBe('accepted');
+  });
+
+  it('reconcile_unsupported: 조회는 unsupported(원격에 있어도) / cancel_supported 만 capabilities.cancel 과 원격 취소', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    const c = withS('reconcile_unsupported');
+    await submit(a, c);
+    expect((await a.reconcile(ref(c), c)).status).toBe('unsupported');
+    expect(a.capabilities(snapshot().account, c).cancel).toBe(false);
+    const k = withS('cancel_supported');
+    const r = await submit(a, k);
+    expect(a.capabilities(snapshot().account, k).cancel).toBe(true);
+    expect(a.capabilities(snapshot().account).cancel).toBe(false);
+    expect((await a.cancel(ref(k, r.external_id ?? null), k)).status).toBe('canceled');
+    expect((await a.cancel(ref(c), c)).status).toBe('unsupported');
+  });
+
+  it('delay_ms: 항목별 지연, 중단 신호로 멈춘다', async () => {
+    const a = new MockChannelAdapter({ readEnv: false });
+    const ac = new AbortController();
+    const c = ctx({ signal: ac.signal, mockScenario: { scenario: 'success', delay_ms: 5000 } });
+    const p = submit(a, c);
+    setTimeout(() => ac.abort(), 20);
+    await expect(p).rejects.toThrow(/aborted/);
+  });
+});
+
 describe('레지스트리', () => {
   it('프로세스 싱글턴, live 계정은 LiveChannelNotConfiguredError, createProviders 에 모의만', () => {
     const r1 = createMockAdapterRegistry();

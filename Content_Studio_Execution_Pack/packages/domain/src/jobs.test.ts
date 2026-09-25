@@ -141,20 +141,65 @@ describe('항목·계획 상태', () => {
   });
 
   const I = (status: string, activeApproval = true) => ({ status, activeApproval });
-  it('planStatusFrom: 진행 중·완료·취소·실패·PARTIAL', () => {
+  it('planStatusFrom: 진행 중·완료·취소·실패·PARTIAL·확인 필요(D19)', () => {
     expect(planStatusFrom([])).toBe('draft');
     expect(planStatusFrom([I('CONFIRMED'), I('RETRY_WAIT')])).toBe('executing');
     expect(planStatusFrom([I('CONFIRMED'), I('CANCEL_REQUESTED')])).toBe('executing');
     expect(planStatusFrom([I('CONFIRMED'), I('CONFIRMED')])).toBe('completed');
     expect(planStatusFrom([I('CANCELED'), I('CANCELED')])).toBe('canceled');
     expect(planStatusFrom([I('FAILED'), I('FAILED')])).toBe('failed');
-    expect(planStatusFrom([I('FAILED'), I('BLOCKED'), I('CANCELED')])).toBe('failed');
-    // A09: 일부 성공 + 다른 채널 실패/보류/취소/불명 → partial
+    expect(planStatusFrom([I('FAILED'), I('CANCELED')])).toBe('failed');
+    // D19: CONFIRMED 없이 사용자 조치가 필요한 항목(보류·결과 불명·다시 승인)이 있으면 failed 가 아니라 attention(확인 필요)
+    expect(planStatusFrom([I('FAILED'), I('BLOCKED'), I('CANCELED')])).toBe('attention');
+    expect(planStatusFrom([I('UNKNOWN'), I('FAILED')])).toBe('attention');
+    expect(planStatusFrom([I('UNKNOWN')])).toBe('attention');
+    expect(planStatusFrom([I('BLOCKED')])).toBe('attention');
+    expect(planStatusFrom([I('PLANNED', false), I('FAILED')])).toBe('attention');
+    // A09: 일부 성공 + 다른 채널 실패/보류/취소/불명/다시 승인 → partial(성공한 항목은 다시 보내지 않는다)
     for (const other of ['FAILED', 'CANCELED', 'BLOCKED', 'UNKNOWN']) expect(planStatusFrom([I('CONFIRMED'), I(other)])).toBe('partial');
-    // UNKNOWN 은 원격에 있을 수도 있으므로 failed 로 부르지 않는다
-    expect(planStatusFrom([I('UNKNOWN'), I('FAILED')])).toBe('partial');
-    expect(planStatusFrom([I('PLANNED', false), I('CONFIRMED')])).toBe('draft');
+    expect(planStatusFrom([I('PLANNED', false), I('CONFIRMED')])).toBe('partial');
     expect(planStatusFrom([I('PLANNED', true), I('PLANNED', false)])).toBe('partially_approved');
+    expect(planStatusFrom([I('PLANNED', true), I('PLANNED', true)])).toBe('approved');
+    expect(planStatusFrom([I('PLANNED', false), I('PLANNED', false)])).toBe('draft');
+  });
+
+  it('planStatusFrom 행렬: 항목 2개의 모든 상태 조합(D19 규칙표)', () => {
+    const inFlight = ['QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'CANCEL_REQUESTED'];
+    const all: Array<{ status: string; activeApproval: boolean }> = [
+      I('PLANNED', false),
+      I('PLANNED', true),
+      ...[...inFlight, 'UNKNOWN', 'BLOCKED', 'CONFIRMED', 'FAILED', 'CANCELED'].map((st) => I(st)),
+    ];
+    // 규칙표(우선순위 순): 진행 중 → executing / 모두 PLANNED → 승인 수 / 모두 CONFIRMED → completed / 모두 CANCELED → canceled /
+    // CONFIRMED 있음 → partial / BLOCKED·UNKNOWN·PLANNED 있음 → attention / 나머지 → failed
+    const expected = (a: { status: string; activeApproval: boolean }, b: { status: string; activeApproval: boolean }): string => {
+      const st = [a.status, b.status];
+      if (st.some((x) => inFlight.includes(x))) return 'executing';
+      if (st.every((x) => x === 'PLANNED')) {
+        const n = [a, b].filter((x) => x.activeApproval).length;
+        return n === 0 ? 'draft' : n === 2 ? 'approved' : 'partially_approved';
+      }
+      if (st.every((x) => x === 'CONFIRMED')) return 'completed';
+      if (st.every((x) => x === 'CANCELED')) return 'canceled';
+      if (st.includes('CONFIRMED')) return 'partial';
+      if (st.some((x) => ['BLOCKED', 'UNKNOWN', 'PLANNED'].includes(x))) return 'attention';
+      return 'failed';
+    };
+    let n = 0;
+    for (const a of all) {
+      for (const b of all) {
+        const got = planStatusFrom([a, b]);
+        expect(got, `${a.status}/${a.activeApproval} + ${b.status}/${b.activeApproval}`).toBe(expected(a, b));
+        // 순서와 무관
+        expect(planStatusFrom([b, a])).toBe(got);
+        // 불변식: completed 는 모두 CONFIRMED 일 때만, partial 은 CONFIRMED 가 있고 모두 CONFIRMED 는 아닐 때만
+        if (got === 'completed') expect([a.status, b.status]).toEqual(['CONFIRMED', 'CONFIRMED']);
+        if (got === 'partial') expect([a.status, b.status]).toContain('CONFIRMED');
+        if (got === 'failed') expect([a.status, b.status].every((x) => x === 'FAILED' || x === 'CANCELED')).toBe(true);
+        n++;
+      }
+    }
+    expect(n).toBe(all.length ** 2);
   });
 
   it('T10 computePlanStatus 는 planStatusFrom 과 같다', () => {

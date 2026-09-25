@@ -63,6 +63,7 @@ import {
 } from './approval-invalidation';
 import type { Db } from './client';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
+import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
 import { recordAudit, type DbOrTx } from './queries';
 import {
   approvals,
@@ -239,7 +240,8 @@ function blockerError(blockers: string[]): AppError {
 /**
  * 항목의 스냅샷이 지금의 실제 행과 같은지 다시 검사한다. 문제 코드 목록(없으면 []):
  * variant_changed(현재 버전이 다름) · variant_not_review · content_changed · assets_changed(첨부 checksum·순서·삭제) ·
- * account_changed(없음·준비 안 됨·외부 ID/플랫폼 변경) · payload_changed(재계산 hash 불일치) · schedule_passed · blocked:<검토 차단 사유>.
+ * account_changed(없음·준비 안 됨·외부 ID/플랫폼 변경) · brand_changed(T12 D19: 현재 브랜드 프로필 버전 ≠ 스냅샷의 brand_profile_version_id —
+ * hash 에 들어가는 값) · payload_changed(재계산 hash 불일치) · schedule_passed · blocked:<검토 차단 사유>.
  */
 export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: DistributionItemRow, now: Date): Promise<string[]> {
   const problems: string[] = [];
@@ -297,6 +299,8 @@ export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: Distri
     }
   }
   if (payloadHash(item.payloadJson) !== item.payloadHash) problems.push('payload_changed');
+  const brand = await getCurrentBrandProfile(tx, ownerId);
+  if ((brand?.id ?? null) !== item.brandProfileId) problems.push('brand_changed');
   if (item.scheduledAtUtc && item.scheduledAtUtc.getTime() <= now.getTime()) problems.push('schedule_passed');
   if (variant) {
     const blockers = await variantReviewBlockers(tx, ownerId, variant.id);
@@ -311,6 +315,7 @@ export function invalidationReasonOf(problems: readonly string[]): InvalidationR
   if (problems.includes('assets_changed') || problems.some((p) => p.startsWith('blocked:media_incomplete'))) return 'assets_changed';
   if (problems.includes('variant_changed')) return 'body_changed';
   if (problems.includes('account_changed')) return 'account_changed';
+  if (problems.includes('brand_changed')) return 'brand_changed';
   if (problems.includes('schedule_passed')) return 'schedule_passed';
   return 'snapshot_changed';
 }
@@ -454,6 +459,8 @@ export interface PlanItemDetail {
   events: JobEventRow[];
   /** 지금 다시 검사한 스냅샷 문제(없으면 []) — 승인·실행 전 화면 안내용(서버는 승인·실행 때 다시 검사한다). */
   problems: string[];
+  /** T12: 개발용 모의 시나리오(모의 계정 항목, 없으면 null) — 승인 스냅샷 밖 */
+  mockScenario: MockScenarioRow | null;
 }
 
 export interface PlanDetail {
@@ -491,6 +498,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
         .where(and(eq(publications.ownerId, ownerId), inArray(publications.itemId, ids)))
         .orderBy(asc(publications.createdAt), asc(publications.id))
     : [];
+  const scenarios = await mockScenariosForItems(db, ownerId, ids);
   const out: PlanItemDetail[] = [];
   for (const item of items) {
     const mineJobs = allJobs.filter((j) => j.itemId === item.id);
@@ -521,6 +529,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       publications: allPubs.filter((p) => p.itemId === item.id),
       events,
       problems: item.status === 'PLANNED' ? await snapshotProblems(db, ownerId, item, now) : [],
+      mockScenario: scenarios.get(item.id) ?? null,
     });
   }
   return { plan, items: out };
@@ -994,6 +1003,7 @@ export function planDetailView(d: PlanDetail) {
       jobs: x.jobs.map(jobView),
       publications: x.publications.map(publicationViewOf),
       problems: x.problems,
+      mock_scenario: x.mockScenario ? mockScenarioView(x.mockScenario) : null,
     })),
   };
 }

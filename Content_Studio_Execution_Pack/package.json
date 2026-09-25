@@ -22,7 +22,8 @@
     "export": "tsx packages/db/scripts/export.ts",
     "restore:preview": "tsx packages/db/scripts/restore.ts preview",
     "restore:commit": "tsx packages/db/scripts/restore.ts commit",
-    "worker": "tsx apps/worker/src/cli.ts"
+    "worker": "tsx apps/worker/src/cli.ts",
+    "drill:mock": "tsx packages/db/scripts/drill.ts"
   },
   "devDependencies": {
     "@cs/db": "workspace:*",

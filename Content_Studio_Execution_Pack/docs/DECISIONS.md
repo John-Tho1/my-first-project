@@ -243,3 +243,18 @@
 - Exact authorized scope (if applicable): 외부 호출 0(모의 어댑터만), 새 의존성 0, 비밀 0, OAuth·실계정 0.
 - Consequences: M3 게이트를 `pnpm drill:mock` 한 명령으로 사람이 볼 수 있다. 성공 화면·API 는 모두 MOCK 이며 실제 발행 실적으로 저장되지 않는다. 브랜드 프로필을 바꾸면 승인된 옛 계획은 다시 만들어야 한다.
 - When to revisit: M4(live 어댑터 — 실제 capabilities·refresh 1회·Retry-After·원격 취소, 시나리오 표는 live 계정에 쓰이지 않음), PostgreSQL 전환(실제 동시성), 운영 알림(M5, attention 계획 알림).
+
+## D20 — M3 잔여 결정(D19-a~d) 권고안 확정, M4(T13) 착수 보류
+- Decision ID / date: D20 / 2026-09-25 (Europe/Moscow)
+- Question: 클라우드 세션이 M3 마감에 남긴 결정(docs/handoffs/M3_LOCAL_RETURN.md §4)을 어떻게 정하는가?
+- Chosen option (사용자, 2026-09-25, 권고안 전부 채택):
+  - D19-a. 브랜드 프로필 새 버전 → 활성 승인 무효화(`invalidated:brand_changed`) **유지**(D17(d) 뒤집음 확정 — 브랜드 버전이 payload hash 에 들어가므로 일관).
+  - D19-b. `assets.checksum` 제자리 UPDATE 와 기존(불변) 버전에 대한 `variant_assets` INSERT 를 **DB 트리거로 강제** — Codex 판정 뒤 M3 FIX 라운드에서 작은 migration 으로 추가(현재는 실행·재시도 재검사가 막음).
+  - D19-c. 항목별 모의 시나리오는 모의 계정 한정으로 production 동작 유지, M4 live 계정 도입 시 `NODE_ENV` 게이트 재검토.
+  - D19-d. 재시도 수치(30s·15min·±20%·5회·lease 60s·timeout 30s) 잠정 유지, 실계정 연결 전 공식 rate limit 으로 재조정.
+  - M4/T13(OAuth·비밀 암호화)은 실계정·외부 승인이 필요하므로 사용자가 첫 채널(Threads 권고)·앱 등록·scope·테스트 계정·마스터 키 보관 방식을 확인해 줄 때까지 **착수하지 않는다**. 그 전에는 M3 FIX 라운드와 T20 의 mock 가능 부분만.
+- Evidence / assumption: 로컬 재검증(Windows/Node 24, HEAD b14af3e): lint·typecheck·build 통과, unit 530, integration 312, db:migrate 0016~0018, db:seed 모의 계정 4, drill:mock 불변식 위반 0. Codex(GPT-6 Astra/xhigh) T10~T12 검증은 진행 중 — 결과는 M3 FIX 라운드 인계 문서에.
+- Reversible?: 예(각 항목 D17~D19 개정).
+- User decision required?: 확정됨.
+- Consequences: M3 FIX 라운드 착수 가능. D19-b 트리거는 FIX 라운드 산출물.
+- When to revisit: M4 착수 시(D19-c·d), PostgreSQL 전환 시(트리거 호환).

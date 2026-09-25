@@ -573,3 +573,56 @@ describe('FIX-T09 round 2: proposal_status 채움·모순 검사', () => {
     expect(status(build({ adopted: true, status: 'adopted' }))).toBe('adopted');
   });
 });
+
+describe('FIX-T07 round 3: 인용 문법 기반 정제(부분 문자열 비교 없음)', () => {
+  const base = { result_type: 'draft' as const, input_version: 'v', proposed_tags: [] as string[], followup_questions: [] as string[], warnings: [] as string[], claims: [] };
+  const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const M = '[출처 미확인 URL 제거]';
+  const run = (text: string, allowed: Array<{ id: string; locator?: string | null }>) => sanitizeLlmOutput({ ...base, proposed_text: text }, allowed);
+
+  it('재현 1: 허용 id 를 담은 가짜 URL 은 허용되지 않는다', () => {
+    const r = run(`근거 https://fake.example/${ID} 입니다`, [{ id: ID, locator: 'https://example.com/report' }]);
+    expect(r.output.proposed_text).toBe(`근거 ${M} 입니다`);
+    expect(r.output.warnings.at(-1)).toContain('확인 필요');
+  });
+
+  it('재현 2: 경로·쿼리 대소문자가 다르면 다른 자료(허용 안 됨), 같으면 허용', () => {
+    const allowed = [{ id: ID, locator: 'https://example.com/Report?id=ABC' }];
+    expect(run('https://example.com/report?id=abc', allowed).output.proposed_text).toBe(M);
+    expect(run('https://EXAMPLE.com:443/Report?id=ABC#part', allowed).output.proposed_text).toBe('https://EXAMPLE.com:443/Report?id=ABC#part');
+  });
+
+  it('재현 3: 맨 도메인(fabricated.example/report)도 허용 출처가 없으면 제거, 파일 이름·소수는 그대로', () => {
+    expect(run('근거: fabricated.example/report 참고.', []).output.proposed_text).toBe(`근거: ${M} 참고.`);
+    expect(run('근거: fabricated.example 입니다', []).output.proposed_text).toBe(`근거: ${M} 입니다`);
+    expect(run('README.md 와 3.14 와 budget.ts', []).output.proposed_text).toBe('README.md 와 3.14 와 budget.ts');
+    expect(run('메일 owner@example.local 로', []).redactedTotal).toBe(0);
+  });
+
+  it('재현 4: 허용 URL·허용 UUID 를 담은 [출처: …] 는 보존, 그 밖의 [출처…] 는 제거', () => {
+    const allowed = [{ id: ID, locator: 'https://example.com/report' }];
+    expect(run('[출처: https://example.com/report]', allowed).output.proposed_text).toBe('[출처: https://example.com/report]');
+    expect(run(`[출처: ${ID}]`, allowed).output.proposed_text).toBe(`[출처: ${ID}]`);
+    expect(run('[출처: https://example.com/other]', allowed).output.proposed_text).toBe(M);
+    expect(run('[출처: 가짜 연구소 2025]', allowed).output.proposed_text).toBe(M);
+    expect(run(`[출처: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]`, allowed).output.proposed_text).toBe(M);
+  });
+
+  it('재현 5: [10] 은 허용 출처 10개면 그대로, [99] 는 출력 전체 실패(길이와 무관하게 번호 규칙)', () => {
+    const ten = Array.from({ length: 10 }, (_, i) => ({ id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}` }));
+    const ok = sanitizeLlmOutput({ ...base, proposed_text: '보고서[10]', claims: [{ text: 't[10]', kind: 'fact', source_refs: ['[10]'], needs_user_confirmation: false }] }, ten);
+    expect(ok.output.proposed_text).toBe('보고서[10]');
+    expect(ok.output.claims[0]!.text).toBe('t[10]');
+    expect(() => run('보고서[99]', ten)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+    expect(() => run('보고서[11]', ten)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+  });
+
+  it('추적 파라미터(utm_*)만 다른 허용 URL 은 허용, www·scheme 이 다르면 정규형이 달라 허용 안 됨(별칭 없음)', () => {
+    const allowed = [{ id: ID, locator: 'https://example.com/report?b=2&a=1' }];
+    expect(run('https://example.com/report?a=1&b=2&utm_source=x', allowed).redactedTotal).toBe(0);
+    expect(run('https://www.example.com/report?a=1&b=2', allowed).redactedTotal).toBe(1);
+    expect(run('http://example.com/report?a=1&b=2', allowed).redactedTotal).toBe(1);
+    // www 로 시작하는 허용 locator 는 https:// 를 붙인 정규형이 같으면 허용
+    expect(run('www.example.com/r 참고', [{ id: ID, locator: 'https://www.example.com/r' }]).redactedTotal).toBe(0);
+  });
+});

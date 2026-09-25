@@ -10,6 +10,7 @@
 import { z } from 'zod';
 import { MAX_CONTENT_BODY } from './content';
 import { AppError } from './errors';
+import { normalizeUrl } from './url';
 
 // ---- Brand Profile ----
 
@@ -288,8 +289,6 @@ export function pickDefaultSources<T extends { id: string; sourceId: string; fet
 // ---- FIX-T07: 출력 전체 정제(순수) ----
 
 export const DROPPED_REF_MARKER = '[출처 미확인 URL 제거]';
-/** 이 길이 미만의 버린 참조 문자열은 본문에서 찾아 바꾸지 않는다(짧은 조각이 일반 단어를 지우는 것을 막음). */
-export const MIN_REDACT_LENGTH = 4;
 
 export interface SanitizedClaim {
   text: string;
@@ -321,7 +320,6 @@ interface LlmOutputLike {
   warnings: readonly string[];
 }
 
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** 허용 출처(정제 기준): source_version id 와 그 출처의 locator(URL). 순서는 프롬프트의 번호([1], [2] …)와 같다(id 정렬). */
 export interface AllowedRef {
@@ -329,36 +327,56 @@ export interface AllowedRef {
   locator?: string | null;
 }
 
-/** 모델 출력에 허용 목록으로 풀 수 없는 짧은 인용([n] 등)이 있어 안전하게 고칠 수 없음 → 출력 전체를 검증 실패로(FIX round 2). */
+/** 모델 출력에 허용 목록으로 풀 수 없는 번호 인용([n], n 이 범위 밖)이 있어 안전하게 고칠 수 없음 → 출력 전체를 검증 실패로. */
 export class UnverifiableCitationError extends AppError {
   constructor() {
     super('bad_request', 'unverifiable_citation', 'AI 출력에 확인할 수 없는 출처 인용이 있어 저장하지 않았습니다');
   }
 }
 
-/** URL 형태(https?://, www.) — 공백·괄호·따옴표 전까지. */
-const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'()[\]{}]+/giu;
-/** 대괄호 인용: [n] 숫자, [출처…]. */
-const NUM_CITE_RE = /\[(\d{1,4})\]/gu;
-const SRC_CITE_RE = /\[출처[^\]]*\]/gu;
+// ---- 인용 문법(FIX-T07 round 3) ----
+// 받아들이는 형태는 다음뿐이다. 판정은 모두 "전체 값의 동등성" — 부분 문자열 비교는 하지 않는다.
+//   [n]                  n = 1..허용 출처 수(프롬프트 번호). 범위 밖이면 출력 전체 실패.
+//   [출처: <URL|UUID>]   괄호 안의 값을 꺼내 URL 은 정규형 비교, UUID 는 허용 id 와 정확히 비교. 그 밖의 [출처…] 는 미확인.
+//   <URL>                https?://… 또는 www.… (www. 는 https:// 를 붙여 해석)
+//   <맨 도메인>          host.tld[/…] — 점이 있고 TLD 가 영문 2~24자, 흔한 파일 확장자(.md .ts .js …)는 제외
+// URL 동등성 = normalizeUrl().normalized(scheme·host 소문자, 기본 포트·fragment·추적 파라미터 제거, 파라미터 정렬, 끝 슬래시 제거).
+// **경로·쿼리의 대소문자는 그대로** 비교한다. http↔https, www 유무는 정규형이 다르면 같은 출처로 보지 않는다(별칭 없음).
 
-const normUrl = (s: string) =>
-  s
-    .trim()
-    .toLowerCase()
-    .replace(/[.,;:!?…]+$/u, '')
-    .replace(/\/+$/u, '')
-    .replace(/^https?:\/\//u, '')
-    .replace(/^www\./u, '');
+const TOKEN_CHARS = String.raw`[^\s<>"'()[\]{}]`;
+const HOST = String.raw`(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}`;
+const CITATION_RE = new RegExp(
+  [
+    String.raw`\[출처[^\]]*\]`, // [출처…]
+    String.raw`\[(\d+)\]`, // [n]
+    String.raw`https?:\/\/${TOKEN_CHARS}+`, // URL
+    String.raw`www\.${TOKEN_CHARS}+`, // www.…
+    String.raw`(?<![\w@./:-])${HOST}(?:\/${TOKEN_CHARS}*)?(?![\w@-])`, // 맨 도메인
+  ].join('|'),
+  'giu',
+);
+/** 맨 도메인으로 보지 않을 흔한 파일 확장자(보수적 예외) */
+const FILE_EXT = new Set(['md', 'ts', 'tsx', 'js', 'jsx', 'json', 'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'csv', 'xlsx', 'docx', 'pptx', 'zip', 'html', 'css', 'mp4', 'mov', 'sql', 'yml', 'yaml']);
+const UUID_ONLY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const TRAILING_PUNCT = /[.,;:!?…。、]+$/u;
+
+/** URL·www·맨 도메인 문자열 → 정규형(비교용). 해석할 수 없으면 null. */
+export function canonicalCitationUrl(token: string): string | null {
+  const t = token.trim();
+  const withScheme = /^https?:\/\//iu.test(t) ? t : `https://${t}`;
+  try {
+    return normalizeUrl(withScheme).normalized;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지). FIX-T07 round 2 — source_refs 에 기대지 않는다.
- * - claim.source_refs: 허용 id 만(filterClaimSources), 버린 개수·needs_check
- * - 제안 본문·경고·후속 질문·태그·claim 문장의 URL(https?://, www.)과 [출처…] 인용 중 허용 locator·id 로 풀리지 않는 것은
- *   DROPPED_REF_MARKER 로 바꾸고 확인 필요 경고를 단다(바뀐 claim 은 needs_check)
- * - [n] 숫자 인용은 1 ≤ n ≤ 허용 출처 수일 때만 그대로 둔다(프롬프트의 n 번째 허용 출처). 풀리지 않으면 안전하게 고칠 수 없으므로
- *   UnverifiableCitationError(출력 전체 거부 → run failed, 제안 없음)
- * - source_refs 에서 버린 참조 문자열이 글에 다시 나오면: 4자 이상은 바꾸고, 더 짧은 것(안전하게 바꿀 수 없음)은 UnverifiableCitationError
+ * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지). FIX-T07 round 3 — 위 인용 문법으로만 판정.
+ * - claim.source_refs: 허용 id 와 정확히 같은 것만(filterClaimSources), 버린 개수·needs_check
+ * - 제안 본문·경고·후속 질문·태그·claim 문장의 URL·맨 도메인·[출처…] 중 허용 출처로 풀리지 않는 것은 DROPPED_REF_MARKER 로 바꾸고
+ *   "확인 필요" 경고, 바뀐 claim 은 needs_check
+ * - [n] 은 길이와 무관하게 번호 규칙으로만 판정 — 범위 밖이면 UnverifiableCitationError(run failed, 제안 없음)
  * 이 결과 하나를 제안 버전·output_json·claims 행·HTTP 응답에 똑같이 쓴다(원고 assist·채널 AI 초안).
  */
 export function sanitizeLlmOutput(
@@ -368,54 +386,44 @@ export function sanitizeLlmOutput(
   const allowed: AllowedRef[] = allowedIn.map((a) => (typeof a === 'string' ? { id: a } : a));
   const allowedIds = allowed.map((a) => a.id);
   const okIds = new Set(allowedIds.map((s) => s.toLowerCase()));
-  const okUrls = new Set(allowed.flatMap((a) => (a.locator ? [normUrl(a.locator)] : [])));
-  const droppedRefs = [
-    ...new Set(
-      output.claims
-        .flatMap((c) => c.source_refs)
-        .map((r) => r.trim())
-        .filter((r) => r !== '' && !okIds.has(r.toLowerCase())),
-    ),
-  ].sort((a, b) => b.length - a.length); // 긴 것부터(겹치는 참조의 일부만 남지 않게)
-  const longRes = droppedRefs.filter((r) => r.length >= MIN_REDACT_LENGTH).map((d) => new RegExp(escapeRe(d), 'giu'));
-  // [n] 모양은 아래 숫자 인용 규칙(허용 출처 번호로 풀리는지)으로 판정한다.
-  const shortRefs = droppedRefs.filter((r) => r.length < MIN_REDACT_LENGTH && !/^\[\d+\]$/u.test(r));
+  const okUrls = new Set(allowed.flatMap((a) => (a.locator ? [canonicalCitationUrl(a.locator)].filter((x): x is string => x !== null) : [])));
 
   let redactedTotal = 0;
-  const resolves = (token: string) => {
-    const t = token.toLowerCase();
-    if (okUrls.has(normUrl(token))) return true;
-    for (const id of okIds) if (t.includes(id)) return true;
-    return false;
+  const urlAllowed = (token: string) => {
+    const c = canonicalCitationUrl(token);
+    return c !== null && okUrls.has(c);
   };
   const clean = (s: string): { text: string; changed: boolean } => {
     let changed = false;
-    let text = s;
-    for (const re of longRes) {
-      text = text.replace(re, () => {
+    const text = s.replace(CITATION_RE, (m: string, num: string | undefined) => {
+      if (m === DROPPED_REF_MARKER) return m;
+      if (num !== undefined) {
+        const n = Number(num);
+        if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
+        return m;
+      }
+      if (m.startsWith('[')) {
+        const inner = m.slice(1, -1).replace(/^출처\s*[:：]?\s*/u, '').trim();
+        const ok = UUID_ONLY.test(inner) ? okIds.has(inner.toLowerCase()) : inner !== '' && urlAllowed(inner.replace(TRAILING_PUNCT, ''));
+        if (ok) return m;
         changed = true;
         redactedTotal++;
         return DROPPED_REF_MARKER;
-      });
-    }
-    // 짧은 버린 참조가 남아 있으면 안전하게 바꿀 수 없다
-    for (const r of shortRefs) if (text.toLowerCase().includes(r.toLowerCase())) throw new UnverifiableCitationError();
-    text = text.replace(URL_RE, (m) => {
-      if (resolves(m)) return m;
+      }
+      // URL·www·맨 도메인: 끝 문장부호는 인용이 아니라 문장의 것
+      const punct = TRAILING_PUNCT.exec(m)?.[0] ?? '';
+      const token = punct ? m.slice(0, -punct.length) : m;
+      const isBare = !/^(?:https?:\/\/|www\.)/iu.test(token);
+      if (isBare) {
+        const host = token.split('/')[0]!;
+        const tld = host.slice(host.lastIndexOf('.') + 1).toLowerCase();
+        if (FILE_EXT.has(tld) && !token.includes('/')) return m; // 파일 이름으로 보이는 것은 그대로
+      }
+      if (urlAllowed(token)) return m;
       changed = true;
       redactedTotal++;
-      return DROPPED_REF_MARKER;
+      return DROPPED_REF_MARKER + punct;
     });
-    text = text.replace(SRC_CITE_RE, (m) => {
-      if (m === DROPPED_REF_MARKER || resolves(m)) return m;
-      changed = true;
-      redactedTotal++;
-      return DROPPED_REF_MARKER;
-    });
-    for (const m of text.matchAll(NUM_CITE_RE)) {
-      const n = Number(m[1]);
-      if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
-    }
     return { text, changed };
   };
 

@@ -10,7 +10,7 @@
  * - assets/<asset id>.<ext>  파일 바이트
  * - README.md                묶음 설명(한국어)
  *
- * 제외: sessions(인증 비밀 등급), export_runs·restore_runs(운영 기록). OAuth·API key 는 DB 에 없고 앞으로 생겨도 제외 목록에 넣는다.
+ * 제외: sessions(인증 비밀 등급), export_runs·restore_runs(운영 기록), upload_sessions·upload_chunks(T08 전송 중 임시 상태). OAuth·API key 는 DB 에 없고 앞으로 생겨도 제외 목록에 넣는다.
  * 새 표가 생기면 EXPORTED_TABLES 나 EXCLUDED_TABLES 중 하나에 넣어야 한다(@cs/db 단위 테스트가 schema.ts 와 대조).
  */
 import { createHash } from 'node:crypto';
@@ -30,6 +30,10 @@ export const EXPORTED_TABLES = [
   'brand_profiles',
   'sources',
   'source_versions',
+  // T08: captures.capture_transcript_id → transcripts → transcription_jobs → assets 이므로 셋 모두 captures 보다 먼저.
+  'assets',
+  'transcription_jobs',
+  'transcripts',
   'captures',
   'capture_revisions',
   'ideas',
@@ -46,7 +50,6 @@ export const EXPORTED_TABLES = [
   'claims',
   'claim_sources',
   'usage_ledger',
-  'assets',
   'variant_assets',
   'audit_events',
 ] as const;
@@ -66,12 +69,16 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   variants: '0009_t09_variants',
   variant_versions: '0009_t09_variants',
   variant_assets: '0009_t09_variants',
+  transcription_jobs: '0012_t08_uploads_transcription',
+  transcripts: '0012_t08_uploads_transcription',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   sessions: '로그인 세션 — 인증 비밀과 같은 등급이며 다른 환경으로 옮기지 않는다',
   export_runs: '내보내기 실행 기록(운영 기록, 환경마다 다름)',
   restore_runs: '복원 실행 기록(운영 기록, 환경마다 다름)',
+  upload_sessions: '업로드 세션(T08) — 전송 중 임시 상태. 완료된 파일은 assets 로 내보낸다',
+  upload_chunks: '업로드 조각(T08) — 전송 중 임시 파일 목록. 조각 바이트는 묶음에 넣지 않는다',
 };
 
 export const NON_RESTORED_TABLES: readonly ExportedTable[] = ['users', 'audit_events'];
@@ -167,6 +174,8 @@ export const ROW_SCHEMAS = {
     revision: int,
     updated_at: ts,
     content_hash: nstr,
+    // 0012 열. 이전 묶음에는 없으므로 null.
+    capture_transcript_id: uuid.nullable().default(null),
   }),
   capture_revisions: z.strictObject({
     id: uuid,
@@ -306,7 +315,10 @@ export const ROW_SCHEMAS = {
   claim_sources: z.strictObject({ id: uuid, claim_id: uuid, source_version_id: uuid, locator: nstr, support_note: nstr }),
   usage_ledger: z.strictObject({
     id: uuid,
-    run_id: uuid,
+    // 0012: 전사 원장은 run_id 가 null 이고 transcription_job_id 가 있다(둘 중 정확히 하나 — checkIntegrity).
+    run_id: uuid.nullable(),
+    transcription_job_id: uuid.nullable().default(null),
+    audio_seconds: int.min(0).nullable().default(null),
     reserved_amount: amount,
     actual_amount: amount.nullable(),
     currency: z.string().regex(/^[A-Z]{3}$/),
@@ -329,6 +341,35 @@ export const ROW_SCHEMAS = {
     checksum: z.string().regex(/^[0-9a-f]{64}$/),
     rights_status: str,
     verification_state: str,
+    // 0012 열. 이전 묶음은 DB 기본값과 같은 값.
+    verification_scope: str.default('signature_size_checksum'),
+    deleted_at: ts.nullable().default(null),
+    created_at: ts,
+  }),
+  // T08(0012)
+  transcription_jobs: z.strictObject({
+    id: uuid,
+    asset_id: uuid,
+    state: z.enum(['queued', 'running', 'succeeded', 'failed', 'canceled']),
+    provider: str,
+    model: str,
+    progress: int.min(0).max(100),
+    transcript_version_id: uuid.nullable(),
+    error: nstr,
+    attempts: int.min(0),
+    keep_original: z.boolean(),
+    audio_seconds: int.min(1),
+    created_at: ts,
+    started_at: ts.nullable(),
+    finished_at: ts.nullable(),
+  }),
+  transcripts: z.strictObject({
+    id: uuid,
+    job_id: uuid,
+    version: int.min(1),
+    text: str,
+    segments: z.array(z.strictObject({ start_ms: int.min(0), end_ms: int.min(0), text: str })),
+    created_by: z.enum(['mock', 'owner']),
     created_at: ts,
   }),
   audit_events: z.strictObject({
@@ -603,6 +644,12 @@ export function buildBundle(input: BuildBundleInput): BuiltBundle {
     const p = assetBundlePath(a);
     const bytes = input.assetBytes.get(a.id) ?? null;
     const entry = { id: a.id, key: a.key, mime: a.mime, bytes: a.bytes, checksum: a.checksum, path: p };
+    if (a.deleted_at !== null) {
+      // T08: 원음 보존을 끈 전사 뒤 의도적으로 지운 파일 — 메타데이터만(누락 경고와 구분).
+      assets.push({ ...entry, missing: true });
+      warnings.push({ code: 'asset_deleted', asset_id: a.id, message: '원본을 지운 파일(원음 보존 안 함)이라 메타데이터만 내보냈습니다' });
+      continue;
+    }
     if (!bytes) {
       assets.push({ ...entry, missing: true });
       warnings.push({ code: 'asset_missing', asset_id: a.id, message: '저장소에 파일이 없어 메타데이터만 내보냈습니다' });
@@ -925,7 +972,28 @@ export function checkIntegrity(t: BundleTables): void {
     need('claim_sources', 'claim_id', r.claim_id, 'claims');
     need('claim_sources', 'source_version_id', r.source_version_id, 'source_versions');
   }
-  for (const r of t.usage_ledger) need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
+  for (const r of t.usage_ledger) {
+    need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
+    need('usage_ledger', 'transcription_job_id', r.transcription_job_id, 'transcription_jobs');
+    if ((r.run_id === null) === (r.transcription_job_id === null)) problems.push('usage_ledger: run_id·transcription_job_id 중 정확히 하나');
+  }
+  // T08: job 은 묶음 안 파일, 전사 버전은 그 job 의 것(버전 번호 unique), job 의 첫 전사는 같은 job 의 버전, 소재의 전사는 묶음 안.
+  const transcriptJob = new Map(t.transcripts.map((x) => [x.id, x.job_id]));
+  const jobVersions = new Set<string>();
+  for (const r of t.transcription_jobs) need('transcription_jobs', 'asset_id', r.asset_id, 'assets');
+  for (const r of t.transcripts) {
+    need('transcripts', 'job_id', r.job_id, 'transcription_jobs');
+    const k = `${r.job_id}#${r.version}`;
+    if (jobVersions.has(k)) problems.push('transcripts: (job_id, version) 중복');
+    jobVersions.add(k);
+  }
+  for (const r of t.transcription_jobs) {
+    if (r.transcript_version_id !== null && transcriptJob.get(r.transcript_version_id) !== r.id) {
+      problems.push('transcription_jobs.transcript_version_id → transcripts(같은 job)');
+    }
+    if (r.state === 'succeeded' && r.transcript_version_id === null) problems.push('transcription_jobs: succeeded 인데 전사 없음');
+  }
+  for (const r of t.captures) need('captures', 'capture_transcript_id', r.capture_transcript_id, 'transcripts');
   // T09: 파생본은 같은 원고, 버전은 그 파생본·그 원고의 원고 버전, 현재 버전은 그 파생본의 버전, 첨부는 묶음 안 파일.
   const variantContent = new Map(t.variants.map((v) => [v.id, v.content_id]));
   const vvVariant = new Map(t.variant_versions.map((v) => [v.id, v.variant_id]));

@@ -118,13 +118,20 @@ export function reserveFor(policy: BudgetPolicy, prompt: string): Reservation {
   return { tokensIn, tokensOutAllowance, reserveMicro, pricingSnapshot };
 }
 
+/** 한도 검사에 필요한 값(LLM·STT 공용, T08). pricing 이 null 이면 모의 전용 — 한도를 검사하지 않는다. */
+export interface BudgetLimits {
+  pricing: object | null;
+  monthlyLimitMicro: bigint | null;
+  perRunMaxMicro: bigint | null;
+}
+
 export type BudgetDecision = { ok: true } | { ok: false; reason: 'per_run_max' | 'monthly_limit' };
 
 /**
  * 예약 가능 여부. 가격이 없으면(mock 전용 — live 는 그 전에 차단) 한도를 검사하지 않는다.
  * usedMicro = 이번 달 원장 합계(예약 중 + 확정). 경계값(합계 = 상한)은 허용한다.
  */
-export function checkBudget(policy: BudgetPolicy, usedMicro: bigint, reserveMicro: bigint): BudgetDecision {
+export function checkBudget(policy: BudgetLimits, usedMicro: bigint, reserveMicro: bigint): BudgetDecision {
   if (!policy.pricing) return { ok: true };
   if (policy.perRunMaxMicro !== null && reserveMicro > policy.perRunMaxMicro) return { ok: false, reason: 'per_run_max' };
   if (policy.monthlyLimitMicro !== null && usedMicro + reserveMicro > policy.monthlyLimitMicro) return { ok: false, reason: 'monthly_limit' };

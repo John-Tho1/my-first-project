@@ -15,3 +15,5 @@ export * from './zip';
 export * from './writing';
 export * from './budget';
 export * from './channel';
+export * from './upload';
+export * from './stt';

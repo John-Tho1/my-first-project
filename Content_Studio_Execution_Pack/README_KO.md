@@ -285,7 +285,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - **초안 만들기**: Threads·Instagram·YouTube·블로그마다 원고 현재 버전을 채널 모양으로 바꾼 초안(결정적). "AI 초안(모의)"은 채택하기 전까지 현재 초안이 아니다(예산 원장·claim 저장은 T07 규칙). 편집은 본문 + 채널 형식(JSON), 첨부는 올린 파일 중에서 역할(이미지·영상·썸네일·첨부)을 골라 붙인다.
 - **stale**: 원고가 바뀌면 "원문이 바뀜 — 재검토 필요". 저장 값이 아니라 파생 판정이며, 수정만으로는 풀리지 않는다 — "현재 원문으로 다시 초안". AI 가 자동으로 다시 만들지 않는다.
-- **검토로**: stale 이 아니고, 채널 필수 미디어(Instagram 이미지 1개 이상, YouTube 완성 영상 1개)가 있고, 미해결 1인칭 경험 주장이 없을 때만. 완성 영상 업로드는 아직 없다(D14 사용자 결정 필요).
+- **검토로**: stale 이 아니고, 채널 필수 미디어(Instagram 이미지 1개 이상, YouTube 완성 영상 1개)가 있고, 미해결 1인칭 경험 주장이 없을 때만. 완성 영상은 T08 업로드 세션으로 올려 첨부할 수 있다(D15).
 - **배포 파일 만들기**: 채널별 현재 초안의 본문·메타데이터·첨부 파일(sha256 확인)·manifest 를 ZIP 으로 — "배포 파일(수동 게시용). 자동 게시 아님". 승인·게시 기록이 아니다. 위치 `EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip`.
 
 | API | 설명 |
@@ -299,6 +299,32 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - migration `0009_t09_variants`(variants·variant_versions·variant_assets, generation_runs.variant_id, claims.variant_version_id). 새 표는 내보내기·복원에 포함된다.
 
+### 음성 전사·큰 파일 업로드 (M2, T08 — 모의 전사)
+결정 D9·D15(docs/DECISIONS.md). **외부 호출·과금·비밀 0.** 전사는 모의(`STT_MODE=mock`, 파일 checksum 으로 정해지는 자리표시 문장 — 실제 음성 인식 아님). 화면 `/record`(상단 "음성").
+
+- **업로드 세션(A14)**: 음성(MP3·M4A·WAV·WebM, 최대 200MB)·영상(MP4·WebM·MOV, 최대 2GB)을 4–8MiB 조각(기본 8MiB)으로 올린다. 끊기면 같은 세션을 `GET` 해 받은 위치(`next_index`)부터 이어 올린다(화면은 파일별로 세션 ID 를 브라우저에 기억). 같은 조각 재전송은 그대로(200), 다른 내용이면 409. 세션은 24시간 뒤 만료되고 worker 가 조각을 지운다.
+- **완료 검사**: 서버가 조각을 이어 붙이며(메모리에 전체를 올리지 않음) 크기·앞부분 형식 서명·sha256 을 확인한다. 통과하면 asset `VERIFIED`(`verification_scope=signature_size_checksum` — 재생 가능 여부·디코딩은 확인하지 않음). 실패하면 세션 rejected + 조각 삭제(415 형식, 400 크기·checksum).
+- **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(`/api/health`·전사 목록 조회 때). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
+- **전사 본문**: 버전 불변. 수정은 새 버전(`base_version` 이 최신이 아니면 409). "이 버전을 소재로 보내기" → 소재(원문 = 전사 본문, 메모 "음성 전사(모의)").
+- **원음 보존**(기본 켬): 끄면 전사 성공 뒤 원본 파일을 지우고 `assets.deleted_at` 을 남긴다(다운로드 410, 채널 초안에 첨부된 파일은 지우지 않음). 내보내기에는 메타데이터만(`asset_deleted` 경고).
+- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). `GET /api/health` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름)와 `uploads`(임시 영역 세션 폴더·파일 수·바이트), 설정 화면 "AI 모드·비용"에서 확인.
+- **브라우저 녹음**: `/record` 는 `MediaRecorder` 지원 여부만 알려 준다(미지원 → "이 기기에서는 브라우저 녹음을 지원하지 않습니다 → 파일 업로드"). 녹음 기능은 기기 확인 뒤 추가(docs/01).
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/uploads/sessions` | `{kind: audio\|video, mime, bytes, sha256?, chunk_size?}` → 201(`chunk_size`·`chunk_count`·`expires_at`), 형식 415, 한도 413 |
+| `GET`·`DELETE /api/uploads/sessions/{id}` | 진행 상태(`received_bytes`·`next_index`·`missing_indexes`·`progress`) · 중단(open 만) |
+| `PUT /api/uploads/sessions/{id}/chunks/{index}` | 조각 바이트(선택 `x-chunk-sha256`) → 새 조각 201 · 같은 내용 200 · 다른 내용 409 `chunk_mismatch` |
+| `POST /api/uploads/sessions/{id}/complete` | 검사 → 200 `{asset(VERIFIED), session}` · 조각 부족 409 `upload_incomplete` · 거부 415/400 `upload_rejected` |
+| `POST /api/assets/{id}/transcribe` | `{duration_seconds?, keep_original?}` → 202 job · 음성·영상 아님 415 · 진행 중 409 · 원본 삭제됨 410 · 예산 429 · live 503 |
+| `GET /api/transcription-jobs?asset_id=` · `GET /api/transcription-jobs/{id}` | 목록(inline tick 1회 후) · 한 작업(버전 목록·최신 본문·`mock_warning`) |
+| `POST /api/transcription-jobs/{id}/cancel` | queued·running → canceled, 끝난 작업 409 |
+| `GET /api/transcripts/{id}` · `POST /api/transcripts/{id}/versions` | 전사 버전 · `{base_version, text}` → 201 새 버전, 오래된 base 409 `stale_transcript` |
+| `POST /api/transcripts/{id}/to-capture` | 소재 저장 → 201(같은 버전 재요청 200) |
+
+- 다른 사용자의 세션·조각·파일·작업·전사는 모든 경로에서 404. 조각 파일 위치 `STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>`(UUID·정수만으로 경로를 만듦).
+- migration `0012_t08_uploads_transcription`(upload_sessions·upload_chunks·transcription_jobs·transcripts, assets.verification_scope·deleted_at, captures.capture_transcript_id, usage_ledger.transcription_job_id·audio_seconds — run_id 와 둘 중 하나). 업로드 세션·조각은 내보내기에서 **제외**(전송 중 임시 상태), 전사 job·버전은 **포함**. 복원 시 진행 중이던 job 은 canceled 로 넣고 예약 원장은 예약액으로 확정한다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -310,7 +336,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
-| `pnpm worker` | worker tick 1회(M0: DB 연결 확인만) 후 종료 | exit 0, JSON 출력 |
+| `pnpm worker` | worker tick 1회(T08: 만료된 업로드 세션 정리만 — 전사는 web inline worker) 후 종료 | exit 0, JSON 출력 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 
 ### PGlite 단일 연결 주의
@@ -323,4 +349,5 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - LLM: `MockLlmProvider`(결정적, 네트워크 없음, 경고 `모의 응답: 실제 AI 호출 아님`). `LLM_MODE=live`는 M0에 공급자가 없어 거부된다.
 - 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 기능이 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
 - 수집: `DisabledCollector`는 항상 CollectorDisabledError.
+- 음성 전사(T08): `MockTranscriber`(결정적, 네트워크 없음, 경고 `모의 전사: 실제 음성 인식 결과가 아닙니다(자리표시 문장)`). `STT_MODE=live`는 어댑터가 없어 거부된다.
 - Next.js 텔레메트리는 `apps/web/scripts/next.mjs`에서 `NEXT_TELEMETRY_DISABLED=1`로 끈다(사용자 전역 설정은 변경하지 않음).

@@ -6,7 +6,9 @@
  * 대신 key 는 `assets/<uuid>/<uuid>` 형식만 허용해 경로 조작(`..`, 절대경로, 역슬래시)이 파일 시스템에 닿지 않게 한다.
  */
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import path from 'node:path';
 import { assertValidStorageKey, ObjectStorageNotImplementedError, type AppConfig } from '@cs/domain';
 
@@ -17,6 +19,10 @@ export interface StorageAdapter {
   get(key: string): Promise<Uint8Array<ArrayBuffer> | null>;
   exists(key: string): Promise<boolean>;
   delete(key: string): Promise<void>;
+  /** T08: 서버가 이미 검증한 로컬 파일을 key 로 옮긴다(큰 파일을 메모리에 올리지 않음). 원본 파일은 사라진다. */
+  putFile(key: string, srcPath: string): Promise<void>;
+  /** T08: 스트리밍 읽기(큰 파일 다운로드). 없으면 null. */
+  openStream(key: string): Promise<{ stream: ReadableStream<Uint8Array>; bytes: number } | null>;
 }
 
 export class LocalStorageAdapter implements StorageAdapter {
@@ -72,6 +78,39 @@ export class LocalStorageAdapter implements StorageAdapter {
 
   async delete(key: string): Promise<void> {
     await rm(/*turbopackIgnore: true*/ this.pathFor(key), { force: true });
+  }
+
+  async putFile(key: string, srcPath: string): Promise<void> {
+    const full = this.pathFor(key);
+    await mkdir(/*turbopackIgnore: true*/ path.dirname(full), { recursive: true });
+    try {
+      await rename(/*turbopackIgnore: true*/ srcPath, full);
+    } catch (e) {
+      // 다른 볼륨이면 복사 후 임시 이름에서 rename(반쯤 쓴 파일이 key 로 보이지 않게)
+      if ((e as NodeJS.ErrnoException).code !== 'EXDEV') throw e;
+      const tmp = `${full}.tmp-${randomBytes(6).toString('hex')}`;
+      try {
+        await copyFile(/*turbopackIgnore: true*/ srcPath, tmp);
+        await rename(/*turbopackIgnore: true*/ tmp, full);
+      } finally {
+        await rm(/*turbopackIgnore: true*/ tmp, { force: true }).catch(() => undefined);
+      }
+      await rm(/*turbopackIgnore: true*/ srcPath, { force: true });
+    }
+  }
+
+  async openStream(key: string): Promise<{ stream: ReadableStream<Uint8Array>; bytes: number } | null> {
+    const full = this.pathFor(key);
+    let size: number;
+    try {
+      const st = await stat(/*turbopackIgnore: true*/ full);
+      if (!st.isFile()) return null;
+      size = st.size;
+    } catch {
+      return null;
+    }
+    const stream = Readable.toWeb(createReadStream(/*turbopackIgnore: true*/ full)) as unknown as ReadableStream<Uint8Array>;
+    return { stream, bytes: size };
   }
 }
 

@@ -1,7 +1,16 @@
 /** 서버 전용 헬퍼(route handler / server component 에서만 import). */
-import { getDb, resolveFromRoot, type DbHandle } from '@cs/db';
+import { getDb, resolveFromRoot, uploadStoreFor, type DbHandle, type UploadStore } from '@cs/db';
 import { assertLiveLlmAllowed, loadConfig, type AppConfig } from '@cs/domain';
-import { createStorage, LiveLlmProvider, MockLlmProvider, type LlmProvider, type StorageAdapter } from '@cs/providers';
+import {
+  createStorage,
+  LiveLlmProvider,
+  LiveTranscriber,
+  MockLlmProvider,
+  MockTranscriber,
+  type LlmProvider,
+  type StorageAdapter,
+  type Transcriber,
+} from '@cs/providers';
 
 export function getConfig(): AppConfig {
   return loadConfig(process.env);
@@ -32,4 +41,25 @@ export function getLlm(config: AppConfig = getConfig()): LlmProvider {
   }
   const fail = process.env.NODE_ENV === 'test' && process.env.LLM_MOCK_FAIL_NEXT === '1';
   return new MockLlmProvider({ fail });
+}
+
+/** T08: 업로드 조각 저장소(STORAGE_LOCAL_DIR/uploads). */
+export function getUploadStore(config: AppConfig = getConfig()): UploadStore {
+  return uploadStoreFor(config);
+}
+
+/**
+ * T08: 전사 요청 전 확인. STT_MODE=live 는 승인 기록·공급자·모델·가격이 있어도 어댑터가 없어 항상 거부(503, 기록 없음).
+ */
+export function assertTranscriptionAllowed(config: AppConfig = getConfig()): void {
+  if (config.STT_MODE === 'live') new LiveTranscriber(config).assertReady();
+}
+
+/**
+ * T08: inline worker 가 쓰는 전사기 — 항상 모의(provider='mock' job 만 처리). 외부 호출 없음.
+ * 실패 주입: NODE_ENV=test 이고 STT_MOCK_FAIL_NEXT=1 일 때만(운영 빌드에서는 무시).
+ */
+export function getWorkerTranscriber(): Transcriber {
+  const fail = process.env.NODE_ENV === 'test' && process.env.STT_MOCK_FAIL_NEXT === '1';
+  return new MockTranscriber({ fail });
 }

@@ -216,7 +216,7 @@ describe('M1 게이트: 입력 → 검색 → 원고 수정 → export → 빈 D
     const paths = entries.map((e) => e.path);
     expect(paths.some((p) => /session/i.test(p))).toBe(false);
     expect(Object.keys(exported.manifest.tables)).not.toContain('sessions');
-    expect(exported.manifest.excluded_tables).toEqual(['export_runs', 'restore_runs', 'sessions']);
+    expect(exported.manifest.excluded_tables).toEqual(['export_runs', 'restore_runs', 'sessions', 'upload_chunks', 'upload_sessions']);
     const all = Buffer.concat(entries.map((e) => Buffer.from(e.bytes))).toString('utf8');
     expect(all).not.toContain('token_hash');
     expect(all).not.toContain(A); // 식별자 원문 없음(가린 형태만)

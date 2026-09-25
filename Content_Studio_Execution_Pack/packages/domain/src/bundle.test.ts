@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildBundle,
   BundleError,
+  checkIntegrity,
   EXCLUDED_TABLES,
   EXPORTED_TABLES,
   fencedVerbatim,
@@ -48,6 +49,7 @@ function tables(): BundleTables {
         revision: 1,
         updated_at: TS,
         content_hash: 'abc',
+        capture_transcript_id: null,
       },
     ],
     capture_revisions: [],
@@ -91,9 +93,13 @@ function tables(): BundleTables {
         checksum: sha256Hex(PNG),
         rights_status: 'owned',
         verification_state: 'VERIFIED',
+        verification_scope: 'signature_size_checksum',
+        deleted_at: null,
         created_at: TS,
       },
     ],
+    transcription_jobs: [],
+    transcripts: [],
     audit_events: [],
   };
 }
@@ -270,5 +276,96 @@ describe('parseBundle', () => {
       ...b.entries.slice(1).map((e) => (e.path === p ? { path: p, bytes: other } : e)),
     ];
     expect(() => parseBundle(entries, { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'manifest_mismatch' }));
+  });
+});
+
+describe('T08 전사 표·지운 원본', () => {
+  const JOB = '77777777-7777-4777-8777-777777777777';
+  const T1 = '88888888-8888-4888-8888-888888888881';
+  const LEDGER = '99999999-9999-4999-8999-999999999999';
+  const withJob = (): BundleTables => {
+    const t = tables();
+    t.transcription_jobs = [
+      {
+        id: JOB,
+        asset_id: ASSET,
+        state: 'succeeded',
+        provider: 'mock',
+        model: 'mock-stt-v1',
+        progress: 100,
+        transcript_version_id: T1,
+        error: null,
+        attempts: 1,
+        keep_original: true,
+        audio_seconds: 60,
+        created_at: TS,
+        started_at: TS,
+        finished_at: TS,
+      },
+    ];
+    t.transcripts = [{ id: T1, job_id: JOB, version: 1, text: '[모의 전사 1] 문장', segments: [{ start_ms: 0, end_ms: 60000, text: '[모의 전사 1] 문장' }], created_by: 'mock', created_at: TS }];
+    t.usage_ledger = [
+      {
+        id: LEDGER,
+        run_id: null,
+        transcription_job_id: JOB,
+        audio_seconds: 60,
+        reserved_amount: '0.000000',
+        actual_amount: '0.000000',
+        currency: 'USD',
+        tokens_in: null,
+        tokens_out: null,
+        pricing_snapshot: { kind: 'stt' },
+        state: 'settled',
+        failed: false,
+        overage_amount: '0.000000',
+        over_budget: false,
+        created_at: TS,
+        settled_at: TS,
+      },
+    ];
+    t.captures[0]!.capture_transcript_id = T1;
+    return t;
+  };
+
+  it('정상 관계는 통과하고 묶음을 왕복한다', () => {
+    expect(() => checkIntegrity(withJob())).not.toThrow();
+    const b = buildBundle(input({ tables: withJob() }));
+    const parsed = parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS });
+    expect(parsed.tables.transcripts[0]!.text).toBe('[모의 전사 1] 문장');
+    expect(parsed.tables.captures[0]!.capture_transcript_id).toBe(T1);
+  });
+
+  it('원장은 run_id·transcription_job_id 중 정확히 하나, job 의 첫 전사는 같은 job, 소재의 전사는 묶음 안', () => {
+    const both = withJob();
+    both.usage_ledger[0]!.run_id = JOB;
+    expect(() => checkIntegrity(both)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const none = withJob();
+    none.usage_ledger[0]!.transcription_job_id = null;
+    expect(() => checkIntegrity(none)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const otherJob = withJob();
+    otherJob.transcripts[0]!.job_id = '77777777-7777-4777-8777-000000000000';
+    expect(() => checkIntegrity(otherJob)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const noTranscript = withJob();
+    noTranscript.transcription_jobs[0]!.transcript_version_id = null;
+    expect(() => checkIntegrity(noTranscript)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const dangling = withJob();
+    dangling.transcripts = [];
+    dangling.transcription_jobs[0]!.transcript_version_id = null;
+    dangling.transcription_jobs[0]!.state = 'failed';
+    expect(() => checkIntegrity(dangling)).toThrow(expect.objectContaining({ code: 'integrity' })); // 소재가 없는 전사를 가리킴
+    const dupVersion = withJob();
+    dupVersion.transcripts.push({ ...dupVersion.transcripts[0]!, id: '88888888-8888-4888-8888-888888888882' });
+    expect(() => checkIntegrity(dupVersion)).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
+  it('지운 원본(deleted_at)은 파일 없이 메타데이터만 + asset_deleted 경고(누락 경고와 구분)', () => {
+    const t = tables();
+    t.assets[0]!.deleted_at = TS;
+    const b = buildBundle(input({ tables: t }));
+    expect(b.manifest.assets[0]).toMatchObject({ id: ASSET, missing: true });
+    expect(b.manifest.warnings).toEqual([expect.objectContaining({ code: 'asset_deleted', asset_id: ASSET })]);
+    expect(b.entries.some((e) => e.path.startsWith('assets/'))).toBe(false);
+    expect(parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS }).tables.assets[0]!.deleted_at).toBe(TS);
   });
 });

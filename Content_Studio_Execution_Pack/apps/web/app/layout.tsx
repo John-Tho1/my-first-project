@@ -17,6 +17,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <nav className="site-nav" aria-label="주요 화면">
           <Link href="/">오늘</Link>
           <Link href="/captures">소재함</Link>
+          <Link href="/record">음성</Link>
           <Link href="/ideas">카드</Link>
           <Link href="/contents">아카이브</Link>
           <Link href="/search">검색</Link>

@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
-import { budgetPolicy, formatMsk, fromMicro, liveLlmReadiness } from '@cs/domain';
+import { budgetPolicy, formatMsk, fromMicro, liveLlmReadiness, sttBudgetPolicy, sttLiveReadiness } from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { getAppDb, getConfig } from '../../lib/server';
@@ -34,6 +34,8 @@ export default async function SettingsPage({
   const usage = await monthlyUsage(db, session.ownerId);
   const policy = budgetPolicy(config);
   const live = liveLlmReadiness(config);
+  const stt = sttBudgetPolicy(config);
+  const sttLive = sttLiveReadiness(config);
   const exports = await listExportRuns(db, session.ownerId, 20);
   const restores = await listRestoreRuns(db, session.ownerId, 10);
   const exported = str(q.exported) ? exports.find((e) => e.id === str(q.exported)) : undefined;
@@ -84,6 +86,14 @@ export default async function SettingsPage({
           live 준비 안 됨: {live.missing.join(', ')}
         </p>
         <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D8·D13). 설정 값·키는 이 화면에 보이지 않습니다.</p>
+        <p className="meta">
+          <span className={config.STT_MODE === 'live' ? 'tag warn' : 'tag'}>음성 전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 없음)' : '실제(live)'}</span>
+          <span>{stt.pricing ? `1분 가격 설정됨(${stt.currency})` : '1분 가격 미설정(모의는 0 으로 기록)'}</span>
+          <span>예산 통화·상한은 AI 와 같은 원장을 씁니다</span>
+        </p>
+        <p className="notice" role="note">
+          음성 전사 live 준비 안 됨: {sttLive.missing.join(', ')}
+        </p>
       </section>
 
       <section className="card archive" aria-labelledby="brand-title">

@@ -216,7 +216,20 @@ export interface AuditInput {
     | 'export.create'
     | 'export.download'
     | 'restore.preview'
-    | 'restore.commit';
+    | 'restore.commit'
+    | 'upload.session_create'
+    | 'upload.complete'
+    | 'upload.reject'
+    | 'upload.abort'
+    | 'upload.expire'
+    | 'asset.delete_original'
+    | 'asset.delete_original_skipped'
+    | 'transcription.request'
+    | 'transcription.cancel'
+    | 'transcription.succeeded'
+    | 'transcription.failed'
+    | 'transcript.version_create'
+    | 'transcript.to_capture';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

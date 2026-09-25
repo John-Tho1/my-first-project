@@ -130,6 +130,8 @@ export const captures = pgTable(
     revision: integer('revision').notNull().default(1),
     updatedAt: ts('updated_at').notNull().defaultNow(),
     contentHash: text('content_hash'),
+    /** T08: 음성 전사에서 만든 소재면 그 전사 버전(transcripts.id). 같은 owner 의 전사만(복합 FK). */
+    captureTranscriptId: uuid('capture_transcript_id'),
   },
   (t) => [
     unique('captures_owner_command_key_uq').on(t.ownerId, t.commandKey),
@@ -143,6 +145,11 @@ export const captures = pgTable(
       name: 'captures_source_same_owner_fk',
       columns: [t.sourceId, t.ownerId],
       foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'captures_transcript_same_owner_fk',
+      columns: [t.captureTranscriptId, t.ownerId],
+      foreignColumns: [transcripts.id, transcripts.ownerId],
     }).onDelete('restrict'),
   ],
 );
@@ -597,7 +604,8 @@ export const claimSources = pgTable(
 );
 
 /**
- * AI 비용 원장(T07, A15). run 마다 한 행: 호출 전 reserved(예약액) → 호출 후 settled(실제액).
+ * AI 비용 원장(T07, A15). T08: 음성 전사 job 도 같은 원장을 쓴다 — 행마다 run_id 또는 transcription_job_id 중 정확히 하나.
+ * run 마다 한 행: 호출 전 reserved(예약액) → 호출 후 settled(실제액).
  * 실패한 호출도 settled + actual = reserved + failed=true 로 남긴다(docs/02: 실패 재시도도 예약량에 반영). released 는 예약 취소(현재 경로 없음).
  * 금액은 numeric(18,6) 문자열. pricing_snapshot 에는 단가 값만(키·비밀 없음).
  */
@@ -608,7 +616,11 @@ export const usageLedger = pgTable(
     ownerId: uuid('owner_id')
       .notNull()
       .references(() => users.id, { onDelete: 'restrict' }),
-    runId: uuid('run_id').notNull(),
+    runId: uuid('run_id'),
+    /** T08: 음성 전사 job(모의 포함). run_id 와 둘 중 하나만. */
+    transcriptionJobId: uuid('transcription_job_id'),
+    /** T08: 예약·확정에 쓴 음성 길이(초). 전사 원장만. */
+    audioSeconds: integer('audio_seconds'),
     reservedAmount: numeric('reserved_amount', { precision: 18, scale: 6 }).notNull(),
     actualAmount: numeric('actual_amount', { precision: 18, scale: 6 }),
     currency: text('currency').notNull(),
@@ -626,12 +638,19 @@ export const usageLedger = pgTable(
   },
   (t) => [
     unique('usage_ledger_run_uq').on(t.runId),
+    unique('usage_ledger_transcription_job_uq').on(t.transcriptionJobId),
+    check('usage_ledger_subject_chk', sql`num_nonnulls(${t.runId}, ${t.transcriptionJobId}) = 1`),
     check('usage_ledger_state_chk', sql`${t.state} in ('reserved', 'settled', 'released')`),
     index('usage_ledger_owner_created_idx').on(t.ownerId, t.createdAt),
     foreignKey({
       name: 'usage_ledger_run_same_owner_fk',
       columns: [t.runId, t.ownerId],
       foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'usage_ledger_transcription_job_same_owner_fk',
+      columns: [t.transcriptionJobId, t.ownerId],
+      foreignColumns: [transcriptionJobs.id, transcriptionJobs.ownerId],
     }).onDelete('restrict'),
   ],
 );
@@ -653,6 +672,12 @@ export const assets = pgTable(
     checksum: text('checksum').notNull(),
     rightsStatus: text('rights_status').notNull().default('unknown'),
     verificationState: text('verification_state').notNull().default('pending'),
+    /**
+     * T08(D15): VERIFIED 가 실제로 확인한 범위. 'signature_size_checksum' = 앞부분 형식 서명·크기·sha256(디코딩·재생 가능 여부는 확인 안 함).
+     */
+    verificationScope: text('verification_scope').notNull().default('signature_size_checksum'),
+    /** T08: 원음 보존을 끈 전사 뒤 파일을 지운 시각. 행(메타데이터)은 남고 다운로드는 410. */
+    deletedAt: ts('deleted_at'),
     createdAt: ts('created_at').notNull().defaultNow(),
   },
   (t) => [
@@ -783,5 +808,149 @@ export const restoreRuns = pgTable(
     check('restore_runs_status_chk', sql`${t.status} in ('previewed', 'committed', 'rejected', 'failed')`),
     check('restore_runs_mode_chk', sql`${t.mode} is null or ${t.mode} in ('empty_only', 'add_missing')`),
     index('restore_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 업로드 세션(T08, A14). 큰 음성·영상 파일을 조각으로 받는다. 조각 파일은 STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>.
+ * state: open → completed(조립·검사 중) → verified(asset 생성) | rejected(검사 실패, 조각 삭제) / open → aborted | expired(24시간, worker 가 조각 삭제).
+ * 주의: export/restore 대상에서 제외한다 — 전송 중 임시 상태이며 조각 파일은 묶음에 넣지 않는다.
+ */
+export const uploadSessions = pgTable(
+  'upload_sessions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    declaredMime: text('declared_mime').notNull(),
+    declaredBytes: bigint('declared_bytes', { mode: 'number' }).notNull(),
+    receivedBytes: bigint('received_bytes', { mode: 'number' }).notNull().default(0),
+    chunkSize: integer('chunk_size').notNull(),
+    checksumExpected: text('checksum_expected'),
+    checksumActual: text('checksum_actual'),
+    state: text('state').notNull().default('open'),
+    /** rejected 이유(코드): size_mismatch | unsupported_signature | mime_mismatch | checksum_mismatch | assembly_failed */
+    rejectReason: text('reject_reason'),
+    assetId: uuid('asset_id'),
+    expiresAt: ts('expires_at').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('upload_sessions_id_owner_uq').on(t.id, t.ownerId),
+    check('upload_sessions_kind_chk', sql`${t.kind} in ('audio', 'video')`),
+    check('upload_sessions_state_chk', sql`${t.state} in ('open', 'completed', 'verified', 'rejected', 'aborted', 'expired')`),
+    check('upload_sessions_bytes_chk', sql`${t.declaredBytes} > 0 and ${t.receivedBytes} >= 0`),
+    check('upload_sessions_chunk_size_chk', sql`${t.chunkSize} between 4194304 and 8388608`),
+    index('upload_sessions_owner_created_idx').on(t.ownerId, t.createdAt.desc()),
+    index('upload_sessions_state_expires_idx').on(t.state, t.expiresAt),
+    foreignKey({
+      name: 'upload_sessions_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 받은 조각(T08). 같은 번호를 같은 sha256 으로 다시 보내면 그대로(멱등), 다른 sha256 이면 409. export 제외. */
+export const uploadChunks = pgTable(
+  'upload_chunks',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    chunkIndex: integer('chunk_index').notNull(),
+    bytes: integer('bytes').notNull(),
+    sha256: text('sha256').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('upload_chunks_session_index_uq').on(t.sessionId, t.chunkIndex),
+    check('upload_chunks_index_chk', sql`${t.chunkIndex} >= 0 and ${t.bytes} > 0`),
+    foreignKey({
+      name: 'upload_chunks_session_same_owner_fk',
+      columns: [t.sessionId, t.ownerId],
+      foreignColumns: [uploadSessions.id, uploadSessions.ownerId],
+    }).onDelete('cascade'),
+  ],
+);
+
+/**
+ * 음성 전사 job(T08, 결정 D9). queued → running(진행률 25·50·75) → succeeded(100, transcripts v1) | failed / queued·running → canceled.
+ * provider 는 T08 에서 항상 'mock'. transcript_version_id 는 이 job 이 만든 첫 전사(v1) — transcripts 와 서로 참조하므로 DB FK 대신
+ * 앱·묶음 검사로 강제한다(같은 job·같은 owner).
+ * 같은 asset 에 진행 중(queued·running) job 은 하나만(부분 unique 색인).
+ */
+export const transcriptionJobs = pgTable(
+  'transcription_jobs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    assetId: uuid('asset_id').notNull(),
+    state: text('state').notNull().default('queued'),
+    provider: text('provider').notNull().default('mock'),
+    model: text('model').notNull(),
+    progress: integer('progress').notNull().default(0),
+    transcriptVersionId: uuid('transcript_version_id'),
+    error: text('error'),
+    attempts: integer('attempts').notNull().default(0),
+    /** false 면 전사 성공 뒤 원본 파일을 지운다(assets.deleted_at). */
+    keepOriginal: boolean('keep_original').notNull().default(true),
+    /** 예약에 쓴 음성 길이(초) */
+    audioSeconds: integer('audio_seconds').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    startedAt: ts('started_at'),
+    finishedAt: ts('finished_at'),
+  },
+  (t) => [
+    unique('transcription_jobs_id_owner_uq').on(t.id, t.ownerId),
+    check('transcription_jobs_state_chk', sql`${t.state} in ('queued', 'running', 'succeeded', 'failed', 'canceled')`),
+    check('transcription_jobs_progress_chk', sql`${t.progress} between 0 and 100`),
+    check('transcription_jobs_audio_seconds_chk', sql`${t.audioSeconds} > 0`),
+    index('transcription_jobs_owner_asset_idx').on(t.ownerId, t.assetId, t.createdAt.desc()),
+    index('transcription_jobs_state_idx').on(t.state, t.createdAt),
+    uniqueIndex('transcription_jobs_active_asset_uq').on(t.assetId).where(sql`${t.state} in ('queued', 'running')`),
+    foreignKey({
+      name: 'transcription_jobs_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 전사 본문 버전(T08). 불변(추가 전용 트리거). v1 = 전사기 결과(created_by 'mock'), 이후 = 사용자 수정(created_by 'owner').
+ * segments = [{start_ms, end_ms, text}] (사용자 수정 버전은 []).
+ */
+export const transcripts = pgTable(
+  'transcripts',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    version: integer('version').notNull(),
+    text: text('text').notNull(),
+    segments: jsonb('segments').$type<Array<{ start_ms: number; end_ms: number; text: string }>>().notNull().default(sql`'[]'::jsonb`),
+    createdBy: text('created_by').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('transcripts_job_version_uq').on(t.jobId, t.version),
+    unique('transcripts_id_owner_uq').on(t.id, t.ownerId),
+    check('transcripts_created_by_chk', sql`${t.createdBy} in ('mock', 'owner')`),
+    check('transcripts_version_chk', sql`${t.version} >= 1`),
+    foreignKey({
+      name: 'transcripts_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [transcriptionJobs.id, transcriptionJobs.ownerId],
+    }).onDelete('restrict'),
   ],
 );

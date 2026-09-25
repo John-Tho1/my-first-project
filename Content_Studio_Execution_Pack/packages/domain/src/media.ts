@@ -5,6 +5,7 @@
  */
 import { z } from 'zod';
 import { InvalidStorageKeyError, UnsupportedMediaTypeError } from './errors';
+import { isMediaMime, MEDIA_EXT } from './upload';
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
@@ -36,13 +37,15 @@ const MIME_TO_EXT: Record<AllowedMime, string> = {
 };
 
 export function extensionForMime(mime: string): string {
+  // T08: 음성·영상(업로드 세션으로만 들어옴)
+  if (isMediaMime(mime)) return MEDIA_EXT[mime];
   return MIME_TO_EXT[mime as AllowedMime] ?? 'bin';
 }
 
 /** 다운로드 응답용 Content-Type. 텍스트는 charset 명시. */
 export function contentTypeForMime(mime: string): string {
   if (mime === 'text/plain') return 'text/plain; charset=utf-8';
-  return (ALLOWED_MIME as readonly string[]).includes(mime) ? mime : 'application/octet-stream';
+  return (ALLOWED_MIME as readonly string[]).includes(mime) || isMediaMime(mime) ? mime : 'application/octet-stream';
 }
 
 function startsWith(bytes: Uint8Array, sig: readonly number[], offset = 0): boolean {

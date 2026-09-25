@@ -20,6 +20,11 @@ const LABELS: Record<string, string> = {
   LLM_BUDGET_PER_RUN_MAX: 'LLM_BUDGET_PER_RUN_MAX(1회 예약 상한)',
   LLM_PRICE_INPUT_PER_1K: 'LLM_PRICE_INPUT_PER_1K(입력 1K 토큰 가격)',
   LLM_PRICE_OUTPUT_PER_1K: 'LLM_PRICE_OUTPUT_PER_1K(출력 1K 토큰 가격)',
+  STT_MODE: 'STT_MODE(음성 전사 모드)',
+  STT_PROVIDER: 'STT_PROVIDER(음성 전사 공급자)',
+  STT_MODEL: 'STT_MODEL(음성 전사 모델)',
+  STT_LIVE_APPROVAL_REF: 'STT_LIVE_APPROVAL_REF(실제 음성 전사 승인 기록)',
+  STT_PRICE_PER_MINUTE: 'STT_PRICE_PER_MINUTE(음성 1분 가격)',
   PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
@@ -60,6 +65,15 @@ export const configSchema = z.object({
   LLM_BUDGET_PER_RUN_MAX: opt(decimalString.optional()),
   LLM_PRICE_INPUT_PER_1K: opt(decimalString.optional()),
   LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
+  /**
+   * T08(결정 D9·D15): 음성 전사. 기본 mock(결정적 모의 전사기, 외부 호출 없음). live 는 승인 기록·공급자·모델·가격이 있어도
+   * T08 에는 어댑터(HTTP 호출)가 없어 항상 거부된다. 예산 통화·상한은 LLM_BUDGET_* 를 함께 쓴다(같은 원장).
+   */
+  STT_MODE: opt(z.enum(['mock', 'live']).default('mock')),
+  STT_PROVIDER: opt(z.string().min(1).optional()),
+  STT_MODEL: opt(z.string().min(1).optional()),
+  STT_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  STT_PRICE_PER_MINUTE: opt(decimalString.optional()),
   PUBLISH_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
   COLLECTOR_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
   WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),

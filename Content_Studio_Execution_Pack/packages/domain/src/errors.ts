@@ -65,7 +65,9 @@ export type AppErrorKind =
   /** T06: AI(모의 포함) 호출 실패 → 502 */
   | 'llm_failed'
   /** T07: AI 예산 상한 초과 → 429 */
-  | 'budget_exceeded';
+  | 'budget_exceeded'
+  /** T08: 의도적으로 지운 자료(원음 삭제 등) → 410 */
+  | 'gone';
 
 export class AppError extends Error {
   readonly kind: AppErrorKind;
@@ -202,5 +204,12 @@ export class CollectorNotEnabledError extends AppError {
 export class CollectorNotImplementedError extends AppError {
   constructor() {
     super('not_implemented', 'collector_not_implemented', '실제 수집기는 아직 구현되지 않았습니다(T19). 외부 자료를 가져오지 않았습니다.');
+  }
+}
+
+/** T08: 원음 보존을 끈 전사 뒤 삭제된 파일 — 410. 메타데이터(asset 행)는 남는다. */
+export class GoneError extends AppError {
+  constructor(message = '원본 파일은 전사 후 삭제되었습니다(원음 보존 안 함). 메타데이터만 남아 있습니다.') {
+    super('gone', 'asset_deleted', message);
   }
 }

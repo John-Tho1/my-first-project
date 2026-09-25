@@ -7,6 +7,7 @@ export * from './collector';
 export * from './llm';
 export * from './publisher';
 export * from './storage';
+export * from './stt';
 
 export interface Providers {
   llm: LlmProvider;

@@ -32,6 +32,7 @@ import {
   MetadataBodyMismatchError,
   renderVariantText,
   variantBodyMismatch,
+  GoneError,
   NotFoundError,
   parseChannelMetadata,
   roleMatchesMime,
@@ -572,12 +573,14 @@ export async function setVariantAssets(
     if (new Set(input.assets.map((a) => a.position)).size !== input.assets.length) throw new BadRequestError('첨부 순서(position)가 겹칩니다');
     const found = ids.length
       ? await tx
-          .select({ id: assets.id, mime: assets.mime })
+          .select({ id: assets.id, mime: assets.mime, deletedAt: assets.deletedAt })
           .from(assets)
           .where(and(eq(assets.ownerId, ownerId), inArray(assets.id, [...new Set(ids)])))
       : [];
     const mimeOf = new Map(found.map((f) => [f.id, f.mime]));
     if (ids.some((i) => !mimeOf.has(i))) throw new NotFoundError('파일을 찾을 수 없습니다');
+    // T08: 원음 보존을 끈 전사 뒤 지운 파일은 첨부할 수 없다(410).
+    if (found.some((f) => f.deletedAt !== null)) throw new GoneError('원본을 지운 파일은 첨부할 수 없습니다(원음 보존 안 함)');
     input.assets.forEach((a, k) => {
       if (!roleMatchesMime(a.role, mimeOf.get(ids[k]!)!)) {
         throw new AppError('bad_request', 'asset_role_mismatch', `파일 형식이 역할(${a.role})과 맞지 않습니다`);

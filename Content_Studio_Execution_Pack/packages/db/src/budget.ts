@@ -17,6 +17,7 @@ import {
   sumToMicro,
   reserveFor,
   toMicro,
+  type BudgetLimits,
   type BudgetPolicy,
   type FilteredClaim,
   type Reservation,
@@ -80,6 +81,22 @@ export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date):
  */
 export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: BudgetPolicy, prompt: string, now: Date): Promise<Reservation> {
   const reservation = reserveFor(policy, prompt);
+  await reserveMicroOrThrow(tx, ownerId, policy, reservation.reserveMicro, now);
+  return reservation;
+}
+
+/**
+ * T08: 예약액(micro)만으로 같은 검사(LLM·STT 공용). owner 잠금 → 통화 불일치 409 → 한도 429.
+ * 반드시 job·원장을 쓰는 트랜잭션 안에서 호출한다.
+ */
+export async function reserveMicroOrThrow(
+  tx: DbOrTx,
+  ownerId: string,
+  policy: BudgetLimits & { currency: string },
+  reserveMicro: bigint,
+  now: Date,
+): Promise<void> {
+  const reservation = { reserveMicro };
   if (!isStorableMicro(reservation.reserveMicro)) throw new AmountRangeError();
   await lockOwnerForBudget(tx, ownerId);
   const others = (await monthlyCurrencies(tx, ownerId, now)).filter((c) => c !== policy.currency);
@@ -100,7 +117,76 @@ export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: Budget
             : null,
     });
   }
-  return reservation;
+}
+
+/** T08: 전사 job 의 예약 원장(run_id 없음). */
+export async function insertReservedSttLedger(
+  tx: DbOrTx,
+  ownerId: string,
+  jobId: string,
+  currency: string,
+  reservation: { reserveMicro: bigint; audioSeconds: number; pricingSnapshot: Record<string, unknown> },
+  now: Date,
+): Promise<UsageLedgerRow> {
+  const rows = await tx
+    .insert(usageLedger)
+    .values({
+      ownerId,
+      runId: null,
+      transcriptionJobId: jobId,
+      audioSeconds: reservation.audioSeconds,
+      reservedAmount: fromMicro(reservation.reserveMicro),
+      currency,
+      pricingSnapshot: reservation.pricingSnapshot,
+      state: 'reserved',
+      createdAt: now,
+    })
+    .returning();
+  return rows[0]!;
+}
+
+export async function getSttLedger(tx: DbOrTx, ownerId: string, jobId: string): Promise<UsageLedgerRow | null> {
+  const rows = await tx
+    .select()
+    .from(usageLedger)
+    .where(and(eq(usageLedger.ownerId, ownerId), eq(usageLedger.transcriptionJobId, jobId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** T08: 시작 전 취소 — 예약을 풀어 0 으로(released). */
+export async function releaseLedger(tx: DbOrTx, ownerId: string, ledger: UsageLedgerRow, at: Date): Promise<void> {
+  await lockOwnerForBudget(tx, ownerId);
+  await tx
+    .update(usageLedger)
+    .set({ state: 'released', actualAmount: '0.000000', settledAt: at })
+    .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
+}
+
+/** T08: 전사 성공 — 실제 처리 길이 × 1분 가격으로 확정(초과는 기록, 숨기지 않음). */
+export async function settleSttLedgerSucceeded(
+  tx: DbOrTx,
+  ownerId: string,
+  ledger: UsageLedgerRow,
+  actualMicro: bigint,
+  audioSeconds: number,
+  at: Date,
+): Promise<void> {
+  await lockOwnerForBudget(tx, ownerId);
+  if (!isStorableMicro(actualMicro)) throw new AmountRangeError();
+  const reserved = toMicro(ledger.reservedAmount);
+  const overage = actualMicro > reserved ? actualMicro - reserved : 0n;
+  await tx
+    .update(usageLedger)
+    .set({
+      state: 'settled',
+      actualAmount: fromMicro(actualMicro),
+      overageAmount: fromMicro(overage),
+      overBudget: overage > 0n,
+      audioSeconds,
+      settledAt: at,
+    })
+    .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
 }
 
 export async function insertReservedLedger(

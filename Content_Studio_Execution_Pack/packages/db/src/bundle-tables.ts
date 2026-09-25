@@ -33,6 +33,8 @@ export const BUNDLE_TABLES: Record<ExportedTable, PgTable> = {
   claim_sources: schema.claimSources,
   usage_ledger: schema.usageLedger,
   assets: schema.assets,
+  transcription_jobs: schema.transcriptionJobs,
+  transcripts: schema.transcripts,
   audit_events: schema.auditEvents,
 };
 

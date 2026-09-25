@@ -85,6 +85,13 @@
       "when": 1790290998991,
       "tag": "0011_t09_fix_proposals",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790297049162,
+      "tag": "0012_t08_uploads_transcription",
+      "breakpoints": true
     }
   ]
 }

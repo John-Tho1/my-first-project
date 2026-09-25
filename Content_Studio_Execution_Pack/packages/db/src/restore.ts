@@ -106,6 +106,8 @@ export interface ApplyReport {
   insertedAssetIds: string[];
   /** FIX-T09(P1): review 조건(현재 버전·stale 아님·채널 미디어)을 못 채워 draft 로 낮춘 파생본 */
   downgradedVariants: DowngradedVariant[];
+  /** T08: 묶음에서 진행 중(queued·running)이던 전사 job — 복원 환경에서 다시 돌리지 않고 canceled 로 넣는다 */
+  interruptedTranscriptions: string[];
 }
 
 const MAX_CONFLICTS_LISTED = 200;
@@ -113,7 +115,13 @@ const MAX_CONFLICTS_LISTED = 200;
 /** 묶음의 부모 참조(같은 owner 에 있어야 삽입 가능). owned=true 는 부모가 "이번에 넣었거나 동일"일 때만(기존 다른 행에 덧붙이지 않음). */
 const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: RestoredTable; owned?: boolean }>>> = {
   source_versions: [{ col: 'source_id', table: 'sources', owned: true }],
-  captures: [{ col: 'source_id', table: 'sources' }],
+  // T08: 전사에서 만든 소재는 그 전사 버전이 이번에 들어갔거나 같은 행일 때만.
+  captures: [
+    { col: 'source_id', table: 'sources' },
+    { col: 'capture_transcript_id', table: 'transcripts' },
+  ],
+  transcription_jobs: [{ col: 'asset_id', table: 'assets' }],
+  transcripts: [{ col: 'job_id', table: 'transcription_jobs', owned: true }],
   capture_revisions: [{ col: 'capture_id', table: 'captures', owned: true }],
   idea_captures: [
     { col: 'idea_id', table: 'ideas' },
@@ -146,7 +154,10 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'claim_id', table: 'claims', owned: true },
     { col: 'source_version_id', table: 'source_versions' },
   ],
-  usage_ledger: [{ col: 'run_id', table: 'generation_runs', owned: true }],
+  usage_ledger: [
+    { col: 'run_id', table: 'generation_runs', owned: true },
+    { col: 'transcription_job_id', table: 'transcription_jobs', owned: true },
+  ],
   // T09
   variants: [{ col: 'content_id', table: 'contents', owned: true }],
   variant_versions: [
@@ -287,9 +298,15 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         return a !== 'inserted' && a !== 'same';
       })
       .map((v) => ({ table, id: v.id, reason: 'dependency' as const }));
-  const orphaned = [...orphanOf('content_versions'), ...orphanOf('variant_versions')];
+  const orphaned: RestoreConflict[] = [...orphanOf('content_versions'), ...orphanOf('variant_versions')];
+  // T08: job 의 첫 전사(transcript_version_id)도 서로 참조하는 순환이라 여기서 확인한다 — 들어간 job 의 전사가 빠졌으면 중단.
+  for (const j of bundle.tables.transcription_jobs) {
+    if (j.transcript_version_id === null || avail.transcription_jobs!.get(j.id) !== 'inserted') continue;
+    const a = avail.transcripts!.get(j.transcript_version_id);
+    if (a !== 'inserted' && a !== 'same') orphaned.push({ table: 'transcription_jobs', id: j.id, reason: 'dependency' });
+  }
   if (orphaned.length > 0) {
-    throw new AppError('conflict', 'restore_conflict', 'AI 제안·채택 버전의 실행 기록을 복원할 수 없어 복원을 중단했습니다', {
+    throw new AppError('conflict', 'restore_conflict', 'AI 제안·채택 버전 또는 전사 작업의 실행 기록을 복원할 수 없어 복원을 중단했습니다', {
       conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED),
     });
   }
@@ -306,7 +323,19 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       downgradedVariants.push({ variant_id: v.id, channel: v.channel, reasons });
     }
   }
-  return { tables, conflicts, insertedAssetIds, downgradedVariants };
+  // T08: 진행 중이던 전사 job 은 복원 환경의 worker 가 다시 처리하지 않도록 canceled 로 바꾸고, 예약 원장은 예약액으로 확정(failed=true)한다.
+  const interruptedTranscriptions: string[] = [];
+  for (const j of bundle.tables.transcription_jobs) {
+    if (avail.transcription_jobs!.get(j.id) !== 'inserted' || (j.state !== 'queued' && j.state !== 'running')) continue;
+    await tx.execute(
+      sql`update transcription_jobs set state = 'canceled', error = '복원 시 진행 중이던 작업(중단됨)', finished_at = coalesce(finished_at, now()) where id = ${j.id}::uuid and owner_id = ${ownerId}::uuid`,
+    );
+    await tx.execute(
+      sql`update usage_ledger set state = 'settled', actual_amount = reserved_amount, failed = true, settled_at = now() where transcription_job_id = ${j.id}::uuid and owner_id = ${ownerId}::uuid and state = 'reserved'`,
+    );
+    interruptedTranscriptions.push(j.id);
+  }
+  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions };
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
@@ -346,6 +375,8 @@ export interface RestorePreview {
   warnings: BundleManifest['warnings'];
   /** FIX-T09: 복원하면 draft 로 낮아질 review 파생본 */
   downgraded_variants: DowngradedVariant[];
+  /** T08: 복원하면 canceled 로 들어갈 진행 중 전사 job */
+  interrupted_transcriptions: string[];
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
@@ -402,6 +433,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     conflicts: r.conflicts.slice(0, MAX_CONFLICTS_LISTED),
     conflicts_total: r.conflicts.length,
     downgraded_variants: r.downgradedVariants,
+    interrupted_transcriptions: r.interruptedTranscriptions,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
@@ -530,6 +562,8 @@ export interface CommitResult {
   assets_missing: number;
   committed_at: string;
   downgraded_variants: DowngradedVariant[];
+  /** T08 */
+  interrupted_transcriptions: string[];
 }
 
 async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
@@ -630,6 +664,7 @@ export async function commitRestore(
         conflicts: report.conflicts.slice(0, MAX_CONFLICTS_LISTED),
         conflicts_total: report.conflicts.length,
         downgraded_variants: report.downgradedVariants,
+        interrupted_transcriptions: report.interruptedTranscriptions,
         assets_written: written,
         assets_verified: verified,
         assets_missing: missing,

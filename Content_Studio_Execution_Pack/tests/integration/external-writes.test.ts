@@ -24,7 +24,8 @@ import {
   loadConfig,
   PublishDisabledError,
 } from '@cs/domain';
-import { createProviders, DisabledPublisher, MockLlmProvider, type Publisher } from '@cs/providers';
+import { createProviders, DisabledPublisher, MockChannelAdapter, MockChannelAdapterRegistry, MockLlmProvider, type Publisher } from '@cs/providers';
+import { runWorkerTick } from '@cs/worker';
 
 describe('게시·수집 가드 (fail closed)', () => {
   it('기본 설정: publish → PublishDisabledError', async () => {
@@ -139,6 +140,20 @@ describe('T10: 기본 모드에서 배포 실행은 MOCK 작업만 만들고 외
     expect(jobs.every((j) => j.state === 'QUEUED')).toBe(true);
     const events = await h.db.select().from(schema.jobEvents);
     expect(events.every((e) => (e.sanitizedDetails as { mode?: string }).mode === 'MOCK')).toBe(true);
+
+    // T11(D18): 작업 처리기까지 돌려도 모의 어댑터만 부르고 publisher·fetch 는 0. 결과는 MOCK(실제 발행 실적 아님).
+    const adapter = new MockChannelAdapter({ readEnv: false });
+    const submitSpy = vi.spyOn(adapter, 'submit');
+    const tick = await runWorkerTick({ config, db: h.db, channelAdapters: new MockChannelAdapterRegistry(adapter), workerId: 'ext-writes' });
+    expect(tick.jobs?.results).toEqual({ CONFIRMED: 1 });
+    expect(submitSpy).toHaveBeenCalledTimes(1);
+    const pubs = await h.db.select().from(schema.publications);
+    expect(pubs).toHaveLength(1);
+    expect(pubs[0]).toMatchObject({ isMock: true, verification: 'MOCK' });
+    expect(pubs[0]!.externalId).toMatch(/^mock:threads:/);
+    expect(pubs[0]!.permalink).toMatch(/^mock:\/\/threads\//);
+    const sendEvents = await h.db.select().from(schema.jobEvents).where(eq(schema.jobEvents.stateAfter, 'SENDING'));
+    expect(sendEvents.every((e) => (e.sanitizedDetails as { mode?: string }).mode === 'MOCK')).toBe(true);
     expect(publishSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
     publishSpy.mockRestore();

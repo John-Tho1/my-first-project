@@ -100,7 +100,7 @@ function tables(): BundleTables {
     ],
     transcription_jobs: [],
     transcripts: [],
-    audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
+    audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [], send_intents: [], publications: [],
   };
 }
 

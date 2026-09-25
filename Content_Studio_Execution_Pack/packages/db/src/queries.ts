@@ -238,7 +238,10 @@ export interface AuditInput {
     | 'approval.grant'
     | 'approval.refused'
     | 'approval.revoke'
-    | 'approval.invalidate';
+    | 'approval.invalidate'
+    | 'item.cancel'
+    | 'item.reconcile'
+    | 'worker.tick';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

@@ -2,12 +2,14 @@
 import { getDb, resolveFromRoot, uploadStoreFor, type DbHandle, type UploadStore } from '@cs/db';
 import { assertLiveLlmAllowed, loadConfig, type AppConfig } from '@cs/domain';
 import {
+  createMockAdapterRegistry,
   createStorage,
   LiveLlmProvider,
   LiveTranscriber,
   MockLlmProvider,
   MockTranscriber,
   type LlmProvider,
+  type MockChannelAdapterRegistry,
   type StorageAdapter,
   type Transcriber,
 } from '@cs/providers';
@@ -62,4 +64,12 @@ export function assertTranscriptionAllowed(config: AppConfig = getConfig()): voi
 export function getWorkerTranscriber(): Transcriber {
   const fail = process.env.NODE_ENV === 'test' && process.env.STT_MOCK_FAIL_NEXT === '1';
   return new MockTranscriber({ fail });
+}
+
+/**
+ * T11: 배포 채널 어댑터 — 모의만(프로세스 싱글턴, web 과 inline worker 가 같은 모의 "원격"을 공유). 실제 채널 어댑터는 없다(M4).
+ * 모의 결과 시나리오는 개발·테스트에서만 MOCK_CHANNEL_SCENARIO 로 바꿀 수 있다(운영 빌드에서는 무시).
+ */
+export function getChannelAdapters(): MockChannelAdapterRegistry {
+  return createMockAdapterRegistry();
 }

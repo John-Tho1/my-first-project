@@ -53,6 +53,7 @@ import {
   invalidateItems,
   lockItemsInOrder,
   recomputePlanStatus,
+  requestCancelLocked,
   revokeActiveApprovalsLocked,
   settleApprovedVariants,
   type ApprovalRow,
@@ -73,6 +74,7 @@ import {
   executeCommands,
   jobEvents,
   jobs,
+  publications,
   variantAssets,
   variants,
   variantVersions,
@@ -83,6 +85,25 @@ import { getCurrentBrandProfile } from './writing';
 export type ChannelAccountRow = typeof channelAccounts.$inferSelect;
 export type DistributionPlanRow = typeof distributionPlans.$inferSelect;
 export type JobEventRow = typeof jobEvents.$inferSelect;
+type PublicationRow = typeof publications.$inferSelect;
+
+/** 원격 결과 응답 모양(jobs.ts publicationView 와 같은 모양 — 순환 import 를 피해 여기 둔다). */
+export function publicationViewOf(p: PublicationRow) {
+  return {
+    id: p.id,
+    item_id: p.itemId,
+    job_id: p.jobId,
+    external_id: p.externalId,
+    permalink: p.permalink,
+    result_kind: p.resultKind,
+    remote_visibility: p.remoteVisibility,
+    verification: p.verification,
+    is_mock: p.isMock,
+    verified_at: p.verifiedAt ? p.verifiedAt.toISOString() : null,
+    created_at: p.createdAt.toISOString(),
+    notice: p.isMock ? 'MOCK — 실제 발행 실적 아님' : null,
+  };
+}
 export type { ApprovalRow, DistributionItemRow, JobRow };
 
 const PLAN_NOT_FOUND = '배포 계획을 찾을 수 없습니다';
@@ -427,6 +448,10 @@ export interface PlanItemDetail {
   activeApproval: ApprovalRow | null;
   approvals: ApprovalRow[];
   jobs: JobRow[];
+  /** T11: 원격 결과(모의 = MOCK, 실제 발행 실적 아님) */
+  publications: PublicationRow[];
+  /** T11: 가장 최근 작업의 이력(최근 10개, 새 것부터) */
+  events: JobEventRow[];
   /** 지금 다시 검사한 스냅샷 문제(없으면 []) — 승인·실행 전 화면 안내용(서버는 승인·실행 때 다시 검사한다). */
   problems: string[];
 }
@@ -459,8 +484,25 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
         .where(and(eq(jobs.ownerId, ownerId), inArray(jobs.itemId, ids)))
         .orderBy(asc(jobs.createdAt), asc(jobs.id))
     : [];
+  const allPubs = ids.length
+    ? await db
+        .select()
+        .from(publications)
+        .where(and(eq(publications.ownerId, ownerId), inArray(publications.itemId, ids)))
+        .orderBy(asc(publications.createdAt), asc(publications.id))
+    : [];
   const out: PlanItemDetail[] = [];
   for (const item of items) {
+    const mineJobs = allJobs.filter((j) => j.itemId === item.id);
+    const latestJob = mineJobs.at(-1);
+    const events = latestJob
+      ? await db
+          .select()
+          .from(jobEvents)
+          .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, latestJob.id)))
+          .orderBy(desc(jobEvents.eventSeq))
+          .limit(10)
+      : [];
     const account = await getChannelAccount(db, ownerId, item.channelAccountId);
     const vRows = await db
       .select({ id: variants.id, channel: variants.channel, contentId: variants.contentId, lifecycle: variants.lifecycle })
@@ -475,7 +517,9 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       variant: vRows[0] ?? null,
       activeApproval: mine.find((a) => a.revokedAt === null) ?? null,
       approvals: mine,
-      jobs: allJobs.filter((j) => j.itemId === item.id),
+      jobs: mineJobs,
+      publications: allPubs.filter((p) => p.itemId === item.id),
+      events,
       problems: item.status === 'PLANNED' ? await snapshotProblems(db, ownerId, item, now) : [],
     });
   }
@@ -645,10 +689,12 @@ export async function revokeApproval(db: Db, ownerId: string, approvalId: string
     if (locked[0]!.revokedAt !== null) throw new AppError('conflict', 'already_revoked', '이미 철회했거나 무효가 된 승인입니다');
     const text = reason?.trim();
     const revoked = await revokeActiveApprovalsLocked(tx, ownerId, [item], () => (text ? `user: ${text}` : 'user'), now, { action: 'approval.revoke' });
+    // T11(D18, docs/03): 이미 전송 단계에 들어간 작업은 되돌렸다고 주장하지 않고 CANCEL_REQUESTED 로 추적한다.
+    const cancelRequestedJobIds = await requestCancelLocked(tx, ownerId, item.id, 'approval_revoked', now);
     await settleApprovedVariants(tx, ownerId, [item.variantId], 'review', now);
     await recomputePlanStatus(tx, ownerId, item.planId, now);
     const after = await tx.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
-    return { approval: after[0]!, planId: item.planId, blockedJobIds: revoked[0]?.blockedJobIds ?? [] };
+    return { approval: after[0]!, planId: item.planId, blockedJobIds: revoked[0]?.blockedJobIds ?? [], cancelRequestedJobIds };
   });
 }
 
@@ -880,6 +926,7 @@ export function approvalView(a: ApprovalRow) {
   };
 }
 
+/** 작업 응답 모양(비밀·본문 없음). lease_owner 는 worker 표시 이름(호스트 이름을 넣지 않는다). */
 export function jobView(j: JobRow) {
   return {
     id: j.id,
@@ -887,7 +934,17 @@ export function jobView(j: JobRow) {
     item_id: j.itemId,
     state: j.state,
     attempt: j.attempt,
+    max_attempts: j.maxAttempts,
     next_run_at: j.nextRunAt.toISOString(),
+    leased: j.leaseOwner !== null,
+    lease_owner: j.leaseOwner,
+    lease_until: j.leaseUntil ? j.leaseUntil.toISOString() : null,
+    heartbeat_at: j.heartbeatAt ? j.heartbeatAt.toISOString() : null,
+    last_error_code: j.lastErrorCode,
+    last_retry_class: j.lastRetryClass,
+    reconcile_count: j.reconcileCount,
+    cancel_requested_at: j.cancelRequestedAt ? j.cancelRequestedAt.toISOString() : null,
+    done_at: j.doneAt ? j.doneAt.toISOString() : null,
     idempotency_key: j.idempotencyKey,
     mode: 'MOCK' as const,
     created_at: j.createdAt.toISOString(),
@@ -935,6 +992,7 @@ export function planDetailView(d: PlanDetail) {
       active_approval: x.activeApproval ? approvalView(x.activeApproval) : null,
       approvals: x.approvals.map(approvalView),
       jobs: x.jobs.map(jobView),
+      publications: x.publications.map(publicationViewOf),
       problems: x.problems,
     })),
   };

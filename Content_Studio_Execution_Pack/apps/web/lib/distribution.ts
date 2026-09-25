@@ -2,7 +2,7 @@
  * T10 배포함 — 폼 → API 입력, 폼 오류 리다이렉트, 화면 문구(서버 전용).
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
-import { AppError } from '@cs/domain';
+import { AppError, formatMsk } from '@cs/domain';
 import { errorResponse, seeOther } from './api';
 
 export const MAX_DISTRIBUTION_REQUEST = 64 * 1024;
@@ -11,24 +11,24 @@ export const PLAN_STATUS_LABEL: Record<string, string> = {
   draft: '승인 전',
   partially_approved: '일부 승인',
   approved: '승인됨(실행 전)',
-  executing: '실행 대기열(MOCK)',
-  partial: '일부 처리',
-  completed: '처리 끝',
+  executing: '처리 중(MOCK)',
+  partial: '일부 처리(PARTIAL — 확인 필요 항목 포함)',
+  completed: '처리 끝(MOCK — 실제 발행 아님)',
   canceled: '취소됨',
   failed: '실패',
 };
 
 export const ITEM_STATUS_LABEL: Record<string, string> = {
   PLANNED: '계획됨(실행 전)',
-  QUEUED: '대기열(MOCK)',
-  BLOCKED: '보류(BLOCKED)',
-  SENDING: '전송 중',
-  REMOTE_PROCESSING: '원격 처리 중',
-  CONFIRMED: '확인됨',
-  RETRY_WAIT: '재시도 대기',
-  RECONCILING: '확인 중',
-  UNKNOWN: '결과 불명(UNKNOWN)',
-  CANCEL_REQUESTED: '취소 요청됨',
+  QUEUED: 'QUEUED · 대기',
+  BLOCKED: 'BLOCKED · 보류',
+  SENDING: 'SENDING · 전송 중',
+  REMOTE_PROCESSING: 'REMOTE_PROCESSING · 원격 처리 중',
+  CONFIRMED: 'CONFIRMED · MOCK 확인(실제 발행 아님)',
+  RETRY_WAIT: 'RETRY_WAIT · 재시도 대기',
+  RECONCILING: 'RECONCILING · 등록 여부 확인 필요',
+  UNKNOWN: 'UNKNOWN · 확인 불가 — 자동 재전송 안 함',
+  CANCEL_REQUESTED: 'CANCEL_REQUESTED · 취소 확인 중',
   CANCELED: '취소됨',
   FAILED: '실패',
   PARTIAL: '일부',
@@ -78,6 +78,9 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   invalid: '입력값을 확인하세요.',
   conflict: '다른 곳에서 먼저 바뀌었습니다. 새로 고친 뒤 다시 시도하세요.',
   live_blocked: '실제 채널 게시는 허용·구현되지 않았습니다(외부로 아무것도 보내지 않음).',
+  not_cancellable: '이미 끝났거나 실행 전인 항목은 취소할 수 없습니다.',
+  cancel_unknown: '결과를 확인할 수 없는 항목(UNKNOWN)은 취소를 확정할 수 없습니다. 먼저 재확인하세요(자동 재전송은 하지 않습니다).',
+  nothing_to_reconcile: '재확인할 작업이 없습니다(확인 중·결과 불명·원격 처리 중인 항목만 재확인합니다).',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -138,4 +141,74 @@ export function formToApprove(f: Record<string, string>) {
 
 export function formToExecute(f: Record<string, string>) {
   return { command_key: f.command_key ?? '' };
+}
+
+/** 결과 종류 → 화면 문구(CONFIRMED ≠ 공개: 비공개 업로드·예약·게시를 구분한다, A12). */
+export const RESULT_KIND_LABEL: Record<string, string> = {
+  UPLOADED_PRIVATE: '비공개 업로드',
+  SCHEDULED_REMOTE: '원격 예약',
+  PUBLISHED: '게시',
+  MANUAL_REPORTED: '수동 기록',
+};
+
+const BLOCK_REASON_LABEL: Record<string, string> = {
+  approval_missing: '승인 없음/변경됨',
+  approval_revoked: '승인 철회됨',
+  approval_invalidated: '승인 무효(내용 변경)',
+  snapshot_stale: '승인 없음/변경됨(내용 변경)',
+  auth: '계정 인증 필요(자동 재시도 안 함)',
+  execution_not_allowed: '실행 모드가 허용하지 않음',
+  account_missing: '계정 없음',
+};
+
+interface JobLike {
+  state: string;
+  attempt: number;
+  maxAttempts: number;
+  nextRunAt: Date;
+  lastErrorCode: string | null;
+}
+
+interface PubLike {
+  permalink: string | null;
+  resultKind: string;
+  isMock: boolean;
+}
+
+/**
+ * 작업 상태 한 줄(docs/03 상태 분리 문구). 예: `RETRY_WAIT · 재시도 대기 (2/5, 다음 2026-09-25 18:04 (MSK))`,
+ * `CONFIRMED · MOCK 게시 확인 (mock://threads/…)`. 모의 결과는 항상 MOCK 을 붙이고 "게시 완료"라고 하지 않는다.
+ */
+export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: string | null): string {
+  switch (job.state) {
+    case 'QUEUED':
+      return 'QUEUED · 대기';
+    case 'LEASED':
+      return 'LEASED · 처리 시작(아직 보내지 않음)';
+    case 'SENDING':
+      return 'SENDING · 전송 중';
+    case 'REMOTE_PROCESSING':
+      return 'REMOTE_PROCESSING · 원격 처리 중(확인 대기)';
+    case 'RETRY_WAIT':
+      return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${formatMsk(job.nextRunAt)})`;
+    case 'RECONCILING':
+      return 'RECONCILING · 등록 여부 확인 필요';
+    case 'UNKNOWN':
+      return 'UNKNOWN · 확인 불가 — 자동 재전송 안 함';
+    case 'CANCEL_REQUESTED':
+      return 'CANCEL_REQUESTED · 취소 확인 중';
+    case 'CANCELED':
+      return 'CANCELED · 취소됨(보내지 않음)';
+    case 'FAILED':
+      return `FAILED · 실패${job.lastErrorCode ? ` (${job.lastErrorCode})` : ''}`;
+    case 'BLOCKED':
+      return `BLOCKED · ${BLOCK_REASON_LABEL[blockReason ?? job.lastErrorCode ?? ''] ?? '보류'}`;
+    case 'CONFIRMED': {
+      const kind = pub ? (RESULT_KIND_LABEL[pub.resultKind] ?? pub.resultKind) : '결과';
+      const mock = !pub || pub.isMock ? 'MOCK ' : '';
+      return `CONFIRMED · ${mock}${kind} 확인${pub?.permalink ? ` (${pub.permalink})` : ''}`;
+    }
+    default:
+      return job.state;
+  }
 }

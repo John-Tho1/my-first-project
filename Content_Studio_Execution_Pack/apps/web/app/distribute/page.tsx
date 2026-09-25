@@ -28,7 +28,7 @@ export default async function DistributePage({ searchParams }: { searchParams: P
     <main className="container">
       <h2 className="screen-title">배포함</h2>
       <p className="notice" role="note">
-        MOCK — 지금 단계(M3)는 모의 배포만 합니다. 승인·실행해도 실제 채널로 아무것도 보내지 않으며, 실행은 작업 대기열(QUEUED)에 넣기까지입니다(처리는 T11).
+        MOCK — 지금 단계(M3)는 모의 배포만 합니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 작업 처리기는 모의 어댑터로만 처리하며 결과는 MOCK(실제 발행 실적 아님)입니다.
       </p>
       {q.missing === '1' ? (
         <p className="notice" role="alert">

@@ -60,6 +60,9 @@ export const EXPORTED_TABLES = [
   'jobs',
   'job_events',
   'execute_commands',
+  // T11(0017, 결정 D18): 전송 의도·원격 결과는 내보내기만 — 복원한 환경은 원격을 다시 확인해야지 기록을 믿고 이어 가지 않는다.
+  'send_intents',
+  'publications',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -87,6 +90,8 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   jobs: '0016_t10_distribution',
   job_events: '0016_t10_distribution',
   execute_commands: '0016_t10_distribution',
+  send_intents: '0017_t11_jobs',
+  publications: '0017_t11_jobs',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -99,9 +104,10 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
 
 /**
  * users·audit_events 는 내보내기만. T10(D17): jobs·job_events·execute_commands 도 내보내기만 — 복원 환경에서 작업을 다시 돌리지 않는다
- * (진행 중이던 항목은 BLOCKED 로 들여온다, 맹목 재전송 금지).
+ * (진행 중이던 항목은 BLOCKED 로 들여온다, 맹목 재전송 금지). T11(D18): send_intents·publications 도 내보내기만 — 원격 결과는 복원 환경에서
+ * 다시 확인할 사실이지 믿고 이어 갈 기록이 아니다.
  */
-export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands'] as const satisfies readonly ExportedTable[];
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands', 'send_intents', 'publications'] as const satisfies readonly ExportedTable[];
 export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
   (typeof NON_RESTORED_TABLES)[number]
@@ -461,7 +467,8 @@ export const ROW_SCHEMAS = {
     kind: z.enum(['publish']),
     item_id: uuid.nullable(),
     payload_ref: str,
-    state: z.enum(['QUEUED', 'LEASED', 'RETRY_WAIT', 'BLOCKED', 'DONE', 'FAILED', 'CANCELED', 'RECONCILING', 'UNKNOWN']),
+    // T11(0017): DONE 은 CONFIRMED 로 이름을 바꿨다(T10 은 DONE 을 쓰지 않았다 — 이전 묶음 호환으로만 받는다).
+    state: z.enum(['QUEUED', 'LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'BLOCKED', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED', 'CANCELED', 'CONFIRMED', 'FAILED', 'DONE']),
     attempt: int.min(0),
     lease_owner: nstr,
     lease_until: ts.nullable(),
@@ -469,6 +476,14 @@ export const ROW_SCHEMAS = {
     idempotency_key: str,
     created_at: ts,
     updated_at: ts,
+    // 0017 열. 이전 묶음에는 없으므로 기본값.
+    heartbeat_at: ts.nullable().default(null),
+    last_error_code: nstr.default(null),
+    last_retry_class: z.enum(['transient_no_side_effect', 'transient_unknown_side_effect', 'permanent', 'auth']).nullable().default(null),
+    max_attempts: int.min(1).max(20).default(5),
+    reconcile_count: int.min(0).default(0),
+    cancel_requested_at: ts.nullable().default(null),
+    done_at: ts.nullable().default(null),
   }),
   job_events: z.strictObject({
     id: uuid,
@@ -485,6 +500,32 @@ export const ROW_SCHEMAS = {
     command_key: str,
     created_at: ts,
     result_json: z.record(z.string(), z.unknown()),
+  }),
+  // T11(0017)
+  send_intents: z.strictObject({
+    id: uuid,
+    job_id: uuid,
+    attempt: int.min(1),
+    intent_key: str,
+    created_at: ts,
+    submitted_at: ts.nullable(),
+    outcome: z.enum(['pending', 'accepted', 'rejected', 'ambiguous']),
+    provider_request_id: nstr,
+    remote_external_id: nstr,
+    sanitized_details: z.record(z.string(), z.unknown()),
+  }),
+  publications: z.strictObject({
+    id: uuid,
+    item_id: uuid,
+    job_id: uuid,
+    external_id: str,
+    permalink: nstr,
+    result_kind: z.enum(['UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED', 'MANUAL_REPORTED']),
+    remote_visibility: z.enum(['private', 'unlisted', 'public', 'unknown']),
+    verification: z.enum(['MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED']),
+    is_mock: z.boolean(),
+    verified_at: ts.nullable(),
+    created_at: ts,
   }),
   audit_events: z.strictObject({
     id: uuid,
@@ -1251,6 +1292,18 @@ function checkDistributionIntegrity(
   for (const j of t.jobs) need('jobs', 'item_id', j.item_id, 'distribution_items');
   for (const e of t.job_events) need('job_events', 'job_id', e.job_id, 'jobs');
   for (const c of t.execute_commands) need('execute_commands', 'plan_id', c.plan_id, 'distribution_plans');
+  for (const i of t.send_intents) {
+    need('send_intents', 'job_id', i.job_id, 'jobs');
+    if (i.intent_key !== `${i.job_id}:${i.attempt}`) problems.push('send_intents.intent_key = <job_id>:<attempt>');
+  }
+  for (const p of t.publications) {
+    need('publications', 'item_id', p.item_id, 'distribution_items');
+    need('publications', 'job_id', p.job_id, 'jobs');
+    if (p.is_mock !== (p.verification === 'MOCK')) problems.push('publications: is_mock = (verification = MOCK)');
+    if (p.is_mock && (!p.external_id.startsWith(MOCK_EXTERNAL_PREFIX) || (p.permalink !== null && !p.permalink.startsWith('mock://')))) {
+      problems.push('publications: 모의 결과는 mock: 외부 ID·mock:// 링크');
+    }
+  }
 }
 
 /** owner 를 뺀 행 비교용 해시(같은 ID 의 기존 행과 내용이 같은지). */

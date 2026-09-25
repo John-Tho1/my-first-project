@@ -332,7 +332,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **불변 스냅샷**: 항목마다 "정확히 나갈 내용"(원고·파생본·브랜드 버전, 계정·외부 계정 ID, 채널별 글, 첨부 ID·checksum·순서, 공개 범위, 예약 UTC·시간대)을 canonical JSON 으로 만들고 SHA-256 hash 를 저장한다. 항목의 스냅샷은 DB 트리거로 바꾸거나 지울 수 없다.
 - **승인**: 계획 화면에서 항목 카드(계정 `MOCK` 배지·채널별 글·미디어 checksum 앞 12자·공개 범위·`MSK (UTC)` 또는 `즉시`·hash)를 확인하고, 항목을 직접 체크 + "내용을 확인했습니다" → "선택 승인". 서버는 화면의 hash 와 저장된 hash, 그리고 지금의 실제 행(파생본 현재 버전·원고 현재 버전·첨부·계정 상태·예약 시각)을 다시 대조한다. 클라이언트·AI 가 보낸 `approved` 같은 값은 무시된다(승인이 아님). 승인되면 채널 초안은 "승인됨".
 - **승인 무효(A06)**: 승인 뒤 채널 초안 수정·AI 채택·다시 초안·첨부 변경·원고 수정·계정 상태 변경은 같은 트랜잭션에서 그 항목의 승인을 철회한다(`invalidated:body_changed|assets_changed|content_changed|account_changed`). 실행할 때도 다시 검사해 어긋나면 전체를 거부하고 승인을 철회한다. 바뀐 내용을 배포하려면 새 계획을 만든다.
-- **실행(MOCK)**: "지금 실행"은 승인된 항목을 작업 대기열(`jobs`, `QUEUED`)에 넣기까지만 한다 — 결과는 항상 `MOCK`, 처리(lease·재시도·확인)는 **T11 작업 처리기**가 맡는다(아직 없음 → 작업은 `QUEUED · MOCK · T11에서 처리` 로 남는다). 버튼을 두 번 눌러도 작업은 하나(같은 `command_key` 재호출은 저장된 결과, 다른 key 는 409 `already_executed`). 승인 없음 403 `approval_required`(아무것도 넣지 않음).
+- **실행(MOCK)**: "지금 실행"은 승인된 항목을 작업 대기열(`jobs`, `QUEUED`)에 넣기까지만 한다 — 결과는 항상 `MOCK`, 처리(lease·재시도·확인)는 **작업 처리기(T11, 아래)**가 맡는다. 버튼을 두 번 눌러도 작업은 하나(같은 `command_key` 재호출은 저장된 결과, 다른 key 는 409 `already_executed`). 승인 없음 403 `approval_required`(아무것도 넣지 않음).
 - **철회**: 승인 기록의 "철회" → 대기 중(QUEUED) 작업은 `BLOCKED`(작업 이력 기록), 항목은 실행 전 상태로, 채널 초안은 "검토 중"으로. 같은 계획에서 다시 승인할 수 있다(새 승인 → 새 작업 key).
 
 | API | 설명 |
@@ -346,6 +346,29 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - migration `0016_t10_distribution`(channel_accounts·distribution_plans·distribution_items·approvals·jobs·job_events·execute_commands, variants.lifecycle 에 `approved`). 내보내기에는 모두 들어가고, 복원은 계정·계획·항목·승인만(hash 그대로). 작업·작업 이력·실행 명령은 복원하지 않는다 — 진행 중이던 항목은 `BLOCKED` 로, 복원된 행과 스냅샷이 맞지 않는 활성 승인은 `restore_stale` 로 철회해 넣는다.
 
+### 작업 처리기·재시도·재확인·취소 (M3, T11)
+결정 D18(docs/DECISIONS.md). **모의 어댑터만 — 외부로 아무것도 보내지 않는다.** 확인된 결과도 `MOCK`(외부 ID `mock:<플랫폼>:<uuid>`, 링크 `mock://<플랫폼>/<uuid>`)이며 **실제 발행 실적이 아니다**(DB 가 `is_mock = (verification = 'MOCK')`·`mock:` 접두어를 CHECK 로 강제).
+
+- **처리 흐름**: tick 한 번 = lease 만료 복구 → lease(짧은 트랜잭션, `FOR UPDATE SKIP LOCKED` — 다른 worker 가 잡은 작업은 건너뜀) → 작업마다 ① 한 트랜잭션에서 **승인·스냅샷·취소·실행 모드를 다시 검사**하고 `SENDING` 전이 + **전송 의도(`send_intents`, key `<작업>:<시도>`)** 기록 ② DB 잠금 없이 어댑터 호출(heartbeat 로 lease 연장, `JOB_SUBMIT_TIMEOUT_MS` 기본 30초 넘으면 결과 불명) ③ 한 트랜잭션에서 결과 기록·다음 상태.
+- **상태(작업·항목)**: `QUEUED · 대기` → `SENDING · 전송 중` → `CONFIRMED · MOCK 게시 확인 (mock://…)`(비공개면 "비공개 업로드" — 확인됨 ≠ 공개). 그 밖에 `REMOTE_PROCESSING`(원격 처리 중), `RETRY_WAIT · 재시도 대기 (n/5, 다음 …)`, `RECONCILING · 등록 여부 확인 필요`, `UNKNOWN · 확인 불가 — 자동 재전송 안 함`, `CANCEL_REQUESTED · 취소 확인 중`, `BLOCKED`(승인 없음/변경됨·인증), `FAILED`, `CANCELED`. 전이는 `@cs/domain` `JOB_TRANSITIONS` 한 곳에서만 정의하고 모든 전이는 `job_events` 에 추가 전용으로 남는다(코드·시도·재시도 분류·외부 ID 만 — 본문·토큰 없음).
+- **재시도**: 부작용 없는 일시 오류만 자동 재시도(30초 × 2^(n-1), 상한 15분, ±20% jitter, `Retry-After` 존중, 최대 5회 → `FAILED`, Retry-After 1시간 초과는 바로 `FAILED`). 부작용 불명(시간 초과·응답 유실·불명확한 5xx)은 재시도가 아니라 **원격 조회**(`RECONCILING`). 인증 오류(401)는 `BLOCKED`(M3 에는 refresh 없음), 형식·권한 오류는 `FAILED` — 자동 반복하지 않는다. 숫자는 잠정값(D18).
+- **결과 불명(A08·A20)**: 전송 의도가 있는데 결과를 모르면 다시 보내지 않고 조회한다 — 찾으면 `CONFIRMED`, "확실히 없음"이면 새 시도(새 의도), 확인 불가 3회면 `UNKNOWN`. `UNKNOWN` 은 자동으로 다시 보내지 않는다(사용자 "재확인"만). worker 가 죽어 lease 가 만료되면 의도 전 작업은 `QUEUED` 로, 의도 뒤 작업은 `RECONCILING` 으로 간다.
+- **취소(A11)**: 아직 보내지 않은 작업(`QUEUED`·`RETRY_WAIT`·`BLOCKED`)만 바로 `CANCELED`. 전송 단계면 `취소 확인 중`(CANCEL_REQUESTED) — 원격이 이미 받았으면 `CONFIRMED`(이력 `cancel_too_late`, 화면 "취소 불가(이미 전송됨)")이고 취소 성공이라고 하지 않는다. `UNKNOWN` 은 409 `cancel_unknown`. 전송 단계 작업의 승인을 철회해도 같은 방식(CANCEL_REQUESTED).
+- **승인 철회(A10)**: 재시도 대기 중 승인을 철회하면 다음 tick 의 재검사가 `BLOCKED`(`approval_missing`)로 막고 새 전송 의도를 만들지 않는다.
+- **계획 상태**: 모두 확인 → `completed`, 일부 확인 + 실패·취소·보류·불명 → `partial`, 모두 취소 → `canceled`, 나머지 끝남 → `failed`(`UNKNOWN` 이 있으면 `partial`).
+- **화면**: `/distribute/{id}` 항목 카드에 작업 상태 한 줄, `취소`·`재확인(조회만 — 다시 보내지 않음)` 버튼, 원격 결과(`MOCK` 배지 + **실제 발행 실적 아님**), 작업 이력 최근 10개. 계획 아래 `작업 처리 실행(모의 1회)`(내 작업 최대 5개).
+- **처리기 실행**: web(`WORKER_MODE=inline`)은 `/api/health` 호출마다 배포 작업을 최대 5개 처리한다. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/distribution-items/{id}/cancel` | `{}` → `{canceled:true, state:'CANCELED'}` 또는 `{cancel_requested:true, state:'CANCEL_REQUESTED', message:'취소 확인 중'}`. UNKNOWN 409 `cancel_unknown`, 끝남·실행 전 409 `not_cancellable` |
+| `POST /api/distribution-items/{id}/reconcile` | `{}` → `{state_before, state, found, remote}` — 조회만(절대 다시 보내지 않음), 대상 없음 409 `nothing_to_reconcile` |
+| `GET /api/jobs/{id}` | 작업 상태·이력(최근 50)·전송 의도·원격 결과(비밀·본문 없음, lease 소유자는 표시 이름뿐) |
+| `POST /api/worker/tick` | `{max_jobs?(1~20), worker_id?}` → `{worker_id, recovered, leased, results, mode:'MOCK'}` — 로그인 owner 의 작업만 |
+| `GET /api/health` | `jobs: {queued, leased, retry_wait, reconciling, unknown, blocked}` 개수(집계만) 추가 |
+
+- migration `0017_t11_jobs`: jobs 열(heartbeat_at·last_error_code·last_retry_class·max_attempts·reconcile_count·cancel_requested_at·done_at), 상태 CHECK 확장(`DONE` → `CONFIRMED`), `send_intents`(결과 한 번만 기록·삭제 금지 트리거), `publications`(모의 CHECK·재확인 열만 변경·삭제 금지 트리거). 둘 다 **내보내기만**(복원 안 함) — 복원한 환경은 원격을 다시 확인해야 한다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -357,7 +380,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
-| `pnpm worker` | worker tick 1회(T08: 만료된 업로드 세션 정리만 — 전사는 web inline worker) 후 종료 | exit 0, JSON 출력 |
+| `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 
 ### PGlite 단일 연결 주의
@@ -370,6 +393,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - LLM: `MockLlmProvider`(결정적, 네트워크 없음, 경고 `모의 응답: 실제 AI 호출 아님`). `LLM_MODE=live`는 M0에 공급자가 없어 거부된다.
 - 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 객체가 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
 - 배포 실행(T10): 모의 계정은 `PUBLISH_MODE` 와 무관하게 `MOCK` 작업(QUEUED)만 만든다. 실제 계정은 `PUBLISH_MODE=enabled` + 서버 승인이 있어도 어댑터가 없어 503(`LiveChannelNotConfiguredError`).
+- 작업 처리기(T11): 채널 어댑터는 `MockChannelAdapter` 뿐(프로세스 안 모의 "원격", 네트워크 없음). live 계정은 어댑터가 없어 작업이 `BLOCKED`(`execution_not_allowed`)로 멈춘다. 모의 결과는 `publications.verification = 'MOCK'` 로만 저장되고 `toStorablePublication` 은 여전히 MOCK 결과를 거부한다.
 - 수집: `DisabledCollector`는 항상 CollectorDisabledError.
 - 음성 전사(T08): `MockTranscriber`(결정적, 네트워크 없음, 경고 `모의 전사: 실제 음성 인식 결과가 아닙니다(자리표시 문장)`). `STT_MODE=live`는 어댑터가 없어 거부된다.
 - Next.js 텔레메트리는 `apps/web/scripts/next.mjs`에서 `NEXT_TELEMETRY_DISABLED=1`로 끈다(사용자 전역 설정은 변경하지 않음).

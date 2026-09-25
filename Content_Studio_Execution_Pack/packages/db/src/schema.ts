@@ -1134,8 +1134,10 @@ export const approvals = pgTable(
 );
 
 /**
- * DB 작업(docs/04 jobs). T10 은 execute 에서 QUEUED 로 만들기만 한다 — lease·재시도·확인은 T11.
- * idempotency_key = 'publish:<item>:<approval>' unique. 같은 항목의 진행 중 작업(QUEUED·LEASED·RETRY_WAIT·RECONCILING·UNKNOWN)은 1개(부분 unique).
+ * DB 작업(docs/04 jobs) = transactional outbox 의 작업 행. T10 은 execute 에서 QUEUED 로 만들고, T11(D18) 작업 처리기가 처리한다.
+ * idempotency_key = 'publish:<item>:<approval>' unique. 같은 항목의 진행 중 작업(ACTIVE_JOB_STATES)은 1개(부분 unique).
+ * 상태 전이는 @cs/domain jobs.ts JOB_TRANSITIONS 로만. lease_owner·lease_until 은 전송·조회 lease(짧은 트랜잭션), heartbeat_at 은 연장 시각.
+ * attempt = 전송 시도 횟수(전송 lease 마다 +1), reconcile_count = 이번 시도의 원격 조회 확인 불가·처리 중 횟수.
  */
 export const jobs = pgTable(
   'jobs',
@@ -1155,16 +1157,32 @@ export const jobs = pgTable(
     idempotencyKey: text('idempotency_key').notNull(),
     createdAt: ts('created_at').notNull().defaultNow(),
     updatedAt: ts('updated_at').notNull().defaultNow(),
+    heartbeatAt: ts('heartbeat_at'),
+    lastErrorCode: text('last_error_code'),
+    lastRetryClass: text('last_retry_class'),
+    maxAttempts: integer('max_attempts').notNull().default(5),
+    reconcileCount: integer('reconcile_count').notNull().default(0),
+    cancelRequestedAt: ts('cancel_requested_at'),
+    doneAt: ts('done_at'),
   },
   (t) => [
     unique('jobs_idempotency_key_uq').on(t.idempotencyKey),
     unique('jobs_id_owner_uq').on(t.id, t.ownerId),
-    uniqueIndex('jobs_active_item_uq').on(t.itemId).where(sql`${t.state} in ('QUEUED', 'LEASED', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN')`),
+    uniqueIndex('jobs_active_item_uq')
+      .on(t.itemId)
+      .where(sql`${t.state} in ('QUEUED', 'LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED')`),
     index('jobs_state_next_run_idx').on(t.state, t.nextRunAt),
     check('jobs_kind_chk', sql`${t.kind} in ('publish')`),
     check('jobs_publish_item_chk', sql`${t.kind} <> 'publish' or ${t.itemId} is not null`),
-    check('jobs_state_chk', sql`${t.state} in ('QUEUED', 'LEASED', 'RETRY_WAIT', 'BLOCKED', 'DONE', 'FAILED', 'CANCELED', 'RECONCILING', 'UNKNOWN')`),
+    check(
+      'jobs_state_chk',
+      sql`${t.state} in ('QUEUED', 'LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'BLOCKED', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED', 'CANCELED', 'CONFIRMED', 'FAILED')`,
+    ),
     check('jobs_attempt_chk', sql`${t.attempt} >= 0`),
+    check('jobs_max_attempts_chk', sql`${t.maxAttempts} between 1 and 20`),
+    check('jobs_reconcile_count_chk', sql`${t.reconcileCount} >= 0`),
+    check('jobs_retry_class_chk', sql`${t.lastRetryClass} is null or ${t.lastRetryClass} in ('transient_no_side_effect', 'transient_unknown_side_effect', 'permanent', 'auth')`),
+    check('jobs_lease_pair_chk', sql`(${t.leaseOwner} is null) = (${t.leaseUntil} is null)`),
     foreignKey({
       name: 'jobs_item_same_owner_fk',
       columns: [t.itemId, t.ownerId],
@@ -1218,6 +1236,88 @@ export const executeCommands = pgTable(
       name: 'execute_commands_plan_same_owner_fk',
       columns: [t.planId, t.ownerId],
       foreignColumns: [distributionPlans.id, distributionPlans.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 전송 의도(transactional outbox 기록, T11 D18). 승인 재검사·SENDING 전이와 **같은 트랜잭션**에서 외부 호출 전에 넣는다.
+ * intent_key = '<job_id>:<attempt>' = 어댑터 멱등 토큰. 의도가 있는데 결과(outcome)가 pending 이면 "보냈을 수도 있음" → 재전송 금지, 조회(A20).
+ * 트리거 send_intents_guard: DELETE 거부, UPDATE 는 outcome 이 pending 일 때 한 번만(submitted_at·outcome·provider_request_id·remote_external_id·sanitized_details).
+ */
+export const sendIntents = pgTable(
+  'send_intents',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    attempt: integer('attempt').notNull(),
+    intentKey: text('intent_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    submittedAt: ts('submitted_at'),
+    outcome: text('outcome').notNull().default('pending'),
+    providerRequestId: text('provider_request_id'),
+    remoteExternalId: text('remote_external_id'),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    unique('send_intents_intent_key_uq').on(t.intentKey),
+    unique('send_intents_job_attempt_uq').on(t.jobId, t.attempt),
+    check('send_intents_outcome_chk', sql`${t.outcome} in ('pending', 'accepted', 'rejected', 'ambiguous')`),
+    check('send_intents_attempt_chk', sql`${t.attempt} >= 1`),
+    check('send_intents_key_chk', sql`${t.intentKey} = ${t.jobId}::text || ':' || ${t.attempt}::text`),
+    foreignKey({
+      name: 'send_intents_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 원격 결과(docs/04 publications, T11 D18). CONFIRMED 라고 public 은 아니다 — result_kind·remote_visibility·verification 을 함께 본다.
+ * 모의 결과: is_mock = (verification = 'MOCK'), external_id 는 'mock:' 접두어, permalink 는 null 이거나 'mock://' — 실제 발행 실적이 아님(DB CHECK).
+ * 트리거 publications_guard: DELETE 거부, UPDATE 는 verification·verified_at·remote_visibility 만(재확인 결과).
+ */
+export const publications = pgTable(
+  'publications',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    itemId: uuid('item_id').notNull(),
+    jobId: uuid('job_id').notNull(),
+    externalId: text('external_id').notNull(),
+    permalink: text('permalink'),
+    resultKind: text('result_kind').notNull(),
+    remoteVisibility: text('remote_visibility').notNull(),
+    verification: text('verification').notNull(),
+    isMock: boolean('is_mock').notNull(),
+    verifiedAt: ts('verified_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('publications_item_external_uq').on(t.itemId, t.externalId),
+    index('publications_item_idx').on(t.itemId),
+    check('publications_result_kind_chk', sql`${t.resultKind} in ('UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED', 'MANUAL_REPORTED')`),
+    check('publications_visibility_chk', sql`${t.remoteVisibility} in ('private', 'unlisted', 'public', 'unknown')`),
+    check('publications_verification_chk', sql`${t.verification} in ('MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED')`),
+    check('publications_mock_verification_chk', sql`${t.isMock} = (${t.verification} = 'MOCK')`),
+    check('publications_mock_external_chk', sql`not ${t.isMock} or ${t.externalId} like 'mock:%'`),
+    check('publications_mock_permalink_chk', sql`not ${t.isMock} or ${t.permalink} is null or ${t.permalink} like 'mock://%'`),
+    check('publications_real_not_mock_chk', sql`${t.isMock} or ${t.externalId} not like 'mock:%'`),
+    foreignKey({
+      name: 'publications_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'publications_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
     }).onDelete('restrict'),
   ],
 );

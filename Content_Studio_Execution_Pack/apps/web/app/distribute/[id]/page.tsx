@@ -4,7 +4,15 @@ import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
 import { CHANNEL_LABEL, formatMsk, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
-import { DISTRIBUTE_ERROR_TEXT, ITEM_STATUS_LABEL, PLAN_STATUS_LABEL, problemLabel, VISIBILITY_LABEL } from '../../../lib/distribution';
+import {
+  DISTRIBUTE_ERROR_TEXT,
+  ITEM_STATUS_LABEL,
+  jobStatusText,
+  PLAN_STATUS_LABEL,
+  problemLabel,
+  RESULT_KIND_LABEL,
+  VISIBILITY_LABEL,
+} from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -131,15 +139,71 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       ) : null}
       {x.jobs.length ? (
         <>
-          <h4>작업</h4>
+          <h4>작업(MOCK — 모의 어댑터)</h4>
           <ul className="list">
-            {x.jobs.map((j) => (
-              <li key={j.id} className="hash">
-                {j.state} · MOCK · T11에서 처리 · 예정 {formatMsk(j.nextRunAt)}
+            {x.jobs.map((j) => {
+              const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
+              const blockEvent = x.events.find((e) => e.stateAfter === 'BLOCKED');
+              const reason = blockEvent ? String((blockEvent.sanitizedDetails as { reason?: unknown; event?: unknown }).reason ?? (blockEvent.sanitizedDetails as { event?: unknown }).event ?? '') : null;
+              return (
+                <li key={j.id} className="hash">
+                  <strong>{jobStatusText(j, pub, reason)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
+                  {j.state === 'QUEUED' ? ` · 예정 ${formatMsk(j.nextRunAt)}` : ''}
+                  {j.cancelRequestedAt && j.state === 'CONFIRMED' ? ' · 취소 불가(이미 전송됨)' : ''} · <a href={`/api/jobs/${j.id}`}>작업 JSON</a>
+                </li>
+              );
+            })}
+          </ul>
+          <div className="actions">
+            {['QUEUED', 'RETRY_WAIT', 'BLOCKED', 'SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED'].includes(x.jobs.at(-1)?.state ?? '') &&
+            x.item.status !== 'PLANNED' ? (
+              <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/cancel`}>
+                <input type="hidden" name="plan_id" value={x.item.planId} />
+                <button type="submit">취소</button>
+              </form>
+            ) : null}
+            {['RECONCILING', 'UNKNOWN', 'REMOTE_PROCESSING'].includes(x.jobs.at(-1)?.state ?? '') ? (
+              <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/reconcile`}>
+                <input type="hidden" name="plan_id" value={x.item.planId} />
+                <button type="submit">재확인(조회만 — 다시 보내지 않음)</button>
+              </form>
+            ) : null}
+          </div>
+          <p className="note">취소는 아직 보내지 않은 작업만 바로 확정됩니다. 전송 중이면 &quot;취소 확인 중&quot;으로 남고, 원격이 이미 받았으면 취소할 수 없습니다.</p>
+        </>
+      ) : null}
+      {x.publications.length ? (
+        <>
+          <h4>원격 결과</h4>
+          <ul className="list">
+            {x.publications.map((p) => (
+              <li key={p.id}>
+                {p.isMock ? <span className="tag warn">MOCK</span> : null} {RESULT_KIND_LABEL[p.resultKind] ?? p.resultKind} · 원격 공개 범위 {p.remoteVisibility} · 확인{' '}
+                {p.verification} · <span className="hash">{p.externalId}</span>
+                {p.permalink ? <span className="hash"> · {p.permalink}</span> : null}
+                {p.isMock ? <strong> — 실제 발행 실적 아님</strong> : null}
               </li>
             ))}
           </ul>
         </>
+      ) : null}
+      {x.events.length ? (
+        <details>
+          <summary>작업 이력(최근 {x.events.length}개)</summary>
+          <ol className="list">
+            {x.events.map((e) => {
+              const d = e.sanitizedDetails as Record<string, unknown>;
+              return (
+                <li key={e.id} className="hash">
+                  #{e.eventSeq} {formatMsk(e.at)} · {e.stateBefore ?? '—'} → {e.stateAfter} · {String(d.event ?? '')}
+                  {d.reason ? ` · ${String(d.reason)}` : ''}
+                  {d.error_code ? ` · ${String(d.error_code)}` : ''}
+                  {typeof d.attempt === 'number' ? ` · 시도 ${d.attempt}` : ''}
+                </li>
+              );
+            })}
+          </ol>
+        </details>
       ) : null}
     </section>
   );
@@ -180,7 +244,8 @@ export default async function PlanPage({
         <Link href="/distribute">배포함</Link>
       </p>
       <p className="notice" role="note">
-        MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 실행은 작업 대기열(QUEUED)에 넣기까지이며 처리는 T11 작업 처리기가 합니다.
+        MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 실행하면 작업 대기열(QUEUED)에 들어가고, 작업 처리기가 모의 어댑터로
+        처리합니다. 확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.
       </p>
       {q.created === '1' ? (
         <p className="saved" role="status">
@@ -194,12 +259,32 @@ export default async function PlanPage({
       ) : null}
       {executed ? (
         <p className="saved" role="status">
-          MOCK 실행: {executed}개 항목을 작업 대기열에 넣었습니다{q.replay === '1' ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — T11 작업 처리기가 처리합니다.
+          MOCK 실행: {executed}개 항목을 작업 대기열에 넣었습니다{q.replay === '1' ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — 아래 &quot;작업 처리 실행(모의 1회)&quot;을 누르거나 작업 처리기가 처리합니다.
         </p>
       ) : null}
       {q.revoked === '1' ? (
         <p className="saved" role="status">
           승인을 철회했습니다(MOCK). 대기 중이던 작업은 보류(BLOCKED)되었습니다.
+        </p>
+      ) : null}
+      {str(q.ticked) !== undefined ? (
+        <p className="saved" role="status">
+          작업 처리기(모의)를 한 번 실행했습니다: 작업 {Number(str(q.ticked) ?? 0)}개 처리. 외부로 아무것도 보내지 않았습니다(MOCK).
+        </p>
+      ) : null}
+      {q.canceled === '1' ? (
+        <p className="saved" role="status">
+          취소했습니다(아직 보내지 않은 작업).
+        </p>
+      ) : null}
+      {q.cancel_requested === '1' ? (
+        <p className="notice" role="status">
+          취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.
+        </p>
+      ) : null}
+      {str(q.reconciled) ? (
+        <p className="saved" role="status">
+          재확인(조회만): {q.reconciled === 'found' ? '원격에서 결과를 찾았습니다(MOCK — 실제 발행 실적 아님).' : '원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.'}
         </p>
       ) : null}
       {err ? (
@@ -241,6 +326,12 @@ export default async function PlanPage({
           </button>
         </form>
         <p className="note">승인된 항목만 대기열에 들어갑니다. 두 번 눌러도 작업은 하나만 생깁니다.</p>
+        <form className="form inline" method="post" action="/api/worker/tick">
+          <input type="hidden" name="plan_id" value={d.plan.id} />
+          <input type="hidden" name="max_jobs" value="5" />
+          <button type="submit">작업 처리 실행(모의 1회)</button>
+        </form>
+        <p className="note">작업 처리기를 한 번 돌립니다(내 작업 최대 5개, 모의 어댑터 — 외부 호출 없음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.</p>
       </section>
     </main>
   );

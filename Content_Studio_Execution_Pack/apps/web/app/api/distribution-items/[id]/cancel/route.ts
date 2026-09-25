@@ -1,5 +1,5 @@
-import { approvalView, revokeApproval } from '@cs/db';
-import { assertSameOrigin, revokeSchema } from '@cs/domain';
+import { cancelItem } from '@cs/db';
+import { assertSameOrigin, cancelSchema } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
 import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
@@ -12,9 +12,11 @@ export const runtime = 'nodejs';
 type Ctx = { params: Promise<{ id: string }> };
 
 /**
- * POST /api/approvals/{id}/revoke — { reason? } → 200 { approval, blocked_job_ids, cancel_requested_job_ids }. 대기열(QUEUED) 작업은 BLOCKED,
- * 항목은 PLANNED 로, 승인됨 파생본은 review 로. 이미 전송 단계(LEASED·SENDING·REMOTE_PROCESSING·RECONCILING)인 작업은 되돌렸다고 주장하지 않고
- * CANCEL_REQUESTED("취소 확인 중")로 기록한다(T11 D18). 재시도 대기 작업은 다음 전송 직전 재검사가 막는다(A10). 이미 철회 409, 다른 owner 404.
+ * POST /api/distribution-items/{id}/cancel — {} → 200
+ * - 아직 시작하지 않은 작업(QUEUED·RETRY_WAIT·BLOCKED): { canceled: true, state: 'CANCELED' }
+ * - 이미 전송 단계(LEASED·SENDING·REMOTE_PROCESSING·RECONCILING): { cancel_requested: true, state: 'CANCEL_REQUESTED', message: '취소 확인 중' }
+ *   — 원격 취소를 주장하지 않는다(A11). worker 가 원격 결과를 확인해 CANCELED 또는 CONFIRMED(취소 불가, 이미 전송됨)로 정한다.
+ * UNKNOWN 409 cancel_unknown, 끝난·실행 전 항목 409 not_cancellable, 다른 owner 404.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
   const html = wantsHtml(request);
@@ -25,11 +27,11 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const owner = await requireOwner(request);
     const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
     if (body.kind === 'form' && body.data.plan_id) back = `/distribute/${encodeURIComponent(body.data.plan_id)}`;
-    const parsed = revokeSchema.safeParse(body.kind === 'form' ? { reason: body.data.reason || undefined } : body.data);
+    const parsed = cancelSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
-    const r = await revokeApproval(owner.db, owner.ownerId, id.toLowerCase(), parsed.data.reason);
-    if (html) return seeOther(`/distribute/${r.planId}?revoked=1`);
-    return json({ approval: approvalView(r.approval), plan_id: r.planId, blocked_job_ids: r.blockedJobIds, cancel_requested_job_ids: r.cancelRequestedJobIds });
+    const r = await cancelItem(owner.db, owner.ownerId, id.toLowerCase());
+    if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}${r.canceled ? 'canceled=1' : 'cancel_requested=1'}`);
+    return json(r);
   } catch (e) {
     if (html) return distributeFormFailure(e, request, back);
     return errorResponse(e, request);

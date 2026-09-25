@@ -36,6 +36,7 @@ const LABELS: Record<string, string> = {
   STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
   EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
   RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
+  JOB_SUBMIT_TIMEOUT_MS: 'JOB_SUBMIT_TIMEOUT_MS(배포 전송 시간 제한, ms)',
 };
 
 /** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
@@ -97,6 +98,18 @@ export const configSchema = z.object({
   EXPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/exports')),
   /** T05: 복원 미리보기에 올린 ZIP(<restore_id>.zip)을 두는 곳. */
   RESTORE_LOCAL_DIR: opt(z.string().min(1).default('./data/restores')),
+  /**
+   * T11(D18): 배포 작업의 어댑터 submit 시간 제한(ms). 넘으면 결과 불명(ambiguous) → RECONCILING(재전송하지 않고 조회).
+   * 1초 ~ 10분, 기본 30초. lease 는 heartbeat 로 연장된다.
+   */
+  JOB_SUBMIT_TIMEOUT_MS: opt(
+    z
+      .string()
+      .regex(/^\d{1,6}$/)
+      .transform(Number)
+      .pipe(z.int().min(1000).max(600000))
+      .default(30000),
+  ),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CHANNELS, renderVariantText, type Channel } from './channel';
 import { AppError } from './errors';
+import { planStatusFrom } from './jobs';
 import { isUuid } from './media';
 
 // ---- 상태·열거 ----
@@ -42,8 +43,7 @@ export type ItemStatus = (typeof ITEM_STATUSES)[number];
 /** 작업이 진행 중인(외부 전송이 일어날 수 있는) 항목 상태 — 복원 시 BLOCKED 로 들여온다. */
 export const IN_FLIGHT_ITEM_STATUSES: readonly ItemStatus[] = ['QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED'];
 
-export const JOB_STATES = ['QUEUED', 'LEASED', 'RETRY_WAIT', 'BLOCKED', 'DONE', 'FAILED', 'CANCELED', 'RECONCILING', 'UNKNOWN'] as const;
-export type JobState = (typeof JOB_STATES)[number];
+// 작업 상태(JOB_STATES)·전이 표는 jobs.ts(T11, D18).
 
 export const REQUESTED_RESULTS = ['mock_publish', 'upload_private', 'public_publish'] as const;
 export type RequestedResult = (typeof REQUESTED_RESULTS)[number];
@@ -54,7 +54,7 @@ export const SCHEDULE_TIMEZONE = 'Europe/Moscow' as const;
 export const SNAPSHOT_VERSION = 1 as const;
 export const MAX_PLAN_ITEMS = 20;
 export const MOCK_EXTERNAL_PREFIX = 'mock:';
-export const MOCK_EXECUTE_NOTICE = 'MOCK — 실제 게시 아님. 작업은 M3 T11 작업 처리기가 처리합니다.';
+export const MOCK_EXECUTE_NOTICE = 'MOCK — 실제 게시 아님. 작업 처리기(모의 어댑터)가 처리하며 외부로 아무것도 보내지 않습니다.';
 
 /**
  * T10 이 직접 일으키는 항목 상태 전이(세부 전이는 T11/T12 가 이 표에 더한다).
@@ -353,23 +353,11 @@ export const revokeSchema = z.object({ reason: z.string().max(200).optional() })
 // ---- 계획 상태(파생) ----
 
 /**
- * 항목 상태·활성 승인에서 계획 상태를 계산한다(저장값은 이것으로만 갱신).
- * 진행 중 항목이 있으면 executing, 대기(PLANNED) 항목이 있으면 승인 수로 draft/partially_approved/approved,
- * 그 밖(모두 끝남)은 T11/T12 가 쓰는 완료 상태.
+ * 항목 상태·활성 승인에서 계획 상태를 계산한다(저장값은 이것으로만 갱신). 규칙은 jobs.ts planStatusFrom 하나(T11 D18) —
+ * T10 의 계획 재계산과 T11 작업 처리기가 같은 함수를 쓴다.
  */
 export function computePlanStatus(items: ReadonlyArray<{ status: string; activeApproval: boolean }>): PlanStatus {
-  if (items.length === 0) return 'draft';
-  if (items.some((i) => IN_FLIGHT_ITEM_STATUSES.includes(i.status as ItemStatus))) return 'executing';
-  const planned = items.filter((i) => i.status === 'PLANNED');
-  if (planned.length > 0) {
-    const approved = planned.filter((i) => i.activeApproval).length;
-    if (approved === 0) return 'draft';
-    return approved === planned.length ? 'approved' : 'partially_approved';
-  }
-  if (items.every((i) => i.status === 'CONFIRMED')) return 'completed';
-  if (items.every((i) => i.status === 'CANCELED')) return 'canceled';
-  if (items.some((i) => i.status === 'CONFIRMED' || i.status === 'PARTIAL')) return 'partial';
-  return 'failed';
+  return planStatusFrom(items);
 }
 
 // ---- 오류 ----

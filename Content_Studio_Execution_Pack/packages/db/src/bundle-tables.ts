@@ -42,6 +42,8 @@ export const BUNDLE_TABLES: Record<ExportedTable, PgTable> = {
   jobs: schema.jobs,
   job_events: schema.jobEvents,
   execute_commands: schema.executeCommands,
+  send_intents: schema.sendIntents,
+  publications: schema.publications,
   audit_events: schema.auditEvents,
 };
 

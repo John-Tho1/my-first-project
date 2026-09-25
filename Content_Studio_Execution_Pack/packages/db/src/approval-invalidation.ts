@@ -9,7 +9,18 @@
  * QUEUED 작업은 BLOCKED(+ job_event), QUEUED 항목은 PLANNED 로 되돌린다(시작 전이라 외부 전송 없음). 승인 행은 지우지 않는다.
  */
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
-import { canVariantTransition, computePlanStatus, type PlanStatus, type VariantLifecycle } from '@cs/domain';
+import {
+  AppError,
+  canVariantTransition,
+  computePlanStatus,
+  itemStatusForJob,
+  TERMINAL_JOB_STATES,
+  transitionJobState,
+  type JobEvent,
+  type JobState,
+  type PlanStatus,
+  type VariantLifecycle,
+} from '@cs/domain';
 import { recordAudit, type DbOrTx } from './queries';
 import { approvals, contents, distributionItems, distributionPlans, jobEvents, jobs, variants } from './schema';
 
@@ -69,16 +80,28 @@ export async function activeApprovalsFor(tx: DbOrTx, ownerId: string, itemIds: r
   return new Map(rows.map((a) => [a.distributionItemId, a]));
 }
 
-/** 작업 상태 전이 + job_event(작업마다 seq = 최대+1). 호출자가 작업 행을 잠근(항목 잠금 아래) 상태여야 한다. */
+/**
+ * 작업 상태 전이 + job_event(작업마다 seq = 최대+1). 다음 상태는 @cs/domain transitionJobState(전이 표 한 곳)로만 정한다 —
+ * 표에 없는 전이는 IllegalJobTransitionError. 호출자가 작업 행을 잠근(항목 잠금 아래) 상태여야 한다.
+ * details 는 비밀·본문 없는 코드 값만(sanitized). details.event 가 없으면 사건 이름을 넣는다. set 은 함께 바꿀 열(lease 해제 등).
+ */
 export async function transitionJob(
   tx: DbOrTx,
   ownerId: string,
   job: Pick<JobRow, 'id' | 'state'>,
-  to: string,
+  event: JobEvent,
   details: Record<string, unknown>,
   now: Date,
-): Promise<void> {
-  await tx.update(jobs).set({ state: to, updatedAt: now }).where(and(eq(jobs.id, job.id), eq(jobs.ownerId, ownerId), eq(jobs.state, job.state)));
+  set: Partial<Pick<typeof jobs.$inferInsert, 'leaseOwner' | 'leaseUntil' | 'heartbeatAt' | 'nextRunAt' | 'lastErrorCode' | 'lastRetryClass' | 'reconcileCount' | 'cancelRequestedAt' | 'attempt'>> = {},
+): Promise<JobState> {
+  const to = transitionJobState(job.state, event);
+  const terminal = (TERMINAL_JOB_STATES as readonly string[]).includes(to);
+  const updated = await tx
+    .update(jobs)
+    .set({ ...set, state: to, updatedAt: now, ...(terminal ? { doneAt: now, leaseOwner: null, leaseUntil: null } : {}) })
+    .where(and(eq(jobs.id, job.id), eq(jobs.ownerId, ownerId), eq(jobs.state, job.state)))
+    .returning({ id: jobs.id });
+  if (!updated[0]) throw new AppError('conflict', 'job_state_changed', '작업 상태가 다른 곳에서 먼저 바뀌었습니다');
   const seq = await tx
     .select({ max: sql<number>`coalesce(max(${jobEvents.eventSeq}), 0)::int` })
     .from(jobEvents)
@@ -90,8 +113,38 @@ export async function transitionJob(
     stateBefore: job.state,
     stateAfter: to,
     at: now,
-    sanitizedDetails: details,
+    sanitizedDetails: { event, ...details, transition: event },
   });
+  return to;
+}
+
+/** 항목 상태를 작업 상태에 맞춘다(itemStatusForJob). override 가 있으면 그 값(예: 보내기 전 승인 문제 → PLANNED). */
+export async function syncItemStatus(tx: DbOrTx, ownerId: string, itemId: string, jobState: JobState, now: Date, override?: string): Promise<void> {
+  await tx
+    .update(distributionItems)
+    .set({ status: override ?? itemStatusForJob(jobState), updatedAt: now })
+    .where(and(eq(distributionItems.id, itemId), eq(distributionItems.ownerId, ownerId)));
+}
+
+/** 이미 보냈을 수 있는(전송 중·조회 중) 작업 상태 — 취소는 CANCEL_REQUESTED 로만 기록한다(원격 되돌림을 주장하지 않음). */
+export const CANCEL_REQUEST_JOB_STATES: readonly JobState[] = ['LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RECONCILING'];
+
+/**
+ * 잠근 항목의 진행 중 작업에 취소 요청을 기록한다(LEASED·SENDING·REMOTE_PROCESSING·RECONCILING → CANCEL_REQUESTED, 항목도 CANCEL_REQUESTED).
+ * worker 가 결과를 확인한 뒤 CANCELED(보내지 않았음) 또는 CONFIRMED(cancel_too_late)로 정한다. 요청이 기록되면 작업 ID 를 돌려준다.
+ */
+export async function requestCancelLocked(tx: DbOrTx, ownerId: string, itemId: string, cause: string, now: Date): Promise<string[]> {
+  const rows = await tx
+    .select({ id: jobs.id, state: jobs.state })
+    .from(jobs)
+    .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, itemId), inArray(jobs.state, [...CANCEL_REQUEST_JOB_STATES])))
+    .orderBy(asc(jobs.id))
+    .for('update');
+  for (const j of rows) {
+    await transitionJob(tx, ownerId, j, 'cancel_requested', { cause }, now, { cancelRequestedAt: now });
+    await syncItemStatus(tx, ownerId, itemId, 'CANCEL_REQUESTED', now);
+  }
+  return rows.map((r) => r.id);
 }
 
 export interface RevokedApproval {
@@ -105,7 +158,8 @@ export interface RevokedApproval {
 
 /**
  * 잠근 항목들의 활성 승인을 철회한다(없으면 건너뜀). QUEUED 작업 → BLOCKED(+event), QUEUED 항목 → PLANNED.
- * T11 이후의 진행 상태(LEASED·SENDING…)는 T11 이 CANCEL_REQUESTED 등으로 다룬다 — 여기서는 QUEUED 만.
+ * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록하고,
+ * RETRY_WAIT 는 worker 가 다음 전송 직전 재검사에서 BLOCKED(approval_missing)로 막는다(A10, T11 D18).
  */
 export async function revokeActiveApprovalsLocked(
   tx: DbOrTx,
@@ -138,7 +192,7 @@ export async function revokeActiveApprovalsLocked(
       .orderBy(asc(jobs.id))
       .for('update');
     for (const j of queued) {
-      await transitionJob(tx, ownerId, j, 'BLOCKED', { event: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated', reason, approval_id: a.id }, now);
+      await transitionJob(tx, ownerId, j, 'blocked', { event: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated', reason, approval_id: a.id }, now);
     }
     if (item.status === 'QUEUED') {
       await tx

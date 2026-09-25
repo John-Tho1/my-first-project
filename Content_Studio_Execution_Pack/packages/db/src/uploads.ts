@@ -35,6 +35,7 @@ import {
 } from '@cs/domain';
 import type { Db } from './client';
 import { resolveFromRoot } from './paths';
+import { cleanupPendingDelete, keyIsLive } from './asset-cleanup';
 import { recordAudit, type AssetRow, type DbOrTx } from './queries';
 import { assets, uploadChunks, uploadSessions } from './schema';
 
@@ -551,8 +552,9 @@ export async function completeUploadSession(
   //    이전 key 에 대한 늦은 삭제가 새 파일에 닿지 않게).
   const sha = built.sha256;
   let movedKey: string | null = null;
+  let cleanupAsset: string | null = null;
   try {
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       const cur = await lockSession(tx, ownerId, s.id);
       if (!cur || cur.state !== 'completed') throw new SessionChanged(cur?.state);
       const existing = (
@@ -561,12 +563,18 @@ export async function completeUploadSession(
       if (existing) {
         let asset = existing;
         if (existing.deletedAt !== null || !(await files.exists(existing.key))) {
+          // FIX-T08 round 2(P1): 옛 key 파일이 남아 있을 수 있다(deleted_at 이 있어도 파일이 없다고 가정하지 않음) — 옛 key 를
+          // pending_delete_key 로 넘겨 커밋 뒤 정리한다. 표시 칸에 다른(더 옛) key 가 있으면 먼저 지운다(실패 → 이번 완료 실패, 다시 시도).
+          if (existing.pendingDeleteKey !== null && existing.pendingDeleteKey !== existing.key && !(await keyIsLive(tx, existing.pendingDeleteKey))) {
+            await files.delete(existing.pendingDeleteKey);
+          }
           const key = buildAssetKey(ownerId, randomUUID());
           await files.putFile(key, built.file);
           movedKey = key;
+          cleanupAsset = existing.id;
           const rows = await tx
             .update(assets)
-            .set({ key, deletedAt: null })
+            .set({ key, deletedAt: null, pendingDeleteKey: existing.key })
             .where(and(eq(assets.id, existing.id), eq(assets.ownerId, ownerId)))
             .returning();
           asset = rows[0]!;
@@ -607,6 +615,9 @@ export async function completeUploadSession(
       const session = await finishVerified(tx, cur, asset, sha, now, false);
       return { session, asset, duplicate: false };
     });
+    // 커밋 뒤 옛 key 파일 정리(실패하면 표시가 남아 worker 가 다시 시도)
+    if (cleanupAsset) await cleanupPendingDelete(db, files, ownerId, cleanupAsset, now).catch(() => undefined);
+    return result;
   } catch (e) {
     // 기록이 되돌아갔으므로 옮긴 파일도 지운다(DB 와 파일이 어긋나지 않게).
     if (movedKey) await files.delete(movedKey).catch(() => undefined);

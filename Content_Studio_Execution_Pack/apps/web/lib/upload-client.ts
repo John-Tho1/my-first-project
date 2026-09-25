@@ -147,11 +147,30 @@ export function pollDelay(last: { ok: boolean; active: boolean; failures: number
 }
 
 /**
- * 폴링 루프: tick 결과와 관계없이 다음 조회를 예약하고, stop() 이면 멈춘다. setTimer/clearTimer 를 넣어 테스트한다.
- * tick 은 { active } 를 돌려주거나 throw(실패).
+ * 응답 순번(FIX-T08 round 2, P2): 요청마다 번호를 붙이고, 이미 반영한 번호보다 오래된 응답은 버린다.
  */
-export function startPolling(
-  tick: () => Promise<{ active: boolean }>,
+export function createSequencer(): { next: () => number; accept: (seq: number) => boolean } {
+  let issued = 0;
+  let applied = 0;
+  return {
+    next: () => ++issued,
+    accept: (seq) => {
+      if (seq <= applied) return false;
+      applied = seq;
+      return true;
+    },
+  };
+}
+
+/**
+ * 폴링 루프: 결과와 관계없이 다음 조회를 예약하고, stop() 이면 멈춘다. 타이머를 넣어 테스트한다.
+ * - 조회는 한 번에 하나만(FIX-T08 round 2): 조회 중 poke() 는 새 조회를 시작하지 않고 "끝나면 바로 한 번 더" 표시만 한다.
+ * - fetch 결과는 순번이 가장 최신일 때만 apply 한다(오래된 응답이 새 상태를 덮어쓰지 않게).
+ * apply 는 { active } 를 돌려주고, fetch 가 throw 하면 실패로 센다.
+ */
+export function startPolling<T>(
+  fetch: () => Promise<T>,
+  apply: (result: T) => { active: boolean },
   timers: { set: (fn: () => void, ms: number) => unknown; clear: (h: unknown) => void } = {
     set: (fn, ms) => setTimeout(fn, ms),
     clear: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -160,32 +179,49 @@ export function startPolling(
   let stopped = false;
   let handle: unknown = null;
   let failures = 0;
+  let inFlight = false;
+  let again = false;
+  const seq = createSequencer();
+  const schedule = (ms: number) => {
+    if (stopped) return;
+    if (handle !== null) timers.clear(handle);
+    handle = timers.set(() => void run(), ms);
+  };
   const run = async () => {
     handle = null;
-    if (stopped) return;
+    if (stopped || inFlight) return;
+    inFlight = true;
+    again = false;
+    const mine = seq.next();
     let delay: number;
     try {
-      const r = await tick();
+      const result = await fetch();
       failures = 0;
-      delay = pollDelay({ ok: true, active: r.active, failures: 0 });
+      const active = seq.accept(mine) && !stopped ? apply(result).active : true;
+      delay = pollDelay({ ok: true, active, failures: 0 });
     } catch {
       failures++;
       delay = pollDelay({ ok: false, active: false, failures });
+    } finally {
+      inFlight = false;
     }
-    if (!stopped && handle === null) handle = timers.set(() => void run(), delay);
+    schedule(again ? 0 : delay);
   };
-  handle = timers.set(() => void run(), 0);
+  schedule(0);
   return {
     stop: () => {
       stopped = true;
       if (handle !== null) timers.clear(handle);
       handle = null;
     },
-    /** 지금 바로 한 번 조회(업로드·취소 뒤). 예약된 조회는 이것으로 대체된다. */
+    /** 지금 바로 한 번 조회(업로드·취소 뒤). 조회 중이면 끝난 직후 한 번으로 합친다. */
     poke: () => {
       if (stopped) return;
-      if (handle !== null) timers.clear(handle);
-      handle = timers.set(() => void run(), 0);
+      if (inFlight) {
+        again = true;
+        return;
+      }
+      schedule(0);
     },
   };
 }

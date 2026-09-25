@@ -56,7 +56,8 @@ export function ownerExpr(name: ExportedTable): SQL {
 export function bundleColumns(name: ExportedTable): PgColumn[] {
   const cols = Object.values(getTableColumns(BUNDLE_TABLES[name])) as PgColumn[];
   if (name === 'users') return cols.filter((c) => c.name === 'id');
-  return cols.filter((c) => c.name !== 'owner_id');
+  // FIX-T08 round 2: 파일 삭제 의도(assets.pending_delete_key)는 운영 상태 — 묶음에 넣지 않고 복원 행은 null(다른 파일 삭제를 지시하지 못하게).
+  return cols.filter((c) => c.name !== 'owner_id' && !(name === 'assets' && c.name === 'pending_delete_key'));
 }
 
 function selectExpr(name: ExportedTable, c: PgColumn): SQL {

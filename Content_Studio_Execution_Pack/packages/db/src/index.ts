@@ -18,3 +18,4 @@ export * from './paths';
 export * from './lock';
 export * from './uploads';
 export * from './transcription';
+export * from './asset-cleanup';

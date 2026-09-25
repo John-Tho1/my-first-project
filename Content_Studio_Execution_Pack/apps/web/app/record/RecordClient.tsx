@@ -138,17 +138,21 @@ export default function RecordClient() {
 
   // FIX-T08(P1): 폴링 루프 — 실패해도 항상 다음 조회를 예약(2초→10초 backoff), 진행 중이면 1.5초, 없으면 10초. 화면을 떠나면 멈춘다.
   useEffect(() => {
-    const p = startPolling(async () => {
-      try {
-        const r = await call<{ jobs: JobView[] }>('/api/transcription-jobs');
+    const p = startPolling(
+      async () => {
+        try {
+          return await call<{ jobs: JobView[] }>('/api/transcription-jobs');
+        } catch (e) {
+          setPollError(`전사 목록을 불러오지 못했습니다: ${(e as Error).message} — 자동으로 다시 시도합니다.`);
+          throw e;
+        }
+      },
+      (r) => {
         setJobs(r.jobs);
         setPollError('');
         return { active: r.jobs.some((j) => j.state === 'queued' || j.state === 'running') };
-      } catch (e) {
-        setPollError(`전사 목록을 불러오지 못했습니다: ${(e as Error).message} — 자동으로 다시 시도합니다.`);
-        throw e;
-      }
-    });
+      },
+    );
     poller.current = p;
     return () => {
       p.stop();

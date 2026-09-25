@@ -10,7 +10,7 @@
  * WORKER_MODE=separate + DB_DRIVER=pglite 는 거부한다 — PGlite 는 한 데이터 디렉터리에 한 연결만 허용하므로
  * web 과 별도 프로세스가 같은 DB 를 동시에 열 수 없다.
  */
-import { advanceTranscriptionJobs, countCaptures, expireUploadSessions, uploadStoreFor, type AssetDeleter, type Db, type TranscriberLike } from '@cs/db';
+import { advanceTranscriptionJobs, cleanupPendingDeletes, countCaptures, expireUploadSessions, uploadStoreFor, type AssetDeleter, type Db, type TranscriberLike } from '@cs/db';
 import type { AppConfig } from '@cs/domain';
 
 export interface WorkerTick {
@@ -20,6 +20,8 @@ export interface WorkerTick {
   captures: number;
   uploadsExpired: number;
   transcription: { advanced: number; succeeded: number; failed: number; originalsDeleted: number } | null;
+  /** FIX-T08 round 2: 남은 파일 삭제 의도 재시도(assets.cleanup) — 저장소가 주어졌을 때만 */
+  cleanup: { deleted: number; failed: number } | null;
   note: string;
 }
 
@@ -59,6 +61,7 @@ export async function runWorkerTick({ config, db, transcriber, files, now }: Wor
   const captures = await countCaptures(db);
   const uploadsExpired = await expireUploadSessions(db, uploadStoreFor(config), at);
   const transcription = transcriber ? await advanceTranscriptionJobs(db, { transcriber, files, now: at }) : null;
+  const cleanup = files ? await cleanupPendingDeletes(db, files, at) : null;
   const tick: WorkerTick = {
     ranAt: at.toISOString(),
     mode: config.WORKER_MODE,
@@ -66,6 +69,7 @@ export async function runWorkerTick({ config, db, transcriber, files, now }: Wor
     captures,
     uploadsExpired,
     transcription,
+    cleanup,
     note: transcriber
       ? `T08: 업로드 만료 정리 + 전사 job 진행(${transcriber.mode === 'mock' ? '모의 전사기, 외부 호출 없음' : 'live'})`
       : 'T08: 업로드 만료 정리만(전사기 없음), 외부 호출 없음',

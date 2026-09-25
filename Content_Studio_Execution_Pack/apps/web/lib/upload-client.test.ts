@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { pollDelay, resumeDecision, Sha256, startPolling } from './upload-client';
+import { createSequencer, pollDelay, resumeDecision, Sha256, startPolling } from './upload-client';
 
 const nodeSha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const bytes = (n: number, seed = 1) => {
@@ -109,11 +109,15 @@ describe('폴링 간격·루프(실패해도 계속)', () => {
     const t = fakeTimers();
     const results: Array<'fail' | 'active' | 'idle'> = ['fail', 'fail', 'active', 'idle'];
     let calls = 0;
-    const p = startPolling(async () => {
-      const r = results[calls++] ?? 'idle';
-      if (r === 'fail') throw new Error('network');
-      return { active: r === 'active' };
-    }, t.timers);
+    const p = startPolling(
+      async () => {
+        const r = results[calls++] ?? 'idle';
+        if (r === 'fail') throw new Error('network');
+        return { active: r === 'active' };
+      },
+      (r) => r,
+      t.timers,
+    );
     expect(await t.fire()).toBe(0); // 첫 조회(실패)
     expect(t.q.map((x) => x.ms)).toEqual([2000]);
     await t.fire(); // 두 번째 실패
@@ -127,5 +131,51 @@ describe('폴링 간격·루프(실패해도 계속)', () => {
     p.stop();
     expect(t.q).toEqual([]);
     expect(calls).toBe(4);
+  });
+
+  it('FIX round 2: 순번 — 오래된 응답은 반영하지 않는다(늦게 도착한 이전 요청)', () => {
+    const s = createSequencer();
+    const a = s.next();
+    const b = s.next();
+    expect(s.accept(b)).toBe(true); // 새 요청이 먼저 도착
+    expect(s.accept(a)).toBe(false); // 이전 요청은 버림
+    expect(s.accept(b)).toBe(false); // 같은 응답 두 번도 버림
+    expect(s.accept(s.next())).toBe(true);
+  });
+
+  it('FIX round 2: 조회 중 poke 는 두 번째 조회를 겹쳐 시작하지 않고, 끝난 직후 한 번으로 합친다', async () => {
+    const t = fakeTimers();
+    const pending: Array<(v: { active: boolean }) => void> = [];
+    let started = 0;
+    const applied: number[] = [];
+    const p = startPolling(
+      () =>
+        new Promise<{ active: boolean }>((resolve) => {
+          started++;
+          pending.push(resolve);
+        }),
+      (r) => {
+        applied.push(started);
+        return r;
+      },
+      t.timers,
+    );
+    const first = t.q.shift()!; // 첫 조회 시작(응답 대기)
+    first.fn();
+    expect(started).toBe(1);
+    p.poke();
+    p.poke();
+    expect(t.q).toEqual([]); // 조회 중에는 새 조회를 예약하지 않음
+    expect(started).toBe(1);
+    pending.shift()!({ active: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(applied).toEqual([1]);
+    expect(t.q.map((x) => x.ms)).toEqual([0]); // 끝난 직후 한 번(합쳐짐), 10초 대기가 아님
+    await t.fire();
+    expect(started).toBe(2);
+    pending.shift()!({ active: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(t.q.map((x) => x.ms)).toEqual([1500]);
+    p.stop();
   });
 });

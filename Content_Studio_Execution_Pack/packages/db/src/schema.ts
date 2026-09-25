@@ -678,6 +678,12 @@ export const assets = pgTable(
     verificationScope: text('verification_scope').notNull().default('signature_size_checksum'),
     /** T08: 원음 보존을 끈 전사 뒤 파일을 지운 시각. 행(메타데이터)은 남고 다운로드는 410. */
     deletedAt: ts('deleted_at'),
+    /**
+     * FIX-T08 round 2(0013): 지울 파일의 저장 key(삭제 의도). 원음 삭제·재업로드 복구가 먼저 이 값을 커밋하고, 커밋 뒤 파일을 지운 다음 비운다.
+     * 파일 삭제가 실패하거나 프로세스가 죽으면 값이 남고 worker(assets.cleanup)가 다시 시도한다. 현재 key 와 같은 파일은 지우지 않는다.
+     * 운영 상태이므로 내보내기 묶음에 넣지 않는다(복원한 행은 항상 null — 묶음이 다른 파일 삭제를 지시하지 못하게).
+     */
+    pendingDeleteKey: text('pending_delete_key'),
     createdAt: ts('created_at').notNull().defaultNow(),
   },
   (t) => [

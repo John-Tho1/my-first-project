@@ -41,6 +41,7 @@ import {
   settleLedgerFailed,
   settleSttLedgerSucceeded,
 } from './budget';
+import { cleanupPendingDelete } from './asset-cleanup';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, captureRevisions, captures, transcriptionJobs, transcripts, variantAssets } from './schema';
 
@@ -276,15 +277,36 @@ function actualFromSnapshot(snapshot: Record<string, unknown>, currency: string,
 }
 
 /**
- * FIX-T08(P0): asset 행 잠금을 쥔 한 트랜잭션 안에서 "첨부 없음 재확인 → 파일 삭제 → deleted_at 기록" 순으로 한다.
- * 파일 삭제가 실패하면 트랜잭션 전체가 되돌아가 deleted_at 이 남지 않는다(DB 와 파일이 어긋나지 않게).
- * 재업로드 복구는 같은 행 잠금 아래 **새 key** 로 쓰므로, 이 삭제가 복구한 파일에 닿을 수 없다.
+ * FIX-T08 round 2(P0): **의도 먼저**. asset 행 잠금 아래 첨부 없음을 다시 확인하고 deleted_at + pending_delete_key(=현재 key)를
+ * 커밋한 뒤, 커밋 밖에서 그 key 의 파일을 지우고 표시를 비운다(cleanupPendingDelete). 파일 삭제가 실패하거나 프로세스가 죽으면
+ * 표시가 남아 worker(assets.cleanup)가 다시 지운다 — "파일은 없는데 asset 은 정상"인 상태가 생기지 않는다(다운로드는 deleted_at 으로 410).
+ * 재업로드 복구는 같은 행 잠금 아래 **새 key** 로 쓰므로 늦은 삭제가 복구한 파일에 닿을 수 없다.
  * 첨부(setVariantAssets)도 같은 asset 행을 잠그고 deleted_at 을 다시 보므로 첨부와 삭제는 직렬화된다.
+ * hooks.afterIntent: 테스트 주입(의도 커밋 직후, 파일 삭제 전 — 프로세스 중단 재현).
  */
-export async function deleteOriginal(db: Db, files: AssetDeleter, job: Pick<TranscriptionJobRow, 'id' | 'ownerId' | 'assetId'>, now: Date): Promise<boolean> {
+export async function deleteOriginal(
+  db: Db,
+  files: AssetDeleter,
+  job: Pick<TranscriptionJobRow, 'id' | 'ownerId' | 'assetId'>,
+  now: Date,
+  hooks: { afterIntent?: () => Promise<void> } = {},
+): Promise<boolean> {
+  // 앞선 삭제 의도(예: 복구로 바뀐 옛 key)가 남아 있으면 먼저 처리한다 — 표시 칸은 하나다.
+  await cleanupPendingDelete(db, files, job.ownerId, job.assetId, now);
   const done = await db.transaction(async (tx) => {
     const a = (await tx.select().from(assets).where(and(eq(assets.id, job.assetId), eq(assets.ownerId, job.ownerId))).for('update'))[0];
     if (!a || a.deletedAt !== null) return null;
+    if (a.pendingDeleteKey !== null && a.pendingDeleteKey !== a.key) {
+      await recordAudit(tx, {
+        ownerId: job.ownerId,
+        action: 'asset.delete_original_skipped',
+        entity: 'asset',
+        entityId: a.id,
+        details: { reason: 'cleanup_pending', job_id: job.id },
+        at: now,
+      });
+      return null;
+    }
     if (await assetInUse(tx, job.ownerId, a.id)) {
       await recordAudit(tx, {
         ownerId: job.ownerId,
@@ -296,12 +318,15 @@ export async function deleteOriginal(db: Db, files: AssetDeleter, job: Pick<Tran
       });
       return null;
     }
-    await files.delete(a.key); // 실패하면 throw → 롤백
-    await tx.update(assets).set({ deletedAt: now }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
+    await tx.update(assets).set({ deletedAt: now, pendingDeleteKey: a.key }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
     await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id }, at: now });
     return true;
   });
-  return done === true;
+  if (done !== true) return false;
+  await hooks.afterIntent?.();
+  // 커밋 뒤 파일 삭제(실패해도 표시가 남아 worker 가 다시 시도)
+  await cleanupPendingDelete(db, files, job.ownerId, job.assetId, now);
+  return true;
 }
 
 /**
@@ -412,7 +437,7 @@ export async function advanceTranscriptionJobs(
     });
     if (outcome === 'succeeded') {
       res.succeeded++;
-      // 원본 삭제 실패(파일 삭제 오류)는 전사 결과와 별개 — 원본은 그대로 남고(deleted_at 없음) 감사만 남긴다.
+      // 원본 삭제의 파일 단계 실패는 pending_delete_key 로 남아 worker 가 다시 지운다(전사 결과와 별개).
       if (!job.keepOriginal && opts.files && (await deleteOriginal(db, opts.files, job, now).catch(() => false))) res.originalsDeleted++;
     } else if (outcome === 'failed') {
       res.failed++;

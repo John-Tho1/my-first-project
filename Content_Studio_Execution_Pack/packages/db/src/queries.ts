@@ -224,6 +224,7 @@ export interface AuditInput {
     | 'upload.expire'
     | 'asset.delete_original'
     | 'asset.delete_original_skipped'
+    | 'asset.cleanup'
     | 'transcription.request'
     | 'transcription.cancel'
     | 'transcription.succeeded'

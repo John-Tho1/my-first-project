@@ -16,6 +16,8 @@ import {
   completeUploadSession,
   createContent,
   createVariantDraft,
+  cleanupPendingDelete,
+  cleanupPendingDeletes,
   deleteOriginal,
   expireUploadSessions,
   setVariantAssets,
@@ -720,15 +722,78 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
     expect(sha(new Uint8Array(await dl.arrayBuffer()))).toBe(sha(f));
   });
 
-  it('P0 파일 삭제가 실패하면 deleted_at 도 남지 않는다(한 트랜잭션, DB 와 파일 일치)', async () => {
+  it('P0(round 2) 의도 먼저: 의도 커밋 뒤 중단되면 파일은 남고 행은 deleted_at+pending_delete_key(다운로드 410), cleanup tick 이 지우고 다시 돌려도 안전', async () => {
     const f = media('mp3', 8000, 66);
     const { res } = await uploadAll(f);
     const asset = (await res.json()).asset;
+    const key = (await assetsWith(sha(f)))[0]!.key;
+    await expect(
+      deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date(), {
+        afterIntent: async () => {
+          throw new Error('process died');
+        },
+      }),
+    ).rejects.toThrow('process died');
+    let row = (await assetsWith(sha(f)))[0]!;
+    expect(row.deletedAt).not.toBeNull();
+    expect(row.pendingDeleteKey).toBe(key);
+    expect(await storage().exists(key)).toBe(true);
+    expect((await assetGET(...assetGet(asset.id, tokenA))).status).toBe(410);
+    const tick = await runWorkerTick({ config: loadConfig(), db, files: storage() });
+    expect(tick.cleanup!.deleted).toBeGreaterThanOrEqual(1);
+    row = (await assetsWith(sha(f)))[0]!;
+    expect(row.pendingDeleteKey).toBeNull();
+    expect(await storage().exists(key)).toBe(false);
+    const again = await runWorkerTick({ config: loadConfig(), db, files: storage() });
+    expect(again.cleanup).toEqual({ deleted: 0, failed: 0 });
+  });
+
+  it('P0(round 2) 파일 삭제 실패 → 의도는 남고(재시도 대상) 다음 정리에서 지운다', async () => {
+    const f = media('mp3', 8000, 72);
+    const { res } = await uploadAll(f);
+    const asset = (await res.json()).asset;
+    const key = (await assetsWith(sha(f)))[0]!.key;
     const failing = { delete: async () => Promise.reject(new Error('EBUSY')) };
-    await expect(deleteOriginal(db, failing, { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date())).rejects.toThrow('EBUSY');
+    expect(await deleteOriginal(db, failing, { id: randomUUID(), ownerId: ownerA, assetId: asset.id }, new Date())).toBe(true);
+    expect((await assetsWith(sha(f)))[0]!).toMatchObject({ pendingDeleteKey: key });
+    expect(await storage().exists(key)).toBe(true);
+    expect(await cleanupPendingDeletes(db, failing)).toMatchObject({ failed: expect.any(Number) });
+    expect((await assetsWith(sha(f)))[0]!.pendingDeleteKey).toBe(key);
+    expect((await cleanupPendingDeletes(db, storage())).deleted).toBeGreaterThanOrEqual(1);
+    expect(await storage().exists(key)).toBe(false);
+    expect((await assetsWith(sha(f)))[0]!.pendingDeleteKey).toBeNull();
+  });
+
+  it('P0(round 2) 정리는 살아 있는 key 의 파일을 지우지 않는다(표시만 비움)', async () => {
+    const live = media('mp3', 8000, 73);
+    const other = media('mp3', 8000, 74);
+    await uploadAll(live);
+    await uploadAll(other);
+    const liveRow = (await assetsWith(sha(live)))[0]!;
+    const otherRow = (await assetsWith(sha(other)))[0]!;
+    await db.update(schema.assets).set({ pendingDeleteKey: liveRow.key }).where(eq(schema.assets.id, otherRow.id));
+    expect(await cleanupPendingDelete(db, storage(), ownerA, otherRow.id)).toBe('skipped_live');
+    expect(await storage().exists(liveRow.key)).toBe(true);
+    expect((await assetsWith(sha(other)))[0]!.pendingDeleteKey).toBeNull();
+  });
+
+  it('P1(round 2) 지운 원본인데 옛 파일이 남아 있어도 재업로드 복구 뒤 옛 파일을 지우고 새 파일을 내려준다', async () => {
+    const f = media('mp4', 11_000, 75);
+    const { res } = await uploadAll(f, 'video/mp4');
+    const asset = (await res.json()).asset;
+    const oldKey = (await assetsWith(sha(f)))[0]!.key;
+    // 이전 구현의 "삭제 실패 무시" 상태를 재현: deleted_at 만 있고 파일·표시는 그대로
+    await db.update(schema.assets).set({ deletedAt: new Date(), pendingDeleteKey: null }).where(eq(schema.assets.id, asset.id));
+    expect(await storage().exists(oldKey)).toBe(true);
+    const again = await uploadAll(f, 'video/mp4');
+    expect((await again.res.json()).asset.id).toBe(asset.id);
     const row = (await assetsWith(sha(f)))[0]!;
-    expect(row.deletedAt).toBeNull();
+    expect(row.key).not.toBe(oldKey);
+    expect(row).toMatchObject({ deletedAt: null, pendingDeleteKey: null });
+    expect(await storage().exists(oldKey)).toBe(false);
     expect(await storage().exists(row.key)).toBe(true);
+    const dl = await assetGET(...assetGet(asset.id, tokenA));
+    expect(sha(new Uint8Array(await dl.arrayBuffer()))).toBe(sha(f));
   });
 
   it('P0 첨부 ↔ 삭제: 지운 파일은 첨부 410, 첨부된 파일은 삭제하지 않음(둘 다 asset 행 잠금 아래 재확인)', async () => {

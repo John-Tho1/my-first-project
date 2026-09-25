@@ -2,9 +2,9 @@
 
 ## 상태
 - 브랜치 `content-studio/m2` = M2 완료(T06~T09), HEAD 는 `git log -1` 로 확인. origin 에 푸시됨. M1 은 `content-studio/m0-m1-imvkel`(71e16c5).
-- Codex(GPT-6 Astra / xhigh) 경계: T07·T09·T08 PASS, T06 은 P1 2건이 **사용자 결정 대기**(아래). 판정 요약 `M2_CODEX_VERDICTS.md`, 진행 현황·결정 목록 `M2_STATUS.md`, 작업별 인계 `T06~T09_IMPLEMENTATION_HANDOFF.md`, 결정 D7~D15 는 `docs/DECISIONS.md`.
+- Codex(GPT-6 Astra / xhigh) 경계: T07·T09·T08 PASS, T06 의 P1 2건은 **D16(A·B) 로 종결**. M2 잔여 결정 A~G 전부 확정(docs/DECISIONS.md D16). 판정 요약 `M2_CODEX_VERDICTS.md`, 진행 현황·결정 목록 `M2_STATUS.md`, 작업별 인계 `T06~T09_IMPLEMENTATION_HANDOFF.md`, 결정 D7~D15 는 `docs/DECISIONS.md`.
 - 검사(HEAD): lint·typecheck·build 통과, unit 26 files/411, integration 16 files/249. 외부 호출·새 의존성·비밀·과금 0.
-- 화면 체크리스트(LOCAL_RUNBOOK §3) 미확인 — 로컬에서만 가능(`screen-notes.md`).
+- 화면 체크리스트(LOCAL_RUNBOOK §3) 사용자 확인 완료(D16-G, `screen-notes.md`).
 
 ## 클라우드에서 못 하는 것
 - Codex 검증은 **로컬 전용**(사용자 PC 의 Codex CLI, `scripts/codex-review-commit.sh`). 클라우드는 구현 + 인계 문서까지만 하고 Codex 경계에서 멈춘다(M1 클라우드 세션과 같은 방식). Codex 는 사용자가 로컬로 돌아왔을 때 실행한다.
@@ -17,8 +17,8 @@
 - 통과 조건: 승인 없는 실행 서버 거부 / 수정 뒤 기존 승인 거부(A06) / 더블클릭·worker 2개 중복 전송 방지(A07) / 원격 성공 후 응답 유실은 자동 재게시 없음(A08) / 앱·worker 종료 후 작업 상태 보존. **성공 화면에 MOCK 표시 필수, 실제 발행 실적으로 저장 금지.**
 - M2 발판: variants/variant_versions(불변)·variant_assets, 배포 파일 ZIP(packages.ts), 예산 원장(budget.ts), inline worker tick, 불변 트리거 패턴, 복합 same-owner FK 패턴, export/restore PARENTS 패턴.
 
-## 사용자 결정 대기(M3 착수 자체는 막지 않음 — T10~T12 는 이 결정과 독립)
-M2_STATUS.md §3 A~G. 특히 A(T06 removed 의미)·B(수동 복사 우회)는 T06 P1 잔존 사유로 기록됨.
+## 사용자 결정
+M2_STATUS.md §3 A~G 는 2026-09-25 권고안대로 전부 확정 → docs/DECISIONS.md **D16**. M3 는 결정 대기 항목 없이 착수한다.
 
 ## 클라우드 착수 프롬프트 (붙여넣기)
 ```
@@ -32,5 +32,5 @@ job_events·publications 행), docs/05 M3·A06~A12 를 읽는다.
 순서 T10 → T11 → T12. PUBLISH_MODE=disabled 유지, 채널 어댑터는 Mock 만, OAuth·실계정·외부 호출·새 의존성·비밀 금지.
 승인은 서버가 canonical payload 해시로 검증하고 LLM 출력·클라이언트 플래그는 절대 승인이 아니다. job 은 DB 트랜잭션 안에서 lease·상태 전이·
 전송 의도 기록을 함께 처리하고, 원격 결과 불명은 UNKNOWN/RECONCILING 으로 남기며 자동 재전송하지 않는다. 모의 성공 화면에는 MOCK 표시.
-M2 결정 대기 항목(M2_STATUS §3 A~G)은 건드리지 않는다. 각 작업 후 lint/typecheck/test/test:integration/build 5종 통과를 인계 문서에 기록한다.
+M2 결정은 D16 으로 전부 확정됐다(재논의 금지, D12~D16 준수). 각 작업 후 lint/typecheck/test/test:integration/build 5종 통과를 인계 문서에 기록한다.
 ```

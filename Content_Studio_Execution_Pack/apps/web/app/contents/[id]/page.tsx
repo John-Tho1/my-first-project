@@ -5,6 +5,7 @@ import {
   getContentVersion,
   getLedgerForRun,
   getWritingState,
+  latestPlanForVariants,
   listAssets,
   listClaimsForRun,
   listPackages,
@@ -68,6 +69,12 @@ export default async function ContentPage({
   const ledger = selectedRun ? await getLedgerForRun(db, session.ownerId, selectedRun.id) : null;
   // T09: 채널 초안·owner 파일·배포 파일
   const variantStates = await listVariantStates(db, session.ownerId, c.id, current.id);
+  // T10: 파생본별 최근 배포 계획(승인됨·검토 중 초안에서 링크)
+  const planByVariant = await latestPlanForVariants(
+    db,
+    session.ownerId,
+    variantStates.map((v) => v.variant.id),
+  );
   const ownerAssets = await listAssets(db, session.ownerId, 50);
   const packages = await listPackages(exportsDir(config), session.ownerId, c.id, 5);
   const newPackage = str(q.package);
@@ -196,6 +203,7 @@ export default async function ContentPage({
             packages={packages}
             savedChannel={str(q.variant_saved) ?? str(q.variant_proposal) ?? null}
             contentTitle={c.title}
+            planByVariant={planByVariant}
             newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}
           />
 

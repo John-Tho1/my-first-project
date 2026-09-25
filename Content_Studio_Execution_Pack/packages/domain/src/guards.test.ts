@@ -3,10 +3,34 @@ import { loadConfig } from './config';
 import {
   ApprovalRequiredError,
   CollectorDisabledError,
+  LiveChannelNotConfiguredError,
   LiveLlmNotAllowedError,
   PublishDisabledError,
 } from './errors';
-import { assertCollectorAllowed, assertLiveLlmAllowed, assertPublishAllowed } from './guards';
+import { assertCollectorAllowed, assertExecutionAllowed, assertLiveLlmAllowed, assertPublishAllowed } from './guards';
+
+const H = 'b'.repeat(64);
+const approval = { id: 'server-approval', payloadHash: H, revokedAt: null };
+
+describe('assertExecutionAllowed (T10, fail closed)', () => {
+  it('mock 계정: PUBLISH_MODE 와 무관하게 MOCK', () => {
+    expect(assertExecutionAllowed(loadConfig({}), { accountKind: 'mock', payloadHash: H, approval })).toEqual({ mode: 'MOCK' });
+    expect(assertExecutionAllowed(loadConfig({ PUBLISH_MODE: 'enabled' }), { accountKind: 'mock', payloadHash: H, approval })).toEqual({ mode: 'MOCK' });
+  });
+  it('live + disabled → PublishDisabledError(승인 객체가 있어도)', () => {
+    expect(() => assertExecutionAllowed(loadConfig({}), { accountKind: 'live', payloadHash: H, approval })).toThrow(PublishDisabledError);
+  });
+  it('live + enabled + 승인 없음·철회·hash 불일치 → ApprovalRequiredError', () => {
+    const c = loadConfig({ PUBLISH_MODE: 'enabled' });
+    expect(() => assertExecutionAllowed(c, { accountKind: 'live', payloadHash: H, approval: null })).toThrow(ApprovalRequiredError);
+    expect(() => assertExecutionAllowed(c, { accountKind: 'live', payloadHash: H, approval: { ...approval, revokedAt: new Date() } })).toThrow(ApprovalRequiredError);
+    expect(() => assertExecutionAllowed(c, { accountKind: 'live', payloadHash: H, approval: { ...approval, payloadHash: 'c'.repeat(64) } })).toThrow(ApprovalRequiredError);
+  });
+  it('live + enabled + 유효한 서버 승인이어도 M3 에는 어댑터가 없어 LiveChannelNotConfiguredError', () => {
+    const c = loadConfig({ PUBLISH_MODE: 'enabled' });
+    expect(() => assertExecutionAllowed(c, { accountKind: 'live', payloadHash: H, approval })).toThrow(LiveChannelNotConfiguredError);
+  });
+});
 
 describe('assertPublishAllowed (fail closed)', () => {
   it('기본 설정에서는 PublishDisabledError', () => {

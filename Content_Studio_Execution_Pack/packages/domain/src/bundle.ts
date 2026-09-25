@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CONTENT_LIFECYCLES } from './content';
+import { MOCK_EXTERNAL_PREFIX, payloadHash } from './distribution';
 import { AppError } from './errors';
 import { extensionForMime, isValidStorageKey } from './media';
 import { formatMsk } from './time';
@@ -51,6 +52,14 @@ export const EXPORTED_TABLES = [
   'claim_sources',
   'usage_ledger',
   'variant_assets',
+  // T10(0016, 결정 D17): 계정(모의)·계획·불변 항목 스냅샷·승인은 복원한다. 작업·작업 이력·실행 명령은 내보내기만(복원 안 함).
+  'channel_accounts',
+  'distribution_plans',
+  'distribution_items',
+  'approvals',
+  'jobs',
+  'job_events',
+  'execute_commands',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -71,6 +80,13 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   variant_assets: '0009_t09_variants',
   transcription_jobs: '0012_t08_uploads_transcription',
   transcripts: '0012_t08_uploads_transcription',
+  channel_accounts: '0016_t10_distribution',
+  distribution_plans: '0016_t10_distribution',
+  distribution_items: '0016_t10_distribution',
+  approvals: '0016_t10_distribution',
+  jobs: '0016_t10_distribution',
+  job_events: '0016_t10_distribution',
+  execute_commands: '0016_t10_distribution',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -81,10 +97,14 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   upload_chunks: '업로드 조각(T08) — 전송 중 임시 파일 목록. 조각 바이트는 묶음에 넣지 않는다',
 };
 
-export const NON_RESTORED_TABLES: readonly ExportedTable[] = ['users', 'audit_events'];
-export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !NON_RESTORED_TABLES.includes(t)) as Exclude<
+/**
+ * users·audit_events 는 내보내기만. T10(D17): jobs·job_events·execute_commands 도 내보내기만 — 복원 환경에서 작업을 다시 돌리지 않는다
+ * (진행 중이던 항목은 BLOCKED 로 들여온다, 맹목 재전송 금지).
+ */
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands'] as const satisfies readonly ExportedTable[];
+export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
-  'users' | 'audit_events'
+  (typeof NON_RESTORED_TABLES)[number]
 >[];
 export type RestoredTable = (typeof RESTORED_TABLES)[number];
 
@@ -274,7 +294,8 @@ export const ROW_SCHEMAS = {
     content_id: uuid,
     channel: z.enum(['threads', 'instagram', 'youtube', 'blog']),
     current_version_id: uuid.nullable(),
-    lifecycle: z.enum(['draft', 'review']),
+    // T10(0016): 'approved' 추가(복원 사후 검사가 활성 승인이 없으면 review/draft 로 낮춘다).
+    lifecycle: z.enum(['draft', 'review', 'approved']),
     created_at: ts,
     updated_at: ts,
   }),
@@ -371,6 +392,99 @@ export const ROW_SCHEMAS = {
     segments: z.array(z.strictObject({ start_ms: int.min(0), end_ms: int.min(0), text: str })),
     created_by: z.enum(['mock', 'owner']),
     created_at: ts,
+  }),
+  // T10(0016)
+  channel_accounts: z.strictObject({
+    id: uuid,
+    platform: z.enum(['threads', 'instagram', 'youtube', 'blog']),
+    kind: z.enum(['mock', 'live']),
+    external_account_id: str.min(1).max(200),
+    display_name: str.max(200),
+    state: z.enum(['mock_ready', 'connected', 'disconnected', 'revoked']),
+    capability_snapshot: z.record(z.string(), z.unknown()),
+    created_at: ts,
+  }),
+  distribution_plans: z.strictObject({
+    id: uuid,
+    target_summary: str,
+    status: z.enum(['draft', 'partially_approved', 'approved', 'executing', 'partial', 'completed', 'canceled', 'failed']),
+    revision: int.min(1),
+    created_at: ts,
+    updated_at: ts,
+  }),
+  distribution_items: z.strictObject({
+    id: uuid,
+    plan_id: uuid,
+    channel_account_id: uuid,
+    variant_id: uuid,
+    variant_version_id: uuid,
+    content_version_id: uuid,
+    brand_profile_id: uuid.nullable(),
+    brand_profile_version: int.min(1).nullable(),
+    payload_json: z.record(z.string(), z.unknown()),
+    payload_hash: z.string().regex(/^[0-9a-f]{64}$/),
+    requested_result: z.enum(['mock_publish', 'upload_private', 'public_publish']),
+    visibility: z.enum(['private', 'unlisted', 'public']),
+    scheduled_at_utc: ts.nullable(),
+    schedule_timezone: z.literal('Europe/Moscow'),
+    status: z.enum([
+      'PLANNED',
+      'QUEUED',
+      'SENDING',
+      'REMOTE_PROCESSING',
+      'CONFIRMED',
+      'RETRY_WAIT',
+      'BLOCKED',
+      'RECONCILING',
+      'UNKNOWN',
+      'CANCEL_REQUESTED',
+      'CANCELED',
+      'FAILED',
+      'PARTIAL',
+    ]),
+    created_at: ts,
+    updated_at: ts,
+  }),
+  approvals: z.strictObject({
+    id: uuid,
+    distribution_item_id: uuid,
+    payload_hash: z.string().regex(/^[0-9a-f]{64}$/),
+    purpose: z.enum(['mock_publish', 'upload_private', 'public_publish']),
+    approval_version: int.min(1),
+    approved_at: ts,
+    revoked_at: ts.nullable(),
+    revoke_reason: nstr,
+    created_at: ts,
+  }),
+  jobs: z.strictObject({
+    id: uuid,
+    kind: z.enum(['publish']),
+    item_id: uuid.nullable(),
+    payload_ref: str,
+    state: z.enum(['QUEUED', 'LEASED', 'RETRY_WAIT', 'BLOCKED', 'DONE', 'FAILED', 'CANCELED', 'RECONCILING', 'UNKNOWN']),
+    attempt: int.min(0),
+    lease_owner: nstr,
+    lease_until: ts.nullable(),
+    next_run_at: ts,
+    idempotency_key: str,
+    created_at: ts,
+    updated_at: ts,
+  }),
+  job_events: z.strictObject({
+    id: uuid,
+    job_id: uuid,
+    event_seq: int.min(1),
+    state_before: nstr,
+    state_after: str,
+    at: ts,
+    sanitized_details: z.record(z.string(), z.unknown()),
+  }),
+  execute_commands: z.strictObject({
+    id: uuid,
+    plan_id: uuid,
+    command_key: str,
+    created_at: ts,
+    result_json: z.record(z.string(), z.unknown()),
   }),
   audit_events: z.strictObject({
     id: uuid,
@@ -1064,9 +1178,79 @@ export function checkIntegrity(t: BundleTables): void {
     need('content_captures', 'content_id', r.content_id, 'contents');
     need('content_captures', 'capture_id', r.capture_id, 'captures');
   }
+  checkDistributionIntegrity(t, need, problems);
   if (problems.length) {
     throw new BundleError('integrity', '묶음 안의 관계(ID 참조)가 맞지 않습니다', { problems: [...new Set(problems)].slice(0, 20) });
   }
+}
+
+/**
+ * T10(D17): 배포 표의 묶음 안 관계. 항목 스냅샷은 불변이므로 payload_hash = sha256(canonical(payload_json)) 이고
+ * payload 의 ID 들이 항목 열과 같아야 한다(변조된 스냅샷을 복원하지 않는다). 승인 hash·목적은 항목과 같고, 항목마다 활성 승인은 최대 1개.
+ */
+function checkDistributionIntegrity(
+  t: BundleTables,
+  need: (table: string, col: string, v: string | null, target: ExportedTable) => void,
+  problems: string[],
+): void {
+  const vvById = new Map(t.variant_versions.map((v) => [v.id, v]));
+  const variantById = new Map(t.variants.map((v) => [v.id, v]));
+  const accountById = new Map(t.channel_accounts.map((a) => [a.id, a]));
+  const brandById = new Map(t.brand_profiles.map((b) => [b.id, b]));
+  const itemById = new Map(t.distribution_items.map((i) => [i.id, i]));
+  for (const a of t.channel_accounts) {
+    if ((a.kind === 'mock') !== a.external_account_id.startsWith(MOCK_EXTERNAL_PREFIX)) problems.push('channel_accounts: mock 계정은 mock: 접두어');
+    if (a.state === 'mock_ready' && a.kind !== 'mock') problems.push('channel_accounts: mock_ready 는 mock 계정만');
+  }
+  for (const i of t.distribution_items) {
+    need('distribution_items', 'plan_id', i.plan_id, 'distribution_plans');
+    need('distribution_items', 'channel_account_id', i.channel_account_id, 'channel_accounts');
+    need('distribution_items', 'variant_id', i.variant_id, 'variants');
+    need('distribution_items', 'variant_version_id', i.variant_version_id, 'variant_versions');
+    need('distribution_items', 'content_version_id', i.content_version_id, 'content_versions');
+    need('distribution_items', 'brand_profile_id', i.brand_profile_id, 'brand_profiles');
+    const vv = vvById.get(i.variant_version_id);
+    if (vv && (vv.variant_id !== i.variant_id || vv.content_version_id !== i.content_version_id)) {
+      problems.push('distribution_items.variant_version_id → 같은 파생본·원고 버전');
+    }
+    const acc = accountById.get(i.channel_account_id);
+    const variant = variantById.get(i.variant_id);
+    if (acc && variant && acc.platform !== variant.channel) problems.push('distribution_items: 계정 플랫폼 ≠ 파생본 채널');
+    const brand = i.brand_profile_id ? brandById.get(i.brand_profile_id) : undefined;
+    if ((i.brand_profile_id === null) !== (i.brand_profile_version === null) || (brand && brand.version !== i.brand_profile_version)) {
+      problems.push('distribution_items.brand_profile_version → brand_profiles');
+    }
+    let hash: string | null;
+    try {
+      hash = payloadHash(i.payload_json);
+    } catch {
+      hash = null;
+    }
+    const p = i.payload_json;
+    if (
+      hash !== i.payload_hash ||
+      p.variant_version_id !== i.variant_version_id ||
+      p.content_version_id !== i.content_version_id ||
+      p.channel_account_id !== i.channel_account_id ||
+      p.visibility !== i.visibility ||
+      p.scheduled_at_utc !== (i.scheduled_at_utc === null ? null : new Date(i.scheduled_at_utc).toISOString()) ||
+      (acc && p.provider_account_id !== acc.external_account_id)
+    ) {
+      problems.push('distribution_items.payload_hash → payload_json(불변 스냅샷)');
+    }
+  }
+  const activeByItem = new Map<string, number>();
+  for (const a of t.approvals) {
+    need('approvals', 'distribution_item_id', a.distribution_item_id, 'distribution_items');
+    const item = itemById.get(a.distribution_item_id);
+    if (item && (item.payload_hash !== a.payload_hash || item.requested_result !== a.purpose)) problems.push('approvals.payload_hash·purpose → distribution_items');
+    if ((a.revoked_at === null) !== (a.revoke_reason === null)) problems.push('approvals: revoked_at·revoke_reason 은 함께');
+    if (a.revoked_at === null) activeByItem.set(a.distribution_item_id, (activeByItem.get(a.distribution_item_id) ?? 0) + 1);
+  }
+  if ([...activeByItem.values()].some((n) => n > 1)) problems.push('approvals: 항목마다 활성 승인은 1개');
+  for (const j of t.jobs) need('jobs', 'item_id', j.item_id, 'distribution_items');
+  for (const e of t.job_events) need('job_events', 'job_id', e.job_id, 'jobs');
+  for (const c of t.execute_commands) need('execute_commands', 'plan_id', c.plan_id, 'distribution_plans');
 }
 
 /** owner 를 뺀 행 비교용 해시(같은 ID 의 기존 행과 내용이 같은지). */

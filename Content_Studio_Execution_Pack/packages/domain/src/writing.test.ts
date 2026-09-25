@@ -176,7 +176,7 @@ describe('묶음 호환: 0005 이전 묶음', () => {
       assets: [],
       transcription_jobs: [],
       transcripts: [],
-      audit_events: [],
+      audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
     } as unknown as BundleTables;
     const b = buildBundle({
       exportId: '77777777-7777-4777-8777-777777777777',
@@ -292,7 +292,7 @@ describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
       assets: [],
       transcription_jobs: [],
       transcripts: [],
-      audit_events: [],
+      audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
     };
   }
   const build = (t: BundleTables) =>
@@ -423,7 +423,7 @@ describe('FIX-T07: 출력 정제·user_confirmed 복원 거부', () => {
       variant_assets: [],
       transcription_jobs: [],
       transcripts: [],
-      audit_events: [],
+      audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
     } as unknown as BundleTables;
     const b = buildBundle({
       exportId: '77777777-7777-4777-8777-777777777777',
@@ -470,7 +470,7 @@ describe('FIX-T09: 묶음의 파생본 AI 참조는 같은 파생본의 variant 
       variant_versions: [vv(VTV, VT, threadsRun), vv(VBV, VB, RB)],
       interview_answers: [],
       generation_runs: [run(RT, VT), run(RB, VB)],
-      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], transcription_jobs: [], transcripts: [], audit_events: [],
+      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], transcription_jobs: [], transcripts: [], audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
     } as unknown as BundleTables;
     return buildBundle({
       exportId: '88888888-8888-4888-8888-888888888888', exportedAt: '2026-09-24T12:00:00.000Z', appVersion: '0.1.0', migrations: ['0000_a'],
@@ -543,7 +543,7 @@ describe('FIX-T09 round 2: proposal_status 채움·모순 검사', () => {
       content_versions: versions,
       content_captures: [], variants: [], variant_versions: [], interview_answers: [],
       generation_runs: [r],
-      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], transcription_jobs: [], transcripts: [], audit_events: [],
+      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], transcription_jobs: [], transcripts: [], audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [],
     } as unknown as BundleTables;
     return buildBundle({
       exportId: '88888888-8888-4888-8888-888888888888', exportedAt: '2026-09-24T12:00:00.000Z', appVersion: '0.1.0', migrations: ['0000_a'],

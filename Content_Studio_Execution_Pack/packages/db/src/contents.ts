@@ -22,6 +22,7 @@ import {
   type ContentLifecycle,
   type ContentMetaPatchInput,
 } from '@cs/domain';
+import { invalidateApprovalsForContent } from './approval-invalidation';
 import { listUnconfirmedExperienceClaims } from './claims-gate';
 import type { Db } from './client';
 import { getCaptureById, recordAudit, type DbOrTx } from './queries';
@@ -431,6 +432,8 @@ export async function insertCurrentVersion(
     .where(and(eq(contents.id, content.id), eq(contents.ownerId, ownerId), eq(contents.currentVersionId, current.id)))
     .returning();
   if (!updated[0]) throw new Error('현재 버전 갱신에 실패했습니다');
+  // T10(A06): 원고가 바뀌면 파생본이 stale — 그 파생본을 담은 배포 항목의 활성 승인을 같은 트랜잭션에서 철회한다(content_changed).
+  await invalidateApprovalsForContent(tx, ownerId, content.id, now);
   return { content: updated[0], version };
 }
 

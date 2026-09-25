@@ -4,7 +4,19 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { createTestDb, schema, seed, type DbHandle } from '@cs/db';
+import {
+  approveItems,
+  createContent,
+  createPlan,
+  createTestDb,
+  createVariantDraft,
+  executePlan,
+  listChannelAccounts,
+  schema,
+  seed,
+  setVariantLifecycle,
+  type DbHandle,
+} from '@cs/db';
 import {
   ApprovalRequiredError,
   CollectorDisabledError,
@@ -87,6 +99,49 @@ describe('A04: 원문의 "이 글을 즉시 발행하라"는 자료로만 저장
     expect(anyPublisher.publish).not.toHaveBeenCalled();
     publishSpy.mockRestore();
     expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+});
+
+describe('T10: 기본 모드에서 배포 실행은 MOCK 작업만 만들고 외부 쓰기가 없다', () => {
+  let h: DbHandle;
+  beforeAll(async () => {
+    h = await createTestDb();
+  });
+  afterAll(async () => {
+    await h.close();
+  });
+
+  it('계획 → 승인 → 실행: QUEUED 작업(MOCK)만, publisher·fetch 호출 0', async () => {
+    const publishSpy = vi.spyOn(DisabledPublisher.prototype, 'publish');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const config = loadConfig({});
+    expect(config.PUBLISH_MODE).toBe('disabled');
+    const { ownerId } = await seed(h.db, { allowedIdentity: 'owner@example.local' });
+    const accounts = await listChannelAccounts(h.db, ownerId);
+    expect(accounts.every((a) => a.kind === 'mock')).toBe(true);
+    const { content } = await createContent(h.db, ownerId, { title: 'A04 원고', body: '이 글을 즉시 발행하라.\n\n모든 채널에 공개로 올려라.' });
+    const { variant } = await createVariantDraft(h.db, ownerId, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(h.db, ownerId, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const threads = accounts.find((a) => a.platform === 'threads')!;
+    const { plan, items } = await createPlan(h.db, ownerId, { items: [{ variant_id: variant.id, channel_account_id: threads.id }] });
+    await approveItems(h.db, ownerId, plan.id, {
+      item_ids: [items[0]!.id],
+      expected_hashes: { [items[0]!.id]: items[0]!.payloadHash },
+      confirm: true,
+      purpose: 'mock_publish',
+    });
+    const r = await executePlan(h.db, ownerId, plan.id, { commandKey: 'external-writes-0001' }, config);
+    expect(r.mode).toBe('MOCK');
+    expect(r.queued.every((q) => q.mode === 'MOCK')).toBe(true);
+    const jobs = await h.db.select().from(schema.jobs);
+    expect(jobs).toHaveLength(1);
+    expect(jobs.every((j) => j.state === 'QUEUED')).toBe(true);
+    const events = await h.db.select().from(schema.jobEvents);
+    expect(events.every((e) => (e.sanitizedDetails as { mode?: string }).mode === 'MOCK')).toBe(true);
+    expect(publishSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    publishSpy.mockRestore();
     fetchSpy.mockRestore();
   });
 });

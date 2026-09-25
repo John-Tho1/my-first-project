@@ -18,8 +18,15 @@ export class ApprovalRequiredError extends GuardError {
   constructor() {
     super(
       'APPROVAL_REQUIRED',
-      '서버에서 검증된 승인이 없어 게시할 수 없습니다. 승인 기능은 M3에서 구현됩니다.',
+      '서버에서 검증된 승인이 없어 게시할 수 없습니다. 배포함에서 정확한 배포 내용을 승인해야 합니다.',
     );
+  }
+}
+
+/** T10: live 채널 어댑터는 M4 전까지 없다 — 모든 조건(PUBLISH_MODE·승인)이 있어도 거부(503). 외부 호출 없음. */
+export class LiveChannelNotConfiguredError extends GuardError {
+  constructor() {
+    super('LIVE_CHANNEL_NOT_CONFIGURED', '실제 채널 게시 어댑터가 아직 없습니다(M4). 외부로 아무것도 보내지 않았습니다.');
   }
 }
 

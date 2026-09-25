@@ -20,6 +20,7 @@ try {
       database: config.DATABASE_URL,
       captures_inserted: result.capturesInserted,
       captures_total: result.capturesTotal,
+      mock_accounts_inserted: result.mockAccountsInserted,
     }),
   );
 } finally {

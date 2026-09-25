@@ -280,7 +280,7 @@ export const contentVersions = pgTable(
 
 /**
  * 채널별 파생본(T09, 결정 D14). 원고 하나에 채널마다 하나(unique(content_id, channel)).
- * lifecycle 은 draft | review 만(APPROVED 는 M3). stale 은 저장하지 않고 "현재 버전의 content_version_id ≠ 원고의 현재 버전"으로 파생한다.
+ * lifecycle 은 draft | review | approved(T10 — 서버 승인만 만든다, 철회 → review, 새 버전 → draft). stale 은 저장하지 않고 "현재 버전의 content_version_id ≠ 원고의 현재 버전"으로 파생한다.
  * current_version_id 는 variant_versions.id — 순환 FK 를 피하려고 앱에서 검증한다(contents 와 같은 방식).
  */
 export const variants = pgTable(
@@ -301,7 +301,8 @@ export const variants = pgTable(
     unique('variants_content_channel_uq').on(t.contentId, t.channel),
     unique('variants_id_owner_uq').on(t.id, t.ownerId),
     check('variants_channel_chk', sql`${t.channel} in ('threads', 'instagram', 'youtube', 'blog')`),
-    check('variants_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review')`),
+    // T10(0016, D17): 'approved' = 이 파생본의 현재 버전을 담은 배포 항목에 활성 승인이 있음(approveItems 만 만든다).
+    check('variants_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review', 'approved')`),
     foreignKey({
       name: 'variants_content_same_owner_fk',
       columns: [t.contentId, t.ownerId],
@@ -963,6 +964,260 @@ export const transcripts = pgTable(
       name: 'transcripts_job_same_owner_fk',
       columns: [t.jobId, t.ownerId],
       foreignColumns: [transcriptionJobs.id, transcriptionJobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T10 배포 계획·승인·실행(결정 D17, migration 0016) ----
+
+/**
+ * 배포 계정. M3 에는 kind='mock' 행만 있다(external_account_id 는 'mock:' 접두어, state 'mock_ready'). 인증 비밀은 여기 두지 않는다(T13).
+ * 상태 변경(setChannelAccountState)은 이 계정을 쓰는 활성 승인을 무효로 한다(A06 account_changed).
+ */
+export const channelAccounts = pgTable(
+  'channel_accounts',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    platform: text('platform').notNull(),
+    kind: text('kind').notNull(),
+    externalAccountId: text('external_account_id').notNull(),
+    displayName: text('display_name').notNull(),
+    state: text('state').notNull(),
+    capabilitySnapshot: jsonb('capability_snapshot').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('channel_accounts_owner_platform_external_uq').on(t.ownerId, t.platform, t.externalAccountId),
+    unique('channel_accounts_id_owner_uq').on(t.id, t.ownerId),
+    check('channel_accounts_platform_chk', sql`${t.platform} in ('threads', 'instagram', 'youtube', 'blog')`),
+    check('channel_accounts_kind_chk', sql`${t.kind} in ('mock', 'live')`),
+    check('channel_accounts_state_chk', sql`${t.state} in ('mock_ready', 'connected', 'disconnected', 'revoked')`),
+    check('channel_accounts_mock_prefix_chk', sql`(${t.kind} = 'mock') = (${t.externalAccountId} like 'mock:%')`),
+    check('channel_accounts_mock_ready_chk', sql`${t.state} <> 'mock_ready' or ${t.kind} = 'mock'`),
+  ],
+);
+
+/** 배포 계획. status 는 항목·승인에서 파생해 저장한다(@cs/domain computePlanStatus). revision 은 상태가 바뀔 때마다 +1. */
+export const distributionPlans = pgTable(
+  'distribution_plans',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    targetSummary: text('target_summary').notNull().default(''),
+    status: text('status').notNull().default('draft'),
+    revision: integer('revision').notNull().default(1),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('distribution_plans_id_owner_uq').on(t.id, t.ownerId),
+    check(
+      'distribution_plans_status_chk',
+      sql`${t.status} in ('draft', 'partially_approved', 'approved', 'executing', 'partial', 'completed', 'canceled', 'failed')`,
+    ),
+    index('distribution_plans_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 배포 항목 = 승인 대상 불변 스냅샷(docs/03 승인 스냅샷). payload_json 은 canonical publish payload, payload_hash = sha256(canonical JSON).
+ * 트리거 distribution_items_snapshot_immutable: 스냅샷 열(및 ID·owner·계획·생성 시각)을 바꾸는 UPDATE 와 모든 DELETE 를 거부 — status·updated_at 만 바뀐다.
+ * unique(owner, plan, account, variant_version, payload_hash) = docs/03 "중복·재시도 규칙"의 로컬 key.
+ */
+export const distributionItems = pgTable(
+  'distribution_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    planId: uuid('plan_id').notNull(),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    variantId: uuid('variant_id').notNull(),
+    variantVersionId: uuid('variant_version_id').notNull(),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    brandProfileId: uuid('brand_profile_id'),
+    brandProfileVersion: integer('brand_profile_version'),
+    payloadJson: jsonb('payload_json').$type<Record<string, unknown>>().notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    requestedResult: text('requested_result').notNull(),
+    visibility: text('visibility').notNull(),
+    scheduledAtUtc: ts('scheduled_at_utc'),
+    scheduleTimezone: text('schedule_timezone').notNull().default('Europe/Moscow'),
+    status: text('status').notNull().default('PLANNED'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('distribution_items_local_key_uq').on(t.ownerId, t.planId, t.channelAccountId, t.variantVersionId, t.payloadHash),
+    unique('distribution_items_id_owner_uq').on(t.id, t.ownerId),
+    index('distribution_items_plan_idx').on(t.planId),
+    index('distribution_items_variant_idx').on(t.variantId),
+    index('distribution_items_account_idx').on(t.channelAccountId),
+    check('distribution_items_requested_result_chk', sql`${t.requestedResult} in ('mock_publish', 'upload_private', 'public_publish')`),
+    check('distribution_items_visibility_chk', sql`${t.visibility} in ('private', 'unlisted', 'public')`),
+    check('distribution_items_timezone_chk', sql`${t.scheduleTimezone} = 'Europe/Moscow'`),
+    check('distribution_items_hash_chk', sql`${t.payloadHash} ~ '^[0-9a-f]{64}$'`),
+    check('distribution_items_brand_chk', sql`(${t.brandProfileId} is null) = (${t.brandProfileVersion} is null)`),
+    check(
+      'distribution_items_status_chk',
+      sql`${t.status} in ('PLANNED', 'QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'CONFIRMED', 'RETRY_WAIT', 'BLOCKED', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED', 'CANCELED', 'FAILED', 'PARTIAL')`,
+    ),
+    foreignKey({
+      name: 'distribution_items_plan_same_owner_fk',
+      columns: [t.planId, t.ownerId],
+      foreignColumns: [distributionPlans.id, distributionPlans.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_variant_version_same_owner_fk',
+      columns: [t.variantVersionId, t.ownerId],
+      foreignColumns: [variantVersions.id, variantVersions.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_brand_same_owner_fk',
+      columns: [t.brandProfileId, t.ownerId],
+      foreignColumns: [brandProfiles.id, brandProfiles.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 승인(docs/03). 서버 approveItems 만 만든다(클라이언트·LLM 플래그는 승인이 아님). payload_hash·purpose 는 항목과 같아야 한다(INSERT 트리거).
+ * 트리거 approvals_guard: DELETE 거부, UPDATE 는 revoked_at·revoke_reason 을 NULL → 값으로 한 번만(다른 열 변경 거부).
+ * 항목마다 활성(revoked_at IS NULL) 승인은 최대 1개(부분 unique).
+ */
+export const approvals = pgTable(
+  'approvals',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    distributionItemId: uuid('distribution_item_id').notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    purpose: text('purpose').notNull(),
+    approvalVersion: integer('approval_version').notNull().default(1),
+    approvedAt: ts('approved_at').notNull(),
+    revokedAt: ts('revoked_at'),
+    revokeReason: text('revoke_reason'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('approvals_id_owner_uq').on(t.id, t.ownerId),
+    uniqueIndex('approvals_active_item_uq').on(t.distributionItemId).where(sql`${t.revokedAt} is null`),
+    check('approvals_purpose_chk', sql`${t.purpose} in ('mock_publish', 'upload_private', 'public_publish')`),
+    check('approvals_version_chk', sql`${t.approvalVersion} >= 1`),
+    check('approvals_revoke_pair_chk', sql`(${t.revokedAt} is null) = (${t.revokeReason} is null)`),
+    foreignKey({
+      name: 'approvals_item_same_owner_fk',
+      columns: [t.distributionItemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * DB 작업(docs/04 jobs). T10 은 execute 에서 QUEUED 로 만들기만 한다 — lease·재시도·확인은 T11.
+ * idempotency_key = 'publish:<item>:<approval>' unique. 같은 항목의 진행 중 작업(QUEUED·LEASED·RETRY_WAIT·RECONCILING·UNKNOWN)은 1개(부분 unique).
+ */
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    itemId: uuid('item_id'),
+    payloadRef: text('payload_ref').notNull(),
+    state: text('state').notNull(),
+    attempt: integer('attempt').notNull().default(0),
+    leaseOwner: text('lease_owner'),
+    leaseUntil: ts('lease_until'),
+    nextRunAt: ts('next_run_at').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('jobs_idempotency_key_uq').on(t.idempotencyKey),
+    unique('jobs_id_owner_uq').on(t.id, t.ownerId),
+    uniqueIndex('jobs_active_item_uq').on(t.itemId).where(sql`${t.state} in ('QUEUED', 'LEASED', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN')`),
+    index('jobs_state_next_run_idx').on(t.state, t.nextRunAt),
+    check('jobs_kind_chk', sql`${t.kind} in ('publish')`),
+    check('jobs_publish_item_chk', sql`${t.kind} <> 'publish' or ${t.itemId} is not null`),
+    check('jobs_state_chk', sql`${t.state} in ('QUEUED', 'LEASED', 'RETRY_WAIT', 'BLOCKED', 'DONE', 'FAILED', 'CANCELED', 'RECONCILING', 'UNKNOWN')`),
+    check('jobs_attempt_chk', sql`${t.attempt} >= 0`),
+    foreignKey({
+      name: 'jobs_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 작업 상태 전이 이력(추가 전용 트리거). event_seq 는 작업마다 1부터. sanitized_details 에 비밀·본문을 넣지 않는다. */
+export const jobEvents = pgTable(
+  'job_events',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    eventSeq: integer('event_seq').notNull(),
+    stateBefore: text('state_before'),
+    stateAfter: text('state_after').notNull(),
+    at: ts('at').notNull().defaultNow(),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    unique('job_events_job_seq_uq').on(t.jobId, t.eventSeq),
+    check('job_events_seq_chk', sql`${t.eventSeq} >= 1`),
+    foreignKey({
+      name: 'job_events_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** HTTP 실행 명령의 멱등 기록(docs/03 "command idempotency key"). 같은 (owner, command_key) 재호출 → 저장된 결과. 추가 전용. */
+export const executeCommands = pgTable(
+  'execute_commands',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    planId: uuid('plan_id').notNull(),
+    commandKey: text('command_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    resultJson: jsonb('result_json').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    unique('execute_commands_owner_key_uq').on(t.ownerId, t.commandKey),
+    foreignKey({
+      name: 'execute_commands_plan_same_owner_fk',
+      columns: [t.planId, t.ownerId],
+      foreignColumns: [distributionPlans.id, distributionPlans.ownerId],
     }).onDelete('restrict'),
   ],
 );

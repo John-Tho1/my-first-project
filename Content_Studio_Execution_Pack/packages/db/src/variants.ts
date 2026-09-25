@@ -8,12 +8,14 @@
  * - 사용자 수정·첨부 변경·AI 제안 채택은 새 현재 버전을 만들고 lifecycle 을 draft 로 되돌린다(다시 검토 필요).
  * - AI 초안(모의)은 현재가 아닌 버전(created_by='ai:mock')으로만 저장되고, 채택해야 현재가 된다. 자동 재생성은 없다.
  * - 검토(review)로 가려면: 현재 버전 있음 · stale 아님 · 채널 필수 미디어 완성 · 원고와 이 파생본의 미해결 경험 claim 없음(A03).
- * - 게시·승인·배포 작업은 만들지 않는다(PUBLISH_MODE=disabled, M3 이후).
+ * - 게시는 하지 않는다. T10: 'approved' 는 배포함 승인(distribution.ts approveItems)만 만들고, 새 버전은 그 승인을 무효로 한다(A06).
  */
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   AppError,
   assistInputVersion,
+  canVariantTransition,
+  VariantApprovedError,
   BadRequestError,
   buildAssistPrompt,
   channelDraft,
@@ -53,6 +55,7 @@ import { insertClaims, insertReservedLedger, reserveOrThrow, settleLedgerFailed,
 import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
 import type { Db } from './client';
 import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './contents';
+import { invalidateApprovalsForVariant } from './approval-invalidation';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, claimConfirmations, contents, generationRuns, variantAssets, variants, variantVersions } from './schema';
 import { getCurrentBrandProfile, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
@@ -175,7 +178,10 @@ function assertBase(current: VariantVersionRow | null, baseVersion: number, your
   }
 }
 
-/** 새 현재 버전 추가 + 첨부 복사/지정 + lifecycle draft. */
+/**
+ * 새 현재 버전 추가 + 첨부 복사/지정 + lifecycle draft.
+ * T10(A06): 이 파생본을 담은 배포 항목의 활성 승인을 같은 트랜잭션에서 철회한다(reason: body_changed | assets_changed).
+ */
 async function insertCurrentVariantVersion(
   tx: DbOrTx,
   ownerId: string,
@@ -183,6 +189,7 @@ async function insertCurrentVariantVersion(
   v: { contentVersionId: string; body: string; metadata: Record<string, unknown>; createdBy: 'owner'; aiRunId: string | null },
   attach: ReadonlyArray<{ assetId: string; position: number; role: string }>,
   now: Date,
+  change: 'body_changed' | 'assets_changed' = 'body_changed',
 ): Promise<VariantVersionRow> {
   const inserted = await tx
     .insert(variantVersions)
@@ -208,6 +215,7 @@ async function insertCurrentVariantVersion(
     .where(and(eq(variants.id, variant.id), eq(variants.ownerId, ownerId)))
     .returning();
   if (!updated[0]) throw new Error('채널 초안 갱신에 실패했습니다');
+  await invalidateApprovalsForVariant(tx, ownerId, variant.id, change, now);
   return version;
 }
 
@@ -597,6 +605,7 @@ export async function setVariantAssets(
       { contentVersionId: current.contentVersionId, body: current.body, metadata: current.metadataJson, createdBy: 'owner', aiRunId: current.aiRunId },
       input.assets.map((a, k) => ({ assetId: ids[k]!, position: a.position, role: a.role })),
       now,
+      'assets_changed',
     );
     await recordAudit(tx, {
       ownerId,
@@ -698,6 +707,9 @@ export async function setVariantLifecycle(
     const { variant, content, contentCurrent, current } = await lockVariant(tx, ownerId, variantId);
     if (!current) throw new AppError('conflict', 'no_current_version', '먼저 채널 초안을 만드세요');
     assertBase(current, input.baseVersion, { lifecycle: input.lifecycle });
+    // T10(D17): 승인됨은 서버 승인(approveItems)만 만들고 철회로만 풀린다 — 사용자 상태 변경으로 바꾸지 않는다.
+    if (variant.lifecycle === 'approved') throw new VariantApprovedError();
+    if (!canVariantTransition(variant.lifecycle, input.lifecycle, 'user')) throw new BadRequestError('허용되지 않는 상태 전이입니다');
     if (input.lifecycle === 'review' && variant.lifecycle !== 'review') {
       if (isVariantStale(current.contentVersionId, contentCurrent.id)) throw new StaleVariantError();
       const media = mediaCompleteness(variant.channel as Channel, await attachedAssets(tx, ownerId, current.id));

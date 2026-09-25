@@ -97,6 +97,8 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   stale_variant: '원문이 바뀌었습니다. "현재 원문으로 다시 초안"을 만든 뒤 검토로 보내세요.',
   no_variants: '배포 파일을 만들 채널 초안이 없습니다. 먼저 채널 초안을 만드세요.',
   no_current_version: '먼저 채널 초안을 만드세요.',
+  // T10
+  variant_approved: '승인된 채널 초안입니다. 배포함에서 승인을 철회한 뒤 상태를 바꾸세요.',
   asset_role_mismatch: '파일 형식이 역할과 맞지 않습니다(이미지·썸네일은 이미지 파일, 영상은 영상 파일).',
   invalid_metadata: '채널 형식(글자 수 등)이 맞지 않아 저장하지 않았습니다.',
   claim_still_in_body: '그 문장이 아직 현재 본문에 있어 "본문에서 뺐음"으로 처리하지 않았습니다. 본문에서 빼거나 고쳐 저장한 뒤 다시 누르세요.',
@@ -109,7 +111,7 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
 };
 
 /** 폼 오류 코드로 그대로 쓰는 AppError 코드(T09). */
-const PASS_THROUGH_CODES = new Set(['media_incomplete', 'stale_variant', 'no_variants', 'no_current_version', 'asset_role_mismatch', 'invalid_metadata']);
+const PASS_THROUGH_CODES = new Set(['media_incomplete', 'stale_variant', 'no_variants', 'no_current_version', 'asset_role_mismatch', 'invalid_metadata', 'variant_approved']);
 
 /** 폼 실패 공통(작성 지원): 401 → /login, 404 → notFoundHref, 그 외 → back?error=<code>. */
 export function writingFormFailure(e: unknown, request: Request, back: string, notFoundHref: string): Response {

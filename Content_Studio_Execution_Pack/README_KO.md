@@ -325,6 +325,27 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 다른 사용자의 세션·조각·파일·작업·전사는 모든 경로에서 404. 조각 파일 위치 `STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>`(UUID·정수만으로 경로를 만듦).
 - migration `0012_t08_uploads_transcription`(upload_sessions·upload_chunks·transcription_jobs·transcripts, assets.verification_scope·deleted_at, captures.capture_transcript_id, usage_ledger.transcription_job_id·audio_seconds — run_id 와 둘 중 하나). 업로드 세션·조각은 내보내기에서 **제외**(전송 중 임시 상태), 전사 job·버전은 **포함**. 복원 시 진행 중이던 job 은 canceled 로 넣고 예약 원장은 예약액으로 확정한다.
 
+### 배포 계획·승인·실행 (M3, T10)
+결정 D17(docs/DECISIONS.md). **MOCK 만 — 실제 게시는 하지 않는다.** 배포 계정은 seed 가 만드는 플랫폼별 모의 계정(`MOCK Threads 계정` 등, `external_account_id` 는 `mock:` 접두어)뿐이고, OAuth·인증 비밀·채널 어댑터는 없다(M4). "MOCK" 은 "이 앱 안에서만 기록하고 외부로 아무것도 보내지 않는다"는 뜻이며 모의 결과는 발행 실적이 아니다. 화면: 상단 "배포함"(`/distribute`).
+
+- **계획 만들기**: 작성실 채널 초안이 "검토 중"이면 "배포 계획 만들기" → 채널 초안 × 그 플랫폼의 모의 계정, 공개 범위, 선택 예약(모스크바 날짜·시각 → 서버가 UTC 로 저장, 지금 + 1분 이하·과거는 400 `schedule_in_past`). 기본 선택 없음. 검토 중이 아닌 초안·stale·미디어 부족·미해결 경험 주장·채널과 계정 플랫폼 불일치는 거부된다.
+- **불변 스냅샷**: 항목마다 "정확히 나갈 내용"(원고·파생본·브랜드 버전, 계정·외부 계정 ID, 채널별 글, 첨부 ID·checksum·순서, 공개 범위, 예약 UTC·시간대)을 canonical JSON 으로 만들고 SHA-256 hash 를 저장한다. 항목의 스냅샷은 DB 트리거로 바꾸거나 지울 수 없다.
+- **승인**: 계획 화면에서 항목 카드(계정 `MOCK` 배지·채널별 글·미디어 checksum 앞 12자·공개 범위·`MSK (UTC)` 또는 `즉시`·hash)를 확인하고, 항목을 직접 체크 + "내용을 확인했습니다" → "선택 승인". 서버는 화면의 hash 와 저장된 hash, 그리고 지금의 실제 행(파생본 현재 버전·원고 현재 버전·첨부·계정 상태·예약 시각)을 다시 대조한다. 클라이언트·AI 가 보낸 `approved` 같은 값은 무시된다(승인이 아님). 승인되면 채널 초안은 "승인됨".
+- **승인 무효(A06)**: 승인 뒤 채널 초안 수정·AI 채택·다시 초안·첨부 변경·원고 수정·계정 상태 변경은 같은 트랜잭션에서 그 항목의 승인을 철회한다(`invalidated:body_changed|assets_changed|content_changed|account_changed`). 실행할 때도 다시 검사해 어긋나면 전체를 거부하고 승인을 철회한다. 바뀐 내용을 배포하려면 새 계획을 만든다.
+- **실행(MOCK)**: "지금 실행"은 승인된 항목을 작업 대기열(`jobs`, `QUEUED`)에 넣기까지만 한다 — 결과는 항상 `MOCK`, 처리(lease·재시도·확인)는 **T11 작업 처리기**가 맡는다(아직 없음 → 작업은 `QUEUED · MOCK · T11에서 처리` 로 남는다). 버튼을 두 번 눌러도 작업은 하나(같은 `command_key` 재호출은 저장된 결과, 다른 key 는 409 `already_executed`). 승인 없음 403 `approval_required`(아무것도 넣지 않음).
+- **철회**: 승인 기록의 "철회" → 대기 중(QUEUED) 작업은 `BLOCKED`(작업 이력 기록), 항목은 실행 전 상태로, 채널 초안은 "검토 중"으로. 같은 계획에서 다시 승인할 수 있다(새 승인 → 새 작업 key).
+
+| API | 설명 |
+| --- | --- |
+| `GET /api/channel-accounts` | 배포 계정(모의만, 비밀 없음) |
+| `GET`·`POST /api/distribution-plans` | 계획 목록(cursor) · `{items:[{variant_id, channel_account_id, requested_result?, visibility?, schedule?:{date,time}}], target_summary?}` → 201(항목 payload·hash) |
+| `GET /api/distribution-plans/{id}` | 계획·항목(payload·hash·계정·활성 승인·작업·지금 검사한 문제) |
+| `POST /api/distribution-plans/{id}/approve` | `{item_ids, expected_hashes:{id: sha256}, confirm: true, purpose}` → 200, confirm 없음 400, hash 불일치 409 `hash_mismatch`, 스냅샷 변경 409 `snapshot_stale` |
+| `POST /api/distribution-plans/{id}/execute` | `{command_key(8~64), item_ids?}` → 200 `{queued:[{item_id, job_id, mode:'MOCK'}], mode:'MOCK', notice, idempotent_replay}` |
+| `POST /api/approvals/{id}/revoke` | `{reason?}` → 200, 이미 철회 409 |
+
+- migration `0016_t10_distribution`(channel_accounts·distribution_plans·distribution_items·approvals·jobs·job_events·execute_commands, variants.lifecycle 에 `approved`). 내보내기에는 모두 들어가고, 복원은 계정·계획·항목·승인만(hash 그대로). 작업·작업 이력·실행 명령은 복원하지 않는다 — 진행 중이던 항목은 `BLOCKED` 로, 복원된 행과 스냅샷이 맞지 않는 활성 승인은 `restore_stale` 로 철회해 넣는다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -347,7 +368,8 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 ### 기본 모드에서 외부 쓰기 0
 - LLM: `MockLlmProvider`(결정적, 네트워크 없음, 경고 `모의 응답: 실제 AI 호출 아님`). `LLM_MODE=live`는 M0에 공급자가 없어 거부된다.
-- 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 기능이 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
+- 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 객체가 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
+- 배포 실행(T10): 모의 계정은 `PUBLISH_MODE` 와 무관하게 `MOCK` 작업(QUEUED)만 만든다. 실제 계정은 `PUBLISH_MODE=enabled` + 서버 승인이 있어도 어댑터가 없어 503(`LiveChannelNotConfiguredError`).
 - 수집: `DisabledCollector`는 항상 CollectorDisabledError.
 - 음성 전사(T08): `MockTranscriber`(결정적, 네트워크 없음, 경고 `모의 전사: 실제 음성 인식 결과가 아닙니다(자리표시 문장)`). `STT_MODE=live`는 어댑터가 없어 거부된다.
 - Next.js 텔레메트리는 `apps/web/scripts/next.mjs`에서 `NEXT_TELEMETRY_DISABLED=1`로 끈다(사용자 전역 설정은 변경하지 않음).

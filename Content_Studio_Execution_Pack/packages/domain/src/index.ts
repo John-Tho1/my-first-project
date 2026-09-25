@@ -17,3 +17,4 @@ export * from './budget';
 export * from './channel';
 export * from './upload';
 export * from './stt';
+export * from './distribution';

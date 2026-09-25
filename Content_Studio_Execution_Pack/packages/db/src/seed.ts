@@ -1,5 +1,5 @@
 /**
- * 멱등 시드: owner 1명, brand profile v1, 가상 capture 10건.
+ * 멱등 시드: owner 1명, brand profile v1, 가상 capture 10건, T10 모의 배포 계정(플랫폼마다 1개 — 없을 때만).
  * 재실행해도 중복되지 않는다(users.allowed_identity, brand_profiles(owner_id,version),
  * captures(owner_id,command_key) unique + ON CONFLICT DO NOTHING).
  * 외부 호출·게시 호출 없음. capture 본문은 자료로만 저장한다.
@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { contentHash, fixtureCaptureSchema, normalizeUrl, type FixtureCapture } from '@cs/domain';
 import { backfillContentHashes, upsertUrlSource } from './captures';
 import type { Db } from './client';
+import { ensureMockAccounts } from './distribution';
 import { brandProfiles, captures, users } from './schema';
 import { resolveFromRoot } from './paths';
 
@@ -34,6 +35,8 @@ export interface SeedResult {
   ownerId: string;
   capturesInserted: number;
   capturesTotal: number;
+  /** T10: 이번 실행에서 만든 모의 배포 계정 수(재실행이면 0) */
+  mockAccountsInserted: number;
 }
 
 export async function seed(db: Db, opts: { allowedIdentity: string; fixtures?: FixtureCapture[] }): Promise<SeedResult> {
@@ -89,8 +92,11 @@ export async function seed(db: Db, opts: { allowedIdentity: string; fixtures?: F
     // 0002 이전에 seed 된 행의 content_hash 를 채운다(원문은 바꾸지 않음).
     await backfillContentHashes(tx, owner.id);
 
+    // T10(D17): 플랫폼마다 모의 배포 계정(MOCK — 외부 호출 없음)을 하나씩, 없을 때만.
+    const mockAccountsInserted = await ensureMockAccounts(tx, owner.id);
+
     const total = await tx.select({ n: count() }).from(captures).where(eq(captures.ownerId, owner.id));
-    return { ownerId: owner.id, capturesInserted: inserted.length, capturesTotal: total[0]?.n ?? 0 };
+    return { ownerId: owner.id, capturesInserted: inserted.length, capturesTotal: total[0]?.n ?? 0, mockAccountsInserted };
   });
 }
 

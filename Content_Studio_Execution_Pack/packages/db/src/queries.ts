@@ -230,7 +230,15 @@ export interface AuditInput {
     | 'transcription.succeeded'
     | 'transcription.failed'
     | 'transcript.version_create'
-    | 'transcript.to_capture';
+    | 'transcript.to_capture'
+    // T10 배포 계획·승인·실행
+    | 'channel_account.state'
+    | 'plan.create'
+    | 'plan.execute'
+    | 'approval.grant'
+    | 'approval.refused'
+    | 'approval.revoke'
+    | 'approval.invalidate';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

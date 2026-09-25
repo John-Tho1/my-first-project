@@ -22,6 +22,7 @@ import path from 'node:path';
 import { and, count, eq, sql } from 'drizzle-orm';
 import {
   AppError,
+  IN_FLIGHT_ITEM_STATUSES,
   isUuid,
   NotFoundError,
   parseBundle,
@@ -38,7 +39,9 @@ import { recordAudit, type DbOrTx } from './queries';
 import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
 import { variantReviewBlockers } from './variants';
-import { assets, captures, contents, ideas, restoreRuns, sources } from './schema';
+import { recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
+import { snapshotProblems } from './distribution';
+import { assets, captures, contents, distributionItems, ideas, restoreRuns, sources } from './schema';
 
 export type RestoreMode = 'empty_only' | 'add_missing';
 export const RESTORE_MODES: readonly RestoreMode[] = ['empty_only', 'add_missing'];
@@ -108,6 +111,10 @@ export interface ApplyReport {
   downgradedVariants: DowngradedVariant[];
   /** T08: 묶음에서 진행 중(queued·running)이던 전사 job — 복원 환경에서 다시 돌리지 않고 canceled 로 넣는다 */
   interruptedTranscriptions: string[];
+  /** T10(D17): 묶음에서 진행 중이던 배포 항목 — 작업(jobs)은 복원하지 않으므로 BLOCKED 로 넣는다(맹목 재전송 없음) */
+  blockedItems: string[];
+  /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
+  revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
 }
 
 const MAX_CONFLICTS_LISTED = 200;
@@ -168,6 +175,16 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'variant_version_id', table: 'variant_versions', owned: true },
     { col: 'asset_id', table: 'assets' },
   ],
+  // T10: 항목은 계획이 이번에 들어갔거나 같을 때만, 스냅샷이 가리키는 행(계정·파생본·버전·원고 버전·브랜드)이 있을 때만. 승인은 그 항목에만.
+  distribution_items: [
+    { col: 'plan_id', table: 'distribution_plans', owned: true },
+    { col: 'channel_account_id', table: 'channel_accounts' },
+    { col: 'variant_id', table: 'variants' },
+    { col: 'variant_version_id', table: 'variant_versions' },
+    { col: 'content_version_id', table: 'content_versions' },
+    { col: 'brand_profile_id', table: 'brand_profiles' },
+  ],
+  approvals: [{ col: 'distribution_item_id', table: 'distribution_items', owned: true }],
 };
 
 type Avail = 'inserted' | 'same' | 'different';
@@ -183,6 +200,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   const insertedAssetIds: string[] = [];
   const insertedContents: Array<{ id: string; currentVersionId: string | null }> = [];
   const insertedVariants: Array<{ id: string; currentVersionId: string | null }> = [];
+  const blockedItems: string[] = [];
 
   for (const name of RESTORED_TABLES) {
     const rows = bundle.tables[name] as unknown as Array<Record<string, unknown> & { id: string }>;
@@ -244,8 +262,12 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
           continue;
         }
       }
-      const overrides = name === 'contents' || name === 'variants' ? { current_version_id: null } : {};
+      const overrides: Record<string, unknown> = name === 'contents' || name === 'variants' ? { current_version_id: null } : {};
+      // T10(D17): 작업은 복원하지 않는다 — 진행 중이던 항목은 BLOCKED 로 넣어 새 환경에서 다시 보내지 않게 한다.
+      const blockedItem = name === 'distribution_items' && (IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(String(row.status));
+      if (blockedItem) overrides.status = 'BLOCKED';
       if (await insertBundleRow(tx, name, row, ownerId, overrides)) {
+        if (blockedItem) blockedItems.push(row.id);
         counts.new++;
         map.set(row.id, 'inserted');
         if (name === 'assets') insertedAssetIds.push(row.id);
@@ -314,7 +336,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   // 조건을 못 채우면 draft 로 낮춘다(검토 상태를 조건 없이 들여오지 않는다). 결과·미리보기에 이유와 함께 남긴다.
   const downgradedVariants: DowngradedVariant[] = [];
   for (const v of bundle.tables.variants) {
-    if (avail.variants!.get(v.id) !== 'inserted' || v.lifecycle !== 'review') continue;
+    if (avail.variants!.get(v.id) !== 'inserted' || (v.lifecycle !== 'review' && v.lifecycle !== 'approved')) continue;
     // FIX-T09 round 2(P1): 검토 요청과 같은 조건(현재 버전·stale·미디어·원고와 파생본의 미해결 경험 claim — 파생본은 나가는 글 전체 기준)을
     // 복원된 행(claim_confirmations 포함)으로 검사한다.
     const reasons = await variantReviewBlockers(tx, ownerId, v.id);
@@ -335,7 +357,39 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     );
     interruptedTranscriptions.push(j.id);
   }
-  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions };
+  // T10(D17): 이번에 넣은 활성 승인을 복원된 행으로 다시 검사한다(파생본 현재 버전·원고 현재 버전·첨부·계정·재계산 hash·예약 시각).
+  // 맞지 않으면 'restore_stale' 로 철회해 둔다(승인 행·hash 는 그대로 보존). 그 뒤 활성 승인이 없는 approved 파생본은 review 로,
+  // 이번에 넣은 계획의 상태는 항목·승인으로 다시 계산한다.
+  const restoreNow = new Date();
+  const revokedApprovals: ApplyReport['revokedApprovals'] = [];
+  const itemById = new Map(bundle.tables.distribution_items.map((i) => [i.id, i]));
+  for (const a of bundle.tables.approvals) {
+    if (avail.approvals!.get(a.id) !== 'inserted' || a.revoked_at !== null) continue;
+    const rows = await tx
+      .select()
+      .from(distributionItems)
+      .where(and(eq(distributionItems.id, a.distribution_item_id), eq(distributionItems.ownerId, ownerId)))
+      .limit(1);
+    const item = rows[0];
+    if (!item || !itemById.has(a.distribution_item_id)) continue;
+    const reasons = await snapshotProblems(tx, ownerId, item, restoreNow);
+    if (reasons.length === 0) continue;
+    await tx.execute(
+      sql`update approvals set revoked_at = ${restoreNow.toISOString()}::timestamptz, revoke_reason = 'restore_stale' where id = ${a.id}::uuid and owner_id = ${ownerId}::uuid and revoked_at is null`,
+    );
+    revokedApprovals.push({ approval_id: a.id, item_id: a.distribution_item_id, reasons });
+  }
+  await settleApprovedVariants(
+    tx,
+    ownerId,
+    bundle.tables.variants.filter((v) => avail.variants!.get(v.id) === 'inserted' && v.lifecycle === 'approved').map((v) => v.id),
+    'review',
+    restoreNow,
+  );
+  for (const p of bundle.tables.distribution_plans) {
+    if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
+  }
+  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, revokedApprovals };
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
@@ -377,6 +431,10 @@ export interface RestorePreview {
   downgraded_variants: DowngradedVariant[];
   /** T08: 복원하면 canceled 로 들어갈 진행 중 전사 job */
   interrupted_transcriptions: string[];
+  /** T10: 복원하면 BLOCKED 로 들어갈 진행 중 배포 항목(작업은 복원하지 않음) */
+  blocked_items: string[];
+  /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
+  revoked_approvals: ApplyReport['revokedApprovals'];
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
@@ -434,6 +492,8 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     conflicts_total: r.conflicts.length,
     downgraded_variants: r.downgradedVariants,
     interrupted_transcriptions: r.interruptedTranscriptions,
+    blocked_items: r.blockedItems,
+    revoked_approvals: r.revokedApprovals,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
@@ -564,6 +624,9 @@ export interface CommitResult {
   downgraded_variants: DowngradedVariant[];
   /** T08 */
   interrupted_transcriptions: string[];
+  /** T10 */
+  blocked_items: string[];
+  revoked_approvals: ApplyReport['revokedApprovals'];
 }
 
 async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
@@ -665,6 +728,8 @@ export async function commitRestore(
         conflicts_total: report.conflicts.length,
         downgraded_variants: report.downgradedVariants,
         interrupted_transcriptions: report.interruptedTranscriptions,
+        blocked_items: report.blockedItems,
+        revoked_approvals: report.revokedApprovals,
         assets_written: written,
         assets_verified: verified,
         assets_missing: missing,

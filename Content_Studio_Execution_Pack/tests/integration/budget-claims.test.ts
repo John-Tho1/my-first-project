@@ -740,6 +740,12 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     'example.xn--p1ai/report 참고',
     'fake.example에 따르면 시장이 커졌다',
     'FAKE.md 참고',
+    // FIX round 6(Codex review-FIX5-T07): 보이지 않는 서식 문자·영역 ID IPv6
+    'fake\u200B.example/report',
+    'fake.e\u00ADxample/report',
+    'https:/\u200D/fake.example/report',
+    '[fe80::1%25eth0]:8080/report',
+    '[fe80::1%eth0]/x',
   ];
 
   it('원고: 라운드 2–3 우회 문자열·버린 자유문 참조는 모두 실패(run failed·버전 없음·본문 그대로), [1]·[10]·오탐 예시는 통과', async () => {

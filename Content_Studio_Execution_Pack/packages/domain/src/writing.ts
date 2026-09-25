@@ -356,7 +356,8 @@ const TLD = String.raw`[a-z](?:[a-z0-9-]{0,61}[a-z0-9])`;
 const HOST_LIKE = new RegExp(String.raw`(?<![\p{L}\p{N}_@.。-])((?:${LABEL}${DOT})+)(${TLD})(?![a-z0-9-])`, 'giu');
 /** IPv4(점 네 묶음, 포트·경로 무관)와 괄호 IPv6(콜론 둘 이상) */
 const IPV4 = /(?<![\p{N}.])(?:\d{1,3}[.。]){3}\d{1,3}(?![\p{N}])/u;
-const IPV6 = /\[[0-9a-f]*:[0-9a-f]*:[0-9a-f:.]*\]/iu;
+/** 괄호 IPv6(콜론 둘 이상) — 영역 ID(%eth0, URL 인코딩 %25eth0) 허용(FIX round 6) */
+const IPV6 = /\[[0-9a-f]*:[0-9a-f]*:[0-9a-f:.]*(?:%(?:25)?[0-9a-z._~-]+)?\]/iu;
 /** 모델이 쓴 [출처…] 표기도 자유문 인용이다(서버만 [출처 n] 을 만든다). */
 const SOURCE_TAG = /\[\s*출처/u;
 const SCHEME_LIKE = /:\/\/|www[.。]|(?<![:/])\/\/[\p{L}\p{N}]/iu;
@@ -364,7 +365,12 @@ const SCHEME_LIKE = /:\/\/|www[.。]|(?<![:/])\/\/[\p{L}\p{N}]/iu;
 const NON_TLD_FILE_EXT = new Set(['txt', 'json', 'csv', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'yml', 'yaml', 'sql', 'html', 'css', 'docx', 'xlsx', 'pptx', 'svg']);
 const NUMBER_MARKER = /\[(\d+)\]/gu;
 
-const nfkc = (s: string) => s.normalize('NFKC');
+/**
+ * FIX round 6(Codex review-FIX5-T07): 보이지 않는 서식 문자(Unicode Cf — 제로폭 공백·결합자·BOM·소프트 하이픈·방향 제어 등)를
+ * 지우고 이어 붙인 뒤 NFKC 로 정규화한 문자열에서 탐지한다(예: 제로폭 공백을 끼운 도메인도 이어 붙여 탐지). 원문은 바꾸지 않는다 — 탐지되면 어차피 실행 전체가 실패한다.
+ */
+const FORMAT_CHARS = /\p{Cf}/gu;
+const nfkc = (s: string) => s.replace(FORMAT_CHARS, '').normalize('NFKC').replace(FORMAT_CHARS, '');
 
 /** 글 하나에 자유문 출처 표기가 있는가(허용 판단 없음 — 탐지만). */
 export function hasFreeTextCitation(text: string): boolean {
@@ -409,7 +415,7 @@ export function sanitizeLlmOutput(output: LlmOutputLike, allowedIds: readonly st
     ...output.claims.map((c) => c.text),
   ];
   for (const text of texts) {
-    for (const m of text.normalize('NFKC').matchAll(NUMBER_MARKER)) {
+    for (const m of nfkc(text).matchAll(NUMBER_MARKER)) {
       const n = Number(m[1]);
       if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
     }

@@ -668,6 +668,26 @@ describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 �
     for (const t of ['보고서[1]', 'v24.21.0 과 1.2.3', '3.14와 2.5%']) expect(run(t).output.proposed_text, t).toBe(t);
   });
 
+  it('FIX round 6: 보이지 않는 서식 문자(제로폭·소프트 하이픈·결합자·방향 제어)를 끼워도, 영역 ID 가 있는 IPv6 도 실패', () => {
+    for (const t of [
+      'fake\u200B.example/report',
+      'fake.e\u00ADxample/report',
+      'https:/\u200D/fake.example/report',
+      'ht\u2060tps://fake.example',
+      'w\u200Cww.fake.example',
+      'fake.\u202Eexample\u202C 참고',
+      '\uFEFFfake.example에 따르면',
+      '[fe80::1%25eth0]:8080/report',
+      '[fe80::1%eth0]/x',
+    ]) {
+      fails(t);
+      fails(t, []);
+    }
+    // 서식 문자가 섞인 평범한 글·번호 인용은 그대로 통과(원문은 바꾸지 않음)
+    for (const t of ['해외\u200B영업 메모', '보고서[\u200B1]']) expect(run(t).output.proposed_text, t).toBe(t);
+    fails('보고서[\u200B9]');
+  });
+
   it('hasFreeTextCitation 는 탐지만 한다(허용 판단 없음)', () => {
     expect(hasFreeTextCitation('https://example.com')).toBe(true);
     expect(hasFreeTextCitation('a//b 가 아니라 //host')).toBe(true);

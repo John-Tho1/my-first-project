@@ -294,6 +294,16 @@ export function blockDetailLabel(detail: string | null): string | null {
  * blocked = 철회로 BLOCKED 가 된 작업 수(대기·재시도 대기 → 다음 전송 차단), cancelRequested = 이미 전송 단계라 CANCEL_REQUESTED 로 기록된 수.
  * 수가 없으면(이전 링크) 작업 결과를 말하지 않는다.
  */
+/**
+ * FIX-T11 round 2(P2, Codex review-FIX-T11T12 page.tsx:28): 철회 리다이렉트의 결과 수(revoked_blocked·revoked_cancel) 파싱 — 페이지가 이것을 쓴다.
+ * 0 이상 정수(최대 3자리)만, 없거나 잘못된 값이면 null(작업 결과를 말하지 않는다).
+ */
+export function revocationCountParam(v: string | string[] | undefined): number | null {
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  return /^\d{1,3}$/.test(t) ? Number(t) : null;
+}
+
 export function revocationNotice(blocked: number | null, cancelRequested: number | null): string {
   const parts = ['승인을 철회했습니다(MOCK).'];
   if (blocked === null && cancelRequested === null) return parts[0]!;
@@ -329,6 +339,8 @@ export function itemHeadline(x: ItemHeadlineInput): string {
   switch (x.status) {
     case 'PLANNED': {
       // 작업이 BLOCKED 로 남은 PLANNED 항목은 승인 문제다(표준 코드가 승인 코드이거나, 활성 승인이 없음 — 예: 401 보류 뒤 편집으로 승인 무효).
+      // FIX-T12 round 2(P2): 지금 활성 승인이 있으면(다시 승인함) 과거 작업의 보류 사유보다 우선한다 — "승인 없음"이라고 하지 않는다.
+      if (x.activeApproval === true) return '계획됨(실행 전)';
       const approvalProblem = job?.state === 'BLOCKED' && (APPROVAL_BLOCK_REASONS.has(reason) || x.activeApproval === false);
       if (!approvalProblem) return '계획됨(실행 전)';
       const detail = blockDetailLabel(x.blockDetail ?? null);

@@ -28,6 +28,7 @@ import {
   parseBundleZip,
   processJob,
   reconcileItem,
+  recoverExpiredLeases,
   runJobsTick,
   schema,
   seed,
@@ -192,7 +193,7 @@ describe('T11 P1 — 처리할 작업만 lease, 시작 전 만료는 시도가 �
     const o = await newOwner();
     const x = await executed(o);
     const [leased] = await leaseJobs(db, { workerId: 'slow-w', now: new Date(), limit: 1, leaseTtlMs: 50, ownerId: o.id });
-    expect(leased!.attempt).toBe(1);
+    expect(leased!.attempt).toBe(0); // FIX-T11 round 2: lease 는 시도가 아니다(의도를 쓸 때 센다)
     await wait(80);
     const p = await processJob(db, registry, leased!, { workerId: 'slow-w', config, submitTimeoutMs: 500 });
     expect(p.state).toBe('lease_lost');
@@ -288,3 +289,38 @@ describe('T11 P2 — 승인 철회 안내는 저장된 작업 상태를 따른�
   });
 });
 
+describe('FIX round 2 (Codex review-FIX-T11T12) P1 — 시도는 전송 의도를 쓸 때만 센다', () => {
+  it('실제 전송 4회 뒤 5번째 lease 가 의도 없이 만료돼도 5번째 실제 시도를 잃지 않는다', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'transient' });
+    for (const off of [0, 1000, 2000, 3000]) await tick(o, off);
+    let j = await jobRow(x.jobId);
+    expect(j).toMatchObject({ state: 'RETRY_WAIT', attempt: 4 });
+    // 5번째 lease — 의도를 쓰기 전에 worker 가 죽음
+    const at = new Date(Date.now() + 4000_000);
+    const [leased] = await leaseJobs(db, { workerId: 'dead-w', now: at, limit: 1, leaseTtlMs: 1000, ownerId: o.id });
+    expect(leased).toMatchObject({ id: x.jobId, state: 'LEASED', attempt: 4 });
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'success' });
+    // 복구(QUEUED, 시도 그대로) → 같은 tick 에서 5번째 실제 시도 → CONFIRMED (수정 전: attempt 5 >= max 로 즉시 FAILED)
+    const r = await tick(o, 5000);
+    expect(r.recovered).toBe(1);
+    j = await jobRow(x.jobId);
+    expect(j).toMatchObject({ state: 'CONFIRMED', attempt: 5, leaseExpiredBeforeIntent: 1 });
+    expect((await intentsOf(x.jobId)).map((i) => i.attempt)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('의도 없이 되풀이해 만료 → 한도(5)에서 FAILED(lease_expired_before_intent), 시도 0·의도 0·전송 0', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    for (let k = 1; k <= 5; k++) {
+      const t0 = new Date(Date.now() + k * 10_000);
+      const [l] = await leaseJobs(db, { workerId: 'dead-w', now: t0, limit: 1, leaseTtlMs: 1000, ownerId: o.id });
+      expect(l?.id).toBe(x.jobId);
+      await recoverExpiredLeases(db, { now: new Date(t0.getTime() + 5000), ownerId: o.id });
+    }
+    expect(await jobRow(x.jobId)).toMatchObject({ state: 'FAILED', lastErrorCode: 'lease_expired_before_intent', leaseExpiredBeforeIntent: 5, attempt: 0 });
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+    expect(adapter.calls.submit).toBe(0);
+  });
+});

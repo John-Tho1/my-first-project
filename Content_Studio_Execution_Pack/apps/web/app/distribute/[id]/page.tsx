@@ -14,6 +14,7 @@ import {
   PLAN_STATUS_LABEL,
   problemLabel,
   RESULT_KIND_LABEL,
+  revocationCountParam,
   revocationNotice,
   VISIBILITY_LABEL,
 } from '../../../lib/distribution';
@@ -22,11 +23,6 @@ import { getAppDb, getConfig } from '../../../lib/server';
 export const dynamic = 'force-dynamic';
 
 const str = (v: string | string[] | undefined) => (typeof v === 'string' && v.trim() !== '' ? v : undefined);
-/** 철회 결과 수(0 이상 정수) — 없거나 잘못된 값이면 null(작업 결과를 말하지 않는다). */
-const countParam = (v: string | string[] | undefined): number | null => {
-  const s = str(v);
-  return s !== undefined && /^d{1,3}$/.test(s) ? Number(s) : null;
-};
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const s = (v: unknown) => (typeof v === 'string' ? v : '');
 
@@ -337,7 +333,7 @@ export default async function PlanPage({
       ) : null}
       {q.revoked === '1' ? (
         <p className="saved" role="status">
-          {revocationNotice(countParam(q.revoked_blocked), countParam(q.revoked_cancel))}
+          {revocationNotice(revocationCountParam(q.revoked_blocked), revocationCountParam(q.revoked_cancel))}
         </p>
       ) : null}
       {str(q.ticked) !== undefined ? (

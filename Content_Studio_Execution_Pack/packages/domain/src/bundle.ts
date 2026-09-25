@@ -496,6 +496,8 @@ export const ROW_SCHEMAS = {
     done_at: ts.nullable().default(null),
     // FIX-T11(0020): 복원한 작업 표시. 이전 묶음에는 없으므로 기본 false(복원할 때는 항상 켠다).
     restored_needs_review: z.boolean().default(false),
+    // FIX-T11 round 2(0022): 의도 없이 만료된 lease 횟수. 이전 묶음에는 없으므로 기본 0.
+    lease_expired_before_intent: int.min(0).default(0),
   }),
   job_events: z.strictObject({
     id: uuid,

@@ -29,6 +29,7 @@ import {
   isUuid,
   LEASE_HELD_STATES,
   LeaseLostError,
+  PRE_INTENT_EXPIRY_LIMIT,
   NotCancellableError,
   NotFoundError,
   NothingToReconcileError,
@@ -157,6 +158,20 @@ async function lockItem(tx: DbOrTx, ownerId: string, itemId: string): Promise<Di
   return item;
 }
 
+/**
+ * FIX-T11 round 2: 가장 최근 취소 요청이 전송 시작 전(LEASED·QUEUED)에 기록됐는지 — 그렇다면 이번 lease 에서는 보내지 않았다.
+ * attempt 는 전송 의도를 쓸 때만 오르므로 "현재 attempt 의 의도 유무"로는 이전 시도의 의도와 구분할 수 없다. 기록이 없으면 false(조회로 확인).
+ */
+async function cancelRequestedBeforeSend(tx: DbOrTx, jobId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ before: jobEvents.stateBefore })
+    .from(jobEvents)
+    .where(and(eq(jobEvents.jobId, jobId), sql`${jobEvents.sanitizedDetails}->>'transition' = 'cancel_requested'`))
+    .orderBy(desc(jobEvents.eventSeq))
+    .limit(1);
+  return rows[0]?.before === 'LEASED' || rows[0]?.before === 'QUEUED';
+}
+
 /** 전이 + 항목 상태 동기화 + 계획 재계산(같은 트랜잭션). */
 async function settle(
   tx: DbOrTx,
@@ -267,23 +282,21 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
       const base = { worker: job.leaseOwner, attempt: job.attempt };
       switch (job.state) {
         case 'LEASED': {
-          // 보내기 전에 되풀이해 죽는 작업(처리 오류 등)이 끝없이 다시 lease 되지 않게 시도 한도에서 멈춘다.
-          // FIX-T11(P1): 시작 전 만료는 시도가 아니다 — attempt 를 lease 전 값으로 되돌리고, 끝없는 재lease 는 만료 횟수(이벤트)로 막는다.
-          const expiries = await tx
-            .select({ n: sql<number>`count(*)::int` })
-            .from(jobEvents)
-            .where(and(eq(jobEvents.jobId, job.id), sql`${jobEvents.sanitizedDetails}->>'transition' = 'lease_expired_before_intent'`));
-          if (job.attempt >= job.maxAttempts || (expiries[0]?.n ?? 0) + 1 >= job.maxAttempts) {
-            await settle(tx, e.ownerId, job, item, 'permanent_failure', { ...base, reason: 'lease_expired_max_attempts', not_sent: true }, now, {
+          // FIX-T11 round 2(P1): 시도(attempt)는 전송 의도를 쓸 때만 센다(beginSend) — 의도 없이 만료된 lease 는 시도가 아니므로 attempt 는 그대로다
+          // (마지막 남은 시도도 잃지 않는다). 보내기 전에 되풀이해 죽는 작업은 별도 횟수(lease_expired_before_intent)가 한도에 이르면 FAILED.
+          const expiries = job.leaseExpiredBeforeIntent + 1;
+          if (expiries >= PRE_INTENT_EXPIRY_LIMIT) {
+            await settle(tx, e.ownerId, job, item, 'permanent_failure', { ...base, reason: 'lease_expired_before_intent', expiries, not_sent: true }, now, {
               ...CLEAR_LEASE,
-              lastErrorCode: 'lease_expired_max_attempts',
+              lastErrorCode: 'lease_expired_before_intent',
+              leaseExpiredBeforeIntent: expiries,
             });
             return true;
           }
-          await settle(tx, e.ownerId, job, item, 'lease_expired_before_intent', { ...base, attempt_restored: job.attempt - 1 }, now, {
+          await settle(tx, e.ownerId, job, item, 'lease_expired_before_intent', { ...base, expiries }, now, {
             ...CLEAR_LEASE,
             nextRunAt: now,
-            attempt: Math.max(job.attempt - 1, 0),
+            leaseExpiredBeforeIntent: expiries,
           });
           return true;
         }
@@ -295,7 +308,8 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
           });
           return true;
         case 'CANCEL_REQUESTED':
-          if (!intent) {
+          // 취소 요청이 전송 시작 전(LEASED·QUEUED)에 들어왔으면 이번 lease 에서는 보내지 않았다(attempt 는 의도를 쓸 때만 오르므로 의도 유무로 판단하지 않는다).
+          if (await cancelRequestedBeforeSend(tx, job.id)) {
             await settle(tx, e.ownerId, job, item, 'canceled', { ...base, not_sent: true, cause: 'lease_expired' }, now);
           } else {
             await settle(tx, e.ownerId, job, item, 'lease_expired_after_intent', base, now, { ...CLEAR_LEASE, nextRunAt: now });
@@ -316,7 +330,7 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
 
 /**
  * 짧은 트랜잭션 하나: 실행할 때가 된 작업을 FOR UPDATE SKIP LOCKED 로 골라 lease 한다(다른 worker 가 잡은 행은 건너뛴다, A07).
- * - QUEUED·RETRY_WAIT → LEASED(attempt + 1, 전송 시도)
+ * - QUEUED·RETRY_WAIT → LEASED(attempt 는 그대로 — FIX-T11 round 2: 전송 의도를 쓸 때 beginSend 가 올린다)
  * - RECONCILING·REMOTE_PROCESSING·CANCEL_REQUESTED(lease 없음·만료) → 상태 그대로 lease 만(원격 조회). UNKNOWN 은 고르지 않는다.
  */
 export async function leaseJobs(
@@ -347,11 +361,10 @@ export async function leaseJobs(
     const out: JobRow[] = [];
     for (const c of candidates) {
       if ((SEND_LEASE_STATES as readonly string[]).includes(c.state)) {
-        await transitionJob(tx, c.ownerId, c, 'lease', { worker: workerId, attempt: c.attempt + 1 }, now, {
+        await transitionJob(tx, c.ownerId, c, 'lease', { worker: workerId, next_attempt: c.attempt + 1 }, now, {
           leaseOwner: workerId,
           leaseUntil: until,
           heartbeatAt: now,
-          attempt: c.attempt + 1,
           reconcileCount: 0,
         });
       } else {
@@ -518,21 +531,29 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         lastRetryClass: 'permanent',
       });
     }
-    const intentKey = `${job.id}:${job.attempt}`;
+    // FIX-T11 round 2(P1): 시도는 여기서(전송 의도와 같은 트랜잭션) 센다. 한도를 다 쓴 작업은 보내지 않고 FAILED.
+    if (job.attempt >= job.maxAttempts) {
+      return settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'attempts_exhausted', not_sent: true, attempt: job.attempt }, now, {
+        ...CLEAR_LEASE,
+        lastErrorCode: 'attempts_exhausted',
+      });
+    }
+    const attempt = job.attempt + 1;
+    const intentKey = `${job.id}:${attempt}`;
     const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(tx, ownerId, item.id) : null;
-    await transitionJob(tx, ownerId, job, 'send_start', { attempt: job.attempt, intent_key: intentKey, mode, approval_id: approval.id }, now);
+    await transitionJob(tx, ownerId, job, 'send_start', { attempt, intent_key: intentKey, mode, approval_id: approval.id }, now, { attempt });
     await syncItemStatus(tx, ownerId, item.id, 'SENDING', now);
     await tx.insert(sendIntents).values({
       ownerId,
       jobId: job.id,
-      attempt: job.attempt,
+      attempt,
       intentKey,
       createdAt: now,
       outcome: 'pending',
       sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind },
     });
     await recomputePlanStatus(tx, ownerId, item.planId, now);
-    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING' }, mockScenario } satisfies SendPlan;
+    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING', attempt }, mockScenario } satisfies SendPlan;
   });
 }
 
@@ -731,7 +752,7 @@ async function checkJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow
   const item = await itemRow(db, ownerId, leased.itemId!);
   if (!item) return 'lease_lost';
   // 취소 요청인데 이번 시도에서 보낸 적이 없으면(lease 뒤 전송 전) 바로 CANCELED.
-  if (leased.state === 'CANCEL_REQUESTED' && (leased.attempt === 0 || !(await intentFor(db, ownerId, leased.id, leased.attempt)))) {
+  if (leased.state === 'CANCEL_REQUESTED' && (await cancelRequestedBeforeSend(db, leased.id))) {
     return db.transaction(async (tx) => {
       const it = await lockItem(tx, ownerId, leased.itemId!);
       const job = await jobForUpdate(tx, ownerId, leased.id);

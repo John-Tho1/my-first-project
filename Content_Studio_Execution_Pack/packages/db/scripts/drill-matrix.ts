@@ -390,7 +390,8 @@ export async function runDrill(): Promise<DrillResult> {
       const o = await newOwner(c);
       const x = await executed(c, o, [{ channel: 'threads', scenario: 'success' }]);
       const [leased] = await leaseJobs(c.db, { workerId: 'dead-worker', now: clockOf(c)(), limit: 1, ownerId: o.id });
-      await c.db.update(schema.jobs).set({ state: 'SENDING', leaseUntil: new Date(clockOf(c)().getTime() - 1000) }).where(eq(schema.jobs.id, leased!.id));
+      // beginSend 흉내: SENDING + attempt 1(시도는 전송 의도를 쓸 때 센다) + 의도
+      await c.db.update(schema.jobs).set({ state: 'SENDING', attempt: 1, leaseUntil: new Date(clockOf(c)().getTime() - 1000) }).where(eq(schema.jobs.id, leased!.id));
       await c.db.insert(schema.sendIntents).values({ ownerId: o.id, jobId: leased!.id, attempt: 1, intentKey: `${leased!.id}:1` });
       adapter.plantRemote(`${leased!.id}:1`, 'threads');
       const before = adapter.calls.submit;

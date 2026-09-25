@@ -164,6 +164,11 @@ export const REMOTE_POLL_MAX = 20;
 export const RECONCILE_BASE_MS = 10_000;
 export const REMOTE_POLL_MS = 15_000;
 export const DEFAULT_LEASE_TTL_MS = 60_000;
+/**
+ * FIX-T11 round 2(P1): 전송 의도 없이 lease 가 만료된 횟수의 한도(시도 한도 max_attempts 와 별개). 시도(attempt)는 전송 의도를 쓸 때만 센다.
+ * 이 횟수가 한도에 이르면 보내지 않은 채 FAILED(lease_expired_before_intent) — 보내기 전에 되풀이해 죽는 작업이 끝없이 lease 되지 않게.
+ */
+export const PRE_INTENT_EXPIRY_LIMIT = 5;
 
 /**
  * 다음 시도 시각. 지연 = min(30초 × 2^(attempt-1), 15분) × (1 ± 20%) 이고 Retry-After(초)보다 짧지 않다.

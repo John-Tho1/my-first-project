@@ -1171,6 +1171,8 @@ export const jobs = pgTable(
     doneAt: ts('done_at'),
     /** FIX-T11(0020): 묶음에서 복원한 작업(읽기 전용 이력 — 자동 lease·재시도 없음, 사용자 재확인만). */
     restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
+    /** FIX-T11 round 2(0022): 전송 의도 없이 lease 가 만료된 횟수(시도가 아님 — 한도 PRE_INTENT_EXPIRY_LIMIT 에 이르면 FAILED). */
+    leaseExpiredBeforeIntent: integer('lease_expired_before_intent').notNull().default(0),
   },
   (t) => [
     unique('jobs_idempotency_key_uq').on(t.idempotencyKey),
@@ -1188,6 +1190,7 @@ export const jobs = pgTable(
     check('jobs_attempt_chk', sql`${t.attempt} >= 0`),
     check('jobs_max_attempts_chk', sql`${t.maxAttempts} between 1 and 20`),
     check('jobs_reconcile_count_chk', sql`${t.reconcileCount} >= 0`),
+    check('jobs_lease_expired_before_intent_chk', sql`${t.leaseExpiredBeforeIntent} >= 0`),
     check('jobs_retry_class_chk', sql`${t.lastRetryClass} is null or ${t.lastRetryClass} in ('transient_no_side_effect', 'transient_unknown_side_effect', 'permanent', 'auth')`),
     check('jobs_lease_pair_chk', sql`(${t.leaseOwner} is null) = (${t.leaseUntil} is null)`),
     foreignKey({

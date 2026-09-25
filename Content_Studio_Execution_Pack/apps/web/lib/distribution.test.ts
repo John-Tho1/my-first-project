@@ -3,7 +3,7 @@
  * 스냅샷이 바뀌어 다시 승인할 수 없으면 새 계획 안내, 승인 철회 안내는 저장된 작업 결과 수만 말한다.
  */
 import { describe, expect, it } from 'vitest';
-import { blockDetailLabel, blockInfoOf, itemHeadline, revocationNotice } from './distribution';
+import { APPROVAL_BLOCK_REASONS, blockDetailLabel, blockInfoOf, itemHeadline, revocationCountParam, revocationNotice } from './distribution';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
 const ev = (details: Record<string, unknown>) => [
@@ -61,5 +61,27 @@ describe('revocationNotice — 저장된 작업 결과만 말한다', () => {
     expect(c).not.toContain('보류');
     expect(revocationNotice(0, 0)).toContain('대기 중이던 작업은 없었습니다');
     expect(revocationNotice(null, null)).toBe('승인을 철회했습니다(MOCK).');
+  });
+});
+
+describe('FIX round 2 (Codex review-FIX-T11T12) P2', () => {
+  it('철회 리다이렉트 파라미터를 페이지와 같은 파싱(revocationCountParam)으로: revoked_blocked=0&revoked_cancel=1 → 취소 확인 중', () => {
+    const q = new URL('http://localhost:3000/distribute/p?revoked=1&revoked_blocked=0&revoked_cancel=1').searchParams;
+    const blocked = revocationCountParam(q.get('revoked_blocked') ?? undefined);
+    const cancel = revocationCountParam(q.get('revoked_cancel') ?? undefined);
+    expect([blocked, cancel]).toEqual([0, 1]);
+    expect(revocationNotice(blocked, cancel)).toContain('취소 확인 중');
+    for (const bad of [undefined, '', 'x', '-1', '1.5', '1234', ['1']]) expect(revocationCountParam(bad as string | string[] | undefined), String(bad)).toBeNull();
+    expect(revocationCountParam(' 12 ')).toBe(12);
+  });
+
+  it('활성 승인이 있으면(다시 승인함) 과거 보류 사유와 관계없이 "승인 없음"이라고 하지 않는다 — activeApproval × 승인 관련 코드 행렬', () => {
+    for (const code of [...APPROVAL_BLOCK_REASONS]) {
+      for (const active of [true, false]) {
+        const h = itemHeadline({ status: 'PLANNED', channel: 'threads', job: job('BLOCKED', code), pub: null, blockReason: code, blockDetail: null, activeApproval: active });
+        if (active) expect(h, code).toBe('계획됨(실행 전)');
+        else expect(h, code).toBe('승인 없음 — 다시 승인 후 실행');
+      }
+    }
   });
 });

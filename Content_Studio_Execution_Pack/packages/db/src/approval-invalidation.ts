@@ -153,7 +153,7 @@ export async function transitionJob(
   event: JobEvent,
   details: Record<string, unknown>,
   now: Date,
-  set: Partial<Pick<typeof jobs.$inferInsert, 'leaseOwner' | 'leaseUntil' | 'heartbeatAt' | 'nextRunAt' | 'lastErrorCode' | 'lastRetryClass' | 'reconcileCount' | 'cancelRequestedAt' | 'attempt'>> = {},
+  set: Partial<Pick<typeof jobs.$inferInsert, 'leaseOwner' | 'leaseUntil' | 'heartbeatAt' | 'nextRunAt' | 'lastErrorCode' | 'lastRetryClass' | 'reconcileCount' | 'cancelRequestedAt' | 'attempt' | 'leaseExpiredBeforeIntent'>> = {},
 ): Promise<JobState> {
   const to = transitionJobState(job.state, event);
   const terminal = (TERMINAL_JOB_STATES as readonly string[]).includes(to);

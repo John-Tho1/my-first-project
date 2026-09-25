@@ -239,7 +239,8 @@ describe('A08·A20 — 결과 불명·lease 만료', () => {
     const x = await executed(o);
     const [leased] = await leaseJobs(db, { workerId: 'dead-worker', now: new Date(), limit: 1, ownerId: o.id });
     // 1단계(SENDING + 의도)까지 하고 죽은 상태를 흉내: 의도 기록, lease 만료, 원격은 받았다.
-    await db.update(schema.jobs).set({ state: 'SENDING', leaseUntil: new Date(Date.now() - 1000) }).where(eq(schema.jobs.id, leased!.id));
+    // beginSend 흉내: SENDING + attempt 1(FIX-T11 round 2 — 시도는 의도를 쓸 때 센다) + 의도
+    await db.update(schema.jobs).set({ state: 'SENDING', attempt: 1, leaseUntil: new Date(Date.now() - 1000) }).where(eq(schema.jobs.id, leased!.id));
     await db.insert(schema.sendIntents).values({ ownerId: o.id, jobId: leased!.id, attempt: 1, intentKey: `${leased!.id}:1` });
     adapter.plantRemote(`${leased!.id}:1`, 'threads');
     const r = await tick(o);
@@ -268,17 +269,30 @@ describe('A08·A20 — 결과 불명·lease 만료', () => {
     expect(await eventNames(leased!.id)).toEqual(['execute', 'lease', 'lease_expired_before_intent', 'lease', 'send_start', 'confirmed']);
   });
 
-  it('보내기 전에 되풀이해 죽는 작업은 시도 한도에서 FAILED(끝없는 재lease 없음, 전송 0)', async () => {
+  it('보내기 전에 되풀이해 죽는 작업은 의도 없는 만료 횟수 한도에서 FAILED(끝없는 재lease 없음, 전송 0) — FIX-T11 round 2: 시도 한도와 별개', async () => {
     const o = await newOwner();
     const x = await executed(o);
     const [leased] = await leaseJobs(db, { workerId: 'dead-worker', now: new Date(), limit: 1, ownerId: o.id });
-    await db.update(schema.jobs).set({ attempt: 5, leaseUntil: new Date(Date.now() - 1000) }).where(eq(schema.jobs.id, leased!.id));
+    // 이미 4번 의도 없이 만료된 작업(한도 5) — 이번 만료로 FAILED
+    await db.update(schema.jobs).set({ leaseExpiredBeforeIntent: 4, leaseUntil: new Date(Date.now() - 1000) }).where(eq(schema.jobs.id, leased!.id));
     const r = await tick(o);
     expect(r.recovered).toBe(1);
     expect(r.leased).toBe(0);
-    expect((await jobRow(leased!.id)).state).toBe('FAILED');
+    const j = await jobRow(leased!.id);
+    expect(j).toMatchObject({ state: 'FAILED', lastErrorCode: 'lease_expired_before_intent', leaseExpiredBeforeIntent: 5, attempt: 0 });
     expect((await itemRow(x.itemIds[0]!)).status).toBe('FAILED');
     expect(adapter.calls.submit).toBe(0);
+  });
+
+  it('시도를 다 쓴 작업은 lease 돼도 보내지 않고 FAILED(attempts_exhausted, 전송 0)', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    await db.update(schema.jobs).set({ attempt: 5 }).where(eq(schema.jobs.id, x.jobIds[0]!));
+    const r = await tick(o);
+    expect(r.results).toEqual({ FAILED: 1 });
+    expect(await jobRow(x.jobIds[0]!)).toMatchObject({ state: 'FAILED', lastErrorCode: 'attempts_exhausted' });
+    expect(adapter.calls.submit).toBe(0);
+    expect(await intentsOf(x.jobIds[0]!)).toHaveLength(0);
   });
 
   it('ambiguous_not_sent: 조회로 "확실히 없음" → RETRY_WAIT → 새 시도·새 의도 → CONFIRMED(의도 2, 결과 1)', async () => {

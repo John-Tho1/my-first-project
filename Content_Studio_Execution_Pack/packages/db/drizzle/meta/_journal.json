@@ -155,6 +155,13 @@
       "when": 1790327820831,
       "tag": "0021_t10_fix2_variant_assets_lock",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790329497368,
+      "tag": "0022_t11_fix2_pre_intent_expiry",
+      "breakpoints": true
     }
   ]
 }

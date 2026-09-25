@@ -574,7 +574,7 @@ export async function completeUploadSession(
           cleanupAsset = existing.id;
           const rows = await tx
             .update(assets)
-            .set({ key, deletedAt: null, pendingDeleteKey: existing.key })
+            .set({ key, deletedAt: null, pendingDeleteKey: existing.key, pendingDeleteAttempts: 0, pendingDeleteNextAt: null })
             .where(and(eq(assets.id, existing.id), eq(assets.ownerId, ownerId)))
             .returning();
           asset = rows[0]!;

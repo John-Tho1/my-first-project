@@ -684,6 +684,9 @@ export const assets = pgTable(
      * 운영 상태이므로 내보내기 묶음에 넣지 않는다(복원한 행은 항상 null — 묶음이 다른 파일 삭제를 지시하지 못하게).
      */
     pendingDeleteKey: text('pending_delete_key'),
+    /** FIX-T08 round 3(0014): 정리 실패 횟수와 다음 재시도 시각(지수 backoff, 최대 6시간). 성공하면 비운다. 운영 상태 — 묶음에 넣지 않음. */
+    pendingDeleteAttempts: integer('pending_delete_attempts').notNull().default(0),
+    pendingDeleteNextAt: ts('pending_delete_next_at'),
     createdAt: ts('created_at').notNull().defaultNow(),
   },
   (t) => [

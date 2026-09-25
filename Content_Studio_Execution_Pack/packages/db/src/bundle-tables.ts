@@ -57,7 +57,7 @@ export function bundleColumns(name: ExportedTable): PgColumn[] {
   const cols = Object.values(getTableColumns(BUNDLE_TABLES[name])) as PgColumn[];
   if (name === 'users') return cols.filter((c) => c.name === 'id');
   // FIX-T08 round 2: 파일 삭제 의도(assets.pending_delete_key)는 운영 상태 — 묶음에 넣지 않고 복원 행은 null(다른 파일 삭제를 지시하지 못하게).
-  return cols.filter((c) => c.name !== 'owner_id' && !(name === 'assets' && c.name === 'pending_delete_key'));
+  return cols.filter((c) => c.name !== 'owner_id' && !(name === 'assets' && ['pending_delete_key', 'pending_delete_attempts', 'pending_delete_next_at'].includes(c.name)));
 }
 
 function selectExpr(name: ExportedTable, c: PgColumn): SQL {
@@ -116,7 +116,9 @@ export async function insertBundleRow(
   ownerId: string,
   overrides: Record<string, unknown> = {},
 ): Promise<boolean> {
-  const cols = Object.values(getTableColumns(BUNDLE_TABLES[name])) as PgColumn[];
+  // 묶음에 넣는 열 + owner_id 만 쓴다 — 묶음에서 뺀 운영 열(assets.pending_delete_* 등)은 DB 기본값을 받는다.
+  const bundled = new Set(bundleColumns(name).map((c) => c.name));
+  const cols = (Object.values(getTableColumns(BUNDLE_TABLES[name])) as PgColumn[]).filter((c) => c.name === 'owner_id' || bundled.has(c.name));
   const names = cols.map((c) => sql.identifier(c.name));
   const values = cols.map((c) => {
     if (c.name === 'owner_id') return sql`${ownerId}::uuid`;

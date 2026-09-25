@@ -17,6 +17,7 @@ import {
   createContent,
   createVariantDraft,
   cleanupPendingDelete,
+  cleanupBackoffMs,
   cleanupPendingDeletes,
   deleteOriginal,
   expireUploadSessions,
@@ -759,7 +760,8 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
     expect(await storage().exists(key)).toBe(true);
     expect(await cleanupPendingDeletes(db, failing)).toMatchObject({ failed: expect.any(Number) });
     expect((await assetsWith(sha(f)))[0]!.pendingDeleteKey).toBe(key);
-    expect((await cleanupPendingDeletes(db, storage())).deleted).toBeGreaterThanOrEqual(1);
+    // round 3: 실패한 의도는 backoff(2분) 뒤에 다시 시도된다
+    expect((await cleanupPendingDeletes(db, storage(), new Date(Date.now() + 3 * 60_000))).deleted).toBeGreaterThanOrEqual(1);
     expect(await storage().exists(key)).toBe(false);
     expect((await assetsWith(sha(f)))[0]!.pendingDeleteKey).toBeNull();
   });
@@ -839,4 +841,55 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
     expect(r.status).toBe(400);
     expect((await r.json()).reason).toBe('checksum_mismatch');
   });
+});
+
+describe('FIX-T08 round 3(Codex review-FIX2-T08): 정리 재시도 backoff', () => {
+  it('계속 실패하는 의도 50개가 배치를 독점하지 않는다 — 51번째는 다음 tick 에 지워지고, 실패는 횟수·다음 시각(2^n 분, 최대 6시간)을 남긴다', async () => {
+    const failId = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+    const okId = 'ffffffff-ffff-4fff-8fff-ffffffffff51';
+    const rows = [...Array.from({ length: 50 }, (_, i) => failId(i)), okId].map((id) => ({
+      id,
+      ownerId: ownerA,
+      key: `assets/${ownerA}/${id}`,
+      mime: 'audio/mpeg',
+      bytes: 1,
+      checksum: sha(new TextEncoder().encode(`r3-${id}`)),
+      verificationState: 'VERIFIED',
+      deletedAt: new Date(),
+      pendingDeleteKey: `assets/${ownerA}/${id}`,
+    }));
+    await db.insert(schema.assets).values(rows);
+    const deletedKeys: string[] = [];
+    const files = {
+      delete: async (key: string) => {
+        if (!key.endsWith(okId)) throw new Error('EBUSY');
+        deletedKeys.push(key);
+      },
+    };
+    const t0 = new Date(Date.now() + 1000);
+    const first = await cleanupPendingDeletes(db, files, t0);
+    expect(first).toEqual({ deleted: 0, failed: 50 }); // 한 번도 실패하지 않은 50개(id 순)만
+    const failed = (await db.select().from(schema.assets).where(eq(schema.assets.id, failId(0))))[0]!;
+    expect(failed.pendingDeleteAttempts).toBe(1);
+    expect(failed.pendingDeleteNextAt!.getTime()).toBe(t0.getTime() + 2 * 60_000);
+    // 같은 시각의 다음 tick: 실패한 50개는 아직 대기 → 51번째가 처리된다
+    const second = await cleanupPendingDeletes(db, files, t0);
+    expect(second).toEqual({ deleted: 1, failed: 0 });
+    expect(deletedKeys).toEqual([`assets/${ownerA}/${okId}`]);
+    const ok = (await db.select().from(schema.assets).where(eq(schema.assets.id, okId)))[0]!;
+    expect(ok).toMatchObject({ pendingDeleteKey: null, pendingDeleteAttempts: 0, pendingDeleteNextAt: null });
+    // 대기 시간이 지나면 다시 시도, 실패하면 간격이 두 배
+    const t1 = new Date(t0.getTime() + 3 * 60_000);
+    expect(await cleanupPendingDeletes(db, files, t1)).toEqual({ deleted: 0, failed: 50 });
+    const again = (await db.select().from(schema.assets).where(eq(schema.assets.id, failId(0))))[0]!;
+    expect(again.pendingDeleteAttempts).toBe(2);
+    expect(again.pendingDeleteNextAt!.getTime()).toBe(t1.getTime() + 4 * 60_000);
+    expect(cleanupBackoffMs(20)).toBe(6 * 3600_000);
+    // 성공하면 횟수·시각도 비운다
+    const t2 = new Date(t1.getTime() + 5 * 60_000);
+    expect((await cleanupPendingDeletes(db, storage(), t2)).deleted).toBe(50);
+    const cleared = (await db.select().from(schema.assets).where(eq(schema.assets.id, failId(0))))[0]!;
+    expect(cleared).toMatchObject({ pendingDeleteKey: null, pendingDeleteAttempts: 0, pendingDeleteNextAt: null });
+  });
+  const storage = () => new LocalStorageAdapter(storageDir);
 });

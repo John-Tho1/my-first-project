@@ -351,7 +351,7 @@ export async function runVariantAssist(
     output = llmStructuredOutputSchema.parse(await llm.generate(llmInput));
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
-    // FIX-T07 round 2: 채널 초안에는 허용 출처가 없다 — URL·[출처] 인용은 빼고, [n] 인용은 검증 실패.
+    // FIX-T07 round 4: 채널 초안에는 허용 출처가 없다 — 글에 URL·도메인·[출처…]·[n] 이 있으면 출력 전체 실패(fail-closed).
     sanitized = sanitizeLlmOutput(output, []);
   } catch (e) {
     const finished = new Date(Math.max(Date.now(), now.getTime()));

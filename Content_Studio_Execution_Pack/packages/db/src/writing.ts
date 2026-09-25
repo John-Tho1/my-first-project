@@ -499,11 +499,8 @@ export async function runAssist(
     output = llmStructuredOutputSchema.parse(raw);
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
-    // FIX-T07 round 2: 정제도 검증의 일부 — 풀 수 없는 인용([n] 등)이면 unverifiable_citation 으로 실패(제안 없음, 본문 그대로).
-    sanitized = sanitizeLlmOutput(
-      output,
-      prep.sourceIds.map((id) => ({ id, locator: prep.locators.get(id) ?? null })),
-    );
+    // FIX-T07 round 4: 구조화 인용만 — 글에 자유문 출처(URL·도메인·버린 참조)나 범위 밖 [n] 이 있으면 unverifiable_citation(제안 없음, 본문 그대로).
+    sanitized = sanitizeLlmOutput(output, prep.sourceIds);
   } catch (e) {
     const finished = new Date(Math.max(Date.now(), now.getTime()));
     await db.transaction(async (tx) => {

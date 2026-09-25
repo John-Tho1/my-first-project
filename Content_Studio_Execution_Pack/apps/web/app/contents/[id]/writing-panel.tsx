@@ -11,6 +11,7 @@ import {
   assistInputVersion,
   BRAND_TONE_LABEL,
   buildAssistPrompt,
+  citationLabel,
   claimNeedsConfirmation,
   isClaimResolved,
   MAX_ASSIST_SOURCES,
@@ -177,7 +178,8 @@ export function WritingPanel({
         ) : null}
         <p className="note">
           입력은 현재 본문(버전 {current.version})·Brand Profile·저장된 답변 {answers.length}개·연결된 소재의 출처 {state.allowedSources.length}개로
-          고정됩니다. AI 가 이 목록 밖의 출처를 내놓으면 저장하지 않고 &quot;출처 미확인&quot;으로 표시합니다.
+          고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있고, 글에 URL·도메인·목록 밖 문헌 제목을 쓰면 제안 전체를 저장하지
+          않습니다(실패로 기록, 본문 그대로). 본문에 URL 이 있으면 모의 제안도 같은 이유로 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
         </p>
 
         {run ? (
@@ -275,7 +277,10 @@ export function WritingPanel({
                             <p className="meta">
                               {view ? <span className="tag">근거: {EVIDENCE_LABEL[view.evidence_grade] ?? view.evidence_grade}</span> : null}
                               {view?.sources.map((s) => (
-                                <span key={s.source_version_id}>출처: {s.locator ?? `source_version ${s.source_version_id.slice(0, 8)}`}</span>
+                                <span key={s.source_version_id}>
+                                  {citationLabel(((run.inputVersionRefs as { source_version_ids?: string[] }).source_version_ids ?? []), s.source_version_id) ?? '출처:'}{' '}
+                                  {s.locator ?? `source_version ${s.source_version_id.slice(0, 8)}`}
+                                </span>
                               ))}
                               {dropped > 0 ? <span className="tag warn">출처 미확인(허용 목록 밖 {dropped}건 — 저장하지 않음)</span> : null}
                               {view?.needs_check ? <span className="tag warn">확인 필요</span> : null}

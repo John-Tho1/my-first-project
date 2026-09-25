@@ -14,6 +14,8 @@ import {
   linesToList,
   PROMPT_VERSION,
   sanitizeLlmOutput,
+  hasFreeTextCitation,
+  citationLabel,
   unconfirmedExperienceClaims,
   type AssistPromptInput,
 } from './writing';
@@ -366,23 +368,21 @@ describe('FIX-T06 round 2: 본문 포함 검사와 제외 해결', () => {
 
 describe('FIX-T07: 출력 정제·user_confirmed 복원 거부', () => {
   const FAKE = 'https://fake.example/report-2026';
-  it('버린 출처 원문이 제안 본문·경고·질문·태그·claim 문장 어디에도 남지 않는다', () => {
-    const { output, droppedTotal } = sanitizeLlmOutput(
-      {
-        result_type: 'draft',
-        input_version: 'v',
-        proposed_text: `근거는 ${FAKE} 입니다. HTTPS://FAKE.EXAMPLE/REPORT-2026 도.`,
-        proposed_tags: [FAKE],
-        claims: [{ text: `시장 규모(${FAKE})`, kind: 'fact', source_refs: [FAKE, 'ok-id-1'], needs_user_confirmation: false }],
-        followup_questions: [`${FAKE} 를 확인할까요?`],
-        warnings: [`참고: ${FAKE}`],
-      },
-      ['ok-id-1'],
-    );
+  it('버린 출처가 글(본문·경고·질문·태그·claim 문장)에 있으면 출력 전체 실패(round 4), 목록에만 있으면 버리고 개수·경고', () => {
+    const base = { result_type: 'draft' as const, input_version: 'v', proposed_tags: [] as string[], followup_questions: [] as string[], warnings: [] as string[] };
+    const claims = [{ text: '시장 규모', kind: 'fact' as const, source_refs: [FAKE, 'ok-id-1'], needs_user_confirmation: false }];
+    for (const where of ['proposed_text', 'warnings', 'followup_questions', 'proposed_tags', 'claim'] as const) {
+      const o = { ...base, proposed_text: '본문', claims: claims.map((c) => ({ ...c })) } as Parameters<typeof sanitizeLlmOutput>[0] & { proposed_text: string };
+      const mut = o as unknown as Record<string, unknown>;
+      if (where === 'proposed_text') mut.proposed_text = `근거는 ${FAKE} 입니다`;
+      else if (where === 'claim') (mut.claims as Array<{ text: string }>)[0]!.text = `시장 규모(${FAKE})`;
+      else mut[where] = [`참고 ${FAKE}`];
+      expect(() => sanitizeLlmOutput(o, ['ok-id-1']), where).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+    }
+    const { output, droppedTotal } = sanitizeLlmOutput({ ...base, proposed_text: '본문[1]', claims }, ['ok-id-1']);
     expect(droppedTotal).toBe(1);
-    const all = JSON.stringify(output);
-    expect(all).not.toMatch(/fake\.example/i);
-    expect(output.proposed_text).toContain('[출처 미확인 URL 제거]');
+    expect(JSON.stringify(output)).not.toMatch(/fake\.example/i);
+    expect(output.proposed_text).toBe('본문[1]');
     expect(output.claims[0]).toMatchObject({ source_refs: ['ok-id-1'], dropped_source_refs: 1, needs_check: true, evidence_grade: 'source' });
     expect(output.warnings.at(-1)).toBe('출처 미확인: 허용 목록에 없는 출처 1건을 버렸습니다');
   });
@@ -494,39 +494,24 @@ describe('FIX-T07 round 2: 출처 정제 범위(source_refs 에 기대지 않음
     ).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
   });
 
-  it('[n] 은 허용 출처 수 안이면 그대로(프롬프트 번호), 밖이면 거부', () => {
-    const allowed = [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', locator: 'https://example.com/report' }];
+  it('[n] 은 허용 출처 수 안이면 그대로(프롬프트 번호), 밖이면 거부 — source_refs 의 [n] 표기는 버리되 글의 [n] 은 막지 않는다', () => {
+    const allowed = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
     const ok = sanitizeLlmOutput({ ...base, proposed_text: '보고서[1]에 따르면', claims: [{ text: 't', kind: 'fact', source_refs: ['[1]'], needs_user_confirmation: false }] }, allowed);
     expect(ok.output.proposed_text).toBe('보고서[1]에 따르면');
     expect(() => sanitizeLlmOutput({ ...base, proposed_text: '보고서[2]', claims: [] }, allowed)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
   });
 
-  it('재현 2: 가짜 URL 이 본문·경고에만 있고 source_refs 는 비어도 제거 + 확인 필요 경고', () => {
-    const r = sanitizeLlmOutput(
-      {
-        ...base,
-        proposed_text: '자세한 내용은 https://fake.example/x?y=1 와 www.other-fake.example 참고.',
-        warnings: ['참고 https://fake.example/x?y=1.'],
-        followup_questions: ['[출처: 가짜 보고서] 를 볼까요?'],
-        claims: [{ text: '근거 https://fake.example/x', kind: 'fact', source_refs: [], needs_user_confirmation: false }],
-      },
-      [],
-    );
-    const all = JSON.stringify(r.output);
-    expect(all).not.toMatch(/fake\.example|가짜 보고서/);
-    expect(r.redactedTotal).toBe(5);
-    expect(r.output.claims[0]!.needs_check).toBe(true);
-    expect(r.output.warnings).toContain('출처 미확인: 허용 목록으로 확인할 수 없는 URL·인용 5건을 글에서 뺐습니다 — 확인 필요');
+  it('재현 2: 가짜 URL·www·[출처: 가짜] 가 본문·경고·질문·claim 어디에 있어도(source_refs 비어도) 출력 전체 실패', () => {
+    for (const t of ['자세한 내용은 https://fake.example/x?y=1 참고', 'www.other-fake.example 참고', '[출처: 가짜 보고서]']) {
+      expect(() => sanitizeLlmOutput({ ...base, proposed_text: t, claims: [] }, []), t).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+      expect(() => sanitizeLlmOutput({ ...base, proposed_text: '본문', warnings: [t], claims: [] }, []), t).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+    }
   });
 
-  it('허용 locator 와 같은 URL(끝 문장부호·슬래시·대소문자 무시)과 허용 id 를 담은 [출처] 는 남긴다', () => {
-    const id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    const r = sanitizeLlmOutput(
-      { ...base, proposed_text: `출처: HTTPS://Example.com/report/. 그리고 [출처 ${id}]`, claims: [] },
-      [{ id, locator: 'https://example.com/report' }],
+  it('허용 locator 와 같은 URL 이라도 자유문으로 쓰면 실패(구조화 인용 [n]·source_refs 만 허용)', () => {
+    expect(() => sanitizeLlmOutput({ ...base, proposed_text: '출처: https://example.com/report', claims: [] }, ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'])).toThrow(
+      expect.objectContaining({ code: 'unverifiable_citation' }),
     );
-    expect(r.output.proposed_text).toBe(`출처: HTTPS://Example.com/report/. 그리고 [출처 ${id}]`);
-    expect(r.redactedTotal).toBe(0);
   });
 });
 
@@ -580,55 +565,97 @@ describe('FIX-T09 round 2: proposal_status 채움·모순 검사', () => {
   });
 });
 
-describe('FIX-T07 round 3: 인용 문법 기반 정제(부분 문자열 비교 없음)', () => {
+describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 탐지해 출력 전체 실패(fail-closed)', () => {
   const base = { result_type: 'draft' as const, input_version: 'v', proposed_tags: [] as string[], followup_questions: [] as string[], warnings: [] as string[], claims: [] };
   const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-  const M = '[출처 미확인 URL 제거]';
-  const run = (text: string, allowed: Array<{ id: string; locator?: string | null }>) => sanitizeLlmOutput({ ...base, proposed_text: text }, allowed);
+  const one = [ID];
+  const run = (text: string, allowed: readonly string[] = one) => sanitizeLlmOutput({ ...base, proposed_text: text }, allowed);
+  const fails = (text: string, allowed: readonly string[] = one) =>
+    expect(() => run(text, allowed), text).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
 
-  it('재현 1: 허용 id 를 담은 가짜 URL 은 허용되지 않는다', () => {
-    const r = run(`근거 https://fake.example/${ID} 입니다`, [{ id: ID, locator: 'https://example.com/report' }]);
-    expect(r.output.proposed_text).toBe(`근거 ${M} 입니다`);
-    expect(r.output.warnings.at(-1)).toContain('확인 필요');
+  it('라운드 2–3 우회 문자열은 모두 실패(허용 출처가 있어도)', () => {
+    for (const t of [
+      `근거 https://fake.example/${ID} 입니다`,
+      'example.com?doc=x 참고',
+      'example.com:8443/report 참고',
+      'https://example.com/report(other)',
+      '출처:fake.example',
+      '출처：fake.example',
+      '//fake.example/report 참고',
+      'fake．example 참고',
+      'fake｡example 참고',
+      'fabricated.example/report',
+      'fabricated.example 입니다',
+      '(fake.example)',
+      'ＷＷＷ．ｆａｋｅ．ｅｘａｍｐｌｅ',
+      'HTTPS://FAKE.EXAMPLE',
+      '가공연구소.한국 이 아닌 가공연구소.com 에서',
+    ]) {
+      fails(t);
+      fails(t, []);
+    }
   });
 
-  it('재현 2: 경로·쿼리 대소문자가 다르면 다른 자료(허용 안 됨), 같으면 허용', () => {
-    const allowed = [{ id: ID, locator: 'https://example.com/Report?id=ABC' }];
-    expect(run('https://example.com/report?id=abc', allowed).output.proposed_text).toBe(M);
-    expect(run('https://EXAMPLE.com:443/Report?id=ABC#part', allowed).output.proposed_text).toBe('https://EXAMPLE.com:443/Report?id=ABC#part');
+  it('버린 자유문 참조(가공연구소 2025 보고서)가 본문·claim·경고·질문에 남으면 실패', () => {
+    const claims = [{ text: '시장이 컸다', kind: 'fact' as const, source_refs: ['가공연구소 2025 보고서'], needs_user_confirmation: false }];
+    expect(() => sanitizeLlmOutput({ ...base, proposed_text: '가공연구소 2025 보고서에 따르면 시장이 컸다.', claims }, [])).toThrow(
+      expect.objectContaining({ code: 'unverifiable_citation' }),
+    );
+    expect(() =>
+      sanitizeLlmOutput({ ...base, proposed_text: '시장이 컸다.', claims: [{ ...claims[0]!, text: '가공연구소  2025 보고서 기준' }] }, []),
+    ).not.toThrow(); // 공백이 다르면 다른 문구(정확한 문구만 탐지 — 한계, D13)
+    expect(() => sanitizeLlmOutput({ ...base, proposed_text: '시장이 컸다.', followup_questions: ['가공연구소 2025 보고서를 볼까요?'], claims }, [])).toThrow(
+      expect.objectContaining({ code: 'unverifiable_citation' }),
+    );
+    // 글에 없으면 버리고 개수만
+    const ok = sanitizeLlmOutput({ ...base, proposed_text: '시장이 컸다.', claims }, []);
+    expect(ok.droppedTotal).toBe(1);
+    expect(ok.output.claims[0]).toMatchObject({ source_refs: [], dropped_source_refs: 1, needs_check: true });
   });
 
-  it('재현 3: 맨 도메인(fabricated.example/report)도 허용 출처가 없으면 제거, 파일 이름·소수는 그대로', () => {
-    expect(run('근거: fabricated.example/report 참고.', []).output.proposed_text).toBe(`근거: ${M} 참고.`);
-    expect(run('근거: fabricated.example 입니다', []).output.proposed_text).toBe(`근거: ${M} 입니다`);
-    expect(run('README.md 와 3.14 와 budget.ts', []).output.proposed_text).toBe('README.md 와 3.14 와 budget.ts');
-    expect(run('메일 owner@example.local 로', []).redactedTotal).toBe(0);
+  it('[1]·[10] 은 범위 안이면 통과, 범위 밖은 실패', () => {
+    const ten = Array.from({ length: 10 }, (_, i) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}`);
+    expect(run('보고서[1]', ten).output.proposed_text).toBe('보고서[1]');
+    const ok = sanitizeLlmOutput({ ...base, proposed_text: '보고서[10]', claims: [{ text: 't[10]', kind: 'fact', source_refs: ['[10]', ten[9]!], needs_user_confirmation: false }] }, ten);
+    expect(ok.output.claims[0]).toMatchObject({ text: 't[10]', source_refs: [ten[9]], dropped_source_refs: 1 });
+    fails('보고서[11]', ten);
+    fails('보고서[99]', ten);
+    fails('보고서[0]', ten);
+    fails('보고서[１]', []); // 전각 숫자도 NFKC 뒤 번호 규칙
   });
 
-  it('재현 4: 허용 URL·허용 UUID 를 담은 [출처: …] 는 보존, 그 밖의 [출처…] 는 제거', () => {
-    const allowed = [{ id: ID, locator: 'https://example.com/report' }];
-    expect(run('[출처: https://example.com/report]', allowed).output.proposed_text).toBe('[출처: https://example.com/report]');
-    expect(run(`[출처: ${ID}]`, allowed).output.proposed_text).toBe(`[출처: ${ID}]`);
-    expect(run('[출처: https://example.com/other]', allowed).output.proposed_text).toBe(M);
-    expect(run('[출처: 가짜 연구소 2025]', allowed).output.proposed_text).toBe(M);
-    expect(run(`[출처: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]`, allowed).output.proposed_text).toBe(M);
+  it('오탐 없음: README.md · 3.14 · 이메일 · 한국어 문장 · 파일 이름', () => {
+    for (const t of [
+      'README.md 를 보세요',
+      'CHANGELOG.md 와 AGENTS.md',
+      '원주율은 3.14 이고 v24.21.0 을 씁니다',
+      '메일 owner@example.local 로 보내 주세요',
+      '해외 영업에서 가장 중요한 것은 신뢰입니다. 다음 분기에 다시 확인합니다.',
+      'budget.ts 와 report.pdf, data.csv, photo.jpeg 파일',
+      '1.5배 늘었다. 끝.',
+    ]) {
+      expect(run(t, []).output.proposed_text, t).toBe(t);
+    }
   });
 
-  it('재현 5: [10] 은 허용 출처 10개면 그대로, [99] 는 출력 전체 실패(길이와 무관하게 번호 규칙)', () => {
-    const ten = Array.from({ length: 10 }, (_, i) => ({ id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}` }));
-    const ok = sanitizeLlmOutput({ ...base, proposed_text: '보고서[10]', claims: [{ text: 't[10]', kind: 'fact', source_refs: ['[10]'], needs_user_confirmation: false }] }, ten);
-    expect(ok.output.proposed_text).toBe('보고서[10]');
-    expect(ok.output.claims[0]!.text).toBe('t[10]');
-    expect(() => run('보고서[99]', ten)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
-    expect(() => run('보고서[11]', ten)).toThrow(expect.objectContaining({ code: 'unverifiable_citation' }));
+  it('알려진 보수성: 파일처럼 보여도 경로·포트가 붙으면 호스트, 소문자 .md 는 도메인으로 본다', () => {
+    fails('notes.md/report');
+    fails('report.pdf:8080/x');
+    fails('fake.md 참고');
+    fails('React.Component 를 씁니다'); // 단어.영문 은 실패할 수 있다(D13 FIX round 4)
   });
 
-  it('추적 파라미터(utm_*)만 다른 허용 URL 은 허용, www·scheme 이 다르면 정규형이 달라 허용 안 됨(별칭 없음)', () => {
-    const allowed = [{ id: ID, locator: 'https://example.com/report?b=2&a=1' }];
-    expect(run('https://example.com/report?a=1&b=2&utm_source=x', allowed).redactedTotal).toBe(0);
-    expect(run('https://www.example.com/report?a=1&b=2', allowed).redactedTotal).toBe(1);
-    expect(run('http://example.com/report?a=1&b=2', allowed).redactedTotal).toBe(1);
-    // www 로 시작하는 허용 locator 는 https:// 를 붙인 정규형이 같으면 허용
-    expect(run('www.example.com/r 참고', [{ id: ID, locator: 'https://www.example.com/r' }]).redactedTotal).toBe(0);
+  it('hasFreeTextCitation 는 탐지만 한다(허용 판단 없음)', () => {
+    expect(hasFreeTextCitation('https://example.com')).toBe(true);
+    expect(hasFreeTextCitation('a//b 가 아니라 //host')).toBe(true);
+    expect(hasFreeTextCitation('주석 // 설명')).toBe(false);
+    expect(hasFreeTextCitation('평범한 문장')).toBe(false);
+  });
+
+  it('서버 인용 표시: 허용 id 정렬 순서로 [출처 n]', () => {
+    const ids = ['cccccccc-cccc-4ccc-8ccc-cccccccccccc', ID];
+    expect(citationLabel(ids, ID)).toBe('[출처 1]');
+    expect(citationLabel(ids, 'CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC')).toBe('[출처 2]');
+    expect(citationLabel(ids, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd')).toBeNull();
   });
 });

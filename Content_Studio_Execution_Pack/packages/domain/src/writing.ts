@@ -10,7 +10,6 @@
 import { z } from 'zod';
 import { MAX_CONTENT_BODY } from './content';
 import { AppError } from './errors';
-import { normalizeUrl } from './url';
 
 // ---- Brand Profile ----
 
@@ -103,7 +102,7 @@ export const ASSIST_RESULT_TYPE = { outline: 'outline', draft: 'draft', revise: 
 /** 프롬프트 형식 버전. 프롬프트 문구를 바꾸면 올린다(generation_runs.prompt_version). */
 export const PROMPT_VERSION = 't06-assist-v1';
 /** T07: 허용 출처 목록이 들어간 프롬프트의 형식 버전(출처가 없으면 t06-assist-v1 과 바이트 단위로 같다). */
-export const PROMPT_VERSION_WITH_SOURCES = 't07-assist-v2';
+export const PROMPT_VERSION_WITH_SOURCES = 't07-assist-v3';
 export const promptVersionFor = (sourceCount: number) => (sourceCount > 0 ? PROMPT_VERSION_WITH_SOURCES : PROMPT_VERSION);
 
 export const assistRequestSchema = z
@@ -235,7 +234,8 @@ function sourceSection(sources: readonly PromptSource[]): string[] {
   const sorted = [...sources].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return [
     '## 허용 출처(source_refs 에는 아래 id 만 쓰세요 — 목록에 없는 URL·문헌을 만들지 마세요)',
-    ...sorted.map((s) => `- ${s.id}${s.locator ? ` · ${s.locator}` : ''}${s.excerpt ? ` · ${s.excerpt}` : ''}`),
+    '- 본문·claim 에서 출처는 아래 번호 [n] 으로만 표시하세요. URL·도메인·문헌 제목을 글에 쓰면 출력 전체가 거부됩니다.',
+    ...sorted.map((s, i) => `[${i + 1}] ${s.id}${s.locator ? ` · ${s.locator}` : ''}${s.excerpt ? ` · ${s.excerpt}` : ''}`),
     '',
   ];
 }
@@ -288,8 +288,6 @@ export function pickDefaultSources<T extends { id: string; sourceId: string; fet
 
 // ---- FIX-T07: 출력 전체 정제(순수) ----
 
-export const DROPPED_REF_MARKER = '[출처 미확인 URL 제거]';
-
 export interface SanitizedClaim {
   text: string;
   kind: 'fact' | 'opinion' | 'experience';
@@ -321,142 +319,120 @@ interface LlmOutputLike {
 }
 
 
-/** 허용 출처(정제 기준): source_version id 와 그 출처의 locator(URL). 순서는 프롬프트의 번호([1], [2] …)와 같다(id 정렬). */
-export interface AllowedRef {
-  id: string;
-  locator?: string | null;
+/** 허용 출처 번호: [n] 은 허용 source_version id 를 **id 오름차순**으로 늘어놓은 순서(프롬프트와 같음), 1부터. */
+export function citationIds(allowed: readonly string[]): string[] {
+  return [...new Set(allowed.map((s) => s.toLowerCase()))].sort();
 }
 
-/** 모델 출력에 허용 목록으로 풀 수 없는 번호 인용([n], n 이 범위 밖)이 있어 안전하게 고칠 수 없음 → 출력 전체를 검증 실패로. */
+/** 서버가 만드는 인용 표시("[출처 n]"). 허용 목록에 없는 id 면 null. */
+export function citationLabel(allowed: readonly string[], id: string): string | null {
+  const n = citationIds(allowed).indexOf(id.toLowerCase());
+  return n < 0 ? null : `[출처 ${n + 1}]`;
+}
+
+/** 모델 출력에 구조화 인용이 아닌 출처 표기(URL·도메인·버린 참조 문구)나 범위 밖 [n] 이 있음 → 출력 전체를 검증 실패로(fail-closed). */
 export class UnverifiableCitationError extends AppError {
   constructor() {
     super('bad_request', 'unverifiable_citation', 'AI 출력에 확인할 수 없는 출처 인용이 있어 저장하지 않았습니다');
   }
 }
 
-// ---- 인용 문법(FIX-T07 round 3) ----
-// 받아들이는 형태는 다음뿐이다. 판정은 모두 "전체 값의 동등성" — 부분 문자열 비교는 하지 않는다.
-//   [n]                  n = 1..허용 출처 수(프롬프트 번호). 범위 밖이면 출력 전체 실패.
-//   [출처: <URL|UUID>]   괄호 안의 값을 꺼내 URL 은 정규형 비교, UUID 는 허용 id 와 정확히 비교. 그 밖의 [출처…] 는 미확인.
-//   <URL>                https?://… 또는 www.… (www. 는 https:// 를 붙여 해석)
-//   <맨 도메인>          host.tld[/…] — 점이 있고 TLD 가 영문 2~24자, 흔한 파일 확장자(.md .ts .js …)는 제외
-// URL 동등성 = normalizeUrl().normalized(scheme·host 소문자, 기본 포트·fragment·추적 파라미터 제거, 파라미터 정렬, 끝 슬래시 제거).
-// **경로·쿼리의 대소문자는 그대로** 비교한다. http↔https, www 유무는 정규형이 다르면 같은 출처로 보지 않는다(별칭 없음).
+// ---- 인용 규칙(FIX-T07 round 4 — 구조화 인용만, 자유문 인용은 fail-closed) ----
+// 자유문에서 출처를 "검증해 허용"하는 방식은 우회가 끝나지 않는다(라운드 1–3). 그래서 허용은 구조화 데이터만:
+//   - claims[].source_refs: 허용 source_version id(그 밖의 값은 버리고 개수만 남김)
+//   - 글 속 [n]: 1 ≤ n ≤ 허용 출처 수(범위 밖이면 실패)
+// 그 밖에 글(제안 본문·경고·후속 질문·태그·claim 문장)에 출처처럼 보이는 것이 하나라도 있으면 **허용 여부를 따지지 않고** 출력 전체 실패.
+// 탐지는 넓게(허용 판단 없음, NFKC 정규화 뒤): '://' · 'www.' · '[출처…]' · 프로토콜 상대 '//host' · 호스트 모양 토큰
+// (문자·숫자·하이픈 라벨을 '.'·'。'(전각 '．'·'｡' 은 NFKC 로 변환)로 이은 뒤 영문 2–24자 TLD) · 버린 source_refs 문구.
+// 오탐 예외는 좁게: 실제 TLD 가 아닌 흔한 파일 확장자(README.md 처럼 대문자 이름의 .md 포함), 이메일(@ 뒤 도메인), 소수(3.14).
+// 그 밖의 "단어.영문" 표기(React.Component, St.Petersburg 등)는 실패할 수 있다 — 의도한 보수성(D13 FIX round 4).
 
-const TOKEN_CHARS = String.raw`[^\s<>"'()[\]{}]`;
-const HOST = String.raw`(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}`;
-const CITATION_RE = new RegExp(
-  [
-    String.raw`\[출처[^\]]*\]`, // [출처…]
-    String.raw`\[(\d+)\]`, // [n]
-    String.raw`https?:\/\/${TOKEN_CHARS}+`, // URL
-    String.raw`www\.${TOKEN_CHARS}+`, // www.…
-    String.raw`(?<![\w@./:-])${HOST}(?:\/${TOKEN_CHARS}*)?(?![\w@-])`, // 맨 도메인
-  ].join('|'),
-  'giu',
-);
-/** 맨 도메인으로 보지 않을 흔한 파일 확장자(보수적 예외) */
-const FILE_EXT = new Set(['md', 'ts', 'tsx', 'js', 'jsx', 'json', 'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'csv', 'xlsx', 'docx', 'pptx', 'zip', 'html', 'css', 'mp4', 'mov', 'sql', 'yml', 'yaml']);
-const UUID_ONLY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const TRAILING_PUNCT = /[.,;:!?…。、]+$/u;
+const DOT = '[.。]';
+const LABEL = String.raw`[\p{L}\p{N}](?:[\p{L}\p{N}-]*[\p{L}\p{N}])?`;
+/** 호스트 모양: 앞이 문자·숫자·밑줄·@·점·하이픈이 아닌 곳에서 시작, 끝(TLD) 뒤에 문자·숫자·밑줄·하이픈이 오지 않음 */
+const HOST_LIKE = new RegExp(String.raw`(?<![\p{L}\p{N}_@.。-])((?:${LABEL}${DOT})+)([a-z]{2,24})(?![\p{L}\p{N}_-])`, 'giu');
+/** 모델이 쓴 [출처…] 표기도 자유문 인용이다(서버만 [출처 n] 을 만든다). */
+const SOURCE_TAG = /\[\s*출처/u;
+const SCHEME_LIKE = /:\/\/|www[.。]|(?<![:/])\/\/[\p{L}\p{N}]/iu;
+/** 실제 TLD 가 아닌 파일 확장자(호스트로 보지 않음). 실제 TLD(.zip·.mov 등)는 넣지 않는다. */
+const NON_TLD_FILE_EXT = new Set(['txt', 'json', 'csv', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'yml', 'yaml', 'sql', 'html', 'css', 'docx', 'xlsx', 'pptx', 'svg']);
+const NUMBER_MARKER = /\[(\d+)\]/gu;
 
-/** URL·www·맨 도메인 문자열 → 정규형(비교용). 해석할 수 없으면 null. */
-export function canonicalCitationUrl(token: string): string | null {
-  const t = token.trim();
-  const withScheme = /^https?:\/\//iu.test(t) ? t : `https://${t}`;
-  try {
-    return normalizeUrl(withScheme).normalized;
-  } catch {
-    return null;
+const nfkc = (s: string) => s.normalize('NFKC');
+
+/** 글 하나에 자유문 출처 표기가 있는가(허용 판단 없음 — 탐지만). */
+export function hasFreeTextCitation(text: string): boolean {
+  const t = nfkc(text);
+  if (SCHEME_LIKE.test(t) || SOURCE_TAG.test(t)) return true;
+  for (const m of t.matchAll(HOST_LIKE)) {
+    const tld = m[2]!.toLowerCase();
+    const after = t.slice(m.index! + m[0].length);
+    const pathLike = /^(?::\d|[/?(])/u.test(after);
+    if (!pathLike && NON_TLD_FILE_EXT.has(tld)) continue;
+    // README.md·CHANGELOG.md 처럼 대문자 이름의 .md 는 파일 이름으로 본다(경로·포트가 붙으면 호스트).
+    if (!pathLike && tld === 'md' && /^[A-Z][A-Z0-9_-]*[.]$/u.test(m[1]!)) continue;
+    return true;
   }
+  return false;
 }
 
 /**
- * 모델 출력 한 개를 저장·반환 전에 정제한다(docs/04: 목록 밖 출처는 확인 전 채택 금지). FIX-T07 round 3 — 위 인용 문법으로만 판정.
- * - claim.source_refs: 허용 id 와 정확히 같은 것만(filterClaimSources), 버린 개수·needs_check
- * - 제안 본문·경고·후속 질문·태그·claim 문장의 URL·맨 도메인·[출처…] 중 허용 출처로 풀리지 않는 것은 DROPPED_REF_MARKER 로 바꾸고
- *   "확인 필요" 경고, 바뀐 claim 은 needs_check
- * - [n] 은 길이와 무관하게 번호 규칙으로만 판정 — 범위 밖이면 UnverifiableCitationError(run failed, 제안 없음)
- * 이 결과 하나를 제안 버전·output_json·claims 행·HTTP 응답에 똑같이 쓴다(원고 assist·채널 AI 초안).
+ * 모델 출력 한 개를 저장·반환 전에 검증한다(docs/04: 목록 밖 출처는 확인 전 채택 금지). FIX-T07 round 4.
+ * - claim.source_refs: 허용 id 와 정확히 같은 것만(filterClaimSources), 버린 개수·needs_check, 경고
+ * - 글([n] 제외)에 URL·도메인·버린 source_refs 문구가 있으면, 또는 [n] 이 범위 밖이면 UnverifiableCitationError
+ *   → 호출자가 run failed(error unverifiable_citation)·제안 없음·본문 그대로·502 llm_failed 로 처리한다. 글을 고쳐 살리지 않는다.
+ * 통과한 출력 하나를 제안 버전·output_json·claims 행·HTTP 응답에 똑같이 쓴다(원고 assist·채널 AI 초안).
  */
-export function sanitizeLlmOutput(
-  output: LlmOutputLike,
-  allowedIn: ReadonlyArray<AllowedRef | string>,
-): { output: SanitizedOutput; droppedTotal: number; redactedTotal: number } {
-  const allowed: AllowedRef[] = allowedIn.map((a) => (typeof a === 'string' ? { id: a } : a));
-  const allowedIds = allowed.map((a) => a.id);
-  const okIds = new Set(allowedIds.map((s) => s.toLowerCase()));
-  const okUrls = new Set(allowed.flatMap((a) => (a.locator ? [canonicalCitationUrl(a.locator)].filter((x): x is string => x !== null) : [])));
-
-  let redactedTotal = 0;
-  const urlAllowed = (token: string) => {
-    const c = canonicalCitationUrl(token);
-    return c !== null && okUrls.has(c);
-  };
-  const clean = (s: string): { text: string; changed: boolean } => {
-    let changed = false;
-    const text = s.replace(CITATION_RE, (m: string, num: string | undefined) => {
-      if (m === DROPPED_REF_MARKER) return m;
-      if (num !== undefined) {
-        const n = Number(num);
-        if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
-        return m;
-      }
-      if (m.startsWith('[')) {
-        const inner = m.slice(1, -1).replace(/^출처\s*[:：]?\s*/u, '').trim();
-        const ok = UUID_ONLY.test(inner) ? okIds.has(inner.toLowerCase()) : inner !== '' && urlAllowed(inner.replace(TRAILING_PUNCT, ''));
-        if (ok) return m;
-        changed = true;
-        redactedTotal++;
-        return DROPPED_REF_MARKER;
-      }
-      // URL·www·맨 도메인: 끝 문장부호는 인용이 아니라 문장의 것
-      const punct = TRAILING_PUNCT.exec(m)?.[0] ?? '';
-      const token = punct ? m.slice(0, -punct.length) : m;
-      const isBare = !/^(?:https?:\/\/|www\.)/iu.test(token);
-      if (isBare) {
-        const host = token.split('/')[0]!;
-        const tld = host.slice(host.lastIndexOf('.') + 1).toLowerCase();
-        if (FILE_EXT.has(tld) && !token.includes('/')) return m; // 파일 이름으로 보이는 것은 그대로
-      }
-      if (urlAllowed(token)) return m;
-      changed = true;
-      redactedTotal++;
-      return DROPPED_REF_MARKER + punct;
-    });
-    return { text, changed };
-  };
-
-  const filtered = filterClaimSources(output.claims, allowedIds);
+export function sanitizeLlmOutput(output: LlmOutputLike, allowedIds: readonly string[]): { output: SanitizedOutput; droppedTotal: number } {
+  const allowed = citationIds(allowedIds);
+  const okIds = new Set(allowed);
+  const filtered = filterClaimSources(output.claims, allowed);
   const droppedTotal = filtered.reduce((n, c) => n + c.dropped_source_refs, 0);
-  const proposed = clean(output.proposed_text);
-  const tags = output.proposed_tags.map((t) => clean(t).text);
-  const questions = output.followup_questions.map((q) => clean(q).text);
-  const claims = filtered.map((c) => {
-    const t = clean(c.text);
-    return {
-      text: t.text,
-      kind: c.kind,
-      source_refs: c.source_refs,
-      needs_user_confirmation: c.needs_user_confirmation,
-      dropped_source_refs: c.dropped_source_refs,
-      evidence_grade: c.evidence_grade,
-      needs_check: c.needs_check || t.changed,
-    };
-  });
-  const warnings = output.warnings.map((w) => clean(w).text);
-  if (redactedTotal > 0) warnings.push(`출처 미확인: 허용 목록으로 확인할 수 없는 URL·인용 ${redactedTotal}건을 글에서 뺐습니다 — 확인 필요`);
+
+  // 버린 참조 문구(범위 안 [n] 표기는 구조화 인용이라 제외 — 범위 밖 [n] 은 아래 번호 규칙이 잡는다)
+  const droppedPhrases = [
+    ...new Set(
+      output.claims.flatMap((c) =>
+        c.source_refs.map((r) => nfkc(r).trim().toLowerCase()).filter((r) => r !== '' && !okIds.has(r) && !/^\[\d+\]$/u.test(r)),
+      ),
+    ),
+  ];
+  const texts = [
+    output.proposed_text,
+    ...output.proposed_tags,
+    ...output.followup_questions,
+    ...output.warnings,
+    ...output.claims.map((c) => c.text),
+  ];
+  for (const text of texts) {
+    for (const m of text.normalize('NFKC').matchAll(NUMBER_MARKER)) {
+      const n = Number(m[1]);
+      if (!(n >= 1 && n <= allowed.length)) throw new UnverifiableCitationError();
+    }
+    if (hasFreeTextCitation(text)) throw new UnverifiableCitationError();
+    const low = nfkc(text).toLowerCase();
+    if (droppedPhrases.some((p) => low.includes(p))) throw new UnverifiableCitationError();
+  }
+
+  const warnings = [...output.warnings];
   if (droppedTotal > 0) warnings.push(`출처 미확인: 허용 목록에 없는 출처 ${droppedTotal}건을 버렸습니다`);
   return {
     droppedTotal,
-    redactedTotal,
     output: {
       result_type: output.result_type,
       input_version: output.input_version,
-      proposed_text: proposed.text,
-      proposed_tags: tags,
-      claims,
-      followup_questions: questions,
+      proposed_text: output.proposed_text,
+      proposed_tags: [...output.proposed_tags],
+      claims: filtered.map((c) => ({
+        text: c.text,
+        kind: c.kind,
+        source_refs: c.source_refs,
+        needs_user_confirmation: c.needs_user_confirmation,
+        dropped_source_refs: c.dropped_source_refs,
+        evidence_grade: c.evidence_grade,
+        needs_check: c.needs_check,
+      })),
+      followup_questions: [...output.followup_questions],
       warnings,
     },
   };

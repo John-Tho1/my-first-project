@@ -130,7 +130,7 @@ describe('허용 출처(입력 버전 고정)와 claim–source 연결', () => {
     const res = await assist(contentId, { mode: 'draft', base_version: 1, brand_profile_version: 1, source_version_ids: [svId.toUpperCase()] });
     expect(res.status).toBe(201);
     const body = await res.json();
-    expect(body.run.prompt_version).toBe('t07-assist-v2');
+    expect(body.run.prompt_version).toBe('t07-assist-v3');
     expect(body.run.input_version_refs.source_version_ids).toEqual([svId]);
     expect(body.run.input_version_refs.input_version).toContain(`;sv:${svId}`);
     expect(body.usage).toMatchObject({ state: 'settled', reserved_amount: '0.000000', actual_amount: '0.000000', failed: false });
@@ -508,7 +508,7 @@ describe('FIX-T07(Codex review-T07)', () => {
     }
   });
 
-  it('P1 버린 출처: 같은 가짜 URL 이 source_refs·warnings·proposed_text 에 있어도 저장·응답 어디에도 남지 않는다', async () => {
+  it('P1 버린 출처(round 4): 같은 가짜 URL 이 글에 있으면 출력 전체 실패, source_refs 에만 있으면 버리고 저장·응답 어디에도 남지 않는다', async () => {
     const FAKE = 'https://invented.example/fake-report-2026';
     const { contentId, svId } = await contentWithSource(ownerA, 'fix-leak', 'https://example.com/leak');
     const mock = new MockLlmProvider();
@@ -526,7 +526,20 @@ describe('FIX-T07(Codex review-T07)', () => {
         } satisfies LlmStructuredOutput;
       },
     };
-    const r = await runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], sourceVersionIds: [svId] }, leaky);
+    const input = { mode: 'draft' as const, baseVersion: 1, brandProfileVersion: 1, answerIds: [], sourceVersionIds: [svId] };
+    const before = await counts(contentId);
+    await expect(runAssist(db, ownerA, contentId, input, leaky)).rejects.toMatchObject({ code: 'llm_failed' });
+    expect((await counts(contentId)).versions).toBe(before.versions);
+    expect((await counts(contentId)).claims).toBe(before.claims);
+    const refsOnly: AssistLlm = {
+      name: 'mock',
+      mode: 'mock',
+      async generate(i) {
+        const out = await mock.generate(i);
+        return { ...out, claims: [{ text: '시장이 컸다.', kind: 'fact', source_refs: [FAKE, svId], needs_user_confirmation: false }] } satisfies LlmStructuredOutput;
+      },
+    };
+    const r = await runAssist(db, ownerA, contentId, input, refsOnly);
     const response = assistResponse(r, generationRunView(r.run));
     const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, r.run.id));
     const [proposal] = await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, r.proposal.id));
@@ -540,7 +553,6 @@ describe('FIX-T07(Codex review-T07)', () => {
     ] as const) {
       expect(JSON.stringify(v), label).not.toContain('invented.example');
     }
-    expect(proposal!.body).toContain('[출처 미확인 URL 제거]');
     expect(response.claims[0]).toMatchObject({ source_refs: [svId], dropped_source_refs: 1, needs_check: true });
   });
 
@@ -644,24 +656,25 @@ describe('FIX-T07 round 2(Codex review-FIX-T07)', () => {
     expect((await db.select().from(schema.contents).where(eq(schema.contents.id, contentId)))[0]!.currentVersionId).toBe(body);
   });
 
-  it('P1 원고: 가짜 URL 이 본문·경고에만 있고 source_refs 가 비어도 저장·결과에서 제거, 확인 필요 경고', async () => {
+  it('P1 원고(round 4): 가짜 URL 이 본문·경고에만 있고 source_refs 가 비어도 출력 전체 실패 — run failed, 제안 없음, 글 어디에도 저장 안 됨', async () => {
     const { contentId } = await contentWithSource(ownerA, 'cite-2', 'https://example.com/cite2');
-    const r = await runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, urlOnlyInText);
-    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, r.run.id));
-    const [proposal] = await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, r.proposal.id));
-    for (const v of [run!.outputJson, proposal!.body, r.output]) expect(JSON.stringify(v)).not.toContain('fake-only-in-text');
-    expect(r.output.warnings.some((w) => w.includes('확인 필요'))).toBe(true);
+    const before = await counts(contentId);
+    expect(await failCode(runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [] }, urlOnlyInText))).toBe('llm_failed');
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, contentId));
+    expect(run).toMatchObject({ status: 'failed', error: 'unverifiable_citation', outputRef: null, outputJson: null });
+    expect((await counts(contentId)).versions).toBe(before.versions);
+    const bodies = await db.select({ body: schema.contentVersions.body }).from(schema.contentVersions).where(eq(schema.contentVersions.contentId, contentId));
+    expect(JSON.stringify(bodies)).not.toContain('fake-only-in-text');
   });
 
-  it('P1 채널 초안: 같은 두 입력 — [1] 은 실패(버전 없음), 가짜 URL 은 제거', async () => {
+  it('P1 채널 초안: 같은 두 입력 — [1] 도 가짜 URL 도 실패(버전 없음)', async () => {
     const id = (await createContent(db, ownerA, { title: '채널 인용', body: '본문 한 줄.' })).content.id;
     expect(await failCode(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, citing))).toBe('llm_failed');
     const [vr] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, id));
     expect(vr).toMatchObject({ status: 'failed', error: 'unverifiable_citation' });
+    expect(await failCode(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, urlOnlyInText))).toBe('llm_failed');
     const [variant] = await db.select().from(schema.variants).where(eq(schema.variants.contentId, id));
     expect((await db.select().from(schema.variantVersions).where(eq(schema.variantVersions.variantId, variant!.id))).length).toBe(0);
-    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, urlOnlyInText);
-    for (const v of [ok.proposal.body, ok.proposal.metadataJson, ok.output]) expect(JSON.stringify(v)).not.toContain('fake-only-in-text');
   });
 
   it('P2 합계: 행마다 600000000000.000000 인 원장 두 행의 합을 정확히 읽고, 예약 검사도 답한다(429)', async () => {
@@ -693,12 +706,16 @@ describe('FIX-T07 round 2(Codex review-FIX-T07)', () => {
   });
 });
 
-describe('FIX-T07 round 3(Codex review-FIX2-T07): 인용 문법 — 원고·채널 경로', () => {
+describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고·채널 경로 fail-closed', () => {
   const mock = new MockLlmProvider();
-  const saying = (text: string): AssistLlm => ({
+  const saying = (text: string, sourceRefs: string[] = []): AssistLlm => ({
     name: 'mock',
     mode: 'mock',
-    generate: async (input) => ({ ...(await mock.generate(input)), proposed_text: text, claims: [] }),
+    generate: async (input) => ({
+      ...(await mock.generate(input)),
+      proposed_text: text,
+      claims: [{ text: '시장이 컸다.', kind: 'opinion', source_refs: sourceRefs, needs_user_confirmation: false }],
+    }),
   });
   const code = async (p: Promise<unknown>) => {
     try {
@@ -708,30 +725,60 @@ describe('FIX-T07 round 3(Codex review-FIX2-T07): 인용 문법 — 원고·채�
       return (e as AppError).code;
     }
   };
+  const BYPASSES = (svId: string) => [
+    `근거 https://fake.example/${svId} 입니다`,
+    'example.com?doc=x 참고',
+    'example.com:8443/report 참고',
+    'https://example.com/report(other)',
+    '출처:fake.example',
+    '//fake.example/report 참고',
+    'fake．example 참고',
+    'fabricated.example/report 참고',
+    '[출처: https://example.com/r4-report]', // 허용 locator 라도 자유문 인용은 실패
+  ];
 
-  it('원고: 허용 id 를 담은 가짜 URL·맨 도메인은 제거, [출처: 허용 URL] 은 보존, [10](출처 10개) 보존, [99] 는 실패', async () => {
-    const { contentId, svId } = await contentWithSource(ownerA, 'r3-a', 'https://example.com/r3-report');
+  it('원고: 라운드 2–3 우회 문자열·버린 자유문 참조는 모두 실패(run failed·버전 없음·본문 그대로), [1]·[10]·오탐 예시는 통과', async () => {
+    const { contentId, svId } = await contentWithSource(ownerA, 'r4-a', 'https://example.com/r4-report');
     const [sv] = await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.id, svId));
     for (let i = 0; i < 9; i++) await db.insert(schema.sourceVersions).values({ sourceId: sv!.sourceId, excerpt: `v${i}`, extractionState: 'fetched' });
     const ids = (await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.sourceId, sv!.sourceId))).map((x) => x.id);
     expect(ids).toHaveLength(10);
     const input = { mode: 'draft' as const, baseVersion: 1, brandProfileVersion: 1, answerIds: [], sourceVersionIds: ids };
-    const text = `근거 https://fake.example/${svId} 와 fabricated.example/report, [출처: https://example.com/r3-report], 보고서[10].`;
-    const r = await runAssist(db, ownerA, contentId, input, saying(text));
-    expect(r.proposal.body).toBe('근거 [출처 미확인 URL 제거] 와 [출처 미확인 URL 제거], [출처: https://example.com/r3-report], 보고서[10].');
-    expect(r.output.warnings.some((w) => w.includes('확인 필요'))).toBe(true);
+    const current = async () => (await db.select().from(schema.contents).where(eq(schema.contents.id, contentId)))[0]!.currentVersionId;
+    const body = await current();
     const before = await counts(contentId);
-    expect(await code(runAssist(db, ownerA, contentId, input, saying('보고서[99]')))).toBe('llm_failed');
+    const failing = [...BYPASSES(svId).map((t) => saying(t)), saying('가공연구소 2025 보고서에 따르면 시장이 컸다.', ['가공연구소 2025 보고서'])];
+    for (const llm of failing) expect(await code(runAssist(db, ownerA, contentId, input, llm))).toBe('llm_failed');
     const runs = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, contentId));
-    expect(runs.find((x) => x.status === 'failed')).toMatchObject({ error: 'unverifiable_citation' });
-    expect((await counts(contentId)).versions).toBe(before.versions);
+    expect(runs).toHaveLength(failing.length);
+    for (const r of runs) expect(r).toMatchObject({ status: 'failed', error: 'unverifiable_citation', outputRef: null });
+    const after = await counts(contentId);
+    expect({ versions: after.versions, claims: after.claims }).toEqual({ versions: before.versions, claims: before.claims });
+    expect(after.runs - before.runs).toBe(failing.length); // 실패 run·원장은 남는다(T07 규칙)
+    expect(await current()).toBe(body);
+
+    const ok = await runAssist(db, ownerA, contentId, input, saying('보고서[1]와 [10], README.md, 3.14, owner@example.local — 해외 영업 메모.', [ids[0]!]));
+    expect(ok.proposal.body).toBe('보고서[1]와 [10], README.md, 3.14, owner@example.local — 해외 영업 메모.');
+    expect(await code(runAssist(db, ownerA, contentId, input, saying('보고서[11]')))).toBe('llm_failed');
   });
 
-  it('채널 초안: 맨 도메인은 제거(허용 출처 없음), [1] 은 실패', async () => {
-    const id = (await createContent(db, ownerA, { title: 'r3 채널', body: '본문.' })).content.id;
-    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('근거: fabricated.example/report 참고'));
-    expect(ok.proposal.body).toBe('근거: [출처 미확인 URL 제거] 참고');
-    expect(JSON.stringify(ok.proposal.metadataJson)).not.toContain('fabricated.example');
-    expect(await code(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('보고서[1]')))).toBe('llm_failed');
+  it('채널 초안: 같은 우회 문자열은 모두 실패(버전 없음), 평범한 글은 통과', async () => {
+    const id = (await createContent(db, ownerA, { title: 'r4 채널', body: '본문.' })).content.id;
+    for (const t of BYPASSES('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')) {
+      expect(await code(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying(t))), t).toBe('llm_failed');
+    }
+    expect(await code(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('가공연구소 2025 보고서 기준', ['가공연구소 2025 보고서'])))).toBe(
+      'llm_failed',
+    );
+    const [variant] = await db.select().from(schema.variants).where(eq(schema.variants.contentId, id));
+    if (variant) expect((await db.select().from(schema.variantVersions).where(eq(schema.variantVersions.variantId, variant.id))).length).toBe(0);
+    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('README.md 와 3.14 를 정리한 글입니다.'));
+    expect(ok.proposal.body).toBe('README.md 와 3.14 를 정리한 글입니다.');
+  });
+
+  it('모의 provider 의 기본 출력은 URL 모양 글이 없어 통과한다(출처가 있어도)', async () => {
+    const { contentId, svId } = await contentWithSource(ownerA, 'r4-mock', 'https://example.com/r4-mock');
+    const r = await runAssist(db, ownerA, contentId, { mode: 'draft', baseVersion: 1, brandProfileVersion: 1, answerIds: [], sourceVersionIds: [svId] }, new MockLlmProvider());
+    expect(r.run.status).toBe('succeeded');
   });
 });

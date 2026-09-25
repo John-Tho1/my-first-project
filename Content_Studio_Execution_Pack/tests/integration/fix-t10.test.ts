@@ -208,8 +208,14 @@ describe('P0 — 복원은 UNKNOWN 을 보존한다(BLOCKED·FAILED 로 덮어�
       const plans = await h.db.select().from(schema.distributionPlans).where(eq(schema.distributionPlans.ownerId, target));
       expect(plans.find((x) => x.id === u.planId)!.status).toBe('attention');
       expect(plans.find((x) => x.id === q.planId)!.status).toBe('attention');
-      // 작업은 복원하지 않음 → 자동 실행 없음. 재시도는 명시적으로 거부(결과 불명 → outcome_unknown, 대기 → not_retryable)
-      expect((await h.db.select({ n: count() }).from(schema.jobs))[0]!.n).toBe(0);
+      // FIX-T11: 작업은 읽기 전용 이력(UNKNOWN·BLOCKED + 복원 표시, lease 없음) → 자동 실행 없음. 재시도는 명시적으로 거부(결과 불명 → outcome_unknown, 대기 → not_retryable)
+      const rjobs = await h.db.select().from(schema.jobs);
+      expect(rjobs.map((j) => [j.itemId, j.state, j.restoredNeedsReview, j.leaseOwner]).sort()).toEqual(
+        [
+          [ui.id, 'UNKNOWN', true, null],
+          [qi.id, 'BLOCKED', true, null],
+        ].sort(),
+      );
       await expect(retryItem(h.db, target, ui.id)).rejects.toMatchObject({ kind: 'conflict', code: 'outcome_unknown' });
       await expect(retryItem(h.db, target, qi.id)).rejects.toMatchObject({ kind: 'conflict', code: 'not_retryable' });
       expect((await h.db.select().from(schema.distributionItems).where(eq(schema.distributionItems.id, ui.id)))[0]!.status).toBe('UNKNOWN');

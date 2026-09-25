@@ -19,7 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { and, count, eq, sql } from 'drizzle-orm';
+import { and, count, desc, eq, sql } from 'drizzle-orm';
 import {
   AppError,
   isUuid,
@@ -27,6 +27,7 @@ import {
   parseBundle,
   readZip,
   restoredItemStatus,
+  restoredJobState,
   RESTORED_TABLES,
   rowHash,
   sha256Hex,
@@ -41,7 +42,7 @@ import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from '
 import { variantReviewBlockers } from './variants';
 import { recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
 import { snapshotProblems } from './distribution';
-import { assets, captures, contents, distributionItems, ideas, restoreRuns, sources } from './schema';
+import { assets, captures, contents, distributionItems, ideas, jobs, publications, restoreRuns, sources } from './schema';
 
 export type RestoreMode = 'empty_only' | 'add_missing';
 export const RESTORE_MODES: readonly RestoreMode[] = ['empty_only', 'add_missing'];
@@ -115,6 +116,8 @@ export interface ApplyReport {
   blockedItems: string[];
   /** FIX-T10(P0): 묶음에서 전송 중·결과 불명이던 항목 — UNKNOWN 그대로(또는 UNKNOWN 으로) 넣는다. BLOCKED·FAILED 로 덮어쓰지 않는다. */
   unknownItems: string[];
+  /** FIX-T11(P1): 묶음에서 CONFIRMED 였지만 복원된 원격 결과(publications)가 없는 항목 — 근거 없이 CONFIRMED 로 두지 않고 UNKNOWN(+표시). */
+  unverifiedConfirmedItems: string[];
   /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
   revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
 }
@@ -187,6 +190,13 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'brand_profile_id', table: 'brand_profiles' },
   ],
   approvals: [{ col: 'distribution_item_id', table: 'distribution_items', owned: true }],
+  // FIX-T11: 작업·전송 의도·원격 결과는 읽기 전용 이력 — 그 항목·작업이 이번에 들어갔을 때만(기존 항목에 이력을 덧붙이지 않는다).
+  jobs: [{ col: 'item_id', table: 'distribution_items', owned: true }],
+  send_intents: [{ col: 'job_id', table: 'jobs', owned: true }],
+  publications: [
+    { col: 'item_id', table: 'distribution_items', owned: true },
+    { col: 'job_id', table: 'jobs', owned: true },
+  ],
 };
 
 type Avail = 'inserted' | 'same' | 'different';
@@ -271,6 +281,14 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       const restoredStatus = name === 'distribution_items' ? restoredItemStatus(String(row.status)) : null;
       if (restoredStatus) {
         overrides.status = restoredStatus;
+        overrides.restored_needs_review = true;
+      }
+      // FIX-T11(P1): 작업은 읽기 전용 이력 — 끝난 상태·BLOCKED·UNKNOWN 으로만, lease 없이, 복원 표시(자동 lease·재시도 없음).
+      if (name === 'jobs') {
+        overrides.state = restoredJobState(String(row.state));
+        overrides.lease_owner = null;
+        overrides.lease_until = null;
+        overrides.heartbeat_at = null;
         overrides.restored_needs_review = true;
       }
       if (await insertBundleRow(tx, name, row, ownerId, overrides)) {
@@ -365,6 +383,25 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     );
     interruptedTranscriptions.push(j.id);
   }
+  // FIX-T11(P1): 묶음에서 CONFIRMED 인데 원격 결과(publications)가 함께 들어오지 않은 항목은 근거가 없으므로 UNKNOWN(+restored_needs_review)으로,
+  // 그 항목의 CONFIRMED 작업(가장 최근 것)도 UNKNOWN 으로 — 사용자 재확인(조회만)으로 다시 확인한다. 원격 결과가 있는 항목은 CONFIRMED 그대로.
+  const unverifiedConfirmedItems: string[] = [];
+  for (const i of bundle.tables.distribution_items) {
+    if (avail.distribution_items!.get(i.id) !== 'inserted' || i.status !== 'CONFIRMED') continue;
+    const pubs = await tx.select({ id: publications.id }).from(publications).where(and(eq(publications.itemId, i.id), eq(publications.ownerId, ownerId))).limit(1);
+    if (pubs.length) continue;
+    await tx.execute(
+      sql`update distribution_items set status = 'UNKNOWN', restored_needs_review = true where id = ${i.id}::uuid and owner_id = ${ownerId}::uuid`,
+    );
+    const lastJob = await tx
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(eq(jobs.itemId, i.id), eq(jobs.ownerId, ownerId), eq(jobs.state, 'CONFIRMED')))
+      .orderBy(desc(jobs.createdAt), desc(jobs.id))
+      .limit(1);
+    if (lastJob[0]) await tx.execute(sql`update jobs set state = 'UNKNOWN', done_at = null where id = ${lastJob[0].id}::uuid and owner_id = ${ownerId}::uuid`);
+    unverifiedConfirmedItems.push(i.id);
+  }
   // T10(D17): 이번에 넣은 활성 승인을 복원된 행으로 다시 검사한다(파생본 현재 버전·원고 현재 버전·첨부·계정·재계산 hash·예약 시각).
   // 맞지 않으면 'restore_stale' 로 철회해 둔다(승인 행·hash 는 그대로 보존). 그 뒤 활성 승인이 없는 approved 파생본은 review 로,
   // 이번에 넣은 계획의 상태는 항목·승인으로 다시 계산한다.
@@ -397,7 +434,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   for (const p of bundle.tables.distribution_plans) {
     if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
   }
-  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, unknownItems, revokedApprovals };
+  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, unknownItems, unverifiedConfirmedItems, revokedApprovals };
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
@@ -443,6 +480,8 @@ export interface RestorePreview {
   blocked_items: string[];
   /** FIX-T10: 복원하면 UNKNOWN 으로 들어갈(결과 불명 보존) 배포 항목 */
   unknown_items: string[];
+  /** FIX-T11: CONFIRMED 였지만 원격 결과 근거가 없어 UNKNOWN 으로 들어갈 항목 */
+  unverified_confirmed_items: string[];
   /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
   revoked_approvals: ApplyReport['revokedApprovals'];
 }
@@ -504,6 +543,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     interrupted_transcriptions: r.interruptedTranscriptions,
     blocked_items: r.blockedItems,
     unknown_items: r.unknownItems,
+    unverified_confirmed_items: r.unverifiedConfirmedItems,
     revoked_approvals: r.revokedApprovals,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
@@ -639,6 +679,8 @@ export interface CommitResult {
   blocked_items: string[];
   /** FIX-T10 */
   unknown_items: string[];
+  /** FIX-T11 */
+  unverified_confirmed_items: string[];
   revoked_approvals: ApplyReport['revokedApprovals'];
 }
 
@@ -743,6 +785,7 @@ export async function commitRestore(
         interrupted_transcriptions: report.interruptedTranscriptions,
         blocked_items: report.blockedItems,
         unknown_items: report.unknownItems,
+        unverified_confirmed_items: report.unverifiedConfirmedItems,
         revoked_approvals: report.revokedApprovals,
         assets_written: written,
         assets_verified: verified,

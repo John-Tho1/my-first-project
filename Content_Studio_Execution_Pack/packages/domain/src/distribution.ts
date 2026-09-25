@@ -49,6 +49,17 @@ export const IN_FLIGHT_ITEM_STATUSES: readonly ItemStatus[] = ['QUEUED', 'SENDIN
  */
 export const RESTORE_AS_UNKNOWN_ITEM_STATUSES: readonly ItemStatus[] = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED'];
 
+/**
+ * FIX-T11(P1): 복원할 작업 상태 — 읽기 전용 이력. 끝난 상태(CONFIRMED·FAILED·CANCELED)와 보류(BLOCKED)는 그대로(레거시 DONE → CONFIRMED),
+ * 보내기 전 대기(QUEUED·LEASED·RETRY_WAIT) → BLOCKED, 전송 중·조회 중·결과 불명 → UNKNOWN. 어느 쪽도 worker 가 lease 하지 않는다.
+ */
+export function restoredJobState(state: string): 'CONFIRMED' | 'FAILED' | 'CANCELED' | 'BLOCKED' | 'UNKNOWN' {
+  if (state === 'DONE' || state === 'CONFIRMED') return 'CONFIRMED';
+  if (state === 'FAILED' || state === 'CANCELED' || state === 'BLOCKED') return state;
+  if (state === 'QUEUED' || state === 'LEASED' || state === 'RETRY_WAIT') return 'BLOCKED';
+  return 'UNKNOWN';
+}
+
 /** 복원할 항목 상태: 진행 중이 아니면 null(그대로), 결과를 정할 수 없으면 UNKNOWN, 보내기 전 대기면 BLOCKED. */
 export function restoredItemStatus(status: string): 'UNKNOWN' | 'BLOCKED' | null {
   if (!(IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(status)) return null;

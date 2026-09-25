@@ -28,6 +28,7 @@ import {
   DEFAULT_LEASE_TTL_MS,
   isUuid,
   LEASE_HELD_STATES,
+  LeaseLostError,
   NotCancellableError,
   NotFoundError,
   NothingToReconcileError,
@@ -265,17 +266,27 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
       const intent = job.attempt > 0 ? await intentFor(tx, e.ownerId, job.id, job.attempt) : null;
       const base = { worker: job.leaseOwner, attempt: job.attempt };
       switch (job.state) {
-        case 'LEASED':
+        case 'LEASED': {
           // 보내기 전에 되풀이해 죽는 작업(처리 오류 등)이 끝없이 다시 lease 되지 않게 시도 한도에서 멈춘다.
-          if (job.attempt >= job.maxAttempts) {
+          // FIX-T11(P1): 시작 전 만료는 시도가 아니다 — attempt 를 lease 전 값으로 되돌리고, 끝없는 재lease 는 만료 횟수(이벤트)로 막는다.
+          const expiries = await tx
+            .select({ n: sql<number>`count(*)::int` })
+            .from(jobEvents)
+            .where(and(eq(jobEvents.jobId, job.id), sql`${jobEvents.sanitizedDetails}->>'transition' = 'lease_expired_before_intent'`));
+          if (job.attempt >= job.maxAttempts || (expiries[0]?.n ?? 0) + 1 >= job.maxAttempts) {
             await settle(tx, e.ownerId, job, item, 'permanent_failure', { ...base, reason: 'lease_expired_max_attempts', not_sent: true }, now, {
               ...CLEAR_LEASE,
               lastErrorCode: 'lease_expired_max_attempts',
             });
             return true;
           }
-          await settle(tx, e.ownerId, job, item, 'lease_expired_before_intent', base, now, { ...CLEAR_LEASE, nextRunAt: now });
+          await settle(tx, e.ownerId, job, item, 'lease_expired_before_intent', { ...base, attempt_restored: job.attempt - 1 }, now, {
+            ...CLEAR_LEASE,
+            nextRunAt: now,
+            attempt: Math.max(job.attempt - 1, 0),
+          });
           return true;
+        }
         case 'SENDING':
           await settle(tx, e.ownerId, job, item, 'lease_expired_after_intent', { ...base, intent: intent ? 'present' : 'missing' }, now, {
             ...CLEAR_LEASE,
@@ -310,7 +321,7 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
  */
 export async function leaseJobs(
   db: Db,
-  opts: { workerId: string; now: Date; limit: number; leaseTtlMs?: number; ownerId?: string },
+  opts: { workerId: string; now: Date; limit: number; leaseTtlMs?: number; ownerId?: string; excludeIds?: readonly string[] },
 ): Promise<JobRow[]> {
   const { workerId, now } = opts;
   const limit = Math.min(Math.max(Math.floor(opts.limit), 1), 20);
@@ -322,6 +333,7 @@ export async function leaseJobs(
       .where(
         and(
           opts.ownerId ? eq(jobs.ownerId, opts.ownerId) : undefined,
+          opts.excludeIds?.length ? sql`${jobs.id} <> all(${sql.param([...opts.excludeIds])}::uuid[])` : undefined,
           lte(jobs.nextRunAt, now),
           or(
             and(inArray(jobs.state, [...SEND_LEASE_STATES]), isNull(jobs.leaseOwner)),
@@ -379,6 +391,7 @@ function makeContext(
   opts: JobRunOptions,
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
+  onLeaseLost?: () => void,
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
   return {
@@ -389,7 +402,11 @@ function makeContext(
     now: clock(),
     signal,
     heartbeat: async () => {
-      await heartbeatJob(db, job.id, opts.workerId, clock(), opts.leaseTtlMs);
+      // FIX-T11(P0): lease 를 잃었으면(만료 복구·다른 worker) 호출자에게 알리고 중단한다 — 어댑터가 부작용을 만들지 않게.
+      if (!(await heartbeatJob(db, job.id, opts.workerId, clock(), opts.leaseTtlMs))) {
+        onLeaseLost?.();
+        throw new LeaseLostError();
+      }
     },
     mockScenario,
   };
@@ -432,6 +449,8 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     const active = await activeApprovalsFor(tx, ownerId, [item.id]);
     const job = await jobForUpdate(tx, ownerId, leased.id);
     if (!job || job.leaseOwner !== opts.workerId || job.attempt !== leased.attempt) return 'lease_lost' as const;
+    // FIX-T11(P1): lease 가 이미 만료됐으면(시작 전에 오래 기다림) 아무것도 쓰지 않는다 — 만료 복구가 attempt 를 되돌리고 다시 대기시킨다.
+    if (!job.leaseUntil || job.leaseUntil.getTime() <= now.getTime()) return 'lease_lost' as const;
     // 취소 요청(lease 뒤, 보내기 전) → 보내지 않고 CANCELED.
     if (job.state === 'CANCEL_REQUESTED' || job.cancelRequestedAt) {
       if (job.state !== 'LEASED' && job.state !== 'CANCEL_REQUESTED') return 'lease_lost' as const;
@@ -529,6 +548,21 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
     await fillIntent(tx, ownerId, intent, cls.intentOutcome, result, now, 'submit');
     // lease 를 잃었으면(만료 복구가 RECONCILING 으로 옮김) 결과만 의도에 남기고, 전이는 조회 경로가 원격 사실로 정한다.
     if (!job || job.leaseOwner !== opts.workerId || job.attempt !== plan.job.attempt || (job.state !== 'SENDING' && job.state !== 'CANCEL_REQUESTED')) {
+      // FIX-T11(P0): 늦게 온 결과가 부작용이 있을 수 있는데(accepted·processing·ambiguous·쓰기 뒤 5xx) 작업이 이미 새 시도를 기다리면
+      // (QUEUED·LEASED·RETRY_WAIT — 다른 경로가 "보내지 않음"으로 판단) 새 의도로 가지 않고 조회(RECONCILING)로 돌린다.
+      const sideEffectPossible = result.status !== 'rejected' || cls.retryClass === 'transient_unknown_side_effect';
+      if (job && sideEffectPossible && (job.state === 'QUEUED' || job.state === 'LEASED' || job.state === 'RETRY_WAIT')) {
+        await settle(
+          tx,
+          ownerId,
+          job,
+          item,
+          'late_result',
+          { late_attempt: plan.job.attempt, status: result.status, error_code: result.error_code ?? null, external_id: result.external_id ?? null },
+          now,
+          { ...CLEAR_LEASE, nextRunAt: now, reconcileCount: 0 },
+        );
+      }
       return 'lease_lost' as const;
     }
     const cancel = job.state === 'CANCEL_REQUESTED';
@@ -576,8 +610,11 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
   if (typeof begun === 'string') return begun;
   // 2단계: DB 잠금 없이 외부(모의) 호출. 시간 초과·예외 = 결과 불명(보냈을 수도 있음).
   const timeoutMs = opts.submitTimeoutMs ?? 30_000;
-  const r = await withTimeout(timeoutMs, async (signal) => {
-    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario);
+  const r = await withTimeout(timeoutMs, async (timeoutSignal) => {
+    // FIX-T11(P0): 시간 초과 또는 lease 상실(heartbeat 실패) 중 먼저 온 것으로 중단한다.
+    const lease = new AbortController();
+    const signal = AbortSignal.any([timeoutSignal, lease.signal]);
+    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort());
     let prepared;
     try {
       prepared = await begun.adapter.prepare(begun.snapshot, ctx);
@@ -585,6 +622,8 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
       // prepare 는 원격에 아무것도 보내지 않는다 — 부작용 없는 영구 오류(자동 반복 없음).
       return { status: 'rejected', retry_class: 'permanent', error_code: 'prepare_failed' } satisfies AdapterResult;
     }
+    // prepare 가 시간 초과·중단 뒤에 끝났으면 submit 하지 않는다(결과는 불명으로 기록 — 이번 시도 의도는 이미 있다).
+    if (signal.aborted) throw new LeaseLostError();
     return begun.adapter.submit(prepared, ctx);
   });
   const result: AdapterResult = r.ok
@@ -732,13 +771,19 @@ export interface JobsTickResult {
 export async function runJobsTick(db: Db, registry: ChannelAdapterRegistry, opts: JobRunOptions & { maxJobs?: number }): Promise<JobsTickResult> {
   const clock = opts.clock ?? (() => new Date());
   const recovered = await recoverExpiredLeases(db, { now: clock(), ownerId: opts.ownerId });
-  const leased = await leaseJobs(db, { workerId: opts.workerId, now: clock(), limit: opts.maxJobs ?? 5, leaseTtlMs: opts.leaseTtlMs, ownerId: opts.ownerId });
   const results: Record<string, number> = {};
-  for (const j of leased) {
+  // FIX-T11(P1): 지금 처리할 작업 하나만 lease 한다(한꺼번에 lease 하면 뒤 작업의 lease 가 처리 전에 만료돼 시도를 잃는다).
+  // 이번 tick 에서 이미 처리한 작업은 다시 고르지 않는다(tick 당 최대 maxJobs 개 — 이전 일괄 lease 와 같은 범위).
+  const max = Math.min(Math.max(Math.floor(opts.maxJobs ?? 5), 1), 20);
+  const done: string[] = [];
+  for (let i = 0; i < max; i++) {
+    const [j] = await leaseJobs(db, { workerId: opts.workerId, now: clock(), limit: 1, leaseTtlMs: opts.leaseTtlMs, ownerId: opts.ownerId, excludeIds: done });
+    if (!j) break;
+    done.push(j.id);
     const r = await processJob(db, registry, j, opts);
     results[r.state] = (results[r.state] ?? 0) + 1;
   }
-  return { worker_id: opts.workerId, recovered, leased: leased.length, results };
+  return { worker_id: opts.workerId, recovered, leased: done.length, results };
 }
 
 // ---- 사용자 동작: 취소·재확인 ----
@@ -876,6 +921,14 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
   if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
   return db.transaction(async (tx) => {
     const item = await lockItem(tx, ownerId, itemId);
+    // FIX-T11: 복원한 작업(읽기 전용 이력)은 다시 보내지 않는다 — 항목 표시가 없어도(복원 전부터 BLOCKED 였던 항목) 작업 표시로 거부.
+    const restoredJob = await latestJobForItem(tx, ownerId, item.id, false);
+    if (restoredJob?.restoredNeedsReview && !item.restoredNeedsReview) {
+      throw new NotRetryableError('not_retryable', '복원한 작업은 다시 보내지 않습니다(원격 결과를 이 환경에서 다시 확인하세요). 새 배포 계획을 만드세요.', {
+        status: item.status,
+        restored: true,
+      });
+    }
     // FIX-T10(P0): 복원 때 진행 중이던 항목(restored_needs_review)은 원격 결과를 모르므로 재시도(재전송)하지 않는다 — 결과 불명이면 outcome_unknown.
     if (item.restoredNeedsReview) {
       throw item.status === 'UNKNOWN'

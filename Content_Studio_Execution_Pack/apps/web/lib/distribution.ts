@@ -253,12 +253,70 @@ export function mskHourMinute(d: Date): string {
 /** 승인 문제로 보류된 이유(항목은 PLANNED 로 돌아가 있다 — 다시 승인 후 실행). */
 export const APPROVAL_BLOCK_REASONS = new Set(['approval_missing', 'approval_revoked', 'approval_invalidated', 'snapshot_stale']);
 
+export interface BlockEventLike {
+  stateAfter: string;
+  sanitizedDetails: unknown;
+}
+
+/** 보류 이유: code = 판단에 쓰는 표준 코드, detail = 상세 사유(예: 'invalidated:assets_changed' — 화면에 따로 보인다). */
+export interface BlockInfo {
+  code: string | null;
+  detail: string | null;
+}
+
+/**
+ * FIX-T12(P2, Codex review-T12 lib/distribution.ts:269): 최근 BLOCKED 이벤트(최신 먼저)와 작업의 lastErrorCode 에서 보류 이유를 정한다.
+ * 승인 철회·무효 여부는 **구조화된 코드**(이벤트 event·lastErrorCode·reason 중 APPROVAL_BLOCK_REASONS 에 있는 것)로 먼저 판단하고,
+ * 'invalidated:<이유>'·사용자 철회 사유 같은 상세 reason 은 detail 로 따로 돌려준다(상세 사유가 표준 코드를 가리지 않게).
+ */
+export function blockInfoOf(events: readonly BlockEventLike[], job: { lastErrorCode: string | null } | null): BlockInfo {
+  const ev = events.find((e) => e.stateAfter === 'BLOCKED');
+  const d = (ev?.sanitizedDetails ?? {}) as { reason?: unknown; event?: unknown };
+  const evCode = typeof d.event === 'string' && d.event ? d.event : null;
+  const reason = typeof d.reason === 'string' && d.reason ? d.reason : null;
+  const last = job?.lastErrorCode ?? null;
+  const approvalCode = [evCode, last, reason].find((c): c is string => c !== null && APPROVAL_BLOCK_REASONS.has(c)) ?? null;
+  const code = approvalCode ?? reason ?? last ?? evCode;
+  return { code, detail: reason && reason !== code ? reason : null };
+}
+
+/** 상세 보류 사유 문구('invalidated:assets_changed' → '첨부 파일이 바뀜', 'user: …' → 사용자 사유). */
+export function blockDetailLabel(detail: string | null): string | null {
+  if (!detail) return null;
+  if (detail.startsWith('invalidated:')) return problemLabel(detail.slice('invalidated:'.length));
+  if (detail === 'user') return '사용자 철회';
+  if (detail.startsWith('user:')) return `사용자 철회: ${detail.slice('user:'.length).trim()}`;
+  return problemLabel(detail);
+}
+
+/**
+ * FIX-T11(P2, Codex review-T11 page.tsx:267): 승인 철회 뒤 안내 — 철회 사실과 **저장된 작업 결과**를 구분한다(추측하지 않는다).
+ * blocked = 철회로 BLOCKED 가 된 작업 수(대기·재시도 대기 → 다음 전송 차단), cancelRequested = 이미 전송 단계라 CANCEL_REQUESTED 로 기록된 수.
+ * 수가 없으면(이전 링크) 작업 결과를 말하지 않는다.
+ */
+export function revocationNotice(blocked: number | null, cancelRequested: number | null): string {
+  const parts = ['승인을 철회했습니다(MOCK).'];
+  if (blocked === null && cancelRequested === null) return parts[0]!;
+  if (blocked) parts.push(`대기·재시도 대기 중이던 작업 ${blocked}개는 보류(BLOCKED) — 다음 전송이 차단되었습니다.`);
+  if (cancelRequested) {
+    parts.push(`이미 전송 단계에 들어간 작업 ${cancelRequested}개는 취소 확인 중입니다 — 원격 결과를 확인한 뒤 취소됨 또는 "취소 불가(이미 전송됨)"으로 표시됩니다.`);
+  }
+  if (!blocked && !cancelRequested) parts.push('대기 중이던 작업은 없었습니다.');
+  return parts.join(' ');
+}
+
 export interface ItemHeadlineInput {
   status: string;
   channel: string;
   job: (JobLike & { lastRetryClass?: string | null }) | null;
   pub: PubLike | null;
   blockReason: string | null;
+  /** FIX-T12: 상세 보류 사유(표준 코드와 별도) */
+  blockDetail?: string | null;
+  /** FIX-T12: 활성 승인이 있는지(없으면서 작업이 BLOCKED 인 PLANNED 항목 = 승인 문제) */
+  activeApproval?: boolean;
+  /** FIX-T12: 스냅샷이 지금 행과 달라 이 계획을 다시 승인할 수 없음(snapshotProblems 있음) */
+  needsNewPlan?: boolean;
 }
 
 /**
@@ -269,9 +327,14 @@ export function itemHeadline(x: ItemHeadlineInput): string {
   const job = x.job;
   const reason = x.blockReason ?? job?.lastErrorCode ?? '';
   switch (x.status) {
-    case 'PLANNED':
-      if (job && job.state === 'BLOCKED' && APPROVAL_BLOCK_REASONS.has(reason)) return '승인 없음 — 다시 승인 후 실행';
-      return '계획됨(실행 전)';
+    case 'PLANNED': {
+      // 작업이 BLOCKED 로 남은 PLANNED 항목은 승인 문제다(표준 코드가 승인 코드이거나, 활성 승인이 없음 — 예: 401 보류 뒤 편집으로 승인 무효).
+      const approvalProblem = job?.state === 'BLOCKED' && (APPROVAL_BLOCK_REASONS.has(reason) || x.activeApproval === false);
+      if (!approvalProblem) return '계획됨(실행 전)';
+      const detail = blockDetailLabel(x.blockDetail ?? null);
+      if (x.needsNewPlan) return `승인 무효${detail ? ` (${detail})` : ''} — 내용이 바뀌어 이 계획은 다시 승인할 수 없습니다. 새 계획 만들기`;
+      return `승인 없음${detail ? ` (${detail})` : ''} — 다시 승인 후 실행`;
+    }
     case 'QUEUED':
       return '대기 중(QUEUED)';
     case 'SENDING':

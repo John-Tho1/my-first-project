@@ -238,3 +238,23 @@ describe('레지스트리', () => {
     expect(createMockAdapterRegistry()).not.toBe(r1);
   });
 });
+
+describe('FIX-T11(P0) 진행 중 전송', () => {
+  it('submit 이 진행 중인 key 는 조회가 not_found 가 아니라 unknown(mock_in_flight), 끝난 뒤(부작용 없음)에만 not_found', async () => {
+    const a = new MockChannelAdapter({ readEnv: false, scenario: 'ambiguous_not_sent', delayMs: 50 });
+    const c = ctx();
+    const p = submit(a, c);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await a.reconcile({ platform: 'threads', intent_key: c.intentKey, external_id: null, provider_request_id: null }, c)).toEqual({ status: 'unknown', error_code: 'mock_in_flight' });
+    await p;
+    expect((await a.reconcile({ platform: 'threads', intent_key: c.intentKey, external_id: null, provider_request_id: null }, c)).status).toBe('not_found');
+  });
+  it('heartbeat 가 lease 상실로 던지거나 신호가 중단되면 원격에 쓰지 않는다', async () => {
+    const a = new MockChannelAdapter({ readEnv: false, scenario: 'success' });
+    await expect(submit(a, ctx({ heartbeat: async () => { throw new Error('lease lost'); } }))).rejects.toThrow('lease lost');
+    const ac = new AbortController();
+    const c = ctx({ signal: ac.signal, heartbeat: async () => { ac.abort(); } });
+    await expect(submit(a, c)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(a.remoteEntries()).toHaveLength(0);
+  });
+});

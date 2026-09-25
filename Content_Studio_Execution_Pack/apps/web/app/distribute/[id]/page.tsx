@@ -5,6 +5,7 @@ import { getPlanDetail, type PlanItemDetail } from '@cs/db';
 import { CHANNEL_LABEL, formatMsk, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
+  blockInfoOf,
   DISTRIBUTE_ERROR_TEXT,
   ITEM_STATUS_LABEL,
   itemHeadline,
@@ -13,6 +14,7 @@ import {
   PLAN_STATUS_LABEL,
   problemLabel,
   RESULT_KIND_LABEL,
+  revocationNotice,
   VISIBILITY_LABEL,
 } from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -20,6 +22,11 @@ import { getAppDb, getConfig } from '../../../lib/server';
 export const dynamic = 'force-dynamic';
 
 const str = (v: string | string[] | undefined) => (typeof v === 'string' && v.trim() !== '' ? v : undefined);
+/** 철회 결과 수(0 이상 정수) — 없거나 잘못된 값이면 null(작업 결과를 말하지 않는다). */
+const countParam = (v: string | string[] | undefined): number | null => {
+  const s = str(v);
+  return s !== undefined && /^d{1,3}$/.test(s) ? Number(s) : null;
+};
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const s = (v: unknown) => (typeof v === 'string' ? v : '');
 
@@ -74,11 +81,9 @@ function OutgoingText({ channel, text }: { channel: string; text: CanonicalPaylo
 
 const FINISHED = ['CONFIRMED', 'CANCELED', 'FAILED'];
 
-function blockReasonOf(x: PlanItemDetail): string | null {
-  const blockEvent = x.events.find((e) => e.stateAfter === 'BLOCKED');
-  if (!blockEvent) return null;
-  const d = blockEvent.sanitizedDetails as { reason?: unknown; event?: unknown };
-  return String(d.reason ?? d.event ?? '') || null;
+/** FIX-T12(P2): 표준 코드(승인 철회·무효 판단)와 상세 사유를 나눠 쓴다 — lib blockInfoOf. */
+function blockInfoOfItem(x: PlanItemDetail) {
+  return blockInfoOf(x.events, x.jobs.at(-1) ?? null);
 }
 
 /** T12: 개발용 모의 시나리오 선택(모의 계정·끝나지 않은 항목만). 승인 스냅샷 밖 — hash·승인 상태가 바뀌지 않는다. */
@@ -113,7 +118,17 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const scheduled = x.item.scheduledAtUtc;
   const latest = x.jobs.at(-1) ?? null;
   const latestPub = latest ? (x.publications.find((q) => q.jobId === latest.id) ?? x.publications.at(-1) ?? null) : (x.publications.at(-1) ?? null);
-  const headline = itemHeadline({ status: x.item.status, channel, job: latest, pub: latestPub, blockReason: blockReasonOf(x) });
+  const block = blockInfoOfItem(x);
+  const headline = itemHeadline({
+    status: x.item.status,
+    channel,
+    job: latest,
+    pub: latestPub,
+    blockReason: block.code,
+    blockDetail: block.detail,
+    activeApproval: x.activeApproval !== null,
+    needsNewPlan: x.problems.length > 0,
+  });
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
@@ -194,7 +209,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
-              const reason = blockReasonOf(x);
+              const reason = block.code;
               return (
                 <li key={j.id} className="hash">
                   <strong>{jobStatusText(j, pub, reason)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
@@ -322,7 +337,7 @@ export default async function PlanPage({
       ) : null}
       {q.revoked === '1' ? (
         <p className="saved" role="status">
-          승인을 철회했습니다(MOCK). 대기 중이던 작업은 보류(BLOCKED)되었습니다.
+          {revocationNotice(countParam(q.revoked_blocked), countParam(q.revoked_cancel))}
         </p>
       ) : null}
       {str(q.ticked) !== undefined ? (

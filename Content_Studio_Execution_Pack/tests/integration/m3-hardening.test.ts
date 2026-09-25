@@ -243,15 +243,29 @@ describe('B — 보류 항목 재시도(retry) 규칙', () => {
     await revokeApproval(db, o.id, au.approvalId, undefined);
     expect((await (await post(au.itemId)).json()).error).toBe('approval_required');
 
-    // auth 보류 + 파생본 새 버전(보류 항목은 편집 훅이 철회하지 않는다) → 재시도 때 스냅샷 재검사로 거부, 아무것도 바꾸지 않음
+    // FIX-T12(P0, D19(d) 뒤집음): auth 보류 + 파생본 새 버전 → 편집 훅이 보류 항목의 승인도 철회(invalidated:body_changed), 항목 PLANNED,
+    // 작업은 BLOCKED 그대로(확정되지 않은 전송을 실행 가능 상태로 되돌리지 않음) → 재시도 409 approval_required
     const st = await executed(o, 'blog');
     await setMockScenario(db, o.id, st.itemId, { scenario: 'auth' });
     await tick(o, 7300);
     await appendVariantVersion(db, o.id, st.variantId, { baseVersion: 1, body: '바뀐 블로그', metadata: { title: '바뀐', markdown: '바뀐 블로그' } });
+    expect((await approvalRow(st.approvalId)).revokeReason).toBe('invalidated:body_changed');
+    expect((await itemRow(st.itemId)).status).toBe('PLANNED');
     const r3 = await post(st.itemId);
     expect(r3.status).toBe(409);
-    expect((await r3.json()).error).toBe('snapshot_stale');
+    expect((await r3.json()).error).toBe('approval_required');
     expect((await jobRow(st.jobId)).state).toBe('BLOCKED');
+    // 훅을 거치지 않은 변경(계정 상태를 직접 UPDATE)은 여전히 재시도 때 스냅샷 재검사가 막는다(아무것도 바꾸지 않음)
+    const sk = await executed(o);
+    await setMockScenario(db, o.id, sk.itemId, { scenario: 'auth' });
+    await tick(o, 7350);
+    expect((await itemRow(sk.itemId)).status).toBe('BLOCKED');
+    await db.update(schema.channelAccounts).set({ state: 'disconnected' }).where(eq(schema.channelAccounts.id, o.accounts.threads));
+    const r4 = await post(sk.itemId);
+    expect(r4.status).toBe(409);
+    expect((await r4.json()).error).toBe('snapshot_stale');
+    expect((await jobRow(sk.jobId)).state).toBe('BLOCKED');
+    await db.update(schema.channelAccounts).set({ state: 'mock_ready' }).where(eq(schema.channelAccounts.id, o.accounts.threads));
 
     // 시도 한도
     const ex = await executed(o);
@@ -348,7 +362,7 @@ describe('C2 — 첨부 교체·변조', () => {
 });
 
 describe('C3 — 복원은 승인·결과·의도·시나리오를 믿고 들여오지 않는다', () => {
-  it('항목 스냅샷 없는 승인·hash 다른 승인 묶음은 전체 거부, add_missing 은 publications·send_intents·mock_scenarios 를 복원하지 않는다', async () => {
+  it('항목 스냅샷 없는 승인·hash 다른 승인 묶음은 전체 거부, add_missing 은 결과·의도·작업을 읽기 전용 이력으로(FIX-T11), mock_scenarios 는 복원하지 않는다', async () => {
     const o = await newOwner();
     const x = await executed(o);
     await setMockScenario(db, o.id, x.itemId, { scenario: 'success' });
@@ -387,15 +401,23 @@ describe('C3 — 복원은 승인·결과·의도·시나리오를 믿고 들여
       const target = (await ensureOwner(h.db, 'restore-t12@example.local')).id;
       const restoresDir = path.join(tmp, 'restores');
       const p = await createRestorePreview(h.db, target, rebuild(structuredClone(parsed.tables) as BundleTables), { restoresDir, source: 'upload' });
-      for (const t of ['publications', 'send_intents', 'mock_scenarios', 'jobs'] as const) expect(p.preview.tables[t], t).toMatchObject({ restored: false });
+      expect(p.preview.tables.mock_scenarios).toMatchObject({ restored: false });
+      for (const t of ['publications', 'send_intents', 'jobs'] as const) expect(p.preview.tables[t], t).toMatchObject({ restored: true });
       const r = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-r')), target, p.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
       expect(r.restored.approvals).toBe(1);
-      for (const t of [schema.publications, schema.sendIntents, schema.mockScenarios, schema.jobs] as const) {
-        expect((await h.db.select({ n: count() }).from(t))[0]!.n).toBe(0);
-      }
-      // 복원된 CONFIRMED 항목은 결과 행 없이 CONFIRMED(원격은 복원 환경에서 다시 확인할 사실)
+      expect((await h.db.select({ n: count() }).from(schema.mockScenarios))[0]!.n).toBe(0);
+      // FIX-T11: 결과 근거(MOCK 표식 그대로)·전송 의도(재확인용 원격 참조)·작업(끝난 상태, 복원 표시)이 들어온다 — 자동 재개 없음
+      const pubs = await h.db.select().from(schema.publications).where(eq(schema.publications.itemId, x.itemId));
+      expect(pubs).toHaveLength(1);
+      expect(pubs[0]).toMatchObject({ isMock: true, verification: 'MOCK' });
+      expect(pubs[0]!.externalId.startsWith('mock:')).toBe(true);
+      expect(await h.db.select().from(schema.sendIntents).where(eq(schema.sendIntents.jobId, x.jobId))).toHaveLength(1);
+      const [rj] = await h.db.select().from(schema.jobs).where(eq(schema.jobs.id, x.jobId));
+      expect(rj).toMatchObject({ state: 'CONFIRMED', restoredNeedsReview: true, leaseOwner: null });
+      // 원격 결과가 있는 CONFIRMED 항목은 CONFIRMED 그대로
       const [it] = await h.db.select().from(schema.distributionItems).where(and(eq(schema.distributionItems.ownerId, target), eq(schema.distributionItems.id, x.itemId)));
       expect(it!.status).toBe('CONFIRMED');
+      expect(r.unverified_confirmed_items).toEqual([]);
     } finally {
       await h.close();
     }

@@ -1169,6 +1169,8 @@ export const jobs = pgTable(
     reconcileCount: integer('reconcile_count').notNull().default(0),
     cancelRequestedAt: ts('cancel_requested_at'),
     doneAt: ts('done_at'),
+    /** FIX-T11(0020): 묶음에서 복원한 작업(읽기 전용 이력 — 자동 lease·재시도 없음, 사용자 재확인만). */
+    restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
   },
   (t) => [
     unique('jobs_idempotency_key_uq').on(t.idempotencyKey),

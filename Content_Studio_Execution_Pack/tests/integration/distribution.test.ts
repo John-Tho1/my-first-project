@@ -483,7 +483,7 @@ describe('DB 불변 트리거', () => {
 });
 
 describe('export → 빈 DB 복원', () => {
-  it('계정·계획·항목·승인은 hash 그대로 복원, 작업은 복원 안 함(진행 중 항목은 BLOCKED), 파생본이 바뀐 활성 승인은 restore_stale', async () => {
+  it('계정·계획·항목·승인은 hash 그대로 복원, 작업은 읽기 전용 이력(FIX-T11 — 진행 중 항목·작업은 BLOCKED+표시, 이벤트·실행 명령은 복원 안 함), 파생본이 바뀐 활성 승인은 restore_stale', async () => {
     // (1) 실행까지 간 계획(작업 있음) (2) 승인 뒤 파생본이 바뀐 계획 — 묶음에서 그 승인을 "활성"으로 조작해 복원 사후 검사를 확인
     const queued = await approvedPlan('threads');
     expect((await executeApi(queued.planId, { command_key: `exp-${randomUUID()}` })).status).toBe(200);
@@ -518,12 +518,22 @@ describe('export → 빈 DB 복원', () => {
       const restoresDir = path.join(tmp, 'dist-restores');
       const p = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
       expect(p.preview.conflicts_total).toBe(0);
-      expect(p.preview.tables.jobs).toMatchObject({ restored: false });
+      expect(p.preview.tables.jobs).toMatchObject({ restored: true });
+      expect(p.preview.tables.job_events).toMatchObject({ restored: false });
+      expect(p.preview.tables.execute_commands).toMatchObject({ restored: false });
       const r = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-r')), target, p.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
       expect(r.conflicts_total).toBe(0);
       for (const t of ['channel_accounts', 'distribution_plans', 'distribution_items', 'approvals'] as const) expect(r.restored[t], t).toBe(tables[t].length);
-      expect(r.restored.jobs).toBeUndefined();
-      expect((await h.db.select({ n: count() }).from(schema.jobs))[0]!.n).toBe(0);
+      // FIX-T11: 작업은 읽기 전용 이력 — 들어오되 lease 없음·복원 표시, QUEUED 작업은 BLOCKED(자동 재개 없음)
+      expect(r.restored.jobs).toBe(tables.jobs.length);
+      const rjobs = await h.db.select().from(schema.jobs);
+      expect(rjobs.length).toBe(tables.jobs.length);
+      for (const j of rjobs) {
+        expect(j.restoredNeedsReview).toBe(true);
+        expect(j.leaseOwner).toBeNull();
+        expect(['CONFIRMED', 'FAILED', 'CANCELED', 'BLOCKED', 'UNKNOWN']).toContain(j.state);
+      }
+      expect(rjobs.find((j) => j.itemId === queued.itemId)!.state).toBe('BLOCKED');
       expect((await h.db.select({ n: count() }).from(schema.jobEvents))[0]!.n).toBe(0);
       expect((await h.db.select({ n: count() }).from(schema.executeCommands))[0]!.n).toBe(0);
       // hash·스냅샷 그대로

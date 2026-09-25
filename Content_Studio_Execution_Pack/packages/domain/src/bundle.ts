@@ -109,8 +109,12 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
  * users·audit_events 는 내보내기만. T10(D17): jobs·job_events·execute_commands 도 내보내기만 — 복원 환경에서 작업을 다시 돌리지 않는다
  * (진행 중이던 항목은 BLOCKED 로 들여온다, 맹목 재전송 금지). T11(D18): send_intents·publications 도 내보내기만 — 원격 결과는 복원 환경에서
  * 다시 확인할 사실이지 믿고 이어 갈 기록이 아니다. T12(D19): mock_scenarios(개발용 모의 결과 선택)도 내보내기만.
+ * FIX-T11(P1, Codex review-T11 bundle.ts:110): jobs·send_intents·publications 는 **읽기 전용 이력**으로 복원한다 — 확인된 결과의 근거
+ * (외부 ID·공개 범위·MOCK 표식)와 재확인용 원격 참조(전송 의도 key)를 잃지 않게. 자동 재개는 없다: 작업은 끝난 상태(CONFIRMED·FAILED·CANCELED·
+ * BLOCKED) 또는 UNKNOWN 으로만 들어가고 restored_needs_review 가 켜진다(worker 는 lease 하지 않고, 재시도 API 는 거부, 재확인은 조회만).
+ * job_events·execute_commands·mock_scenarios·users·audit_events 는 계속 내보내기만.
  */
-export const NON_RESTORED_TABLES = ['users', 'audit_events', 'jobs', 'job_events', 'execute_commands', 'send_intents', 'publications', 'mock_scenarios'] as const satisfies readonly ExportedTable[];
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'job_events', 'execute_commands', 'mock_scenarios'] as const satisfies readonly ExportedTable[];
 export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
   (typeof NON_RESTORED_TABLES)[number]
@@ -490,6 +494,8 @@ export const ROW_SCHEMAS = {
     reconcile_count: int.min(0).default(0),
     cancel_requested_at: ts.nullable().default(null),
     done_at: ts.nullable().default(null),
+    // FIX-T11(0020): 복원한 작업 표시. 이전 묶음에는 없으므로 기본 false(복원할 때는 항상 켠다).
+    restored_needs_review: z.boolean().default(false),
   }),
   job_events: z.strictObject({
     id: uuid,

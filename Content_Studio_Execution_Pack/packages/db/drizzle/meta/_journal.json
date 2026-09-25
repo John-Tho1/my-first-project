@@ -141,6 +141,13 @@
       "when": 1790322340276,
       "tag": "0019_t10_fix_restore_triggers",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790325063018,
+      "tag": "0020_t11_t12_fix_restore_history_plan_status",
+      "breakpoints": true
     }
   ]
 }

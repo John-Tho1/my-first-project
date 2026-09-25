@@ -252,7 +252,7 @@ describe('A08·A20 — 결과 불명·lease 만료', () => {
     expect(await eventNames(leased!.id)).toEqual(['execute', 'lease', 'lease_expired_after_intent', 'reconciled_found']);
   });
 
-  it('의도 기록 전에 죽음 → QUEUED 로 돌아가 한 번만 처리(시도 2, 의도 1)', async () => {
+  it('의도 기록 전에 죽음 → QUEUED 로 돌아가 한 번만 처리(FIX-T11: 시작 전 만료는 시도가 아님 — 시도 1, 의도 1)', async () => {
     const o = await newOwner();
     const x = await executed(o);
     const [leased] = await leaseJobs(db, { workerId: 'dead-worker', now: new Date(), limit: 1, ownerId: o.id });
@@ -262,7 +262,8 @@ describe('A08·A20 — 결과 불명·lease 만료', () => {
     expect(r.results).toEqual({ CONFIRMED: 1 });
     expect(adapter.calls.submit).toBe(1);
     const intents = await intentsOf(leased!.id);
-    expect(intents.map((i) => [i.attempt, i.outcome])).toEqual([[2, 'accepted']]);
+    expect(intents.map((i) => [i.attempt, i.outcome])).toEqual([[1, 'accepted']]);
+    expect((await jobRow(leased!.id)).attempt).toBe(1);
     expect(await pubsOf(x.itemIds[0]!)).toHaveLength(1);
     expect(await eventNames(leased!.id)).toEqual(['execute', 'lease', 'lease_expired_before_intent', 'lease', 'send_start', 'confirmed']);
   });

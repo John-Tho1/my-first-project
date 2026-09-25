@@ -48,10 +48,12 @@ export type InvalidationReason =
   | 'snapshot_changed';
 
 /**
- * 승인 무효화·철회가 곧바로 막는 항목 상태: 실행 전(PLANNED)·대기(QUEUED)·재시도 대기(RETRY_WAIT, T12 D19 — 다음 전송 시점이 아니라 즉시).
- * 전송 단계(LEASED 이후)는 철회가 CANCEL_REQUESTED 로 추적하고, 보류(BLOCKED)는 재시도(retryItem)가 승인·스냅샷을 다시 검사한다.
+ * 승인 무효화·철회가 곧바로 막는 항목 상태: 실행 전(PLANNED)·대기(QUEUED)·재시도 대기(RETRY_WAIT, T12 D19 — 다음 전송 시점이 아니라 즉시)·
+ * 보류(BLOCKED — FIX-T12 P0: 편집은 보류 항목의 승인도 무효로 한다. D19(d) "재시도 재검사로만 막음"을 뒤집음, D20 후속).
+ * 보류 항목의 작업은 BLOCKED 그대로 둔다(확정되지 않은 전송을 실행 가능한 상태로 되돌리지 않음) — 항목만 PLANNED(다시 승인·새 실행 키).
+ * 전송 단계(LEASED 이후)는 철회가 CANCEL_REQUESTED 로 추적한다.
  */
-export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT'] as const;
+export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT', 'BLOCKED'] as const;
 /** 철회 시 BLOCKED 로 막는 작업 상태(아직 보내지 않은 대기 작업). */
 const BLOCK_ON_REVOKE_JOB_STATES = ['QUEUED', 'RETRY_WAIT'] as const;
 const isRevocable = (status: string) => (REVOCABLE_ITEM_STATUSES as readonly string[]).includes(status);
@@ -262,11 +264,14 @@ export async function revokeActiveApprovalsLocked(
         { leaseOwner: null, leaseUntil: null, lastErrorCode: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated' },
       );
     }
-    if (item.status === 'QUEUED' || item.status === 'RETRY_WAIT') {
+    // FIX-T12(P0): 보류(BLOCKED) 항목도 PLANNED 로(작업은 BLOCKED 그대로 — retryItem 은 approval_required). 복원 표시가 있는 항목은 그대로 둔다
+    // (복원 전 결과를 이 환경에서 확인하기 전에는 다시 승인·실행하지 않는다).
+    const toPlanned = item.status === 'QUEUED' || item.status === 'RETRY_WAIT' || (item.status === 'BLOCKED' && !item.restoredNeedsReview);
+    if (toPlanned) {
       await tx
         .update(distributionItems)
         .set({ status: 'PLANNED', updatedAt: now })
-        .where(and(eq(distributionItems.id, item.id), eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, ['QUEUED', 'RETRY_WAIT'])));
+        .where(and(eq(distributionItems.id, item.id), eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, ['QUEUED', 'RETRY_WAIT', 'BLOCKED'])));
     }
     await recordAudit(tx, {
       ownerId,

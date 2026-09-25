@@ -8,6 +8,8 @@
  *   reconcile 이 찾아낼 수 있다(A08·A20 시험). 같은 intentKey 로 다시 submit 하면 원격은 같은 결과를 돌려준다(멱등 토큰).
  * - 조회(reconcile)는 이 프로세스가 submit 을 받은 key 에 대해서만 "없음"을 단정하고, 모르는 key(재시작 뒤 등)는 unknown 을 돌려준다
  *   — 재시작한 모의 원격이 "안 보냈다"고 꾸며 재전송을 부추기지 않게.
+ * - FIX-T11(P0): submit 이 아직 끝나지 않은(진행 중인) key 는 결과가 없어도 not_found 가 아니라 unknown(mock_in_flight) — 진행 중인 전송을
+ *   "보내지 않았음"으로 확정해 새 시도(새 의도)를 부르지 않게. 결과를 쓰기 직전에 lease(heartbeat)·중단 신호를 확인하고, 잃었으면 쓰지 않는다.
  * - T12(D19) 결과는 호출마다 scenarioFor(ctx) 로 정한다: **항목별 시나리오(ctx.mockScenario — 작업 처리기가 mock_scenarios 표에서 읽어
  *   넣는다)** → 프로그램 설정(테스트) → 환경변수 MOCK_CHANNEL_SCENARIO(운영 빌드에서는 무시) → success.
  * - YouTube 의 success 는 A12 대로 비공개 업로드(UPLOADED_PRIVATE·private)를 "처리 중"으로 먼저 돌려주고 조회에서 확인된다(여전히 private).
@@ -113,6 +115,8 @@ export class MockChannelAdapter implements ChannelAdapter {
   private readonly remote = new Map<string, MockRemoteEntry>();
   /** 이 프로세스에서 submit 요청을 받은 intentKey. 모르는 key 는 "없음"이라고 단정하지 않는다(재시작 뒤 맹목 재전송 방지). */
   private readonly seen = new Set<string>();
+  /** FIX-T11(P0): submit 이 진행 중인 intentKey(시작했지만 아직 응답하지 않음) — 조회는 이 key 를 "없음"으로 단정하지 않는다. */
+  private readonly inflight = new Set<string>();
   private scenario: ScenarioSource | null;
   private delayMs: number;
   private caps: AdapterCapabilities;
@@ -146,6 +150,7 @@ export class MockChannelAdapter implements ChannelAdapter {
   reset(): void {
     this.remote.clear();
     this.seen.clear();
+    this.inflight.clear();
     this.scenario = null;
     this.delayMs = 0;
     this.caps = { ...DEFAULT_CAPS };
@@ -243,13 +248,24 @@ export class MockChannelAdapter implements ChannelAdapter {
   async submit(prepared: PreparedSubmission, ctx: AdapterContext): Promise<AdapterResult> {
     this.calls.submit++;
     this.seen.add(ctx.intentKey);
+    this.inflight.add(ctx.intentKey);
+    try {
+      return await this.submitInner(prepared, ctx);
+    } finally {
+      this.inflight.delete(ctx.intentKey);
+    }
+  }
+
+  private async submitInner(prepared: PreparedSubmission, ctx: AdapterContext): Promise<AdapterResult> {
     const snap = prepared.snapshot;
     const platform = snap.account.platform;
     const scenario = this.scenarioFor(ctx, snap);
     const requestId = `mock-req:${randomUUID()}`;
     const delay = ctx.mockScenario && ctx.mockScenario.delay_ms > 0 ? ctx.mockScenario.delay_ms : this.delayMs;
     if (delay > 0) await sleep(delay, ctx.signal);
+    // FIX-T11(P0): 원격에 쓰기(부작용) 직전 — lease 를 잃었으면 heartbeat 가 던지고, 시간 초과·중단이면 여기서 멈춘다(아무것도 쓰지 않음).
     await ctx.heartbeat();
+    if (ctx.signal.aborted) throw abortError();
     // 같은 멱등 토큰의 재전송 → 원격은 이미 받은 결과를 돌려준다(중복 게시 없음).
     const existing = this.remote.get(ctx.intentKey);
     if (existing) {
@@ -325,6 +341,8 @@ export class MockChannelAdapter implements ChannelAdapter {
     if (!e) {
       // 이 프로세스가 받은 적 없는 요청이면(재시작 등) 보내지 않았다고 단정할 수 없다 → 확인 불가.
       if (!this.seen.has(reference.intent_key)) return { status: 'unknown', error_code: 'mock_no_record' };
+      // FIX-T11(P0): 아직 진행 중인 submit — 결과가 곧 생길 수 있으므로 "없음"이 아니다.
+      if (this.inflight.has(reference.intent_key)) return { status: 'unknown', error_code: 'mock_in_flight' };
       return { status: 'not_found' };
     }
     if (e.state === 'processing') e.state = 'done';

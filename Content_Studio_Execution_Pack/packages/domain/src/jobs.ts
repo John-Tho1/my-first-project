@@ -59,6 +59,7 @@ export const JOB_EVENTS = [
   'lease_expired_before_intent',
   'lease_expired_after_intent',
   'unblock',
+  'late_result',
 ] as const;
 export type JobEvent = (typeof JOB_EVENTS)[number];
 
@@ -71,7 +72,7 @@ export type JobEvent = (typeof JOB_EVENTS)[number];
  * - lease_expired_*: lease 만료 복구 — 의도 기록 전이면 다시 대기, 뒤면 RECONCILING(재전송 금지 A20).
  */
 export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<JobEvent, JobState>>>>> = {
-  QUEUED: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED' },
+  QUEUED: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING' },
   LEASED: {
     send_start: 'SENDING',
     blocked: 'BLOCKED',
@@ -79,6 +80,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     cancel_requested: 'CANCEL_REQUESTED',
     permanent_failure: 'FAILED',
     lease_expired_before_intent: 'QUEUED',
+    late_result: 'RECONCILING',
   },
   SENDING: {
     remote_accepted: 'REMOTE_PROCESSING',
@@ -101,7 +103,9 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     cancel_requested: 'CANCEL_REQUESTED',
     lease_expired_after_intent: 'RECONCILING',
   },
-  RETRY_WAIT: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED' },
+  // FIX-T11(P0): late_result — lease 를 잃은 옛 시도가 부작용이 있을 수 있는 결과(accepted·processing·ambiguous)를 늦게 돌려주면
+  // 다음 시도(새 의도)로 가지 않고 조회로 돌린다(맹목 재전송 금지).
+  RETRY_WAIT: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING' },
   RECONCILING: {
     reconciled_found: 'CONFIRMED',
     remote_accepted: 'REMOTE_PROCESSING',
@@ -320,7 +324,7 @@ export interface AdapterContext {
   now: Date;
   /** 시간 초과·중단 신호 */
   signal: AbortSignal;
-  /** lease 연장(작은 별도 트랜잭션) */
+  /** lease 연장(작은 별도 트랜잭션). FIX-T11(P0): lease 를 잃었으면 LeaseLostError 를 던지고 signal 을 중단한다 — 어댑터는 부작용 전에 부른다. */
   heartbeat(): Promise<void>;
   /** T12: 항목별 모의 시나리오(모의 계정 항목만, 없으면 null). live 어댑터는 무시한다. */
   mockScenario?: MockScenarioSetting | null;
@@ -450,6 +454,14 @@ export class NotCancellableError extends AppError {
         : '이미 끝났거나 실행 전인 항목은 취소할 수 없습니다',
       { state },
     );
+  }
+}
+
+/** FIX-T11(P0): heartbeat 가 lease 를 잃었음을 알릴 때(다른 worker 가 복구·조회 중) — 어댑터는 부작용 없이 멈춘다. */
+export class LeaseLostError extends Error {
+  constructor() {
+    super('lease lost');
+    this.name = 'LeaseLostError';
   }
 }
 

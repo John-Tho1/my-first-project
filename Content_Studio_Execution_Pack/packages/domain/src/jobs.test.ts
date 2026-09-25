@@ -218,3 +218,10 @@ describe('tickSchema', () => {
     expect(tickSchema.parse({ worker_id: 'demo_1' })).toEqual({ worker_id: 'demo_1' });
   });
 });
+
+describe('FIX-T11(P0) late_result 전이', () => {
+  it('새 시도를 기다리는 상태(QUEUED·LEASED·RETRY_WAIT)에서 옛 시도의 늦은 결과 → RECONCILING, 그 밖에서는 불법', () => {
+    for (const s of ['QUEUED', 'LEASED', 'RETRY_WAIT'] as const) expect(transitionJobState(s, 'late_result')).toBe('RECONCILING');
+    for (const s of ['SENDING', 'CONFIRMED', 'UNKNOWN', 'BLOCKED'] as const) expect(canTransitionJob(s, 'late_result')).toBe(false);
+  });
+});

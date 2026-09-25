@@ -735,6 +735,11 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     'fake．example 참고',
     'fabricated.example/report 참고',
     '[출처: https://example.com/r4-report]', // 허용 locator 라도 자유문 인용은 실패
+    // FIX round 5(Codex review-FIX4-T07)
+    '203.0.113.5/report 참고',
+    'example.xn--p1ai/report 참고',
+    'fake.example에 따르면 시장이 커졌다',
+    'FAKE.md 참고',
   ];
 
   it('원고: 라운드 2–3 우회 문자열·버린 자유문 참조는 모두 실패(run failed·버전 없음·본문 그대로), [1]·[10]·오탐 예시는 통과', async () => {
@@ -757,8 +762,8 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     expect(after.runs - before.runs).toBe(failing.length); // 실패 run·원장은 남는다(T07 규칙)
     expect(await current()).toBe(body);
 
-    const ok = await runAssist(db, ownerA, contentId, input, saying('보고서[1]와 [10], README.md, 3.14, owner@example.local — 해외 영업 메모.', [ids[0]!]));
-    expect(ok.proposal.body).toBe('보고서[1]와 [10], README.md, 3.14, owner@example.local — 해외 영업 메모.');
+    const ok = await runAssist(db, ownerA, contentId, input, saying('보고서[1]와 [10], budget.ts, 3.14, owner@example.local — 해외 영업 메모.', [ids[0]!]));
+    expect(ok.proposal.body).toBe('보고서[1]와 [10], budget.ts, 3.14, owner@example.local — 해외 영업 메모.');
     expect(await code(runAssist(db, ownerA, contentId, input, saying('보고서[11]')))).toBe('llm_failed');
   });
 
@@ -772,8 +777,8 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     );
     const [variant] = await db.select().from(schema.variants).where(eq(schema.variants.contentId, id));
     if (variant) expect((await db.select().from(schema.variantVersions).where(eq(schema.variantVersions.variantId, variant.id))).length).toBe(0);
-    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('README.md 와 3.14 를 정리한 글입니다.'));
-    expect(ok.proposal.body).toBe('README.md 와 3.14 를 정리한 글입니다.');
+    const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('budget.ts 와 3.14 를 정리한 글입니다.'));
+    expect(ok.proposal.body).toBe('budget.ts 와 3.14 를 정리한 글입니다.');
   });
 
   it('모의 provider 의 기본 출력은 URL 모양 글이 없어 통과한다(출처가 있어도)', async () => {

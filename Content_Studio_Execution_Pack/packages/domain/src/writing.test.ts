@@ -624,10 +624,9 @@ describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 �
     fails('보고서[１]', []); // 전각 숫자도 NFKC 뒤 번호 규칙
   });
 
-  it('오탐 없음: README.md · 3.14 · 이메일 · 한국어 문장 · 파일 이름', () => {
+  it('오탐 없음: 3.14 · 이메일 · 한국어 문장 · 코드·문서 파일 이름(실제 TLD 아닌 확장자)', () => {
     for (const t of [
-      'README.md 를 보세요',
-      'CHANGELOG.md 와 AGENTS.md',
+      'BUDGET.TS 와 Report.PDF',
       '원주율은 3.14 이고 v24.21.0 을 씁니다',
       '메일 owner@example.local 로 보내 주세요',
       '해외 영업에서 가장 중요한 것은 신뢰입니다. 다음 분기에 다시 확인합니다.',
@@ -642,7 +641,31 @@ describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 �
     fails('notes.md/report');
     fails('report.pdf:8080/x');
     fails('fake.md 참고');
+    // FIX round 5: 대소문자로 파일 이름을 믿지 않는다 — 대문자 .md 도 실패(README.md 오탐은 받아들임, D13)
+    fails('FAKE.md 참고');
+    fails('README.md 를 보세요');
     fails('React.Component 를 씁니다'); // 단어.영문 은 실패할 수 있다(D13 FIX round 4)
+  });
+
+  it('FIX round 5: IP 주소·퍼니코드/숫자·하이픈 TLD·한국어 조사가 바로 붙은 도메인도 실패', () => {
+    for (const t of [
+      '203.0.113.5/report 참고',
+      '203.0.113.5:8080 에서',
+      '203.0.113.5에 따르면',
+      '[2001:db8::1]:443/report',
+      'example.xn--p1ai/report 참고',
+      '예시.xn--3e0b707e 참고',
+      'fake.example에 따르면 시장이 커졌다',
+      'fake.example의 보고서',
+      '출처는fake.example입니다',
+      'fake.co2/report',
+      'host.a-b 참고',
+    ]) {
+      fails(t);
+      fails(t, []);
+    }
+    // 번호 인용·버전·소수는 여전히 통과
+    for (const t of ['보고서[1]', 'v24.21.0 과 1.2.3', '3.14와 2.5%']) expect(run(t).output.proposed_text, t).toBe(t);
   });
 
   it('hasFreeTextCitation 는 탐지만 한다(허용 판단 없음)', () => {

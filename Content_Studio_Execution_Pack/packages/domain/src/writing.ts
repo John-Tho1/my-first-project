@@ -343,14 +343,20 @@ export class UnverifiableCitationError extends AppError {
 //   - 글 속 [n]: 1 ≤ n ≤ 허용 출처 수(범위 밖이면 실패)
 // 그 밖에 글(제안 본문·경고·후속 질문·태그·claim 문장)에 출처처럼 보이는 것이 하나라도 있으면 **허용 여부를 따지지 않고** 출력 전체 실패.
 // 탐지는 넓게(허용 판단 없음, NFKC 정규화 뒤): '://' · 'www.' · '[출처…]' · 프로토콜 상대 '//host' · 호스트 모양 토큰
-// (문자·숫자·하이픈 라벨을 '.'·'。'(전각 '．'·'｡' 은 NFKC 로 변환)로 이은 뒤 영문 2–24자 TLD) · 버린 source_refs 문구.
-// 오탐 예외는 좁게: 실제 TLD 가 아닌 흔한 파일 확장자(README.md 처럼 대문자 이름의 .md 포함), 이메일(@ 뒤 도메인), 소수(3.14).
-// 그 밖의 "단어.영문" 표기(React.Component, St.Petersburg 등)는 실패할 수 있다 — 의도한 보수성(D13 FIX round 4).
+// (문자·숫자·하이픈 라벨을 '.'·'。'(전각 '．'·'｡' 은 NFKC 로 변환)로 이은 뒤 영문으로 시작하는 TLD — 숫자·하이픈 포함, 퍼니코드 xn--…)
+// · IPv4 주소(점 네 묶음) · 괄호 IPv6([…:…:…]) · 버린 source_refs 문구.
+// TLD 뒤 경계는 "영문·숫자·하이픈이 아닌 모든 문자 또는 끝"(FIX round 5: 한국어 조사가 바로 붙어도 탐지 — fake.example에).
+// 오탐 예외는 좁게: 실제 TLD 가 아닌 코드·문서 파일 확장자(.ts .json .pdf …, 대소문자 무관, 경로·포트 없을 때), 이메일(@ 뒤 도메인), 소수(3.14).
+// 대소문자로 파일 이름을 믿는 예외는 없다(FIX round 5) — README.md·FAKE.md·fake.md 모두 실패. 그 밖의 "단어.영문" 표기도 실패할 수 있다(D13).
 
 const DOT = '[.。]';
 const LABEL = String.raw`[\p{L}\p{N}](?:[\p{L}\p{N}-]*[\p{L}\p{N}])?`;
 /** 호스트 모양: 앞이 문자·숫자·밑줄·@·점·하이픈이 아닌 곳에서 시작, 끝(TLD) 뒤에 문자·숫자·밑줄·하이픈이 오지 않음 */
-const HOST_LIKE = new RegExp(String.raw`(?<![\p{L}\p{N}_@.。-])((?:${LABEL}${DOT})+)([a-z]{2,24})(?![\p{L}\p{N}_-])`, 'giu');
+const TLD = String.raw`[a-z](?:[a-z0-9-]{0,61}[a-z0-9])`;
+const HOST_LIKE = new RegExp(String.raw`(?<![\p{L}\p{N}_@.。-])((?:${LABEL}${DOT})+)(${TLD})(?![a-z0-9-])`, 'giu');
+/** IPv4(점 네 묶음, 포트·경로 무관)와 괄호 IPv6(콜론 둘 이상) */
+const IPV4 = /(?<![\p{N}.])(?:\d{1,3}[.。]){3}\d{1,3}(?![\p{N}])/u;
+const IPV6 = /\[[0-9a-f]*:[0-9a-f]*:[0-9a-f:.]*\]/iu;
 /** 모델이 쓴 [출처…] 표기도 자유문 인용이다(서버만 [출처 n] 을 만든다). */
 const SOURCE_TAG = /\[\s*출처/u;
 const SCHEME_LIKE = /:\/\/|www[.。]|(?<![:/])\/\/[\p{L}\p{N}]/iu;
@@ -363,14 +369,12 @@ const nfkc = (s: string) => s.normalize('NFKC');
 /** 글 하나에 자유문 출처 표기가 있는가(허용 판단 없음 — 탐지만). */
 export function hasFreeTextCitation(text: string): boolean {
   const t = nfkc(text);
-  if (SCHEME_LIKE.test(t) || SOURCE_TAG.test(t)) return true;
+  if (SCHEME_LIKE.test(t) || SOURCE_TAG.test(t) || IPV4.test(t) || IPV6.test(t)) return true;
   for (const m of t.matchAll(HOST_LIKE)) {
     const tld = m[2]!.toLowerCase();
     const after = t.slice(m.index! + m[0].length);
     const pathLike = /^(?::\d|[/?(])/u.test(after);
     if (!pathLike && NON_TLD_FILE_EXT.has(tld)) continue;
-    // README.md·CHANGELOG.md 처럼 대문자 이름의 .md 는 파일 이름으로 본다(경로·포트가 붙으면 호스트).
-    if (!pathLike && tld === 'md' && /^[A-Z][A-Z0-9_-]*[.]$/u.test(m[1]!)) continue;
     return true;
   }
   return false;

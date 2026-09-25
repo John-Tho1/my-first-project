@@ -178,8 +178,10 @@ export function WritingPanel({
         ) : null}
         <p className="note">
           입력은 현재 본문(버전 {current.version})·Brand Profile·저장된 답변 {answers.length}개·연결된 소재의 출처 {state.allowedSources.length}개로
-          고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있고, 글에 URL·도메인·목록 밖 문헌 제목을 쓰면 제안 전체를 저장하지
-          않습니다(실패로 기록, 본문 그대로). 본문에 URL 이 있으면 모의 제안도 같은 이유로 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
+          고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있습니다. 서버가 자동으로 거부하는 것(제안 전체를 저장하지 않음, 실패로
+          기록, 본문 그대로): 글 속 URL·도메인·IP 주소 모양 표기, 범위 밖 번호 인용, AI 가 허용 목록 밖 출처로 적었다가 버려진 문구. 그 밖의 일반 문헌
+          제목·기관명(예: &quot;OO연구소 보고서에 따르면&quot;)은 <strong>자동으로 검증되지 않습니다</strong> — 아래 주장에 &quot;출처 미검증 · 사용자 확인
+          필요&quot;로 표시되니 직접 확인하세요. 본문에 URL 이 있으면 모의 제안도 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
         </p>
 
         {run ? (
@@ -283,7 +285,11 @@ export function WritingPanel({
                                 </span>
                               ))}
                               {dropped > 0 ? <span className="tag warn">출처 미확인(허용 목록 밖 {dropped}건 — 저장하지 않음)</span> : null}
-                              {view?.needs_check ? <span className="tag warn">확인 필요</span> : null}
+                              {view?.needs_check ? (
+                                <span className="tag warn">
+                                  {view.evidence_grade === 'none' ? '출처 미검증 · 사용자 확인 필요' : '확인 필요'}
+                                </span>
+                              ) : null}
                             </p>
                           );
                         })()}

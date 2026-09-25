@@ -14,7 +14,7 @@ if (!dir) throw new Error('dir 인자가 필요합니다');
 
 const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 writeFileSync(path.join(dir, `ready-${process.pid}`), '');
-const deadline = Date.now() + 30_000;
+const deadline = Date.now() + 90_000;
 while (!existsSync(path.join(dir, 'go'))) {
   if (Date.now() > deadline) throw new Error('go 신호를 받지 못했습니다');
   sleepSync(5);

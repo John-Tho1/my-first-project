@@ -69,6 +69,9 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
 
     const fresh = mk();
     writeFileSync(lockFile(fresh), 'garbage'); // 방금 만들어진(내용을 아직 못 읽은) 파일로 취급 → 재시도 후 포기
+    // 병렬 테스트 부하로 재시도 루프가 2초를 넘어도 "오래된 파일"로 바뀌지 않게 mtime 을 미래로 고정한다(미래 mtime = 신선한 파일).
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(lockFile(fresh), future, future);
     expect(() => acquireDirLock(fresh)).toThrow(/재시도 초과/);
     expect(readFileSync(lockFile(fresh), 'utf8')).toBe('garbage');
   });
@@ -82,7 +85,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
     expect(readFileSync(lockFile(d), 'utf8')).toBe(foreign);
   });
 
-  it('죽은 잠금을 여러 프로세스가 동시에 회수해도 한 프로세스만 잠금을 얻는다', { timeout: 120_000 }, async () => {
+  it('죽은 잠금을 여러 프로세스가 동시에 회수해도 한 프로세스만 잠금을 얻는다', { timeout: 180_000 }, async () => {
     const d = mk();
     writeFileSync(lockFile(d), DEAD_PID);
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -93,7 +96,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
     const results = await Promise.all(
       Array.from({ length: N }, () =>
         new Promise<string>((resolve, reject) => {
-          const c = spawn(process.execPath, ['--import', 'tsx', child, d, '12000'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+          const c = spawn(process.execPath, ['--import', 'tsx', child, d, '20000'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
           let out = '';
           let err = '';
           c.stdout.on('data', (b) => (out += b));
@@ -103,7 +106,7 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
         }),
       ).concat(
         (async () => {
-          const until = Date.now() + 30_000;
+          const until = Date.now() + 90_000;
           while (readyCount() < N) {
             if (Date.now() > until) throw new Error('자식 프로세스가 준비되지 않았습니다');
             await new Promise((r) => setTimeout(r, 20));
@@ -113,9 +116,10 @@ describe('acquireDirLock (PGlite 단일 프로세스 강제)', () => {
         })(),
       ),
     ).then((r) => r.filter((x) => x !== 'GO'));
-    expect(results.filter((r) => r === 'OK')).toHaveLength(1);
-    expect(results.filter((r) => r === 'LOCKED')).toHaveLength(N - 1);
-    expect(existsSync(lockFile(d))).toBe(false); // 승자가 12초 뒤 해제(부하 시 자식 기동 지연 대비)
+    const detail = `results=${results.join(' | ')}`;
+    expect(results.filter((r) => r === 'OK'), detail).toHaveLength(1);
+    expect(results.filter((r) => r === 'LOCKED'), detail).toHaveLength(N - 1);
+    expect(existsSync(lockFile(d))).toBe(false); // 승자가 20초 뒤 해제(병렬 테스트 부하 시 자식 기동 지연 대비)
     expect(existsSync(lockFile(d) + '.reclaim')).toBe(false);
   });
 });

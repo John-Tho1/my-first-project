@@ -156,3 +156,20 @@
 - FIX round 2(Codex review-FIX-T08, 2026-09-25): 파일 삭제는 **의도 먼저**(migration 0013 `assets.pending_delete_key`). 원음 삭제는 asset 행 잠금 아래 deleted_at + pending_delete_key(=현재 key)를 커밋하고, 커밋 뒤 그 key 의 파일을 지운 다음 표시를 비운다. 파일 삭제 실패·프로세스 중단이면 표시가 남고 worker tick(`assets.cleanup`, 저장소가 주어진 inline tick)이 다시 시도한다 — 지운 원본은 파일 유무와 관계없이 410. 정리는 삭제 대상 key 를 지워지지 않은 asset 이 쓰고 있으면 파일을 두고 표시만 비운다. 재업로드 복구는 옛 key 를 pending_delete_key 로 넘기고(deleted_at 이 있어도 파일이 없다고 가정하지 않음) 커밋 뒤 정리한다. 0013 은 기존 deleted_at 행의 key 를 삭제 대상으로 채운다. pending_delete_key 는 운영 상태라 내보내기 묶음에 넣지 않고 복원 행은 null(묶음이 다른 파일 삭제를 지시하지 못하게). 앞선 라운드의 "파일 삭제 실패 시 deleted_at 롤백" 동작·테스트는 이 설계로 대체했다. 전사 목록 폴링은 조회를 한 번에 하나만 하고(조회 중 poke 는 끝난 직후 한 번으로 합침) 응답 순번이 최신일 때만 반영한다.
 - FIX round 3(Codex review-FIX2-T08, 2026-09-25): 정리 재시도 backoff(migration 0014 `assets.pending_delete_attempts`·`pending_delete_next_at`) — tick 은 다음 시도 시각이 된 의도만 `next_at NULLS FIRST, id` 순으로 50개 처리, 실패하면 횟수+1·다음 시각 = min(2^횟수 분, 6시간), 성공·새 의도면 초기화. 계속 실패하는 의도가 배치를 독점하지 않는다. 세 열은 운영 상태라 묶음에 넣지 않는다(복원 행은 DB 기본값).
 - FIX round 4(Codex review-FIX3-T08, 2026-09-25): 삭제 의도는 만들 때 다음 시도 시각 = 만든 시각(NULL 없음, migration 0015 가 기존 NULL 을 asset 생성 시각으로 채움) — tick 은 `다음 시도 시각, id` 한 시간축으로 줄을 세워 새 의도와 재시도가 서로 굶기지 않는다. tick 은 때가 된 행을 `FOR UPDATE SKIP LOCKED` 로 가져가(claim) 다음 시도 시각을 60초 미룬 뒤 처리한다(동시 tick 이 같은 의도를 두 번 시도하지 않음). 실패 기록은 SQL 한 문장(횟수+1, 다음 시각 = GREATEST(현재, now + LEAST(2^(횟수+1) 분, 6시간)), 같은 key 일 때만)으로 원자적·단조.
+
+## D16 — M2 잔여 결정 일괄 확정(권고안 채택) 및 화면 체크리스트 완료
+- Decision ID / date: D16 / 2026-09-25 (Europe/Moscow)
+- Question: M2 마감 시점의 미결 항목(M2_STATUS §3 A~G)을 어떻게 정하는가?
+- Chosen option (사용자, 2026-09-25 아침, 권고안 전부 승인):
+  - A. T06 `removed`(본문에서 뺐음)는 **사용자 단언 + 문자열 재삽입 가드**로 유지. 어미 변경 등 의미 단위 삭제는 서버가 증명하지 않음을 D12·UI 도움말에 명시. claim–구간 연결은 구현하지 않음.
+  - B. 제안을 손으로 복사해 저장하는 경로는 A03 미적용 — 한계로 수용(M3 이후 재검토).
+  - C. T07 인용 정제는 구조화 인용(`source_refs`·`[n]`)만 인정하고 자유 텍스트의 URL·도메인·IP 유사 토큰은 fail-closed 유지. 오탐(README.md, 1.2.3.4, 사용자 원문 URL → 모의 제안 실패)은 live 도입 전까지 수용. 입력 URL 치환은 하지 않음.
+  - D. D14: YouTube 파생본 review 는 **영상 첨부 필수** 유지(T08 로 영상 업로드가 열렸으므로 대본만 허용 예외 없음). 채널 글자 수 한도는 M4 착수 전 공식 자료로 재확인. 새 버전마다 draft 복귀 유지. 패키지 파일 보존 기간은 무기한(정리 없음) — 운영 백업(T20)에서 재검토.
+  - E. D15: 한도(음성 200MB·영상 2GB·24h 만료·8MiB 조각) 유지. VERIFIED 는 서명·크기·checksum 범위 유지(디코딩 검증 없음, 라벨로 표시). 원음 보존 기본값 켬 유지. sha256 은 서버에서 선택(없으면 resumable:false) 유지. 실제 STT 공급자·가격·승인은 D9 대로 별도 승인 전 미연결.
+  - F. D13: 월 한도·건당 상한·통화 값은 live 도입(D8) 시점에 정한다(그때까지 mock 은 가격 없음 → 0 기록·한도 미적용). 실패 호출 전액 과금 유지. 월 경계를 넘는 예약은 예약 시점 월에 귀속(현 구현).
+  - G. 화면 체크리스트 12항목(LOCAL_RUNBOOK §3): 사용자가 로컬 dev 서버(HEAD 5ec8d3b, migration 0015)에서 확인 완료. 별도 불편·오류 보고 없음.
+- Evidence / assumption: Codex 재검증 판정(docs/handoffs/M2_CODEX_VERDICTS.md). T06 P1 2건은 위 A·B 결정으로 종결(코드 변경 없음).
+- Reversible?: 예. 각 항목은 해당 결정(D12~D15) 개정으로 되돌릴 수 있다.
+- User decision required?: 확정됨.
+- Consequences: M1·M2 Codex 경계 전부 종결. M3(T10~T12) 착수 가능.
+- When to revisit: live LLM/STT 승인(D8·D9) 시점, M4 착수 전(채널 한도), T20(백업·보존).

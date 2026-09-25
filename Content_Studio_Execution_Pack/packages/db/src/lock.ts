@@ -67,6 +67,19 @@ function judge(file: string): Verdict {
   return Date.now() - cur.mtimeMs < UNREADABLE_STALE_MS ? { kind: 'unknown' } : { kind: 'stale', raw: cur.raw };
 }
 
+/**
+ * 파일 삭제. Windows 에서는 다른 프로세스가 같은 파일을 읽고 있는 순간 EPERM/EBUSY 가 날 수 있다(force 는 ENOENT 만 무시).
+ * 그 경우 지우지 못한 채 돌아가고, 호출자의 재시도 루프가 다음 시도에서 다시 판정한다.
+ */
+function rmQuiet(file: string): void {
+  try {
+    rmSync(/*turbopackIgnore: true*/ file, { force: true });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== "EPERM" && code !== "EBUSY" && code !== "ENOENT") throw e;
+  }
+}
+
 const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
@@ -86,9 +99,9 @@ function reclaimStale(file: string, expectRaw: string): void {
   }
   try {
     const cur = readLock(file);
-    if (cur && cur.raw === expectRaw) rmSync(/*turbopackIgnore: true*/ file, { force: true });
+    if (cur && cur.raw === expectRaw) rmQuiet(file);
   } finally {
-    rmSync(/*turbopackIgnore: true*/ reclaim, { force: true });
+    rmQuiet(reclaim);
   }
 }
 

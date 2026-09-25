@@ -369,7 +369,13 @@ const NUMBER_MARKER = /\[(\d+)\]/gu;
  * FIX round 6(Codex review-FIX5-T07): 보이지 않는 서식 문자(Unicode Cf — 제로폭 공백·결합자·BOM·소프트 하이픈·방향 제어 등)를
  * 지우고 이어 붙인 뒤 NFKC 로 정규화한 문자열에서 탐지한다(예: 제로폭 공백을 끼운 도메인도 이어 붙여 탐지). 원문은 바꾸지 않는다 — 탐지되면 어차피 실행 전체가 실패한다.
  */
-const FORMAT_CHARS = /\p{Cf}/gu;
+/**
+ * FIX round 7(Codex review-FIX6-T07): Cf 에 더해 Unicode Default_Ignorable_Code_Point 전체(변형 선택자 U+FE0F·결합 자소 결합자 U+034F 등 Mn 포함)도
+ * 지운다. 실제 결합 발음 부호(예: U+0301)는 \p{Mn} 전체가 아니라 아래 명시 범위만 지우므로 그대로 남는다.
+ */
+const FORMAT_CHARS =
+  // \uACB0\uD569 \uBB38\uC790(Mn) \uBC94\uC704\uB294 \uAC01\uC790\uC758 \uBB38\uC790 \uD074\uB798\uC2A4\uB85C \uB454\uB2E4(\uD55C \uD074\uB798\uC2A4\uC5D0 \uC55E \uAE00\uC790\uC640 \uBD99\uC5B4 "\uACB0\uD569 \uBB38\uC790"\uB85C \uC77D\uD788\uC9C0 \uC54A\uAC8C \u2014 no-misleading-character-class).
+  /[\p{Cf}\u00AD\u061C\u115F\u1160\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFEFF\uFFA0\uFFF0-\uFFF8\u{1BCA0}-\u{1BCA3}\u{1D173}-\u{1D17A}]|[\u034F]|[\u17B4\u17B5]|[\u180B-\u180F]|[\uFE00-\uFE0F]|[\u{E0000}-\u{E0FFF}]/gu;
 const nfkc = (s: string) => s.replace(FORMAT_CHARS, '').normalize('NFKC').replace(FORMAT_CHARS, '');
 
 /** 글 하나에 자유문 출처 표기가 있는가(허용 판단 없음 — 탐지만). */

@@ -746,6 +746,9 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     'https:/\u200D/fake.example/report',
     '[fe80::1%25eth0]:8080/report',
     '[fe80::1%eth0]/x',
+    // FIX round 7(Codex review-FIX6-T07): Cf 가 아닌 무시 가능 문자
+    'fake.\uFE0Fexample/report',
+    '보고서[\u034F99]', // 원고 경로는 허용 출처 10개 — 범위 밖 번호로(허용 0개인 [\u034F9] 는 아래 테스트)
   ];
 
   it('원고: 라운드 2–3 우회 문자열·버린 자유문 참조는 모두 실패(run failed·버전 없음·본문 그대로), [1]·[10]·오탐 예시는 통과', async () => {
@@ -785,6 +788,18 @@ describe('FIX-T07 round 4(Codex review-FIX3-T07): 구조화 인용만 — 원고
     if (variant) expect((await db.select().from(schema.variantVersions).where(eq(schema.variantVersions.variantId, variant.id))).length).toBe(0);
     const ok = await runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('budget.ts 와 3.14 를 정리한 글입니다.'));
     expect(ok.proposal.body).toBe('budget.ts 와 3.14 를 정리한 글입니다.');
+  });
+
+  it('FIX round 7: 허용 출처가 없고 source_refs 도 비면 CGJ 를 끼운 [9] 는 원고·채널 모두 실패, 변형 선택자가 끼인 [1] 은 허용 1개면 통과', async () => {
+    const { contentId, svId } = await contentWithSource(ownerA, 'r7-a', 'https://example.com/r7');
+    const noSources = { mode: 'draft' as const, baseVersion: 1, brandProfileVersion: 1, answerIds: [] };
+    expect(await code(runAssist(db, ownerA, contentId, noSources, saying('보고서[\u034F9]')))).toBe('llm_failed');
+    expect(await code(runAssist(db, ownerA, contentId, noSources, saying('fake.\uFE0Fexample/report')))).toBe('llm_failed');
+    const ok = await runAssist(db, ownerA, contentId, { ...noSources, sourceVersionIds: [svId] }, saying('보고서[\uFE0F1] — cafe\u0301 메모'));
+    expect(ok.proposal.body).toBe('보고서[\uFE0F1] — cafe\u0301 메모');
+    const id = (await createContent(db, ownerA, { title: 'r7 채널', body: '본문.' })).content.id;
+    expect(await code(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('보고서[\u034F9]')))).toBe('llm_failed');
+    expect(await code(runVariantAssist(db, ownerA, id, { channel: 'blog', baseVersion: 1 }, saying('fake.\uFE0Fexample/report')))).toBe('llm_failed');
   });
 
   it('모의 provider 의 기본 출력은 URL 모양 글이 없어 통과한다(출처가 있어도)', async () => {

@@ -688,6 +688,23 @@ describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 �
     fails('보고서[\u200B9]');
   });
 
+  it('FIX round 7: Cf 가 아닌 무시 가능 문자(변형 선택자 U+FE0F·CGJ U+034F·한글 채움 문자·태그 문자)도 지우고 탐지, 실제 결합 부호는 그대로', () => {
+    for (const t of [
+      'fake.\uFE0Fexample/report',
+      'fake\u034F.example/report',
+      'fake.ex\u3164ample 참고',
+      'fake.example\u{E0041}/report',
+      'www\uFE0F.fake.example',
+    ]) {
+      fails(t);
+      fails(t, []);
+    }
+    fails('보고서[\u034F9]');
+    fails('보고서[\u034F9]', []);
+    // 결합 발음 부호가 있는 글과 변형 선택자가 끼인 범위 안 번호는 통과(원문 그대로)
+    for (const t of ['cafe\u0301 메모 — 한국어 문장', '보고서[\uFE0F1]']) expect(run(t).output.proposed_text, t).toBe(t);
+  });
+
   it('hasFreeTextCitation 는 탐지만 한다(허용 판단 없음)', () => {
     expect(hasFreeTextCitation('https://example.com')).toBe(true);
     expect(hasFreeTextCitation('a//b 가 아니라 //host')).toBe(true);

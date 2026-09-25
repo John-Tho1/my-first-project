@@ -2,8 +2,18 @@
  * T10(결정 D17) 승인 무효화·철회의 공용 핵심. variants.ts·contents.ts(편집 경로)와 distribution.ts(승인·철회·실행)가 함께 쓴다.
  * 이 모듈은 schema·queries 만 import 한다(variants/contents/distribution 과 순환 import 없음).
  *
- * 잠금 순서(교착 방지 — 모든 경로가 같은 순서): contents → variants → distribution_plans → distribution_items → approvals → jobs.
- * 편집 경로(원고·파생본 새 버전)는 이미 content → variant 를 잠근 상태에서 이 모듈을 부른다(PostgreSQL 행 잠금은 같은 트랜잭션에서 재진입 가능).
+ * 전역 잠금 순서(교착 방지 — 모든 경로가 이 순서의 부분 수열로만 잠근다. FIX-T10: INSERT 의 FK 참조 잠금(KEY SHARE)까지 포함):
+ *   channel_accounts(id 순) → contents(id 순) → variants(id 순; variant_versions 는 불변이라 FK KEY SHARE 만) → distribution_plans → distribution_items
+ *   → approvals → jobs.
+ * - 계정 준비 상태에 기대는 경로(계획 생성·승인·실행)는 계정 행을 FOR SHARE 로, 계정 상태 변경은 FOR UPDATE 로 **가장 먼저** 잠근다
+ *   (lockAccountsInOrder). 그래서 승인 INSERT 와 계정 연결 해제가 서로를 놓치지 않는다: 먼저 잠근 쪽이 커밋할 때까지 다른 쪽이 기다리고,
+ *   뒤에 온 쪽은 커밋된 결과(새 승인 → 무효화 대상 / disconnected → 승인 거부)를 본다.
+ * - 계획 생성은 항목 INSERT 전에 계정 → 원고 → 파생본을 순서대로 FOR SHARE 로 잠근다 — INSERT 가 잡는 FK KEY SHARE 는 이미 가진 잠금보다 약해
+ *   새 대기 순서를 만들지 않는다(계정 A·B 두 항목 계획 vs B 상태 변경의 순환 대기 제거).
+ * - 편집 경로(원고·파생본 새 버전, 브랜드 새 버전)는 계정을 잠그지 않는다(content → variant 를 잠근 뒤 계정을 잠그면 순서가 뒤집힌다).
+ *   그래서 lockItemsInOrder 도 계정을 잠그지 않는다 — 계정이 필요한 호출자는 그 전에 lockAccountsInOrder 를 부른다.
+ * 편집 경로는 이미 content → variant 를 잠근 상태에서 이 모듈을 부른다(PostgreSQL 행 잠금은 같은 트랜잭션에서 재진입 가능).
+ * 실제 PostgreSQL 동시 실행 검증은 not_run — PGlite 는 연결 하나라 트랜잭션이 직렬화된다(시험은 두 순서의 사후 조건과 잠금 흔적만 확인).
  *
  * A06: 승인 뒤 본문·첨부·원고·계정이 바뀌면 그 항목의 활성 승인을 revoke_reason='invalidated:<이유>' 로 철회하고,
  * QUEUED 작업은 BLOCKED(+ job_event), QUEUED 항목은 PLANNED 로 되돌린다(시작 전이라 외부 전송 없음). 승인 행은 지우지 않는다.
@@ -22,7 +32,7 @@ import {
   type VariantLifecycle,
 } from '@cs/domain';
 import { recordAudit, type DbOrTx } from './queries';
-import { approvals, contents, distributionItems, distributionPlans, jobEvents, jobs, variants } from './schema';
+import { approvals, channelAccounts, contents, distributionItems, distributionPlans, jobEvents, jobs, variants } from './schema';
 
 export type DistributionItemRow = typeof distributionItems.$inferSelect;
 export type ApprovalRow = typeof approvals.$inferSelect;
@@ -49,7 +59,40 @@ const isRevocable = (status: string) => (REVOCABLE_ITEM_STATUSES as readonly str
 const sortIds = (ids: Iterable<string>) => [...new Set(ids)].sort();
 
 /**
- * 항목 ID 들을 전역 잠금 순서대로 잠근다: 원고 → 파생본 → 계획 → 항목(id 순, FOR UPDATE). 잠근 항목 행(최신 값)을 id 순으로 돌려준다.
+ * FIX-T10(P1): 전역 잠금 순서의 첫 단계 — 계정 행을 id 순으로 잠근다. 계정 상태에 기대는 읽기 경로는 'share'(서로 막지 않음),
+ * 상태 변경은 'update'. 같은 트랜잭션에서 share → update 로 올리는 경로는 없다(올리면 교착 가능). owner 가 다른 ID 는 무시된다.
+ */
+export async function lockAccountsInOrder(tx: DbOrTx, ownerId: string, accountIds: Iterable<string>, mode: 'share' | 'update'): Promise<void> {
+  const ids = sortIds(accountIds);
+  if (ids.length === 0) return;
+  await tx
+    .select({ id: channelAccounts.id })
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.ownerId, ownerId), inArray(channelAccounts.id, ids)))
+    .orderBy(asc(channelAccounts.id))
+    .for(mode);
+}
+
+/**
+ * FIX-T10(P1): 원고·파생본을 전역 순서(원고 → 파생본, 각각 id 순)로 FOR SHARE 잠근다 — 계획 생성이 항목 INSERT(FK KEY SHARE) 전에 부른다.
+ * 편집 경로(FOR UPDATE)와는 직렬화되고, 다른 계획 생성과는 서로 막지 않는다.
+ */
+export async function shareLockVariantsInOrder(tx: DbOrTx, ownerId: string, variantIds: Iterable<string>): Promise<void> {
+  const ids = sortIds(variantIds);
+  if (ids.length === 0) return;
+  const peek = await tx
+    .select({ contentId: variants.contentId })
+    .from(variants)
+    .where(and(eq(variants.ownerId, ownerId), inArray(variants.id, ids)));
+  const contentIds = sortIds(peek.map((p) => p.contentId));
+  if (contentIds.length) {
+    await tx.select({ id: contents.id }).from(contents).where(and(eq(contents.ownerId, ownerId), inArray(contents.id, contentIds))).orderBy(asc(contents.id)).for('share');
+  }
+  await tx.select({ id: variants.id }).from(variants).where(and(eq(variants.ownerId, ownerId), inArray(variants.id, ids))).orderBy(asc(variants.id)).for('share');
+}
+
+/**
+ * 항목 ID 들을 전역 잠금 순서대로 잠근다: 원고 → 파생본 → 계획 → 항목(id 순, FOR UPDATE). 계정은 잠그지 않는다(호출자가 먼저 — 위 주석). 잠근 항목 행(최신 값)을 id 순으로 돌려준다.
  * owner 가 다른 ID 는 결과에서 빠진다.
  */
 export async function lockItemsInOrder(tx: DbOrTx, ownerId: string, itemIds: readonly string[]): Promise<DistributionItemRow[]> {

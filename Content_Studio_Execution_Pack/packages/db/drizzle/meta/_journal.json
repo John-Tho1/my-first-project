@@ -134,6 +134,13 @@
       "when": 1790317528508,
       "tag": "0018_t12_mock_scenarios",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790322340276,
+      "tag": "0019_t10_fix_restore_triggers",
+      "breakpoints": true
     }
   ]
 }

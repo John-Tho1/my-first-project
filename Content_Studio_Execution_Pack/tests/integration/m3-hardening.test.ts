@@ -121,6 +121,16 @@ const eventNames = async (jobId: string) =>
     (e) => (e.sanitizedDetails as { transition?: string; event?: string }).transition ?? (e.sanitizedDetails as { event?: string }).event,
   );
 
+/** 이중 방어 시험용: 트리거를 잠시 끄고(DB 우회 흉내) 실행한 뒤 반드시 다시 켠다. */
+async function withTriggerDisabled(table: string, trigger: string, fn: () => Promise<unknown>) {
+  await db.execute(sql`alter table ${sql.identifier(table)} disable trigger ${sql.identifier(trigger)}`);
+  try {
+    await fn();
+  } finally {
+    await db.execute(sql`alter table ${sql.identifier(table)} enable trigger ${sql.identifier(trigger)}`);
+  }
+}
+
 const BRAND_V2 = { pen_name: '새 필명', audience: '해외 영업 실무자', pillars: ['해외 영업'], style_rules: [], tone: 'formal' as const, avoid_phrases: [], cta_rules: [], sample_texts: [] };
 
 beforeAll(async () => {
@@ -317,8 +327,10 @@ describe('C2 — 첨부 교체·변조', () => {
 
     const img3 = await putAsset(o.id, 'image/png');
     const b = await approved(o, 'instagram', img3);
-    // 훅을 거치지 않는 제자리 변조(파일 교체 + checksum 갱신)를 흉내
-    await db.execute(sql`update assets set checksum = ${'f'.repeat(64)} where id = ${img3}::uuid`);
+    // 훅을 거치지 않는 제자리 변조(파일 교체 + checksum 갱신) — FIX-T10(D19-b, 0019): 이제 DB 트리거가 먼저 거부한다
+    await expect(db.execute(sql`update assets set checksum = ${'f'.repeat(64)} where id = ${img3}::uuid`)).rejects.toThrow();
+    // 트리거를 끈 우회(운영자 직접 SQL 등)도 실행 재검사가 막는다(이중 방어 유지)
+    await withTriggerDisabled('assets', 'assets_content_immutable', () => db.execute(sql`update assets set checksum = ${'f'.repeat(64)} where id = ${img3}::uuid`));
     await expect(executePlan(db, o.id, b.planId, { commandKey: `hard-${randomUUID()}` }, config)).rejects.toMatchObject({ code: 'snapshot_stale' });
     expect((await approvalRow(b.approvalId)).revokeReason).toBe('invalidated:assets_changed');
     // 첨부 목록을 직접 늘려도(불변 버전에 행 추가) 실행 재검사가 막는다
@@ -326,7 +338,11 @@ describe('C2 — 첨부 교체·변조', () => {
     const img5 = await putAsset(o.id, 'image/png');
     const c = await approved(o, 'instagram', img4);
     const vv = (await variantRow(c.variantId)).currentVersionId!;
-    await db.insert(schema.variantAssets).values({ ownerId: o.id, variantVersionId: vv, assetId: img5, position: 2, role: 'image' });
+    // FIX-T10(D19-b, 0019): 스냅샷이 참조하는 버전에 첨부 추가는 DB 트리거가 거부한다 — 트리거를 끈 우회도 실행 재검사가 막는다
+    await expect(db.insert(schema.variantAssets).values({ ownerId: o.id, variantVersionId: vv, assetId: img5, position: 2, role: 'image' })).rejects.toThrow();
+    await withTriggerDisabled('variant_assets', 'variant_assets_version_open', () =>
+      db.insert(schema.variantAssets).values({ ownerId: o.id, variantVersionId: vv, assetId: img5, position: 2, role: 'image' }),
+    );
     await expect(executePlan(db, o.id, c.planId, { commandKey: `hard-${randomUUID()}` }, config)).rejects.toMatchObject({ code: 'snapshot_stale' });
   });
 });

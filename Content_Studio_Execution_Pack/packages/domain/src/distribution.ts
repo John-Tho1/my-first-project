@@ -40,8 +40,20 @@ export const ITEM_STATUSES = [
   'PARTIAL',
 ] as const;
 export type ItemStatus = (typeof ITEM_STATUSES)[number];
-/** 작업이 진행 중인(외부 전송이 일어날 수 있는) 항목 상태 — 복원 시 BLOCKED 로 들여온다. */
+/** 작업이 진행 중인(외부 전송이 일어날 수 있는) 항목 상태 — 복원 때 작업(jobs)은 들여오지 않으므로 restoredItemStatus 로 바꾸고 restored_needs_review 를 켠다. */
 export const IN_FLIGHT_ITEM_STATUSES: readonly ItemStatus[] = ['QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED'];
+/**
+ * FIX-T10(P0, Codex review-T10 restore.ts:267): 복원 때 원격 결과를 정할 수 없는 항목 상태 — 전송이 시작됐거나(SENDING·REMOTE_PROCESSING·
+ * RECONCILING·CANCEL_REQUESTED) 이미 결과 불명(UNKNOWN). 이들은 UNKNOWN 으로 들여온다("reconcile or remain UNKNOWN" — BLOCKED·FAILED 로 바꾸지 않는다).
+ * 아직 보내지 않은 대기(QUEUED·RETRY_WAIT)만 BLOCKED 로 들여온다(보내지 않았음이 확실한 보류).
+ */
+export const RESTORE_AS_UNKNOWN_ITEM_STATUSES: readonly ItemStatus[] = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED'];
+
+/** 복원할 항목 상태: 진행 중이 아니면 null(그대로), 결과를 정할 수 없으면 UNKNOWN, 보내기 전 대기면 BLOCKED. */
+export function restoredItemStatus(status: string): 'UNKNOWN' | 'BLOCKED' | null {
+  if (!(IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(status)) return null;
+  return (RESTORE_AS_UNKNOWN_ITEM_STATUSES as readonly string[]).includes(status) ? 'UNKNOWN' : 'BLOCKED';
+}
 
 // 작업 상태(JOB_STATES)·전이 표는 jobs.ts(T11, D18).
 
@@ -103,17 +115,33 @@ export class VariantApprovedError extends AppError {
 
 // ---- canonical JSON·hash ----
 
+/** FIX-T10(P2): NFC 정규화 뒤 같아지는 키가 둘 이상이면 한 필드가 조용히 사라지므로 hash 계산을 거부한다. */
+export class CanonicalKeyCollisionError extends AppError {
+  constructor(key: string) {
+    super('bad_request', 'canonical_key_collision', 'NFC 정규화 뒤 같은 키가 둘 이상 있어 canonical JSON 을 만들 수 없습니다', { key });
+  }
+}
+
 function canon(v: unknown): unknown {
   if (typeof v === 'string') return v.normalize('NFC');
   if (Array.isArray(v)) return v.map((x) => (x === undefined ? null : canon(x)));
   if (v !== null && typeof v === 'object') {
     if (v instanceof Date) return v.toISOString();
     const o = v as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(o).sort()) {
+    // FIX-T10(P2): 키를 먼저 NFC 로 정규화하고, 정규화 뒤 중복이면 거부, 그 다음 정규화한 키로 정렬한다.
+    // 결과는 프로토타입 없는 객체 — '__proto__' 도 일반 키로 남는다(대입이 프로토타입을 바꾸지 않음).
+    const entries: Array<[string, unknown]> = [];
+    const seen = new Set<string>();
+    for (const k of Object.keys(o)) {
       if (o[k] === undefined) continue;
-      out[k.normalize('NFC')] = canon(o[k]);
+      const nk = k.normalize('NFC');
+      if (seen.has(nk)) throw new CanonicalKeyCollisionError(nk);
+      seen.add(nk);
+      entries.push([nk, o[k]]);
     }
+    entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const out = Object.create(null) as Record<string, unknown>;
+    for (const [k, x] of entries) out[k] = canon(x);
     return out;
   }
   if (typeof v === 'number' && !Number.isFinite(v)) throw new TypeError('canonical JSON 에 넣을 수 없는 숫자입니다');
@@ -219,6 +247,59 @@ export function buildCanonicalPayload(input: CanonicalPayloadInput): CanonicalPa
     provider_metadata: {},
     snapshot_version: SNAPSHOT_VERSION,
   };
+}
+
+/**
+ * FIX-T10(P1, Codex review-T10 bundle.ts:424): 저장·복원된 payload_json 의 구조(buildCanonicalPayload 출력 모양 그대로)를 엄격하게 검사한다.
+ * hash 는 맞지만 text·assets 가 빠진(또는 모르는 키가 더해진) 스냅샷은 상세 화면·어댑터를 깨뜨리고 항목이 불변이라 고칠 수도 없으므로
+ * 묶음 복원에서 승인 유무와 관계없이 모든 항목을 이 스키마로 검사한다. 채널마다 text 필드가 다르다(channelOutgoingText).
+ */
+const payloadUuid = z.string().refine((v) => isUuid(v), 'uuid');
+const payloadAssetSchema = z.strictObject({
+  id: payloadUuid,
+  checksum: z.string().regex(SHA256_HEX_RE),
+  role: z.enum(['image', 'video', 'thumbnail', 'attachment']),
+  order: z.int().min(1),
+  mime: z.string().min(1),
+});
+const payloadTextSchemas = {
+  threads: z.strictObject({ rendered: z.string(), posts: z.array(z.string()) }),
+  instagram: z.strictObject({ rendered: z.string(), caption: z.string(), cards: z.array(z.strictObject({ index: z.int().min(0), text: z.string() })) }),
+  youtube: z.strictObject({ rendered: z.string(), title: z.string(), description: z.string(), tags: z.array(z.string()) }),
+  blog: z.strictObject({ rendered: z.string(), title: z.string(), markdown: z.string() }),
+} as const satisfies Record<Channel, z.ZodType>;
+const payloadBase = {
+  content_version_id: payloadUuid,
+  variant_version_id: payloadUuid,
+  brand_profile_version_id: payloadUuid.nullable(),
+  channel_account_id: payloadUuid,
+  provider_account_id: z.string().min(1),
+  assets: z.array(payloadAssetSchema),
+  visibility: z.enum(VISIBILITIES),
+  scheduled_at_utc: z.iso.datetime().nullable(),
+  timezone: z.literal(SCHEDULE_TIMEZONE),
+  provider_metadata: z.strictObject({}),
+  snapshot_version: z.literal(SNAPSHOT_VERSION),
+};
+export const canonicalPayloadSchema = z
+  .discriminatedUnion('channel', [
+    z.strictObject({ ...payloadBase, channel: z.literal('threads'), text: payloadTextSchemas.threads }),
+    z.strictObject({ ...payloadBase, channel: z.literal('instagram'), text: payloadTextSchemas.instagram }),
+    z.strictObject({ ...payloadBase, channel: z.literal('youtube'), text: payloadTextSchemas.youtube }),
+    z.strictObject({ ...payloadBase, channel: z.literal('blog'), text: payloadTextSchemas.blog }),
+  ])
+  .superRefine((p, ctx) => {
+    // 첨부는 position 순(order 오름차순, 중복 없음) — buildCanonicalPayload 가 만드는 순서
+    for (let i = 1; i < p.assets.length; i++) {
+      if (p.assets[i]!.order <= p.assets[i - 1]!.order) ctx.addIssue({ code: 'custom', path: ['assets', i, 'order'], message: 'assets 는 order 오름차순·중복 없음' });
+    }
+  });
+
+/** payload_json 이 canonical payload 모양인지(아니면 문제 경로 목록, 맞으면 빈 배열). */
+export function canonicalPayloadProblems(payload: unknown): string[] {
+  const r = canonicalPayloadSchema.safeParse(payload);
+  if (r.success) return [];
+  return [...new Set(r.error.issues.map((i) => i.path.map(String).join('.') || '(root)'))].slice(0, 5);
 }
 
 // ---- 예약(MSK → UTC, A13) ----

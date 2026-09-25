@@ -876,6 +876,12 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
   if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
   return db.transaction(async (tx) => {
     const item = await lockItem(tx, ownerId, itemId);
+    // FIX-T10(P0): 복원 때 진행 중이던 항목(restored_needs_review)은 원격 결과를 모르므로 재시도(재전송)하지 않는다 — 결과 불명이면 outcome_unknown.
+    if (item.restoredNeedsReview) {
+      throw item.status === 'UNKNOWN'
+        ? new NotRetryableError('outcome_unknown', '복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.', { status: item.status, restored: true })
+        : new NotRetryableError('not_retryable', '복원 때 진행 중이던 항목은 다시 보내지 않습니다. 새 배포 계획을 만드세요.', { status: item.status, restored: true });
+    }
     const active = await activeApprovalsFor(tx, ownerId, [item.id]);
     const job = await latestJobForItem(tx, ownerId, item.id, true);
     if (item.status === 'PLANNED' && job?.state === 'BLOCKED') {

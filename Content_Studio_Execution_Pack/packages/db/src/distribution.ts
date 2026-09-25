@@ -11,7 +11,8 @@
  * - 실행 = QUEUED 작업 생성뿐(T11 이 처리). 모의 계정만 있으므로 결과는 항상 MOCK 이고 외부 호출·publisher 호출이 없다.
  *   HTTP 명령 멱등: execute_commands(owner, command_key) — 같은 key 재호출은 저장된 결과. 작업 멱등: jobs.idempotency_key unique
  *   ('publish:<item>:<approval>') + 항목당 진행 중 작업 1개(부분 unique). 동시 실행은 계획 행 잠금으로 직렬화되고, 진 쪽은 409 already_executed.
- * - 잠금 순서: contents → variants → distribution_plans → distribution_items → approvals → jobs(approval-invalidation.ts 와 같음).
+ * - 잠금 순서: channel_accounts → contents → variants → distribution_plans → distribution_items → approvals → jobs(approval-invalidation.ts 머리 주석).
+ *   FIX-T10: 계획 생성·승인·실행은 관련 계정을 FOR SHARE 로 먼저 잠그고(계정 상태 변경은 FOR UPDATE), 계획 생성은 원고·파생본도 INSERT 전에 잠근다.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
@@ -51,11 +52,13 @@ import {
   activeApprovalsFor,
   invalidateApprovalsForAccount,
   invalidateItems,
+  lockAccountsInOrder,
   lockItemsInOrder,
   recomputePlanStatus,
   requestCancelLocked,
   revokeActiveApprovalsLocked,
   settleApprovedVariants,
+  shareLockVariantsInOrder,
   type ApprovalRow,
   type DistributionItemRow,
   type InvalidationReason,
@@ -172,6 +175,7 @@ export function accountReady(a: Pick<ChannelAccountRow, 'kind' | 'state'>): bool
 export async function setChannelAccountState(db: Db, ownerId: string, accountId: string, state: AccountState, now: Date = new Date()) {
   if (!isUuid(accountId)) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
   return db.transaction(async (tx) => {
+    // 전역 잠금 순서의 첫 단계(계정 FOR UPDATE) — 승인·계획 생성·실행의 FOR SHARE 와 직렬화된 뒤 무효화 대상을 찾는다(FIX-T10 P1).
     const rows = await tx
       .select()
       .from(channelAccounts)
@@ -334,6 +338,18 @@ export interface CreatedPlan {
  */
 export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput, now: Date = new Date()): Promise<CreatedPlan> {
   return db.transaction(async (tx) => {
+    // FIX-T10(P1): 항목 INSERT 의 FK 잠금까지 포함한 전역 순서 — 계정(id 순) → 원고 → 파생본을 먼저 FOR SHARE 로 잠근다.
+    await lockAccountsInOrder(
+      tx,
+      ownerId,
+      input.items.map((it) => it.channel_account_id).filter((id) => isUuid(id)),
+      'share',
+    );
+    await shareLockVariantsInOrder(
+      tx,
+      ownerId,
+      input.items.map((it) => it.variant_id).filter((id) => isUuid(id)),
+    );
     const brand = await getCurrentBrandProfile(tx, ownerId);
     const seen = new Set<string>();
     const prepared: Array<Omit<typeof distributionItems.$inferInsert, 'planId'>> = [];
@@ -597,6 +613,17 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
       .from(distributionItems)
       .where(and(eq(distributionItems.ownerId, ownerId), eq(distributionItems.planId, plan.id), inArray(distributionItems.id, ids)));
     if (owned.length !== ids.length) throw new NotFoundError(ITEM_NOT_FOUND);
+    // FIX-T10(P1): 계정 준비 상태 검사·승인 INSERT 를 계정 상태 변경과 직렬화 — 계정(FOR SHARE)을 전역 순서의 처음에 잠근다.
+    const accountIds = await tx
+      .selectDistinct({ id: distributionItems.channelAccountId })
+      .from(distributionItems)
+      .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.id, ids)));
+    await lockAccountsInOrder(
+      tx,
+      ownerId,
+      accountIds.map((a) => a.id),
+      'share',
+    );
     const items = await lockItemsInOrder(tx, ownerId, ids);
     const notPlanned = items.filter((i) => i.status !== 'PLANNED');
     if (notPlanned.length) {
@@ -765,6 +792,17 @@ export async function executePlan(
   let outcome: { replay: ExecuteResult } | { stale: Array<{ item_id: string; reasons: string[] }> } | { result: ExecuteResult };
   try {
     outcome = await db.transaction(async (tx) => {
+      // FIX-T10(P1): 계정 → 계획 → 항목(전역 순서). 계정 준비 상태 재검사와 작업 INSERT 를 계정 상태 변경과 직렬화한다.
+      const planAccounts = await tx
+        .selectDistinct({ id: distributionItems.channelAccountId })
+        .from(distributionItems)
+        .where(and(eq(distributionItems.ownerId, ownerId), eq(distributionItems.planId, planId)));
+      await lockAccountsInOrder(
+        tx,
+        ownerId,
+        planAccounts.map((a) => a.id),
+        'share',
+      );
       const planRows = await tx
         .select()
         .from(distributionPlans)
@@ -985,6 +1023,7 @@ export function itemView(i: DistributionItemRow) {
     scheduled_at_utc: i.scheduledAtUtc ? i.scheduledAtUtc.toISOString() : null,
     schedule_timezone: i.scheduleTimezone,
     status: i.status,
+    restored_needs_review: i.restoredNeedsReview,
     payload_hash: i.payloadHash,
     payload: i.payloadJson,
   };

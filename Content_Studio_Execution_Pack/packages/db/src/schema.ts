@@ -1054,6 +1054,11 @@ export const distributionItems = pgTable(
     status: text('status').notNull().default('PLANNED'),
     createdAt: ts('created_at').notNull().defaultNow(),
     updatedAt: ts('updated_at').notNull().defaultNow(),
+    /**
+     * FIX-T10(0019): 복원 때 진행 중(작업은 복원하지 않음)이던 항목 — 자동 실행·재시도 금지, 사용자 확인 필요. 상태(UNKNOWN 등)와 별개의 속성이라
+     * 결과 불명 상태를 BLOCKED 로 덮어쓰지 않는다(D17 개정).
+     */
+    restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
   },
   (t) => [
     unique('distribution_items_local_key_uq').on(t.ownerId, t.planId, t.channelAccountId, t.variantVersionId, t.payloadHash),

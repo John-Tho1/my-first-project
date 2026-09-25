@@ -22,11 +22,11 @@ import path from 'node:path';
 import { and, count, eq, sql } from 'drizzle-orm';
 import {
   AppError,
-  IN_FLIGHT_ITEM_STATUSES,
   isUuid,
   NotFoundError,
   parseBundle,
   readZip,
+  restoredItemStatus,
   RESTORED_TABLES,
   rowHash,
   sha256Hex,
@@ -111,8 +111,10 @@ export interface ApplyReport {
   downgradedVariants: DowngradedVariant[];
   /** T08: 묶음에서 진행 중(queued·running)이던 전사 job — 복원 환경에서 다시 돌리지 않고 canceled 로 넣는다 */
   interruptedTranscriptions: string[];
-  /** T10(D17): 묶음에서 진행 중이던 배포 항목 — 작업(jobs)은 복원하지 않으므로 BLOCKED 로 넣는다(맹목 재전송 없음) */
+  /** T10(D17): 묶음에서 보내기 전 대기(QUEUED·RETRY_WAIT)이던 배포 항목 — 작업(jobs)은 복원하지 않으므로 BLOCKED 로 넣는다(맹목 재전송 없음) */
   blockedItems: string[];
+  /** FIX-T10(P0): 묶음에서 전송 중·결과 불명이던 항목 — UNKNOWN 그대로(또는 UNKNOWN 으로) 넣는다. BLOCKED·FAILED 로 덮어쓰지 않는다. */
+  unknownItems: string[];
   /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
   revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
 }
@@ -201,6 +203,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   const insertedContents: Array<{ id: string; currentVersionId: string | null }> = [];
   const insertedVariants: Array<{ id: string; currentVersionId: string | null }> = [];
   const blockedItems: string[] = [];
+  const unknownItems: string[] = [];
 
   for (const name of RESTORED_TABLES) {
     const rows = bundle.tables[name] as unknown as Array<Record<string, unknown> & { id: string }>;
@@ -263,11 +266,16 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         }
       }
       const overrides: Record<string, unknown> = name === 'contents' || name === 'variants' ? { current_version_id: null } : {};
-      // T10(D17): 작업은 복원하지 않는다 — 진행 중이던 항목은 BLOCKED 로 넣어 새 환경에서 다시 보내지 않게 한다.
-      const blockedItem = name === 'distribution_items' && (IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(String(row.status));
-      if (blockedItem) overrides.status = 'BLOCKED';
+      // T10(D17)·FIX-T10(P0): 작업은 복원하지 않는다 — 진행 중이던 항목은 새 환경에서 다시 보내지 않도록 restored_needs_review 를 켠다(자동 실행·재시도 금지).
+      // 상태는 결과를 정할 수 있을 때만 바꾼다: 보내기 전 대기(QUEUED·RETRY_WAIT) → BLOCKED, 전송 중·결과 불명 → UNKNOWN(그대로 보존).
+      const restoredStatus = name === 'distribution_items' ? restoredItemStatus(String(row.status)) : null;
+      if (restoredStatus) {
+        overrides.status = restoredStatus;
+        overrides.restored_needs_review = true;
+      }
       if (await insertBundleRow(tx, name, row, ownerId, overrides)) {
-        if (blockedItem) blockedItems.push(row.id);
+        if (restoredStatus === 'BLOCKED') blockedItems.push(row.id);
+        if (restoredStatus === 'UNKNOWN') unknownItems.push(row.id);
         counts.new++;
         map.set(row.id, 'inserted');
         if (name === 'assets') insertedAssetIds.push(row.id);
@@ -389,7 +397,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   for (const p of bundle.tables.distribution_plans) {
     if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
   }
-  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, revokedApprovals };
+  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, unknownItems, revokedApprovals };
 }
 
 /** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
@@ -431,8 +439,10 @@ export interface RestorePreview {
   downgraded_variants: DowngradedVariant[];
   /** T08: 복원하면 canceled 로 들어갈 진행 중 전사 job */
   interrupted_transcriptions: string[];
-  /** T10: 복원하면 BLOCKED 로 들어갈 진행 중 배포 항목(작업은 복원하지 않음) */
+  /** T10: 복원하면 BLOCKED 로 들어갈 보내기 전 대기 배포 항목(작업은 복원하지 않음) */
   blocked_items: string[];
+  /** FIX-T10: 복원하면 UNKNOWN 으로 들어갈(결과 불명 보존) 배포 항목 */
+  unknown_items: string[];
   /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
   revoked_approvals: ApplyReport['revokedApprovals'];
 }
@@ -493,6 +503,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     downgraded_variants: r.downgradedVariants,
     interrupted_transcriptions: r.interruptedTranscriptions,
     blocked_items: r.blockedItems,
+    unknown_items: r.unknownItems,
     revoked_approvals: r.revokedApprovals,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
@@ -626,6 +637,8 @@ export interface CommitResult {
   interrupted_transcriptions: string[];
   /** T10 */
   blocked_items: string[];
+  /** FIX-T10 */
+  unknown_items: string[];
   revoked_approvals: ApplyReport['revokedApprovals'];
 }
 
@@ -729,6 +742,7 @@ export async function commitRestore(
         downgraded_variants: report.downgradedVariants,
         interrupted_transcriptions: report.interruptedTranscriptions,
         blocked_items: report.blockedItems,
+        unknown_items: report.unknownItems,
         revoked_approvals: report.revokedApprovals,
         assets_written: written,
         assets_verified: verified,

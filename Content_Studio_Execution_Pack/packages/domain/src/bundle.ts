@@ -16,7 +16,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CONTENT_LIFECYCLES } from './content';
-import { MOCK_EXTERNAL_PREFIX, payloadHash } from './distribution';
+import { canonicalPayloadProblems, MOCK_EXTERNAL_PREFIX, payloadHash, PLAN_STATUSES } from './distribution';
 import { AppError } from './errors';
 import { extensionForMime, isValidStorageKey } from './media';
 import { formatMsk } from './time';
@@ -416,7 +416,8 @@ export const ROW_SCHEMAS = {
   distribution_plans: z.strictObject({
     id: uuid,
     target_summary: str,
-    status: z.enum(['draft', 'partially_approved', 'approved', 'executing', 'partial', 'completed', 'canceled', 'failed']),
+    // FIX-T10: T12(0018) 의 'attention'(확인 필요)도 — 없으면 결과 불명 항목이 있는 계획을 내보낸 묶음을 복원하지 못한다.
+    status: z.enum(PLAN_STATUSES),
     revision: int.min(1),
     created_at: ts,
     updated_at: ts,
@@ -453,6 +454,8 @@ export const ROW_SCHEMAS = {
     ]),
     created_at: ts,
     updated_at: ts,
+    // FIX-T10(0019): 복원 때 진행 중이던 항목 표시(자동 실행 금지·사용자 확인 필요). 0019 이전 묶음에는 없으므로 기본 false.
+    restored_needs_review: z.boolean().default(false),
   }),
   approvals: z.strictObject({
     id: uuid,
@@ -1279,6 +1282,9 @@ function checkDistributionIntegrity(
     } catch {
       hash = null;
     }
+    // FIX-T10(P1): hash 가 맞아도 구조가 canonical payload 가 아니면(text·assets 누락 등) 거부 — 승인 유무와 관계없이 모든 항목.
+    const shape = canonicalPayloadProblems(i.payload_json);
+    if (shape.length) problems.push(`distribution_items[${i.id}].payload_json 구조: ${shape.join(', ')}`);
     const p = i.payload_json;
     if (
       hash !== i.payload_hash ||
@@ -1286,6 +1292,9 @@ function checkDistributionIntegrity(
       p.content_version_id !== i.content_version_id ||
       p.channel_account_id !== i.channel_account_id ||
       p.visibility !== i.visibility ||
+      p.brand_profile_version_id !== i.brand_profile_id ||
+      p.timezone !== i.schedule_timezone ||
+      (variant && p.channel !== variant.channel) ||
       p.scheduled_at_utc !== (i.scheduled_at_utc === null ? null : new Date(i.scheduled_at_utc).toISOString()) ||
       (acc && p.provider_account_id !== acc.external_account_id)
     ) {

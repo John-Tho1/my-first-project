@@ -2,14 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
   approveSchema,
   buildCanonicalPayload,
+  CanonicalKeyCollisionError,
   canItemTransition,
   canonicalJson,
+  canonicalPayloadProblems,
   canVariantTransition,
   computePlanStatus,
   executeSchema,
   InvalidScheduleError,
   payloadHash,
   planCreateSchema,
+  restoredItemStatus,
   revokeSchema,
   scheduleFromMsk,
   ScheduleInPastError,
@@ -226,5 +229,78 @@ describe('상태 규칙', () => {
     expect(computePlanStatus([{ status: 'QUEUED', activeApproval: true }, P(false)])).toBe('executing');
     expect(computePlanStatus([{ status: 'CONFIRMED', activeApproval: true }])).toBe('completed');
     expect(computePlanStatus([{ status: 'CONFIRMED', activeApproval: true }, { status: 'FAILED', activeApproval: true }])).toBe('partial');
+  });
+});
+
+describe('FIX-T10(P2) canonicalJson — NFC 정규화 키 충돌·__proto__', () => {
+  it('정규화 뒤 같아지는 키 둘은 거부(한 필드가 조용히 사라지지 않음)', () => {
+    const collide = JSON.parse('{"e\u0301":1,"\u00e9":2}') as Record<string, unknown>;
+    expect(Object.keys(collide)).toHaveLength(2);
+    expect(() => canonicalJson(collide)).toThrow(CanonicalKeyCollisionError);
+    expect(() => payloadHash(collide)).toThrow(CanonicalKeyCollisionError);
+    expect(() => payloadHash({ nested: [collide] })).toThrow(CanonicalKeyCollisionError);
+    try {
+      canonicalJson(collide);
+    } catch (e) {
+      expect((e as CanonicalKeyCollisionError).code).toBe('canonical_key_collision');
+    }
+    // 충돌 없는 분해형 키 하나는 NFC 로 정규화돼 완성형과 같다
+    expect(canonicalJson({ ['é']: 1 })).toBe(canonicalJson({ ['é']: 1 }));
+  });
+  it('__proto__ 키는 일반 키로 남는다(프로토타입을 바꾸지 않음)', () => {
+    const withProto = JSON.parse('{"__proto__":{"x":1},"a":2}') as Record<string, unknown>;
+    expect(canonicalJson(withProto)).toBe('{"__proto__":{"x":1},"a":2}');
+    expect(payloadHash(withProto)).not.toBe(payloadHash({ a: 2 }));
+    expect(JSON.parse(canonicalJson(withProto))).toEqual(withProto);
+  });
+  it('정규화한 키로 정렬한다', () => {
+    expect(canonicalJson({ b: 1, ['가']: 2, a: 3 })).toBe(`{"a":3,"b":1,"가":2}`);
+  });
+});
+
+describe('FIX-T10(P1) canonicalPayloadSchema — 복원 payload 구조', () => {
+  const input: CanonicalPayloadInput = {
+    contentVersionId: U1,
+    variantVersionId: U2,
+    brandProfileVersionId: U1,
+    channelAccountId: U2,
+    providerAccountId: 'mock:instagram:x',
+    channel: 'instagram',
+    body: '본문',
+    metadata: { caption: '캡션', cards: [{ index: 1, text: '카드' }] },
+    assets: [{ id: U1, checksum: H, role: 'image', position: 1, mime: 'image/png' }],
+    visibility: 'private',
+    scheduledAtUtc: new Date('2030-01-01T00:00:00.000Z'),
+    timezone: 'Europe/Moscow',
+  };
+  it('buildCanonicalPayload 출력(채널 4개)은 통과', () => {
+    expect(canonicalPayloadProblems(buildCanonicalPayload(input))).toEqual([]);
+    for (const channel of ['threads', 'youtube', 'blog'] as const) {
+      expect(canonicalPayloadProblems(buildCanonicalPayload({ ...input, channel, assets: [], scheduledAtUtc: null })), channel).toEqual([]);
+    }
+    // JSON 왕복(jsonb 저장 뒤 모양)도 통과
+    expect(canonicalPayloadProblems(JSON.parse(JSON.stringify(buildCanonicalPayload(input))))).toEqual([]);
+  });
+  it('text·assets 제거, 모르는 키, 다른 채널의 text 모양, 첨부 필드 누락·순서 뒤집힘, snapshot_version 다름 → 문제', () => {
+    const p = JSON.parse(JSON.stringify(buildCanonicalPayload(input))) as Record<string, unknown>;
+    const without = (k: string) => Object.fromEntries(Object.entries(p).filter(([x]) => x !== k));
+    expect(canonicalPayloadProblems(without('text'))).toContain('text');
+    expect(canonicalPayloadProblems(without('assets'))).toContain('assets');
+    expect(canonicalPayloadProblems({ ...p, extra: 1 }).length).toBeGreaterThan(0);
+    expect(canonicalPayloadProblems({ ...p, text: { rendered: 'x', posts: ['x'] } }).length).toBeGreaterThan(0);
+    expect(canonicalPayloadProblems({ ...p, assets: [{ id: U1, checksum: H, role: 'image', order: 1 }] }).length).toBeGreaterThan(0);
+    const a = { id: U1, checksum: H, role: 'image', mime: 'image/png' };
+    expect(canonicalPayloadProblems({ ...p, assets: [{ ...a, order: 2 }, { ...a, id: U2, order: 1 }] })).toContain('assets.1.order');
+    expect(canonicalPayloadProblems({ ...p, snapshot_version: 2 })).toContain('snapshot_version');
+    expect(canonicalPayloadProblems({ ...p, provider_metadata: { token: 'x' } }).length).toBeGreaterThan(0);
+    expect(canonicalPayloadProblems(null)).toEqual(['(root)']);
+  });
+});
+
+describe('FIX-T10(P0) restoredItemStatus — 복원은 결과 불명을 BLOCKED 로 덮어쓰지 않는다', () => {
+  it('전송 중·결과 불명 → UNKNOWN, 보내기 전 대기 → BLOCKED, 그 밖 → 그대로(null)', () => {
+    for (const s of ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED']) expect(restoredItemStatus(s), s).toBe('UNKNOWN');
+    for (const s of ['QUEUED', 'RETRY_WAIT']) expect(restoredItemStatus(s), s).toBe('BLOCKED');
+    for (const s of ['PLANNED', 'CONFIRMED', 'BLOCKED', 'CANCELED', 'FAILED', 'PARTIAL']) expect(restoredItemStatus(s), s).toBeNull();
   });
 });

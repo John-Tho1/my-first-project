@@ -132,6 +132,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       </p>
       <p className="meta">
         <span className="tag">{ITEM_STATUS_LABEL[x.item.status] ?? x.item.status}</span>
+        {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
         <span>공개 범위: {VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility}</span>
         <span>
           일정: {scheduled ? `${formatMsk(scheduled)} (UTC ${scheduled.toISOString()})` : '즉시(실행 후 대기열)'}

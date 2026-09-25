@@ -23,6 +23,7 @@ import {
 } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { DiffView } from '../../../lib/diff-view';
+import { proposalActions } from '../../../lib/proposals';
 
 export interface ProposalView {
   id: string;
@@ -96,7 +97,8 @@ export function WritingPanel({
   const claims = run ? claimsOf(run.outputJson) : [];
   const adopted = run ? state.adopted.has(run.id) : false;
   // FIX-T09(P1): 채택·무시 여부는 run.proposal_status 로 본다.
-  const canAdopt = run?.status === 'succeeded' && proposal !== null && run.inputVersionId === current.id && !adopted && run.proposalStatus === 'proposed';
+  // FIX-T09(P1)·round 2(P2): 채택·무시 판정은 proposal_status 기준, 무시는 채택 가능 여부와 따로.
+  const { canAdopt, canDismiss } = proposalActions(run, { hasProposal: proposal !== null, currentVersionId: current.id, adopted });
 
   return (
     <>
@@ -223,10 +225,7 @@ export function WritingPanel({
                 {canAdopt ? (
                   <form className="form inline" method="post" action={`/api/contents/${contentId}/assist/${run.id}/adopt`}>
                     <input type="hidden" name="base_version" value={current.version} />
-                    <button type="submit">제안 채택(새 버전으로 저장)</button>{' '}
-                    <button type="submit" formAction={`/api/contents/${contentId}/assist/${run.id}/dismiss`}>
-                      무시(목록에서 빼기)
-                    </button>
+                    <button type="submit">제안 채택(새 버전으로 저장)</button>
                   </form>
                 ) : (
                   <p className="note">
@@ -234,9 +233,14 @@ export function WritingPanel({
                       ? '이 제안은 채택되었습니다.'
                       : run.proposalStatus === 'dismissed'
                         ? '무시한 제안입니다(버전 목록에는 남아 있습니다).'
-                      : '이 제안은 지금 본문이 아닌 이전 버전을 기준으로 만들어져 채택할 수 없습니다. 새로 요청하세요.'}
+                      : '이 제안은 지금 본문이 아닌 이전 버전을 기준으로 만들어져 채택할 수 없습니다. 새로 요청하거나 무시하세요.'}
                   </p>
                 )}
+                {canDismiss ? (
+                  <form className="form inline" method="post" action={`/api/contents/${contentId}/assist/${run.id}/dismiss`}>
+                    <button type="submit">무시(목록에서 빼기)</button>
+                  </form>
+                ) : null}
               </>
             ) : null}
             {claims.length > 0 ? (

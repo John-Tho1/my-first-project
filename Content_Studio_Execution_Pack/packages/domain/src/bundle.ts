@@ -246,7 +246,8 @@ export const ROW_SCHEMAS = {
     // 0009 열(채널 초안 run). 이전 묶음에는 없으므로 null.
     variant_id: uuid.nullable().default(null),
     // 0011 열. 이전 묶음에는 없으므로 'proposed'(채택 여부는 버전 행으로 따로 남아 있다).
-    proposal_status: z.enum(['proposed', 'adopted', 'dismissed']).default('proposed'),
+    // FIX-T09 round 2: 없으면 parseBundle 이 채택 이력(ai_run_id 를 가진 사용자 버전)으로 채운다(fillProposalStatus).
+    proposal_status: z.enum(['proposed', 'adopted', 'dismissed']).optional(),
   }),
   claim_confirmations: z.strictObject({
     id: uuid,
@@ -781,6 +782,7 @@ export function parseBundle(entries: readonly ZipEntry[], opts: ParseBundleOptio
   }
 
   fillAnswerSeq(tables.interview_answers);
+  fillProposalStatus(tables);
   checkIntegrity(tables);
 
   // asset: manifest 목록 = assets 표, 파일 바이트 checksum = assets.checksum
@@ -819,6 +821,25 @@ export function parseBundle(entries: readonly ZipEntry[], opts: ParseBundleOptio
 }
 
 /** 0006 이전 묶음의 interview_answers.seq 를 원고별 (created_at, id) 순서로 1..n 채운다. 이미 있으면 그대로 둔다. */
+/** run id → 그 run 을 ai_run_id 로 가진 사용자 버전(원고·파생본)이 있는가 */
+function adoptedRunIds(t: Pick<BundleTables, 'content_versions' | 'variant_versions'>): Set<string> {
+  const out = new Set<string>();
+  for (const v of t.content_versions) if (v.created_by === 'owner' && v.ai_run_id) out.add(v.ai_run_id);
+  for (const v of t.variant_versions) if (v.created_by === 'owner' && v.ai_run_id) out.add(v.ai_run_id);
+  return out;
+}
+
+/**
+ * FIX-T09 round 2(P1): 0011 이전 묶음에는 proposal_status 가 없다 — 채택 이력으로 채운다('adopted' | 'proposed').
+ * migration 0011 의 채움과 같은 규칙. 이미 있으면 그대로 두고, 모순은 checkIntegrity 가 거부한다.
+ */
+export function fillProposalStatus(t: Pick<BundleTables, 'content_versions' | 'variant_versions' | 'generation_runs'>): void {
+  const adopted = adoptedRunIds(t);
+  for (const r of t.generation_runs) {
+    if (r.proposal_status === undefined) (r as { proposal_status?: string }).proposal_status = adopted.has(r.id) ? 'adopted' : 'proposed';
+  }
+}
+
 export function fillAnswerSeq(rows: Array<{ id: string; content_id: string; created_at: string; seq?: number | undefined }>): void {
   if (rows.every((r) => r.seq !== undefined)) return;
   const sorted = [...rows].sort((a, b) =>
@@ -931,6 +952,15 @@ export function checkIntegrity(t: BundleTables): void {
     }
   }
   for (const r of t.claims) need('claims', 'variant_version_id', r.variant_version_id, 'variant_versions');
+  // FIX-T09 round 2(P1): 제안 상태와 채택 이력이 맞아야 한다 — 'adopted' 인데 채택 버전이 없거나, 채택 버전이 있는데 'adopted' 가 아니면 거부.
+  {
+    const adopted = adoptedRunIds(t);
+    for (const r of t.generation_runs) {
+      if (r.proposal_status === undefined) continue;
+      if (r.proposal_status === 'adopted' && !adopted.has(r.id)) problems.push('generation_runs.proposal_status=adopted → 채택 버전 없음');
+      if (r.proposal_status !== 'adopted' && adopted.has(r.id)) problems.push('generation_runs.proposal_status ≠ adopted → 채택 버전 있음');
+    }
+  }
   // FIX-T09(P1): AI 참조는 같은 파생본·같은 run 이어야 한다(같은 원고의 다른 채널 run 으로 바꿔치기한 묶음 거부).
   const runById = new Map(t.generation_runs.map((r) => [r.id, r]));
   const vvById = new Map(t.variant_versions.map((v) => [v.id, v]));

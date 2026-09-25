@@ -591,3 +591,82 @@ describe('FIX-T09(Codex review-T09)', () => {
     expect((await packageGET(new Request(`${BASE}/api/packages/${pb.package_id}`, { headers: cookieHeader(tokenA) }), ctx(pb.package_id))).status).toBe(200);
   });
 });
+
+describe('FIX-T09 round 2(Codex review-FIX-T09)', () => {
+  const EXP = '제가 직접 대리점 대표를 설득했습니다.';
+  const rebuild = (parsed: Awaited<ReturnType<typeof parseBundleZip>>, tables: BundleTables) =>
+    writeZip(
+      buildBundle({
+        exportId: randomUUID(),
+        exportedAt: new Date().toISOString(),
+        appVersion: parsed.manifest.app_version,
+        migrations: parsed.manifest.schema_migrations,
+        owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+        tables,
+        assetBytes: new Map(parsed.assetBytes),
+      }).entries,
+    );
+
+  it('P1 복원 claim 게이트: 본문에서만 빠지고 카드에 남은 경험 문장(이전 버그로 review 된 묶음) → draft 로 낮추고 unresolved_claims', async () => {
+    const id = await newContent(ownerA, `${EXP}\n\n두 번째 문단입니다.`);
+    const ai = await (await createVariant(id, { channel: 'instagram', mode: 'ai_draft', base_version: 1 })).json();
+    const v = ai.variant.id as string;
+    await adopt(v, ai.proposal.id, { base_version: 0 }); // v2
+    await attach(v, { base_version: 2, assets: [{ asset_id: pngA, position: 1, role: 'image' }] }); // v3
+    await edit(v, { base_version: 3, body: '뺀 캡션', metadata: { caption: '뺀 캡션', cards: [{ index: 1, text: '다른 카드' }] } }); // v4
+    const expIdx = (ai.claims as Array<{ kind: string }>).map((c, i) => (c.kind === 'experience' ? i : -1)).filter((i) => i >= 0);
+    expect((await confirmPOST(jsonPost(`/api/contents/${id}/claims/confirm`, { run_id: ai.run.id, claim_indexes: expIdx, resolution: 'removed' }, cookieHeader(tokenA)), ctx(id))).status).toBe(200);
+    expect((await lifecycle(v, { lifecycle: 'review', base_version: 4 })).status).toBe(200);
+
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'r2-exports') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const tables = structuredClone(parsed.tables) as BundleTables;
+    const variantRow = tables.variants.find((x) => x.id === v)!;
+    const cur = tables.variant_versions.find((x) => x.id === variantRow.current_version_id)!;
+    cur.metadata_json = { caption: '뺀 캡션', cards: [{ index: 1, text: EXP }] }; // 이전 버그 상태: 카드에 경험 문장이 남음
+    const zip = rebuild(parsed, tables);
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'r2-claims-t09@example.local')).id;
+      const restoresDir = path.join(tmp, 'r2-restores');
+      const p = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+      const r = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-r2')), target, p.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      expect(r.downgraded_variants.find((d) => d.variant_id === v)).toMatchObject({ channel: 'instagram', reasons: ['unresolved_claims'] });
+      expect((await h.db.select().from(schema.variants).where(eq(schema.variants.id, v)))[0]!.lifecycle).toBe('draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('P1 add_missing: 이미 있는(동일) 파생본 버전에 첨부를 새로 붙이는 묶음 → immutable_version 충돌, 첨부·review 그대로', async () => {
+    const id = await newContent();
+    const v = (await (await createVariant(id, { channel: 'youtube', mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    await attach(v, { base_version: 1, assets: [{ asset_id: videoA, position: 1, role: 'video' }] }); // v2
+    expect((await lifecycle(v, { lifecycle: 'review', base_version: 2 })).status).toBe(200);
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'r2b-exports') });
+    const zipBytes = new Uint8Array(readFileSync(exported.zipPath));
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'r2-assets-t09@example.local')).id;
+      const restoresDir = path.join(tmp, 'r2b-restores');
+      const assetsDir = path.join(tmp, 'assets-r2b');
+      const first = await createRestorePreview(h.db, target, zipBytes, { restoresDir, source: 'upload' });
+      await commitRestore(h.db, new LocalStorageAdapter(assetsDir), target, first.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+
+      const parsed = await parseBundleZip(zipBytes);
+      const tables = structuredClone(parsed.tables) as BundleTables;
+      const cur = tables.variants.find((x) => x.id === v)!.current_version_id!;
+      const extraId = randomUUID();
+      tables.variant_assets.push({ id: extraId, variant_version_id: cur, asset_id: videoA, position: 2, role: 'video' }); // 두 번째 영상
+      const p = await createRestorePreview(h.db, target, rebuild(parsed, tables), { restoresDir, source: 'upload' });
+      expect(p.preview.conflicts).toEqual(expect.arrayContaining([{ table: 'variant_assets', id: extraId, reason: 'immutable_version' }]));
+      const r = await commitRestore(h.db, new LocalStorageAdapter(assetsDir), target, p.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+      expect(r.restored.variant_assets).toBe(0);
+      const attached = await h.db.select().from(schema.variantAssets).where(eq(schema.variantAssets.variantVersionId, cur));
+      expect(attached).toHaveLength(1);
+      expect((await h.db.select().from(schema.variants).where(eq(schema.variants.id, v)))[0]!.lifecycle).toBe('review');
+    } finally {
+      await h.close();
+    }
+  });
+});

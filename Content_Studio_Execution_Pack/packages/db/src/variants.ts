@@ -53,7 +53,7 @@ import { claimsOf, listUnconfirmedExperienceClaims } from './claims-gate';
 import type { Db } from './client';
 import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './contents';
 import { recordAudit, type DbOrTx } from './queries';
-import { assets, claimConfirmations, generationRuns, variantAssets, variants, variantVersions } from './schema';
+import { assets, claimConfirmations, contents, generationRuns, variantAssets, variants, variantVersions } from './schema';
 import { getCurrentBrandProfile, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
 
 export type VariantRow = typeof variants.$inferSelect;
@@ -646,6 +646,34 @@ async function unresolvedVariantClaims(tx: DbOrTx, ownerId: string, channel: Cha
     confirmations,
     renderVariantText(channel, current.body, current.metadataJson),
   );
+}
+
+/**
+ * FIX-T09 round 2: 파생본이 review 로 갈 수 없는 이유 목록(없으면 []). 검토 요청과 복원 사후 검사가 같은 규칙을 쓴다.
+ * 'no_current_version' | 'stale' | 'media_incomplete:<항목>' | 'unresolved_claims'(원고 + 이 파생본의 채택 AI 제안, 나가는 글 전체 기준).
+ */
+export async function variantReviewBlockers(tx: DbOrTx, ownerId: string, variantId: string): Promise<string[]> {
+  const v = await getVariantRow(tx, ownerId, variantId);
+  if (!v) return ['no_current_version'];
+  const current = await getVersionRow(tx, ownerId, v.currentVersionId);
+  if (!current) return ['no_current_version'];
+  const reasons: string[] = [];
+  const content = await getContentRowForVariant(tx, ownerId, v.contentId);
+  if (isVariantStale(current.contentVersionId, content?.currentVersionId ?? null)) reasons.push('stale');
+  const media = mediaCompleteness(v.channel as Channel, await attachedAssets(tx, ownerId, current.id));
+  if (!media.complete) reasons.push(...media.missing.map((m) => `media_incomplete:${m}`));
+  const pending = [...(await listUnconfirmedExperienceClaims(tx, ownerId, v.contentId)), ...(await unresolvedVariantClaims(tx, ownerId, v.channel as Channel, current))];
+  if (pending.length > 0) reasons.push('unresolved_claims');
+  return reasons;
+}
+
+async function getContentRowForVariant(tx: DbOrTx, ownerId: string, contentId: string) {
+  const rows = await tx
+    .select({ currentVersionId: contents.currentVersionId })
+    .from(contents)
+    .where(and(eq(contents.id, contentId), eq(contents.ownerId, ownerId)))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 /**

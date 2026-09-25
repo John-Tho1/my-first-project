@@ -274,7 +274,8 @@ describe('FIX-T06 묶음 무결성: ai_run_id·답변 seq', () => {
           created_at: TS,
           finished_at: TS,
           variant_id: null,
-          proposal_status: 'proposed',
+          // 채택 이력과 맞춘다(FIX-T09 round 2 검사)
+          proposal_status: adoptedRun ? ('adopted' as const) : ('proposed' as const),
         },
       ],
       claim_confirmations: [],
@@ -520,5 +521,55 @@ describe('FIX-T07 round 2: 출처 정제 범위(source_refs 에 기대지 않음
     );
     expect(r.output.proposed_text).toBe(`출처: HTTPS://Example.com/report/. 그리고 [출처 ${id}]`);
     expect(r.redactedTotal).toBe(0);
+  });
+});
+
+describe('FIX-T09 round 2: proposal_status 채움·모순 검사', () => {
+  const OWNER = '11111111-1111-4111-8111-111111111111';
+  const BP = '22222222-2222-4222-8222-222222222222';
+  const CT = '33333333-3333-4333-8333-333333333333';
+  const CV1 = '44444444-4444-4444-8444-444444444441';
+  const CV2 = '44444444-4444-4444-8444-444444444442';
+  const CV3 = '44444444-4444-4444-8444-444444444443';
+  const R1 = '77777777-7777-4777-8777-777777777771';
+  const TS = '2026-09-01T06:10:00.123456Z';
+  function build(opts: { adopted: boolean; status?: 'proposed' | 'adopted' | 'dismissed' }) {
+    const versions = [
+      { id: CV1, content_id: CT, version: 1, body: 'b', created_by: 'owner', ai_run_id: null, created_at: TS, note: null },
+      { id: CV2, content_id: CT, version: 2, body: 'p', created_by: 'ai:mock', ai_run_id: R1, created_at: TS, note: null },
+      ...(opts.adopted ? [{ id: CV3, content_id: CT, version: 3, body: 'p', created_by: 'owner', ai_run_id: R1, created_at: TS, note: null }] : []),
+    ];
+    const r: Record<string, unknown> = {
+      id: R1, content_id: CT, mode: 'draft', input_version_id: CV1, brand_profile_id: BP, input_version_refs: {}, prompt_version: 'v', provider: 'mock', model: 'mock',
+      status: 'succeeded', output_ref: CV2, output_json: { claims: [] }, error: null, created_at: TS, finished_at: TS, variant_id: null,
+    };
+    if (opts.status) r.proposal_status = opts.status;
+    const tables = {
+      users: [{ id: OWNER, identity_masked: 'ow***@example.local' }],
+      brand_profiles: [{ id: BP, version: 1, pen_name: 'p', audience: 'a', pillars: ['x'], style_rules: [], created_at: TS }],
+      sources: [], source_versions: [], captures: [], capture_revisions: [], ideas: [], idea_captures: [],
+      contents: [{ id: CT, idea_id: null, series: null, title: 't', audience: null, tags: [], revision: 1, current_version_id: opts.adopted ? CV3 : CV1, lifecycle: 'draft', created_at: TS, updated_at: TS }],
+      content_versions: versions,
+      content_captures: [], variants: [], variant_versions: [], interview_answers: [],
+      generation_runs: [r],
+      claim_confirmations: [], claims: [], claim_sources: [], usage_ledger: [], assets: [], variant_assets: [], audit_events: [],
+    } as unknown as BundleTables;
+    return buildBundle({
+      exportId: '88888888-8888-4888-8888-888888888888', exportedAt: '2026-09-24T12:00:00.000Z', appVersion: '0.1.0', migrations: ['0000_a'],
+      owner: { id: OWNER, identityMasked: 'ow***@example.local' }, tables, assetBytes: new Map(),
+    }).entries;
+  }
+  const status = (e: ReturnType<typeof build>) => parseBundle(e, { migrations: ['0000_a'] }).tables.generation_runs[0]!.proposal_status;
+
+  it('0011 이전 묶음(상태 없음): 채택 버전이 있으면 adopted, 없으면 proposed', () => {
+    expect(status(build({ adopted: true }))).toBe('adopted');
+    expect(status(build({ adopted: false }))).toBe('proposed');
+  });
+  it('명시한 상태가 채택 이력과 모순이면 integrity 거부', () => {
+    expect(() => status(build({ adopted: true, status: 'proposed' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => status(build({ adopted: true, status: 'dismissed' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => status(build({ adopted: false, status: 'adopted' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(status(build({ adopted: false, status: 'dismissed' }))).toBe('dismissed');
+    expect(status(build({ adopted: true, status: 'adopted' }))).toBe('adopted');
   });
 });

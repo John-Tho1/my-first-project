@@ -32,15 +32,12 @@ import {
   type BundleManifest,
   type ParsedBundle,
   type RestoredTable,
-  isVariantStale,
-  mediaCompleteness,
-  type Channel,
 } from '@cs/domain';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
 import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
-import { attachedAssets } from './variants';
+import { variantReviewBlockers } from './variants';
 import { assets, captures, contents, ideas, restoreRuns, sources } from './schema';
 
 export type RestoreMode = 'empty_only' | 'add_missing';
@@ -93,7 +90,7 @@ export interface RestoreConflict {
   table: RestoredTable;
   id: string;
   /** different: 같은 owner 의 같은 ID 가 내용이 다름 / id_in_use: 다른 owner 가 쓰는 ID / dependency: 부모 행이 복원되지 않음 / unique: 다른 unique 값 충돌 / version_exists: 같은 버전의 브랜드 프로필이 다름 */
-  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists';
+  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version';
 }
 
 export interface DowngradedVariant {
@@ -218,6 +215,11 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         conflict(row.id, 'dependency');
         continue;
       }
+      // FIX-T09 round 2(P1): 이미 있던(동일) 파생본 버전에 첨부를 새로 붙이지 않는다 — 버전은 불변이고, 붙이면 검토 조건(미디어)이 바뀐다.
+      if (name === 'variant_assets' && avail.variant_versions!.get(String(row.variant_version_id)) === 'same') {
+        conflict(row.id, 'immutable_version');
+        continue;
+      }
       if (name === 'brand_profiles') {
         // (owner, version) unique: 같은 버전이 이미 있으면(예: seed) 내용이 같을 때만 "동일", 다르면 충돌. 덮어쓰지 않는다.
         // 같은 (owner, version) 이 다른 ID 로 이미 있으면(예: seed) 내용이 같아도 충돌이다 — 묶음의 ID 가 보존되지 않기 때문(결정 D6: ID 보존).
@@ -294,19 +296,11 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   // FIX-T09(P1): 이번에 넣은 review 파생본을 복원된 행(현재 버전·원고 현재 버전·실제 첨부 관계)으로 다시 검사하고,
   // 조건을 못 채우면 draft 로 낮춘다(검토 상태를 조건 없이 들여오지 않는다). 결과·미리보기에 이유와 함께 남긴다.
   const downgradedVariants: DowngradedVariant[] = [];
-  const vvById = new Map(bundle.tables.variant_versions.map((v) => [v.id, v]));
   for (const v of bundle.tables.variants) {
     if (avail.variants!.get(v.id) !== 'inserted' || v.lifecycle !== 'review') continue;
-    const reasons: string[] = [];
-    const vv = v.current_version_id ? vvById.get(v.current_version_id) : undefined;
-    if (!vv) reasons.push('no_current_version');
-    else {
-      const cur = await tx.execute(sql`select current_version_id from contents where id = ${v.content_id}::uuid and owner_id = ${ownerId}::uuid`);
-      const contentCurrent = ((cur as unknown as { rows: Array<{ current_version_id: string | null }> }).rows[0]?.current_version_id) ?? null;
-      if (isVariantStale(vv.content_version_id, contentCurrent)) reasons.push('stale');
-      const media = mediaCompleteness(v.channel as Channel, await attachedAssets(tx, ownerId, vv.id));
-      if (!media.complete) reasons.push(...media.missing.map((m) => `media_incomplete:${m}`));
-    }
+    // FIX-T09 round 2(P1): 검토 요청과 같은 조건(현재 버전·stale·미디어·원고와 파생본의 미해결 경험 claim — 파생본은 나가는 글 전체 기준)을
+    // 복원된 행(claim_confirmations 포함)으로 검사한다.
+    const reasons = await variantReviewBlockers(tx, ownerId, v.id);
     if (reasons.length) {
       await tx.execute(sql`update variants set lifecycle = 'draft' where id = ${v.id}::uuid and owner_id = ${ownerId}::uuid`);
       downgradedVariants.push({ variant_id: v.id, channel: v.channel, reasons });

@@ -118,7 +118,13 @@ export function acquireDirLock(dir: string): () => void {
     try {
       writeFileSync(/*turbopackIgnore: true*/ file, token, { flag: 'wx' });
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EBUSY') {
+        // Windows: 다른 프로세스가 같은 파일을 지우거나 읽는 순간 열기 자체가 EPERM/EBUSY 로 실패할 수 있다 → 일시 오류로 보고 재시도
+        sleepSync(RETRY_WAIT_MS);
+        continue;
+      }
+      if (code !== 'EEXIST') throw e;
       const v = judge(file);
       if (v.kind === 'held') throw new DbLockedError(v.pid);
       if (v.kind === 'stale') reclaimStale(file, v.raw);

@@ -162,6 +162,13 @@
       "when": 1790329497368,
       "tag": "0022_t11_fix2_pre_intent_expiry",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790331113467,
+      "tag": "0023_t11_fix3_normalize_attempt",
+      "breakpoints": true
     }
   ]
 }

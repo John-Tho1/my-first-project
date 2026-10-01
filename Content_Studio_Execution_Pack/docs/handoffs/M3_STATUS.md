@@ -31,3 +31,8 @@ D17~D19(클라우드) → D20(로컬 확정: D19-a~d 권고안, M4 보류) + D20
 
 ## 다음
 D20: M4/T13(OAuth·비밀 암호화)은 사용자가 첫 채널(Threads 권고)·앱 등록·scope·테스트 계정·마스터 키 보관 방식을 확인해 줄 때까지 착수하지 않음. 그 전 가능한 것: T20(모니터링·백업) mock 부분.
+
+## M3 화면 검증 FIX (2026-09-30~10-01, 로컬)
+사용자 체크리스트 12항목은 구현 담당(Claude)이 내장 브라우저로 직접 확인(Codex 는 소스 정적 대조 보조). 결함 11건(P1 1·P2 6·P3 4) → 커밋 3개(d2b1db8, 7548f12, cf13ae5)로 전부 수정, Codex 최종 PASS.
+핵심: 폼 편집 CRLF 정규화·본문 우선 파생(D21), 재확인 결과 4종 표시, 배너는 저장 상태·이벤트에서 파생, 홈 최근 배포, dev Turbopack 파일 캐시 끔(재시작 404 재발 방지), worker @cs/providers 선언, 수동 재확인 stale 검사, UI tick 10s 상한.
+기록: docs/handoffs/screen-notes-m3.md, T12_IMPLEMENTATION_HANDOFF.md(FIX 라운드), docs/DECISIONS.md D21.

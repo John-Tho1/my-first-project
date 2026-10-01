@@ -75,3 +75,102 @@
 - Questions specifically for Codex:
   1. With an active approval now taking precedence, is there a state where a PLANNED item has an active approval and yet cannot be executed (e.g. the job is still BLOCKED because of `auth`), and should the headline then say something other than "계획됨"?
   2. Should an item with an active approval but snapshot `problems` (the approval will be refused at execute) show the "새 계획 만들기" guidance instead of "계획됨"?
+
+---
+
+# FIX round (M3 화면 검증, D1·D2·D3·D5·D8·D9)
+- Input: `.handoffs/screen-notes-m3.md` ("진행 기록", "완료 기록"). This is the implementer checking its own work in the browser, not an independent Codex check. Decision: D21 in `docs/DECISIONS.md`.
+- BASE_SHA: 77a152d · HEAD_SHA: TBD (uncommitted working tree; the orchestrator commits)
+- Reproduction: run the new tests against the HEAD 77a152d sources. These fail there: D1 unit `channel.test.ts` "D1: 브라우저 폼의 \r\n …"; D1/D2 integration `variants.test.ts` "M3 화면 FIX D1·D2" (all 4 fail); D8 integration `m3-hardening.test.ts` "M3 화면 FIX D8" (got `reconciled=not_found`). D5 and D3 add new helpers or data functions, so their tests have no HEAD counterpart. D5's fake-query case is the live repro (`?approved=1&executed=1` on an unapproved plan with 0 jobs).
+
+| Finding | Change | Test |
+|---|---|---|
+| D1 [P1] the form can't save a multi-paragraph body (browser sends CRLF) | `variantBodyMismatch` turns CRLF and CR into LF on both sides before comparing. `formToVariantEdit` saves the body as LF (`normalizeNewlines`). | unit: CRLF in all 4 channel shapes, plus CR alone and the reverse direction, and a real mismatch is still `true`. integration: a CRLF multi-paragraph form POST for threads/instagram/youtube/blog → 303 `variant_saved`, version 2, stored body LF. JSON API: CRLF body vs LF parts → 201. |
+| D2 [P2] generic error, and the user had to keep raw JSON fields in sync | Form path only: `appendVariantVersion(bodyAuthoritative: true)` → `deriveBodyFields`. threads: parts = paragraphs(body), text = first part, body rejoined with single blank lines. A part over 500 chars → 400 `thread_part_too_long`. Over 20 parts → `thread_too_many_parts` (never auto-split). instagram caption, youtube script and blog markdown = body. The other fields keep the user's JSON, and the schema check is unchanged. The panel's JSON box shows only non-body fields (`editableMetadata`), and an empty box counts as {}. New help text. Specific error codes go through `writingFormFailure`: `metadata_json`, `invalid_metadata` (reworded), `metadata_body_mismatch`, `thread_part_too_long`, `thread_too_many_parts`. These also show inside the variants panel. JSON API unchanged (mismatch → 400). | unit: deriveBodyFields for 4 channels (result has no mismatch and passes the schema), >500 and >20, editableMetadata. integration: a body-only form edit with derived fields following and non-body fields kept; an old page whose JSON still has thread_parts → body wins; invalid JSON / array → `metadata_json`; empty title or unknown key → `invalid_metadata`; part >500 → `thread_part_too_long`; 21 parts → `thread_too_many_parts`; no new version on error; API mismatch still 400 `metadata_body_mismatch`. |
+| D8 [P2] the reconcile banner says "찾지 못했습니다" for unsupported/unknown | Route redirects with `reconciled=reconciledParam(r.remote)`: found / not_found / unsupported / unknown (processing → unknown). Page shows `reconciledNotice` (4 fixed messages). Old values still work. Garbage, array or missing → no banner. Non-found results use the `notice` style. | unit: param mapping, 4 messages, garbage values (`__proto__`, `toString`, case, whitespace, array). integration: a reconcile_unsupported item, reconciled from the form, redirects to `?reconciled=unsupported`, state stays UNKNOWN, 0 re-sends. |
+| D5 [P2] success banners come from the query string alone | `bannersFromState(q, planDetail)`. approved = number of items with an active approval (≥1). executed = items with jobs and job count (≥1 job), replay flag kept. canceled / cancel_requested only if an item or job is CANCELED or CANCEL_REQUESTED. retried only if a job is QUEUED. revoked_* is already count-based and unchanged. Informational banners left as they were: `created`, `ticked`, `scenario_saved` (they still trust the query; they describe an action, not a stored-state claim). | unit: fake query on an unapproved, 0-job plan → no claim banners. Real state → counts come from state (query numbers ignored). Cancel, retry and query-value gating. |
+| D3 [P2] home 「최근 배포」 shows stale "M3에서 활성화됩니다" | `listRecentPlans(db, owner, 5)` in `packages/db/src/distribution.ts` reuses `listPlans`. The home page shows target summary → `/distribute/{id}`, MOCK tag, `PLAN_STATUS_LABEL`, channels and MSK time, plus 「배포함 전체 보기」. Empty state has the new wording plus `현재 게시: 비활성`. | integration: an owner with no plans → []. 6 plans → 5, newest first. The other owner's plan is excluded. |
+| D9 [P2, env] dev 404 on dynamic routes after a restart or build | `apps/web/next.config.ts` `experimental.turbopackFileSystemCacheForDev: false` (exists in next 16.3.6 `config-shared.d.ts:726`). README_KO dev section gets a note and a manual fallback (delete `.next/dev` and `.next/cache`). | typecheck and build pass. The restart behaviour was **not** checked here (no dev server was started), so the orchestrator needs to check it live. |
+
+- Changed files: `packages/domain/src/{channel.ts,channel.test.ts}`, `packages/db/src/{variants.ts,distribution.ts}`, `apps/web/lib/{variants.ts,writing.ts,distribution.ts,distribution.test.ts}`, `apps/web/app/api/variants/[id]/versions/route.ts`, `apps/web/app/api/distribution-items/[id]/reconcile/route.ts`, `apps/web/app/contents/[id]/{page.tsx,variants-panel.tsx}`, `apps/web/app/distribute/[id]/page.tsx`, `apps/web/app/page.tsx`, `apps/web/next.config.ts`, `tests/integration/{variants.test.ts,m3-hardening.test.ts}`, `README_KO.md`, `docs/DECISIONS.md` (D21).
+- Commands (Windows 10, Git Bash, `source tools/env.sh`, Node v24.21.0, pnpm 12.6.0; no dev server): `corepack pnpm lint` pass · `typecheck` pass · `test` pass, 30 files / 559 tests (baseline 550) · `test:integration` pass, 24 files / 338 tests (baseline 332), 248 s · `build` pass · `drill:mock` exit 0, 불변식 위반 0, fetch 0, mock submit 49.
+- Not done: no browser check of the panel, the banners or the home card, and no D9 restart check. P3 items (D4, D6, D7, D10, D11) are out of scope.
+- Remaining risks: the JSON API path still stores a CRLF body as sent. Only the comparison is newline-insensitive, so a CRLF body can now be saved next to LF thread_parts, and `renderVariantText` / payload `rendered` would then mix line endings. Threads form normalization trims paragraph whitespace and collapses runs of blank lines, which changes the stored body compared with what was typed.
+- Questions specifically for Codex:
+  1. Newline normalization: should the JSON API also store LF (normalize body and the compared fields in `appendVariantVersion`), so the payload hash and `rendered` never mix CRLF and LF? Can the newline-insensitive comparison let a body through whose actual outgoing text (threads `posts`) differs from what was checked?
+  2. Body-authoritative derivation: is rejecting (rather than auto-splitting) a paragraph over 500 chars right? Is the trim/collapse of empty or whitespace-only paragraphs acceptable? With an empty threads body, `thread_parts: []` and `text: ''` are allowed; should an empty body be rejected?
+  3. bannersFromState: approved counts every active approval in the plan, not just the ones from this request. `retried` disappears once a tick takes the job. `canceled` shows if any item in the plan is canceled, even a different one. Are any of these misleading? Should `created`, `ticked` or `scenario_saved` also be checked against state?
+  4. unsupported vs not_found: is mapping remote `processing` to `unknown` right? Should `not_found` be shown as "없음" only when the adapter's `definitive_not_found` capability is true?
+  5. `turbopackFileSystemCacheForDev: false`: any effect on `next build`/`start` or on the HMR route manifest? Is turning off the cache better than a dev-start cleanup?
+
+---
+
+# FIX round P3 + missed cases (M3 화면 D4·D6·D7·D10·D11, T11 missed cases)
+- BASE_SHA: d2b1db8 · HEAD_SHA: TBD (uncommitted working tree; the orchestrator commits)
+- Reproduction: run the new tests against the d2b1db8 sources. These fail there:
+  - D7: the form tick with `hang` took 30018 ms, past the 1 s UI cap the test sets.
+  - Stale lookup: HEAD returned `found: true, state: CONFIRMED` even though the attempt had been bumped between the lookup and the apply.
+  - D11 and D10 add new functions or behaviour, so their tests have no HEAD counterpart.
+  - D4 and D6 are copy/doc only.
+
+| Finding | Change | Test |
+|---|---|---|
+| D4 [P3] stale copy | contents page: "채널별 배포 기록은 배포함(/distribute)에서 봅니다" (link). Relation line: "파생본: 채널 초안 N개" (anchor #variants). YouTube media note (YouTube card only): "YouTube 는 완성 영상 1개가 붙어야 검토로 보낼 수 있습니다. 영상은 /record 의 분할 업로드로 올립니다." Grep of apps/web: the remaining "아직 지원하지 않습니다" lines (offline device storage) and "지금 단계(M3)는 모의 배포만" are still true and were left. | — (copy) |
+| D6 [P3] checklist ↔ UI wording | `docs/handoffs/M3_LOCAL_RETURN.md` §3 #5 → title `작업(MOCK — 모의 어댑터)` + `QUEUED · 대기`; #8 → `처리 끝(MOCK — 실제 발행 아님)`. The mapping is noted in `docs/handoffs/M3_STATUS.md`. | — (docs) |
+| D7 [P3] UI tick blocks for the full adapter timeout on hang | New config `WORKER_UI_TICK_TIMEOUT_MS` (1 s–10 min, default 10000, `.env.example`). `/api/worker/tick` **form** path uses min(that value, `JOB_SUBMIT_TIMEOUT_MS`). The JSON API and the worker CLI keep `JOB_SUBMIT_TIMEOUT_MS` (30 s). The job takes the existing timeout path (ambiguous → RECONCILING, no re-send). | integration (m3-hardening): hang plus UI cap 1 s → 303 in < 10 s, job RECONCILING, 1 intent. |
+| D10 [P3] `/distribute/new` loses input after an error | The route appends `planFormEcho(form)` to the error redirect as `e_use`, `e_acc_<vid>`, `e_vis_<vid>`, `e_date_<vid>`, `e_time_<vid>`, `e_name`, keeping only values that validate (UUIDs, the visibility list, YYYY-MM-DD, HH:mm, name ≤200). The page applies `planFormDefaults(q)` only when `error` is present (fresh page = no default selection, docs/03). Approval checkboxes live on the plan page and are never echoed. | unit: echo/defaults round trip, garbage and array values dropped, 200-char name. integration: a past-schedule form → `/distribute/new?content_id…&e_…&error=schedule_in_past`, the parsed defaults equal the submitted values, no plan item created. I did not do an HTML render test: the server page needs a Next request context. |
+| D11 [P3] channel draft titles copy the "> 카드:" scaffold | `withoutDraftScaffold(coreBody)`: skips a leading `> 카드:`/`> 원문:` blockquote block and the following `## 초안` line. It is used only for YouTube title/description, blog title and Instagram caption. Script, markdown, cards and thread parts stay as authored. | unit: helper cases (non-scaffold quote or heading kept), youtube/blog/instagram titles and caption, a scaffold-only body falls back to the content title, an unscaffolded body is unchanged. |
+| T11 missed case: worker does not declare `@cs/providers` | Added `"@cs/providers": "workspace:*"` to `apps/worker/package.json` and the matching 3-line importer link to `pnpm-lock.yaml`. `install --offline` failed because the local cache lacks metadata (environment), so I ran `corepack pnpm install --frozen-lockfile` instead. It passed: "Lockfile is up to date, resolution step is skipped", 529 entries pass the supply-chain policy, no package added. It contacted registry.npmjs.org for metadata only. `apps/worker/node_modules/@cs/providers` now exists. | — |
+| T11 missed case: manual `reconcileItem` applies a stale lookup | Inside the locked transaction, the job's `attempt` and `state` must equal the values seen at lookup time, otherwise the result is `outcome: 'stale_lookup'`: nothing applied, `found: false`, audit `outcome`. The form redirect uses the new `reconciled=stale` message. | integration: the attempt is bumped inside the adapter reconcile → stale_lookup, still RECONCILING, 0 publications. Control without the bump → applied, CONFIRMED, 1 publication. unit: stale notice. |
+
+- Changed files: `packages/domain/src/{channel.ts,channel.test.ts,config.ts}`, `packages/db/src/jobs.ts`, `apps/web/lib/{distribution.ts,distribution.test.ts}`, `apps/web/app/api/{worker/tick,distribution-plans,distribution-items/[id]/reconcile}/route.ts`, `apps/web/app/contents/[id]/{page.tsx,variants-panel.tsx}`, `apps/web/app/distribute/new/page.tsx`, `apps/worker/{package.json,src/cli.ts}`, `pnpm-lock.yaml`, `.env.example`, `tests/integration/{m3-hardening,distribution}.test.ts`, `docs/handoffs/{M3_LOCAL_RETURN.md,M3_STATUS.md}`.
+- Commands (Windows 10, Git Bash, `source tools/env.sh`, Node v24.21.0, pnpm 12.6.0):
+  - `lint` pass.
+  - `typecheck` pass.
+  - `test` pass: 30 files / 563 tests.
+  - `test:integration` pass: 24 files / 341 tests, 238 s. A first run failed with PGlite "Array buffer allocation failed" (out of memory) because I ran `drill:mock` at the same time; the rerun on its own was clean.
+  - `drill:mock` exit 0, 불변식 위반 0, fetch 0, submit 49.
+  - `build` **not_run**: a `next dev` (PID 20648, port 3000) was running in this tree, and building over a live dev server is unsafe (memory note), so I left it alone.
+- Questions specifically for Codex:
+  1. stale_lookup compares `attempt` and `state` only. Can an intent or remote ref change for the same attempt and state (e.g. a late_result write) so that a stale lookup is still applied? Should the comparison also include the intent key or `updated_at`?
+  2. D10 puts the plan name and schedule into the redirect query string, so they can end up in access logs and history. Is that acceptable for a single-owner app, or should it be a short-lived cookie?
+  3. D11 also skips a leading `> 원문:` block (the capture scaffold) in titles. Is that right when the raw quote is the only real content (the title then falls back to the content title)?
+
+---
+
+# FIX round 2 (Codex review-FIX-M3screen)
+- Review input: `.handoffs/review-FIX-M3screen.md` (re-review of d2b1db8). BASE_SHA: 7548f12 · HEAD_SHA: TBD (uncommitted working tree)
+- Reproduction: with the 7548f12 `apps/web/lib/distribution.ts`, 4 unit tests fail:
+  - the 3 new negative tests;
+  - the earlier "실제 상태" test, which had asserted the flagged behaviour (first-execution QUEUED → `retried` true) and is now corrected to `false`.
+
+| Finding | Change | Test |
+|---|---|---|
+| P1 `bannersFromState` canceled and cancel_requested share one condition | `canceled` needs a CANCELED item or job. `cancel_requested` needs a CANCEL_REQUESTED item or job. Each state now triggers only its own banner. | unit: CANCEL_REQUESTED-only plan + `?canceled=1` → no banner, and `?cancel_requested=1` → banner. CANCELED-only plan + `?cancel_requested=1` → no banner, and `?canceled=1` → banner. |
+| P2 `retried` fires on any QUEUED job | `retried` needs an item whose latest job is QUEUED **and** whose newest job event is `unblock` with `cause: 'user_retry'`. That event is written by `retryItem` through `settle(…, 'unblock', { cause: 'user_retry' })`. `BannerStateInput` items take an optional `events` (newest first), which `PlanItemDetail.events` already provides. | unit: first-execution QUEUED (event `execute`, or no events) → false. unblock with another cause → false. SENDING after unblock → false. user_retry + QUEUED → true. Without the query → false. integration (m3-hardening, real DB events): executed plan → false; auth BLOCKED → `retryItem` → QUEUED → true; after the tick (CONFIRMED) → false. |
+
+- Commands (Windows 10, Git Bash, `source tools/env.sh`, Node v24.21.0, pnpm 12.6.0; no dev server, port 3000 free):
+  - `lint` pass.
+  - `typecheck` pass.
+  - `test` pass: 30 files / 566 tests.
+  - `test:integration` pass: 24 files / 342 tests, 198 s.
+  - `build` pass.
+  - `drill:mock` exit 0, 불변식 위반 0, fetch 0, submit 49.
+- Questions specifically for Codex:
+  1. The retried banner reads only the newest event of the latest job. If a tick has already recovered or leased the job and then returned it to QUEUED (lease expired before intent), the newest event is no longer `unblock` and the banner hides. Is that acceptable, or should it look for "an unblock/user_retry with no send_start after it"?
+  2. A plan with one item CANCELED and another item CANCEL_REQUESTED shows each banner only when its own query flag is set. The cancel route sets exactly one flag per request. Is any other entry point able to set both?
+- **Added to this round — Codex `.handoffs/review-FIX-M3p3.md` P2 (`withoutDraftScaffold`, packages/domain/src/channel.ts):**
+  - **Problem:** a `# 초안` / `## 초안` heading was stripped even with no leading `> 카드:` / `> 원문:` block. `channelDraft('youtube','기본 제목','# 초안\n\n본문')` changed its title from 초안 to 본문.
+  - **Fix:** with no leading scaffold quote block, the text is returned untouched apart from LF normalization, leading blank lines included. The heading line is skipped only after a scaffold block was removed, and only when it is exactly `## 초안`; a `# 초안` there stays.
+  - **Tests (unit, `channel.test.ts`):**
+    - No-scaffold `# 초안` / `## 초안` bodies keep their heading-derived YouTube and blog title ("초안") and their Instagram caption.
+    - Scaffold + `## 초안` is still stripped for all three.
+    - Scaffold + `# 초안` keeps the heading.
+    - Both new tests fail with the 7548f12 `channel.ts`.
+  - **Commands (after both fixes):**
+    - `lint` pass.
+    - `typecheck` pass.
+    - `test` pass: 30 files / 568 tests.
+    - `test:integration` pass: 24 files / 342 tests.
+    - `build` pass.
+    - `drill:mock` exit 0, 불변식 위반 0.

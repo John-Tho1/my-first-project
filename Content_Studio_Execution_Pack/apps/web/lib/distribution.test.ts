@@ -139,7 +139,8 @@ describe('M3 화면 FIX D5 — 성공 배너는 저장된 상태로(bannersFromS
     expect(bannersFromState({ approved: '99' }, d).approved).toBe(2);
     expect(bannersFromState({ executed: '99', replay: '1' }, d).executed).toEqual({ items: 1, jobs: 1, replay: true });
     expect(bannersFromState({ executed: '0' }, d).executed).toEqual({ items: 1, jobs: 1, replay: false });
-    expect(bannersFromState({ retried: '1' }, d).retried).toBe(true);
+    // Codex review-FIX-M3screen P2: 첫 실행의 QUEUED 는 재시도가 아니다
+    expect(bannersFromState({ retried: '1' }, d).retried).toBe(false);
     // 쿼리가 없으면 상태가 있어도 배너 없음
     expect(bannersFromState({}, d)).toEqual({ approved: null, executed: null, canceled: false, cancelRequested: false, retried: false });
   });
@@ -193,5 +194,32 @@ describe('화면 확인 D10 — planFormEcho·planFormDefaults', () => {
     expect(d.account).toEqual({});
     expect(d.date).toEqual({});
     expect(Array.from(d.name)).toHaveLength(200);
+  });
+});
+
+describe('Codex review-FIX-M3screen — 취소 두 배너 분리·재시도 배너는 기록된 재시도로', () => {
+  const ev = (details: Record<string, unknown>) => ({ sanitizedDetails: details });
+  const row = (status: string, jobs: string[], events: Array<{ sanitizedDetails: unknown }> = []) => ({ item: { status }, activeApproval: { id: 'a' }, jobs: jobs.map((state) => ({ state })), events });
+  it('P1: CANCEL_REQUESTED 만 있는 계획에 ?canceled=1 → 취소됨 배너 없음, 취소 확인 중 배너는 그 상태일 때만', () => {
+    const requested = { items: [row('CANCEL_REQUESTED', ['CANCEL_REQUESTED'])] };
+    expect(bannersFromState({ canceled: '1' }, requested)).toMatchObject({ canceled: false, cancelRequested: false });
+    expect(bannersFromState({ cancel_requested: '1' }, requested)).toMatchObject({ canceled: false, cancelRequested: true });
+  });
+  it('P1: CANCELED 만 있는 계획에 ?cancel_requested=1 → 취소 확인 중 배너 없음', () => {
+    const canceled = { items: [row('CANCELED', ['CANCELED'])] };
+    expect(bannersFromState({ cancel_requested: '1' }, canceled)).toMatchObject({ canceled: false, cancelRequested: false });
+    expect(bannersFromState({ canceled: '1' }, canceled)).toMatchObject({ canceled: true, cancelRequested: false });
+  });
+  it('P2: 첫 실행으로 QUEUED 인 계획에 ?retried=1 → 재시도 배너 없음, 사용자 재시도(unblock·user_retry) 뒤 QUEUED 면 표시', () => {
+    const firstRun = { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'execute', transition: 'execute' })])] };
+    expect(bannersFromState({ retried: '1' }, firstRun).retried).toBe(false);
+    expect(bannersFromState({ retried: '1' }, { items: [row('QUEUED', ['QUEUED'])] }).retried).toBe(false);
+    const retried = { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'unblock', transition: 'unblock', cause: 'user_retry' }), ev({ event: 'blocked', transition: 'blocked' })])] };
+    expect(bannersFromState({ retried: '1' }, retried).retried).toBe(true);
+    // unblock 이지만 사용자 재시도가 아닌 경우(다른 원인)·이미 처리기가 가져간 경우는 아님
+    expect(bannersFromState({ retried: '1' }, { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'unblock', transition: 'unblock', cause: 'other' })])] }).retried).toBe(false);
+    expect(bannersFromState({ retried: '1' }, { items: [row('SENDING', ['SENDING'], [ev({ event: 'unblock', transition: 'unblock', cause: 'user_retry' })])] }).retried).toBe(false);
+    // 쿼리 없으면 상태가 맞아도 없음
+    expect(bannersFromState({}, retried).retried).toBe(false);
   });
 });

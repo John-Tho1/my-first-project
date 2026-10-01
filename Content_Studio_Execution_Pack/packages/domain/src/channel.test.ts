@@ -229,3 +229,24 @@ describe('화면 확인 D11: 원고 스캐폴드("> 카드:" 인용 블록·"## 
     expect(channelDraft('youtube', 't', '# 주재원 첫 달\n\n본문').metadata.title).toBe('주재원 첫 달');
   });
 });
+
+describe('Codex review-FIX-M3p3 P2: 스캐폴드 인용 블록이 없으면 "초안" 제목도 건드리지 않는다', () => {
+  it('스캐폴드 없는 원고의 # 초안·## 초안 제목 → youtube·blog·instagram 이 예전처럼 그 제목·첫 문단을 쓴다', () => {
+    for (const h of ['# 초안', '## 초안']) {
+      const body = `${h}\n\n본문 첫 문단\n\n둘째 문단`;
+      expect(withoutDraftScaffold(body), h).toBe(body);
+      expect(channelDraft('youtube', '기본 제목', body).metadata.title, h).toBe('초안');
+      expect(channelDraft('blog', '기본 제목', body).metadata.title, h).toBe('초안');
+      expect(channelDraft('instagram', '기본 제목', body).metadata.caption, h).toBe(h);
+    }
+    // 앞의 빈 줄도 그대로(줄바꿈만 LF)
+    expect(withoutDraftScaffold('\r\n# 초안\r\n본문')).toBe('\n# 초안\n본문');
+  });
+  it('스캐폴드 + ## 초안 은 여전히 둘 다 건너뛴다, 스캐폴드 뒤의 다른 제목(# 초안)은 남긴다', () => {
+    const scaffold = '> 카드: 아이디어\n> 독자: 실무자\n\n## 초안\n\n진짜 첫 줄\n\n둘째';
+    expect(channelDraft('youtube', '기본 제목', scaffold).metadata.title).toBe('진짜 첫 줄');
+    expect(channelDraft('blog', '기본 제목', scaffold).metadata.title).toBe('진짜 첫 줄');
+    expect(channelDraft('instagram', '기본 제목', scaffold).metadata.caption).toBe('진짜 첫 줄');
+    expect(withoutDraftScaffold('> 카드: 아이디어\n\n# 초안\n\n본문')).toBe('# 초안\n\n본문');
+  });
+});

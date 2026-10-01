@@ -26,6 +26,7 @@ import {
   executePlan,
   exportOwner,
   getDb,
+  getPlanDetail,
   insertAsset,
   listChannelAccounts,
   listRecentPlans,
@@ -48,6 +49,7 @@ import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
+import { bannersFromState } from '../../apps/web/lib/distribution';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const config = loadConfig({});
@@ -662,5 +664,25 @@ describe('T11 missed case — 수동 재확인은 조회한 시도가 적용 때
     await db.execute(sql`update jobs set attempt = ${before.attempt} where id = ${x.jobId}`);
     expect(await reconcileItem(db, reg, o.id, x.itemId)).toMatchObject({ outcome: 'applied', found: true, state: 'CONFIRMED' });
     expect(await pubsOf(x.itemId)).toHaveLength(1);
+  });
+});
+
+describe('Codex review-FIX-M3screen P2 — 재시도 배너는 실제 재시도 기록(DB 이벤트)으로', () => {
+  it('첫 실행 QUEUED 계획 + ?retried=1 → 배너 없음 / auth 보류 → retryItem 뒤 QUEUED → 배너 / 처리 뒤 → 없음', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    const detail = async () => (await getPlanDetail(db, o.id, x.planId))!;
+    expect((await jobRow(x.jobId)).state).toBe('QUEUED');
+    expect(bannersFromState({ retried: '1' }, await detail()).retried).toBe(false);
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'auth' });
+    await tick(o);
+    expect((await jobRow(x.jobId)).state).toBe('BLOCKED');
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'success' });
+    await retryItem(db, o.id, x.itemId);
+    expect((await jobRow(x.jobId)).state).toBe('QUEUED');
+    expect(bannersFromState({ retried: '1' }, await detail()).retried).toBe(true);
+    await tick(o, 5);
+    expect((await jobRow(x.jobId)).state).toBe('CONFIRMED');
+    expect(bannersFromState({ retried: '1' }, await detail()).retried).toBe(false);
   });
 });

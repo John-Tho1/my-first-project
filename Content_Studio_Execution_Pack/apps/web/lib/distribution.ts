@@ -409,7 +409,13 @@ export function reconciledNotice(v: string | string[] | undefined): string | nul
 // ---- M3 화면 FIX(D5): 성공 배너는 쿼리가 아니라 저장된 상태로 ----
 
 export interface BannerStateInput {
-  items: ReadonlyArray<{ item: { status: string }; activeApproval: unknown; jobs: ReadonlyArray<{ state: string }> }>;
+  items: ReadonlyArray<{
+    item: { status: string };
+    activeApproval: unknown;
+    jobs: ReadonlyArray<{ state: string }>;
+    /** 가장 최근 작업의 이력(새 것부터) — 재시도 배너는 최근 이벤트가 사용자 재시도(unblock·user_retry)일 때만 */
+    events?: ReadonlyArray<{ sanitizedDetails: unknown }>;
+  }>;
 }
 
 export interface PlanBanners {
@@ -417,10 +423,11 @@ export interface PlanBanners {
   approved: number | null;
   /** 작업이 있는 항목 수·작업 수(작업 ≥1 일 때만) + 같은 실행 요청 재제출 표시 */
   executed: { items: number; jobs: number; replay: boolean } | null;
-  /** 실제로 CANCELED·CANCEL_REQUESTED 인 항목·작업이 있을 때만 */
+  /** 실제로 CANCELED 인 항목·작업이 있을 때만 */
   canceled: boolean;
+  /** 실제로 CANCEL_REQUESTED 인 항목·작업이 있을 때만 */
   cancelRequested: boolean;
-  /** 실제로 QUEUED 작업이 있을 때만 */
+  /** 가장 최근 작업이 QUEUED 이고 그 마지막 이벤트가 사용자 재시도(unblock, cause=user_retry)인 항목이 있을 때만 */
   retried: boolean;
 }
 
@@ -435,15 +442,20 @@ export function bannersFromState(q: Record<string, string | string[] | undefined
   const approvedItems = d.items.filter((x) => x.activeApproval != null).length;
   const jobItems = d.items.filter((x) => x.jobs.length > 0).length;
   const jobCount = d.items.reduce((n, x) => n + x.jobs.length, 0);
-  const cancelState = (s: string) => s === 'CANCELED' || s === 'CANCEL_REQUESTED';
-  const anyCancel = d.items.some((x) => cancelState(x.item.status) || x.jobs.some((j) => cancelState(j.state)));
-  const anyQueued = d.items.some((x) => x.jobs.some((j) => j.state === 'QUEUED'));
+  // Codex review-FIX-M3screen P1: 취소됨과 취소 확인 중은 서로 다른 조건(한쪽 상태로 다른 쪽 문구를 띄우지 않는다).
+  const anyIn = (state: string) => d.items.some((x) => x.item.status === state || x.jobs.some((j) => j.state === state));
+  // P2: 재시도 배너는 첫 실행의 QUEUED 가 아니라 기록된 사용자 재시도(최근 작업의 마지막 이벤트 = unblock·user_retry, 아직 QUEUED)일 때만.
+  const retriedNow = d.items.some((x) => {
+    const latest = x.jobs.at(-1);
+    const last = x.events?.[0]?.sanitizedDetails as { event?: unknown; transition?: unknown; cause?: unknown } | null | undefined;
+    return latest?.state === 'QUEUED' && (last?.transition ?? last?.event) === 'unblock' && last?.cause === 'user_retry';
+  });
   return {
     approved: flag(q.approved) && approvedItems > 0 ? approvedItems : null,
     executed: flag(q.executed) && jobCount > 0 ? { items: jobItems, jobs: jobCount, replay: q.replay === '1' } : null,
-    canceled: q.canceled === '1' && anyCancel,
-    cancelRequested: q.cancel_requested === '1' && anyCancel,
-    retried: q.retried === '1' && anyQueued,
+    canceled: q.canceled === '1' && anyIn('CANCELED'),
+    cancelRequested: q.cancel_requested === '1' && anyIn('CANCEL_REQUESTED'),
+    retried: q.retried === '1' && retriedNow,
   };
 }
 

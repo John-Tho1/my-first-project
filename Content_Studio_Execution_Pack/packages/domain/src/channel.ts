@@ -140,7 +140,7 @@ export interface ChannelDraft {
 }
 
 /**
- * 화면 확인 D11: 제목·첫 문단을 고를 때 건너뛰는 원고 스캐폴드 — 맨 앞의 `> 카드:`(또는 `> 원문:`) 인용 블록 전체와 그 뒤의 `## 초안` 제목 줄.
+ * 화면 확인 D11: 제목·첫 문단을 고를 때 건너뛰는 원고 스캐폴드 — 맨 앞의 `> 카드:`(또는 `> 원문:`) 인용 블록 전체와, 그 블록을 지웠을 때만 바로 뒤의 정확한 `## 초안` 줄.
  * 제목·설명·캡션을 고르는 데만 쓴다. 본문(대본·Markdown·이어지는 글·카드)은 쓴 그대로 둔다. 스캐폴드가 없으면 원문 그대로(줄바꿈만 LF).
  */
 export function withoutDraftScaffold(coreBody: string): string {
@@ -150,11 +150,12 @@ export function withoutDraftScaffold(coreBody: string): string {
     while (i < lines.length && lines[i]!.trim() === '') i++;
   };
   skipBlank();
-  if (i < lines.length && /^>\s*(카드|원문):/u.test(lines[i]!.trim())) {
-    while (i < lines.length && lines[i]!.trimStart().startsWith('>')) i++;
-    skipBlank();
-  }
-  if (i < lines.length && /^#{1,6}\s*초안\s*$/u.test(lines[i]!.trim())) i++;
+  // Codex review-FIX-M3p3 P2: 맨 앞 스캐폴드 인용 블록이 없으면 아무것도 건너뛰지 않는다(`# 초안` 같은 사용자 제목도 그대로).
+  if (!(i < lines.length && /^>\s*(카드|원문):/u.test(lines[i]!.trim()))) return lines.join('\n');
+  while (i < lines.length && lines[i]!.trimStart().startsWith('>')) i++;
+  skipBlank();
+  // 스캐폴드가 만든 정확한 `## 초안` 줄만(인용 블록을 지웠을 때만) 건너뛴다.
+  if (i < lines.length && lines[i]!.trim() === '## 초안') i++;
   return lines.slice(i).join('\n');
 }
 

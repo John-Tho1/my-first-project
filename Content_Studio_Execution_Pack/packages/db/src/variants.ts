@@ -20,6 +20,7 @@ import {
   buildAssistPrompt,
   channelDraft,
   CHANNEL_LABEL,
+  deriveBodyFields,
   estimateTokens,
   sanitizeLlmOutput,
   isUuid,
@@ -488,20 +489,27 @@ export async function runVariantAssist(
 
 // ---- 사용자 수정·채택·첨부 ----
 
-/** 사용자 수정: 새 현재 버전(원래 버전의 원고 버전을 그대로 — 수정만으로 stale 이 풀리지 않는다). 첨부는 이어진다. */
+/**
+ * 사용자 수정: 새 현재 버전(원래 버전의 원고 버전을 그대로 — 수정만으로 stale 이 풀리지 않는다). 첨부는 이어진다.
+ * M3 화면 FIX(D2): bodyAuthoritative(화면 폼 경로만) 이면 본문과 중복되는 칸을 본문에서 만든 뒤 검증한다(`deriveBodyFields`).
+ * JSON API 경로는 false — 중복 칸이 본문과 다르면 400 metadata_body_mismatch(T09 규칙 그대로, 줄바꿈 표기만 무시).
+ */
 export async function appendVariantVersion(
   db: Db,
   ownerId: string,
   variantId: string,
-  input: { baseVersion: number; body: string; metadata: Record<string, unknown> },
+  input: { baseVersion: number; body: string; metadata: Record<string, unknown>; bodyAuthoritative?: boolean },
   now: Date = new Date(),
 ): Promise<{ variant: VariantRow; version: VariantVersionRow }> {
   return db.transaction(async (tx) => {
     const { variant, contentCurrent, current } = await lockVariant(tx, ownerId, variantId);
     assertBase(current, input.baseVersion, { body: input.body, metadata: input.metadata });
-    const metadata = parseChannelMetadata(variant.channel as Channel, input.metadata);
+    const derived = input.bodyAuthoritative
+      ? deriveBodyFields(variant.channel as Channel, input.body, input.metadata)
+      : { body: input.body, metadata: input.metadata };
+    const metadata = parseChannelMetadata(variant.channel as Channel, derived.metadata);
     // FIX-T09(P0): 본문과 중복되는 메타데이터 칸은 본문과 같아야 한다(검사한 글 = 나가는 글). 다르면 400.
-    if (variantBodyMismatch(variant.channel as Channel, input.body, metadata)) throw new MetadataBodyMismatchError(variant.channel as Channel);
+    if (variantBodyMismatch(variant.channel as Channel, derived.body, metadata)) throw new MetadataBodyMismatchError(variant.channel as Channel);
     const version = await insertCurrentVariantVersion(
       tx,
       ownerId,
@@ -509,7 +517,7 @@ export async function appendVariantVersion(
       // ai_run_id 는 이어받는다: 채택한 AI 제안을 고쳐도 그 제안의 미해결 경험 claim 이 검토 게이트에서 사라지지 않게(A03).
       {
         contentVersionId: current?.contentVersionId ?? contentCurrent.id,
-        body: input.body,
+        body: derived.body,
         metadata,
         createdBy: 'owner',
         aiRunId: current?.aiRunId ?? null,

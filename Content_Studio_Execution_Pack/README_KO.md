@@ -134,6 +134,8 @@ pnpm dev                                  # http://localhost:3000 , 상태: http
 ~~~
 `pnpm dev`는 첫 요청에서 migration을 자동 적용하므로 `db:seed` 없이도 뜬다(이때 화면에 `pnpm db:seed 를 실행하세요`가 보인다).
 
+dev 서버는 Turbopack 파일 시스템 캐시를 끈 채 뜬다(`apps/web/next.config.ts`의 `experimental.turbopackFileSystemCacheForDev: false`, 결정 D21). 재시작·`pnpm build` 뒤 동적 경로(`/distribute/{id}` 등)가 404 로 나오던 문제(M3 화면 확인 D9) 때문이다. 그래도 404 가 나오면 dev 서버를 끄고 `apps/web/.next/dev`·`apps/web/.next/cache`를 지운 뒤 다시 띄운다. `pnpm build`는 dev 서버를 끈 상태에서 실행한다.
+
 ### 로그인 (M1, T02)
 M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`AUTH_MODE=dev`)** 만 제공한다(결정 D3, `docs/DECISIONS.md`). 비밀번호 없이 허용된 식별자 1개(`AUTH_ALLOWED_IDENTITY`)만 접속할 수 있고, `APP_BASE_URL` 이 `localhost`/`127.0.0.1` 일 때만 동작한다.
 

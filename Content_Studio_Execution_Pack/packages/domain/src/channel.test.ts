@@ -7,6 +7,10 @@ import {
   paragraphs,
   renderVariantText,
   variantBodyMismatch,
+  deriveBodyFields,
+  editableMetadata,
+  normalizeNewlines,
+  THREADS_MAX_PARTS,
   parseChannelMetadata,
   roleMatchesMime,
   splitByLength,
@@ -144,5 +148,54 @@ describe('FIX-T09: 나가는 글 전체·본문 중복 칸 일치', () => {
       const d = channelDraft(ch, 't', '첫 문단\n\n둘째 문단');
       expect(variantBodyMismatch(ch, d.body, d.metadata), ch).toBe(false);
     }
+  });
+});
+
+describe('M3 화면 FIX D1·D2: 줄바꿈 표기 무시·본문 기준 파생', () => {
+  it('D1: 브라우저 폼의 \\r\\n 본문은 네 채널 모두 LF 중복 칸과 같다고 본다', () => {
+    expect(variantBodyMismatch('threads', '첫 글\r\n\r\n둘째 글', { text: '첫 글', thread_parts: ['첫 글', '둘째 글'] })).toBe(false);
+    expect(variantBodyMismatch('instagram', '캡션 1\r\n\r\n캡션 2', { caption: '캡션 1\n\n캡션 2', cards: [] })).toBe(false);
+    expect(variantBodyMismatch('youtube', '대본\r\n둘째 줄', { title: 't', description: '', script: '대본\n둘째 줄', tags: [] })).toBe(false);
+    expect(variantBodyMismatch('blog', '# 제목\r\n\r\n본문', { title: '제목', markdown: '# 제목\n\n본문' })).toBe(false);
+    // 반대 방향(중복 칸이 CRLF, 본문 LF)과 단독 \r 도 같다
+    expect(variantBodyMismatch('blog', '# 제목\n\n본문', { title: '제목', markdown: '# 제목\r\n\r\n본문' })).toBe(false);
+    expect(variantBodyMismatch('instagram', 'a\rb', { caption: 'a\nb', cards: [] })).toBe(false);
+    // 내용이 다르면 여전히 불일치
+    expect(variantBodyMismatch('threads', '첫 글\r\n\r\n둘째 글', { text: '첫 글', thread_parts: ['첫 글', '다른 글'] })).toBe(true);
+    expect(variantBodyMismatch('blog', '# 제목\r\n\r\n본문', { title: '제목', markdown: '# 제목\n\n다른 본문' })).toBe(true);
+    expect(normalizeNewlines('a\r\nb\rc\nd')).toBe('a\nb\nc\nd');
+  });
+
+  it('D2: deriveBodyFields — 본문이 기준, 나머지 칸은 사용자 값 그대로, 결과는 불일치 없음·스키마 통과', () => {
+    const t = deriveBodyFields('threads', '  첫 글 \r\n\r\n\r\n둘째 글\r\n \r\n셋째\r\n', { text: '옛 글', thread_parts: ['옛 글'] });
+    expect(t).toEqual({ body: '첫 글\n\n둘째 글\n\n셋째', metadata: { text: '첫 글', thread_parts: ['첫 글', '둘째 글', '셋째'] } });
+    const i = deriveBodyFields('instagram', '새 캡션\r\n둘째 줄', { cards: [{ index: 1, text: '카드' }] });
+    expect(i).toEqual({ body: '새 캡션\n둘째 줄', metadata: { caption: '새 캡션\n둘째 줄', cards: [{ index: 1, text: '카드' }] } });
+    const y = deriveBodyFields('youtube', '대본', { title: '제목', description: '설명', script: '옛 대본', tags: ['a'] });
+    expect(y.metadata).toEqual({ title: '제목', description: '설명', script: '대본', tags: ['a'] });
+    const b = deriveBodyFields('blog', '# 글\r\n\r\n본문', { title: '글' });
+    expect(b.metadata).toEqual({ title: '글', markdown: '# 글\n\n본문' });
+    for (const [ch, d] of [['threads', t], ['instagram', i], ['youtube', y], ['blog', b]] as const) {
+      expect(variantBodyMismatch(ch, d.body, d.metadata), ch).toBe(false);
+      expect(() => parseChannelMetadata(ch, d.metadata), ch).not.toThrow();
+    }
+    // 빈 본문(threads): 문단 없음 → 빈 목록
+    expect(deriveBodyFields('threads', ' \r\n ', {})).toEqual({ body: '', metadata: { text: '', thread_parts: [] } });
+  });
+
+  it('D2: threads 문단이 500자를 넘거나 20개를 넘으면 자르지 않고 거부(구체 코드)', () => {
+    expect(() => deriveBodyFields('threads', `짧은 글\r\n\r\n${'가'.repeat(THREADS_MAX + 1)}`, {})).toThrow(
+      expect.objectContaining({ code: 'thread_part_too_long', extra: { part: 2, max: THREADS_MAX } }),
+    );
+    expect(() => deriveBodyFields('threads', '가'.repeat(THREADS_MAX), {})).not.toThrow();
+    const many = Array.from({ length: THREADS_MAX_PARTS + 1 }, (_, k) => `글 ${k}`).join('\n\n');
+    expect(() => deriveBodyFields('threads', many, {})).toThrow(expect.objectContaining({ code: 'thread_too_many_parts' }));
+  });
+
+  it('D2: editableMetadata 는 본문에서 만들어지는 칸만 뺀다', () => {
+    expect(editableMetadata('threads', { text: 'a', thread_parts: ['a'] })).toEqual({});
+    expect(editableMetadata('instagram', { caption: 'c', cards: [{ index: 1, text: 'x' }] })).toEqual({ cards: [{ index: 1, text: 'x' }] });
+    expect(editableMetadata('youtube', { title: 'T', description: 'D', script: 'S', tags: [] })).toEqual({ title: 'T', description: 'D', tags: [] });
+    expect(editableMetadata('blog', { title: 'T', markdown: 'M' })).toEqual({ title: 'T' });
   });
 });

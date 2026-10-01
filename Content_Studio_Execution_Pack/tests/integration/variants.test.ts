@@ -670,3 +670,101 @@ describe('FIX-T09 round 2(Codex review-FIX-T09)', () => {
     }
   });
 });
+
+describe('M3 화면 FIX D1·D2: 화면 편집 폼(CRLF·본문 기준·구체 오류)', () => {
+  const formEdit = (vid: string, fields: Record<string, string>, token = tokenA) =>
+    versionsPOST(
+      new Request(`${BASE}/api/variants/${vid}/versions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(token) },
+        body: new URLSearchParams(fields).toString(),
+      }),
+      ctx(vid),
+    );
+  const currentOf = async (contentId: string, channel: string) => {
+    const list = await (await variantsGET(new Request(`${BASE}/api/contents/${contentId}/variants`, { headers: cookieHeader(tokenA) }), ctx(contentId))).json();
+    return list.items.find((v: { channel: string }) => v.channel === channel).current_version as { version: number; body: string; metadata: Record<string, unknown> };
+  };
+  const newVariant = async (channel: string) => {
+    const id = await newContent();
+    const v = (await (await createVariant(id, { channel, mode: 'draft', base_version: 1 })).json()).variant.id as string;
+    return { id, v };
+  };
+  const CRLF_BODY = '첫 문단입니다.\r\n\r\n둘째 문단입니다.\r\n셋째 줄';
+  const LF_BODY = '첫 문단입니다.\n\n둘째 문단입니다.\n셋째 줄';
+
+  it('D1: 브라우저처럼 \r\n 여러 문단 본문(중복 칸은 LF로 맞춘 옛 화면 JSON) → 네 채널 모두 새 버전, 저장 본문 LF', async () => {
+    const lfMeta: Record<string, Record<string, unknown>> = {
+      threads: { text: '첫 문단입니다.', thread_parts: ['첫 문단입니다.', '둘째 문단입니다.\n셋째 줄'] },
+      instagram: { caption: LF_BODY, cards: [{ index: 1, text: '카드' }] },
+      youtube: { title: '제목', description: '설명', script: LF_BODY, tags: [] },
+      blog: { title: '제목', markdown: LF_BODY },
+    };
+    for (const ch of ['threads', 'instagram', 'youtube', 'blog']) {
+      const { id, v } = await newVariant(ch);
+      const res = await formEdit(v, { base_version: '1', body: CRLF_BODY, metadata: JSON.stringify(lfMeta[ch], null, 2).replace(/\n/g, '\r\n') });
+      expect(res.status, ch).toBe(303);
+      expect(res.headers.get('location'), ch).toBe(`/contents/${id}?variant_saved=${ch}#variants`);
+      const cur = await currentOf(id, ch);
+      expect(cur.version, ch).toBe(2);
+      expect(cur.body, ch).toBe(LF_BODY);
+      expect(cur.body.includes('\r'), ch).toBe(false);
+    }
+  });
+
+  it('D2: 본문만 고치면(JSON 은 본문 외 항목만) 중복 칸이 본문을 따르고 나머지 칸은 그대로', async () => {
+    const t = await newVariant('threads');
+    expect((await formEdit(t.v, { base_version: '1', body: '새 첫 글\r\n\r\n\r\n새 둘째 글\r\n', metadata: '{}' })).headers.get('location')).toMatch(/variant_saved=threads/);
+    expect(await currentOf(t.id, 'threads')).toMatchObject({ version: 2, body: '새 첫 글\n\n새 둘째 글', metadata: { text: '새 첫 글', thread_parts: ['새 첫 글', '새 둘째 글'] } });
+    // 옛 화면처럼 thread_parts 를 JSON 에 남겨 둬도 본문이 기준(불일치로 거부하지 않음)
+    expect((await formEdit(t.v, { base_version: '2', body: '하나뿐', metadata: JSON.stringify({ text: '옛', thread_parts: ['옛'] }) })).headers.get('location')).toMatch(
+      /variant_saved=threads/,
+    );
+    expect((await currentOf(t.id, 'threads')).metadata).toEqual({ text: '하나뿐', thread_parts: ['하나뿐'] });
+
+    const ig = await newVariant('instagram');
+    const igCur = await currentOf(ig.id, 'instagram');
+    const cards = igCur.metadata.cards;
+    expect((await formEdit(ig.v, { base_version: '1', body: '새 캡션\r\n둘째 줄', metadata: JSON.stringify({ cards }) })).status).toBe(303);
+    expect((await currentOf(ig.id, 'instagram')).metadata).toEqual({ caption: '새 캡션\n둘째 줄', cards });
+
+    const yt = await newVariant('youtube');
+    await formEdit(yt.v, { base_version: '1', body: '새 대본', metadata: JSON.stringify({ title: '새 제목', description: '설명', tags: ['태그'] }) });
+    expect((await currentOf(yt.id, 'youtube')).metadata).toEqual({ title: '새 제목', description: '설명', script: '새 대본', tags: ['태그'] });
+
+    const bl = await newVariant('blog');
+    await formEdit(bl.v, { base_version: '1', body: '# 새 글\r\n\r\n본문', metadata: JSON.stringify({ title: '새 글' }) });
+    expect(await currentOf(bl.id, 'blog')).toMatchObject({ version: 2, body: '# 새 글\n\n본문', metadata: { title: '새 글', markdown: '# 새 글\n\n본문' } });
+  });
+
+  it('D2: 폼 오류는 구체 코드로 되돌리고 새 버전을 만들지 않는다(JSON 문법·객체 아님·항목 규칙·Threads 문단 500자)', async () => {
+    const bl = await newVariant('blog');
+    const back = `/contents/${bl.id}`;
+    expect((await formEdit(bl.v, { base_version: '1', body: '본문', metadata: '{"title": "t",' })).headers.get('location')).toBe(`${back}?error=metadata_json`);
+    expect((await formEdit(bl.v, { base_version: '1', body: '본문', metadata: '[1, 2]' })).headers.get('location')).toBe(`${back}?error=metadata_json`);
+    expect((await formEdit(bl.v, { base_version: '1', body: '본문', metadata: '{"title": ""}' })).headers.get('location')).toBe(`${back}?error=invalid_metadata`);
+    expect((await formEdit(bl.v, { base_version: '1', body: '본문', metadata: '{"title": "t", "extra": 1}' })).headers.get('location')).toBe(
+      `${back}?error=invalid_metadata`,
+    );
+    expect((await currentOf(bl.id, 'blog')).version).toBe(1);
+
+    const t = await newVariant('threads');
+    const long = await formEdit(t.v, { base_version: '1', body: `짧은 글\r\n\r\n${'가'.repeat(501)}`, metadata: '{}' });
+    expect(long.headers.get('location')).toBe(`/contents/${t.id}?error=thread_part_too_long`);
+    const many = await formEdit(t.v, { base_version: '1', body: Array.from({ length: 21 }, (_, k) => `글 ${k}`).join('\r\n\r\n'), metadata: '' });
+    expect(many.headers.get('location')).toBe(`/contents/${t.id}?error=thread_too_many_parts`);
+    expect((await currentOf(t.id, 'threads')).version).toBe(1);
+  });
+
+  it('JSON API: 줄바꿈 표기 차이(\r\n 본문 vs LF 이어지는 글)는 통과, 실제 불일치는 계속 400 metadata_body_mismatch', async () => {
+    const t = await newVariant('threads');
+    const ok = await edit(t.v, { base_version: 1, body: 'a\r\n\r\nb', metadata: { text: 'a', thread_parts: ['a', 'b'] } });
+    expect(ok.status).toBe(201);
+    const bad = await edit(t.v, { base_version: 2, body: '새 본문', metadata: { text: '옛 글', thread_parts: ['옛 글'] } });
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toBe('metadata_body_mismatch');
+    const bl = await newVariant('blog');
+    const bad2 = await edit(bl.v, { base_version: 1, body: '본문', metadata: { title: 't' } }); // markdown 없음 → 본문 기준 파생은 폼 경로만
+    expect(bad2.status).toBe(400);
+  });
+});

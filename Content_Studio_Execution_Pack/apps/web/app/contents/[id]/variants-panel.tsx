@@ -5,7 +5,7 @@
  * T10: 검토 중 초안 → "배포 계획 만들기"(배포함, MOCK), 승인됨 초안 → 계획 링크. 승인됨은 배포함에서 철회해야 상태를 바꿀 수 있다.
  */
 import type { AssetRow, VariantState } from '@cs/db';
-import { CHANNEL_LABEL, CHANNELS, formatMsk, VARIANT_BODY_MAX, VARIANT_ROLES, type Channel } from '@cs/domain';
+import { CHANNEL_LABEL, CHANNELS, editableMetadata, formatMsk, VARIANT_BODY_MAX, VARIANT_ROLES, type Channel } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { preview } from '../../../lib/labels';
 
@@ -19,6 +19,7 @@ export function VariantsPanel({
   assets,
   packages,
   savedChannel,
+  editError,
   newPackageId,
   contentTitle,
   planByVariant,
@@ -29,6 +30,8 @@ export function VariantsPanel({
   assets: AssetRow[];
   packages: Array<{ id: string; bytes: number; createdAt: Date }>;
   savedChannel: string | null;
+  /** M3 화면 FIX(D2): 편집 폼 오류 문구(고정 문구, 쿼리 값을 그대로 쓰지 않음) */
+  editError?: string | null;
   newPackageId: string | null;
   contentTitle: string;
   /** T10: 파생본 id → 가장 최근 배포 계획 id */
@@ -45,6 +48,11 @@ export function VariantsPanel({
       {savedChannel ? (
         <p className="saved" role="status">
           {`${CHANNEL_LABEL[savedChannel as Channel] ?? savedChannel} 초안 저장됨 ✓`}
+        </p>
+      ) : null}
+      {editError ? (
+        <p className="notice" role="alert">
+          {`채널 초안 편집: ${editError}`}
         </p>
       ) : null}
       {CHANNELS.map((ch) => {
@@ -86,8 +94,18 @@ export function VariantsPanel({
                     <input type="hidden" name="base_version" value={cur.version} />
                     <label htmlFor={`vb-${ch}`}>본문</label>
                     <textarea id={`vb-${ch}`} name="body" rows={8} maxLength={VARIANT_BODY_MAX} defaultValue={cur.body} />
-                    <label htmlFor={`vm-${ch}`}>채널 형식(JSON)</label>
-                    <textarea id={`vm-${ch}`} name="metadata" rows={8} defaultValue={JSON.stringify(cur.metadataJson, null, 2)} />
+                    <p className="note" id={`vh-${ch}`}>
+                      본문이 곧 채널 본문입니다{ch === 'threads' ? '(빈 줄로 나눈 문단마다 이어지는 글 하나, 문단마다 500자 이하)' : ''}. 아래 JSON 에서는 카드·제목·설명 같은 나머지
+                      항목만 고치세요.
+                    </p>
+                    <label htmlFor={`vm-${ch}`}>채널 형식(JSON — 본문 외 항목)</label>
+                    <textarea
+                      id={`vm-${ch}`}
+                      name="metadata"
+                      rows={8}
+                      aria-describedby={`vh-${ch}`}
+                      defaultValue={JSON.stringify(editableMetadata(ch, cur.metadataJson as Record<string, unknown>), null, 2)}
+                    />
                     <button type="submit">새 버전으로 저장</button>
                   </form>
                 </details>

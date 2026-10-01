@@ -28,6 +28,8 @@ import {
   getDb,
   insertAsset,
   listChannelAccounts,
+  listRecentPlans,
+  HOME_RECENT_PLANS,
   parseBundleZip,
   reconcileItem,
   retryItem,
@@ -42,9 +44,10 @@ import {
 import { buildAssetKey, buildBundle, loadConfig, writeZip, type BundleTables, type Channel } from '@cs/domain';
 import { createMockAdapterRegistry, LocalStorageAdapter, MockChannelAdapter, MockChannelAdapterRegistry } from '@cs/providers';
 import { PUT as scenarioPUT } from '../../apps/web/app/api/distribution-items/[id]/mock-scenario/route';
+import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
-import { BASE, cookieHeader, jsonPost, login } from './helpers';
+import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const config = loadConfig({});
 const BODY = '# 해외 영업 첫 분기\n\n대리점과 재고 기준을 먼저 합의했다.\n\n가격표는 마지막에 확정했다.';
@@ -548,5 +551,55 @@ describe('C8 — 재시작 뒤 결과 불명', () => {
     expect((await jobRow(x.jobId)).state).toBe('UNKNOWN');
     expect(await reconcileItem(db, registry, o.id, x.itemId)).toMatchObject({ state: 'UNKNOWN', remote: 'unsupported' });
     expect(adapter.calls.submit).toBe(1);
+  });
+});
+
+describe('M3 화면 FIX D8 — 화면 재확인 리다이렉트는 결과 4종을 그대로', () => {
+  it('reconcile_unsupported 항목을 화면 폼으로 재확인 → reconciled=unsupported(찾지 못함 아님), 상태 그대로, 재전송 0', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'reconcile_unsupported' });
+    await tick(o);
+    await tick(o, 11);
+    await tick(o, 11 + 21);
+    await tick(o, 11 + 21 + 41);
+    expect((await jobRow(x.jobId)).state).toBe('UNKNOWN');
+    const submits = adapter.calls.submit;
+    as(o.identity);
+    const res = await reconcilePOST(
+      new Request(`${BASE}/api/distribution-items/${x.itemId}/reconcile`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(o.token) },
+        body: new URLSearchParams({ plan_id: x.planId }).toString(),
+      }),
+      ctx(x.itemId),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe(`/distribute/${x.planId}?reconciled=unsupported`);
+    expect((await jobRow(x.jobId)).state).toBe('UNKNOWN');
+    expect((await itemRow(x.itemId)).status).toBe('UNKNOWN');
+    expect(adapter.calls.submit).toBe(submits);
+  });
+});
+
+describe('M3 화면 FIX D3 — 홈 「최근 배포」 데이터(listRecentPlans)', () => {
+  it('최근 5개만, 새것부터, 다른 owner 계획은 없음, 계획 없으면 빈 목록', async () => {
+    const a = await newOwner();
+    const b = await newOwner();
+    expect(await listRecentPlans(db, a.id)).toEqual([]);
+    const made: string[] = [];
+    for (let k = 0; k < 6; k++) {
+      const v = await reviewVariant(a, 'threads');
+      made.push((await createPlan(db, a.id, { items: [{ variant_id: v.variantId, channel_account_id: a.accounts.threads }] }, new Date(Date.now() + k * 1000))).plan.id);
+    }
+    const vb = await reviewVariant(b, 'threads');
+    const bPlan = (await createPlan(db, b.id, { items: [{ variant_id: vb.variantId, channel_account_id: b.accounts.threads }] })).plan.id;
+    const recent = await listRecentPlans(db, a.id);
+    expect(recent).toHaveLength(HOME_RECENT_PLANS);
+    expect(HOME_RECENT_PLANS).toBe(5);
+    expect(recent.map((e) => e.plan.id)).toEqual(made.slice(1).reverse());
+    expect(recent.every((e) => e.plan.ownerId === a.id && e.mock && e.channels.join() === 'threads' && e.itemCount === 1)).toBe(true);
+    expect(recent.map((e) => e.plan.id)).not.toContain(bPlan);
+    expect((await listRecentPlans(db, b.id)).map((e) => e.plan.id)).toEqual([bPlan]);
   });
 });

@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { latestDraft, listAssets, listCaptures, listCapturesPage } from '@cs/db';
-import { describeModes, formatMsk, maskIdentity, MAX_RAW_TEXT, MAX_TITLE, MAX_UPLOAD_BYTES, MAX_USER_NOTE } from '@cs/domain';
+import { latestDraft, listAssets, listCaptures, listCapturesPage, listRecentPlans } from '@cs/db';
+import { CHANNEL_LABEL, describeModes, formatMsk, maskIdentity, MAX_RAW_TEXT, MAX_TITLE, MAX_UPLOAD_BYTES, MAX_USER_NOTE, type Channel } from '@cs/domain';
 import { getSession } from '../lib/auth';
 import { LIFECYCLE_LABEL } from '../lib/contents';
+import { PLAN_STATUS_LABEL } from '../lib/distribution';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
 import { getAppDb, getConfig } from '../lib/server';
 
@@ -87,6 +88,8 @@ export default async function TodayPage({
       : undefined;
   const recent = await listCapturesPage(handle.db, session.ownerId, { limit: 10 });
   const draft = await latestDraft(handle.db, session.ownerId);
+  // M3 화면 FIX(D3): 최근 배포 계획 5개(배포함과 같은 목록 함수·상태 문구)
+  const recentPlans = await listRecentPlans(handle.db, session.ownerId);
   // 폼을 그릴 때마다 새 command_key: 같은 폼의 중복 제출(더블클릭·새로고침 재전송)은 한 건으로 저장된다.
   const commandKey = randomUUID();
   const recommended = captures.slice(0, 2);
@@ -197,7 +200,32 @@ export default async function TodayPage({
 
         <section className="card">
           <h3>최근 배포</h3>
-          <p className="empty-text">배포 기능은 M3에서 활성화됩니다 · 현재 {publishLabel}</p>
+          {recentPlans.length ? (
+            <>
+              <ul className="list">
+                {recentPlans.map((e) => (
+                  <li key={e.plan.id} className="capture">
+                    <p className="capture-text">
+                      <Link href={`/distribute/${e.plan.id}`}>{e.plan.targetSummary || '배포 계획'}</Link>
+                    </p>
+                    <p className="meta">
+                      {e.mock ? <span className="tag warn">MOCK</span> : null}
+                      <span className="tag">{PLAN_STATUS_LABEL[e.plan.status] ?? e.plan.status}</span>
+                      <span>{e.channels.map((ch) => CHANNEL_LABEL[ch as Channel] ?? ch).join(' · ')}</span>
+                      <time dateTime={e.plan.createdAt.toISOString()}>{formatMsk(e.plan.createdAt)}</time>
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              <p className="pager">
+                <Link href="/distribute">배포함 전체 보기</Link> · 현재 {publishLabel}
+              </p>
+            </>
+          ) : (
+            <p className="empty-text">
+              아직 배포 계획이 없습니다. 원고의 채널 초안(검토 중)에서 「배포 계획 만들기」를 누르세요 · 현재 {publishLabel}
+            </p>
+          )}
         </section>
       </div>
 

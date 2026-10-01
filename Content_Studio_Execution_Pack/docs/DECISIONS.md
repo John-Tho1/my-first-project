@@ -277,3 +277,21 @@
   - 실제 PostgreSQL 두 연결 교차 실행 검증은 not_run(PGlite 는 연결 하나 — 시험은 두 순서의 결과와 잠금 흔적(xmax)만 확인).
 - **Follow-up (M3 FIX round 2, Codex review-FIX-T11T12, 2026-09-25) — 시도는 전송 의도를 쓸 때만 센다**: lease 는 `attempt` 를 바꾸지 않고, `beginSend` 가 전송 의도 INSERT 와 같은 트랜잭션에서 `attempt + 1`(의도 key `<job>:<attempt>`)로 올린다. 시도를 다 쓴 작업이 lease 되면 보내지 않고 FAILED(`attempts_exhausted`). 의도 없이 만료된 lease 는 시도가 아니다 — `jobs.lease_expired_before_intent`(migration 0022)를 1 올리고 QUEUED 로 되돌리며, 이 횟수가 `PRE_INTENT_EXPIRY_LIMIT`(5, max_attempts 와 별개)에 이르면 보내지 않은 채 FAILED(`lease_expired_before_intent`). 취소 요청이 전송 전(LEASED·QUEUED)에 들어왔는지는 의도 유무가 아니라 가장 최근 `cancel_requested` 이벤트의 이전 상태로 판단한다. 화면: 철회 결과 수 파싱을 lib `revocationCountParam` 로 옮겨 시험하고(정규식 오타 수정), PLANNED 항목에 활성 승인이 있으면 과거 작업의 보류 사유보다 우선한다("승인 없음" 표시 안 함).
 - **Follow-up (M3 FIX round 3, Codex review-FIX2-T11T12, 2026-09-25) — 업그레이드 시 attempt 정규화(migration 0023)**: 0022 이전 worker 는 lease 때 attempt 를 먼저 올렸다. 0023 은 끝나지 않은 작업(CONFIRMED·FAILED·CANCELED 제외) 중 attempt 가 그 작업의 가장 큰 전송 의도 번호보다 큰 행을 그 번호(의도 없으면 0)로 되돌린다 — 이미 의도가 있는 시도 번호는 유지, 개수가 아니라 최대 번호를 쓰는 것은 다음 의도 key `<job>:<attempt+1>` 가 기존 key 와 겹치지 않게 하려는 것. **전제: 구버전 worker(CLI·inline tick·/api/worker/tick 을 부르는 서버)를 멈춘 뒤 migration 을 적용한다** — 적용 중에 구버전이 lease 하면 다시 선증가한다.
+
+
+## D21 — M3 화면 검증 FIX(D1·D2·D3·D5·D8·D9): 화면 폼은 본문이 기준, 성공 배너는 저장된 상태로, 재확인 결과는 4종, dev 파일 캐시 끔
+- Decision ID / date: D21 / 2026-10-01 (Europe/Moscow)
+- Question: M3 화면 확인(.handoffs/screen-notes-m3.md "완료 기록")에서 나온 결함 D1·D2·D3·D5·D8·D9 를 승인·발행 불변식을 건드리지 않고 어떻게 고치는가?
+- Options: (1) 채널 초안 편집 폼: 사용자가 JSON 중복 칸을 계속 직접 맞춤 / 브라우저 쪽 스크립트로 맞춤 / **서버가 폼 경로에서만 본문으로 중복 칸을 만든다(JSON API 는 T09 불일치 거부 그대로)**. (2) 성공 배너: 쿼리 값 그대로 / 서명된 쿼리 / **쿼리는 "보여 달라"는 신호일 뿐, 표시 여부·수는 저장된 상태에서**. (3) 재확인 결과: found/not_found 2종 / **found·not_found·unsupported·unknown 4종**. (4) D9: dev 시작 때 캐시 삭제 스크립트 / **Turbopack dev 파일 시스템 캐시 끄기**.
+- Chosen option: 각 굵은 선택. 세부:
+  - D1: 줄바꿈 표기(\r\n·\r·\n)는 `variantBodyMismatch` 에서 양쪽 모두 LF 로 맞춘 뒤 비교한다(JSON API 도 표기 차이로는 거부하지 않음). 화면 폼(`formToVariantEdit`)은 본문을 LF 로 바꿔 저장한다. JSON API 가 보낸 CRLF 본문은 예전처럼 그대로 저장된다(변경 없음).
+  - D2: 폼 경로 = `appendVariantVersion(..., bodyAuthoritative: true)` → `deriveBodyFields`: threads 는 본문을 빈 줄로 나눈 문단(앞뒤 공백 제거·빈 문단 제외) = thread_parts, text = 첫 문단, 저장 본문 = 문단을 빈 줄 하나로 다시 이은 것; 문단 하나가 500자 초과면 400 `thread_part_too_long`, 20개 초과면 400 `thread_too_many_parts`(자르거나 나누지 않음). instagram caption·youtube script·blog markdown = 본문. 나머지 칸(카드·제목·설명·태그)은 사용자 JSON 그대로, 채널 스키마 검사는 그대로. 화면 JSON 칸에는 본문 외 항목만 보이고(`editableMetadata`), 빈 칸은 {}. 오류는 고정 문구 코드(`metadata_json`·`invalid_metadata`·`metadata_body_mismatch`·`thread_part_too_long`·`thread_too_many_parts`)로 리다이렉트하고 채널 초안 영역에도 보인다.
+  - D5: `bannersFromState(query, planDetail)` — 승인 배너는 활성 승인이 있는 항목 수(≥1), 실행 배너는 작업이 있는 항목·작업 수(작업 ≥1, replay 표시 유지), 취소·취소 확인 중은 CANCELED·CANCEL_REQUESTED 항목/작업이 있을 때만, 재시도는 QUEUED 작업이 있을 때만. 정보성 배너(created·ticked·scenario_saved)와 철회 배너(revoked_* — 저장된 결과 수)는 그대로.
+  - D8: 화면 재확인 리다이렉트 `reconciled=<found|not_found|unsupported|unknown>`(원격 processing 도 unknown). 옛 값 found·not_found 는 그대로 유효, 알 수 없는 값은 배너 없음. unsupported·unknown 문구는 "없다는 뜻이 아님·다시 보내지 않음"을 명시.
+  - D3: 홈 「최근 배포」 = `listRecentPlans`(배포함 `listPlans` 재사용, 최근 5개·새것부터·owner 한정) + 배포함과 같은 상태 문구·MOCK 표시·MSK 시각·「배포함 전체 보기」, 없으면 안내 문구.
+  - D9: `apps/web/next.config.ts` `experimental.turbopackFileSystemCacheForDev: false`(next 16.3.6 에 있는 옵션). production build 는 영향 없음. 재시작 동작은 오케스트레이터가 실제로 확인한다.
+- Evidence / assumption: 결함 재현은 각 시험이 HEAD 77a152d 소스에서 실패하는 것으로 확인(D1 단위·통합, D2 통합, D8 통합). 브라우저 확인은 이 FIX 에서 하지 않았다(dev 서버 미기동).
+- Reversible?: 예(폼 경로 플래그·화면 헬퍼·설정 한 줄).
+- User decision required?: 아니오(화면 결함 수정). 단 threads 본문 정규화(빈 줄 여러 개 → 하나, 문단 앞뒤 공백 제거)가 사용자 의도와 다르면 알려 달라.
+- Consequences: 화면 폼에서 JSON 의 중복 칸은 무시된다(옛 화면을 열어 둔 채 thread_parts 를 고쳐도 본문이 이긴다). JSON API 규칙(T09)은 바뀌지 않는다. dev 첫 컴파일이 조금 느려질 수 있다.
+- When to revisit: 화면에 클라이언트 편집기를 둘 때(D2), 실제 원격 조회가 생길 때(M4 — D8 문구), Next 업그레이드 시(D9 옵션 존재·기본값).

@@ -5,6 +5,7 @@ import { getPlanDetail, type PlanItemDetail } from '@cs/db';
 import { CHANNEL_LABEL, formatMsk, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
+  bannersFromState,
   blockInfoOf,
   DISTRIBUTE_ERROR_TEXT,
   ITEM_STATUS_LABEL,
@@ -13,6 +14,7 @@ import {
   MOCK_SCENARIO_OPTIONS,
   PLAN_STATUS_LABEL,
   problemLabel,
+  reconciledNotice,
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
@@ -300,8 +302,9 @@ export default async function PlanPage({
   const executable = d.items.some((x) => x.item.status === 'PLANNED' && x.activeApproval);
   const purpose = approvable[0]?.item.requestedResult ?? 'mock_publish';
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
-  const approved = Number(str(q.approved) ?? 0);
-  const executed = str(q.executed);
+  // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
+  const banners = bannersFromState(q, d);
+  const reconciled = reconciledNotice(q.reconciled);
 
   return (
     <main className="container">
@@ -321,14 +324,14 @@ export default async function PlanPage({
           배포 계획을 만들었습니다(MOCK — 아직 승인 전). 아래 내용을 확인한 뒤 승인할 항목을 고르세요.
         </p>
       ) : null}
-      {approved > 0 ? (
+      {banners.approved !== null ? (
         <p className="saved" role="status">
-          {approved}개 항목을 승인했습니다(MOCK 계정 — 실제 게시 아님).
+          승인됨: 이 계획에서 지금 승인된 항목 {banners.approved}개(MOCK 계정 — 실제 게시 아님).
         </p>
       ) : null}
-      {executed ? (
+      {banners.executed ? (
         <p className="saved" role="status">
-          MOCK 실행: {executed}개 항목을 작업 대기열에 넣었습니다{q.replay === '1' ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — 아래 &quot;작업 처리 실행(모의 1회)&quot;을 누르거나 작업 처리기가 처리합니다.
+          MOCK 실행: 작업이 만들어진 항목 {banners.executed.items}개(작업 {banners.executed.jobs}개){banners.executed.replay ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — 아래 &quot;작업 처리 실행(모의 1회)&quot;을 누르거나 작업 처리기가 처리합니다.
         </p>
       ) : null}
       {q.revoked === '1' ? (
@@ -341,17 +344,17 @@ export default async function PlanPage({
           작업 처리기(모의)를 한 번 실행했습니다: 작업 {Number(str(q.ticked) ?? 0)}개 처리. 외부로 아무것도 보내지 않았습니다(MOCK).
         </p>
       ) : null}
-      {q.canceled === '1' ? (
+      {banners.canceled ? (
         <p className="saved" role="status">
           취소했습니다(아직 보내지 않은 작업).
         </p>
       ) : null}
-      {q.cancel_requested === '1' ? (
+      {banners.cancelRequested ? (
         <p className="notice" role="status">
           취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.
         </p>
       ) : null}
-      {q.retried === '1' ? (
+      {banners.retried ? (
         <p className="saved" role="status">
           보류된 작업을 다시 대기열에 넣었습니다(MOCK — 새 시도). &quot;작업 처리 실행(모의 1회)&quot;을 누르면 처리합니다.
         </p>
@@ -361,9 +364,9 @@ export default async function PlanPage({
           모의 시나리오를 저장했습니다(개발용 · 실제 채널 없음). 승인·배포 내용(hash)은 바뀌지 않습니다.
         </p>
       ) : null}
-      {str(q.reconciled) ? (
-        <p className="saved" role="status">
-          재확인(조회만): {q.reconciled === 'found' ? '원격에서 결과를 찾았습니다(MOCK — 실제 발행 실적 아님).' : '원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.'}
+      {reconciled ? (
+        <p className={q.reconciled === 'found' ? 'saved' : 'notice'} role="status">
+          재확인(조회만): {reconciled}
         </p>
       ) : null}
       {err ? (

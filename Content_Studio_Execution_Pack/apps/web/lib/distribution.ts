@@ -381,3 +381,68 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       return ITEM_STATUS_LABEL[x.status] ?? x.status;
   }
 }
+
+// ---- M3 화면 FIX(D8): 수동 재확인 결과 4종 ----
+
+export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown';
+
+/** 재확인 결과(원격 조회 상태) → 리다이렉트 값. processing·unknown 은 "확인 못 함(unknown)" — 없다는 뜻이 아니다. */
+export function reconciledParam(remote: string): ReconciledKind {
+  if (remote === 'found' || remote === 'not_found' || remote === 'unsupported') return remote;
+  return 'unknown';
+}
+
+export const RECONCILED_TEXT: Record<ReconciledKind, string> = {
+  found: '원격에서 결과를 찾았습니다(MOCK — 실제 발행 실적 아님).',
+  not_found: '원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.',
+  unsupported: '이 채널은 원격 조회를 지원하지 않아 확인하지 못했습니다. 원격에 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
+  unknown: '원격 상태를 확인하지 못했습니다(진행 중이거나 기록이 없음). 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
+};
+
+/** 쿼리 reconciled 값 → 고정 문구. 알 수 없는 값·여러 값이면 null(아무 결과도 말하지 않는다). */
+export function reconciledNotice(v: string | string[] | undefined): string | null {
+  if (typeof v !== 'string') return null;
+  return Object.hasOwn(RECONCILED_TEXT, v) ? RECONCILED_TEXT[v as ReconciledKind] : null;
+}
+
+// ---- M3 화면 FIX(D5): 성공 배너는 쿼리가 아니라 저장된 상태로 ----
+
+export interface BannerStateInput {
+  items: ReadonlyArray<{ item: { status: string }; activeApproval: unknown; jobs: ReadonlyArray<{ state: string }> }>;
+}
+
+export interface PlanBanners {
+  /** 지금 활성 승인이 있는 항목 수(≥1 일 때만, 아니면 null) */
+  approved: number | null;
+  /** 작업이 있는 항목 수·작업 수(작업 ≥1 일 때만) + 같은 실행 요청 재제출 표시 */
+  executed: { items: number; jobs: number; replay: boolean } | null;
+  /** 실제로 CANCELED·CANCEL_REQUESTED 인 항목·작업이 있을 때만 */
+  canceled: boolean;
+  cancelRequested: boolean;
+  /** 실제로 QUEUED 작업이 있을 때만 */
+  retried: boolean;
+}
+
+const flag = (v: string | string[] | undefined) => typeof v === 'string' && v.trim() !== '';
+
+/**
+ * 성공 배너(승인·실행·취소·재시도)는 쿼리 문자열이 "보여 달라"고 할 때 저장된 상태가 그것을 뒷받침하면만 보이고, 수는 상태에서 센다.
+ * 쿼리만 바꿔서(예: 미승인·작업 0건 계획에 ?approved=1&executed=1) 승인·실행했다고 말하게 할 수 없다.
+ * 정보성 배너(created·ticked·scenario_saved)와 철회 배너(revoked_*, 이미 저장된 결과 수만 말함)는 이 함수 밖이다.
+ */
+export function bannersFromState(q: Record<string, string | string[] | undefined>, d: BannerStateInput): PlanBanners {
+  const approvedItems = d.items.filter((x) => x.activeApproval != null).length;
+  const jobItems = d.items.filter((x) => x.jobs.length > 0).length;
+  const jobCount = d.items.reduce((n, x) => n + x.jobs.length, 0);
+  const cancelState = (s: string) => s === 'CANCELED' || s === 'CANCEL_REQUESTED';
+  const anyCancel = d.items.some((x) => cancelState(x.item.status) || x.jobs.some((j) => cancelState(j.state)));
+  const anyQueued = d.items.some((x) => x.jobs.some((j) => j.state === 'QUEUED'));
+  return {
+    approved: flag(q.approved) && approvedItems > 0 ? approvedItems : null,
+    executed: flag(q.executed) && jobCount > 0 ? { items: jobItems, jobs: jobCount, replay: q.replay === '1' } : null,
+    canceled: q.canceled === '1' && anyCancel,
+    cancelRequested: q.cancel_requested === '1' && anyCancel,
+    retried: q.retried === '1' && anyQueued,
+  };
+}
+

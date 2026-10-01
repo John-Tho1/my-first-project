@@ -100,7 +100,13 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   // T10
   variant_approved: '승인된 채널 초안입니다. 배포함에서 승인을 철회한 뒤 상태를 바꾸세요.',
   asset_role_mismatch: '파일 형식이 역할과 맞지 않습니다(이미지·썸네일은 이미지 파일, 영상은 영상 파일).',
-  invalid_metadata: '채널 형식(글자 수 등)이 맞지 않아 저장하지 않았습니다.',
+  invalid_metadata:
+    '채널 형식(JSON)의 항목이 규칙에 맞지 않아 저장하지 않았습니다. 카드(번호·300자 이하)·제목(필수, 글자 수)·설명·태그 칸의 이름과 값을 확인하세요(본문은 바뀌지 않았습니다).',
+  // M3 화면 FIX(D2): 채널 초안 편집 폼의 구체 오류
+  metadata_json: '채널 형식(JSON)을 읽을 수 없어 저장하지 않았습니다. 중괄호 { } 로 감싼 JSON 객체인지(따옴표·쉼표) 확인하세요. 비워 두면 본문만 저장됩니다.',
+  metadata_body_mismatch: '본문과 채널 형식의 본문 칸(이어지는 글·캡션·대본·Markdown)이 달라 저장하지 않았습니다. 화면 폼에서는 본문이 기준이니 본문만 고쳐 다시 저장하세요.',
+  thread_part_too_long: 'Threads 글은 문단(빈 줄로 구분)마다 500자 이하여야 합니다. 긴 문단을 빈 줄로 나눈 뒤 다시 저장하세요.',
+  thread_too_many_parts: 'Threads 이어지는 글은 20개(빈 줄로 구분한 문단 20개)까지입니다. 문단을 합치거나 줄인 뒤 다시 저장하세요.',
   claim_still_in_body: '그 문장이 아직 현재 본문에 있어 "본문에서 뺐음"으로 처리하지 않았습니다. 본문에서 빼거나 고쳐 저장한 뒤 다시 누르세요.',
   unconfirmed_claims: '"준비됨" 원고에는 확인하지 않은 1인칭 경험 주장이 있는 제안을 채택할 수 없습니다. 먼저 주장을 확인하거나 상태를 "검토 중"으로 바꾸세요.',
   conflict: '다른 곳에서 먼저 저장되었습니다. 현재 내용을 확인한 뒤 다시 저장하세요.',
@@ -111,7 +117,23 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
 };
 
 /** 폼 오류 코드로 그대로 쓰는 AppError 코드(T09). */
-const PASS_THROUGH_CODES = new Set(['media_incomplete', 'stale_variant', 'no_variants', 'no_current_version', 'asset_role_mismatch', 'invalid_metadata', 'variant_approved']);
+const PASS_THROUGH_CODES = new Set([
+  'media_incomplete',
+  'stale_variant',
+  'no_variants',
+  'no_current_version',
+  'asset_role_mismatch',
+  'invalid_metadata',
+  'variant_approved',
+  // M3 화면 FIX(D2)
+  'metadata_json',
+  'metadata_body_mismatch',
+  'thread_part_too_long',
+  'thread_too_many_parts',
+]);
+
+/** 채널 초안 편집 폼의 오류 코드(D2) — 채널 초안 영역 안에서도 다시 보여 준다. */
+export const VARIANT_EDIT_ERROR_CODES: ReadonlySet<string> = new Set(['metadata_json', 'metadata_body_mismatch', 'thread_part_too_long', 'thread_too_many_parts', 'invalid_metadata']);
 
 /** 폼 실패 공통(작성 지원): 401 → /login, 404 → notFoundHref, 그 외 → back?error=<code>. */
 export function writingFormFailure(e: unknown, request: Request, back: string, notFoundHref: string): Response {

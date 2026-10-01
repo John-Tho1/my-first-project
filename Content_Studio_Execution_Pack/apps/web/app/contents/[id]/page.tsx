@@ -22,7 +22,7 @@ import {
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
-import { normalizeRunParam, selectRun, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
+import { normalizeRunParam, selectRun, VARIANT_EDIT_ERROR_CODES, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
 import { WritingPanel, type ProposalView } from './writing-panel';
 import { preview } from '../../../lib/labels';
 import { exportsDir } from '../../../lib/backup';
@@ -202,6 +202,7 @@ export default async function ContentPage({
             assets={ownerAssets}
             packages={packages}
             savedChannel={str(q.variant_saved) ?? str(q.variant_proposal) ?? null}
+            editError={err && VARIANT_EDIT_ERROR_CODES.has(str(q.error)!) ? err : null}
             contentTitle={c.title}
             planByVariant={planByVariant}
             newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}

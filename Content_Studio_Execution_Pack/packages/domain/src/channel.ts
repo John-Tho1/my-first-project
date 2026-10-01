@@ -202,17 +202,81 @@ export function renderVariantText(channel: Channel, body: string, metadata: Reco
  * threads: 이어지는 글을 빈 줄로 이은 것 = 본문, text = 첫 글 / instagram: 캡션 = 본문 / youtube: 대본 = 본문 / blog: Markdown = 본문.
  */
 export function variantBodyMismatch(channel: Channel, body: string, metadata: Record<string, unknown>): boolean {
+  // M3 화면 FIX(D1): 줄바꿈 표기(\r\n·\r·\n)는 비교에서 같게 본다 — 브라우저 폼은 textarea 줄바꿈을 \r\n 으로 보낸다.
+  const b = normalizeNewlines(body);
+  const n = (v: unknown) => normalizeNewlines(str(v));
   switch (channel) {
     case 'threads': {
-      const parts = strs(metadata.thread_parts);
-      return parts.join('\n\n') !== body || str(metadata.text) !== (parts[0] ?? '');
+      const parts = strs(metadata.thread_parts).map(normalizeNewlines);
+      return parts.join('\n\n') !== b || n(metadata.text) !== (parts[0] ?? '');
     }
     case 'instagram':
-      return str(metadata.caption) !== body;
+      return n(metadata.caption) !== b;
     case 'youtube':
-      return str(metadata.script) !== body;
+      return n(metadata.script) !== b;
     case 'blog':
-      return str(metadata.markdown) !== body;
+      return n(metadata.markdown) !== b;
+  }
+}
+
+/** 줄바꿈 표기를 LF 하나로(\r\n·\r → \n). 저장되는 본문은 LF 다. */
+export const normalizeNewlines = (s: string) => s.replace(/\r\n?/gu, '\n');
+
+/** 본문과 중복되어 본문에서 만들어지는 메타데이터 칸(채널별). 화면 폼에서는 이 칸을 받지 않고 본문으로 채운다. */
+export const BODY_DERIVED_FIELDS: Record<Channel, readonly string[]> = {
+  threads: ['text', 'thread_parts'],
+  instagram: ['caption'],
+  youtube: ['script'],
+  blog: ['markdown'],
+};
+
+/** 화면 편집 칸에 보여 줄 메타데이터: 본문에서 만들어지는 칸을 뺀 나머지(카드·제목·설명·태그 등). */
+export function editableMetadata(channel: Channel, metadata: Record<string, unknown>): Record<string, unknown> {
+  const drop = new Set(BODY_DERIVED_FIELDS[channel]);
+  return Object.fromEntries(Object.entries(metadata).filter(([k]) => !drop.has(k)));
+}
+
+export class ThreadPartTooLongError extends AppError {
+  constructor(index: number) {
+    super('bad_request', 'thread_part_too_long', `Threads 이어지는 글 ${index}번째 문단이 ${THREADS_MAX}자를 넘습니다. 빈 줄로 나누거나 줄이세요.`, {
+      part: index,
+      max: THREADS_MAX,
+    });
+  }
+}
+
+export class ThreadTooManyPartsError extends AppError {
+  constructor(n: number) {
+    super('bad_request', 'thread_too_many_parts', `Threads 이어지는 글은 ${THREADS_MAX_PARTS}개까지입니다(지금 ${n}개 문단). 문단을 합치거나 줄이세요.`, {
+      parts: n,
+      max: THREADS_MAX_PARTS,
+    });
+  }
+}
+
+/**
+ * M3 화면 FIX(D2): 화면 폼 경로는 본문이 기준이다 — 본문과 중복되는 칸을 본문에서 만든다(순수, 결정적).
+ * threads: 본문을 빈 줄로 나눈 문단(앞뒤 공백 제거, 빈 문단 제외) = thread_parts, text = 첫 문단, 본문 = 문단을 빈 줄 하나로 다시 이은 것.
+ *          문단 하나가 500자를 넘으면 400 thread_part_too_long, 20개를 넘으면 400 thread_too_many_parts(자르거나 나누지 않는다).
+ * instagram: caption = 본문 / youtube: script = 본문 / blog: markdown = 본문. 나머지 칸(카드·제목·설명·태그)은 사용자 값 그대로.
+ * 줄바꿈은 LF 로 맞춘다. JSON API 경로는 이 함수를 쓰지 않는다(중복 칸이 다르면 계속 400 metadata_body_mismatch).
+ */
+export function deriveBodyFields(channel: Channel, body: string, metadata: Record<string, unknown>): { body: string; metadata: Record<string, unknown> } {
+  const b = normalizeNewlines(body);
+  switch (channel) {
+    case 'threads': {
+      const parts = paragraphs(b);
+      const long = parts.findIndex((p) => cpLength(p) > THREADS_MAX);
+      if (long >= 0) throw new ThreadPartTooLongError(long + 1);
+      if (parts.length > THREADS_MAX_PARTS) throw new ThreadTooManyPartsError(parts.length);
+      return { body: parts.join('\n\n'), metadata: { ...metadata, text: parts[0] ?? '', thread_parts: parts } };
+    }
+    case 'instagram':
+      return { body: b, metadata: { ...metadata, caption: b } };
+    case 'youtube':
+      return { body: b, metadata: { ...metadata, script: b } };
+    case 'blog':
+      return { body: b, metadata: { ...metadata, markdown: b } };
   }
 }
 

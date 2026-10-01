@@ -3,7 +3,17 @@
  * 스냅샷이 바뀌어 다시 승인할 수 없으면 새 계획 안내, 승인 철회 안내는 저장된 작업 결과 수만 말한다.
  */
 import { describe, expect, it } from 'vitest';
-import { APPROVAL_BLOCK_REASONS, blockDetailLabel, blockInfoOf, itemHeadline, revocationCountParam, revocationNotice } from './distribution';
+import {
+  APPROVAL_BLOCK_REASONS,
+  bannersFromState,
+  blockDetailLabel,
+  blockInfoOf,
+  itemHeadline,
+  reconciledNotice,
+  reconciledParam,
+  revocationCountParam,
+  revocationNotice,
+} from './distribution';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
 const ev = (details: Record<string, unknown>) => [
@@ -83,5 +93,63 @@ describe('FIX round 2 (Codex review-FIX-T11T12) P2', () => {
         else expect(h, code).toBe('승인 없음 — 다시 승인 후 실행');
       }
     }
+  });
+});
+
+describe('M3 화면 FIX D8 — 재확인 결과 4종(조회 미지원·불명을 "찾지 못함"으로 뭉개지 않음)', () => {
+  it('reconciledParam: 원격 조회 상태 → 리다이렉트 값', () => {
+    expect(reconciledParam('found')).toBe('found');
+    expect(reconciledParam('not_found')).toBe('not_found');
+    expect(reconciledParam('unsupported')).toBe('unsupported');
+    expect(reconciledParam('unknown')).toBe('unknown');
+    expect(reconciledParam('processing')).toBe('unknown');
+    expect(reconciledParam('뭔가 다른 값')).toBe('unknown');
+  });
+  it('reconciledNotice: 네 문구, 옛 값(found·not_found) 유지, 쓰레기 값·배열·없음 → null', () => {
+    expect(reconciledNotice('found')).toBe('원격에서 결과를 찾았습니다(MOCK — 실제 발행 실적 아님).');
+    expect(reconciledNotice('not_found')).toBe('원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.');
+    expect(reconciledNotice('unsupported')).toBe('이 채널은 원격 조회를 지원하지 않아 확인하지 못했습니다. 원격에 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.');
+    expect(reconciledNotice('unknown')).toBe('원격 상태를 확인하지 못했습니다(진행 중이거나 기록이 없음). 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.');
+    for (const bad of ['', 'FOUND', 'toString', '__proto__', 'constructor', '<script>', ' found']) expect(reconciledNotice(bad), bad).toBeNull();
+    expect(reconciledNotice(['found', 'not_found'])).toBeNull();
+    expect(reconciledNotice(undefined)).toBeNull();
+  });
+});
+
+describe('M3 화면 FIX D5 — 성공 배너는 저장된 상태로(bannersFromState)', () => {
+  const it_ = (status: string, approved: boolean, jobs: string[]) => ({ item: { status }, activeApproval: approved ? { id: 'a' } : null, jobs: jobs.map((state) => ({ state })) });
+  const fake = { approved: '1', executed: '1', canceled: '1', cancel_requested: '1', retried: '1', replay: '1' };
+
+  it('미승인·작업 0건 계획에 가짜 쿼리 → 주장 배너 없음', () => {
+    expect(bannersFromState(fake, { items: [it_('PLANNED', false, []), it_('PLANNED', false, [])] })).toEqual({
+      approved: null,
+      executed: null,
+      canceled: false,
+      cancelRequested: false,
+      retried: false,
+    });
+    expect(bannersFromState(fake, { items: [] }).approved).toBeNull();
+  });
+
+  it('실제 상태 → 수는 상태에서(쿼리 숫자 무시)', () => {
+    const d = { items: [it_('PLANNED', true, []), it_('QUEUED', true, ['QUEUED']), it_('PLANNED', false, [])] };
+    expect(bannersFromState({ approved: '99' }, d).approved).toBe(2);
+    expect(bannersFromState({ executed: '99', replay: '1' }, d).executed).toEqual({ items: 1, jobs: 1, replay: true });
+    expect(bannersFromState({ executed: '0' }, d).executed).toEqual({ items: 1, jobs: 1, replay: false });
+    expect(bannersFromState({ retried: '1' }, d).retried).toBe(true);
+    // 쿼리가 없으면 상태가 있어도 배너 없음
+    expect(bannersFromState({}, d)).toEqual({ approved: null, executed: null, canceled: false, cancelRequested: false, retried: false });
+  });
+
+  it('취소·취소 확인 중은 실제 CANCELED·CANCEL_REQUESTED 가 있을 때만, 재시도는 QUEUED 작업이 있을 때만', () => {
+    const canceled = { items: [it_('CANCELED', true, ['CANCELED'])] };
+    expect(bannersFromState({ canceled: '1' }, canceled).canceled).toBe(true);
+    expect(bannersFromState({ cancel_requested: '1' }, { items: [it_('CANCEL_REQUESTED', true, ['CANCEL_REQUESTED'])] }).cancelRequested).toBe(true);
+    const confirmed = { items: [it_('CONFIRMED', true, ['CONFIRMED'])] };
+    expect(bannersFromState({ canceled: '1', cancel_requested: '1', retried: '1' }, confirmed)).toMatchObject({ canceled: false, cancelRequested: false, retried: false });
+    // 처리기가 이미 가져간 재시도(QUEUED 아님) → 재시도 배너 없음
+    expect(bannersFromState({ retried: '1' }, { items: [it_('SENDING', true, ['BLOCKED', 'SENDING'])] }).retried).toBe(false);
+    // 쿼리 값은 정확히 '1' 이어야 한다
+    expect(bannersFromState({ canceled: 'yes' }, canceled).canceled).toBe(false);
   });
 });

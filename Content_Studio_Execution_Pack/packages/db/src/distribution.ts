@@ -590,6 +590,12 @@ export async function listPlans(
   };
 }
 
+/** M3 화면 FIX(D3): 홈 「최근 배포」 — 배포함 목록(listPlans)과 같은 함수로 이 owner 의 최근 계획 N개(기본 5, 새것부터). */
+export const HOME_RECENT_PLANS = 5;
+export async function listRecentPlans(db: DbOrTx, ownerId: string, limit: number = HOME_RECENT_PLANS): Promise<PlanListEntry[]> {
+  return (await listPlans(db, ownerId, { limit })).items;
+}
+
 // ---- 승인 ----
 
 export interface ApproveResult {

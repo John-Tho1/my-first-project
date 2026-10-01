@@ -55,8 +55,12 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const sttLive = sttLiveReadiness(config);
   const drill = s.backup.lastDrill;
   const drillMismatches = (drill?.mismatchJson ?? []) as Array<{ kind?: string; table?: string; sample_ids?: string[]; columns?: string[] }>;
+  const drillScope = (drill?.scopeJson ?? null) as null | { partial: boolean; partial_reasons: string[]; empty_tables: string[]; search_probe: string };
   const more = (l: { total: number; items: unknown[]; truncated: boolean }) => (l.truncated ? ` (전체 ${l.total}개 중 ${l.items.length}개 표시)` : '');
   const states = Object.entries(s.jobs.byState);
+  const retentionFailed = s.lastRetention
+    ? ['packages_failed', 'exports_failed', 'export_dirs_failed'].reduce((n, k) => n + Number(s.lastRetention!.details[k] ?? 0), 0)
+    : 0;
   const planEmpty = plan.jobEvents.events === 0 && plan.packages.length === 0 && plan.exports.length === 0;
 
   return (
@@ -89,8 +93,14 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         {drill ? (
           <>
             <p className={drill.result === 'pass' ? 'meta' : 'notice'} role={drill.result === 'pass' ? undefined : 'alert'}>
-              마지막 복원 훈련: {formatMsk(drill.startedAt)} · 결과 {drill.result === 'pass' ? 'PASS(빈 메모리 DB 복원이 원본 묶음 — 복원 규칙 적용 — 과 일치)' : `FAIL${drill.errorCode ? `(${drill.errorCode})` : ''}`} · 표{' '}
+              마지막 복원 훈련: {formatMsk(drill.startedAt)} · 결과{' '}
+              {drill.result === 'pass'
+                ? `PASS${drillScope?.partial ? `(부분 검증: ${drillScope.partial_reasons.join(', ')})` : ''}(빈 메모리 DB 복원이 원본 묶음 — 복원 규칙 적용 — 과 일치)`
+                : `FAIL${drill.errorCode ? `(${drill.errorCode})` : ''}`} · 표{' '}
               {drill.tablesCompared}개 · 행 {drill.rowsCompared}개 · 파일 {drill.assetsCompared}개 · 실행 {drill.trigger === 'cli' ? 'CLI' : drill.trigger === 'api' ? '화면' : drill.trigger}
+              {drillScope
+                ? ` · 검색 확인 ${drillScope.search_probe} · 빈 표 ${drillScope.empty_tables.length}개${drillScope.empty_tables.length ? `(${drillScope.empty_tables.join(', ')})` : ''}`
+                : ''}
             </p>
             {drillMismatches.length ? (
               <ul className="list">
@@ -256,11 +266,11 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <p className="meta">
           마지막 정리:{' '}
           {s.lastRetention
-            ? `${formatMsk(s.lastRetention.at)} · 이력 ${String(s.lastRetention.details.job_events_deleted ?? 0)}행 · 배포 파일 ${String(s.lastRetention.details.packages_deleted ?? 0)}개 · 내보내기 ${String(s.lastRetention.details.exports_deleted ?? 0)}개${
-                Number(s.lastRetention.details.packages_failed ?? 0) + Number(s.lastRetention.details.exports_failed ?? 0) > 0
-                  ? ` · 삭제 실패 ${Number(s.lastRetention.details.packages_failed ?? 0) + Number(s.lastRetention.details.exports_failed ?? 0)}개(${String(s.lastRetention.details.error_codes ?? '')}) — 남은 파일은 다음 미리보기에 다시 나옵니다`
+            ? `${formatMsk(s.lastRetention.at)} · 이력 ${String(s.lastRetention.details.job_events_deleted ?? 0)}행 · 배포 파일 ${String(s.lastRetention.details.packages_deleted ?? 0)}개 · 내보내기 ZIP ${String(s.lastRetention.details.exports_deleted ?? 0)}개 · 폴더 ${String(s.lastRetention.details.export_dirs_deleted ?? 0)}개${
+                retentionFailed > 0
+                  ? ` · 삭제 실패 ${retentionFailed}개(${String(s.lastRetention.details.error_codes ?? '')}) — 남은 파일은 다음 미리보기에 다시 나옵니다`
                   : ''
-              }`
+              }${s.lastRetention.resultMissing ? ' · 파일 삭제 결과 기록이 없습니다(중단됐을 수 있음 — 아래 미리보기로 남은 파일 확인)' : ''}`
             : '기록 없음'}
         </p>
         <h4>지금 적용하면 지울 것(미리보기 — 아직 아무것도 지우지 않음)</h4>
@@ -273,12 +283,13 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           </li>
           <li>
             내보내기 ZIP(최근 {plan.policy.exportsKeep}개 밖): {plan.exports.length}개 · {formatByteSize(plan.exports.reduce((a, b) => a + b.zipBytes, 0))}
-            {plan.exports.length ? ` (가장 최근 것 ${formatMsk(plan.exports[0]!.createdAt)})` : ''} — 정상 백업 ZIP {plan.exportsExisting}개 기준, 가장 최근 1개는 항상 남김
+            {plan.exports.length ? ` (가장 최근 것 ${formatMsk(plan.exports[0]!.createdAt)})` : ''} — 검증된 백업 ZIP(구조·checksum·manifest 확인) {plan.exportsExisting}개 기준, 가장 최근 1개는 항상 남김
           </li>
           {plan.exportsMissingFile.length ? (
             <li>
-              파일 없음 기록(ZIP 이 없거나 손상 — 세지도 지우지도 않음): {plan.exportsMissingFile.length}개 · 가장 최근 것{' '}
-              {formatMsk(plan.exportsMissingFile[0]!.createdAt)}
+              검증되지 않은 기록(세지 않음): ZIP 없음 {plan.exportsMissingFile.filter((m) => m.zipState === 'absent').length}개 · 손상{' '}
+              {plan.exportsMissingFile.filter((m) => m.zipState === 'damaged').length}개 · 읽기 실패 {plan.exportsMissingFile.filter((m) => m.zipState === 'unreadable').length}개 —
+              손상·읽기 실패 ZIP 과 그 폴더는 지우지 않습니다. 가장 최근 것 {formatMsk(plan.exportsMissingFile[0]!.createdAt)}
             </li>
           ) : null}
         </ul>

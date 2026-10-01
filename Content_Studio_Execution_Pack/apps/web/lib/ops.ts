@@ -45,6 +45,7 @@ export function drillView(r: RestoreDrillResult) {
     search_probe: r.searchProbe,
     empty_tables: r.emptyTables,
     error_code: r.errorCode,
+    scope: r.scope,
     tables: r.tables,
     mismatches: r.mismatches,
   };
@@ -59,7 +60,7 @@ export function retentionPlanView(p: RetentionPlan) {
     packages: p.packages.map((x) => ({ id: x.id, bytes: x.bytes, modified_at: x.mtime.toISOString() })),
     exports: p.exports.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString(), zip_bytes: x.zipBytes })),
     exports_existing: p.exportsExisting,
-    exports_missing_file: p.exportsMissingFile.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString() })),
+    exports_missing_file: p.exportsMissingFile.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString(), zip_state: x.zipState, dir_present: x.dirPresent })),
   };
 }
 

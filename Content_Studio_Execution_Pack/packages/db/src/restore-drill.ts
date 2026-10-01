@@ -20,7 +20,7 @@ import { readZip, RESTORED_TABLES, searchQuerySchema, sha256Hex, type RestoredTa
 import { createDb, migrate, type Db } from './client';
 import { exportOwner, readOwnerTables, type BlobStore } from './export';
 import { ensureOwner, recordAudit } from './queries';
-import { expectedRestoredRows, transformedRowCount, valueMatches } from './restore-expect';
+import { deriveRestoreTransforms, expectedRestoredRows, transformedRowCount, valueMatches } from './restore-expect';
 import { commitRestore, createRestorePreview, parseBundleZip } from './restore';
 import { restoreDrills, users } from './schema';
 import { search } from './search';
@@ -36,6 +36,7 @@ export interface DrillMismatch {
     | 'search_probe'
     | 'credentials_in_bundle'
     | 'restore_error'
+    | 'declared_transforms'
     | 'drill_error';
   expected?: number | string;
   actual?: number | string;
@@ -69,8 +70,31 @@ export interface RestoreDrillResult {
   emptyTables: string[];
   tables: DrillTableRow[];
   mismatches: DrillMismatch[];
-  /** 준비·비교 중 예외로 끝났으면 정제된 오류 코드 */
+  /** 준비·복원·비교 중 예외로 끝났으면 정제된 오류 코드 */
   errorCode: string | null;
+  /** 검증 범위(restore_drills.scope_json 에 저장) — partial 이면 화면에 "부분 검증" */
+  scope: DrillScope;
+}
+
+export interface DrillScope {
+  empty_tables: string[];
+  tables_compared: number;
+  files_checked: number;
+  search_probe: 'found' | 'not_found' | 'skipped';
+  /** 파일 0개·검색 skipped·핵심 표(소재·원고·원고 버전) 중 빈 표가 있음 */
+  partial: boolean;
+  partial_reasons: string[];
+}
+
+/** 이 표가 비어 있으면 그 PASS 는 "부분 검증"이다. */
+export const DRILL_CORE_TABLES = ['captures', 'contents', 'content_versions'] as const;
+
+export function drillScope(emptyTables: readonly string[], tablesCompared: number, filesChecked: number, searchProbe: DrillScope['search_probe']): DrillScope {
+  const reasons: string[] = [];
+  if (filesChecked === 0) reasons.push('no_files');
+  if (searchProbe === 'skipped') reasons.push('search_skipped');
+  for (const t of DRILL_CORE_TABLES) if (emptyTables.includes(t)) reasons.push(`empty:${t}`);
+  return { empty_tables: [...emptyTables], tables_compared: tablesCompared, files_checked: filesChecked, search_probe: searchProbe, partial: reasons.length > 0, partial_reasons: reasons };
 }
 
 export interface RestoreDrillOptions {
@@ -81,7 +105,9 @@ export interface RestoreDrillOptions {
   /** 시험 전용: 복원 직후·비교 전에 대상 DB 를 바꾼다(변조 감지 확인). */
   afterRestore?: (target: Db, targetOwnerId: string) => Promise<void>;
   /** 시험 전용: 그 단계에서 예외를 낸다(실패 기록·정리 확인). */
-  faultInjection?: 'export' | 'compare';
+  faultInjection?: 'export' | 'restore' | 'compare';
+  /** 시험 전용: 복원이 알린 변환 목록(커밋 결과)을 바꾼다(복원 회귀 흉내 — 행과 선언이 함께 틀린 경우). */
+  tamperCommit?: (c: Awaited<ReturnType<typeof commitRestore>>) => Awaited<ReturnType<typeof commitRestore>>;
 }
 
 /** 빈 임시 폴더 저장소(복원 대상). key 는 폴더 밖을 가리킬 수 없다. */
@@ -173,21 +199,41 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
     await mkdir(path.join(tmp, 'storage'), { recursive: true });
     const restoresDir = path.join(tmp, 'restores');
     let committed: Awaited<ReturnType<typeof commitRestore>> | null = null;
+    let restoreFrom = new Date();
+    let restoreTo = restoreFrom;
     try {
+      if (opts.faultInjection === 'restore') throw injected();
       const { restoreId } = await createRestorePreview(target.db, targetOwner.id, zip, { restoresDir, source: 'upload' });
+      restoreFrom = new Date();
       committed = await commitRestore(target.db, targetStorage, targetOwner.id, restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      restoreTo = new Date();
+      if (opts.tamperCommit) committed = opts.tamperCommit(committed);
     } catch (e) {
-      mismatches.push({ kind: 'restore_error', code: drillErrorCode(e) });
+      // FIX round 3: 복원 단계 실패도 최상위 오류 코드로 남긴다
+      errorCode = drillErrorCode(e);
+      mismatches.push({ kind: 'restore_error', code: errorCode });
     }
 
     if (committed) {
       if (opts.afterRestore) await opts.afterRestore(target.db, targetOwner.id);
       // 4. 표 비교 — 모든 열을 기대 복원값과
-      const window = { from: new Date(startedAt.getTime() - 5_000), to: new Date(Date.now() + 60_000) };
-      const expected = expectedRestoredRows(bundle.tables, {
-        downgradedVariants: committed.downgraded_variants.map((v) => v.variant_id),
-        revokedApprovals: committed.revoked_approvals.map((a) => a.approval_id),
-      });
+      // FIX round 3(Q8): 복원 때 정해지는 시각은 실제 복원 호출 직전~직후 구간 안이어야 한다
+      const window = { from: restoreFrom, to: restoreTo };
+      // FIX round 3(P1): 강등·철회 대상은 묶음 행에서 독립적으로 계산하고, 복원이 알린 목록과도 대조한다
+      const derived = deriveRestoreTransforms(bundle.tables, window);
+      const declaredRevoked = new Set(committed.revoked_approvals.map((a) => a.approval_id));
+      const declaredDowngraded = new Set(committed.downgraded_variants.map((v) => v.variant_id));
+      const revokedDiff = [
+        ...[...derived.revokedApprovals].filter((id) => !declaredRevoked.has(id)),
+        ...[...declaredRevoked].filter((id) => !derived.revokedApprovals.has(id) && !derived.ambiguousApprovals.has(id)),
+      ];
+      if (revokedDiff.length) mismatches.push({ table: 'approvals', kind: 'declared_transforms', code: 'revoked_approvals', sample_ids: revokedDiff.slice(0, 5) });
+      const downgradedDiff = [
+        ...[...derived.downgradedVariants].filter((id) => !declaredDowngraded.has(id)),
+        ...[...declaredDowngraded].filter((id) => !derived.downgradedVariants.has(id)),
+      ];
+      if (downgradedDiff.length) mismatches.push({ table: 'variants', kind: 'declared_transforms', code: 'downgraded_variants', sample_ids: downgradedDiff.slice(0, 5) });
+      const expected = expectedRestoredRows(bundle.tables, derived);
       const { tables: got } = await readOwnerTables(target.db, targetOwner.id);
       for (const t of RESTORED_TABLES) {
         if (opts.faultInjection === 'compare') throw injected();
@@ -267,6 +313,7 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
 
   const finishedAt = new Date(Math.max(Date.now(), startedAt.getTime()));
   const result: 'pass' | 'fail' = mismatches.length === 0 && errorCode === null && tablesCompared > 0 ? 'pass' : 'fail';
+  const scope = drillScope(emptyTables, tablesCompared, assetsCompared, searchProbe);
   const [row] = await source
     .insert(restoreDrills)
     .values({
@@ -282,6 +329,7 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
       mismatchJson: mismatches as unknown as Array<Record<string, unknown>>,
       bundleSha256,
       errorCode,
+      scopeJson: scope as unknown as Record<string, unknown>,
     })
     .returning({ id: restoreDrills.id });
   await recordAudit(source, {
@@ -300,6 +348,7 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
       search_probe: searchProbe,
       empty_tables: emptyTables.length,
       error_code: errorCode,
+      partial: scope.partial,
     },
     at: finishedAt,
   });
@@ -318,6 +367,7 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
     tables,
     mismatches,
     errorCode,
+    scope,
   };
 }
 
@@ -344,6 +394,12 @@ export function formatDrillResult(r: RestoreDrillResult): string {
       );
     }
   }
-  lines.push(`결과: ${r.result === 'pass' ? 'PASS — 복원한 빈 환경이 원본 묶음(복원 규칙 적용)과 일치' : `FAIL${r.errorCode ? `(${r.errorCode})` : ''}`}`);
+  lines.push(
+    `결과: ${
+      r.result === 'pass'
+        ? `PASS${r.scope.partial ? `(부분 검증: ${r.scope.partial_reasons.join(', ')})` : ''} — 복원한 빈 환경이 원본 묶음(복원 규칙 적용)과 일치`
+        : `FAIL${r.errorCode ? `(${r.errorCode})` : ''}`
+    }`,
+  );
   return lines.join('\n');
 }

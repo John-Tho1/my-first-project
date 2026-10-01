@@ -4,7 +4,7 @@
 import type { Dirent, Stats } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { dirUsage, type DirFs } from './ops';
+import { cachedDiskUsage, dirUsage, resetDiskCache, type DirFs, type DiskUsage } from './ops';
 
 const ROOT = path.resolve('/virtual-root');
 const dirent = (name: string, kind: 'dir' | 'file') => ({ name, isDirectory: () => kind === 'dir', isFile: () => kind === 'file' }) as unknown as Dirent;
@@ -56,5 +56,54 @@ describe('dirUsage — 측정 상태', () => {
   });
   it('항목 수 상한 → partial + truncated', async () => {
     expect(await dirUsage(ROOT, { fs: fakeFs(), maxEntries: 1 })).toMatchObject({ status: 'partial', truncated: true });
+  });
+});
+
+describe('FIX round 3 (Codex review-FIX-T20)', () => {
+  it('Q10: 측정 중 하위 폴더가 사라지면(ENOENT) partial + changedDuringScan, 접근 실패 수는 0', async () => {
+    expect(await dirUsage(ROOT, { fs: fakeFs({ subReaddir: 'ENOENT' }) })).toMatchObject({ status: 'partial', changedDuringScan: true, errors: 0, bytes: 10 });
+    expect(await dirUsage(ROOT, { fs: fakeFs() })).toMatchObject({ status: 'complete', changedDuringScan: false });
+  });
+
+  it('P2 ops.ts:141: 진행 중 측정은 TTL(60초)이 지나도 공유 — 끝나지 않는 측정에 두 번 요청해도 순회 1번', async () => {
+    resetDiskCache();
+    let calls = 0;
+    const never = () => {
+      calls++;
+      return new Promise<DiskUsage>(() => undefined);
+    };
+    const cfg = { DATABASE_URL: 'memory://', STORAGE_LOCAL_DIR: './x', EXPORT_LOCAL_DIR: './y' };
+    const a = cachedDiskUsage(cfg, 0, never);
+    const b = cachedDiskUsage(cfg, 120_000, never);
+    expect(a).toBe(b);
+    expect(calls).toBe(1);
+    resetDiskCache();
+  });
+
+  it('끝난 측정에만 TTL: 60초 안에는 재사용, 지나면 다시 측정, 실패하면 캐시에 남기지 않음', async () => {
+    resetDiskCache();
+    let calls = 0;
+    let t = 1_000;
+    const value = { measuredAt: new Date(0) } as DiskUsage;
+    const ok = async () => {
+      calls++;
+      return value;
+    };
+    const cfg = { DATABASE_URL: 'memory://', STORAGE_LOCAL_DIR: './x', EXPORT_LOCAL_DIR: './y' };
+    await cachedDiskUsage(cfg, t, ok, () => t);
+    await cachedDiskUsage(cfg, t + 59_000, ok, () => t);
+    expect(calls).toBe(1);
+    t += 61_000;
+    await cachedDiskUsage(cfg, t, ok, () => t);
+    expect(calls).toBe(2);
+    resetDiskCache();
+    const fail = async () => {
+      calls++;
+      throw new Error('x');
+    };
+    await expect(cachedDiskUsage(cfg, t, fail, () => t)).rejects.toThrow();
+    await cachedDiskUsage(cfg, t, ok, () => t);
+    expect(calls).toBe(4);
+    resetDiskCache();
   });
 });

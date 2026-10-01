@@ -27,6 +27,8 @@ export interface DirUsage {
   errors: number;
   /** 항목이 너무 많아 세다가 멈췄는가(status = partial) */
   truncated: boolean;
+  /** 측정 중 하위 폴더가 사라졌는가(status = partial — 한 시점의 정확한 값이 아님) */
+  changedDuringScan: boolean;
 }
 
 export const DIR_SCAN_MAX_ENTRIES = 50_000;
@@ -52,7 +54,7 @@ const errCode = (e: unknown) => String((e as { code?: unknown } | null)?.code ??
 export async function dirUsage(dir: string, opts: { excludeTop?: readonly string[]; maxEntries?: number; fs?: DirFs } = {}): Promise<DirUsage> {
   const fs = opts.fs ?? nodeFs;
   const max = opts.maxEntries ?? DIR_SCAN_MAX_ENTRIES;
-  const out: DirUsage = { present: false, bytes: 0, files: 0, status: 'unavailable', errors: 0, truncated: false };
+  const out: DirUsage = { present: false, bytes: 0, files: 0, status: 'unavailable', errors: 0, truncated: false, changedDuringScan: false };
   try {
     if (!(await fs.lstat(dir)).isDirectory()) return out;
   } catch (e) {
@@ -73,7 +75,9 @@ export async function dirUsage(dir: string, opts: { excludeTop?: readonly string
         out.status = 'unavailable';
         return out;
       }
-      if (errCode(e) !== 'ENOENT') out.errors++;
+      // FIX round 3(Codex Q10): 하위 폴더가 측정 중 사라진 것은 접근 실패는 아니지만 완전한 측정도 아니다
+      if (errCode(e) === 'ENOENT') out.changedDuringScan = true;
+      else out.errors++;
       continue;
     }
     for (const n of names) {
@@ -95,7 +99,7 @@ export async function dirUsage(dir: string, opts: { excludeTop?: readonly string
       }
     }
   }
-  out.status = out.errors > 0 ? 'partial' : 'complete';
+  out.status = out.errors > 0 || out.changedDuringScan ? 'partial' : 'complete';
   return out;
 }
 
@@ -128,24 +132,42 @@ export async function diskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAG
   };
 }
 
-const globalForOps = globalThis as typeof globalThis & { __csDiskCache?: { key: string; at: number; value: Promise<DiskUsage> } };
+const globalForOps = globalThis as typeof globalThis & {
+  __csDiskCache?: { key: string; value: Promise<DiskUsage>; settledAt: number | null };
+};
 export const DISK_CACHE_MS = 60_000;
 
 /**
  * /ops·/api/health 공용: 같은 설정이면 60초 동안 측정값을 다시 쓰고, 측정 중이면 그 Promise 를 같이 기다린다(동시 요청이 폴더를 중복으로 걷지 않게).
  * 측정이 실패하면 캐시에 남기지 않는다.
  */
-export function cachedDiskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAGE_LOCAL_DIR' | 'EXPORT_LOCAL_DIR'>, nowMs = Date.now()): Promise<DiskUsage> {
+export function cachedDiskUsage(
+  config: Pick<AppConfig, 'DATABASE_URL' | 'STORAGE_LOCAL_DIR' | 'EXPORT_LOCAL_DIR'>,
+  nowMs = Date.now(),
+  measure: (c: Pick<AppConfig, 'DATABASE_URL' | 'STORAGE_LOCAL_DIR' | 'EXPORT_LOCAL_DIR'>) => Promise<DiskUsage> = diskUsage,
+  clock: () => number = Date.now,
+): Promise<DiskUsage> {
   const key = `${config.DATABASE_URL}|${config.STORAGE_LOCAL_DIR}|${config.EXPORT_LOCAL_DIR}`;
   const c = globalForOps.__csDiskCache;
-  if (c && c.key === key && nowMs - c.at < DISK_CACHE_MS) return c.value;
-  const value = diskUsage(config);
-  const entry = { key, at: nowMs, value };
+  // FIX round 3(Codex review-FIX-T20 P2): 측정 중이면 TTL 과 무관하게 같은 Promise 를 기다리고, TTL 은 끝난 결과에만 적용한다
+  if (c && c.key === key && (c.settledAt === null || nowMs - c.settledAt < DISK_CACHE_MS)) return c.value;
+  const value = measure(config);
+  const entry: { key: string; value: Promise<DiskUsage>; settledAt: number | null } = { key, value, settledAt: null };
   globalForOps.__csDiskCache = entry;
-  value.catch(() => {
-    if (globalForOps.__csDiskCache === entry) globalForOps.__csDiskCache = undefined;
-  });
+  value.then(
+    () => {
+      entry.settledAt = clock();
+    },
+    () => {
+      if (globalForOps.__csDiskCache === entry) globalForOps.__csDiskCache = undefined;
+    },
+  );
   return value;
+}
+
+/** 시험 전용: 캐시 비우기. */
+export function resetDiskCache(): void {
+  globalForOps.__csDiskCache = undefined;
 }
 
 // ---- 작업·의도·삭제 대기 ----
@@ -256,7 +278,7 @@ export interface OpsSnapshot {
     lastDrill: RestoreDrillRow | null;
   };
   /** 마지막 보존 정리(감사 기록 retention.sweep — 지운 개수만) */
-  lastRetention: { at: Date; details: Record<string, unknown> } | null;
+  lastRetention: { at: Date; details: Record<string, unknown>; resultMissing: boolean } | null;
 }
 
 export async function opsSnapshot(
@@ -357,14 +379,34 @@ export async function opsSnapshot(
   };
 }
 
-export async function lastRetentionSweep(db: DbOrTx, ownerId: string): Promise<{ at: Date; details: Record<string, unknown> } | null> {
-  const [r] = await db
-    .select({ at: auditEvents.at, details: auditEvents.sanitizedDetails })
-    .from(auditEvents)
-    .where(and(eq(auditEvents.ownerId, ownerId), eq(auditEvents.action, 'retention.sweep')))
-    .orderBy(desc(auditEvents.at))
-    .limit(1);
-  return r ? { at: r.at, details: (r.details ?? {}) as Record<string, unknown> } : null;
+/**
+ * 마지막 보존 정리: 계획 기록(retention.sweep — 지운 이력 수·지울 파일 계획 수)과 그 뒤의 결과 기록(retention.files — 실제 삭제·실패 수)을 합친다.
+ * 파일 계획이 있었는데 결과 기록이 없으면 resultMissing = true(파일 삭제 중 중단됐을 수 있음 — 다음 미리보기로 남은 것을 확인).
+ */
+export async function lastRetentionSweep(
+  db: DbOrTx,
+  ownerId: string,
+): Promise<{ at: Date; details: Record<string, unknown>; resultMissing: boolean } | null> {
+  const latest = async (action: 'retention.sweep' | 'retention.files') =>
+    (
+      await db
+        .select({ at: auditEvents.at, details: auditEvents.sanitizedDetails })
+        .from(auditEvents)
+        .where(and(eq(auditEvents.ownerId, ownerId), eq(auditEvents.action, action)))
+        .orderBy(desc(auditEvents.at))
+        .limit(1)
+    )[0] ?? null;
+  const sweep = await latest('retention.sweep');
+  const files = await latest('retention.files');
+  if (!sweep && !files) return null;
+  const filesForSweep = files && (!sweep || files.at.getTime() >= sweep.at.getTime()) ? files : null;
+  const sd = (sweep?.details ?? {}) as Record<string, unknown>;
+  const planned = Number(sd.planned_packages ?? 0) + Number(sd.planned_export_zips ?? 0) + Number(sd.planned_export_dirs ?? 0);
+  return {
+    at: (filesForSweep ?? sweep)!.at,
+    details: { ...sd, ...((filesForSweep?.details ?? {}) as Record<string, unknown>) },
+    resultMissing: Boolean(sweep) && planned > 0 && !filesForSweep,
+  };
 }
 
 // ---- /api/health (모든 owner 합계, 숫자만) ----

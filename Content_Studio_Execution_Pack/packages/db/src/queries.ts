@@ -245,7 +245,8 @@ export interface AuditInput {
     | 'item.mock_scenario'
     | 'worker.tick'
     | 'restore_drill.run'
-    | 'retention.sweep';
+    | 'retention.sweep'
+    | 'retention.files';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

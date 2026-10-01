@@ -849,6 +849,8 @@ export const restoreDrills = pgTable(
     bundleSha256: text('bundle_sha256'),
     /** FIX round 1(Codex review-T20 P1): 준비·비교 중 예외로 끝난 훈련의 정제된 오류 코드(오류 클래스 이름·코드만 — 경로·메시지 없음) */
     errorCode: text('error_code'),
+    /** FIX round 3(Codex review-FIX-T20 Q2): 검증 범위(빈 표·파일 수·검색 확인·부분 검증 이유) — PASS 가 부분 검증인지 화면에 보인다 */
+    scopeJson: jsonb('scope_json').$type<Record<string, unknown>>(),
   },
   (t) => [
     check('restore_drills_result_chk', sql`${t.result} in ('pass', 'fail')`),

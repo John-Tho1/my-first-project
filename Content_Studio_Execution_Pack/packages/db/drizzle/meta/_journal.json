@@ -183,6 +183,13 @@
       "when": 1790887564046,
       "tag": "0025_t20_fix_drill_error_code",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790891336027,
+      "tag": "0026_t20_fix3_drill_scope",
+      "breakpoints": true
     }
   ]
 }

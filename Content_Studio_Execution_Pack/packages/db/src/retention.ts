@@ -4,12 +4,14 @@
  *     지우기 전에 EXPORT_LOCAL_DIR/retention/<owner>/ 아래 JSONL 로 내보내고(쓴 줄 수 = 지울 행 수 확인), 같은 트랜잭션에서
  *     set_config('cs.retention_sweep','on', true) 로 0024 트리거의 예외를 켠 뒤 지운다. 진행 중·결과 불명·보류 작업의 이력은 건드리지 않는다.
  *  2. 배포 파일 ZIP(수동 게시용, 다시 만들 수 있음) — 파일 수정 시각이 RETENTION_PACKAGES_DAYS 보다 오래된 것.
- *  3. 내보내기 ZIP·폴더 — owner 마다 최근 RETENTION_EXPORT_RUNS_KEEP 개만 남긴다(export_runs 행은 이력으로 남긴다).
+ *  3. 내보내기 ZIP·폴더 — owner 마다 실제로 있는 정상 백업 중 최근 RETENTION_EXPORT_RUNS_KEEP 개(하한 1)만 남긴다(export_runs 행은 이력으로 남긴다).
+ *     파일 없는·손상된 실행 기록은 세지 않는다(FIX round 1 P0).
  * 원문 소재·출처·원고 버전·파생본·승인·결과 등 다른 표는 읽지도 지우지도 않는다. 업로드 세션(24시간)은 기존 worker 만료 정리(D15) 그대로.
  * 미리보기(planRetention)는 아무것도 바꾸지 않는다. 적용(applyRetention)은 confirm === true 일 때만. 같은 입력으로 두 번 돌리면 두 번째는 0건(멱등).
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { access, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { AppError, cutoffDays, exportsToPrune, isUuid, packageExpired, TERMINAL_JOB_STATES, type AppConfig } from '@cs/domain';
@@ -26,7 +28,12 @@ export interface RetentionPlan {
   cutoffs: { jobEvents: Date; packages: Date };
   jobEvents: { jobs: number; events: number; jobIds: string[] };
   packages: Array<{ id: string; contentId: string | null; bytes: number; mtime: Date }>;
+  /** 지울 내보내기(최근 keep 개 밖의 정상 백업만) */
   exports: Array<{ id: string; createdAt: Date; zipBytes: number; filePresent: boolean }>;
+  /** 정상 백업(ZIP 이 있고 읽을 수 있고 크기가 기록과 같음) 수 — 보존 개수는 이것으로 센다 */
+  exportsExisting: number;
+  /** 파일 없음·손상(0 바이트·크기 불일치) 기록 — 세지도 지우지도 않는다 */
+  exportsMissingFile: Array<{ id: string; createdAt: Date }>;
 }
 
 async function eligibleJobIds(db: Db, ownerId: string, cutoff: Date): Promise<Array<{ id: string; n: number }>> {
@@ -67,32 +74,57 @@ async function expiredPackages(exportsDir: string, ownerId: string, now: Date, d
   return out.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
 }
 
-async function exportsBeyondKeep(db: Db, exportsDir: string, ownerId: string, keep: number): Promise<RetentionPlan['exports']> {
+/**
+ * FIX round 1(Codex review-T20 P0): 보존 개수는 **실제로 쓸 수 있는 백업**(ZIP 이 일반 파일로 있고, 읽을 수 있고, 0 바이트가 아니며,
+ * 크기가 실행 기록의 zip_bytes 와 같음)만 센다. 파일이 없거나 손상된 실행 기록은 세지도 지우지도 않고 따로 보고한다.
+ * 정상 백업이 keep 이하면 아무것도 지우지 않고, 설정과 무관하게 가장 최근 정상 백업은 남긴다(하한 1).
+ */
+async function usableBackup(exportsDir: string, run: { id: string; zipBytes: number }): Promise<boolean> {
+  const file = exportZipPath(exportsDir, run.id);
+  try {
+    const s = await stat(/*turbopackIgnore: true*/ file);
+    if (!s.isFile() || s.size <= 0 || s.size !== run.zipBytes) return false;
+    await access(/*turbopackIgnore: true*/ file, fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function exportsBeyondKeep(
+  db: Db,
+  exportsDir: string,
+  ownerId: string,
+  keep: number,
+): Promise<{ prune: RetentionPlan['exports']; existing: number; missing: RetentionPlan['exportsMissingFile'] }> {
   const runs = await db
     .select({ id: exportRuns.id, createdAt: exportRuns.createdAt, zipBytes: exportRuns.zipBytes })
     .from(exportRuns)
     .where(and(eq(exportRuns.ownerId, ownerId), eq(exportRuns.status, 'completed')))
     .orderBy(desc(exportRuns.createdAt), desc(exportRuns.id));
-  const out: RetentionPlan['exports'] = [];
-  for (const r of exportsToPrune(runs, keep)) {
-    const zip = await stat(/*turbopackIgnore: true*/ exportZipPath(exportsDir, r.id)).catch(() => null);
-    const dir = await stat(/*turbopackIgnore: true*/ path.join(exportsDir, r.id)).catch(() => null);
-    const filePresent = Boolean(zip?.isFile() || dir?.isDirectory());
-    if (filePresent) out.push({ id: r.id, createdAt: r.createdAt, zipBytes: r.zipBytes, filePresent });
+  const usable: typeof runs = [];
+  const missing: RetentionPlan['exportsMissingFile'] = [];
+  for (const r of runs) {
+    if (await usableBackup(exportsDir, r)) usable.push(r);
+    else missing.push({ id: r.id, createdAt: r.createdAt });
   }
-  return out;
+  const prune = exportsToPrune(usable, Math.max(1, keep)).map((r) => ({ id: r.id, createdAt: r.createdAt, zipBytes: r.zipBytes, filePresent: true }));
+  return { prune, existing: usable.length, missing };
 }
 
 /** 미리보기(dry-run): 무엇을 지울지 계산만 한다 — DB·파일 변화 없음. */
 export async function planRetention(db: Db, ownerId: string, policy: RetentionPolicy, exportsDir: string, now: Date = new Date()): Promise<RetentionPlan> {
   const jobCut = cutoffDays(now, policy.RETENTION_JOB_EVENTS_DAYS);
   const eligible = await eligibleJobIds(db, ownerId, jobCut);
+  const ex = await exportsBeyondKeep(db, exportsDir, ownerId, policy.RETENTION_EXPORT_RUNS_KEEP);
   return {
     policy: { jobEventsDays: policy.RETENTION_JOB_EVENTS_DAYS, packagesDays: policy.RETENTION_PACKAGES_DAYS, exportsKeep: policy.RETENTION_EXPORT_RUNS_KEEP },
     cutoffs: { jobEvents: jobCut, packages: cutoffDays(now, policy.RETENTION_PACKAGES_DAYS) },
     jobEvents: { jobs: eligible.length, events: eligible.reduce((a, b) => a + b.n, 0), jobIds: eligible.map((e) => e.id) },
     packages: await expiredPackages(exportsDir, ownerId, now, policy.RETENTION_PACKAGES_DAYS),
-    exports: await exportsBeyondKeep(db, exportsDir, ownerId, policy.RETENTION_EXPORT_RUNS_KEEP),
+    exports: ex.prune,
+    exportsExisting: ex.existing,
+    exportsMissingFile: ex.missing,
   };
 }
 

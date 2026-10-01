@@ -24,5 +24,6 @@ export * from './distribution';
 export * from './jobs';
 export * from './mock-scenarios';
 export * from './restore-drill';
+export * from './restore-expect';
 export * from './ops';
 export * from './retention';

@@ -27,8 +27,12 @@ function Usage({ label, u }: { label: string; u: DirUsage | null }) {
       {u === null
         ? '측정 없음(메모리 DB — 파일이 없음)'
         : !u.present
-          ? '측정 없음(폴더 없음)'
-          : `${formatByteSize(u.bytes)} · 파일 ${u.files}개${u.truncated ? ' (항목이 많아 세다가 멈춤 — 하한값)' : ''}`}
+          ? `측정 없음(폴더 없음${u.errors ? ' 또는 읽을 수 없음' : ''})`
+          : u.status === 'unavailable'
+            ? '측정 불가(폴더를 읽지 못함)'
+            : `${formatByteSize(u.bytes)} · 파일 ${u.files}개${
+                u.status === 'partial' ? ` — 하한값(일부 측정 실패${u.errors ? ` ${u.errors}건` : ''}${u.truncated ? ', 항목이 많아 세다가 멈춤' : ''})` : ''
+              }`}
     </li>
   );
 }
@@ -50,7 +54,8 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const live = liveLlmReadiness(config);
   const sttLive = sttLiveReadiness(config);
   const drill = s.backup.lastDrill;
-  const drillMismatches = (drill?.mismatchJson ?? []) as Array<{ kind?: string; table?: string; sample_ids?: string[] }>;
+  const drillMismatches = (drill?.mismatchJson ?? []) as Array<{ kind?: string; table?: string; sample_ids?: string[]; columns?: string[] }>;
+  const more = (l: { total: number; items: unknown[]; truncated: boolean }) => (l.truncated ? ` (전체 ${l.total}개 중 ${l.items.length}개 표시)` : '');
   const states = Object.entries(s.jobs.byState);
   const planEmpty = plan.jobEvents.events === 0 && plan.packages.length === 0 && plan.exports.length === 0;
 
@@ -84,7 +89,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         {drill ? (
           <>
             <p className={drill.result === 'pass' ? 'meta' : 'notice'} role={drill.result === 'pass' ? undefined : 'alert'}>
-              마지막 복원 훈련: {formatMsk(drill.startedAt)} · 결과 {drill.result === 'pass' ? 'PASS(빈 메모리 DB 복원이 원본 묶음과 일치)' : 'FAIL'} · 표{' '}
+              마지막 복원 훈련: {formatMsk(drill.startedAt)} · 결과 {drill.result === 'pass' ? 'PASS(빈 메모리 DB 복원이 원본 묶음 — 복원 규칙 적용 — 과 일치)' : `FAIL${drill.errorCode ? `(${drill.errorCode})` : ''}`} · 표{' '}
               {drill.tablesCompared}개 · 행 {drill.rowsCompared}개 · 파일 {drill.assetsCompared}개 · 실행 {drill.trigger === 'cli' ? 'CLI' : drill.trigger === 'api' ? '화면' : drill.trigger}
             </p>
             {drillMismatches.length ? (
@@ -93,6 +98,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
                   <li key={i}>
                     {m.kind}
                     {m.table ? ` · ${m.table}` : ''}
+                    {m.columns?.length ? ` · 열 ${m.columns.join(', ')}` : ''}
                     {m.sample_ids?.length ? ` · ${m.sample_ids.join(', ')}` : ''}
                   </li>
                 ))}
@@ -133,10 +139,10 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           <li>처리할 때가 지난 대기(QUEUED) 중 가장 오래 기다린 작업: {s.jobs.oldestQueuedHours === null ? '없음' : formatAgeHours(s.jobs.oldestQueuedHours)}</li>
           <li>재시도 대기(RETRY_WAIT) 다음 시각: {s.jobs.nextRetryAt ? formatMsk(s.jobs.nextRetryAt) : '없음'}</li>
           <li>
-            지난 7일 실패(거부·결과 불명) 3회 이상 항목: {s.jobs.repeatedFailures.length}개
-            {s.jobs.repeatedFailures.length ? (
+            지난 7일 실패(거부·결과 불명) 3회 이상 항목: {s.jobs.repeatedFailures.total}개{more(s.jobs.repeatedFailures)}
+            {s.jobs.repeatedFailures.items.length ? (
               <ul>
-                {s.jobs.repeatedFailures.map((f) => (
+                {s.jobs.repeatedFailures.items.map((f) => (
                   <li key={f.itemId}>
                     {f.planId ? <Link href={`/distribute/${f.planId}`}>{f.itemId.slice(0, 8)}</Link> : f.itemId.slice(0, 8)} · {f.failures}회
                   </li>
@@ -145,10 +151,12 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
             ) : null}
           </li>
         </ul>
-        <h4>확인이 필요한 작업(RECONCILING·UNKNOWN·BLOCKED) {s.jobs.attention.length}개</h4>
-        {s.jobs.attention.length ? (
+        <h4>
+          확인이 필요한 작업(RECONCILING·UNKNOWN·BLOCKED) {s.jobs.attention.total}개{more(s.jobs.attention)}
+        </h4>
+        {s.jobs.attention.items.length ? (
           <ul className="list">
-            {s.jobs.attention.map((j) => (
+            {s.jobs.attention.items.map((j) => (
               <li key={j.jobId}>
                 {j.planId ? <Link href={`/distribute/${j.planId}`}>{j.state}</Link> : j.state}
                 {j.channel ? ` · ${CHANNEL_LABEL[j.channel as Channel] ?? j.channel}` : ''}
@@ -159,10 +167,12 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         ) : (
           <p className="empty-text">없음</p>
         )}
-        <h4>확인 필요 계획 {s.jobs.attentionPlans.length}개</h4>
-        {s.jobs.attentionPlans.length ? (
+        <h4>
+          확인 필요 계획 {s.jobs.attentionPlans.total}개{more(s.jobs.attentionPlans)}
+        </h4>
+        {s.jobs.attentionPlans.items.length ? (
           <ul className="list">
-            {s.jobs.attentionPlans.map((p) => (
+            {s.jobs.attentionPlans.items.map((p) => (
               <li key={p.id}>
                 <Link href={`/distribute/${p.id}`}>{p.targetSummary || '배포 계획'}</Link> · {formatMsk(p.updatedAt)}
               </li>
@@ -183,6 +193,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
 
       <section className="card archive" aria-labelledby="disk-title">
         <h3 id="disk-title">용량</h3>
+        <p className="note">측정 시각 {formatMsk(s.disk.measuredAt)}(60초 동안 같은 측정값을 씁니다).</p>
         <ul className="list">
           <Usage label="DB 데이터 폴더" u={s.disk.db} />
           <Usage label="파일 저장소(업로드 조각 제외)" u={s.disk.assets} />
@@ -258,8 +269,14 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           </li>
           <li>
             내보내기 ZIP(최근 {plan.policy.exportsKeep}개 밖): {plan.exports.length}개 · {formatByteSize(plan.exports.reduce((a, b) => a + b.zipBytes, 0))}
-            {plan.exports.length ? ` (가장 최근 것 ${formatMsk(plan.exports[0]!.createdAt)})` : ''}
+            {plan.exports.length ? ` (가장 최근 것 ${formatMsk(plan.exports[0]!.createdAt)})` : ''} — 정상 백업 ZIP {plan.exportsExisting}개 기준, 가장 최근 1개는 항상 남김
           </li>
+          {plan.exportsMissingFile.length ? (
+            <li>
+              파일 없음 기록(ZIP 이 없거나 손상 — 세지도 지우지도 않음): {plan.exportsMissingFile.length}개 · 가장 최근 것{' '}
+              {formatMsk(plan.exportsMissingFile[0]!.createdAt)}
+            </li>
+          ) : null}
         </ul>
         {planEmpty ? (
           <p className="empty-text">지울 것이 없습니다.</p>

@@ -43,6 +43,8 @@ export function drillView(r: RestoreDrillResult) {
     rows_compared: r.rowsCompared,
     assets_compared: r.assetsCompared,
     search_probe: r.searchProbe,
+    empty_tables: r.emptyTables,
+    error_code: r.errorCode,
     tables: r.tables,
     mismatches: r.mismatches,
   };
@@ -56,6 +58,8 @@ export function retentionPlanView(p: RetentionPlan) {
     job_events: { jobs: p.jobEvents.jobs, events: p.jobEvents.events },
     packages: p.packages.map((x) => ({ id: x.id, bytes: x.bytes, modified_at: x.mtime.toISOString() })),
     exports: p.exports.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString(), zip_bytes: x.zipBytes })),
+    exports_existing: p.exportsExisting,
+    exports_missing_file: p.exportsMissingFile.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString() })),
   };
 }
 

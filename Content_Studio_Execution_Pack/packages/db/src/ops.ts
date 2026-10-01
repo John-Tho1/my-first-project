@@ -16,23 +16,47 @@ import { assets, auditEvents, distributionItems, distributionPlans, exportRuns, 
 // ---- 파일 용량 ----
 
 export interface DirUsage {
-  /** 폴더가 있는가(없으면 bytes·files 는 0 이고 화면에는 "측정 없음") */
+  /** 폴더가 있는가 */
   present: boolean;
+  /** 센 바이트. status 가 partial 이면 하한값, unavailable 이면 쓰지 않는다 */
   bytes: number;
   files: number;
-  /** 항목이 너무 많아 세다가 멈췄는가(그때 bytes 는 하한) */
+  /** complete = 모두 셈, partial = 일부 읽기 실패·항목 상한(하한값), unavailable = 폴더 없음·맨 위 폴더를 못 읽음(측정 불가) */
+  status: 'complete' | 'partial' | 'unavailable';
+  /** 읽기 실패 수(폴더·파일) */
+  errors: number;
+  /** 항목이 너무 많아 세다가 멈췄는가(status = partial) */
   truncated: boolean;
 }
 
 export const DIR_SCAN_MAX_ENTRIES = 50_000;
 
-/** 폴더 아래 일반 파일 바이트·개수(심볼릭 링크는 따라가지 않음). excludeTop: 맨 위 단계에서 건너뛸 이름. */
-export async function dirUsage(dir: string, opts: { excludeTop?: readonly string[]; maxEntries?: number } = {}): Promise<DirUsage> {
+/** 시험에서 바꿔 끼우는 파일 시스템 부분(node:fs/promises 와 같은 모양). */
+export interface DirFs {
+  lstat(p: string): Promise<import('node:fs').Stats>;
+  readdir(p: string, opts: { withFileTypes: true }): Promise<import('node:fs').Dirent[]>;
+}
+
+const nodeFs: DirFs = {
+  lstat: (p) => lstat(/*turbopackIgnore: true*/ p),
+  readdir: (p, o) => readdir(/*turbopackIgnore: true*/ p, o),
+};
+
+const errCode = (e: unknown) => String((e as { code?: unknown } | null)?.code ?? '');
+
+/**
+ * 폴더 아래 일반 파일 바이트·개수(심볼릭 링크는 따라가지 않음). excludeTop: 맨 위 단계에서 건너뛸 이름.
+ * FIX round 1(Codex review-T20 P2): 읽기 실패를 완전한 측정값처럼 돌려주지 않는다 — 하위 폴더·파일 실패는 partial(하한값),
+ * 맨 위 폴더를 못 읽으면 unavailable. 세는 사이 지워진 파일(ENOENT)은 실패로 세지 않는다.
+ */
+export async function dirUsage(dir: string, opts: { excludeTop?: readonly string[]; maxEntries?: number; fs?: DirFs } = {}): Promise<DirUsage> {
+  const fs = opts.fs ?? nodeFs;
   const max = opts.maxEntries ?? DIR_SCAN_MAX_ENTRIES;
-  const out: DirUsage = { present: false, bytes: 0, files: 0, truncated: false };
+  const out: DirUsage = { present: false, bytes: 0, files: 0, status: 'unavailable', errors: 0, truncated: false };
   try {
-    if (!(await lstat(/*turbopackIgnore: true*/ dir)).isDirectory()) return out;
-  } catch {
+    if (!(await fs.lstat(dir)).isDirectory()) return out;
+  } catch (e) {
+    if (errCode(e) !== 'ENOENT') out.errors++;
     return out;
   }
   out.present = true;
@@ -42,13 +66,20 @@ export async function dirUsage(dir: string, opts: { excludeTop?: readonly string
     const { d, top } = stack.pop()!;
     let names: import('node:fs').Dirent[];
     try {
-      names = await readdir(/*turbopackIgnore: true*/ d, { withFileTypes: true });
-    } catch {
+      names = await fs.readdir(d, { withFileTypes: true });
+    } catch (e) {
+      if (top) {
+        out.errors++;
+        out.status = 'unavailable';
+        return out;
+      }
+      if (errCode(e) !== 'ENOENT') out.errors++;
       continue;
     }
     for (const n of names) {
       if (++seen > max) {
         out.truncated = true;
+        out.status = 'partial';
         return out;
       }
       if (top && opts.excludeTop?.includes(n.name)) continue;
@@ -56,18 +87,21 @@ export async function dirUsage(dir: string, opts: { excludeTop?: readonly string
       if (n.isDirectory()) stack.push({ d: full, top: false });
       else if (n.isFile()) {
         try {
-          out.bytes += (await lstat(/*turbopackIgnore: true*/ full)).size;
+          out.bytes += (await fs.lstat(full)).size;
           out.files++;
-        } catch {
-          // 세는 사이 지워진 파일
+        } catch (e) {
+          if (errCode(e) !== 'ENOENT') out.errors++;
         }
       }
     }
   }
+  out.status = out.errors > 0 ? 'partial' : 'complete';
   return out;
 }
 
 export interface DiskUsage {
+  /** 측정 시각 */
+  measuredAt: Date;
   /** PGlite 데이터 폴더(메모리 DB 면 null) */
   db: DirUsage | null;
   /** 저장소(STORAGE_LOCAL_DIR, uploads 제외) */
@@ -84,6 +118,7 @@ export async function diskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAG
   const storage = resolveFromRoot(config.STORAGE_LOCAL_DIR);
   const exportsDir = resolveFromRoot(config.EXPORT_LOCAL_DIR);
   return {
+    measuredAt: new Date(),
     db: config.DATABASE_URL === 'memory://' ? null : await dirUsage(resolveFromRoot(config.DATABASE_URL)),
     assets: await dirUsage(storage, { excludeTop: ['uploads'] }),
     uploads: await dirUsage(path.join(/*turbopackIgnore: true*/ storage, 'uploads')),
@@ -93,16 +128,23 @@ export async function diskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAG
   };
 }
 
-const globalForOps = globalThis as typeof globalThis & { __csDiskCache?: { key: string; at: number; value: DiskUsage } };
+const globalForOps = globalThis as typeof globalThis & { __csDiskCache?: { key: string; at: number; value: Promise<DiskUsage> } };
 export const DISK_CACHE_MS = 60_000;
 
-/** /api/health 용: 같은 설정이면 60초 동안 측정값을 다시 쓴다(요청마다 폴더 전체를 걷지 않게). */
-export async function cachedDiskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAGE_LOCAL_DIR' | 'EXPORT_LOCAL_DIR'>, nowMs = Date.now()): Promise<DiskUsage> {
+/**
+ * /ops·/api/health 공용: 같은 설정이면 60초 동안 측정값을 다시 쓰고, 측정 중이면 그 Promise 를 같이 기다린다(동시 요청이 폴더를 중복으로 걷지 않게).
+ * 측정이 실패하면 캐시에 남기지 않는다.
+ */
+export function cachedDiskUsage(config: Pick<AppConfig, 'DATABASE_URL' | 'STORAGE_LOCAL_DIR' | 'EXPORT_LOCAL_DIR'>, nowMs = Date.now()): Promise<DiskUsage> {
   const key = `${config.DATABASE_URL}|${config.STORAGE_LOCAL_DIR}|${config.EXPORT_LOCAL_DIR}`;
   const c = globalForOps.__csDiskCache;
   if (c && c.key === key && nowMs - c.at < DISK_CACHE_MS) return c.value;
-  const value = await diskUsage(config);
-  globalForOps.__csDiskCache = { key, at: nowMs, value };
+  const value = diskUsage(config);
+  const entry = { key, at: nowMs, value };
+  globalForOps.__csDiskCache = entry;
+  value.catch(() => {
+    if (globalForOps.__csDiskCache === entry) globalForOps.__csDiskCache = undefined;
+  });
   return value;
 }
 
@@ -179,6 +221,16 @@ async function lastExportAt(db: DbOrTx, ownerId: string | null) {
 
 // ---- /ops 화면 ----
 
+/** FIX round 1(Codex review-T20 P2): 화면 목록은 OPS_LIST_LIMIT 개까지, 전체 개수는 따로 센다. */
+export const OPS_LIST_LIMIT = 50;
+export interface Listed<T> {
+  total: number;
+  items: T[];
+  /** total > items.length */
+  truncated: boolean;
+}
+const listed = <T>(total: number, items: T[]): Listed<T> => ({ total, items, truncated: total > items.length });
+
 export interface OpsSnapshot {
   measuredAt: Date;
   jobs: {
@@ -188,9 +240,9 @@ export interface OpsSnapshot {
     oldestQueuedHours: number | null;
     /** RETRY_WAIT 중 가장 이른 다음 시도 시각 */
     nextRetryAt: Date | null;
-    attention: AttentionJob[];
-    repeatedFailures: RepeatedFailure[];
-    attentionPlans: Array<{ id: string; targetSummary: string; updatedAt: Date }>;
+    attention: Listed<AttentionJob>;
+    repeatedFailures: Listed<RepeatedFailure>;
+    attentionPlans: Listed<{ id: string; targetSummary: string; updatedAt: Date }>;
   };
   intents: { pending: number; oldestPendingAt: Date | null };
   pendingDeletes: { count: number; oldestAt: Date | null };
@@ -243,13 +295,18 @@ export async function opsSnapshot(
     .leftJoin(variants, and(eq(variants.id, distributionItems.variantId), eq(variants.ownerId, distributionItems.ownerId)))
     .where(and(eq(jobs.ownerId, ownerId), inArray(jobs.state, [...ATTENTION_JOB_STATES])))
     .orderBy(asc(jobs.updatedAt), asc(jobs.id))
-    .limit(50);
+    .limit(OPS_LIST_LIMIT);
+  const [attentionTotal] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(jobs)
+    .where(and(eq(jobs.ownerId, ownerId), inArray(jobs.state, [...ATTENTION_JOB_STATES])));
   const plans = await db
     .select({ id: distributionPlans.id, targetSummary: distributionPlans.targetSummary, updatedAt: distributionPlans.updatedAt })
     .from(distributionPlans)
     .where(and(eq(distributionPlans.ownerId, ownerId), eq(distributionPlans.status, 'attention')))
-    .orderBy(desc(distributionPlans.updatedAt))
-    .limit(50);
+    .orderBy(desc(distributionPlans.updatedAt), desc(distributionPlans.id))
+    .limit(OPS_LIST_LIMIT);
+  const failures = await repeatedFailures(db, ownerId, now);
   const [intent] = await db
     .select({ n: sql<number>`count(*)::int`, oldest: sql<string | null>`min(${sendIntents.createdAt})::text` })
     .from(sendIntents)
@@ -272,14 +329,17 @@ export async function opsSnapshot(
       total: Object.values(byState).reduce((a, b) => a + b, 0),
       oldestQueuedHours: queued?.oldest ? ageHours(new Date(queued.oldest), now) : null,
       nextRetryAt: retry?.next ? new Date(retry.next) : null,
-      attention: attention.map((a) => ({ ...a, itemId: a.itemId ?? null, planId: a.planId ?? null, channel: a.channel ?? null })),
-      repeatedFailures: await repeatedFailures(db, ownerId, now),
-      attentionPlans: plans,
+      attention: listed(
+        Number(attentionTotal?.n ?? 0),
+        attention.map((a) => ({ ...a, itemId: a.itemId ?? null, planId: a.planId ?? null, channel: a.channel ?? null })),
+      ),
+      repeatedFailures: listed(failures.length, failures.slice(0, OPS_LIST_LIMIT)),
+      attentionPlans: listed(await countAttentionPlans(db, ownerId), plans),
     },
     intents: { pending: Number(intent?.n ?? 0), oldestPendingAt: intent?.oldest ? new Date(intent.oldest) : null },
     pendingDeletes: await pendingDeleteStats(db, ownerId),
     uploads: { expiredSessions: Number(up?.expired ?? 0), openPastExpiry: Number(up?.openPast ?? 0) },
-    disk: await diskUsage(config),
+    disk: await cachedDiskUsage(config, now.getTime()),
     cost: {
       currency: policy.currency,
       monthlyLimit: config.LLM_BUDGET_MONTHLY_LIMIT ?? null,
@@ -314,18 +374,22 @@ export interface HealthOps {
   attention_plans: number;
   repeated_failures: number;
   pending_deletes: number;
+  /** unavailable(폴더 없음·읽기 실패)이면 null. partial 이면 하한값이고 disk_partial = true */
   disk: { db: number | null; assets: number | null; uploads: number | null; exports: number | null };
+  disk_partial: boolean;
 }
 
 export async function healthOps(db: Db, config: AppConfig, now: Date = new Date()): Promise<HealthOps> {
   const last = await lastExportAt(db, null);
   const disk = await cachedDiskUsage(config, now.getTime());
-  const bytes = (u: DirUsage | null) => (u && u.present ? u.bytes : null);
+  const bytes = (u: DirUsage | null) => (u && u.present && u.status !== 'unavailable' ? u.bytes : null);
+  const partial = [disk.db, disk.assets, disk.uploads, disk.exports].some((u) => u?.status === 'partial');
   return {
     backup_age_hours: last ? ageHours(last.createdAt, now) : null,
     attention_plans: await countAttentionPlans(db, null),
     repeated_failures: (await repeatedFailures(db, null, now)).length,
     pending_deletes: (await pendingDeleteStats(db, null)).count,
     disk: { db: bytes(disk.db), assets: bytes(disk.assets), uploads: bytes(disk.uploads), exports: bytes(disk.exports) },
+    disk_partial: partial,
   };
 }

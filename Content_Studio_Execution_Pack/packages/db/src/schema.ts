@@ -847,6 +847,8 @@ export const restoreDrills = pgTable(
     result: text('result').notNull(),
     mismatchJson: jsonb('mismatch_json').$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
     bundleSha256: text('bundle_sha256'),
+    /** FIX round 1(Codex review-T20 P1): 준비·비교 중 예외로 끝난 훈련의 정제된 오류 코드(오류 클래스 이름·코드만 — 경로·메시지 없음) */
+    errorCode: text('error_code'),
   },
   (t) => [
     check('restore_drills_result_chk', sql`${t.result} in ('pass', 'fail')`),

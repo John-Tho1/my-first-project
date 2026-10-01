@@ -98,6 +98,8 @@ export const DRILL_PARTIAL_LABEL: Record<string, string> = {
   'empty:contents': '원고 없음',
   'empty:content_versions': '원고 버전 없음',
   no_distribution: '배포 복구 미검증(작업·승인 없음)',
+  'empty:jobs': '작업(jobs) 없음 — 작업 복구 미검증',
+  'empty:approvals': '승인(approvals) 없음 — 승인 복구 미검증',
 };
 
 export function drillScope(emptyTables: readonly string[], tablesCompared: number, filesChecked: number, searchProbe: DrillScope['search_probe']): DrillScope {
@@ -107,6 +109,8 @@ export function drillScope(emptyTables: readonly string[], tablesCompared: numbe
   for (const t of DRILL_CORE_TABLES) if (emptyTables.includes(t)) reasons.push(`empty:${t}`);
   // FIX round 4(Codex Q17): 배포 이력(작업·승인)이 없으면 배포 복구는 검증되지 않았다
   if (DRILL_DISTRIBUTION_TABLES.every((t) => emptyTables.includes(t))) reasons.push('no_distribution');
+  // FIX round 5(Codex Q17): 한쪽만 비었으면 그 쪽의 복구가 검증되지 않았다고 따로 표시한다
+  else for (const t of DRILL_DISTRIBUTION_TABLES) if (emptyTables.includes(t)) reasons.push(`empty:${t}`);
   return { empty_tables: [...emptyTables], tables_compared: tablesCompared, files_checked: filesChecked, search_probe: searchProbe, partial: reasons.length > 0, partial_reasons: reasons };
 }
 

@@ -272,7 +272,11 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
                   : ''
               }${s.lastRetention.resultMissing ? ' · 파일 삭제 결과 기록이 없습니다(중단됐을 수 있음 — 아래 미리보기로 남은 파일 확인)' : ''}${
                 Number(s.lastRetention.details.already_absent ?? 0) > 0 ? ` · 이미 없던 파일 ${String(s.lastRetention.details.already_absent)}개` : ''
-              }${s.lastRetention.details.exports_aborted ? ' · 남길 백업을 다시 검증하지 못해 내보내기는 지우지 않았습니다' : ''}`
+              }${s.lastRetention.details.exports_aborted ? ' · 남길 백업을 다시 검증하지 못해 내보내기는 지우지 않았습니다' : ''}${
+                Number(s.lastRetention.details.candidates_damaged_kept ?? 0) > 0
+                  ? ` · 지울 예정이던 백업 ${String(s.lastRetention.details.candidates_damaged_kept)}개가 손상·읽기 실패로 확인되어 ZIP·폴더를 남겼습니다`
+                  : ''
+              }${s.lastRetention.details.outcome === 'partial' ? ' · 결과: 일부만 처리(전체 성공 아님)' : ''}`
             : '기록 없음'}
         </p>
         {s.incompleteRetention.total ? (

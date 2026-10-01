@@ -339,7 +339,8 @@ describe('보존 정리', () => {
       exportsAborted: null,
       jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
       packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
-      exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0 },
+      exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0, candidatesDamagedKept: 0 },
+      outcome: 'complete',
     });
   });
 
@@ -793,14 +794,16 @@ describe('FIX round 3 (Codex review-FIX-T20 · review-FIX2-T20) — 보존 정�
         },
       },
     });
-    expect(r1.exports).toEqual({ deleted: 1, failed: 0, bytes: old.zipBytes, errorCodes: ['EACCES'], dirsDeleted: 0, dirsFailed: 1 });
+    expect(r1.exports).toEqual({ deleted: 1, failed: 0, bytes: old.zipBytes, errorCodes: ['EACCES'], dirsDeleted: 0, dirsFailed: 1, candidatesDamagedKept: 0 });
+    expect(r1.outcome).toBe('partial');
     expect(existsSync(old.zipPath)).toBe(false);
     expect(existsSync(old.dirPath)).toBe(true);
     const files1 = (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'retention.files'))))[0]!
       .sanitizedDetails as Record<string, unknown>;
     expect(files1).toMatchObject({ exports_deleted: 1, exports_bytes: old.zipBytes, export_dirs_deleted: 0, export_dirs_failed: 1, error_codes: 'EACCES' });
     const r2 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true });
-    expect(r2.exports).toEqual({ deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 1, dirsFailed: 0 });
+    expect(r2.exports).toEqual({ deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 1, dirsFailed: 0, candidatesDamagedKept: 0 });
+    expect(r2.outcome).toBe('complete');
     expect(existsSync(old.dirPath)).toBe(false);
   });
 
@@ -1091,5 +1094,134 @@ describe('FIX round 4 (Codex review-FIX3-T20) — 복원 훈련 판정 시각', 
     expect(r.scope.partial_reasons).toContain('no_distribution');
     expect(r.scope.partial_reasons).not.toContain('no_files');
     expect(DRILL_PARTIAL_LABEL.no_distribution).toMatch(/배포 복구 미검증/u);
+  }, 60_000);
+});
+
+describe('FIX round 5 (Codex review-FIX4-T20)', () => {
+  const pol1 = () => ({ ...cfg(), RETENTION_EXPORT_RUNS_KEEP: 1 });
+  const flipKeepMtime = (file: string, mtime: number) => {
+    const b = readFileSync(file);
+    const i = Math.floor(b.length / 2);
+    b[i] = b[i]! ^ 0xff;
+    writeFileSync(file, b);
+    utimesSync(file, mtime, mtime);
+  };
+
+  it('P1: 미리보기 캐시 뒤 **오래된 삭제 후보** ZIP 을 같은 길이·mtime 으로 손상 → 적용은 후보도 다시 검증해 ZIP·폴더를 남기고 기록한다', async () => {
+    const o = await newOwner('ops-r5-cand');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    const newest = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const fixed = Math.floor(Date.now() / 1000) - 120;
+    utimesSync(older.zipPath, fixed, fixed);
+    expect((await planRetention(db, o.id, pol1(), exportsDir)).exports.map((e) => e.id)).toEqual([older.exportId]); // 캐시: older = verified
+    flipKeepMtime(older.zipPath, fixed);
+    expect((await planRetention(db, o.id, pol1(), exportsDir)).exports.map((e) => e.id)).toEqual([older.exportId]); // 미리보기는 여전히 캐시
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true });
+    expect(r.exports).toMatchObject({ deleted: 0, dirsDeleted: 0, candidatesDamagedKept: 1 });
+    expect(r.outcome).toBe('partial');
+    expect(r.exportsAborted).toBeNull();
+    expect(existsSync(older.zipPath)).toBe(true);
+    expect(existsSync(older.dirPath)).toBe(true);
+    expect(existsSync(newest.zipPath)).toBe(true);
+    const files = (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'retention.files'))))[0]!
+      .sanitizedDetails as Record<string, unknown>;
+    expect(files).toMatchObject({ candidates_damaged_kept: 1, outcome: 'partial', sweep_id: r.sweepId });
+  });
+
+  it('Q18: 남길 백업 재검증 실패로 내보내기는 멈춰도 배포 파일 정리는 진행하고, 같은 sweep_id 결과에 둘 다 남기며 전체 성공이 아니다', async () => {
+    const o = await newOwner('ops-r5-q18');
+    const { content } = await createContent(db, o.id, { title: '배포 파일', body: BODY });
+    const dir = path.join(exportsDir, 'packages', o.id, content.id);
+    mkdirSync(dir, { recursive: true });
+    const pkg = path.join(dir, `${randomUUID()}.zip`);
+    writeFileSync(pkg, 'pkg');
+    const t = new Date(Date.now() - 40 * DAY);
+    utimesSync(pkg, t, t);
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    const newest = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    let reads = 0;
+    const zipFs = {
+      stat: async (f: string) => statSync(f),
+      readFile: async (f: string) => {
+        if (path.resolve(f) === path.resolve(newest.zipPath) && ++reads > 1) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        return new Uint8Array(readFileSync(f));
+      },
+    };
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, zipFs });
+    expect(r.exportsAborted).toBe('kept_unverified');
+    expect(r.packages.deleted).toBe(1);
+    expect(existsSync(pkg)).toBe(false);
+    expect(existsSync(older.zipPath)).toBe(true);
+    expect(r.outcome).toBe('partial');
+    const [plan] = (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'retention.sweep')))).map(
+      (a) => a.sanitizedDetails as Record<string, unknown>,
+    );
+    const [files] = (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'retention.files')))).map(
+      (a) => a.sanitizedDetails as Record<string, unknown>,
+    );
+    expect(plan!.sweep_id).toBe(r.sweepId);
+    expect(files).toMatchObject({ sweep_id: r.sweepId, exports_aborted: 'kept_unverified', packages_deleted: 1, outcome: 'partial' });
+  });
+
+  it('P1: 미완료 정리 1개 뒤에 완료된 계획이 1,000개 넘게 쌓여도 미완료는 전체 수 1 로 남고 목록에 나온다', async () => {
+    const o = await newOwner('ops-r5-many');
+    const incomplete = randomUUID();
+    const base = Date.now() - 10 * DAY;
+    await db.insert(schema.auditEvents).values({
+      ownerId: o.id,
+      action: 'retention.sweep',
+      entity: 'retention',
+      sanitizedDetails: { sweep_id: incomplete, planned_packages: 1, planned_export_zips: 0, planned_export_dirs: 0 },
+      at: new Date(base),
+    });
+    const rows: Array<typeof schema.auditEvents.$inferInsert> = [];
+    for (let k = 0; k < 1005; k++) {
+      const id = randomUUID();
+      const at = new Date(base + (k + 1) * 1000);
+      rows.push({ ownerId: o.id, action: 'retention.sweep', entity: 'retention', sanitizedDetails: { sweep_id: id, planned_packages: 1 }, at });
+      rows.push({ ownerId: o.id, action: 'retention.files', entity: 'retention', sanitizedDetails: { sweep_id: id, packages_deleted: 1 }, at });
+    }
+    for (let k = 0; k < rows.length; k += 500) await db.insert(schema.auditEvents).values(rows.slice(k, k + 500));
+    const inc = await incompleteRetentionSweeps(db, o.id, 5);
+    expect(inc.total).toBe(1);
+    expect(inc.items.map((i) => i.sweepId)).toEqual([incomplete]);
+    expect((await opsSnapshot(db, o.id, cfg())).incompleteRetention.total).toBe(1);
+  }, 60_000);
+
+  it('같은 시각에 끝난 두 정리: lastRetentionSweep 은 (at, id) 순서로 결정적이고 각 실행은 제 결과와 짝지어진다', async () => {
+    const o = await newOwner('ops-r5-tie');
+    const at = new Date();
+    for (let k = 0; k < 2; k++) {
+      const id = randomUUID();
+      await db.insert(schema.auditEvents).values([
+        { ownerId: o.id, action: 'retention.sweep', entity: 'retention', sanitizedDetails: { sweep_id: id, planned_packages: 1 }, at },
+        { ownerId: o.id, action: 'retention.files', entity: 'retention', sanitizedDetails: { sweep_id: id, packages_deleted: k + 1 }, at },
+      ]);
+    }
+    const a = await lastRetentionSweep(db, o.id);
+    const b = await lastRetentionSweep(db, o.id);
+    expect(a).toEqual(b);
+    expect(a!.resultMissing).toBe(false);
+    // 고른 계획의 결과(같은 sweep_id)가 합쳐졌다
+    const files = await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'retention.files')));
+    const mine = files.find((f) => (f.sanitizedDetails as Record<string, unknown>).sweep_id === a!.sweepId)!;
+    expect(a!.details.packages_deleted).toBe((mine.sanitizedDetails as Record<string, unknown>).packages_deleted);
+    expect((await incompleteRetentionSweeps(db, o.id)).total).toBe(0);
+  });
+
+  it('Q17: 승인은 있고 작업이 없는 owner → 부분 검증 "작업(jobs) 없음"(배포 전체 미검증과 구분)', async () => {
+    const o = await newOwner('ops-r5-scope');
+    await putAsset(o.id);
+    const { content } = await createContent(db, o.id, { title: '승인만', body: BODY });
+    const { variant } = await createVariantDraft(db, o.id, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, o.id, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const { plan, items } = await createPlan(db, o.id, { items: [{ variant_id: variant.id, channel_account_id: o.accounts.threads }] });
+    await approveItems(db, o.id, plan.id, { item_ids: [items[0]!.id], expected_hashes: { [items[0]!.id]: items[0]!.payloadHash }, confirm: true, purpose: 'mock_publish' });
+    const r = await runRestoreDrill(db, storage, o.id, { trigger: 'test', tmpRoot: tmp });
+    expect(r.result).toBe('pass');
+    expect(r.scope.partial_reasons).toContain('empty:jobs');
+    expect(r.scope.partial_reasons).not.toContain('no_distribution');
+    expect(r.scope.partial_reasons).not.toContain('empty:approvals');
+    expect(DRILL_PARTIAL_LABEL['empty:jobs']).toMatch(/작업/u);
   }, 60_000);
 });

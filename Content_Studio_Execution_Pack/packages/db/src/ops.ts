@@ -424,18 +424,27 @@ export async function lastRetentionSweep(
   };
 }
 
-/** 파일 계획이 있었는데 같은 실행 ID 의 결과 기록이 없는 정리 실행(최근 것부터, 최대 limit 개)과 전체 수. */
+/**
+ * 파일 계획이 있었는데 같은 실행 ID 의 결과 기록이 없는 정리 실행(최근 것부터, 최대 limit 개)과 전체 수.
+ * FIX round 5(Codex review-FIX4-T20 P1): 최근 N 개만 보지 않고 owner 의 **모든** 계획 감사를 SQL NOT EXISTS 로 본다 — 완료된 실행이 아무리 쌓여도
+ * 옛 미완료 실행이 사라지지 않는다. 전체 수는 따로 세고, limit 은 표시 목록에만 적용한다.
+ */
 export async function incompleteRetentionSweeps(
   db: DbOrTx,
   ownerId: string,
   limit = 20,
 ): Promise<{ total: number; items: Array<{ sweepId: string; at: Date; planned: number }> }> {
-  const plans = await sweepAudits(db, ownerId, 'retention.sweep', 1000);
-  const done = new Set((await sweepAudits(db, ownerId, 'retention.files', 1000)).map((f) => f.details.sweep_id).filter((x): x is string => typeof x === 'string'));
-  const open = plans
-    .filter((p) => typeof p.details.sweep_id === 'string' && plannedFiles(p.details) > 0 && !done.has(p.details.sweep_id as string))
-    .map((p) => ({ sweepId: p.details.sweep_id as string, at: p.at, planned: plannedFiles(p.details) }));
-  return { total: open.length, items: open.slice(0, limit) };
+  const planned = sql`coalesce((p.sanitized_details->>'planned_packages')::int, 0) + coalesce((p.sanitized_details->>'planned_export_zips')::int, 0) + coalesce((p.sanitized_details->>'planned_export_dirs')::int, 0)`;
+  const where = sql`p.owner_id = ${ownerId}::uuid and p.action = 'retention.sweep' and p.sanitized_details ? 'sweep_id' and ${planned} > 0
+    and not exists (select 1 from audit_events f where f.owner_id = p.owner_id and f.action = 'retention.files' and f.sanitized_details->>'sweep_id' = p.sanitized_details->>'sweep_id')`;
+  const countRes = await db.execute(sql`select count(*)::int as n from audit_events p where ${where}`);
+  const total = Number((countRes as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0);
+  if (total === 0) return { total: 0, items: [] };
+  const listRes = await db.execute(
+    sql`select p.sanitized_details->>'sweep_id' as sweep_id, p.at::text as at, ${planned} as planned from audit_events p where ${where} order by p.at desc, p.id desc limit ${limit}`,
+  );
+  const rows = (listRes as unknown as { rows: Array<{ sweep_id: string; at: string; planned: number }> }).rows;
+  return { total, items: rows.map((r) => ({ sweepId: r.sweep_id, at: new Date(r.at), planned: Number(r.planned) })) };
 }
 
 // ---- /api/health (모든 owner 합계, 숫자만) ----

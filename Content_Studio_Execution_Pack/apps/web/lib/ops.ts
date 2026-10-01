@@ -70,6 +70,7 @@ export function retentionResultView(r: RetentionResult) {
     sweep_id: r.sweepId,
     already_absent: r.alreadyAbsent,
     exports_aborted: r.exportsAborted,
+    outcome: r.outcome,
     job_events: { jobs: r.jobEvents.jobs, deleted: r.jobEvents.deleted, archived: r.jobEvents.archive !== null },
     packages: r.packages,
     exports: r.exports,

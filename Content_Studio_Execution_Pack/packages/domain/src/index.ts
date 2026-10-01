@@ -19,3 +19,4 @@ export * from './upload';
 export * from './stt';
 export * from './distribution';
 export * from './jobs';
+export * from './ops';

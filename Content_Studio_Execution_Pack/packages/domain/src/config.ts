@@ -38,12 +38,26 @@ const LABELS: Record<string, string> = {
   RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
   JOB_SUBMIT_TIMEOUT_MS: 'JOB_SUBMIT_TIMEOUT_MS(배포 전송 시간 제한, ms)',
   WORKER_UI_TICK_TIMEOUT_MS: 'WORKER_UI_TICK_TIMEOUT_MS(화면 "작업 처리 실행" 전송 시간 제한, ms)',
+  BACKUP_MAX_AGE_HOURS: 'BACKUP_MAX_AGE_HOURS(백업 경고 기준 시간)',
+  RETENTION_PACKAGES_DAYS: 'RETENTION_PACKAGES_DAYS(배포 파일 보존 일수)',
+  RETENTION_EXPORT_RUNS_KEEP: 'RETENTION_EXPORT_RUNS_KEEP(남길 내보내기 ZIP 수)',
+  RETENTION_JOB_EVENTS_DAYS: 'RETENTION_JOB_EVENTS_DAYS(끝난 작업 이력 보존 일수)',
+  RETENTION_SWEEP_MODE: 'RETENTION_SWEEP_MODE(보존 정리 방식)',
 };
 
 /** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
 const emptyToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
 
 const opt = <T extends z.ZodType>(schema: T) => z.preprocess(emptyToUndefined, schema);
+
+/** T20: 정수 문자열(최대 6자리) → min~max, 없으면 기본값. */
+const intRange = (min: number, max: number, def: number) =>
+  z
+    .string()
+    .regex(/^\d{1,6}$/)
+    .transform(Number)
+    .pipe(z.int().min(min).max(max))
+    .default(def);
 
 /** 0 이상, 소수 6자리까지의 10진 문자열(부동소수 오차 없이 micro 단위 정수로 바꾼다 — budget.ts). */
 const decimalString = z.string().regex(/^\d{1,9}(\.\d{1,6})?$/);
@@ -124,6 +138,16 @@ export const configSchema = z.object({
       .pipe(z.int().min(1000).max(600000))
       .default(10000),
   ),
+  /** T20(D22): 마지막 내보내기(백업)가 이 시간보다 오래되면 /ops 에 경고(시간, 1 ~ 8760, 기본 24). 외부 알림은 없다. */
+  BACKUP_MAX_AGE_HOURS: opt(intRange(1, 8760, 24)),
+  /** T20: 배포 파일(수동 게시용 ZIP, 다시 만들 수 있음) 보존 일수 — 파일 수정 시각 기준(1 ~ 3650, 기본 30). */
+  RETENTION_PACKAGES_DAYS: opt(intRange(1, 3650, 30)),
+  /** T20: owner 마다 남길 최근 내보내기 ZIP 개수(1 ~ 1000, 기본 10). 실행 기록(export_runs)은 남긴다. */
+  RETENTION_EXPORT_RUNS_KEEP: opt(intRange(1, 1000, 10)),
+  /** T20: 끝난 배포 작업(CONFIRMED·FAILED·CANCELED)의 이력 보존 일수 — 마지막 이력이 이보다 오래된 작업만, JSONL 로 내보낸 뒤 삭제(1 ~ 3650, 기본 180). */
+  RETENTION_JOB_EVENTS_DAYS: opt(intRange(1, 3650, 180)),
+  /** T20: 보존 정리 실행 방식. manual(기본) = /ops 에서 미리보기 → confirm 으로만, auto = worker tick 이 한 시간에 한 번 적용. */
+  RETENTION_SWEEP_MODE: opt(z.enum(['manual', 'auto']).default('manual')),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

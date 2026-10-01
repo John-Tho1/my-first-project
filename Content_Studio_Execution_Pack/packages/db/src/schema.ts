@@ -825,6 +825,37 @@ export const restoreRuns = pgTable(
 );
 
 /**
+ * 복원 훈련 기록(T20, 결정 D22). 내보내기 → 버리는 메모리 DB + 빈 저장소에 empty_only 복원 → 표별 행 수·ID·내용 sha256·파일 checksum·검색 확인.
+ * result: pass | fail. mismatch_json 은 불일치 목록(표 이름·종류·건수 — 본문·식별자 원문 없음).
+ * export_run_id 는 훈련용 묶음의 export_id 다 — 훈련 묶음은 export_runs 에 기록하지 않는다(백업으로 세지 않음, 파일은 훈련 뒤 삭제).
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES — 운영 기록, 환경마다 다름).
+ */
+export const restoreDrills = pgTable(
+  'restore_drills',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    startedAt: ts('started_at').notNull(),
+    finishedAt: ts('finished_at').notNull(),
+    exportRunId: uuid('export_run_id'),
+    trigger: text('trigger').notNull(),
+    tablesCompared: integer('tables_compared').notNull(),
+    rowsCompared: integer('rows_compared').notNull(),
+    assetsCompared: integer('assets_compared').notNull(),
+    result: text('result').notNull(),
+    mismatchJson: jsonb('mismatch_json').$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+    bundleSha256: text('bundle_sha256'),
+  },
+  (t) => [
+    check('restore_drills_result_chk', sql`${t.result} in ('pass', 'fail')`),
+    check('restore_drills_trigger_chk', sql`${t.trigger} in ('cli', 'api', 'test')`),
+    index('restore_drills_owner_started_idx').on(t.ownerId, t.startedAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
  * 업로드 세션(T08, A14). 큰 음성·영상 파일을 조각으로 받는다. 조각 파일은 STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>.
  * state: open → completed(조립·검사 중) → verified(asset 생성) | rejected(검사 실패, 조각 삭제) / open → aborted | expired(24시간, worker 가 조각 삭제).
  * 주의: export/restore 대상에서 제외한다 — 전송 중 임시 상태이며 조각 파일은 묶음에 넣지 않는다.

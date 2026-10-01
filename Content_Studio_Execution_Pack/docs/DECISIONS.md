@@ -295,3 +295,19 @@
 - User decision required?: 아니오(화면 결함 수정). 단 threads 본문 정규화(빈 줄 여러 개 → 하나, 문단 앞뒤 공백 제거)가 사용자 의도와 다르면 알려 달라.
 - Consequences: 화면 폼에서 JSON 의 중복 칸은 무시된다(옛 화면을 열어 둔 채 thread_parts 를 고쳐도 본문이 이긴다). JSON API 규칙(T09)은 바뀌지 않는다. dev 첫 컴파일이 조금 느려질 수 있다.
 - When to revisit: 화면에 클라이언트 편집기를 둘 때(D2), 실제 원격 조회가 생길 때(M4 — D8 문구), Next 업그레이드 시(D9 옵션 존재·기본값).
+
+## D22 — T20 운영·복원 훈련·보존(로컬·모의 범위): 숫자는 기록에서만, 훈련 = 메모리 DB 에 empty_only, 보존 정리는 내보낸 뒤 삭제·기본 수동, 외부 알림 없음
+- Decision ID / date: D22 / 2026-10-01 (Europe/Moscow)
+- Question: docs/02 "운영·복원"(job 지연·반복 실패·UNKNOWN·용량·비용·backup age 표시, 운영 전 복원 1회 통과)과 docs/07 "백업/보존 초안"을 실계정·외부 저장소·외부 알림 없이(D20: M4 보류) 어떻게 구현하는가?
+- Options: (1) 표시: 상태 배지("정상") / **기록에서 센 숫자만, 원천 없으면 "측정 없음"**. (2) 복원 훈련 대상: 두 번째 파일 DB / 같은 DB 의 다른 owner / **버리는 메모리 PGlite + 빈 임시 저장소에 empty_only**. (3) 훈련 묶음: export_runs 에 기록 / **기록 안 함(백업으로 세지 않음), 끝나면 삭제**. (4) 보존: 바로 삭제 / **job_events 는 JSONL 로 내보낸 뒤 삭제, 파일은 정책대로 삭제**. (5) 실행: worker 자동 / **기본 수동(미리보기 → confirm=yes), auto 는 설정으로**. (6) 알림: 이메일·메시지 / **앱 화면(/ops)만**.
+- Chosen option: 각 굵은 선택. 세부:
+  - 기준값(설정, 잠정): `BACKUP_MAX_AGE_HOURS` 24, 반복 실패 = 지난 7일 전송 의도 결과 rejected·ambiguous 3회 이상(코드 상수), `RETENTION_JOB_EVENTS_DAYS` 180, `RETENTION_PACKAGES_DAYS` 30, `RETENTION_EXPORT_RUNS_KEEP` 10, `RETENTION_SWEEP_MODE` manual. 업로드 세션 24시간은 기존 D15 고정값(설정 추가 안 함). 앱은 파일 로그가 없어 `RETENTION_LOG_DAYS` 는 문서로만 둔다(설정 없음).
+  - 백업 나이 = 마지막 **완료된 export_runs**(owner) 이후 시간. 파일이 아직 있는지·외부로 옮겼는지는 판단하지 않는다(로컬 ZIP 만). 기준 초과면 경고, 기록 없으면 "백업 나이를 잴 수 없음".
+  - 복원 훈련: 임시 내보내기(record:false) → 인증 비밀 없음 확인(sessions 표·session 파일·token_hash·식별자 원문) → 메모리 DB + 임시 폴더 저장소에 미리보기·empty_only 커밋 → RESTORED_TABLES 마다 행 수·ID 집합·내용 sha256(stableStringify, owner 열 없음) 비교. 복원이 안전을 위해 바꾸는 열(D17~D19: jobs 상태·lease·표시, distribution_items 상태·표시, distribution_plans 상태·revision, approvals 철회, variants lifecycle, transcription_jobs·usage_ledger 정리 열)은 내용 비교에서만 뺀다. 파일: 복원 저장소 바이트 sha256 = checksum = 원본(원본 파일이 없으면 FAIL), 검색: 원본에서 찾히는 소재 1건을 같은 검색어로. 결과는 `restore_drills`(migration 0024, export/restore 제외 표)에 표·종류·ID·열 이름만.
+  - 화면 훈련(`POST /api/ops/restore-drill`)은 운영 DB 를 읽기만 하므로 파일 잠금과 무관. CLI `pnpm drill:restore` 는 운영 DB 를 열므로 dev 서버가 켜져 있으면 기존 잠금 안내로 exit 1.
+  - 보존 정리 대상은 정확히 셋(job_events·배포 파일 ZIP·내보내기 ZIP). job_events 는 끝난 작업(CONFIRMED·FAILED·CANCELED)이면서 마지막 이력이 기준보다 오래된 작업의 이력 전체만. migration 0024 가 `job_events_immutable` 트리거를 `job_events_guard` 로 바꿔 `set_config('cs.retention_sweep','on', true)` 가 켜진 트랜잭션에서 끝난 작업의 행 삭제만 허용한다(UPDATE·그 밖의 DELETE 는 계속 거부). 앱은 작업 행을 잠그고 다시 확인한 뒤 JSONL 을 쓰고 되읽어 줄 수를 확인한 다음 지운다. export_runs 행은 이력으로 남긴다.
+- Evidence / assumption: 통합 테스트 tests/integration/ops-retention.test.ts — 배포 이력(확정·보류·실패 의도)이 있는 owner 의 훈련 PASS, 복원 행 변조·원본 파일 누락 → FAIL, 보존 미리보기 무변경, 적용 후 원문 표 행 수 불변·보류 작업·다른 owner 이력 유지, 트리거가 표시 없는/끝나지 않은 작업 삭제를 거부. 훈련은 처음에 계획 상태 재계산(revision) 때문에 FAIL 로 나와 변환 열 목록에 넣었다(거짓 실패 제거 — 거짓 통과 위험은 인계 문서 질문).
+- Reversible?: 예(설정·migration 0024 의 트리거 함수는 되돌릴 수 있음, restore_drills 는 운영 기록).
+- User decision required?: 예 — (a) 기준값(24시간·180일·30일·10개) 확인, (b) 보존 정리 기본 manual 유지 여부(auto 로 바꾸면 오래된 내보내기 ZIP 도 자동으로 지워짐), (c) 백업을 이 PC 밖(외부 디스크·클라우드)으로 옮길지 — 지금은 로컬 ZIP 만이며 외부 저장소는 연결하지 않았다, (d) 외부 알림(M5 선택 기능)을 쓸지.
+- Consequences: "백업으로 안전" 같은 문구는 없다 — 복원 훈련 PASS 와 백업 나이라는 사실만 보여 준다. 훈련 PASS 는 "지금 DB 를 내보내 빈 환경에 넣으면 같아진다"는 뜻이지 과거 ZIP 이 온전하다는 뜻은 아니다. job_events 를 지운 작업은 화면 이력이 비고, JSONL 보관 파일이 근거가 된다(보관 파일 자체의 보존 기간은 미정).
+- When to revisit: PostgreSQL 전환(트리거·set_config 호환, 훈련 대상 DB), 외부 백업 저장소 도입, M5 외부 알림, 실계정(M4) 연결 시 기준값.

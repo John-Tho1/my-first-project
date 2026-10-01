@@ -67,6 +67,8 @@ export interface ExportOptions {
   /** 절대 경로. 이 아래에 <export_id>/ 와 <export_id>.zip 을 만든다. */
   outDir: string;
   now?: Date;
+  /** T20: false 면 export_runs·감사 기록을 남기지 않는다(복원 훈련용 임시 묶음 — 백업으로 세지 않는다). 기본 true. */
+  record?: boolean;
 }
 
 export interface ExportResult {
@@ -137,7 +139,7 @@ export async function exportOwner(db: Db, storage: BlobStore, ownerId: string, o
   }
 
   const manifestSha256 = sha256Hex(built.manifestBytes);
-  await db.transaction(async (tx) => {
+  if (opts.record !== false) await db.transaction(async (tx) => {
     await tx.insert(exportRuns).values({
       id: exportId,
       ownerId,

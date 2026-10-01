@@ -107,6 +107,9 @@ export default async function SettingsPage({
       <section className="card archive" aria-labelledby="export-title">
         <h3 id="export-title">내보내기</h3>
         <p className="note">
+          백업 나이·복원 훈련 결과·보존 정리는 <Link href="/ops">운영</Link> 화면에서 봅니다.
+        </p>
+        <p className="note">
           소재·수정 이력·출처·카드·원고(모든 버전)·원문 관계·첨부 파일을 Markdown + JSON + 파일 + checksum manifest 로 묶은 ZIP 을 만듭니다.
           로그인 세션·인증 비밀은 넣지 않습니다. 개인 원문이 들어 있으니 파일을 보관할 곳을 직접 정하세요.
         </p>

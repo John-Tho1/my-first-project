@@ -169,6 +169,13 @@
       "when": 1790331113467,
       "tag": "0023_t11_fix3_normalize_attempt",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790883992960,
+      "tag": "0024_t20_restore_drills",
+      "breakpoints": true
     }
   ]
 }

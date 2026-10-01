@@ -101,6 +101,7 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   sessions: '로그인 세션 — 인증 비밀과 같은 등급이며 다른 환경으로 옮기지 않는다',
   export_runs: '내보내기 실행 기록(운영 기록, 환경마다 다름)',
   restore_runs: '복원 실행 기록(운영 기록, 환경마다 다름)',
+  restore_drills: '복원 훈련 기록(T20, 운영 기록, 환경마다 다름)',
   upload_sessions: '업로드 세션(T08) — 전송 중 임시 상태. 완료된 파일은 assets 로 내보낸다',
   upload_chunks: '업로드 조각(T08) — 전송 중 임시 파일 목록. 조각 바이트는 묶음에 넣지 않는다',
 };

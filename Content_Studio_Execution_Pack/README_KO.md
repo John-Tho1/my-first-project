@@ -388,6 +388,25 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - migration `0018_t12_mock_scenarios`: `mock_scenarios`(항목당 1행, 시나리오 CHECK, 지연 0~5000, 모의 계정 항목만 트리거) — **내보내기만**. 계획 상태 CHECK 에 `attention` 추가(기존 `failed`·`partial` 중 확인 없이 보류·불명이 있는 계획은 `attention` 으로 재분류). 브랜드 프로필 새 버전은 옛 브랜드를 가리키는 활성 승인을 `invalidated:brand_changed` 로 철회한다.
 
+### 운영·복원 훈련·보존 정리 (M5, T20 — 로컬·모의 범위)
+결정 D22(docs/DECISIONS.md). **외부 알림·외부 저장소·외부 호출 0.**
+- 화면 `/ops`(상단 "운영", 설정에서도 링크): owner 전용·읽기 전용. 숫자는 모두 DB 행과 파일에서 센다. 원천이 없으면 "측정 없음"이며, "정상"·"안전" 같은 판정 배지는 없다.
+  - 배포 작업: 상태별 개수, 처리할 때가 지난 QUEUED 중 가장 오래 기다린 시간, RETRY_WAIT 다음 시각, RECONCILING·UNKNOWN·BLOCKED 작업(계획 링크), 지난 7일 실패(거부·결과 불명) 3회 이상 항목, 확인 필요(attention) 계획, 결과 대기 전송 의도, 파일 삭제 대기.
+  - 용량: DB 데이터 폴더(메모리 DB 면 측정 없음)·파일 저장소·업로드 조각·내보내기·배포 파일·보존 보관 파일 바이트(경로는 표시하지 않음), 만료된 업로드 세션 수.
+  - 비용: 이번 달(MSK) 통화별 사용·초과액·실행 수(기존 원장), 월 상한.
+  - 백업: 마지막 내보내기 시각·나이·크기. `BACKUP_MAX_AGE_HOURS`(기본 24)보다 오래되면 경고. 마지막 복원 훈련 결과.
+  - 모드: LLM·게시·수집·음성 전사·작업 처리기, live 준비 안 됨 이유.
+- 복원 훈련(A18): `/ops` 의 "복원 훈련 실행"(서버 켠 채로) 또는 `corepack pnpm drill:restore`(서버를 끈 상태 — 켜져 있으면 잠금 안내와 함께 exit 1).
+  - 순서: 임시 폴더로 내보내기 → 묶음에 인증 비밀이 없는지 확인 → **버리는 메모리 PGlite + 빈 임시 저장소**에 `empty_only` 복원 → 복원 표마다 행 수·ID 집합·내용 sha256 비교, 파일 checksum, 검색 1건 확인.
+  - 복원이 일부러 바꾸는 열(진행 중 작업 → 보류·결과 불명, 계획 상태, 승인 철회, 파생본 검토 → 초안 등)은 내용 비교에서 빼고 행 수·ID 로만 본다.
+  - 결과는 `restore_drills` 표에 남는다(불일치는 표·종류·ID·열 이름만). 훈련용 묶음은 내보내기 기록에 남지 않고(백업으로 세지 않음) 끝나면 지운다. 불일치가 있으면 CLI 는 exit 1.
+- 보존 정리: `/ops` 에서 "지금 적용하면 지울 것"(미리보기, 변경 없음)을 보고, 체크(`confirm=yes`)한 뒤에만 적용한다. API: `POST /api/ops/retention` `{dry_run:true}` | `{confirm:"yes"}`.
+  - 끝난 작업(CONFIRMED·FAILED·CANCELED)의 마지막 이력이 `RETENTION_JOB_EVENTS_DAYS`(180일)보다 오래되면 그 이력을 `EXPORT_LOCAL_DIR/retention/<owner>/job-events-*.jsonl` 로 먼저 보관한 뒤 지운다. DB 트리거가 이 경우 외의 삭제를 계속 막는다.
+  - 배포 파일 ZIP 은 `RETENTION_PACKAGES_DAYS`(30일), 내보내기 ZIP 은 최근 `RETENTION_EXPORT_RUNS_KEEP`(10개)만 남긴다. 실행 기록은 남긴다.
+  - 원문 소재·출처·원고 버전·파생본·승인·결과 기록은 지우지 않는다. 업로드 세션은 기존 24시간 자동 만료(D15) 그대로. 앱은 파일 로그를 쓰지 않아 로그 보존 설정은 없다.
+  - `RETENTION_SWEEP_MODE=auto` 면 작업 처리기가 한 시간에 한 번 같은 정리를 적용한다(기본 manual).
+- `/api/health` 의 `ops`: `backup_age_hours`·`attention_plans`·`repeated_failures`·`pending_deletes`·`disk{db,assets,uploads,exports}`. 숫자만, 기록이 없으면 null. 폴더 크기는 60초 동안 같은 측정값을 쓴다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -401,6 +420,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm drill:mock` | T12 M3 게이트 훈련(버리는 메모리 DB, 모의 어댑터 — 외부 호출 없음) 표 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 
 ### PGlite 단일 연결 주의

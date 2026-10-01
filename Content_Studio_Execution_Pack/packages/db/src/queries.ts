@@ -243,7 +243,9 @@ export interface AuditInput {
     | 'item.reconcile'
     | 'item.retry'
     | 'item.mock_scenario'
-    | 'worker.tick';
+    | 'worker.tick'
+    | 'restore_drill.run'
+    | 'retention.sweep';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

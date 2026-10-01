@@ -18,12 +18,15 @@ import {
   cleanupPendingDeletes,
   countCaptures,
   expireUploadSessions,
+  maybeAutoRetention,
+  resolveFromRoot,
   newWorkerId,
   runJobsTick,
   uploadStoreFor,
   type AssetDeleter,
   type Db,
   type JobsTickResult,
+  type RetentionResult,
   type TranscriberLike,
 } from '@cs/db';
 import type { AppConfig, ChannelAdapterRegistry } from '@cs/domain';
@@ -39,6 +42,8 @@ export interface WorkerTick {
   cleanup: { deleted: number; failed: number } | null;
   /** T11: 배포 작업(어댑터가 주어졌을 때만) — 결과 상태별 개수 */
   jobs: JobsTickResult | null;
+  /** T20: 보존 정리(RETENTION_SWEEP_MODE=auto 이고 한 시간이 지났을 때만, owner 별 결과). manual 이면 null */
+  retention: RetentionResult[] | null;
   note: string;
 }
 
@@ -107,6 +112,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
       ownerId: input.ownerId,
     });
   }
+  const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);
   const tick: WorkerTick = {
     ranAt: at.toISOString(),
     mode: config.WORKER_MODE,
@@ -117,6 +123,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
     transcription,
     cleanup,
     jobs,
+    retention,
     note:
       (transcriber
         ? `T08: 업로드 만료 정리 + 전사 job 진행(${transcriber.mode === 'mock' ? '모의 전사기, 외부 호출 없음' : 'live'})`

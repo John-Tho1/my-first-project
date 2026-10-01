@@ -26,7 +26,7 @@ describe('export 표 범위', () => {
   });
 
   it('sessions·export_runs·restore_runs·upload_sessions·upload_chunks(T08) 는 제외된다', () => {
-    expect(Object.keys(EXCLUDED_TABLES).sort()).toEqual(['export_runs', 'restore_runs', 'sessions', 'upload_chunks', 'upload_sessions']);
+    expect(Object.keys(EXCLUDED_TABLES).sort()).toEqual(['export_runs', 'restore_drills', 'restore_runs', 'sessions', 'upload_chunks', 'upload_sessions']);
   });
 
   it('BUNDLE_TABLES 는 이름이 맞는 drizzle 표를 가리킨다', () => {

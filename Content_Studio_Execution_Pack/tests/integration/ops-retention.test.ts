@@ -12,6 +12,10 @@ import {
   applyRetention,
   approveItems,
   closeDb,
+  ensureOwner,
+  createTestDb,
+  createRestorePreview,
+  commitRestore,
   drillErrorCode,
   createContent,
   createPlan,
@@ -319,7 +323,11 @@ describe('보존 정리', () => {
     expect(audit[0]!.sanitizedDetails).toMatchObject({ job_events_deleted: evConfirmed, packages_deleted: 2, exports_deleted: 2 });
     // 멱등
     const again = await applyRetention(db, A.id, policy(1), exportsDir, { confirm: true, now: future() });
-    expect(again).toEqual({ jobEvents: { jobs: 0, deleted: 0, archive: null }, packages: { deleted: 0, bytes: 0 }, exports: { deleted: 0, bytes: 0 } });
+    expect(again).toEqual({
+      jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
+      packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
+      exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
+    });
   });
 
   it('트리거: 정리 표시 없이·끝나지 않은 작업의 이력은 DB 가 삭제를 거부한다', async () => {
@@ -491,5 +499,178 @@ describe('FIX round 1 (Codex review-T20) P2 — 50개 상한은 전체 개수와
     const body = await (await healthGET()).json();
     expect(body.ops.attention_plans).toBeGreaterThanOrEqual(51);
     expect(typeof body.ops.disk_partial).toBe('boolean');
+  });
+});
+
+describe('FIX round 2 (Codex 놓친 케이스) — 보존 정리', () => {
+  const later = () => new Date(Date.now() + 200 * DAY);
+  const pol = (keep = 1) => ({ ...cfg(), RETENTION_EXPORT_RUNS_KEEP: keep });
+  const oldPackage = (owner: string, contentId: string) => {
+    const dir = path.join(exportsDir, 'packages', owner, contentId);
+    mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, `${randomUUID()}.zip`);
+    writeFileSync(f, 'pkg');
+    const t = new Date(Date.now() - 40 * DAY);
+    utimesSync(f, t, t);
+    return f;
+  };
+  const sweepAudits = async (owner: string) =>
+    (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, owner), eq(schema.auditEvents.action, 'retention.sweep')))).map(
+      (a) => a.sanitizedDetails as Record<string, unknown>,
+    );
+
+  it('동시 실행 두 번: 이력·파일을 두 번 보관·삭제하지 않고, 감사 합계 = 실제 삭제 수', async () => {
+    const o = await newOwner('ops-conc');
+    const d = await distribute(o, 'success');
+    const events = await eventCount(d.jobId);
+    expect(events).toBeGreaterThan(0);
+    oldPackage(o.id, d.contentId);
+    oldPackage(o.id, d.contentId);
+    for (const k of [3, 2, 1]) await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - k * 3600_000) });
+    const [r1, r2] = await Promise.all([
+      applyRetention(db, o.id, pol(1), exportsDir, { confirm: true, now: later() }),
+      applyRetention(db, o.id, pol(1), exportsDir, { confirm: true, now: later() }),
+    ]);
+    expect(r1.jobEvents.deleted + r2.jobEvents.deleted).toBe(events);
+    expect(r1.packages.deleted + r2.packages.deleted).toBe(2);
+    expect(r1.exports.deleted + r2.exports.deleted).toBe(2);
+    expect(readdirSync(path.join(exportsDir, 'retention', o.id))).toHaveLength(1);
+    const audits = await sweepAudits(o.id);
+    expect(audits.reduce((n, a) => n + Number(a.job_events_deleted), 0)).toBe(events);
+    expect(audits.reduce((n, a) => n + Number(a.packages_deleted), 0)).toBe(2);
+    expect(audits.reduce((n, a) => n + Number(a.exports_deleted), 0)).toBe(2);
+  });
+
+  it('보관 파일 sha256 확인: 되읽은 내용이 다르면 삭제를 멈추고 이력은 그대로, 정상이면 감사에 sha256·바이트 수(경로·본문 없음)', async () => {
+    const o = await newOwner('ops-sha');
+    const d = await distribute(o, 'success');
+    const events = await eventCount(d.jobId);
+    await expect(
+      applyRetention(db, o.id, pol(), exportsDir, {
+        confirm: true,
+        now: later(),
+        fs: { readFile: async (f) => Buffer.concat([readFileSync(f), Buffer.from('x')]) },
+      }),
+    ).rejects.toMatchObject({ code: 'retention_archive_mismatch' });
+    expect(await eventCount(d.jobId)).toBe(events);
+    expect(await sweepAudits(o.id)).toEqual([]);
+    // 같은 줄 수인데 내용만 바뀐 경우도 멈춘다
+    await expect(
+      applyRetention(db, o.id, pol(), exportsDir, {
+        confirm: true,
+        now: later(),
+        fs: { readFile: async (f) => Buffer.from(readFileSync(f, 'utf8').replace(/"job_events"/u, '"job_eventz"')) },
+      }),
+    ).rejects.toMatchObject({ code: 'retention_archive_mismatch' });
+    expect(await eventCount(d.jobId)).toBe(events);
+    const r = await applyRetention(db, o.id, pol(), exportsDir, { confirm: true, now: later() });
+    expect(r.jobEvents.deleted).toBe(events);
+    const [a] = await sweepAudits(o.id);
+    expect(a!.archive_sha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(Number(a!.archive_bytes)).toBeGreaterThan(0);
+    const file = readdirSync(path.join(exportsDir, 'retention', o.id)).find((n) => {
+      const b = readFileSync(path.join(exportsDir, 'retention', o.id, n));
+      return createHash('sha256').update(b).digest('hex') === a!.archive_sha256;
+    });
+    expect(file).toBeDefined();
+    expect(JSON.stringify(a)).not.toMatch(/[\\/]|state_after|sanitized_details/u);
+  });
+
+  it('파일 하나 삭제 실패(EACCES): 나머지는 지우고 실패 수·오류 코드만 결과·감사에 남기며, 다음 미리보기에 다시 나온다', async () => {
+    const o = await newOwner('ops-unlink');
+    const { content } = await createContent(db, o.id, { title: '배포 파일', body: BODY });
+    const bad = oldPackage(o.id, content.id);
+    oldPackage(o.id, content.id);
+    oldPackage(o.id, content.id);
+    const r = await applyRetention(db, o.id, pol(), exportsDir, {
+      confirm: true,
+      fs: {
+        unlink: async (f) => {
+          if (path.resolve(f) === path.resolve(bad)) throw Object.assign(new Error('denied C:\\x'), { code: 'EACCES' });
+          rmSync(f);
+        },
+      },
+    });
+    expect(r.packages).toMatchObject({ deleted: 2, failed: 1, errorCodes: ['EACCES'] });
+    expect(existsSync(bad)).toBe(true);
+    const [a] = await sweepAudits(o.id);
+    expect(a).toMatchObject({ packages_deleted: 2, packages_failed: 1, error_codes: 'EACCES' });
+    const next = await planRetention(db, o.id, pol(), exportsDir);
+    expect(next.packages.map((p) => p.id)).toEqual([path.basename(bad, '.zip')]);
+  });
+
+  describe('내보내기 파일 상태(ZIP 만 백업으로 센다)', () => {
+    it('ZIP 은 있고 폴더가 없음 → 정상 백업으로 셈', async () => {
+      const o = await newOwner('ops-zip');
+      const a = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+      const b = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+      rmSync(b.dirPath, { recursive: true, force: true });
+      const plan = await planRetention(db, o.id, pol(1), exportsDir);
+      expect(plan.exportsExisting).toBe(2);
+      expect(plan.exports.map((e) => [e.id, e.kind])).toEqual([[a.exportId, 'zip']]);
+      expect(plan.exportsMissingFile).toEqual([]);
+    });
+    it('폴더만 있고 ZIP 이 없음 → 세지 않음, 파일 없음 기록(폴더 있음)으로 보고, 더 최근 정상 백업이 있을 때만 폴더 정리 대상', async () => {
+      const o = await newOwner('ops-dir');
+      const old = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 7200_000) });
+      const kept = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+      const newest = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+      rmSync(old.zipPath);
+      rmSync(newest.zipPath);
+      const plan = await planRetention(db, o.id, pol(5), exportsDir);
+      expect(plan.exportsExisting).toBe(1);
+      expect(plan.exportsMissingFile.map((m) => [m.id, m.dirPresent]).sort()).toEqual(
+        [
+          [old.exportId, true],
+          [newest.exportId, true],
+        ].sort(),
+      );
+      // old 폴더는 더 최근 정상 백업(kept)보다 오래되어 정리 대상, newest 폴더는 kept 보다 최근이라 남긴다
+      expect(plan.exports.map((e) => [e.id, e.kind])).toEqual([[old.exportId, 'dir_only']]);
+      const r = await applyRetention(db, o.id, pol(5), exportsDir, { confirm: true });
+      expect(r.exports).toMatchObject({ deleted: 1, failed: 0 });
+      expect(existsSync(old.dirPath)).toBe(false);
+      expect(existsSync(newest.dirPath)).toBe(true);
+      expect(existsSync(kept.zipPath)).toBe(true);
+    });
+    it('모든 백업 ZIP 이 없음 → 아무것도 지우지 않고 전부 파일 없음 기록', async () => {
+      const o = await newOwner('ops-none');
+      const runs = [];
+      for (const k of [2, 1, 0]) runs.push(await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - k * 3600_000) }));
+      for (const r of runs) rmSync(r.zipPath);
+      const plan = await planRetention(db, o.id, pol(1), exportsDir);
+      expect(plan.exportsExisting).toBe(0);
+      expect(plan.exports).toEqual([]);
+      expect(plan.exportsMissingFile.map((m) => m.id).sort()).toEqual(runs.map((r) => r.exportId).sort());
+      const r = await applyRetention(db, o.id, pol(1), exportsDir, { confirm: true });
+      expect(r.exports).toMatchObject({ deleted: 0, failed: 0 });
+      for (const x of runs) expect(existsSync(x.dirPath)).toBe(true);
+    });
+  });
+
+  it('정리 직후 내보내기 → 빈 메모리 DB 복원: 이력을 지운 작업도 복원되고(restored_needs_review) 이력은 없다', async () => {
+    const o = await newOwner('ops-after');
+    const d = await distribute(o, 'success');
+    const r = await applyRetention(db, o.id, pol(), exportsDir, { confirm: true, now: later() });
+    expect(r.jobEvents.deleted).toBeGreaterThan(0);
+    expect(await eventCount(d.jobId)).toBe(0);
+    const ex = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const target = await createTestDb();
+    try {
+      const t = await ensureOwner(target.db, 'after-sweep@example.local');
+      const zip = new Uint8Array(readFileSync(ex.zipPath));
+      const restores = path.join(tmp, 'after-sweep-restores');
+      const { restoreId } = await createRestorePreview(target.db, t.id, zip, { restoresDir: restores, source: 'upload' });
+      await commitRestore(target.db, new LocalStorageAdapter(path.join(tmp, 'after-sweep-assets')), t.id, restoreId, {
+        mode: 'empty_only',
+        confirm: true,
+        restoresDir: restores,
+      });
+      const [job] = await target.db.select().from(schema.jobs).where(eq(schema.jobs.id, d.jobId));
+      expect(job).toMatchObject({ state: 'CONFIRMED', restoredNeedsReview: true, leaseOwner: null });
+      expect(Number((await target.db.select({ n: count() }).from(schema.jobEvents).where(eq(schema.jobEvents.jobId, d.jobId)))[0]!.n)).toBe(0);
+    } finally {
+      await target.close();
+    }
   });
 });

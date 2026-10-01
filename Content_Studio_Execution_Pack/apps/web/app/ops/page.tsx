@@ -256,7 +256,11 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <p className="meta">
           마지막 정리:{' '}
           {s.lastRetention
-            ? `${formatMsk(s.lastRetention.at)} · 이력 ${String(s.lastRetention.details.job_events_deleted ?? 0)}행 · 배포 파일 ${String(s.lastRetention.details.packages_deleted ?? 0)}개 · 내보내기 ${String(s.lastRetention.details.exports_deleted ?? 0)}개`
+            ? `${formatMsk(s.lastRetention.at)} · 이력 ${String(s.lastRetention.details.job_events_deleted ?? 0)}행 · 배포 파일 ${String(s.lastRetention.details.packages_deleted ?? 0)}개 · 내보내기 ${String(s.lastRetention.details.exports_deleted ?? 0)}개${
+                Number(s.lastRetention.details.packages_failed ?? 0) + Number(s.lastRetention.details.exports_failed ?? 0) > 0
+                  ? ` · 삭제 실패 ${Number(s.lastRetention.details.packages_failed ?? 0) + Number(s.lastRetention.details.exports_failed ?? 0)}개(${String(s.lastRetention.details.error_codes ?? '')}) — 남은 파일은 다음 미리보기에 다시 나옵니다`
+                  : ''
+              }`
             : '기록 없음'}
         </p>
         <h4>지금 적용하면 지울 것(미리보기 — 아직 아무것도 지우지 않음)</h4>

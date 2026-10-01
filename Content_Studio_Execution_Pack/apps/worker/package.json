@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@cs/db": "workspace:*",
-    "@cs/domain": "workspace:*"
+    "@cs/domain": "workspace:*",
+    "@cs/providers": "workspace:*"
   }
 }

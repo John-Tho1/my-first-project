@@ -9,6 +9,8 @@ import {
   blockDetailLabel,
   blockInfoOf,
   itemHeadline,
+  planFormDefaults,
+  planFormEcho,
   reconciledNotice,
   reconciledParam,
   revocationCountParam,
@@ -113,6 +115,7 @@ describe('M3 화면 FIX D8 — 재확인 결과 4종(조회 미지원·불명을
     for (const bad of ['', 'FOUND', 'toString', '__proto__', 'constructor', '<script>', ' found']) expect(reconciledNotice(bad), bad).toBeNull();
     expect(reconciledNotice(['found', 'not_found'])).toBeNull();
     expect(reconciledNotice(undefined)).toBeNull();
+    expect(reconciledNotice('stale')).toMatch(/적용하지 않았습니다/);
   });
 });
 
@@ -151,5 +154,44 @@ describe('M3 화면 FIX D5 — 성공 배너는 저장된 상태로(bannersFromS
     expect(bannersFromState({ retried: '1' }, { items: [it_('SENDING', true, ['BLOCKED', 'SENDING'])] }).retried).toBe(false);
     // 쿼리 값은 정확히 '1' 이어야 한다
     expect(bannersFromState({ canceled: 'yes' }, canceled).canceled).toBe(false);
+  });
+});
+
+describe('화면 확인 D10 — planFormEcho·planFormDefaults', () => {
+  const V = '11111111-2222-4333-8444-555555555555';
+  const A = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  it('형식이 맞는 값만 왕복하고 체크 안 한 파생본은 use 에 없다', () => {
+    const W = '99999999-2222-4333-8444-555555555555';
+    const qs = planFormEcho({
+      content_id: 'x',
+      [`use_${V}`]: 'on',
+      [`account_${V}`]: A,
+      [`visibility_${V}`]: 'public',
+      [`date_${V}`]: '2030-01-02',
+      [`time_${V}`]: '09:30',
+      [`account_${W}`]: A,
+      [`visibility_${W}`]: 'everyone',
+      [`date_${W}`]: '2030/01/02',
+      [`time_${W}`]: '9:30',
+      'use_not-a-uuid': 'on',
+      target_summary: '  이름  ',
+    });
+    expect(qs.startsWith('&')).toBe(true);
+    const d = planFormDefaults(Object.fromEntries(new URLSearchParams(qs.slice(1)).entries()));
+    expect([...d.use]).toEqual([V]);
+    expect(d.account).toEqual({ [V]: A, [W]: A });
+    expect(d.visibility).toEqual({ [V]: 'public' });
+    expect(d.date).toEqual({ [V]: '2030-01-02' });
+    expect(d.time).toEqual({ [V]: '09:30' });
+    expect(d.name).toBe('이름');
+    expect(planFormEcho({ content_id: 'x' })).toBe('');
+  });
+  it('쿼리를 직접 고쳐도 형식이 틀린 값·배열은 버린다, 이름은 200자', () => {
+    const d = planFormDefaults({ e_use: `${V},bad`, [`e_vis_${V}`]: 'x', [`e_acc_${V}`]: ['a', 'b'], 'e_date_bad': '2030-01-01', e_name: '가'.repeat(300) });
+    expect([...d.use]).toEqual([V]);
+    expect(d.visibility).toEqual({});
+    expect(d.account).toEqual({});
+    expect(d.date).toEqual({});
+    expect(Array.from(d.name)).toHaveLength(200);
   });
 });

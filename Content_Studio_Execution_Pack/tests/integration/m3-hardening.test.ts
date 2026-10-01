@@ -47,6 +47,7 @@ import { PUT as scenarioPUT } from '../../apps/web/app/api/distribution-items/[i
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
+import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const config = loadConfig({});
@@ -601,5 +602,65 @@ describe('M3 화면 FIX D3 — 홈 「최근 배포」 데이터(listRecentPlans
     expect(recent.every((e) => e.plan.ownerId === a.id && e.mock && e.channels.join() === 'threads' && e.itemCount === 1)).toBe(true);
     expect(recent.map((e) => e.plan.id)).not.toContain(bPlan);
     expect((await listRecentPlans(db, b.id)).map((e) => e.plan.id)).toEqual([bPlan]);
+  });
+});
+
+describe('화면 확인 D7 — 화면 "작업 처리 실행" 버튼은 작업당 전송 시간 제한을 짧게(WORKER_UI_TICK_TIMEOUT_MS)', () => {
+  it('hang 시나리오: 폼 tick 은 UI 제한(1초) 안에 돌아오고 작업은 기존 시간 초과 경로(RECONCILING), 재전송 없음', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'hang' });
+    as(o.identity);
+    vi.stubEnv('JOB_SUBMIT_TIMEOUT_MS', '30000');
+    vi.stubEnv('WORKER_UI_TICK_TIMEOUT_MS', '1000');
+    try {
+      const started = Date.now();
+      const res = await tickPOST(
+        new Request(`${BASE}/api/worker/tick`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(o.token) },
+          body: new URLSearchParams({ plan_id: x.planId }).toString(),
+        }),
+      );
+      const elapsed = Date.now() - started;
+      expect(res.status).toBe(303);
+      expect(res.headers.get('location')).toBe(`/distribute/${x.planId}?ticked=1`);
+      expect(elapsed).toBeLessThan(10_000);
+      expect((await jobRow(x.jobId)).state).toBe('RECONCILING');
+      expect(await intentsOf(x.jobId)).toHaveLength(1);
+    } finally {
+      vi.stubEnv('JOB_SUBMIT_TIMEOUT_MS', '');
+      vi.stubEnv('WORKER_UI_TICK_TIMEOUT_MS', '');
+    }
+  }, 30_000);
+});
+
+describe('T11 missed case — 수동 재확인은 조회한 시도가 적용 때도 현재인지 다시 본다', () => {
+  it('조회(어댑터 reconcile)와 적용 사이에 attempt 가 바뀌면 stale_lookup — CONFIRMED·publication 을 만들지 않는다', async () => {
+    const o = await newOwner();
+    const x = await executed(o);
+    await setMockScenario(db, o.id, x.itemId, { scenario: 'ambiguous_sent' });
+    const remote = new MockChannelAdapter({ readEnv: false });
+    const reg = new MockChannelAdapterRegistry(remote);
+    await tick(o, 0, reg);
+    const before = await jobRow(x.jobId);
+    expect(before.state).toBe('RECONCILING');
+    // 조회 도중(잠금 밖) 다른 경로가 시도를 올린 상황을 흉내 낸다
+    const orig = remote.reconcile.bind(remote);
+    remote.reconcile = async (ref, ctx) => {
+      const out = await orig(ref, ctx);
+      await db.execute(sql`update jobs set attempt = attempt + 1 where id = ${x.jobId}`);
+      return out;
+    };
+    const r = await reconcileItem(db, reg, o.id, x.itemId);
+    expect(r).toMatchObject({ outcome: 'stale_lookup', found: false, remote: 'found', state: 'RECONCILING', state_before: 'RECONCILING' });
+    expect((await jobRow(x.jobId)).state).toBe('RECONCILING');
+    expect((await itemRow(x.itemId)).status).not.toBe('CONFIRMED');
+    expect(await pubsOf(x.itemId)).toHaveLength(0);
+    // 바뀌지 않았으면 그대로 적용(대조군)
+    remote.reconcile = orig;
+    await db.execute(sql`update jobs set attempt = ${before.attempt} where id = ${x.jobId}`);
+    expect(await reconcileItem(db, reg, o.id, x.itemId)).toMatchObject({ outcome: 'applied', found: true, state: 'CONFIRMED' });
+    expect(await pubsOf(x.itemId)).toHaveLength(1);
   });
 });

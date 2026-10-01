@@ -139,8 +139,29 @@ export interface ChannelDraft {
   metadata: Record<string, unknown>;
 }
 
+/**
+ * 화면 확인 D11: 제목·첫 문단을 고를 때 건너뛰는 원고 스캐폴드 — 맨 앞의 `> 카드:`(또는 `> 원문:`) 인용 블록 전체와 그 뒤의 `## 초안` 제목 줄.
+ * 제목·설명·캡션을 고르는 데만 쓴다. 본문(대본·Markdown·이어지는 글·카드)은 쓴 그대로 둔다. 스캐폴드가 없으면 원문 그대로(줄바꿈만 LF).
+ */
+export function withoutDraftScaffold(coreBody: string): string {
+  const lines = coreBody.replace(/\r\n?/gu, '\n').split('\n');
+  let i = 0;
+  const skipBlank = () => {
+    while (i < lines.length && lines[i]!.trim() === '') i++;
+  };
+  skipBlank();
+  if (i < lines.length && /^>\s*(카드|원문):/u.test(lines[i]!.trim())) {
+    while (i < lines.length && lines[i]!.trimStart().startsWith('>')) i++;
+    skipBlank();
+  }
+  if (i < lines.length && /^#{1,6}\s*초안\s*$/u.test(lines[i]!.trim())) i++;
+  return lines.slice(i).join('\n');
+}
+
 export function channelDraft(channel: Channel, title: string, coreBody: string): ChannelDraft {
   const paras = paragraphs(coreBody);
+  // D11: 제목·설명·캡션은 스캐폴드를 건너뛴 원고에서 고른다(본문은 그대로).
+  const lead = withoutDraftScaffold(coreBody);
   switch (channel) {
     case 'threads': {
       const parts = paras.flatMap((p) => splitByLength(p, THREADS_MAX)).slice(0, THREADS_MAX_PARTS);
@@ -148,12 +169,12 @@ export function channelDraft(channel: Channel, title: string, coreBody: string):
       return { body: safe.join('\n\n'), metadata: { text: safe[0]!, thread_parts: safe } };
     }
     case 'instagram': {
-      const caption = truncate(paras[0] ?? title, INSTAGRAM_CAPTION_MAX);
+      const caption = truncate(paragraphs(lead)[0] ?? title, INSTAGRAM_CAPTION_MAX);
       const cards = paras.slice(0, INSTAGRAM_MAX_CARDS).map((p, i) => ({ index: i + 1, text: truncate(p, INSTAGRAM_CARD_MAX) }));
       return { body: caption, metadata: { caption, cards } };
     }
     case 'youtube': {
-      const lines = coreBody.replace(/\r\n?/gu, '\n').split('\n');
+      const lines = lead.split('\n');
       const firstIdx = lines.findIndex((l) => l.trim() !== '');
       const first = firstIdx >= 0 ? lines[firstIdx]!.replace(/^#+\s*/u, '').replace(/^>\s*/u, '').trim() : '';
       const t = truncate(first || title, YOUTUBE_TITLE_MAX);
@@ -161,7 +182,7 @@ export function channelDraft(channel: Channel, title: string, coreBody: string):
       return { body: coreBody, metadata: { title: t, description, script: coreBody, tags: [] } };
     }
     case 'blog': {
-      const firstLine = coreBody.replace(/\r\n?/gu, '\n').split('\n').find((l) => l.trim() !== '') ?? '';
+      const firstLine = lead.split('\n').find((l) => l.trim() !== '') ?? '';
       const t = truncate(firstLine.replace(/^#+\s*/u, '').replace(/^>\s*/u, '').trim() || title, BLOG_TITLE_MAX);
       return { body: coreBody, metadata: { title: t, markdown: coreBody } };
     }

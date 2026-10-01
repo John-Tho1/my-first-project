@@ -2,7 +2,7 @@ import { createPlan, listPlans, planView } from '@cs/db';
 import { assertSameOrigin, decodeCaptureCursor, encodeCaptureCursor, planCreateSchema } from '@cs/domain';
 import { apiHandler, errorResponse, json, seeOther, wantsHtml } from '../../../lib/api';
 import { readRequestFields, validationError } from '../../../lib/body';
-import { distributeFormFailure, formToPlanCreate, MAX_DISTRIBUTION_REQUEST } from '../../../lib/distribution';
+import { distributeFormFailure, formToPlanCreate, MAX_DISTRIBUTION_REQUEST, planFormEcho } from '../../../lib/distribution';
 import { getConfig } from '../../../lib/server';
 import { requireOwner } from '../../../lib/session';
 
@@ -34,7 +34,8 @@ export async function POST(request: Request): Promise<Response> {
     assertSameOrigin(request, getConfig());
     const owner = await requireOwner(request);
     const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
-    if (body.kind === 'form' && body.data.content_id) back = `/distribute/new?content_id=${encodeURIComponent(body.data.content_id)}`;
+    // 화면 확인 D10: 오류로 돌아가면 입력한 값(체크·계정·공개 범위·예약·이름)을 다시 채운다(형식이 맞는 값만, 승인 없음).
+    if (body.kind === 'form' && body.data.content_id) back = `/distribute/new?content_id=${encodeURIComponent(body.data.content_id)}${planFormEcho(body.data)}`;
     const parsed = planCreateSchema.safeParse(body.kind === 'form' ? formToPlanCreate(body.data) : body.data);
     if (!parsed.success) throw validationError(parsed.error);
     const r = await createPlan(owner.db, owner.ownerId, parsed.data);

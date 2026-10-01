@@ -134,7 +134,9 @@ export function VariantsPanel({
                   ) : (
                     <p className="empty-text">올린 파일이 없습니다. 소재함에서 파일을 먼저 올리세요.</p>
                   )}
-                  <p className="note">완성 영상 업로드는 아직 지원하지 않습니다(이미지·PDF·텍스트만). YouTube 는 영상이 붙기 전까지 검토로 보낼 수 없습니다.</p>
+                  {ch === 'youtube' ? (
+                    <p className="note">YouTube 는 완성 영상 1개가 붙어야 검토로 보낼 수 있습니다. 영상은 /record 의 분할 업로드로 올립니다.</p>
+                  ) : null}
                 </details>
                 {s.variant.lifecycle === 'approved' ? (
                   <p className="note">

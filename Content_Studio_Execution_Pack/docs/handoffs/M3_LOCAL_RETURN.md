@@ -37,10 +37,10 @@ corepack pnpm drill:mock                                        # M3 게이트 �
 | 2 | `/distribute/new?content_id=` | 채널별 MOCK 계정만 선택 가능, 예약 MSK 입력, 과거 시각 → 오류 |
 | 3 | `/distribute/{id}` 미리보기 | 나갈 글 그대로(채널별 모양), 첨부 checksum, 공개 범위, `MSK (UTC)`, 해시, **기본 미선택**, MOCK 배지 |
 | 4 | 승인 | 확인 체크 없이 → 오류; 선택 승인 → 승인 목록·`철회` 버튼; 원고/파생본 수정 후 돌아오면 승인 자동 철회(`invalidated:*`) |
-| 5 | 실행 | `지금 실행` → job `QUEUED · MOCK`; 새로고침 후 재클릭해도 job 1개 |
+| 5 | 실행 | `지금 실행` → 작업 칸 제목 `작업(MOCK — 모의 어댑터)` 아래 `QUEUED · 대기`; 새로고침 후 재클릭해도 job 1개 |
 | 6 | 처리 | `작업 처리 실행(모의 1회)` → `CONFIRMED · MOCK`, publication `mock://…` + `실제 발행 실적 아님`; `게시 완료` 문구 없음 |
 | 7 | 시나리오 | 새 계획에서 항목별 `개발용 · 모의 결과 선택`: auth → `계정 다시 연결 필요`; transient_then_success → `재시도 대기 (n/5, 다음 HH:mm MSK)` → 성공; ambiguous_sent → `등록 여부 확인 필요` → 재확인 → CONFIRMED; reconcile_unsupported → `확인 불가 — 자동 재전송 안 함` |
-| 8 | PARTIAL | 4채널 계획 + 1채널 auth → 목록 `부분 성공`; 재시도 → `완료` |
+| 8 | PARTIAL | 4채널 계획 + 1채널 auth → 목록 `부분 성공`; 재시도 → `처리 끝(MOCK — 실제 발행 아님)` |
 | 9 | YouTube | 성공해도 `비공개 업로드 완료, 공개 전환 확인 필요`(공개 성공 표시 없음) |
 | 10 | 취소 | QUEUED 취소 → `취소됨`; 전송 중(hang 시나리오) 취소 → `취소 확인 중` |
 | 11 | `/api/health` | `jobs{queued,…,attention_plans}` 집계만, 비밀·경로 없음 |

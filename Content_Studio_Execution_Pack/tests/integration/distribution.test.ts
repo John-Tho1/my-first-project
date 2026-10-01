@@ -39,6 +39,7 @@ import { POST as approvePOST } from '../../apps/web/app/api/distribution-plans/[
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
 import { GET as planGET } from '../../apps/web/app/api/distribution-plans/[id]/route';
 import { GET as plansGET, POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
+import { planFormDefaults } from '../../apps/web/lib/distribution';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
@@ -601,5 +602,42 @@ describe('HTML 폼', () => {
     expect(res.headers.get('location')).toBe(`/distribute/${p.plan.id}?error=confirm_required`);
     res = await form({ [`hash_${item.id}`]: item.payload_hash, [`item_${item.id}`]: 'on', purpose: 'mock_publish', confirm: 'yes' });
     expect(res.headers.get('location')).toBe(`/distribute/${p.plan.id}?approved=1`);
+  });
+});
+
+describe('화면 확인 D10 — /distribute/new 오류 뒤 입력값 되살리기', () => {
+  it('과거 예약(schedule_in_past) 폼 → 같은 화면으로 돌아오며 체크·계정·공개 범위·날짜·시각·이름을 쿼리로 돌려주고, 그 값이 폼 기본값이 된다', async () => {
+    const v = await reviewVariant('threads');
+    const other = randomUUID();
+    const res = await plansPOST(
+      new Request(`${BASE}/api/distribution-plans`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(tokenA) },
+        body: new URLSearchParams({
+          content_id: v.contentId,
+          [`use_${v.variantId}`]: 'on',
+          [`account_${v.variantId}`]: acc[ownerA]!.threads,
+          [`visibility_${v.variantId}`]: 'unlisted',
+          [`date_${v.variantId}`]: '2020-01-01',
+          [`time_${v.variantId}`]: '10:00',
+          [`visibility_${other}`]: '<script>',
+          target_summary: '첫 계획 <b>',
+        }).toString(),
+      }),
+    );
+    expect(res.status).toBe(303);
+    const loc = new URL(res.headers.get('location')!, BASE);
+    expect(loc.pathname).toBe('/distribute/new');
+    expect(loc.searchParams.get('content_id')).toBe(v.contentId);
+    expect(loc.searchParams.get('error')).toBe('schedule_in_past');
+    const d = planFormDefaults(Object.fromEntries(loc.searchParams.entries()));
+    expect([...d.use]).toEqual([v.variantId]);
+    expect(d.account[v.variantId]).toBe(acc[ownerA]!.threads);
+    expect(d.visibility).toEqual({ [v.variantId]: 'unlisted' });
+    expect(d.date[v.variantId]).toBe('2020-01-01');
+    expect(d.time[v.variantId]).toBe('10:00');
+    expect(d.name).toBe('첫 계획 <b>');
+    // 계획은 만들어지지 않았다
+    expect((await db.select({ n: count() }).from(schema.distributionItems).where(eq(schema.distributionItems.variantId, v.variantId)))[0]!.n).toBe(0);
   });
 });

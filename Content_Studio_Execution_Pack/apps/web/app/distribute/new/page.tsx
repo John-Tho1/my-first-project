@@ -3,7 +3,7 @@ import { notFound, redirect } from 'next/navigation';
 import { getContentRow, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
 import { CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
-import { DISTRIBUTE_ERROR_TEXT, VISIBILITY_LABEL } from '../../../lib/distribution';
+import { DISTRIBUTE_ERROR_TEXT, planFormDefaults, VISIBILITY_LABEL } from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -28,6 +28,8 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
   const rows = [];
   for (const v of vs) rows.push({ v, blockers: await variantReviewBlockers(db, session.ownerId, v.id), accounts: accounts.filter((a) => a.platform === v.channel) });
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
+  // 화면 확인 D10: 오류로 돌아온 경우에만 입력값을 되살린다(오류 없이 연 화면은 기본 선택 없음 — docs/03).
+  const prev = err ? planFormDefaults(q) : planFormDefaults({});
 
   return (
     <main className="container">
@@ -57,11 +59,11 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
               ) : (
                 <>
                   <label className="choice">
-                    <input type="checkbox" name={`use_${v.id}`} disabled={blockers.length > 0} />
+                    <input type="checkbox" name={`use_${v.id}`} disabled={blockers.length > 0} defaultChecked={blockers.length === 0 && prev.use.has(v.id)} />
                     이 채널 초안을 계획에 넣기
                   </label>
                   <label htmlFor={`acc-${v.id}`}>계정</label>
-                  <select id={`acc-${v.id}`} name={`account_${v.id}`}>
+                  <select id={`acc-${v.id}`} name={`account_${v.id}`} defaultValue={accs.some((a) => a.id === prev.account[v.id]) ? prev.account[v.id] : undefined}>
                     {accs.map((a) => (
                       <option key={a.id} value={a.id}>
                         {`${a.displayName}${a.kind === 'mock' ? ' (MOCK)' : ''}`}
@@ -69,7 +71,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                     ))}
                   </select>
                   <label htmlFor={`vis-${v.id}`}>공개 범위</label>
-                  <select id={`vis-${v.id}`} name={`visibility_${v.id}`} defaultValue="private">
+                  <select id={`vis-${v.id}`} name={`visibility_${v.id}`} defaultValue={prev.visibility[v.id] ?? 'private'}>
                     {VISIBILITIES.map((x) => (
                       <option key={x} value={x}>
                         {VISIBILITY_LABEL[x]}
@@ -77,15 +79,15 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                     ))}
                   </select>
                   <label htmlFor={`date-${v.id}`}>예약 날짜(모스크바, 선택)</label>
-                  <input id={`date-${v.id}`} type="date" name={`date_${v.id}`} />
+                  <input id={`date-${v.id}`} type="date" name={`date_${v.id}`} defaultValue={prev.date[v.id] ?? ''} />
                   <label htmlFor={`time-${v.id}`}>예약 시각(모스크바, HH:mm, 선택)</label>
-                  <input id={`time-${v.id}`} type="text" name={`time_${v.id}`} placeholder="예: 12:00" pattern="[0-2][0-9]:[0-5][0-9]" maxLength={5} />
+                  <input id={`time-${v.id}`} type="text" name={`time_${v.id}`} placeholder="예: 12:00" defaultValue={prev.time[v.id] ?? ''} pattern="[0-2][0-9]:[0-5][0-9]" maxLength={5} />
                 </>
               )}
             </fieldset>
           ))}
           <label htmlFor="target_summary">계획 이름(선택)</label>
-          <input id="target_summary" type="text" name="target_summary" maxLength={200} />
+          <input id="target_summary" type="text" name="target_summary" maxLength={200} defaultValue={prev.name} />
           <button type="submit">배포 계획 만들기(MOCK — 승인 전)</button>
         </form>
       )}

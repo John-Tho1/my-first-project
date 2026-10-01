@@ -131,7 +131,7 @@ export default async function ContentPage({
         <span>현재 버전 {current.version}</span>
         <span>최근 수정 {formatMsk(c.updatedAt)}</span>
       </p>
-      <p className="note">배포(게시) 상태는 여기서 관리하지 않습니다. 채널별 배포 기록은 M3 배포함에서 따로 보여 줍니다.</p>
+      <p className="note">배포(게시) 상태는 여기서 관리하지 않습니다. 채널별 배포 기록은 배포함(<Link href="/distribute">/distribute</Link>)에서 봅니다.</p>
 
       <div className="cols">
         <section className="card archive" aria-labelledby="editor-title">
@@ -179,7 +179,9 @@ export default async function ContentPage({
                 카드: <Link href={`/ideas/${d.idea.id}`}>{preview(d.idea.idea, 60)}</Link>
               </p>
             ) : null}
-            <p className="note">파생본: M2에서 채널별 초안 추가</p>
+            <p className="note">
+              파생본: <a href="#variants">채널 초안 {variantStates.length}개</a>
+            </p>
           </section>
 
           <WritingPanel

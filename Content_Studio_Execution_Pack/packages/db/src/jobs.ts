@@ -880,11 +880,17 @@ export interface ReconcileOutcome {
   state: string;
   found: boolean;
   remote: ReconcileResult['status'];
+  /**
+   * applied: 조회 결과를 적용함(찾음 → CONFIRMED, 못 찾음 → 상태 그대로 기록).
+   * stale_lookup: 조회한 뒤 잠금 안에서 보니 작업의 시도(attempt)나 상태가 바뀌어 있어 아무것도 적용하지 않음(옛 시도 조회 결과로 새 시도를 확정하지 않는다).
+   */
+  outcome: 'applied' | 'stale_lookup';
 }
 
 /**
  * 사용자 원격 재확인(docs/04 "기존 결과 조회만"): 확인 중·결과 불명·원격 처리 중 작업만. 어댑터 reconcile(읽기)만 부르고 절대 submit 하지 않는다.
  * 찾으면 CONFIRMED + publications(모의 = MOCK), 못 찾으면 상태 그대로(재확인 기록만).
+ * T11 missed case: 조회는 잠금 밖에서 하므로, 적용 직전 잠금 안에서 작업의 attempt·state 가 조회 때와 같은지 다시 본다 — 다르면 stale_lookup(적용 없음).
  */
 export async function reconcileItem(
   db: Db,
@@ -900,21 +906,24 @@ export async function reconcileItem(
   if (!job || !(RECONCILABLE_JOB_STATES as readonly string[]).includes(job.state)) throw new NothingToReconcileError();
   const { r, caps } = await remoteCheck(db, registry, job, item, opts.timeoutMs ?? 30_000, { workerId: 'user-reconcile', tryCancel: false });
   const now = opts.now ?? new Date();
-  const state = await db.transaction(async (tx) => {
+  const { state, outcome } = await db.transaction(async (tx) => {
     const it = await lockItem(tx, ownerId, item.id);
     const locked = await jobForUpdate(tx, ownerId, job.id);
-    if (!locked || !(RECONCILABLE_JOB_STATES as readonly string[]).includes(locked.state)) return locked?.state ?? job.state;
-    return applyReconcile(tx, locked, it, r, caps, null, now, { manual: true });
+    if (!locked) return { state: job.state, outcome: 'stale_lookup' as const };
+    if (locked.attempt !== job.attempt || locked.state !== job.state || !(RECONCILABLE_JOB_STATES as readonly string[]).includes(locked.state)) {
+      return { state: locked.state, outcome: 'stale_lookup' as const };
+    }
+    return { state: await applyReconcile(tx, locked, it, r, caps, null, now, { manual: true }), outcome: 'applied' as const };
   });
   await recordAudit(db, {
     ownerId,
     action: 'item.reconcile',
     entity: 'distribution_item',
     entityId: item.id,
-    details: { job_id: job.id, from: job.state, to: state, remote: r.status },
+    details: { job_id: job.id, from: job.state, to: state, remote: r.status, outcome },
     at: now,
   });
-  return { item_id: item.id, job_id: job.id, state_before: job.state, state, found: r.status === 'found', remote: r.status };
+  return { item_id: item.id, job_id: job.id, state_before: job.state, state, found: outcome === 'applied' && r.status === 'found', remote: r.status, outcome };
 }
 
 // ---- 사용자 동작: 보류 항목 재시도(T12 D19) ----

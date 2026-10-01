@@ -384,7 +384,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
 
 // ---- M3 화면 FIX(D8): 수동 재확인 결과 4종 ----
 
-export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown';
+export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown' | 'stale';
 
 /** 재확인 결과(원격 조회 상태) → 리다이렉트 값. processing·unknown 은 "확인 못 함(unknown)" — 없다는 뜻이 아니다. */
 export function reconciledParam(remote: string): ReconciledKind {
@@ -397,6 +397,7 @@ export const RECONCILED_TEXT: Record<ReconciledKind, string> = {
   not_found: '원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.',
   unsupported: '이 채널은 원격 조회를 지원하지 않아 확인하지 못했습니다. 원격에 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
   unknown: '원격 상태를 확인하지 못했습니다(진행 중이거나 기록이 없음). 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
+  stale: '조회하는 사이 작업 상태(시도)가 바뀌어 조회 결과를 적용하지 않았습니다. 아래 현재 상태를 확인하세요. 다시 보내지 않았습니다.',
 };
 
 /** 쿼리 reconciled 값 → 고정 문구. 알 수 없는 값·여러 값이면 null(아무 결과도 말하지 않는다). */
@@ -446,3 +447,69 @@ export function bannersFromState(q: Record<string, string | string[] | undefined
   };
 }
 
+
+// ---- 화면 확인 D10: /distribute/new 오류 뒤 입력값 되살리기 ----
+
+const ECHO_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const ECHO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
+const ECHO_TIME = /^\d{2}:\d{2}$/u;
+const ECHO_VIS = new Set(['private', 'unlisted', 'public']);
+const ECHO_NAME_MAX = 200;
+
+export interface PlanFormDefaults {
+  /** 체크했던 파생본 id */
+  use: Set<string>;
+  account: Record<string, string>;
+  visibility: Record<string, string>;
+  date: Record<string, string>;
+  time: Record<string, string>;
+  name: string;
+}
+
+/**
+ * 계획 만들기 폼 → 오류 리다이렉트에 붙일 쿼리(`&e_…`). 형식이 맞는 값만(파생본·계정 UUID, 공개 범위 목록, 날짜 YYYY-MM-DD, 시각 HH:mm, 이름 200자).
+ * 승인은 이 화면에 없다 — 계획 화면의 승인 체크("내용을 확인했습니다")는 되살리지 않는다(의도적으로 매번 새로).
+ */
+export function planFormEcho(f: Record<string, string>): string {
+  const p = new URLSearchParams();
+  const use: string[] = [];
+  const vids = new Set<string>();
+  for (const k of Object.keys(f)) {
+    const m = /^(use|account|visibility|date|time)_(.+)$/u.exec(k);
+    if (m && ECHO_UUID.test(m[2]!.toLowerCase())) vids.add(m[2]!.toLowerCase());
+  }
+  for (const vid of [...vids].sort()) {
+    if (f[`use_${vid}`] === 'on') use.push(vid);
+    const acc = (f[`account_${vid}`] ?? '').toLowerCase();
+    if (ECHO_UUID.test(acc)) p.set(`e_acc_${vid}`, acc);
+    const vis = f[`visibility_${vid}`] ?? '';
+    if (ECHO_VIS.has(vis)) p.set(`e_vis_${vid}`, vis);
+    const date = (f[`date_${vid}`] ?? '').trim();
+    if (ECHO_DATE.test(date)) p.set(`e_date_${vid}`, date);
+    const time = (f[`time_${vid}`] ?? '').trim();
+    if (ECHO_TIME.test(time)) p.set(`e_time_${vid}`, time);
+  }
+  if (use.length) p.set('e_use', use.join(','));
+  const name = Array.from((f.target_summary ?? '').trim()).slice(0, ECHO_NAME_MAX).join('');
+  if (name) p.set('e_name', name);
+  const qs = p.toString();
+  return qs ? `&${qs}` : '';
+}
+
+/** 쿼리(`e_…`) → 폼 기본값. 형식이 틀린 값은 버린다(화면에는 React 가 escape 해서 넣는다). */
+export function planFormDefaults(q: Record<string, string | string[] | undefined>): PlanFormDefaults {
+  const one = (k: string) => (typeof q[k] === 'string' ? (q[k] as string) : '');
+  const d: PlanFormDefaults = { use: new Set(), account: {}, visibility: {}, date: {}, time: {}, name: '' };
+  for (const vid of one('e_use').split(',')) if (ECHO_UUID.test(vid)) d.use.add(vid);
+  for (const k of Object.keys(q)) {
+    const m = /^e_(acc|vis|date|time)_(.+)$/u.exec(k);
+    if (!m || !ECHO_UUID.test(m[2]!)) continue;
+    const v = one(k);
+    if (m[1] === 'acc' && ECHO_UUID.test(v)) d.account[m[2]!] = v;
+    if (m[1] === 'vis' && ECHO_VIS.has(v)) d.visibility[m[2]!] = v;
+    if (m[1] === 'date' && ECHO_DATE.test(v)) d.date[m[2]!] = v;
+    if (m[1] === 'time' && ECHO_TIME.test(v)) d.time[m[2]!] = v;
+  }
+  d.name = Array.from(one('e_name')).slice(0, ECHO_NAME_MAX).join('');
+  return d;
+}

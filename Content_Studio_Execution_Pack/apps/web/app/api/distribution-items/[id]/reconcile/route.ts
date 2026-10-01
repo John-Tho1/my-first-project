@@ -30,7 +30,7 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const parsed = reconcileSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
     const r = await reconcileItem(owner.db, getChannelAdapters(), owner.ownerId, id.toLowerCase(), { timeoutMs: config.JOB_SUBMIT_TIMEOUT_MS });
-    if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}reconciled=${reconciledParam(r.remote)}`);
+    if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}reconciled=${r.outcome === 'stale_lookup' ? 'stale' : reconciledParam(r.remote)}`);
     return json(r);
   } catch (e) {
     if (html) return distributeFormFailure(e, request, back);

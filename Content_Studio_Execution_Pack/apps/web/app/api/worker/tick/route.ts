@@ -13,7 +13,14 @@ export const runtime = 'nodejs';
  * POST /api/worker/tick — { max_jobs?(1~20, 기본 5), worker_id? } → 200 { worker_id, recovered, leased, results }.
  * 로그인한 owner 의 배포 작업만 한 번 처리한다(lease 만료 복구 → lease → 모의 어댑터 전송·조회). 화면의 "작업 처리 실행(모의 1회)".
  * 외부 호출 없음(모의 어댑터만). CSRF(같은 출처) 검사.
+ * 화면 폼(버튼)은 작업당 전송 시간 제한을 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS)(기본 10초)로 줄인다(화면 확인 D7) —
+ * 넘으면 기존 시간 초과 → RECONCILING(다시 보내지 않고 조회). JSON 호출은 JOB_SUBMIT_TIMEOUT_MS 그대로.
  */
+/** 화면 폼이면 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS), 아니면 JOB_SUBMIT_TIMEOUT_MS. */
+function uiTickTimeoutMs(config: { JOB_SUBMIT_TIMEOUT_MS: number; WORKER_UI_TICK_TIMEOUT_MS: number }, form: boolean): number {
+  return form ? Math.min(config.WORKER_UI_TICK_TIMEOUT_MS, config.JOB_SUBMIT_TIMEOUT_MS) : config.JOB_SUBMIT_TIMEOUT_MS;
+}
+
 export async function POST(request: Request): Promise<Response> {
   const html = wantsHtml(request);
   let back = '/distribute';
@@ -32,7 +39,7 @@ export async function POST(request: Request): Promise<Response> {
       config,
       ownerId: owner.ownerId,
       maxJobs: parsed.data.max_jobs ?? 5,
-      submitTimeoutMs: config.JOB_SUBMIT_TIMEOUT_MS,
+      submitTimeoutMs: uiTickTimeoutMs(config, body.kind === 'form'),
     });
     await recordAudit(owner.db, {
       ownerId: owner.ownerId,

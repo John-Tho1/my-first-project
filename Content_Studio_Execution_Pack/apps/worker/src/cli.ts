@@ -2,7 +2,7 @@
  * `pnpm worker`: tick 1회(업로드 만료 정리 + 배포 작업 — 모의 채널 어댑터, 외부 호출 없음) 후 종료.
  * `pnpm worker -- --loop 5000`: 5초마다 tick(로컬 시연용). Ctrl-C(SIGINT)·SIGTERM 이면 진행 중 tick 을 마치고 DB 를 닫은 뒤 끝난다.
  * dev 서버가 같은 PGlite 디렉터리를 열고 있으면 먼저 종료한다(한 디렉터리 한 프로세스).
- * 모의 어댑터는 루트 워크스페이스의 @cs/providers 에서 가져온다(worker 패키지 자체는 providers 에 의존하지 않는다 — runWorkerTick 에 주입).
+ * 모의 어댑터는 @cs/providers 에서 가져온다(apps/worker/package.json 에 workspace 의존성으로 선언 — CLI 진입점만 쓰고, runWorkerTick 은 레지스트리를 주입받는다).
  */
 import { DbLockedError, loadRootEnv, newWorkerId, openDb } from '@cs/db';
 import { loadConfig } from '@cs/domain';

@@ -37,6 +37,7 @@ const LABELS: Record<string, string> = {
   EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
   RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
   JOB_SUBMIT_TIMEOUT_MS: 'JOB_SUBMIT_TIMEOUT_MS(배포 전송 시간 제한, ms)',
+  WORKER_UI_TICK_TIMEOUT_MS: 'WORKER_UI_TICK_TIMEOUT_MS(화면 "작업 처리 실행" 전송 시간 제한, ms)',
 };
 
 /** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
@@ -109,6 +110,19 @@ export const configSchema = z.object({
       .transform(Number)
       .pipe(z.int().min(1000).max(600000))
       .default(30000),
+  ),
+  /**
+   * 화면 확인 D7: 화면의 "작업 처리 실행(모의 1회)" 버튼(폼 POST /api/worker/tick)이 쓰는 작업당 전송 시간 제한(ms).
+   * 응답이 없는 전송(hang)이 화면을 30초 붙잡지 않게 min(이 값, JOB_SUBMIT_TIMEOUT_MS) 를 쓴다 — 넘으면 기존 시간 초과 → RECONCILING 경로.
+   * 1초 ~ 10분, 기본 10초. 작업 처리기(CLI·백그라운드)와 JSON API 는 JOB_SUBMIT_TIMEOUT_MS 그대로.
+   */
+  WORKER_UI_TICK_TIMEOUT_MS: opt(
+    z
+      .string()
+      .regex(/^\d{1,6}$/)
+      .transform(Number)
+      .pipe(z.int().min(1000).max(600000))
+      .default(10000),
   ),
 });
 

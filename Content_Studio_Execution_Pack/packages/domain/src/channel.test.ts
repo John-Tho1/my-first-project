@@ -8,6 +8,7 @@ import {
   renderVariantText,
   variantBodyMismatch,
   deriveBodyFields,
+  withoutDraftScaffold,
   editableMetadata,
   normalizeNewlines,
   THREADS_MAX_PARTS,
@@ -197,5 +198,34 @@ describe('M3 화면 FIX D1·D2: 줄바꿈 표기 무시·본문 기준 파생', 
     expect(editableMetadata('instagram', { caption: 'c', cards: [{ index: 1, text: 'x' }] })).toEqual({ cards: [{ index: 1, text: 'x' }] });
     expect(editableMetadata('youtube', { title: 'T', description: 'D', script: 'S', tags: [] })).toEqual({ title: 'T', description: 'D', tags: [] });
     expect(editableMetadata('blog', { title: 'T', markdown: 'M' })).toEqual({ title: 'T' });
+  });
+});
+
+describe('화면 확인 D11: 원고 스캐폴드("> 카드:" 인용 블록·"## 초안")는 제목·캡션에 쓰지 않는다', () => {
+  const SCAFFOLD = '> 카드: 주재원으로 첫 달\n> 독자: 해외 영업 실무자\n\n## 초안\n\n주재원 첫 달의 교훈\n\n대리점과 재고 기준을 먼저 합의했다.';
+  it('withoutDraftScaffold: 인용 블록 전체와 바로 뒤 "## 초안" 만 건너뛴다', () => {
+    expect(withoutDraftScaffold(SCAFFOLD)).toBe('\n주재원 첫 달의 교훈\n\n대리점과 재고 기준을 먼저 합의했다.');
+    expect(withoutDraftScaffold('> 원문:\r\n> 메모\r\n\r\n## 초안\r\n\r\n본문')).toBe('\n본문');
+    // 스캐폴드가 아닌 인용·제목은 그대로
+    expect(withoutDraftScaffold('> 인용문\n\n본문')).toBe('> 인용문\n\n본문');
+    expect(withoutDraftScaffold('# 제목\n\n본문')).toBe('# 제목\n\n본문');
+    expect(withoutDraftScaffold('본문\n\n## 초안')).toBe('본문\n\n## 초안');
+  });
+  it('youtube·blog 제목, instagram 캡션은 스캐폴드 다음 줄에서, 대본·Markdown 은 원고 그대로', () => {
+    const yt = channelDraft('youtube', '원고 제목', SCAFFOLD);
+    expect(yt.metadata.title).toBe('주재원 첫 달의 교훈');
+    expect(yt.metadata.description).toBe('대리점과 재고 기준을 먼저 합의했다.');
+    expect(yt.metadata.script).toBe(SCAFFOLD);
+    expect(yt.body).toBe(SCAFFOLD);
+    const bl = channelDraft('blog', '원고 제목', SCAFFOLD);
+    expect(bl.metadata).toEqual({ title: '주재원 첫 달의 교훈', markdown: SCAFFOLD });
+    const ig = channelDraft('instagram', '원고 제목', SCAFFOLD);
+    expect(ig.metadata.caption).toBe('주재원 첫 달의 교훈');
+    expect(ig.body).toBe('주재원 첫 달의 교훈');
+    for (const d of [yt, bl, ig]) expect(String(d.metadata.title ?? d.metadata.caption)).not.toMatch(/카드:|초안/);
+    // 스캐폴드만 있고 본문이 비면 원고 제목으로
+    expect(channelDraft('blog', '원고 제목', '> 카드: 아이디어\n\n## 초안\n\n').metadata.title).toBe('원고 제목');
+    // 스캐폴드 없는 원고는 예전과 같다
+    expect(channelDraft('youtube', 't', '# 주재원 첫 달\n\n본문').metadata.title).toBe('주재원 첫 달');
   });
 });

@@ -205,7 +205,10 @@ type Avail = 'inserted' | 'same' | 'different';
  * 묶음 행을 현재 owner 로 넣는다(add_missing 규칙). 미리보기는 이것을 트랜잭션 안에서 실행하고 되돌린다.
  * 기존 행은 UPDATE 하지 않는다 — 유일한 UPDATE 는 이번에 넣은 원고의 current_version_id(null → 버전 id).
  */
-export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBundle): Promise<ApplyReport> {
+/**
+ * now: 복원 판정 시각(승인 재검사의 예약 시각 비교·철회 시각·계획 상태 갱신 시각). 기본 지금 — 복원 훈련은 같은 시각을 기대값 계산에도 쓴다(FIX round 4).
+ */
+export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBundle, now?: Date): Promise<ApplyReport> {
   const avail: Record<string, Map<string, Avail>> = {};
   const tables = {} as Record<RestoredTable, TableCounts>;
   const conflicts: RestoreConflict[] = [];
@@ -428,7 +431,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   // T10(D17): 이번에 넣은 활성 승인을 복원된 행으로 다시 검사한다(파생본 현재 버전·원고 현재 버전·첨부·계정·재계산 hash·예약 시각).
   // 맞지 않으면 'restore_stale' 로 철회해 둔다(승인 행·hash 는 그대로 보존). 그 뒤 활성 승인이 없는 approved 파생본은 review 로,
   // 이번에 넣은 계획의 상태는 항목·승인으로 다시 계산한다.
-  const restoreNow = new Date();
+  const restoreNow = now ?? new Date();
   const revokedApprovals: ApplyReport['revokedApprovals'] = [];
   const itemById = new Map(bundle.tables.distribution_items.map((i) => [i.id, i]));
   for (const a of bundle.tables.approvals) {
@@ -794,7 +797,7 @@ export async function commitRestore(
         const scope = await ownerScopeCounts(tx, ownerId);
         if (!scope.empty) throw new RestoreTargetNotEmptyError({ target: scope.counts });
       }
-      const report = await applyBundle(tx, ownerId, bundle);
+      const report = await applyBundle(tx, ownerId, bundle, now);
       if (opts.mode === 'empty_only' && report.conflicts.length > 0) {
         throw new RestoreConflictError({ conflicts: report.conflicts.slice(0, MAX_CONFLICTS_LISTED), conflicts_total: report.conflicts.length });
       }

@@ -88,12 +88,25 @@ export interface DrillScope {
 
 /** 이 표가 비어 있으면 그 PASS 는 "부분 검증"이다. */
 export const DRILL_CORE_TABLES = ['captures', 'contents', 'content_versions'] as const;
+/** 이 표가 모두 비어 있으면 "배포 복구 미검증"(부분 검증). */
+export const DRILL_DISTRIBUTION_TABLES = ['jobs', 'approvals'] as const;
+/** 부분 검증 이유 → 화면 문구. */
+export const DRILL_PARTIAL_LABEL: Record<string, string> = {
+  no_files: '파일 미검증(첨부 없음)',
+  search_skipped: '검색 미검증',
+  'empty:captures': '소재 없음',
+  'empty:contents': '원고 없음',
+  'empty:content_versions': '원고 버전 없음',
+  no_distribution: '배포 복구 미검증(작업·승인 없음)',
+};
 
 export function drillScope(emptyTables: readonly string[], tablesCompared: number, filesChecked: number, searchProbe: DrillScope['search_probe']): DrillScope {
   const reasons: string[] = [];
   if (filesChecked === 0) reasons.push('no_files');
   if (searchProbe === 'skipped') reasons.push('search_skipped');
   for (const t of DRILL_CORE_TABLES) if (emptyTables.includes(t)) reasons.push(`empty:${t}`);
+  // FIX round 4(Codex Q17): 배포 이력(작업·승인)이 없으면 배포 복구는 검증되지 않았다
+  if (DRILL_DISTRIBUTION_TABLES.every((t) => emptyTables.includes(t))) reasons.push('no_distribution');
   return { empty_tables: [...emptyTables], tables_compared: tablesCompared, files_checked: filesChecked, search_probe: searchProbe, partial: reasons.length > 0, partial_reasons: reasons };
 }
 
@@ -108,6 +121,8 @@ export interface RestoreDrillOptions {
   faultInjection?: 'export' | 'restore' | 'compare';
   /** 시험 전용: 복원이 알린 변환 목록(커밋 결과)을 바꾼다(복원 회귀 흉내 — 행과 선언이 함께 틀린 경우). */
   tamperCommit?: (c: Awaited<ReturnType<typeof commitRestore>>) => Awaited<ReturnType<typeof commitRestore>>;
+  /** 시험 전용: 복원 판정 시각(기본: 복원 호출 직전 시각). */
+  restoreNow?: Date;
 }
 
 /** 빈 임시 폴더 저장소(복원 대상). key 는 폴더 밖을 가리킬 수 없다. */
@@ -201,11 +216,14 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
     let committed: Awaited<ReturnType<typeof commitRestore>> | null = null;
     let restoreFrom = new Date();
     let restoreTo = restoreFrom;
+    let decisionAt = restoreFrom;
     try {
       if (opts.faultInjection === 'restore') throw injected();
       const { restoreId } = await createRestorePreview(target.db, targetOwner.id, zip, { restoresDir, source: 'upload' });
       restoreFrom = new Date();
-      committed = await commitRestore(target.db, targetStorage, targetOwner.id, restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      // FIX round 4(Codex review-FIX3-T20 P1): 복원의 판정 시각을 주입한다 — 같은 시각으로 기대값을 계산해 철회 여부가 정해진다
+      decisionAt = opts.restoreNow ?? restoreFrom;
+      committed = await commitRestore(target.db, targetStorage, targetOwner.id, restoreId, { mode: 'empty_only', confirm: true, restoresDir, now: decisionAt });
       restoreTo = new Date();
       if (opts.tamperCommit) committed = opts.tamperCommit(committed);
     } catch (e) {
@@ -217,15 +235,15 @@ export async function runRestoreDrill(source: Db, sourceStorage: BlobStore, owne
     if (committed) {
       if (opts.afterRestore) await opts.afterRestore(target.db, targetOwner.id);
       // 4. 표 비교 — 모든 열을 기대 복원값과
-      // FIX round 3(Q8): 복원 때 정해지는 시각은 실제 복원 호출 직전~직후 구간 안이어야 한다
+      // DB now() 로 정해지는 시각(원장·전사)은 실제 복원 호출 직전~직후 구간 안이어야 한다. 판정 시각으로 정해지는 값은 정확히 비교한다.
       const window = { from: restoreFrom, to: restoreTo };
-      // FIX round 3(P1): 강등·철회 대상은 묶음 행에서 독립적으로 계산하고, 복원이 알린 목록과도 대조한다
-      const derived = deriveRestoreTransforms(bundle.tables, window);
+      // FIX round 3·4(P1): 강등·철회 대상은 묶음 행에서 독립적으로(같은 판정 시각으로) 계산하고, 복원이 알린 목록과도 대조한다
+      const derived = deriveRestoreTransforms(bundle.tables, decisionAt);
       const declaredRevoked = new Set(committed.revoked_approvals.map((a) => a.approval_id));
       const declaredDowngraded = new Set(committed.downgraded_variants.map((v) => v.variant_id));
       const revokedDiff = [
         ...[...derived.revokedApprovals].filter((id) => !declaredRevoked.has(id)),
-        ...[...declaredRevoked].filter((id) => !derived.revokedApprovals.has(id) && !derived.ambiguousApprovals.has(id)),
+        ...[...declaredRevoked].filter((id) => !derived.revokedApprovals.has(id)),
       ];
       if (revokedDiff.length) mismatches.push({ table: 'approvals', kind: 'declared_transforms', code: 'revoked_approvals', sample_ids: revokedDiff.slice(0, 5) });
       const downgradedDiff = [
@@ -397,7 +415,7 @@ export function formatDrillResult(r: RestoreDrillResult): string {
   lines.push(
     `결과: ${
       r.result === 'pass'
-        ? `PASS${r.scope.partial ? `(부분 검증: ${r.scope.partial_reasons.join(', ')})` : ''} — 복원한 빈 환경이 원본 묶음(복원 규칙 적용)과 일치`
+        ? `PASS${r.scope.partial ? `(부분 검증: ${r.scope.partial_reasons.map((x) => DRILL_PARTIAL_LABEL[x] ?? x).join(', ')})` : ''} — 복원한 빈 환경이 원본 묶음(복원 규칙 적용)과 일치`
         : `FAIL${r.errorCode ? `(${r.errorCode})` : ''}`
     }`,
   );

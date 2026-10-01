@@ -278,7 +278,9 @@ export interface OpsSnapshot {
     lastDrill: RestoreDrillRow | null;
   };
   /** 마지막 보존 정리(감사 기록 retention.sweep — 지운 개수만) */
-  lastRetention: { at: Date; details: Record<string, unknown>; resultMissing: boolean } | null;
+  lastRetention: { at: Date; details: Record<string, unknown>; resultMissing: boolean; sweepId: string | null } | null;
+  /** 결과 기록이 없는 정리 실행(실행 ID 기준) */
+  incompleteRetention: { total: number; items: Array<{ sweepId: string; at: Date; planned: number }> };
 }
 
 export async function opsSnapshot(
@@ -376,37 +378,64 @@ export async function opsSnapshot(
       lastDrill: await latestRestoreDrill(db, ownerId),
     },
     lastRetention: await lastRetentionSweep(db, ownerId),
+    incompleteRetention: await incompleteRetentionSweeps(db, ownerId),
   };
 }
 
 /**
- * 마지막 보존 정리: 계획 기록(retention.sweep — 지운 이력 수·지울 파일 계획 수)과 그 뒤의 결과 기록(retention.files — 실제 삭제·실패 수)을 합친다.
- * 파일 계획이 있었는데 결과 기록이 없으면 resultMissing = true(파일 삭제 중 중단됐을 수 있음 — 다음 미리보기로 남은 것을 확인).
+ * 보존 정리 기록(FIX round 4, Codex review-FIX3-T20 P1): 계획 감사(retention.sweep)와 결과 감사(retention.files)를 시각이 아니라
+ * 실행 ID(details.sweep_id)로 잇는다. lastRetentionSweep = 가장 최근 계획 + 같은 ID 의 결과. incompleteRetentionSweeps = 파일 계획이 있었는데
+ * 같은 ID 의 결과가 없는 실행 전부(뒤의 성공한 실행이 가리지 않는다). sweep_id 가 없는 옛 기록(round 4 이전)은 짝을 지을 수 없어 미완료로 세지 않는다.
  */
+type SweepAudit = { id: string; at: Date; details: Record<string, unknown> };
+const plannedFiles = (d: Record<string, unknown>) => Number(d.planned_packages ?? 0) + Number(d.planned_export_zips ?? 0) + Number(d.planned_export_dirs ?? 0);
+
+async function sweepAudits(db: DbOrTx, ownerId: string, action: 'retention.sweep' | 'retention.files', limit = 200): Promise<SweepAudit[]> {
+  const rows = await db
+    .select({ id: auditEvents.id, at: auditEvents.at, details: auditEvents.sanitizedDetails })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.ownerId, ownerId), eq(auditEvents.action, action)))
+    .orderBy(desc(auditEvents.at), desc(auditEvents.id))
+    .limit(limit);
+  return rows.map((r) => ({ id: r.id, at: r.at, details: (r.details ?? {}) as Record<string, unknown> }));
+}
+
 export async function lastRetentionSweep(
   db: DbOrTx,
   ownerId: string,
-): Promise<{ at: Date; details: Record<string, unknown>; resultMissing: boolean } | null> {
-  const latest = async (action: 'retention.sweep' | 'retention.files') =>
-    (
-      await db
-        .select({ at: auditEvents.at, details: auditEvents.sanitizedDetails })
-        .from(auditEvents)
-        .where(and(eq(auditEvents.ownerId, ownerId), eq(auditEvents.action, action)))
-        .orderBy(desc(auditEvents.at))
-        .limit(1)
-    )[0] ?? null;
-  const sweep = await latest('retention.sweep');
-  const files = await latest('retention.files');
-  if (!sweep && !files) return null;
-  const filesForSweep = files && (!sweep || files.at.getTime() >= sweep.at.getTime()) ? files : null;
-  const sd = (sweep?.details ?? {}) as Record<string, unknown>;
-  const planned = Number(sd.planned_packages ?? 0) + Number(sd.planned_export_zips ?? 0) + Number(sd.planned_export_dirs ?? 0);
+): Promise<{ at: Date; details: Record<string, unknown>; resultMissing: boolean; sweepId: string | null } | null> {
+  const [sweep] = await sweepAudits(db, ownerId, 'retention.sweep', 1);
+  if (!sweep) return null;
+  const sweepId = typeof sweep.details.sweep_id === 'string' ? sweep.details.sweep_id : null;
+  const files = sweepId
+    ? ((
+        await db
+          .select({ at: auditEvents.at, details: auditEvents.sanitizedDetails })
+          .from(auditEvents)
+          .where(and(eq(auditEvents.ownerId, ownerId), eq(auditEvents.action, 'retention.files'), sql`${auditEvents.sanitizedDetails}->>'sweep_id' = ${sweepId}`))
+          .limit(1)
+      )[0] ?? null)
+    : null;
   return {
-    at: (filesForSweep ?? sweep)!.at,
-    details: { ...sd, ...((filesForSweep?.details ?? {}) as Record<string, unknown>) },
-    resultMissing: Boolean(sweep) && planned > 0 && !filesForSweep,
+    at: (files ?? sweep).at,
+    details: { ...sweep.details, ...((files?.details ?? {}) as Record<string, unknown>) },
+    resultMissing: sweepId !== null && plannedFiles(sweep.details) > 0 && !files,
+    sweepId,
   };
+}
+
+/** 파일 계획이 있었는데 같은 실행 ID 의 결과 기록이 없는 정리 실행(최근 것부터, 최대 limit 개)과 전체 수. */
+export async function incompleteRetentionSweeps(
+  db: DbOrTx,
+  ownerId: string,
+  limit = 20,
+): Promise<{ total: number; items: Array<{ sweepId: string; at: Date; planned: number }> }> {
+  const plans = await sweepAudits(db, ownerId, 'retention.sweep', 1000);
+  const done = new Set((await sweepAudits(db, ownerId, 'retention.files', 1000)).map((f) => f.details.sweep_id).filter((x): x is string => typeof x === 'string'));
+  const open = plans
+    .filter((p) => typeof p.details.sweep_id === 'string' && plannedFiles(p.details) > 0 && !done.has(p.details.sweep_id as string))
+    .map((p) => ({ sweepId: p.details.sweep_id as string, at: p.at, planned: plannedFiles(p.details) }));
+  return { total: open.length, items: open.slice(0, limit) };
 }
 
 // ---- /api/health (모든 owner 합계, 숫자만) ----

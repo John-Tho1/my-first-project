@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { opsSnapshot, planRetention, type DirUsage } from '@cs/db';
+import { DRILL_PARTIAL_LABEL, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
 import {
   CHANNEL_LABEL,
   describeModes,
@@ -95,7 +95,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
             <p className={drill.result === 'pass' ? 'meta' : 'notice'} role={drill.result === 'pass' ? undefined : 'alert'}>
               마지막 복원 훈련: {formatMsk(drill.startedAt)} · 결과{' '}
               {drill.result === 'pass'
-                ? `PASS${drillScope?.partial ? `(부분 검증: ${drillScope.partial_reasons.join(', ')})` : ''}(빈 메모리 DB 복원이 원본 묶음 — 복원 규칙 적용 — 과 일치)`
+                ? `PASS${drillScope?.partial ? `(부분 검증: ${drillScope.partial_reasons.map((r) => DRILL_PARTIAL_LABEL[r] ?? r).join(', ')})` : ''}(빈 메모리 DB 복원이 원본 묶음 — 복원 규칙 적용 — 과 일치)`
                 : `FAIL${drill.errorCode ? `(${drill.errorCode})` : ''}`} · 표{' '}
               {drill.tablesCompared}개 · 행 {drill.rowsCompared}개 · 파일 {drill.assetsCompared}개 · 실행 {drill.trigger === 'cli' ? 'CLI' : drill.trigger === 'api' ? '화면' : drill.trigger}
               {drillScope
@@ -270,9 +270,23 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
                 retentionFailed > 0
                   ? ` · 삭제 실패 ${retentionFailed}개(${String(s.lastRetention.details.error_codes ?? '')}) — 남은 파일은 다음 미리보기에 다시 나옵니다`
                   : ''
-              }${s.lastRetention.resultMissing ? ' · 파일 삭제 결과 기록이 없습니다(중단됐을 수 있음 — 아래 미리보기로 남은 파일 확인)' : ''}`
+              }${s.lastRetention.resultMissing ? ' · 파일 삭제 결과 기록이 없습니다(중단됐을 수 있음 — 아래 미리보기로 남은 파일 확인)' : ''}${
+                Number(s.lastRetention.details.already_absent ?? 0) > 0 ? ` · 이미 없던 파일 ${String(s.lastRetention.details.already_absent)}개` : ''
+              }${s.lastRetention.details.exports_aborted ? ' · 남길 백업을 다시 검증하지 못해 내보내기는 지우지 않았습니다' : ''}`
             : '기록 없음'}
         </p>
+        {s.incompleteRetention.total ? (
+          <div className="notice" role="alert">
+            결과 기록이 없는 정리 실행 {s.incompleteRetention.total}개(파일 삭제 중 중단됐을 수 있음 — 아래 미리보기로 남은 파일을 확인하세요):
+            <ul className="list">
+              {s.incompleteRetention.items.map((i) => (
+                <li key={i.sweepId}>
+                  {formatMsk(i.at)} · 계획 {i.planned}개 · 실행 {i.sweepId.slice(0, 8)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         <h4>지금 적용하면 지울 것(미리보기 — 아직 아무것도 지우지 않음)</h4>
         <ul className="list">
           <li>

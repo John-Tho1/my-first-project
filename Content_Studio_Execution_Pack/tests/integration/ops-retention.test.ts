@@ -12,6 +12,9 @@ import {
   applyRetention,
   approveItems,
   closeDb,
+  DRILL_PARTIAL_LABEL,
+  appendContentVersion,
+  incompleteRetentionSweeps,
   lastRetentionSweep,
   ensureOwner,
   createTestDb,
@@ -326,9 +329,14 @@ describe('보존 정리', () => {
     const filesAudit = await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, A.id), eq(schema.auditEvents.action, 'retention.files')));
     expect(filesAudit).toHaveLength(1);
     expect(filesAudit[0]!.sanitizedDetails).toMatchObject({ packages_deleted: 2, exports_deleted: 2, export_dirs_deleted: 2 });
+    // FIX round 4: 계획·결과는 같은 실행 ID 로 이어진다
+    expect((filesAudit[0]!.sanitizedDetails as Record<string, unknown>).sweep_id).toBe((audit[0]!.sanitizedDetails as Record<string, unknown>).sweep_id);
     // 멱등
     const again = await applyRetention(db, A.id, policy(1), exportsDir, { confirm: true, now: future() });
     expect(again).toEqual({
+      sweepId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      alreadyAbsent: 0,
+      exportsAborted: null,
       jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
       packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
       exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0 },
@@ -920,5 +928,168 @@ describe('FIX round 3 (Codex review-FIX-T20) — 복원 훈련', () => {
     const [row] = await db.select().from(schema.restoreDrills).where(eq(schema.restoreDrills.id, r.drillId));
     expect(row!.scopeJson).toMatchObject({ partial: true, files_checked: 0 });
     expect((await opsSnapshot(db, o.id, cfg())).backup.lastDrill!.scopeJson).toMatchObject({ partial: true });
+  }, 60_000);
+});
+
+describe('FIX round 4 (Codex review-FIX3-T20) — 보존 정리', () => {
+  const pol1 = () => ({ ...cfg(), RETENTION_EXPORT_RUNS_KEEP: 1 });
+  const filesAudits = async (owner: string) =>
+    (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, owner), eq(schema.auditEvents.action, 'retention.files')))).map(
+      (a) => a.sanitizedDetails as Record<string, unknown>,
+    );
+
+  it('P0: 미리보기가 캐시한 뒤 최신 ZIP 을 같은 길이로 손상시키고 mtime 을 되돌려도, 적용은 삭제 직전 실제 바이트로 다시 검증해 아무것도 지우지 않는다', async () => {
+    const o = await newOwner('ops-r4-cache');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    const newest = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const fixedMtime = Math.floor(Date.now() / 1000) - 60; // 정수 초 — 손상 뒤 같은 값으로 되돌릴 수 있게
+    utimesSync(newest.zipPath, fixedMtime, fixedMtime);
+    const before = await planRetention(db, o.id, pol1(), exportsDir); // 캐시: newest = verified
+    expect(before.exports.map((e) => e.id)).toEqual([older.exportId]);
+    const st = statSync(newest.zipPath);
+    const b = readFileSync(newest.zipPath);
+    const i = Math.floor(b.length / 2);
+    b[i] = b[i]! ^ 0xff;
+    writeFileSync(newest.zipPath, b);
+    utimesSync(newest.zipPath, fixedMtime, fixedMtime); // 크기·mtime 그대로
+    expect(statSync(newest.zipPath).mtimeMs).toBe(st.mtimeMs);
+    // 미리보기는 캐시를 써서 여전히 지울 것으로 본다(이것이 Codex 가 지적한 위험)
+    expect((await planRetention(db, o.id, pol1(), exportsDir)).exports.map((e) => e.id)).toEqual([older.exportId]);
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true });
+    expect(r.exportsAborted).toBe('kept_unverified');
+    expect(r.exports).toMatchObject({ deleted: 0, dirsDeleted: 0 });
+    expect(existsSync(older.zipPath)).toBe(true);
+    expect((await filesAudits(o.id))[0]).toMatchObject({ exports_aborted: 'kept_unverified', exports_deleted: 0, sweep_id: r.sweepId });
+  });
+
+  it('P0: 남길 ZIP 이 삭제 직전 읽기 실패(EACCES) → 내보내기 정리 중단', async () => {
+    const o = await newOwner('ops-r4-eacces');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    const newest = await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    let reads = 0;
+    const zipFs = {
+      stat: async (f: string) => statSync(f),
+      readFile: async (f: string) => {
+        if (path.resolve(f) === path.resolve(newest.zipPath) && ++reads > 1) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        return new Uint8Array(readFileSync(f));
+      },
+    };
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, zipFs });
+    expect(reads).toBe(2); // 계획 때 한 번 + 삭제 직전 재검증 한 번
+    expect(r.exportsAborted).toBe('kept_unverified');
+    expect(existsSync(older.zipPath)).toBe(true);
+  });
+
+  it('P1: 실행 ID 로 계획·결과를 잇는다 — 같은 now 의 두 정리 중 결과 없는 것은 표시되고, 뒤의 성공한 정리가 가리지 않는다', async () => {
+    const o = await newOwner('ops-r4-sweepid');
+    const { content } = await createContent(db, o.id, { title: '실행 ID', body: BODY });
+    const pkg = () => {
+      const dir = path.join(exportsDir, 'packages', o.id, content.id);
+      mkdirSync(dir, { recursive: true });
+      const f = path.join(dir, `${randomUUID()}.zip`);
+      writeFileSync(f, 'pkg');
+      const t = new Date(Date.now() - 40 * DAY);
+      utimesSync(f, t, t);
+    };
+    const at = new Date();
+    pkg();
+    const r1 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, now: at });
+    pkg();
+    const r2 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, now: at });
+    expect(r1.sweepId).not.toBe(r2.sweepId);
+    // r2 의 결과 기록이 남지 않은 경우(③ 전 중단) 흉내
+    await db.execute(sql`delete from audit_events where owner_id = ${o.id}::uuid and action = 'retention.files' and sanitized_details->>'sweep_id' = ${r2.sweepId}`);
+    expect((await incompleteRetentionSweeps(db, o.id)).items.map((x) => x.sweepId)).toEqual([r2.sweepId]);
+    // 같은 시각의 r1 결과가 r2 의 미완료를 가리지 않는다
+    pkg();
+    const r3 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, now: new Date(at.getTime() + 1000) });
+    expect(r3.packages.deleted).toBe(1);
+    const inc = await incompleteRetentionSweeps(db, o.id);
+    expect(inc).toMatchObject({ total: 1, items: [{ sweepId: r2.sweepId, planned: 1 }] });
+    expect((await lastRetentionSweep(db, o.id))).toMatchObject({ sweepId: r3.sweepId, resultMissing: false });
+    expect((await opsSnapshot(db, o.id, cfg())).incompleteRetention.total).toBe(1);
+  });
+
+  it('P2: 계획한 파일이 모두 이미 없으면(ENOENT) 결과 기록에 already_absent 를 남기고 중단으로 보이지 않는다', async () => {
+    const o = await newOwner('ops-r4-absent');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const enoent = async () => {
+      throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+    };
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, fs: { unlink: enoent, rmDir: enoent } });
+    expect(r.alreadyAbsent).toBe(2); // ZIP + 폴더
+    expect(r.exports).toMatchObject({ deleted: 0, dirsDeleted: 0, failed: 0, dirsFailed: 0 });
+    expect((await filesAudits(o.id))[0]).toMatchObject({ already_absent: 2, sweep_id: r.sweepId });
+    expect(await lastRetentionSweep(db, o.id)).toMatchObject({ resultMissing: false });
+    expect(existsSync(older.zipPath)).toBe(true); // 주입한 ENOENT 라 실제로는 남아 있다
+  });
+});
+
+describe('FIX round 4 (Codex review-FIX3-T20) — 복원 훈련 판정 시각', () => {
+  const mskDate = (d: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Moscow' }).format(d);
+  let S: Owner;
+  let approvalId: string;
+  let scheduledAt: Date;
+  beforeAll(async () => {
+    S = await newOwner('ops-r4-clock');
+    await putAsset(S.id);
+    const { content } = await createContent(db, S.id, { title: '판정 시각', body: BODY });
+    const { variant } = await createVariantDraft(db, S.id, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, S.id, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const date = mskDate(new Date(Date.now() - DAY));
+    scheduledAt = new Date(`${date}T09:00:00.000Z`); // 12:00 MSK
+    const past = new Date(Date.now() - 2 * DAY);
+    const { plan, items } = await createPlan(db, S.id, { items: [{ variant_id: variant.id, channel_account_id: S.accounts.threads, schedule: { date, time: '12:00' } }] }, past);
+    const a = await approveItems(db, S.id, plan.id, { item_ids: [items[0]!.id], expected_hashes: { [items[0]!.id]: items[0]!.payloadHash }, confirm: true, purpose: 'mock_publish' }, past);
+    approvalId = a.approvals[0]!.id;
+  }, 60_000);
+
+  it('판정 시각 = 예약 시각(예약 시각 ≤ 판정 시각 → 철회): 복원과 기대값이 같은 시각으로 철회 → PASS', async () => {
+    const r = await runRestoreDrill(db, storage, S.id, { trigger: 'test', tmpRoot: tmp, restoreNow: scheduledAt });
+    expect(r.mismatches).toEqual([]);
+    expect(r.result).toBe('pass');
+  }, 60_000);
+
+  it('판정 시각 = 예약 1초 전(아직 지나지 않음 → 유지): 승인·파생본 approved·계획 approved 그대로 → PASS', async () => {
+    const r = await runRestoreDrill(db, storage, S.id, { trigger: 'test', tmpRoot: tmp, restoreNow: new Date(scheduledAt.getTime() - 1000) });
+    expect(r.mismatches).toEqual([]);
+    expect(r.result).toBe('pass');
+    expect(r.tables.find((t) => t.table === 'approvals')!.content).toBe('same');
+  }, 60_000);
+
+  it('유지되어야 할 승인인데 복원이 철회했다고 알림(행은 유지) → FAIL(선언 불일치)', async () => {
+    const r = await runRestoreDrill(db, storage, S.id, {
+      trigger: 'test',
+      tmpRoot: tmp,
+      restoreNow: new Date(scheduledAt.getTime() - 1000),
+      tamperCommit: (c) => ({ ...c, revoked_approvals: [{ approval_id: approvalId, item_id: 'x', reasons: ['schedule_passed'] }] }),
+    });
+    expect(r.result).toBe('fail');
+    expect(r.mismatches).toEqual([expect.objectContaining({ kind: 'declared_transforms', code: 'revoked_approvals', sample_ids: [approvalId] })]);
+  }, 60_000);
+
+  it('필요한 강등(원고가 바뀌어 stale 인 검토 중 파생본): 기대 강등 = 복원 강등 → PASS, 파생본 표는 복원 규칙 적용', async () => {
+    const o = await newOwner('ops-r4-stale');
+    const { content } = await createContent(db, o.id, { title: 'stale', body: BODY });
+    const { variant } = await createVariantDraft(db, o.id, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, o.id, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    await appendContentVersion(db, o.id, content.id, { baseVersion: 1, body: `${BODY}\n\n고침` });
+    expect((await db.select().from(schema.variants).where(eq(schema.variants.id, variant.id)))[0]!.lifecycle).toBe('review');
+    const r = await runRestoreDrill(db, storage, o.id, { trigger: 'test', tmpRoot: tmp });
+    expect(r.mismatches).toEqual([]);
+    expect(r.result).toBe('pass');
+    expect(r.tables.find((t) => t.table === 'variants')!.content).toMatch(/^same\(복원 규칙 1행\)$/u);
+  }, 60_000);
+
+  it('배포 이력(작업·승인)이 없는 owner 의 PASS 는 "배포 복구 미검증"(no_distribution) 부분 검증', async () => {
+    const o = await newOwner('ops-r4-nodist');
+    await putAsset(o.id);
+    await createContent(db, o.id, { title: '배포 없음', body: BODY });
+    const r = await runRestoreDrill(db, storage, o.id, { trigger: 'test', tmpRoot: tmp });
+    expect(r.result).toBe('pass');
+    expect(r.scope.partial_reasons).toContain('no_distribution');
+    expect(r.scope.partial_reasons).not.toContain('no_files');
+    expect(DRILL_PARTIAL_LABEL.no_distribution).toMatch(/배포 복구 미검증/u);
   }, 60_000);
 });

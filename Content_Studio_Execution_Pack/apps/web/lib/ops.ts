@@ -67,6 +67,9 @@ export function retentionPlanView(p: RetentionPlan) {
 export function retentionResultView(r: RetentionResult) {
   return {
     dry_run: false,
+    sweep_id: r.sweepId,
+    already_absent: r.alreadyAbsent,
+    exports_aborted: r.exportsAborted,
     job_events: { jobs: r.jobEvents.jobs, deleted: r.jobEvents.deleted, archived: r.jobEvents.archive !== null },
     packages: r.packages,
     exports: r.exports,

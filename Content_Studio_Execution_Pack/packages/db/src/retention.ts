@@ -49,6 +49,8 @@ export interface RetentionPlan {
   exports: Array<{ id: string; createdAt: Date; zipBytes: number; filePresent: boolean; kind: 'zip' | 'dir_only' }>;
   /** 검증된 백업 수 — 보존 개수는 이것으로 센다 */
   exportsExisting: number;
+  /** 지울 것이 있을 때 남길 검증된 백업(가장 최근 keep 개) — 적용은 삭제 직전에 이것을 캐시 없이 다시 검증한다 */
+  exportsKept: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string }>;
   /** 검증되지 않은 기록(ZIP 없음·손상·읽기 실패) — 보존 개수에 세지 않는다. dirPresent = 풀어 둔 폴더는 남아 있음 */
   exportsMissingFile: Array<{ id: string; createdAt: Date; dirPresent: boolean; zipState: Exclude<ZipState, 'verified'> }>;
 }
@@ -111,7 +113,12 @@ const verifyCache = () => (globalForZip.__csZipVerify ??= new Map());
  * ZIP 상태 판정. verified = 크기 일치 + parseBundleZip(구조·manifest·항목 checksum·파일 checksum) 통과 + manifest sha256 = 생성 때 기록한 값.
  * 크기 일치는 무결성 검사가 아니다(같은 길이로 손상된 ZIP 을 걸러낸다).
  */
-export async function zipState(exportsDir: string, run: { id: string; zipBytes: number; manifestSha256: string }, fs: ZipFs = nodeZipFs): Promise<ZipState> {
+export async function zipState(
+  exportsDir: string,
+  run: { id: string; zipBytes: number; manifestSha256: string },
+  fs: ZipFs = nodeZipFs,
+  opts: { noCache?: boolean } = {},
+): Promise<ZipState> {
   const file = exportZipPath(exportsDir, run.id);
   let s: { isFile(): boolean; size: number; mtimeMs: number };
   try {
@@ -120,8 +127,10 @@ export async function zipState(exportsDir: string, run: { id: string; zipBytes: 
     return errCode(e) === 'ENOENT' ? 'absent' : 'unreadable';
   }
   if (!s.isFile() || s.size <= 0 || s.size !== run.zipBytes) return 'damaged';
-  const key = `${run.id}:${s.size}:${s.mtimeMs}:${run.manifestSha256}`;
-  const cached = fs === nodeZipFs ? verifyCache().get(key) : undefined;
+  // FIX round 4(Codex review-FIX3-T20 P0): 캐시는 미리보기 전용이며 키에 실제 경로를 넣는다. 삭제 직전 재검증은 noCache 로 실제 바이트를 다시 읽는다.
+  const key = `${file}:${run.id}:${s.size}:${s.mtimeMs}:${run.manifestSha256}`;
+  const useCache = fs === nodeZipFs && !opts.noCache;
+  const cached = useCache ? verifyCache().get(key) : undefined;
   if (cached) return cached;
   let bytes: Uint8Array;
   try {
@@ -136,6 +145,7 @@ export async function zipState(exportsDir: string, run: { id: string; zipBytes: 
   } catch {
     state = 'damaged';
   }
+  // 다시 읽어 얻은 결과로 캐시를 갱신한다(재검증 결과가 미리보기에 반영되게)
   if (fs === nodeZipFs) verifyCache().set(key, state);
   return state;
 }
@@ -154,7 +164,7 @@ async function exportsBeyondKeep(
   ownerId: string,
   keep: number,
   fs?: ZipFs,
-): Promise<{ prune: RetentionPlan['exports']; existing: number; missing: RetentionPlan['exportsMissingFile'] }> {
+): Promise<{ prune: RetentionPlan['exports']; existing: number; missing: RetentionPlan['exportsMissingFile']; kept: RetentionPlan['exportsKept'] }> {
   const runs = await db
     .select({ id: exportRuns.id, createdAt: exportRuns.createdAt, zipBytes: exportRuns.zipBytes, manifestSha256: exportRuns.manifestSha256 })
     .from(exportRuns)
@@ -169,7 +179,8 @@ async function exportsBeyondKeep(
   }
   const effectiveKeep = Math.max(1, keep);
   // 검증된 백업이 keep 보다 적으면 내보내기는 아무것도 지우지 않는다
-  if (verified.length < effectiveKeep) return { prune: [], existing: verified.length, missing };
+  if (verified.length < effectiveKeep) return { prune: [], existing: verified.length, missing, kept: [] };
+  const kept = verified.slice(0, effectiveKeep).map((r) => ({ id: r.id, createdAt: r.createdAt, zipBytes: r.zipBytes, manifestSha256: r.manifestSha256 }));
   const prune: RetentionPlan['exports'] = verified.slice(effectiveKeep).map((r) => ({
     id: r.id,
     createdAt: r.createdAt,
@@ -184,7 +195,7 @@ async function exportsBeyondKeep(
       prune.push({ id: m.id, createdAt: m.createdAt, zipBytes: 0, filePresent: true, kind: 'dir_only' });
     }
   }
-  return { prune, existing: verified.length, missing };
+  return { prune, existing: verified.length, missing, kept: prune.length ? kept : [] };
 }
 
 /** 미리보기(dry-run): 무엇을 지울지 계산만 한다 — DB·파일 변화 없음. */
@@ -207,6 +218,7 @@ export async function planRetention(
     exports: ex.prune,
     exportsExisting: ex.existing,
     exportsMissingFile: ex.missing,
+    exportsKept: ex.kept,
   };
 }
 
@@ -226,6 +238,12 @@ export interface ExportDeleteResult extends FileDeleteResult {
 }
 
 export interface RetentionResult {
+  /** 이 정리 실행의 ID — 계획 감사(retention.sweep)와 결과 감사(retention.files)를 잇는다 */
+  sweepId: string;
+  /** 이미 없던 파일·폴더(ENOENT) 수 — 정상 완료와 중단을 구분 */
+  alreadyAbsent: number;
+  /** 남길 백업을 삭제 직전에 다시 검증하지 못해 내보내기 정리를 멈췄으면 그 이유 */
+  exportsAborted: 'kept_unverified' | null;
   jobEvents: { jobs: number; deleted: number; archive: string | null; archiveSha256: string | null; archiveBytes: number };
   packages: FileDeleteResult;
   exports: ExportDeleteResult;
@@ -324,7 +342,11 @@ export async function applyRetention(db: Db, ownerId: string, policy: RetentionP
 async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPolicy, exportsDir: string, opts: ApplyOpts): Promise<RetentionResult> {
   const now = opts.now ?? new Date();
   const fs: RetentionFs = { ...nodeRetentionFs, ...opts.fs };
+  const sweepId = randomUUID();
   const result: RetentionResult = {
+    sweepId,
+    alreadyAbsent: 0,
+    exportsAborted: null,
     jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
     packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
     exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0 },
@@ -394,6 +416,7 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
         entity: 'retention',
         details: {
           trigger: opts.trigger ?? 'ui',
+          sweep_id: sweepId,
           job_events_deleted: result.jobEvents.deleted,
           job_event_jobs: result.jobEvents.jobs,
           archive_sha256: result.jobEvents.archiveSha256,
@@ -412,6 +435,17 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
   });
 
   // ② 파일 삭제 — 하나가 실패해도 나머지는 계속, 개수는 실제 결과로만
+  // FIX round 4(P0): 내보내기를 지우기 직전에 남길 백업을 캐시 없이 실제 바이트로 다시 검증한다. 하나라도 실패하면 내보내기는 하나도 지우지 않는다.
+  let exportPlan = plan.exports;
+  if (exportPlan.length) {
+    for (const k of plan.exportsKept) {
+      if ((await zipState(exportsDir, k, opts.zipFs, { noCache: true })) !== 'verified') {
+        result.exportsAborted = 'kept_unverified';
+        exportPlan = [];
+        break;
+      }
+    }
+  }
   for (const p of plan.packages) {
     const file = p.contentId
       ? path.join(/*turbopackIgnore: true*/ packagesDir(exportsDir, ownerId, p.contentId), `${p.id}.zip`)
@@ -420,19 +454,21 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
     if (r === 'deleted') {
       result.packages.deleted++;
       result.packages.bytes += p.bytes;
-    } else if (r !== 'absent') {
+    } else if (r === 'absent') result.alreadyAbsent++;
+    else {
       result.packages.failed++;
       addCode(result.packages.errorCodes, r.code);
     }
   }
-  for (const e of plan.exports) {
+  for (const e of exportPlan) {
     const dir = path.join(exportsDir, e.id);
     if (e.kind === 'zip') {
       const z = await removeOne(() => fs.unlink(exportZipPath(exportsDir, e.id)));
       if (z === 'deleted') {
         result.exports.deleted++;
         result.exports.bytes += e.zipBytes;
-      } else if (z !== 'absent') {
+      } else if (z === 'absent') result.alreadyAbsent++;
+      else {
         result.exports.failed++;
         addCode(result.exports.errorCodes, z.code);
         continue; // ZIP 을 못 지웠으면 폴더도 그대로
@@ -440,7 +476,8 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
     }
     const d = await removeOne(() => fs.rmDir(dir));
     if (d === 'deleted') result.exports.dirsDeleted++;
-    else if (d !== 'absent') {
+    else if (d === 'absent') result.alreadyAbsent++;
+    else {
       result.exports.dirsFailed++;
       addCode(result.exports.errorCodes, d.code);
     }
@@ -449,15 +486,17 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
   result.exports.errorCodes.sort();
 
   // ③ 실제 결과 기록
-  const touched =
-    result.packages.deleted + result.packages.failed + result.exports.deleted + result.exports.failed + result.exports.dirsDeleted + result.exports.dirsFailed;
-  if (touched > 0) {
+  // FIX round 4(P2): 파일 계획이 있었으면 실제 삭제가 0건이어도(모두 이미 없음·내보내기 중단) 결과를 남긴다 — 중단과 구분
+  if (plan.packages.length + plan.exports.length > 0) {
     await recordAudit(db, {
       ownerId,
       action: 'retention.files',
       entity: 'retention',
       details: {
         trigger: opts.trigger ?? 'ui',
+        sweep_id: sweepId,
+        already_absent: result.alreadyAbsent,
+        exports_aborted: result.exportsAborted,
         packages_deleted: result.packages.deleted,
         packages_failed: result.packages.failed,
         packages_bytes: result.packages.bytes,

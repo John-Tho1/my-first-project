@@ -10,13 +10,15 @@
  *    (publications)가 없으면 UNKNOWN + restored_needs_review=true.
  *  - jobs: state = restoredJobState(원본), lease_owner·lease_until·heartbeat_at = null, restored_needs_review = true.
  *    위의 "근거 없는 CONFIRMED" 항목은 그 항목의 (변환 뒤) CONFIRMED 작업 중 가장 최근 것이 UNKNOWN, done_at = null.
- *  - approvals: 활성 승인의 스냅샷 문제(파생본 버전·lifecycle·원고 버전·첨부·계정·재계산 hash·브랜드·예약 시각·검토 차단)가 있으면
- *    revoked_at = 복원 시각, revoke_reason = restore_stale(이 집합 = 기대 철회 집합). 예약 시각이 복원 호출 구간 안이면 어느 쪽이든 허용(모호).
+ *  - approvals: 활성 승인의 스냅샷 문제(파생본 버전·lifecycle·원고 버전·첨부·계정·재계산 hash·브랜드·예약 시각 ≤ 판정 시각·검토 차단)가 있으면
+ *    revoked_at = 판정 시각, revoke_reason = restore_stale(이 집합 = 기대 철회 집합). FIX round 4: 판정 시각은 훈련이 복원에 넘긴 같은 시각이라
+ *    철회 여부가 정해진다(모호한 분기 없음).
  *  - variants(이어서): 원본 approved 이고 강등되지 않았는데 기대 활성 승인(그 파생본의 현재 버전을 가리키는 항목)이 없으면 review(updated_at = 원본 또는 복원 시각).
  *  - distribution_plans: 상태 = planStatusFrom(기대 항목 상태·기대 활성 승인). 원본과 다르면 revision + 1, updated_at = 복원 시각.
  *  - transcription_jobs: queued·running → canceled, error 고정 문구, finished_at = 원본 값 또는 복원 시각.
  *  - usage_ledger: 그 중단된 전사의 reserved 원장 → settled, actual_amount = reserved_amount, failed = true, settled_at = 복원 시각. 그 밖의 금액은 그대로.
- * 복원 시각 = 실제 복원 호출 직전~직후 구간(훈련이 잰 값). 원래 시각을 보존해야 하는 열은 정확히 비교한다.
+ * 판정 시각(decisionAt)으로 정해지는 값(승인 철회 시각·계획/파생본 updated_at)은 그 시각과 정확히 같아야 한다. DB now() 로 정해지는 값(원장 settled_at·
+ * 전사 finished_at)은 실제 복원 호출 직전~직후 구간 안인지 본다. 원래 시각을 보존해야 하는 열은 정확히 비교한다.
  */
 import {
   buildCanonicalPayload,
@@ -42,10 +44,6 @@ export const RESTORE_TIME = Symbol('restore_time');
 export class SameOrRestoreTime {
   constructor(readonly original: unknown) {}
 }
-/** 값 자리표시: 두 값 중 하나(예약 시각이 복원 구간 안이라 철회 여부가 모호한 승인). */
-export class OneOf {
-  constructor(readonly options: readonly unknown[]) {}
-}
 
 export type ExpectedValue = unknown;
 export type ExpectedRow = Record<string, ExpectedValue>;
@@ -53,9 +51,12 @@ export type ExpectedRow = Record<string, ExpectedValue>;
 export interface DerivedTransforms {
   downgradedVariants: Set<string>;
   revokedApprovals: Set<string>;
-  /** 예약 시각이 복원 호출 구간 안이라 철회될 수도 안 될 수도 있는 승인 */
-  ambiguousApprovals: Set<string>;
+  /** 판정 시각 — 복원에 넘긴 것과 같은 시각 */
+  decisionAt: Date;
 }
+
+/** 묶음 행의 시각 형식(마이크로초 6자리, UTC). */
+export const bundleTime = (d: Date) => d.toISOString().replace(/\.(\d{3})Z$/u, '.$1000Z');
 
 export const INTERRUPTED_TRANSCRIPTION_ERROR = '복원 시 진행 중이던 작업(중단됨)';
 
@@ -65,7 +66,7 @@ const byId = (list: readonly Row[]) => new Map(list.map((r) => [String(r.id), r]
 const str = (v: unknown) => (v === null || v === undefined ? null : String(v));
 
 /** 묶음 행만으로 복원의 강등·철회 대상 집합을 계산한다(복원 결과를 보지 않는다). */
-export function deriveRestoreTransforms(t: BundleTables, restoreWindow: { from: Date; to: Date }): DerivedTransforms {
+export function deriveRestoreTransforms(t: BundleTables, decisionAt: Date): DerivedTransforms {
   const variants = byId(rows(t, 'variants'));
   const versions = byId(rows(t, 'variant_versions'));
   const contents = byId(rows(t, 'contents'));
@@ -146,7 +147,6 @@ export function deriveRestoreTransforms(t: BundleTables, restoreWindow: { from: 
 
   const brand = [...rows(t, 'brand_profiles')].sort((a, b) => Number(b.version) - Number(a.version))[0];
   const revokedApprovals = new Set<string>();
-  const ambiguousApprovals = new Set<string>();
   for (const a of rows(t, 'approvals')) {
     if (a.revoked_at !== null) continue;
     const item = items.get(String(a.distribution_item_id));
@@ -189,16 +189,10 @@ export function deriveRestoreTransforms(t: BundleTables, restoreWindow: { from: 
     if (payloadHash(item.payload_json as Record<string, unknown>) !== item.payload_hash) problems.push('payload_changed');
     if (str(brand?.id) !== str(item.brand_profile_id)) problems.push('brand_changed');
     if (variant && (blockersOf.get(String(variant.id)) ?? []).length) problems.push('blocked');
-    let ambiguous = false;
-    if (item.scheduled_at_utc) {
-      const at = Date.parse(String(item.scheduled_at_utc));
-      if (at <= restoreWindow.from.getTime()) problems.push('schedule_passed');
-      else if (at <= restoreWindow.to.getTime()) ambiguous = true;
-    }
+    if (item.scheduled_at_utc && Date.parse(String(item.scheduled_at_utc)) <= decisionAt.getTime()) problems.push('schedule_passed');
     if (problems.length) revokedApprovals.add(String(a.id));
-    else if (ambiguous) ambiguousApprovals.add(String(a.id));
   }
-  return { downgradedVariants, revokedApprovals, ambiguousApprovals };
+  return { downgradedVariants, revokedApprovals, decisionAt };
 }
 
 /**
@@ -243,14 +237,12 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
       confirmed[0].done_at = null;
     }
   }
-  // 승인 철회(독립 계산), 모호한 것은 둘 중 하나
+  const at = bundleTime(derived.decisionAt);
+  // 승인 철회(독립 계산, 판정 시각으로 확정)
   for (const a of out.approvals?.values() ?? []) {
     if (derived.revokedApprovals.has(String(a.id))) {
-      a.revoked_at = RESTORE_TIME;
+      a.revoked_at = at;
       a.revoke_reason = 'restore_stale';
-    } else if (derived.ambiguousApprovals.has(String(a.id))) {
-      a.revoked_at = new OneOf([null, RESTORE_TIME]);
-      a.revoke_reason = new OneOf([null, 'restore_stale']);
     }
   }
   const activeByItem = new Map<string, boolean>();
@@ -263,7 +255,7 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
     );
     if (!still) {
       v.lifecycle = 'review';
-      v.updated_at = new SameOrRestoreTime(v.updated_at);
+      v.updated_at = at;
     }
   }
   // 계획
@@ -275,7 +267,7 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
     if (status !== p.status) {
       p.status = status;
       p.revision = Number(p.revision) + 1;
-      p.updated_at = RESTORE_TIME;
+      p.updated_at = at;
     }
   }
   // 전사·원장
@@ -297,7 +289,7 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
   return out;
 }
 
-const isMarker = (v: unknown) => v === RESTORE_TIME || v instanceof SameOrRestoreTime || v instanceof OneOf;
+const isMarker = (v: unknown) => v === RESTORE_TIME || v instanceof SameOrRestoreTime;
 
 /** 원본과 기대값이 다른(복원 규칙이 적용된) 행 수 — 화면 요약용. */
 export function transformedRowCount(src: readonly Row[], expected: Map<string, ExpectedRow>): number {
@@ -318,6 +310,5 @@ export function valueMatches(expected: ExpectedValue, actual: unknown, window: {
   };
   if (expected === RESTORE_TIME) return inWindow(actual);
   if (expected instanceof SameOrRestoreTime) return stableStringify(expected.original) === stableStringify(actual) || inWindow(actual);
-  if (expected instanceof OneOf) return expected.options.some((o) => valueMatches(o, actual, window));
   return stableStringify(expected) === stableStringify(actual);
 }

@@ -58,6 +58,8 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 실행 | POST /api/distribution-plans/{id}/execute | approval+command key 필수, jobs 생성 |
 | 취소 | POST /api/distribution-items/{id}/cancel | 취소 완료와 확인 중을 구분 |
 | 작업 조회 | GET /api/jobs/{id} | 비밀 제거, 실제 상태 반환 |
+| 계정 연결 | POST /api/channel-accounts/{id}/connect, GET /api/oauth/callback | state 1회용·PKCE·redirect 정확 일치, 토큰은 서버 암호화 저장(D24·D25) |
+| 연결 상태·갱신·철회 | GET /api/channel-accounts/{id}/health, POST …/refresh·/check·/revoke | 비밀 제거, 다른 owner 404, 철회 시 해당 계정 승인 무효 |
 | 원격 재확인 | POST /api/distribution-items/{id}/reconcile | 기존 결과 조회만 수행 |
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |

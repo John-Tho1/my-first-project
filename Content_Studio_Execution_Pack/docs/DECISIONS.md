@@ -343,3 +343,10 @@
   - 기본값 그대로: `PUBLISH_MODE=disabled`, 실제 외부 호출 0. live OAuth 는 환경 조건(앱 ID·비밀·redirect URI·승인 기록)이 모두 갖춰지고 사용자가 정확한 범위를 승인하기 전까지 `blocked_external`.
 - 실계정 연결 전 사용자에게 받을 것: Meta 앱 등록 여부와 앱 ID 보관 방식, 테스트용 Threads 계정, redirect URI(로컬/운영), 마스터 키를 둘 위치 확인, 첫 실계정 시험의 정확한 원고·공개 범위.
 - Reversible?: 예.
+
+## D25 — T13 구현 중 잠정 판단 5건 확정 (사용자, 2026-10-02, 권고안 채택)
+1. 연결 철회(revoke) → 그 계정의 활성 승인 무효화(`account_changed`), 다시 연결할 때까지 실행 차단. 토큰 갱신·같은 계정 재연결은 승인 유지(다른 계정 정체성으로 돌아온 콜백은 409 `oauth_account_mismatch`). **유지.**
+2. 요청 scope 중 일부만 허용 → 자격 증명은 저장하되 `needs_reconnect`, 실행 차단. **유지.**
+3. 모의 동의 화면의 테스트용 매개변수(`mock_user`·`mock_grant`·`mock_deny`) → **운영(`NODE_ENV=production`)에서는 거부**하도록 바꾼다(T13 FIX 라운드). 개발·테스트에서만 허용.
+4. API 경로는 기존 `/api/channel-accounts/{id}/…` 유지. docs/04 API 표를 코드에 맞춰 갱신.
+5. 키 교체는 실행 명령을 추가한다(T13 FIX 라운드): 기본은 미리보기(몇 건을 재암호화할지 숫자만), `--confirm` 일 때만 적용. 파일 DB 를 열므로 dev 서버가 꺼져 있어야 한다. 키 값은 출력하지 않는다.

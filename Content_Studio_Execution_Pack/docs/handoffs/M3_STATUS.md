@@ -36,3 +36,20 @@ D20: M4/T13(OAuth·비밀 암호화)은 사용자가 첫 채널(Threads 권고)�
 사용자 체크리스트 12항목은 구현 담당(Claude)이 내장 브라우저로 직접 확인(Codex 는 소스 정적 대조 보조). 결함 11건(P1 1·P2 6·P3 4) → 커밋 3개(d2b1db8, 7548f12, cf13ae5)로 전부 수정, Codex 최종 PASS.
 핵심: 폼 편집 CRLF 정규화·본문 우선 파생(D21), 재확인 결과 4종 표시, 배너는 저장 상태·이벤트에서 파생, 홈 최근 배포, dev Turbopack 파일 캐시 끔(재시작 404 재발 방지), worker @cs/providers 선언, 수동 재확인 stale 검사, UI tick 10s 상한.
 기록: docs/handoffs/screen-notes-m3.md, T12_IMPLEMENTATION_HANDOFF.md(FIX 라운드), docs/DECISIONS.md D21.
+
+## T20 운영·복원 훈련·보존 — 모의·로컬 부분 (2026-10-01~02, 로컬, M4 보류 중 선행) — Codex 최종 PASS (FIX6-T20)
+커밋 41ff399(구현) → 0c0d969(FIX round 1, review-T20) → cef5eaf(FIX2, 보존 정리 놓친 케이스) → 9458dff(FIX3, review-FIX-T20 + review-FIX2-T20 반영) → 19986fc(FIX4, review-FIX3-T20 반영) → 82cde4a(FIX5, review-FIX4-T20 반영) → 6e99eef(FIX6, review-FIX5-T20 반영). 외부 알림·외부 저장소·실계정 없음(D22).
+- `/ops`(owner 전용): 작업 상태 수, 확인 필요 계획·작업(실제 합계 + 50건 표시 상한 명시), 반복 실패, 대기 중 삭제, 용량(complete/partial/unavailable, 경로 미노출), 비용, 백업 나이, 마지막 복원 훈련, 모드. 원천 없으면 "측정 없음".
+- 복원 훈련 `pnpm drill:restore` / `POST /api/ops/restore-drill`: 임시 export → 비밀 없음 확인(ZIP 엔트리 해제 후 검사) → 메모리 PGlite + 빈 임시 저장소에 empty_only 복원 → **전 컬럼 비교**(restore-expect.ts 가 복원 규칙을 독립 재계산, 부정 테스트 7건) → `restore_drills` 기록(0024, 예외도 fail+error_code 0025). 실제 로컬 DB 1회 PASS(표 29·행 89·파일 2).
+- 보존 정리: 대상은 job_events(끝난 작업, JSONL 내보낸 뒤 삭제, 트리거 `job_events_guard`)·배포 ZIP·내보내기 ZIP 만. **내보내기 보존은 사용 가능한 백업 파일 기준, 최신 사용 가능 ZIP 1개는 항상 보존**. 기본 수동(미리보기 → confirm=yes), `RETENTION_SWEEP_MODE=auto` 는 설정으로만.
+- 검사(6e99eef): lint·typecheck·build 통과, unit 33 files/589, integration 25 files/412, drill:mock 위반 0. migration 0024·0025·0026 로컬 적용.
+- 실제 로컬 DB `drill:restore`(9458dff~6e99eef 매 라운드, 전 컬럼 비교): **PASS** — 표 29·행 89·파일 2·검색 found, 복원 규칙 적용 행 items 2·approvals 3·jobs 8, 빈 표 10개 표시(부분 검증 범위 명시).
+- FIX3 요지: 보존은 **검증된 백업**(크기 + 전 엔트리 해제·checksum + manifest sha256 = export_runs 저장값)만 keep 으로 셈, 검증된 백업이 keep 미만이면 아무것도 삭제 안 함; ZIP absent/damaged/unreadable 구분(폴더 정리는 absent 만); 3단계 sweep(계획 감사 커밋 → 파일 삭제 → 결과 감사). 훈련은 철회·강등 기대값을 묶음에서 독립 재계산, 복원 호출 구간으로 시각 검사 축소, scope_json 으로 "PASS(부분 검증)" 표시. FIX4: 삭제 직전 남길 ZIP 캐시 없이 실제 바이트 재검증(실패 시 아무것도 삭제 안 함), 복원 판정 시각 주입으로 철회 결정론화, sweep_id 로 계획·결과 연결 + 미완료 sweep 전부 표시, 전부 ENOENT 도 결과 감사.
+- Codex: T20 P0 1·P1 2·P2 2 → FIX1 → FIX-T20 P0 1·P1 1·P2 2 → FIX2(보존 놓친 케이스) P1 1·P2 1 → FIX3 → FIX3-T20 P0 1·P1 2·P2 1 → FIX4 → FIX4-T20 P1 2 → FIX5 → FIX5-T20 P2 1 → FIX6(6e99eef) → **FIX6-T20 PASS**. 라운드별 상세 `T20_IMPLEMENTATION_HANDOFF.md`, 판정 `M3_CODEX_VERDICTS.md`.
+
+### 사용자 결정 대기 (D22)
+(a) 기준값 24h·180d·30d·keep 10 확인, (b) 보존 정리 기본 manual 유지 여부, (b2) FIX3 규칙: 손상·접근 불가 ZIP 과 그 폴더는 무기한 보존(자동 삭제 안 함) — 유지할지, (c) 백업을 이 PC 밖으로 옮길지(Codex Q5: 백업 나이는 사용 가능한 파일·확인된 외부 사본 기준이어야 함), (d) 외부 알림 사용 여부, (e) Codex Q6: 공개 `/api/health` 의 `ops` 숫자(사용량·운영 상태 노출)를 세션 뒤로 옮길지.
+### 남은 위험
+- 보존 정리의 동시 실행·JSONL 줄 수는 같지만 내용 손상·삭제 도중 부분 실패는 테스트 밖(Codex 놓친 케이스).
+- 훈련 PASS 는 "지금 DB 를 빈 환경에 복원하면 같아진다"는 뜻. 보관 중인 과거 ZIP 의 온전함은 별도 훈련이 필요(Q5).
+- 운영(PostgreSQL) 환경 훈련 통과는 M7/운영 전 별도.

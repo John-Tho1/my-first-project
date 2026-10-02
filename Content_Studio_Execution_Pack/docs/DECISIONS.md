@@ -311,3 +311,10 @@
 - User decision required?: 예 — (a) 기준값(24시간·180일·30일·10개) 확인, (b) 보존 정리 기본 manual 유지 여부(auto 로 바꾸면 오래된 내보내기 ZIP 도 자동으로 지워짐), (c) 백업을 이 PC 밖(외부 디스크·클라우드)으로 옮길지 — 지금은 로컬 ZIP 만이며 외부 저장소는 연결하지 않았다, (d) 외부 알림(M5 선택 기능)을 쓸지.
 - Consequences: "백업으로 안전" 같은 문구는 없다 — 복원 훈련 PASS 와 백업 나이라는 사실만 보여 준다. 훈련 PASS 는 "지금 DB 를 내보내 빈 환경에 넣으면 같아진다"는 뜻이지 과거 ZIP 이 온전하다는 뜻은 아니다. job_events 를 지운 작업은 화면 이력이 비고, JSONL 보관 파일이 근거가 된다(보관 파일 자체의 보존 기간은 미정).
 - When to revisit: PostgreSQL 전환(트리거·set_config 호환, 훈련 대상 DB), 외부 백업 저장소 도입, M5 외부 알림, 실계정(M4) 연결 시 기준값.
+
+### D22 후속 (2026-10-02, Codex T20 FIX 라운드 1~6 반영, HEAD 6e99eef)
+- 보존 정리의 "백업" 정의가 바뀜: export_runs 행이 아니라 **검증된 ZIP 파일**(크기 = zip_bytes, 전 엔트리 해제·checksum, manifest sha256 = 생성 시 저장값)만 keep 으로 센다. 검증된 백업이 keep 미만이면 아무것도 지우지 않는다. 남길 ZIP 과 삭제 후보 ZIP 모두 삭제 직전 캐시 없이 실제 바이트로 재검증한다.
+- 손상·접근 불가 ZIP 과 그 폴더는 **무기한 보존**(자동 삭제 없음, /ops 에 candidates_damaged_kept 로 표시). 폴더만 남은 실행은 ZIP 부재(ENOENT)가 확인된 경우에만 정리한다. → 사용자 결정 (b2): 이 규칙 유지 여부.
+- sweep 은 3단계(계획 감사 커밋 → 파일 삭제 → 결과 감사, sweep_id 로 연결). 결과 없는 실행·일부만 처리된 실행은 뒤에 성공이 있어도 /ops 에 계속 표시된다. 프로세스 간 배타는 없음(단일 worker 전제, PostgreSQL 다중 worker 전 영속 sweep 상태 필요 — Codex 권고, 미구현).
+- 복원 훈련은 변환 열을 제외하지 않고 **전 컬럼** 을 비교한다. 기대값은 restore-expect.ts 가 묶음 행에서 독립 재계산하며(복원 코드 호출 없음), 복원 판정 시각은 commitRestore 의 now 로 주입한다. 검증 범위(빈 표·파일 0·검색 skipped·jobs/approvals 없음)는 restore_drills.scope_json(0026)에 저장되고 "PASS(부분 검증: …)" 로 표시된다. 예외도 fail 행 + error_code(0025).
+- Codex 권고 중 **미반영(사용자 결정)**: Q5 백업 나이는 완료 기록이 아니라 검증 가능한 파일·확인된 외부 사본 기준이어야 하고 보관 중인 과거 ZIP 의 복원 훈련은 별도 지표여야 함(현재는 마지막 완료 export 기준 그대로) → (c) 와 함께 결정. Q6 공개 `/api/health` 의 `ops` 숫자를 세션 뒤로 옮길지 → (e).

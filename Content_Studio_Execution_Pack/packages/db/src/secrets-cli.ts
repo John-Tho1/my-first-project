@@ -57,7 +57,7 @@ export async function runSecretsRotateCli(deps: SecretsRotateCliDeps): Promise<n
     return 1;
   }
   let handle: DbHandle | null = null;
-  let code = 0;
+  let code: number;
   try {
     handle = await deps.openDb(loadConfig(deps.env));
     const r = await rotateSecretKeys(handle.db, ring.keyring, { dryRun: !confirm });
@@ -65,11 +65,8 @@ export async function runSecretsRotateCli(deps: SecretsRotateCliDeps): Promise<n
     deps.out(formatRotationReport(r));
     code = [r.credentials, r.states, r.pendingTokens].some((c) => Object.keys(c.failed).length > 0) ? 1 : 0;
   } catch (e) {
-    if (e instanceof DbLockedError) {
-      deps.err(e.message);
-      return 1;
-    }
-    deps.err(`키 교체를 마치지 못했습니다(오류 종류: ${describeErrorSafely(e)}). 적용된 행은 다시 실행하면 "현재 키"로 셉니다.`);
+    if (e instanceof DbLockedError) deps.err(e.message);
+    else deps.err(`키 교체를 마치지 못했습니다(오류 종류: ${describeErrorSafely(e)}). 적용된 행은 다시 실행하면 "현재 키"로 셉니다.`);
     code = 1;
   }
   // FIX3-T13(Codex P2): DB 닫기 실패도 종료 코드에 반영한다(같은 안전 출력).

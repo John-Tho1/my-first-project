@@ -255,6 +255,9 @@ export interface AuditInput {
     | 'oauth.refresh_failed'
     | 'oauth.refresh_discarded'
     | 'oauth.pending_reconciled'
+    | 'oauth.pending_record_failed'
+    | 'oauth.cleanup_revoke_failed'
+    | 'oauth.cleanup_revoke_unknown'
     | 'oauth.checked'
     | 'oauth.revoked'
     | 'oauth.key_rotated';

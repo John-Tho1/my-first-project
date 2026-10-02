@@ -1136,3 +1136,403 @@ describe('FIX2 Q7 — 실패 경로의 콘솔 출력에도 비밀 없음', () =>
   });
 });
 
+// ---------------- FIX round 3 (Codex review-FIX2-T13) ----------------
+
+/** 모의 공급자에서 이 사용자(external id)에게 아직 유효한 토큰 수 */
+const liveTokensOfUser = (user: string) => [...mockOAuthStore().tokens.values()].filter((t) => t.user === user && !t.revoked).length;
+const pendingOf = async (accountId: string) => {
+  const c = await credRow(accountId);
+  return c ? { opId: c.pendingOpId, kind: c.pendingKind, token: c.pendingToken, keyVersion: c.pendingKeyVersion } : null;
+};
+const jobOfItem = async (itemId: string) => (await db.select().from(schema.jobs).where(eq(schema.jobs.itemId, itemId)))[0]!;
+const intentsOfJob = (jobId: string) => db.select().from(schema.sendIntents).where(eq(schema.sendIntents.jobId, jobId));
+const retry = (itemId: string) => retryPOST(jsonPost(`/api/distribution-items/${itemId}/retry`, {}, cookieHeader(tokenA)), ctx(itemId));
+/** 갱신이 공급자에서 받은 새 토큰(T2)을 엿본다(시험만 — 비밀 검사·판정용) */
+function spyIssuedRefreshTokens(): string[] {
+  const issued: string[] = [];
+  const orig = MockThreadsOAuthProvider.prototype.refresh;
+  vi.spyOn(MockThreadsOAuthProvider.prototype, 'refresh').mockImplementation(async function (this: MockThreadsOAuthProvider, input) {
+    const t = await orig.call(this, input);
+    issued.push(t.accessToken);
+    return t;
+  });
+  return issued;
+}
+
+/**
+ * 실행 경로 전체가 막혔는지: health 사용 불가 · 새 계획 실행 409(작업 0) · 이미 대기 중인 작업은 tick 에서 BLOCKED(전송 의도 0) · 재시도 409.
+ * queued = 실패 전에 실행해 둔 계획의 항목, fresh = 승인만 된 계획.
+ */
+async function expectExecutionBlocked(accountId: string, queued: { itemId: string }, fresh: { planId: string; itemId: string }) {
+  const hv = (await (await health(accountId)).json()).account;
+  expect(hv).toMatchObject({ usable_for_execution: false, status: 'error' });
+  const ex = await execute(fresh.planId);
+  expect(ex.status).toBe(409);
+  expect((await ex.json()).error).toBe('account_credential_blocked');
+  expect(await db.select().from(schema.jobs).where(eq(schema.jobs.itemId, fresh.itemId))).toHaveLength(0);
+  await tick();
+  const job = await jobOfItem(queued.itemId);
+  expect(job.state).toBe('BLOCKED');
+  expect(job.lastErrorCode).toBe('credential_error');
+  expect(await intentsOfJob(job.id)).toHaveLength(0);
+  const rt = await retry(queued.itemId);
+  expect(rt.status).toBe(409);
+  expect((await rt.json()).error).toBe('account_credential_blocked');
+}
+
+/** 연결 + 실행해 둔 계획(작업 QUEUED) + 승인만 된 계획 */
+async function connectedWithPlans(accountId: string) {
+  await connectFully(accountId);
+  const queued = await approvedPlanFor(accountId);
+  expect((await execute(queued.planId)).status).toBe(200);
+  const fresh = await approvedPlanFor(accountId);
+  return { queued, fresh };
+}
+
+describe('FIX3 P1 :690 — 저장 안 됨이 확인된 갱신 실패는 수동 확인 없이 실행 차단', () => {
+  it('봉인 실패 → T2 철회 + 읽은 세대에서 error(refresh_store_failed): health 사용 불가·execute 409·worker BLOCKED·의도 0·재시도 409', async () => {
+    const accountId = await newThreadsAccount();
+    const { queued, fresh } = await connectedWithPlans(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.beforeRefreshSeal = async () => {
+      throw new Error('simulated seal failure');
+    };
+    const r = await refresh(accountId);
+    expect(r.status).toBe(409);
+    expect((await r.json()).reason).toBe('store_failed');
+    const row = (await credRow(accountId))!;
+    expect(row).toMatchObject({ status: 'error', lastErrorCode: 'refresh_store_failed', tokenGeneration: gen, pendingOpId: null });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.refresh_discarded')).at(-1)).toMatchObject({ reason: 'store_failed', issued_token_revoke: 'ok', credential_marked: 'refresh_store_failed' });
+    await expectExecutionBlocked(accountId, queued, fresh);
+    expect((await getAccountHealth(db, ownerA, accountId)).reason).toBe('refresh_store_failed');
+    // 다시 연결하면 풀린다
+    await connectFully(accountId);
+    expect((await execute(fresh.planId)).status).toBe(200);
+  });
+
+  it('저장 트랜잭션 안 실패(되돌림) → 같은 결과: error(refresh_store_failed), 실행 경로 전부 차단', async () => {
+    const accountId = await newThreadsAccount();
+    const { queued, fresh } = await connectedWithPlans(accountId);
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('simulated audit insert failure');
+    };
+    const r = await refresh(accountId);
+    expect((await r.json()).reason).toBe('store_failed');
+    expect(await credRow(accountId)).toMatchObject({ status: 'error', lastErrorCode: 'refresh_store_failed' });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    await expectExecutionBlocked(accountId, queued, fresh);
+  });
+
+  it('저장 실패 직후(표시 전) 다시 연결이 새 세대를 저장 → 새 세대는 그대로 active·사용 가능, T2 만 철회', async () => {
+    const accountId = await newThreadsAccount();
+    const { fresh } = await connectedWithPlans(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('simulated audit insert failure');
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      delete oauthTestHooks.beforeStoredOutcomeRead;
+      delete oauthTestHooks.insideRefreshStore;
+      await connectFully(accountId); // 세대 +1(다시 연결)
+    };
+    const r = await refresh(accountId);
+    expect((await r.json()).reason).toBe('store_failed');
+    const row = (await credRow(accountId))!;
+    expect(row).toMatchObject({ status: 'active', lastErrorCode: null, tokenGeneration: gen + 1, pendingOpId: null });
+    expect(await liveProviderTokens(accountId)).toBe(1); // 다시 연결 토큰만
+    expect((await auditDetails(accountId, 'oauth.refresh_discarded')).at(-1)).toMatchObject({ reason: 'store_failed', issued_token_revoke: 'ok', credential_marked: 'not_marked' });
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(true);
+    expect((await execute(fresh.planId)).status).toBe(200);
+  });
+});
+
+describe('FIX3 Q14 — 저장 결과 불명은 정리 대기(refresh_unknown)로 남기고 차단, 다음 확인이 정리', () => {
+  it('되돌림 + 다시 읽기 실패 → 봉인한 T2 기록·차단(의도 0) → check 가 T2 철회·C 무효 → error(refresh_store_failed); 비밀은 응답·감사·콘솔에 없음', async () => {
+    const logs: string[] = [];
+    for (const m of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+      vi.spyOn(console, m).mockImplementation((...args: unknown[]) => void logs.push(args.map((a) => (typeof a === 'string' ? a : inspect(a, { depth: Infinity, getters: true }))).join(' ')));
+    }
+    const issued = spyIssuedRefreshTokens();
+    seen.length = 0;
+    const accountId = await newThreadsAccount();
+    const { queued, fresh } = await connectedWithPlans(accountId);
+    const t1 = await decryptToken(ownerA, accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error(`simulated rollback ${t1}`);
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      throw new Error('simulated re-read failure');
+    };
+    const r = await refresh(accountId);
+    delete oauthTestHooks.insideRefreshStore;
+    delete oauthTestHooks.beforeStoredOutcomeRead;
+    expect(r.status).toBe(409);
+    expect((await r.json()).reason).toBe('store_outcome_unknown');
+    expect(issued).toHaveLength(1);
+    const t2 = issued[0]!;
+    const p = (await pendingOf(accountId))!;
+    expect(p.kind).toBe('refresh_unknown');
+    expect(p.opId).toBeTruthy();
+    expect(p.token!.startsWith('csk1:')).toBe(true);
+    expect(p.keyVersion).toBe(1);
+    expect(p.token).not.toContain(t2);
+    // 봉인은 T2 이고(AAD purpose oauth_pending_token) 저장된 토큰은 여전히 T1(세대 그대로)
+    expect(JSON.parse(openSecret(requireSecretKeyring(process.env), p.token!, 1, { ownerId: ownerA, channelAccountId: accountId, purpose: 'oauth_pending_token' })).access_token).toBe(t2);
+    expect((await credRow(accountId))!).toMatchObject({ tokenGeneration: gen, status: 'active' });
+    expect(liveTokensOfUser((await accountRow(accountId)).externalAccountId)).toBe(1); // T2 만 살아 있음(저장됐을 수 있어 철회 안 함)
+    expect((await auditDetails(accountId, 'oauth.refresh_failed')).at(-1)).toMatchObject({ error_code: 'store_outcome_unknown', pending_record: 'recorded', pending_kind: 'refresh_unknown' });
+    // 표시가 있는 동안: health error(pending_refresh_unknown), 실행 경로 전부 차단
+    expect((await getAccountHealth(db, ownerA, accountId)).reason).toBe('pending_refresh_unknown');
+    await expectExecutionBlocked(accountId, queued, fresh);
+
+    // 다음 확인이 정리: C(T1) != P(T2) → T2 철회, C 는 공급자가 갱신 때 무효로 함 → error(refresh_store_failed)
+    const ck = await check(accountId);
+    expect(ck.status).toBe(200);
+    expect((await ck.json()).account).toMatchObject({ status: 'error', reason: 'refresh_store_failed', pending_reconcile: null, usable_for_execution: false });
+    expect(await pendingOf(accountId)).toMatchObject({ opId: null, kind: null, token: null, keyVersion: null });
+    expect(liveTokensOfUser((await accountRow(accountId)).externalAccountId)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.pending_reconciled')).at(-1)).toMatchObject({
+      kind: 'refresh_unknown',
+      result: 'resolved',
+      stored_was_pending: false,
+      issued_token_revoke: 'ok',
+      current_token_valid: 'no',
+      status: 'error',
+    });
+    // 비밀 검사: T1·T2·봉인(P)은 응답·감사·콘솔 어디에도 없다
+    const audits = JSON.stringify(await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId, accountId)));
+    vi.restoreAllMocks();
+    for (const [name, v] of Object.entries({ t1, t2, pending: p.token!, pendingOp: p.opId! })) {
+      for (const s of seen) expect(s.text.includes(v), `${name} in ${s.label}`).toBe(false);
+      expect(audits.includes(v), `${name} in audit`).toBe(false);
+      expect(logs.join('\n').includes(v), `${name} in console`).toBe(false);
+    }
+    // 다시 연결하면 풀린다
+    await connectFully(accountId);
+    expect((await execute(fresh.planId)).status).toBe(200);
+  });
+
+  it('커밋됐는데 다시 읽기 실패 → refresh_unknown(세대 +1) → check: 저장된 토큰 == T2 → 철회하지 않고 유지·active, 실행 가능', async () => {
+    const accountId = await newThreadsAccount();
+    const { fresh } = await connectedWithPlans(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.afterRefreshStoreCommit = async () => {
+      throw new Error('simulated lost commit ack');
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      throw new Error('simulated re-read failure');
+    };
+    const r = await refresh(accountId);
+    delete oauthTestHooks.afterRefreshStoreCommit;
+    delete oauthTestHooks.beforeStoredOutcomeRead;
+    expect((await r.json()).reason).toBe('store_outcome_unknown');
+    expect((await credRow(accountId))!.tokenGeneration).toBe(gen + 1);
+    expect((await pendingOf(accountId))!.kind).toBe('refresh_unknown');
+    expect((await execute(fresh.planId)).status).toBe(409);
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'connected', usable_for_execution: true, pending_reconcile: null });
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    expect((await auditDetails(accountId, 'oauth.pending_reconciled')).at(-1)).toMatchObject({ stored_was_pending: true, issued_token_revoke: 'not_needed', current_token_valid: 'yes', status: 'active' });
+    expect((await execute(fresh.planId)).status).toBe(200);
+  });
+
+  it('표시 뒤 다시 연결(새 토큰 C 유효) → check: C != P → P 철회, C 유지 active(새 세대 그대로)', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('rollback');
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      throw new Error('re-read failure');
+    };
+    await refresh(accountId);
+    delete oauthTestHooks.insideRefreshStore;
+    delete oauthTestHooks.beforeStoredOutcomeRead;
+    expect((await pendingOf(accountId))!.kind).toBe('refresh_unknown');
+    await connectFully(accountId); // 다시 연결은 표시를 지우지 않는다(정리 전까지 차단)
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    expect((await pendingOf(accountId))!.kind).toBe('refresh_unknown');
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(false);
+    expect(await liveProviderTokens(accountId)).toBe(2); // 다시 연결 토큰 + P
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'connected', usable_for_execution: true });
+    expect((await credRow(accountId))!).toMatchObject({ tokenGeneration: gen, pendingOpId: null });
+    expect(await liveProviderTokens(accountId)).toBe(1);
+  });
+
+  it('정리 대기 기록 자체가 실패 → 감사 pending_record_failed, 가능하면 error(refresh_pending_record_failed)로 차단', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('rollback');
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      throw new Error('re-read failure');
+    };
+    oauthTestHooks.insidePendingRecord = async () => {
+      throw new Error('pending write failure');
+    };
+    const r = await refresh(accountId);
+    expect((await r.json()).reason).toBe('store_outcome_unknown');
+    expect(await credRow(accountId)).toMatchObject({ status: 'error', lastErrorCode: 'refresh_pending_record_failed', pendingOpId: null });
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(false);
+    expect((await auditDetails(accountId, 'oauth.pending_record_failed')).at(-1)).toMatchObject({ context: 'refresh', error_code: 'refresh_pending_record_failed', result: 'write_failed' });
+  });
+
+  it('키 교체가 pending_token 도 다시 봉인(미리보기는 변경 없음), 새 키만으로 정리 가능; 내보내기 묶음에 연결 정보·봉인·T2 없음', async () => {
+    const issued = spyIssuedRefreshTokens();
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('rollback');
+    };
+    oauthTestHooks.beforeStoredOutcomeRead = async () => {
+      throw new Error('re-read failure');
+    };
+    await refresh(accountId);
+    delete oauthTestHooks.insideRefreshStore;
+    delete oauthTestHooks.beforeStoredOutcomeRead;
+    vi.restoreAllMocks();
+    const t2 = issued[0]!;
+    const before = (await pendingOf(accountId))!;
+    expect(before.keyVersion).toBe(1);
+
+    // 내보내기: oauth_credentials(새 열 포함)는 묶음 밖
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'exp-fix3') });
+    const zipText = Buffer.from(readFileSync(exported.zipPath)).toString('latin1');
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const bundleText = JSON.stringify(parsed.tables) + JSON.stringify(parsed.manifest);
+    expect(parsed.manifest.excluded_tables).toContain('oauth_credentials');
+    expect(Object.keys(parsed.tables)).not.toContain('oauth_credentials');
+    for (const [name, v] of Object.entries({ t2, pending: before.token!, op: before.opId! })) {
+      expect(bundleText.includes(v), `${name} in bundle`).toBe(false);
+      expect(zipText.includes(v), `${name} in zip`).toBe(false);
+    }
+    // 연결 정보 행의 비밀·식별 열(JSON 키)도 없다(감사 세부의 pending_token_revoke·pending_kind 같은 결과 코드와 구분해 정확한 키로 검사)
+    for (const col of ['pending_token', 'pending_op_id', 'pending_key_version', 'encrypted_token']) expect(bundleText.includes(`"${col}":`), col).toBe(false);
+
+    useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
+    const dry = await rotateSecretKeys(db, requireSecretKeyring(process.env), { dryRun: true });
+    expect(dry.pendingTokens.toReseal).toBeGreaterThanOrEqual(1);
+    expect(dry.pendingTokens.resealed).toBe(0);
+    expect(await pendingOf(accountId)).toEqual(before);
+    const applied = await rotateSecretKeys(db, requireSecretKeyring(process.env));
+    expect(applied.pendingTokens.resealed).toBeGreaterThanOrEqual(1);
+    const report = formatRotationReport(applied);
+    expect(report).toContain('정리 대기 봉인');
+    for (const v of [t2, before.token!, KEY1, KEY2]) expect(report.includes(v)).toBe(false);
+    const after = (await pendingOf(accountId))!;
+    expect(after).toMatchObject({ opId: before.opId, kind: 'refresh_unknown', keyVersion: 2 });
+    expect(after.token).not.toBe(before.token);
+    // 이전 키를 빼도(새 키만) 정리 가능 — 봉인이 새 키로 바뀌었으므로
+    useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2' });
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'error', reason: 'refresh_store_failed', pending_reconcile: null });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});
+
+describe('FIX3 놓친 케이스 — 정리 철회 실패·결과 불명은 cleanup_revoke 로 남기고 차단', () => {
+  it('저장 실패 + T2 철회 실패(failed) → 감사 cleanup_revoke_failed, 표시·차단 → check 가 다시 철회해 표시 지움(error 는 유지)', async () => {
+    const accountId = await newThreadsAccount();
+    const { queued, fresh } = await connectedWithPlans(accountId);
+    oauthTestHooks.beforeRefreshSeal = async () => {
+      throw new Error('simulated seal failure');
+    };
+    mockOAuthStore().failNext = { op: 'revoke', code: 'invalid_grant' };
+    const r = await refresh(accountId);
+    expect((await r.json()).reason).toBe('store_failed');
+    expect(await credRow(accountId)).toMatchObject({ status: 'error', lastErrorCode: 'refresh_store_failed', pendingKind: 'cleanup_revoke' });
+    expect(await liveProviderTokens(accountId)).toBe(1); // T2 가 아직 살아 있다
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_failed')).at(-1)).toMatchObject({ context: 'refresh_store_failed', issued_token_revoke: 'failed', pending_record: 'recorded' });
+    expect((await getAccountHealth(db, ownerA, accountId)).reason).toBe('pending_cleanup_revoke');
+    await expectExecutionBlocked(accountId, queued, fresh);
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'error', reason: 'refresh_store_failed', pending_reconcile: null, usable_for_execution: false });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.pending_reconciled')).at(-1)).toMatchObject({ kind: 'cleanup_revoke', result: 'resolved', issued_token_revoke: 'ok' });
+  });
+
+  it('철회 결과 불명(provider_error) → cleanup_revoke_unknown; 다음 정리도 불명이면 그대로(차단), worker 정리(refreshExpiringCredentials)가 끝냄', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('rollback');
+    };
+    mockOAuthStore().failNext = { op: 'revoke', code: 'provider_error' };
+    await refresh(accountId);
+    delete oauthTestHooks.insideRefreshStore;
+    expect((await pendingOf(accountId))!.kind).toBe('cleanup_revoke');
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_unknown')).at(-1)).toMatchObject({ context: 'refresh_store_failed', issued_token_revoke: 'unknown' });
+    // 다음 확인: 다시 불명 → 표시 유지, 차단 유지
+    mockOAuthStore().failNext = { op: 'revoke', code: 'provider_error' };
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ pending_reconcile: 'cleanup_revoke', usable_for_execution: false });
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_unknown')).at(-1)).toMatchObject({ context: 'reconcile_cleanup_revoke', pending_record: 'kept' });
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    // 갱신은 정리 대기가 남아 있으면 하지 않는다
+    mockOAuthStore().failNext = { op: 'revoke', code: 'provider_error' };
+    const rf = await refresh(accountId);
+    expect(rf.status).toBe(409);
+    expect((await rf.json()).reason).toBe('pending_reconcile');
+    // worker tick 경로가 정리
+    const w = await refreshExpiringCredentials(db, { providerFor: oauthDeps(config).providerFor, keyring: oauthDeps(config).keyring, ownerId: ownerA });
+    expect(w.pendingResolved).toBeGreaterThanOrEqual(1);
+    expect(await pendingOf(accountId)).toMatchObject({ opId: null, kind: null });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('첫 연결 callback 거부(다른 계정) + 철회 실패 → 자리 표시 행에 정리 대기, 모의 계정도 차단 → check 가 철회하고 자리 표시를 지움(원래대로 not_connected)', async () => {
+    const accountId = await newThreadsAccount();
+    const plan = await approvedPlanFor(accountId);
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(true);
+    const other = `mock:threads:other-${randomUUID()}`;
+    const b = await begin(accountId, { mock_user: other });
+    mockOAuthStore().failNext = { op: 'revoke', code: 'invalid_grant' };
+    const r = await callback(b.location!);
+    expect(r.status).toBe(409);
+    expect(liveTokensOfUser(other)).toBe(1);
+    const row = (await credRow(accountId))!;
+    expect(row).toMatchObject({ status: 'revoked', encryptedToken: null, revocationEpoch: 0, pendingKind: 'cleanup_revoke' });
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_failed')).at(-1)).toMatchObject({ context: 'callback_account_mismatch', pending_record: 'recorded' });
+    expect((await auditDetails(accountId, 'oauth.callback_rejected')).some((d) => d.reason === 'account_mismatch' && d.issued_token_revoke === 'failed' && d.pending_record === 'recorded')).toBe(true);
+    expect(await getAccountHealth(db, ownerA, accountId)).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable_for_execution: false });
+    expect((await execute(plan.planId)).status).toBe(409);
+    const ck = await check(accountId);
+    expect(ck.status).toBe(200);
+    expect((await ck.json()).account).toMatchObject({ status: 'not_connected', usable_for_execution: true });
+    expect(await credRow(accountId)).toBeNull();
+    expect(liveTokensOfUser(other)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.pending_reconciled')).at(-1)).toMatchObject({ kind: 'cleanup_revoke', placeholder_removed: true });
+    expect((await execute(plan.planId)).status).toBe(200);
+  });
+
+  it('연결 해제가 정리 대기 T2 철회에 실패 → 해제는 끝나되 표시는 cleanup_revoke 로 남아 차단, 감사 → check 가 다시 철회(해제 상태 그대로)', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.beforeRefreshSeal = async () => {
+      throw new Error('seal failure');
+    };
+    mockOAuthStore().failNext = { op: 'revoke', code: 'invalid_grant' };
+    await refresh(accountId);
+    delete oauthTestHooks.beforeRefreshSeal;
+    expect((await pendingOf(accountId))!.kind).toBe('cleanup_revoke');
+    mockOAuthStore().failNext = { op: 'revoke', code: 'invalid_grant' }; // 해제의 정리 대기 철회(먼저 실행)가 실패
+    const rv = await revoke(accountId);
+    expect(rv.status).toBe(200);
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked' });
+    const row = (await credRow(accountId))!;
+    expect(row).toMatchObject({ status: 'revoked', encryptedToken: null, pendingKind: 'cleanup_revoke' });
+    expect(row.revocationEpoch).toBe(1);
+    expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ pending_token_revoke: 'failed' });
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_failed')).at(-1)).toMatchObject({ context: 'revoke_pending', pending_record: 'kept' });
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(false);
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'revoked', pending_reconcile: null });
+    expect(await credRow(accountId)).not.toBeNull(); // 실제 해제 행은 지우지 않는다(해제 세대 보존)
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});

@@ -75,6 +75,13 @@ describe('credentialHealth', () => {
     expect(h(mockLinked, { ...base, status: 'error', lastErrorCode: 'token_revoked' } as unknown as typeof base)).toMatchObject({ status: 'error', reason: 'token_revoked', usable: false });
     expect(h(mockLinked, { ...base, scopes: ['threads_basic'] })).toMatchObject({ status: 'needs_reconnect', reason: 'scope_missing', missingScopes: ['threads_content_publish'], usable: false });
   });
+  it('FIX3: 정리 대기 표시가 있으면 active·유효 기간이어도 error(pending_<kind>)·실행 불가, 해제된 행·연결한 적 없는 모의 계정도 마찬가지', () => {
+    const withPending = (kind: string) => ({ ...base, pendingKind: kind }) as unknown as typeof base;
+    expect(h(mockLinked, withPending('refresh_unknown'))).toMatchObject({ status: 'error', reason: 'pending_refresh_unknown', usable: false });
+    expect(h(mockLinked, withPending('cleanup_revoke'))).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
+    expect(h(mockNone, { ...withPending('cleanup_revoke'), status: 'revoked', revokedAt: NOW } as unknown as typeof base)).toMatchObject({ status: 'error', usable: false });
+    expect(h(mockLinked, { ...base, pendingKind: null } as unknown as typeof base)).toMatchObject({ status: 'connected', usable: true });
+  });
 });
 
 describe('live 준비 상태 — T13 에는 live 어댑터가 없어 항상 준비 안 됨', () => {

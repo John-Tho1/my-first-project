@@ -1444,8 +1444,9 @@ export const oauthCredentials = pgTable(
     /**
      * FIX3-T13(Codex review-FIX2-T13 Q14·놓친 케이스): 정리 대기 표시. 갱신으로 받은 새 토큰(T2)의 처리가 끝나지 않았을 때 남긴다 —
      * refresh_unknown = 저장됐는지 판정하지 못함, cleanup_revoke = 저장하지 않은 T2 를 공급자에서 철회하지 못함.
-     * pending_token 은 T2 봉인(AAD purpose 'oauth_pending_token', 평문 없음). 표시가 있는 동안 status='error'(실행 차단)이고,
-     * 다음 확인·갱신·worker tick 이 공급자에 물어 정리한 뒤 지운다(reconcilePendingCredential).
+     * 첫 연결 정리 실패면 해제 상태의 자리 표시 행(revoked·해제 세대 0)에 남긴다.
+     * pending_token 은 T2 봉인(AAD purpose 'oauth_pending_token', 평문 없음). 표시가 있는 동안 연결 상태는 error(pending_<kind>)로 실행 차단
+     * (credentialHealth), 다음 확인·갱신·worker tick 이 공급자에 물어 정리한 뒤 지운다(reconcilePendingCredential). 키 교체가 다시 봉인한다.
      */
     pendingOpId: uuid('pending_op_id'),
     pendingKind: text('pending_kind'),

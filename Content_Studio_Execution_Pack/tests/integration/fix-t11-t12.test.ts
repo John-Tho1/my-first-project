@@ -172,14 +172,34 @@ describe('T11 P0 — 진행 중 전송은 not_found 가 아니다, lease 를 잃
 
 describe('T11 P1 — 처리할 작업만 lease, 시작 전 만료는 시도가 아님', () => {
   it('느린 첫 작업을 처리하는 동안 뒤 작업은 lease 되지 않고(QUEUED), 모두 시도 1·의도 1로 확인된다', async () => {
+    // FIX3-T13(Codex Q16): 벽시계(leaseTtlMs 100 vs 모의 지연 150)에 기대던 것을 제어 시계 + 명시적 장벽으로 바꿨다.
+    // - 시계: tick 의 clock 은 이 시험이 정하는 가상 시각 vt — lease 발급·만료 판정(beginSend·heartbeat·만료 복구)이 모두 이 값만 본다.
+    //   그래서 부하로 DB 호출이 늦어져도 lease 가 저절로 만료되지 않는다(이전 플레이크의 원인).
+    // - 장벽: 모의 submit 이 결과를 돌려주기 직전 onSubmit 을 await 한다. 그 안에서 (1) 지금 LEASED 인 작업 수를 세고
+    //   (2) 가상 시각을 lease 길이보다 길게(150 > 100) 앞당긴다 = "느린 작업". 다음 작업은 그 뒤에야 lease·전송된다.
+    // 원래 버그(한 번에 여러 개 lease)라면: 첫 작업 처리 중 나머지 2개가 LEASED 로 보이고([2, …]), vt 가 앞당겨진 뒤 그 lease 들은
+    // 이미 만료라 beginSend 가 lease_lost → 결과가 {CONFIRMED: 3} 이 아니다. 두 assertion 모두 실패한다(인계 문서에 재현 기록).
     const o = await newOwner();
     const xs = [await executed(o), await executed(o), await executed(o)];
-    for (const x of xs) await setMockScenario(db, o.id, x.itemId, { scenario: 'success', delay_ms: 150 });
+    for (const x of xs) await setMockScenario(db, o.id, x.itemId, { scenario: 'success', delay_ms: 0 });
+    let vt = Date.now() + 1000; // 작업의 next_run_at(실제 시각) 이후
+    const LEASE_TTL_MS = 100;
+    const SLOW_MS = 150;
     const leasedDuringFirst: number[] = [];
     adapter.onSubmit = async () => {
       leasedDuringFirst.push((await db.select().from(schema.jobs).where(and(eq(schema.jobs.ownerId, o.id), eq(schema.jobs.state, 'LEASED')))).length);
+      vt += SLOW_MS; // 이 작업이 lease 길이보다 오래 걸렸다(가상 시각)
     };
-    const r = await tick(o, 0, { leaseTtlMs: 100 });
+    const r = await runJobsTick(db, registry, {
+      workerId: 'fixt11-w',
+      config,
+      ownerId: o.id,
+      clock: () => new Date(vt),
+      random: () => 0.5,
+      submitTimeoutMs: 30_000, // 실제 시간 초과는 이 시험의 관심사가 아니다(부하에도 걸리지 않게)
+      leaseTtlMs: LEASE_TTL_MS,
+      maxJobs: 10,
+    });
     expect(r.results).toEqual({ CONFIRMED: 3 });
     expect(leasedDuringFirst).toEqual([0, 0, 0]); // 수정 전: 첫 전송 중에 나머지 2개가 LEASED(만료된 lease)
     for (const x of xs) {

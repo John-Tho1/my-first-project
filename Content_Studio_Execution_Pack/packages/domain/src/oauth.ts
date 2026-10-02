@@ -248,6 +248,8 @@ export interface CredentialHealthInput {
     scopes: readonly string[];
     revokedAt: Date | null;
     lastErrorCode: string | null;
+    /** FIX3-T13: 정리 대기 표시(refresh_unknown·cleanup_revoke). 있으면 상태와 관계없이 실행 불가 */
+    pendingKind?: string | null;
   } | null;
   requiredScopes: readonly string[];
   now: Date;
@@ -264,7 +266,8 @@ export interface CredentialHealth {
 }
 
 /**
- * 연결 상태 판정(순수 함수). 우선순위: 연결 정보 없음 → 철회 → 오류 → scope 부족 → 만료 → 곧 만료 → 연결됨.
+ * 연결 상태 판정(순수 함수). 우선순위: 연결 정보 없음 → 정리 대기 → 철회 → 오류 → scope 부족 → 만료 → 곧 만료 → 연결됨.
+ * - FIX3-T13: 정리 대기 표시(발급받은 토큰의 저장 여부 불명·정리 철회 실패)가 있으면 error(reason pending_<kind>) — 정리될 때까지 실행 차단.
  * - 연결 정보가 없을 때: live 계정·복원으로 "다시 연결 필요"가 된 계정은 needs_reconnect, 연결한 적 없는 모의 계정은 not_connected
  *   (M3 모의 동작 그대로 — 실행 가능, 결과는 항상 MOCK).
  * - 철회(revoked)·만료·오류·scope 부족은 실행 불가.
@@ -285,6 +288,7 @@ export function credentialHealth(input: CredentialHealthInput): CredentialHealth
     if (account.credentialState === 'linked') return out('needs_reconnect', 'no_credential');
     return out('not_connected');
   }
+  if (credential.pendingKind) return out('error', `pending_${credential.pendingKind}`);
   if (credential.revokedAt || credential.status === 'revoked') return out('revoked');
   // FIX-T13: 연결 해제 진행 중(공급자 철회 대기·불완전) — 실행 차단
   if (credential.status === 'revoking') return out('revoked', 'revoking');

@@ -1441,6 +1441,16 @@ export const oauthCredentials = pgTable(
     revocationEpoch: integer('revocation_epoch').notNull().default(0),
     /** FIX2-T13: 진행 중이거나 마지막으로 끝난 연결 해제 작업 ID. 다시 연결하면 null — 해제 요청이 자기 작업이 아직 현재인지 판정한다. */
     revokeOpId: uuid('revoke_op_id'),
+    /**
+     * FIX3-T13(Codex review-FIX2-T13 Q14·놓친 케이스): 정리 대기 표시. 갱신으로 받은 새 토큰(T2)의 처리가 끝나지 않았을 때 남긴다 —
+     * refresh_unknown = 저장됐는지 판정하지 못함, cleanup_revoke = 저장하지 않은 T2 를 공급자에서 철회하지 못함.
+     * pending_token 은 T2 봉인(AAD purpose 'oauth_pending_token', 평문 없음). 표시가 있는 동안 status='error'(실행 차단)이고,
+     * 다음 확인·갱신·worker tick 이 공급자에 물어 정리한 뒤 지운다(reconcilePendingCredential).
+     */
+    pendingOpId: uuid('pending_op_id'),
+    pendingKind: text('pending_kind'),
+    pendingToken: text('pending_token'),
+    pendingKeyVersion: integer('pending_key_version'),
     /** access token 만료 시각 */
     expiresAt: ts('expires_at'),
     scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
@@ -1460,6 +1470,9 @@ export const oauthCredentials = pgTable(
     // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
     check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
     check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
+    check('oauth_credentials_pending_kind_chk', sql`${t.pendingKind} is null or ${t.pendingKind} in ('refresh_unknown', 'cleanup_revoke')`),
+    check('oauth_credentials_pending_chk', sql`(${t.pendingKind} is null) = (${t.pendingOpId} is null) and (${t.pendingKind} is null) = (${t.pendingToken} is null) and (${t.pendingToken} is null) = (${t.pendingKeyVersion} is null)`),
+    check('oauth_credentials_pending_sealed_chk', sql`${t.pendingToken} is null or ${t.pendingToken} like 'csk1:%'`),
     check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
     check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
     check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),

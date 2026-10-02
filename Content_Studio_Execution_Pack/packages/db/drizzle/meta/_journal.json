@@ -211,6 +211,13 @@
       "when": 1790943068202,
       "tag": "0029_t13_fix2_revocation_epoch",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790949739094,
+      "tag": "0030_t13_fix3_pending_reconcile",
+      "breakpoints": true
     }
   ]
 }

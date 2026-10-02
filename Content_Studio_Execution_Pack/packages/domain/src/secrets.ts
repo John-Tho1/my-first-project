@@ -47,7 +47,7 @@ export interface SecretAad {
   scopeId?: string;
 }
 
-export type SecretPurpose = 'oauth_token' | 'pkce_verifier';
+export type SecretPurpose = 'oauth_token' | 'pkce_verifier' | 'oauth_pending_token';
 
 export class SecretsNotConfiguredError extends AppError {
   readonly problems: string[];

@@ -331,3 +331,15 @@
 - Evidence: tests/integration/ops-retention.test.ts "D23(e)" — health 에 ops·숫자 키 없음, summary 세션 없음·잘못된 세션 401(숫자 미노출), 새 owner 0·null(다른 owner 미집계), A 의 숫자 = opsSnapshot, 51개 계획 owner 정확히 51.
 - 남은 범위(이번 결정 밖): 공개 `/api/health` 에는 여전히 `jobs`(상태별 작업 수·`attention_plans`, T11/T12), `uploads`(업로드 임시 영역 사용량, T08), `db.captures`(소재 수)가 모든 owner 합계로 남아 있다. 이 숫자도 세션 뒤로 옮길지는 사용자 결정 대상.
 - Reversible?: 예.
+
+## D24 — M4 착수: T13(OAuth·계정·비밀 보호)을 로컬·모의 범위로 시작, 실계정 연결은 계속 승인 대기
+- Decision ID / date: D24 / 2026-10-02 (Europe/Moscow). 사용자 지시 "M4 작업 시작해줘"(D20 의 착수 보류 해제).
+- Question: D20 이 착수 조건으로 둔 항목(첫 채널·앱 등록·scope·테스트 계정·마스터 키 보관)이 아직 정해지지 않은 상태에서 무엇을 먼저 하는가?
+- Chosen option (잠정 기본값, 사용자가 바꿀 수 있음):
+  - 첫 채널: **Threads**(D20 권고). T13 은 채널 공통 틀 + Threads 형태의 **모의 OAuth 공급자**로 구현한다. 실제 Meta 앱 등록·OAuth 왕복·토큰 발급은 하지 않는다.
+  - scope: 게시에 필요한 최소 scope 만 요청하는 구조(Threads 는 기본 + 게시 권한, reply·insights 는 요청하지 않음 — docs/03). 실제 scope 이름은 공식 문서 재확인 후 T14 에서 확정.
+  - 마스터 키: 서버 환경변수(`.env.local`, 저장소·DB·백업·export 밖)에서 읽는다. 키 버전(`key_version`)을 함께 저장해 교체할 수 있게 한다. 암호화는 Node 표준 `crypto` 의 AES-256-GCM(자체 알고리즘 구현 아님 — docs/02 "자체 암호화 구현 금지" 준수).
+  - 토큰은 export·backup·restore·로그·감사·브라우저·LLM 입력·API 응답에 나가지 않는다. 복원 후 계정은 "다시 연결 필요" 상태.
+  - 기본값 그대로: `PUBLISH_MODE=disabled`, 실제 외부 호출 0. live OAuth 는 환경 조건(앱 ID·비밀·redirect URI·승인 기록)이 모두 갖춰지고 사용자가 정확한 범위를 승인하기 전까지 `blocked_external`.
+- 실계정 연결 전 사용자에게 받을 것: Meta 앱 등록 여부와 앱 ID 보관 방식, 테스트용 Threads 계정, redirect URI(로컬/운영), 마스터 키를 둘 위치 확인, 첫 실계정 시험의 정확한 원고·공개 범위.
+- Reversible?: 예.

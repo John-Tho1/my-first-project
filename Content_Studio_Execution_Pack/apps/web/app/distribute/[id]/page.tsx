@@ -19,6 +19,7 @@ import {
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
+  stepsPanelView,
   VISIBILITY_LABEL,
   YOUTUBE_STEP_LABEL,
   youtubeProgressLine,
@@ -91,6 +92,31 @@ function blockInfoOfItem(x: PlanItemDetail) {
 function adapterOf(x: PlanItemDetail): AdapterId | null {
   if (!x.account) return null;
   return adapterIdFor({ kind: x.account.kind === 'mock' ? 'mock' : 'live', platform: x.account.platform, credential_state: x.account.credentialState });
+}
+
+/**
+ * M4 화면 FIX(S1): 단계 패널은 가장 최근 전송 의도에 기록된 어댑터로 고른다(lib stepsPanelView — 전송 의도가 없을 때만 현재 선택).
+ * 일반 모의 어댑터로 처리된 항목은 "진행 예정" 대신 "일반 모의 어댑터로 처리됨" 한 줄.
+ */
+function StepsPanel({ x }: { x: PlanItemDetail }) {
+  const v = stepsPanelView({
+    currentAdapter: adapterOf(x),
+    latestIntent: x.latestIntent,
+    platform: x.account?.platform ?? null,
+    remoteStepKinds: x.remoteSteps.map((r) => r.kind),
+  });
+  if (!v.panel) return null;
+  if (v.note) {
+    return (
+      <>
+        <h4>{v.panel === 'threads' ? 'Threads 단계' : 'YouTube 업로드'}(MOCK)</h4>
+        <p className="empty-text">
+          <span className="tag warn">MOCK</span> {v.note}
+        </p>
+      </>
+    );
+  }
+  return v.panel === 'threads' ? <ThreadsSteps x={x} /> : <YouTubeSteps x={x} />;
 }
 
 /** T14: Threads 모의 단계(게시물 n/m · 컨테이너 생성됨/게시됨/오류 · 모의 ID)와 T13 연결 상태 한 줄. */
@@ -344,8 +370,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           {retryable ? <p className="note">재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
         </>
       ) : null}
-      {adapterOf(x) === 'mock_threads' || x.remoteSteps.some((r) => r.kind === 'container' || r.kind === 'publish') ? <ThreadsSteps x={x} /> : null}
-      {adapterOf(x) === 'mock_youtube' || x.remoteSteps.some((r) => r.kind === 'upload_session' || r.kind === 'video') ? <YouTubeSteps x={x} /> : null}
+      <StepsPanel x={x} />
       <ScenarioForm x={x} />
       {x.publications.length ? (
         <>

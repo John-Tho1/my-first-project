@@ -2,7 +2,16 @@
  * T10 배포함 — 폼 → API 입력, 폼 오류 리다이렉트, 화면 문구(서버 전용).
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
-import { AppError, formatMskInline, MOCK_SCENARIO_VALUES, scenarioApplies, type AdapterId } from '@cs/domain';
+import {
+  AppError,
+  CREDENTIAL_STATUS_LABEL,
+  formatMskInline,
+  MOCK_SCENARIO_VALUES,
+  recordedAdapterIdOf,
+  scenarioApplies,
+  type AdapterId,
+  type CredentialStatus,
+} from '@cs/domain';
 import { errorResponse, seeOther } from './api';
 
 export const MAX_DISTRIBUTION_REQUEST = 64 * 1024;
@@ -637,4 +646,82 @@ export function planFormDefaults(q: Record<string, string | string[] | undefined
   }
   d.name = Array.from(one('e_name')).slice(0, ECHO_NAME_MAX).join('');
   return d;
+}
+
+// ---- M4 화면 FIX(S1): 단계 패널은 기록된 어댑터 기준 ----
+
+export interface StepsPanelInput {
+  /** 계정의 현재 선택(@cs/domain adapterIdFor) — 전송 의도가 아직 없을 때만 쓴다 */
+  currentAdapter: AdapterId | null;
+  /** 가장 최근 작업의 가장 최근 전송 의도(없으면 null) */
+  latestIntent: { sanitizedDetails: Record<string, unknown> | null } | null;
+  /** 계정 플랫폼(threads·youtube·…) */
+  platform: string | null;
+  remoteStepKinds: readonly string[];
+}
+
+export interface StepsPanelView {
+  /** 보일 단계 패널(없으면 null) */
+  panel: 'threads' | 'youtube' | null;
+  /** 패널을 고른 어댑터(기록을 읽을 수 없으면 null) */
+  adapter: AdapterId | null;
+  /** intent = 전송 의도에 기록된 어댑터, current = 아직 보낸 적 없어 현재 선택, none = 계정 없음 */
+  source: 'intent' | 'current' | 'none';
+  /** 단계 목록 대신 보일 한 줄(일반 모의 어댑터로 처리됨 · 기록 확인 불가). null 이면 단계 목록·진행 안내를 그대로 보인다 */
+  note: string | null;
+}
+
+const PLATFORM_STEP_NAME: Record<'threads' | 'youtube', string> = { threads: 'Threads 단계', youtube: 'YouTube 업로드 단계' };
+
+/**
+ * M4 화면 FIX(S1, D26 후속 규칙): 단계 패널의 어댑터는 **가장 최근 전송 의도에 기록된 어댑터**(recordedAdapterIdOf — adapter_id 없음·null 이면
+ * mock_generic)로 고른다. 전송 의도가 아직 없을 때만 계정의 현재 선택(adapterIdFor)을 쓴다. 일반 모의 어댑터로 처리된 Threads·YouTube 항목은
+ * "진행 예정" 안내 대신 "일반 모의 어댑터로 처리됨 — 단계 기록 없음(MOCK)"을 보인다. 표시 전용 — 판정·실행에는 쓰지 않는다.
+ */
+export function stepsPanelView(x: StepsPanelInput): StepsPanelView {
+  const hasSteps = (kinds: readonly string[]) => x.remoteStepKinds.some((k) => kinds.includes(k));
+  const threadsSteps = hasSteps(['container', 'publish']);
+  const youtubeSteps = hasSteps(['upload_session', 'video']);
+  const platformPanel = x.platform === 'threads' || x.platform === 'youtube' ? x.platform : null;
+  let adapter: AdapterId | null;
+  let source: StepsPanelView['source'];
+  if (x.latestIntent) {
+    adapter = recordedAdapterIdOf(x.latestIntent.sanitizedDetails).id;
+    source = 'intent';
+  } else {
+    adapter = x.currentAdapter;
+    source = x.currentAdapter ? 'current' : 'none';
+  }
+  const panel: StepsPanelView['panel'] =
+    adapter === 'mock_threads' || threadsSteps ? 'threads' : adapter === 'mock_youtube' || youtubeSteps ? 'youtube' : null;
+  if (panel) return { panel, adapter, source, note: null };
+  if (source === 'intent' && platformPanel) {
+    const name = PLATFORM_STEP_NAME[platformPanel];
+    if (adapter === 'mock_generic') return { panel: platformPanel, adapter, source, note: `일반 모의 어댑터로 처리됨 — ${name} 기록 없음(MOCK)` };
+    return { panel: platformPanel, adapter, source, note: `전송 의도에 기록된 어댑터를 확인할 수 없음 — ${name} 표시 안 함(MOCK)` };
+  }
+  return { panel: null, adapter, source, note: null };
+}
+
+// ---- M4 화면 FIX(S3): 배포함 「배포 계정」 연결 상태 ----
+
+export interface AccountHealthLike {
+  status: CredentialStatus;
+  usable_for_execution: boolean;
+  credential_required: boolean;
+  pending_reconcile: string | null;
+  mock: boolean;
+}
+
+/**
+ * M4 화면 FIX(S3): 설정 화면과 같은 연결 상태(@cs/db listAccountHealth → @cs/domain credentialHealth·CREDENTIAL_STATUS_LABEL)를 한 줄로.
+ * 정리 대기(pending_reconcile)가 있으면 "정리 대기 차단"을 먼저 보인다. 실행이 막히는 계정은 "배포 실행 차단"을 붙인다.
+ */
+export function accountHealthLine(a: AccountHealthLike): { label: string; warn: boolean; text: string } {
+  const label = a.pending_reconcile ? '정리 대기 차단' : (CREDENTIAL_STATUS_LABEL[a.status] ?? a.status);
+  const blocked = a.credential_required && !a.usable_for_execution;
+  const parts = [label];
+  if (a.status === 'not_connected' && a.mock && !blocked) parts.push('모의 배포는 연결 없이 가능(결과는 MOCK)');
+  if (blocked) parts.push('배포 실행 차단');
+  return { label, warn: !a.usable_for_execution, text: parts.join(' — ') };
 }

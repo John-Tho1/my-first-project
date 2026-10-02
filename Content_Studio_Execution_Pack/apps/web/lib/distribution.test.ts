@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  accountHealthLine,
   APPROVAL_BLOCK_REASONS,
   bannersFromState,
   blockDetailLabel,
@@ -18,6 +19,7 @@ import {
   remoteStepLine,
   revocationCountParam,
   revocationNotice,
+  stepsPanelView,
 } from './distribution';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
@@ -259,5 +261,99 @@ describe('T14(D26) Threads 모의 화면 문구', () => {
     expect(gen).not.toContain('threads_success');
     expect(thr).toContain('success');
     expect(gen).toContain('success');
+  });
+});
+
+describe('stepsPanelView — M4 화면 FIX(S1): 단계 패널은 기록된 어댑터 기준', () => {
+  const base = { currentAdapter: 'mock_threads' as const, platform: 'threads', remoteStepKinds: [] as string[] };
+
+  it('T14 이전 전송 의도(adapter_id 없음)는 mock_generic — 지금 연결됨(mock_threads)이어도 "일반 모의 어댑터로 처리됨"', () => {
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { mode: 'MOCK' } } });
+    expect(v).toMatchObject({ panel: 'threads', adapter: 'mock_generic', source: 'intent' });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — Threads 단계 기록 없음(MOCK)');
+    expect(v.note).not.toContain('진행');
+  });
+
+  it('adapter_id: null 도 mock_generic', () => {
+    expect(stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: null } } }).adapter).toBe('mock_generic');
+  });
+
+  it('YouTube 계정·일반 모의로 처리된 의도 → YouTube 쪽 같은 안내', () => {
+    const v = stepsPanelView({ currentAdapter: 'mock_youtube', platform: 'youtube', remoteStepKinds: [], latestIntent: { sanitizedDetails: {} } });
+    expect(v).toMatchObject({ panel: 'youtube', adapter: 'mock_generic' });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — YouTube 업로드 단계 기록 없음(MOCK)');
+  });
+
+  it('기록된 mock_threads 의도 → Threads 단계 패널(안내 없음), 현재 선택이 mock_generic 이어도', () => {
+    const v = stepsPanelView({ ...base, currentAdapter: 'mock_generic', latestIntent: { sanitizedDetails: { adapter_id: 'mock_threads' } } });
+    expect(v).toEqual({ panel: 'threads', adapter: 'mock_threads', source: 'intent', note: null });
+  });
+
+  it('기록된 mock_youtube 의도 → YouTube 패널', () => {
+    const v = stepsPanelView({ currentAdapter: 'mock_generic', platform: 'youtube', remoteStepKinds: [], latestIntent: { sanitizedDetails: { adapter_id: 'mock_youtube' } } });
+    expect(v).toEqual({ panel: 'youtube', adapter: 'mock_youtube', source: 'intent', note: null });
+  });
+
+  it('전송 의도가 아직 없으면 현재 선택(adapterIdFor) — mock_threads 면 진행 안내가 있는 Threads 패널', () => {
+    expect(stepsPanelView({ ...base, latestIntent: null })).toEqual({ panel: 'threads', adapter: 'mock_threads', source: 'current', note: null });
+  });
+
+  it('전송 의도 없음 + 현재 선택 mock_generic → 패널 없음', () => {
+    expect(stepsPanelView({ ...base, currentAdapter: 'mock_generic', latestIntent: null }).panel).toBeNull();
+  });
+
+  it('계정 없음 → 패널 없음(source none)', () => {
+    expect(stepsPanelView({ currentAdapter: null, platform: null, remoteStepKinds: [], latestIntent: null })).toEqual({ panel: null, adapter: null, source: 'none', note: null });
+  });
+
+  it('원격 단계 기록이 있으면 그 패널(기록이 우선 보인다)', () => {
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: {} }, remoteStepKinds: ['container'] });
+    expect(v).toMatchObject({ panel: 'threads', note: null });
+  });
+
+  it('모르는 adapter_id → 확인 불가 안내(진행 안내 아님)', () => {
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: 'live_threads' } } });
+    expect(v).toMatchObject({ panel: 'threads', adapter: null, source: 'intent' });
+    expect(v.note).toBe('전송 의도에 기록된 어댑터를 확인할 수 없음 — Threads 단계 표시 안 함(MOCK)');
+  });
+
+  it('일반 채널(blog 등) + 일반 모의 의도 → 패널 없음', () => {
+    expect(stepsPanelView({ currentAdapter: 'mock_generic', platform: 'blog', remoteStepKinds: [], latestIntent: { sanitizedDetails: {} } }).panel).toBeNull();
+  });
+});
+
+describe('accountHealthLine — M4 화면 FIX(S3): 배포 계정 연결 상태(설정 화면과 같은 라벨)', () => {
+  const h = (status: Parameters<typeof accountHealthLine>[0]['status'], extra: Partial<Parameters<typeof accountHealthLine>[0]> = {}) =>
+    accountHealthLine({ status, usable_for_execution: false, credential_required: true, pending_reconcile: null, mock: true, ...extra });
+
+  it('상태별 한국어 라벨', () => {
+    expect(h('not_connected', { usable_for_execution: true, credential_required: false }).label).toBe('연결 정보 없음');
+    expect(h('connected', { usable_for_execution: true }).label).toBe('연결됨');
+    expect(h('expiring_soon', { usable_for_execution: true }).label).toBe('곧 만료');
+    expect(h('expired').label).toBe('만료됨');
+    expect(h('revoked').label).toBe('연결 해제됨');
+    expect(h('needs_reconnect').label).toBe('다시 연결 필요');
+    expect(h('error').label).toBe('오류');
+  });
+
+  it('정리 대기가 있으면 "정리 대기 차단" + 배포 실행 차단', () => {
+    const r = h('error', { pending_reconcile: 'cleanup_revoke' });
+    expect(r.label).toBe('정리 대기 차단');
+    expect(r.text).toBe('정리 대기 차단 — 배포 실행 차단');
+    expect(r.warn).toBe(true);
+  });
+
+  it('연결한 적 없는 모의 계정: 실행 가능 안내, 경고 아님', () => {
+    const r = h('not_connected', { usable_for_execution: true, credential_required: false });
+    expect(r).toEqual({ label: '연결 정보 없음', warn: false, text: '연결 정보 없음 — 모의 배포는 연결 없이 가능(결과는 MOCK)' });
+  });
+
+  it('연결됨: 경고·차단 없음', () => {
+    expect(h('connected', { usable_for_execution: true })).toEqual({ label: '연결됨', warn: false, text: '연결됨' });
+  });
+
+  it('다시 연결 필요·만료됨: 배포 실행 차단', () => {
+    expect(h('needs_reconnect').text).toBe('다시 연결 필요 — 배포 실행 차단');
+    expect(h('expired').text).toBe('만료됨 — 배포 실행 차단');
   });
 });

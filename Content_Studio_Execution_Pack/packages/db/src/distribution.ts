@@ -84,6 +84,7 @@ import {
   jobEvents,
   jobs,
   publications,
+  sendIntents,
   variantAssets,
   variants,
   variantVersions,
@@ -515,6 +516,11 @@ export interface PlanItemDetail {
   remoteSteps: RemoteStepRow[];
   /** T14: 계정 연결 상태(T13 health, 토큰 없음). 계정이 없으면 null */
   connection: AccountHealthView | null;
+  /**
+   * M4 화면 FIX(S1): 가장 최근 작업의 가장 최근 전송 의도(시도 번호·sanitized_details 만, 없으면 null) — 단계 패널이 **기록된 어댑터**
+   * (@cs/domain recordedAdapterIdOf)로 고르게 한다. 읽기 전용 — 판정·실행에는 쓰지 않는다.
+   */
+  latestIntent: { attempt: number; sanitizedDetails: Record<string, unknown> } | null;
 }
 
 export interface PlanDetail {
@@ -566,6 +572,14 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
           .orderBy(desc(jobEvents.eventSeq))
           .limit(10)
       : [];
+    const intentRows = latestJob
+      ? await db
+          .select({ attempt: sendIntents.attempt, sanitizedDetails: sendIntents.sanitizedDetails })
+          .from(sendIntents)
+          .where(and(eq(sendIntents.ownerId, ownerId), eq(sendIntents.jobId, latestJob.id)))
+          .orderBy(desc(sendIntents.attempt))
+          .limit(1)
+      : [];
     const account = await getChannelAccount(db, ownerId, item.channelAccountId);
     const vRows = await db
       .select({ id: variants.id, channel: variants.channel, contentId: variants.contentId, lifecycle: variants.lifecycle })
@@ -587,6 +601,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       mockScenario: scenarios.get(item.id) ?? null,
       remoteSteps: allSteps.filter((r) => r.itemId === item.id),
       connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
+      latestIntent: intentRows[0] ?? null,
     });
   }
   return { plan, items: out };

@@ -41,3 +41,43 @@
 - 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(사용자 결정 대기, D23).
 - T13 FIX3: 계정당 정리 대기 슬롯 1개(두 번째 정리 실패는 감사만), 열 수 없는 pending 기록은 키를 고칠 때까지 계정 차단.
 - T14/T15: 각 인계 문서 "Known risks" 참조(부분 스레드 공개 잔존, 고아 컨테이너, 세션 만료 not_found 판정 근거, 업로드 뒤 취소 처리).
+
+---
+
+# 로컬 복귀 후 진행 (2026-10-02~03, 로컬 세션, Opus 5.5 구현 · Codex 검증)
+
+## 로컬 복귀 검사 (7634bb1, Windows 10 · Node 24.21.0)
+설치·migration 0030~0032·lint·typecheck·build·unit 697·integration 517·drill:mock(M3·T14·T15) 0건·실제 DB drill:restore PASS.
+
+## Codex 판정과 수정 라운드
+| 대상 | 코드 커밋 | Codex |
+|---|---|---|
+| T13 FIX3 (클라우드) | 79201d6 | P1 3·P2 1 |
+| T14 (클라우드) | 67ade9e | P0 1·P1 1·P2 1 |
+| T15 (클라우드) | 427dc71 | P1 3 |
+| T13 FIX4 (oauth_pending_tokens, 0033) | ea85ac6 | P1 1·P2 2(1건은 D28 로 처리) |
+| T14 FIX1 (기록 어댑터·remote_steps 복원·resume_count 0034) | 6f766d2 | **대기열** |
+| T13 FIX5 (해제 시 현재 토큰 철회 의무 보존·행별 백오프) | 492b1b9 | **대기열** |
+| T15 FIX1 (조각 읽기 뒤 중단·할당량 단위·웹 경로 조각 예산) | cc26535 | **대기열** |
+| 화면 S1–S3 | f2bb3b9 | **대기열** |
+| 화면 기능 G1(항목별 목적 승인)·G2(요청 결과·예약 공개 입력) | fa37b1a | **대기열** |
+| 화면 S4·S5 | 8d2cc64 | **대기열** |
+| 업로드 세션 URI 이중 가림(실제 DB drill:restore 실패 수정) | 0c86db2 | **대기열** |
+판정 요약 `M4_CODEX_VERDICTS.md`. 각 코드 커밋의 인계는 `T13/T14/T15_IMPLEMENTATION_HANDOFF.md`, `M4UI_IMPLEMENTATION_HANDOFF.md`, `screen-notes-m4.md`, `FIX_DRILL_MASK_HANDOFF.md`.
+마지막 검사(0c86db2): lint·typecheck·build·unit 745·integration 570·drill:mock 0건·db:migrate(0034)·실제 DB drill:restore PASS.
+
+## Codex 사용 한도
+2026-10-02 21:31 FIX-T14 검토 중 Codex 사용 한도 도달("try again at Oct 3rd, 2026 10:06 PM"). 모델은 바꾸지 않는다(gpt-6-astra / xhigh 고정). 로컬 `.handoffs/codex-queue.txt` + `run-codex-queue.sh` 가 10-03 22:15 까지 기다렸다가 위 **대기열** 7건을 순서대로 검토한다(PC·앱이 켜져 있어야 함). 결과는 `.handoffs/review-<label>.md`.
+
+## 결정
+- D28: 인계·판정 사본은 docs/handoffs/ 에 추적하되 docs 전용 커밋으로만(코드 커밋과 분리).
+- D26·D27 후속: 클라우드 잠정 판단 위에 FIX 라운드 변경을 기록. D26(a~f)·D27(a~h) 사용자 확인은 아직 받지 않음 — 잠정대로 진행 중.
+
+## 화면 확인 (오케스트레이터 직접, 모의만) — `screen-notes-m4.md`
+Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 공개)·항목별 승인·실행·YouTube 업로드 → UPLOADED_PRIVATE("비공개 업로드 완료, 공개 전환 확인 필요") 확인. 결함 S1–S5 수정. 로컬 `.env.local` 에 이 PC 에서 만든 시험용 마스터 키 추가(값 비공개, git 무시).
+
+## 남은 것
+- Codex 대기열 7건 결과 → 수정 라운드.
+- 사용자 확인: D26(a~f)·D27(a~h), 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(D23).
+- 다음 작업 후보(검증이 따라온 뒤): T16 Instagram(모의), 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
+- 실계정 연결 전 사용자 준비물(D24): Meta 앱·Threads 테스트 계정, Google Cloud 프로젝트·OAuth 동의 화면·YouTube API 감사, redirect URI, 마스터 키 위치, 첫 실계정 시험 원고·공개 범위.

@@ -68,3 +68,6 @@ CHANGES_REQUESTED
 ## FIX-drill-mask (0c86db2, 업로드 세션 URI 이중 가림)
 CHANGES_REQUESTED
 - [P2] packages/db/src/bundle-tables.ts:79 — 가림 예외가 정상 마커 형식보다 넓어 비정상 값까지 그대로 내보낸다
+
+## FIX2-T14 (746aa3a, T14 round 2) — **PASS** (지적 없음) → T14 종결(모의 범위)
+## (참고) FIX-T15 PASS → T15 종결(모의 범위)

@@ -53,8 +53,8 @@ describe('scope', () => {
 
 describe('credentialHealth', () => {
   const base = { status: 'active', expiresAt: new Date(NOW.getTime() + 30 * DAY), scopes: [...THREADS_REQUIRED_SCOPES], revokedAt: null, lastErrorCode: null };
-  const h = (account: { kind: string; credentialState: string }, credential: typeof base | null) =>
-    credentialHealth({ account, credential, requiredScopes: THREADS_REQUIRED_SCOPES, now: NOW });
+  const h = (account: { kind: string; credentialState: string }, credential: typeof base | null, pendingKind: string | null = null) =>
+    credentialHealth({ account, credential, requiredScopes: THREADS_REQUIRED_SCOPES, now: NOW, pendingKind });
   const mockNone = { kind: 'mock', credentialState: 'none' };
   const mockLinked = { kind: 'mock', credentialState: 'linked' };
 
@@ -75,12 +75,15 @@ describe('credentialHealth', () => {
     expect(h(mockLinked, { ...base, status: 'error', lastErrorCode: 'token_revoked' } as unknown as typeof base)).toMatchObject({ status: 'error', reason: 'token_revoked', usable: false });
     expect(h(mockLinked, { ...base, scopes: ['threads_basic'] })).toMatchObject({ status: 'needs_reconnect', reason: 'scope_missing', missingScopes: ['threads_content_publish'], usable: false });
   });
-  it('FIX3: 정리 대기 표시가 있으면 active·유효 기간이어도 error(pending_<kind>)·실행 불가, 해제된 행·연결한 적 없는 모의 계정도 마찬가지', () => {
-    const withPending = (kind: string) => ({ ...base, pendingKind: kind }) as unknown as typeof base;
-    expect(h(mockLinked, withPending('refresh_unknown'))).toMatchObject({ status: 'error', reason: 'pending_refresh_unknown', usable: false });
-    expect(h(mockLinked, withPending('cleanup_revoke'))).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
-    expect(h(mockNone, { ...withPending('cleanup_revoke'), status: 'revoked', revokedAt: NOW } as unknown as typeof base)).toMatchObject({ status: 'error', usable: false });
-    expect(h(mockLinked, { ...base, pendingKind: null } as unknown as typeof base)).toMatchObject({ status: 'connected', usable: true });
+  it('FIX3·FIX4: 정리 대기가 있으면 active·유효 기간이어도 error(pending_<kind>)·실행 불가, 해제된 행·연결 정보 없는 모의 계정도 마찬가지', () => {
+    expect(h(mockLinked, base, 'refresh_unknown')).toMatchObject({ status: 'error', reason: 'pending_refresh_unknown', usable: false });
+    expect(h(mockLinked, base, 'cleanup_revoke')).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
+    expect(h(mockLinked, base, 'verify_current')).toMatchObject({ status: 'error', reason: 'pending_verify_current', usable: false });
+    expect(h(mockNone, { ...base, status: 'revoked', revokedAt: NOW } as unknown as typeof base, 'cleanup_revoke')).toMatchObject({ status: 'error', usable: false });
+    // FIX4: 첫 연결 정리 대기 — 연결 정보 행이 없고 연결한 적 없는 모의 계정(평소엔 실행 가능)도 차단
+    expect(h(mockNone, null, 'cleanup_revoke')).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
+    expect(h(mockNone, null, null)).toMatchObject({ status: 'not_connected', usable: true });
+    expect(h(mockLinked, base, null)).toMatchObject({ status: 'connected', usable: true });
   });
 });
 

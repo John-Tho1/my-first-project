@@ -22,3 +22,19 @@
 - 답 요지: 해제 번호·작업 식별자·저장 결과 불명 시 즉시 철회 안 함은 타당; 결과 불명 T2 의 나중 정리를 보장하려면 내구성 있는 기록 필요; lease 테스트는 시간 확대보다 명시적 장벽·제어 시계 권고.
 
 ## FIX3-T13 (round 3: review-FIX2-T13) — (클라우드 세션에서 구현 중, 로컬 복귀 후 Codex 검증)
+
+## FIX3-T13 (79201d6, round 3: review-FIX2-T13, 클라우드 구현) — CHANGES_REQUESTED (P1 3·P2 1)
+- [P1] packages/db/src/oauth.ts:1037 — 현재 토큰의 유효성을 확인하지 못해도 pending을 지워 무효 토큰의 실행 차단을 해제한다
+- [P1] packages/db/src/oauth.ts:1017 — 되쓰기에서 pending 작업 ID만 확인하여 동시 해제가 남긴 정리 의무를 삭제한다
+- [P1] packages/db/src/oauth.ts:908 — `occupied`가 두 번째 미정리 토큰을 기록 없이 버린다
+- [P2] packages/db/src/oauth.ts:1293 — 오래된 해독 불가 pending들이 뒤 계정의 자동 정리를 계속 막는다
+
+## T14 (67ade9e, Threads 텍스트 — 모의, 클라우드 구현) — CHANGES_REQUESTED (P0 1·P1 1·P2 1)
+- [P0] packages/db/src/jobs.ts:848 — 기존 전송 의도에 `adapter_id`가 없으면 다른 어댑터가 결과 불명을 확정 미전송으로 오판한다
+- [P1] packages/domain/src/bundle.ts:123 — 복원에서 Threads 재확인에 필요한 원격 참조를 버린다
+- [P2] packages/providers/src/threads-mock.ts:622 — 만료 컨테이너가 재시도 경로에서는 문서와 달리 `FAILED`로 끝난다
+
+## T15 (427dc71, YouTube 재개 업로드 — 모의, 클라우드 구현) — CHANGES_REQUESTED (P1 3)
+- [P1] packages/providers/src/youtube-mock.ts:794 — 파일 읽기 도중 작업이 중단되어도 다음 조각을 전송한다
+- [P1] packages/db/src/jobs.ts:683 — 만료된 세션까지 차감하여 새 세션 생성 시 할당량 검사를 건너뛴다
+- [P1] apps/web/app/api/worker/tick/route.ts:45 — 웹 요청 안에서 영상 전체 업로드를 수행하는 경로를 추가했다

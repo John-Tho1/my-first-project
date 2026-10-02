@@ -249,3 +249,89 @@ Tests are in `tests/integration/oauth.test.ts` unless noted.
 4. Is mapping `invalid_token` at revoke to `ok_already_revoked` acceptable for cleanup? The alternative leaves a permanent block after a mock-provider restart.
 5. Is `occupied` (no second record) an acceptable residual, or should the callback also reconcile before exchanging when a record exists?
 6. Q16: the virtual clock removes wall-clock lease expiry from the test entirely. Given the recorded failure with the batch lease reintroduced, is there still a real-time aspect of the original bug that this form no longer covers?
+
+# FIX round 4 (Codex review-FIX3-T13)
+- BASE_SHA: 7634bb1 · **HEAD_SHA: TBD** (the orchestrator commits; this section is written before the commit). Review fixed: `.handoffs/review-FIX3-T13.md` on 79201d6 (CHANGES_REQUESTED, P1×3 + P2×1, plus missed cases).
+- Environment: Windows 10, Git Bash, portable Node 24.21.0 (`source tools/env.sh`), pnpm via corepack. Dev server down. `./data` not opened (no db:migrate/seed/drill:restore/secrets:rotate). Tests use memory DBs. Unit and integration suites run separately, one after the other.
+- Migration: **new `0033_t13_fix4_pending_tokens`** (drizzle-kit output plus two hand-written data statements, marked in the file). 0030 is not amended.
+- External calls 0, new dependencies 0. `docs/DECISIONS.md`, `M4_STATUS.md` and `M4_CODEX_VERDICTS.md` not touched.
+
+## Core design change: pending records move to their own table
+FIX3 kept one pending slot per account in `oauth_credentials.pending_*`. FIX4 moves it to **`oauth_pending_tokens`**, one row per obligation:
+- Columns: `id`, owner + account (same-owner FK to `channel_accounts`), `kind ∈ {refresh_unknown, cleanup_revoke, verify_current}`, `sealed_token`/`key_version` (sealed P, AAD purpose `oauth_pending_token` as before; empty only for `verify_current`), `base_generation`, `on_invalid_code`, `source`, `revision`, `attempts`, `next_attempt_at`, `last_result`, timestamps.
+- CHECKs: kind list; `verify_current ⇔ no seal`; seal and key version together, seal starts with `csk1:`; `verify_current` needs `base_generation`; counters non-negative. Indexes on (owner, account) and `next_attempt_at`.
+- Excluded from export/restore (`EXCLUDED_TABLES`), retention-protected (`RETENTION_PROTECTED_TABLES`), resealed by `secrets:rotate` (counted as `pendingTokens`, report line `정리 대기 봉인` unchanged).
+- **Health**: `credentialHealth` gets a top-level `pendingKind`, checked **before** "no credential". So an account with pending rows is blocked even with no `oauth_credentials` row (first connect). With several rows, the shown kind is the first of `refresh_unknown → verify_current → cleanup_revoke`. The view adds `pending_count` (no ids, no seals).
+- **No placeholder rows.** First-connect failures write only a pending row. No code path deletes `oauth_credentials` rows any more.
+- All pending writes take the account → credential lock first. Execution takes the account lock FOR SHARE, so it reads after a committed pending write.
+
+### Migration 0033 data step
+1. Copy each 0030 pending record into `oauth_pending_tokens`, keeping the id (= old `pending_op_id`), kind, seal and key version. AAD is unchanged, so nothing is resealed. `source='migrated_0030'`, `base_generation = token_generation` for `refresh_unknown`.
+2. Delete only **0030 first-connect placeholder rows**. Every condition must hold: pending present, `revoked`, `revocation_epoch 0`, no ciphertext, no `revoke_op_id`, generation 1, empty scopes, **and the account's `credential_state='none'`**. A real stored credential always sets `linked`, and disconnect keeps `linked`. So a legacy (pre-0029) `revoked + epoch 0` row is `linked` and is never deleted. The pending row still blocks the account after the delete.
+3. Drop the 0030 columns and their 3 CHECKs.
+
+### Reconcile (`reconcilePendingCredential`) — per account, all rows
+- **Read** (under lock): every pending row (revision, kind, opened P), the credential identity (`id|generation|revocation_epoch|status|revoked|has token`), and C.
+- **Provider** (outside the tx): revoke each P that needs it. Check C at most once.
+- **Write** (under lock): apply only if the credential identity **and** every read row's revision and kind are unchanged. Otherwise write nothing and **re-run against current state** (up to 3 passes, then `still_pending`). Row updates and deletes also filter on the read revision.
+
+| Kind | Condition | Provider | Result |
+|---|---|---|---|
+| any | key missing / P or C unreadable / provider unavailable / `revoking` | none | row kept; `attempts+1`, `next_attempt_at` pushed back, `last_result` = problem |
+| refresh_unknown | C == P | check C | valid → delete, `active` · invalid → delete, `error`(provider code) · **unknown → becomes `verify_current`** (seal dropped, `base_generation`=C's generation) |
+| refresh_unknown | C ≠ P | revoke P + check C | P ok: valid → delete/`active`, invalid → delete/`error refresh_store_failed`, **unknown → `verify_current`** (`on_invalid_code=refresh_store_failed`) |
+| | | | P failed/unknown: row → `cleanup_revoke`; C status written if decided; **if C unknown, a separate `verify_current` row is inserted** |
+| cleanup_revoke | — (also refresh_unknown on a non-live row) | revoke P | ok → delete · failed/unknown → kept |
+| verify_current | live and generation == `base_generation` | check C | decided → delete + status (`on_invalid_code` ?? provider code) · unknown → kept |
+| verify_current | generation changed / not live | none | delete. The new generation came from a callback, which checks the account; a revoked row is blocked anyway. |
+
+Status writes still need `sameLiveGeneration(cred, generation read)`. A transient C check never changes status and never clears the block.
+
+### Disconnect (`revokeCredential`)
+Phase 1 reads all pending rows (id, revision, opened P). Phase 2 revokes each P, then C. Phase 3 changes only the rows it read, and only at the same revision:
+- confirmed revoked → delete;
+- failed or unknown → `cleanup_revoke` with revision +1;
+- `verify_current` → deleted only when this disconnect actually revoked the credential.
+
+Unreadable rows are left for reconcile. The audit `oauth.revoked` gains `pending_tokens` and `pending_tokens_revoked`. There is one `cleanup_revoke_failed`/`_unknown` audit per failed row.
+
+### Worker sweep (`refreshExpiringCredentials`)
+It selects accounts that have rows with `next_attempt_at ≤ now`, grouped by account and ordered by the earliest due time, then account id, up to `limit`. Every attempt pushes `next_attempt_at` back by 1 min × 2^(attempts−1), capped at 1 h. This includes stuck/undecryptable rows. If reconcile itself throws, a locked fallback update still pushes the time back. User `check`/`refresh` ignore the backoff and always try. Expiry refresh skips accounts with any pending row (`NOT EXISTS`).
+
+## Finding → change → test
+Tests are in `tests/integration/oauth.test.ts` unless noted.
+
+| Finding | Change | Test |
+|---|---|---|
+| **[P1] oauth.ts:1037** — pending cleared while C's validity unknown | P cleanup and C verification are separate obligations. An unknown C check keeps or creates a `verify_current` row, so the account stays blocked until C is valid (unblock) or invalid (error). With a P revoke failure and an unknown C, the result is `cleanup_revoke` **plus** a separate `verify_current` row, so a later successful cleanup still leaves the C check. | `FIX4 P1 :1037` ×9.<br>(1–6) Matrix C≠P × {P revoke ok, failed} × {C ok, invalid, transient}, checking rows, status/error, `usable`, `pending_count`, the `verify_current` row shape (no seal, `base_generation`, `on_invalid_code`, attempts 1), execute 409/200, refresh 409 `pending_reconcile` while rows remain. The transient cases continue: next check with P revoke ok but C still transient → only `verify_current`, still blocked, execute 409 (covers the cleanup_revoke → success path). Then C ok → `connected`, usable, audit `verify_current resolved current_token_valid yes`, execute 200.<br>(7) `verify_current`, then C invalid → `error refresh_store_failed`, row deleted, unusable.<br>(8) C==P with a transient check (`failNext account provider_error`) → sealless `verify_current`, P not revoked, audit `result: verify_pending, current_token_valid: unknown`, execute 409. Next check → usable.<br>(9) `verify_current`, then reconnect (generation +1) → still blocked until check. Check → row moot and deleted, connected. |
+| **[P1] oauth.ts:1017** — write-back compared only the op id | Write-back compares credential identity (generation, revocation epoch, status, revoked, token present) **and** each read row's revision and kind. Any change means no write and a re-run (≤3 passes). Disconnect bumps the revision when it turns a row into `cleanup_revoke`. | `FIX4 P1 :1017` ×3:<br>(a) C==P. At `afterReconcileProvider` a disconnect runs, and both its P and C revokes fail. The test asserts inside the hook that the same row id became `cleanup_revoke` with revision +1. Reconcile then does not delete it: pass 2 revokes P (3rd revoke call). 0 rows, 0 live tokens, `revoked`, audit `cleanup_revoke resolved pass 2`.<br>(b) Same, but every revoke fails → row kept as `cleanup_revoke`, token alive, unusable. A later check revokes it.<br>(c) C≠P with a reconnect injected at the hook → the stale "C invalid → error" decision is not written to the new generation. Pass 2 confirms the new C → `active`/usable, 1 live token.<br>**Mutation check**: with the identity/revision comparison removed, (a) and (b) fail. Reverted. |
+| **[P1] oauth.ts:908** — `occupied` dropped a second token | Option **(a)**: several pending rows per account (table above). `markAfterIssuance` always inserts and never overwrites. First connect needs no credential row. Why (a) over (b): an issuance reservation would need a lease and timeout for crashed callbacks. A callback is driven by the user's browser, so a reserved slot would make the second callback fail after the provider already showed consent. A crash between exchange and reservation release would still leave an unrecorded token. With (a), every token that reaches a failure path is recorded (except a seal or DB write failure, which is audited and blocks a live row as before). | `FIX4 P1 :908` ×3:<br>(a) First connect: two callbacks (states issued together) both `account_mismatch`, revokes `failed` and `unknown` → 2 rows, two distinct sealed tokens, **no credential row**, health `pending_cleanup_revoke`, `pending_count 2`, execute 409. Check where the first revoke fails → 1 row left, still 409. Next check → 0 rows, `not_connected`, usable, execute 200, 0 live tokens.<br>(b) Connected account, two reconnect callbacks with cleanup failures → existing credential byte-identical (generation, ciphertext, active), 2 rows, blocked. Disconnect revokes both (`pending_tokens 2`, `pending_tokens_revoked 2`).<br>(c) **Legacy `revoked + epoch 0` (linked) row** gets a pending row → check resolves it and the credential row is kept (`revoked`, epoch 0). |
+| **[P2] oauth.ts:1293** — oldest undecryptable rows starved later accounts | `attempts`, `next_attempt_at`, `last_result` per row, updated on every attempt including stuck ones. The sweep selects by earliest due time. | `FIX4 P2 :1293`: owner B, `limit=1`. Account 1 has a corrupt seal (due earlier) and account 2 a valid seal. Tick 1 → account 1 tried (`attempts 1`, `last_result pending_*`, next > T), account 2 untouched. Tick 2 (same T) → account 2 resolved. Tick 3 → nothing due. Tick at account 1's due time → attempts 2, backoff 2 min. Account 1 stays blocked. **Mutation**: with stuck rows not updated, the test fails (`expected +0 to be 1`). The FIX3 worker test now runs the worker after the backoff (`now + 2h`) and first asserts `attempts ≥ 2` and `next_attempt_at` in the future. |
+| **Missed: legacy `revoked + epoch 0` vs placeholder** | No placeholder rows exist after FIX4, and nothing deletes credential rows. The 0033 delete adds `credential_state='none'` on top of the old fingerprint. | `tests/integration/migration-0033.test.ts` (new): apply 0000–0032, insert a live row + `refresh_unknown`, a 0030 placeholder (`none`), a legacy revoked epoch-0 `linked` row **with** pending (same fingerprint except `credential_state`), and one without. Apply 0033 → 3 rows moved with the same ids, seals, key versions and `base_generation` (3 / null); only the placeholder deleted; no `pending%` columns left. CHECKs reject: `verify_current` with a seal or without a generation, `cleanup_revoke` without a seal, an unsealed token, an unknown kind, a wrong owner (FK). A valid `verify_current` is accepted. |
+| Existing FIX3 tests | Storage assertions moved from `oauth_credentials.pending_*` to `oauth_pending_tokens` (helper `pendingRows`; `pendingOf` keeps the old shape with the row id as op id). The first-connect test now asserts **no credential row** plus a pending row (was: placeholder row). The export test also asserts `oauth_pending_tokens` is excluded and that the keys `sealed_token`/`on_invalid_code`/`next_attempt_at` are absent. No assertion was removed or loosened. | `threads.test.ts` and `youtube.test.ts` gate tests now insert an `oauth_pending_tokens` row instead of setting the dropped columns. `bundle-tables.test.ts` and `export-restore.test.ts` exclusion lists +`oauth_pending_tokens`. Domain `oauth.test.ts`: `pendingKind` is top-level; new cases `verify_current` and "no credential + pending → blocked". |
+
+## Commands (Windows, Git Bash, `source tools/env.sh`, sequential; dev server down)
+- `corepack pnpm exec drizzle-kit generate --name t13_fix4_pending_tokens` (in `packages/db`): wrote `0033_*.sql` + `meta/0033_snapshot.json` + journal entry. The two data statements were added by hand.
+- `corepack pnpm lint`: exit 0.
+- `corepack pnpm typecheck`: exit 0.
+- `corepack pnpm build`: exit 0.
+- `corepack pnpm test`: exit 0, **39 files / 697 tests**.
+- `corepack pnpm test:integration` (run alone): exit 0, **30 files / 534 tests** (370 s). `oauth.test.ts` 55 → **71**; new `migration-0033.test.ts` 1.
+- `corepack pnpm drill:mock`: exit 0, 불변식 위반 0건 (M3, T14 Threads, T15 YouTube), fetch 0.
+- Mutation checks (each reverted; `oauth.ts` restored from a copy): identity/revision check removed → 2 `:1017` tests fail; "C unknown counts as done" → `:1037` tests fail; stuck rows not updated → P2 test fails.
+- not_run: `db:migrate` on `./data` (not allowed this round; the user's local DB is at 0029, so 0030–0033 apply on the next migrate), `db:seed`, `drill:restore`, `secrets:rotate`, real PostgreSQL parallel transactions, browser check of `/settings#accounts` (the new reason `pending_verify_current` and `pending_count` show through existing fields; no new UI text).
+
+## Remaining risks
+- **Seal or write failure at record time** still loses the token record. It is audited (`oauth.pending_record_failed`), and a live row is set to `error refresh_pending_record_failed`. On first connect there is no row to block, so that token is unrecorded. This needs a key misconfiguration or a DB failure right after issuance.
+- **`checkCredential` without pending rows** still maps a transient provider error to `status: active` (pre-existing FIX1 behavior, unchanged here). The `verify_current` path does not go through it.
+- **Re-run limit**: under constant concurrent change, reconcile gives up after 3 passes with `still_pending` (blocked; the next check or tick retries). Each pass may repeat provider revokes, which are idempotent in the mock (`token_revoked`/`invalid_token` → already revoked).
+- **Backoff numbers** (1 min doubling to 1 h) are provisional. The user `check` ignores them.
+- **`invalid_token` at revoke = already revoked** (FIX3 rule, unchanged). It must be confirmed against the real provider (T14 note).
+- Concurrency is hook-injected on PGlite's single connection, not true parallel PostgreSQL.
+
+## Questions for Codex
+1. Is per-row `revision` + credential identity (`id|generation|epoch|status|revoked|has token`) enough to make the write-back safe? Rotation reseals without bumping revision because the token is the same. Is there a path where that lets a stale decision through?
+2. `verify_current` is dropped when the credential generation changes or it is no longer live. The reasoning is that only a callback (which checks the account) can change the generation while rows exist, because refresh refuses. Do you see another writer of `token_generation` that breaks this?
+3. Option (a) over (b) for P1 :908: do you agree, given that the second callback in (b) would fail after consent, and that (a) records every token that reaches a failure path?
+4. The 0033 placeholder delete relies on `credential_state='none'` for accounts that never stored a credential. Can you see a path (restore, seed, T14/T15 adapters) where a real credential row coexists with `credential_state='none'`?
+5. The worker orders by the earliest due row per account, and user `check` ignores the backoff. Is that acceptable, or should a user check also respect a minimum interval to limit provider calls?

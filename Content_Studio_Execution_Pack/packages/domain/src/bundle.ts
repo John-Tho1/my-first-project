@@ -109,6 +109,7 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   upload_chunks: '업로드 조각(T08) — 전송 중 임시 파일 목록. 조각 바이트는 묶음에 넣지 않는다',
   oauth_credentials: '계정 연결 정보(T13, D24) — 봉인한 토큰. 인증 비밀이므로 다른 환경으로 옮기지 않는다(복원한 계정은 "다시 연결 필요")',
   oauth_states: '진행 중인 계정 연결 요청(T13) — 10분짜리 임시 상태',
+  oauth_pending_tokens: '정리 대기 토큰(T13 FIX4) — 봉인한 토큰·확인 의무. 인증 비밀이며 이 환경의 공급자 정리 작업이다(다른 환경으로 옮기지 않는다)',
 };
 
 /**

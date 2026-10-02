@@ -57,6 +57,7 @@ export const RETENTION_PROTECTED_TABLES = [
   // T13: 연결 정보·연결 요청 — 보존 정리 대상 아님(만료된 연결 요청은 연결 흐름이 스스로 지운다)
   'oauth_credentials',
   'oauth_states',
+  'oauth_pending_tokens',
 ] as const;
 
 const HOUR = 3600_000;

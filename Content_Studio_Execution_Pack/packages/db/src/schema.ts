@@ -1510,16 +1510,9 @@ export const oauthCredentials = pgTable(
     /** FIX2-T13: 진행 중이거나 마지막으로 끝난 연결 해제 작업 ID. 다시 연결하면 null — 해제 요청이 자기 작업이 아직 현재인지 판정한다. */
     revokeOpId: uuid('revoke_op_id'),
     /**
-     * FIX3-T13(Codex review-FIX2-T13 Q14·놓친 케이스): 정리 대기 표시. 갱신으로 받은 새 토큰(T2)의 처리가 끝나지 않았을 때 남긴다 —
-     * refresh_unknown = 저장됐는지 판정하지 못함, cleanup_revoke = 저장하지 않은 T2 를 공급자에서 철회하지 못함.
-     * 첫 연결 정리 실패면 해제 상태의 자리 표시 행(revoked·해제 세대 0)에 남긴다.
-     * pending_token 은 T2 봉인(AAD purpose 'oauth_pending_token', 평문 없음). 표시가 있는 동안 연결 상태는 error(pending_<kind>)로 실행 차단
-     * (credentialHealth), 다음 확인·갱신·worker tick 이 공급자에 물어 정리한 뒤 지운다(reconcilePendingCredential). 키 교체가 다시 봉인한다.
+     * FIX3-T13 의 정리 대기 열(pending_*)은 FIX4-T13(0033)에서 별도 표 oauth_pending_tokens 로 옮겼다 — 계정마다 여러 건,
+     * 연결 정보 행이 없어도(첫 연결) 기록할 수 있다.
      */
-    pendingOpId: uuid('pending_op_id'),
-    pendingKind: text('pending_kind'),
-    pendingToken: text('pending_token'),
-    pendingKeyVersion: integer('pending_key_version'),
     /** access token 만료 시각 */
     expiresAt: ts('expires_at'),
     scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
@@ -1539,15 +1532,63 @@ export const oauthCredentials = pgTable(
     // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
     check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
     check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
-    check('oauth_credentials_pending_kind_chk', sql`${t.pendingKind} is null or ${t.pendingKind} in ('refresh_unknown', 'cleanup_revoke')`),
-    check('oauth_credentials_pending_chk', sql`(${t.pendingKind} is null) = (${t.pendingOpId} is null) and (${t.pendingKind} is null) = (${t.pendingToken} is null) and (${t.pendingToken} is null) = (${t.pendingKeyVersion} is null)`),
-    check('oauth_credentials_pending_sealed_chk', sql`${t.pendingToken} is null or ${t.pendingToken} like 'csk1:%'`),
     check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
     check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
     check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),
     check('oauth_credentials_sealed_chk', sql`${t.encryptedToken} is null or ${t.encryptedToken} like 'csk1:%'`),
     foreignKey({
       name: 'oauth_credentials_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * FIX4-T13(Codex review-FIX3-T13 P1 :908·:1037·P2 :1293): 정리 대기(oauth_pending_tokens). 발급받았지만 처리가 끝나지 않은 토큰과
+ * 아직 확인하지 못한 현재 토큰의 의무를 **건마다 한 행**으로 남긴다(계정마다 여러 행 — 두 번째 정리 실패도 버리지 않는다).
+ * - kind: refresh_unknown(받은 토큰 P 가 저장됐는지 모름) · cleanup_revoke(P 는 현재 토큰이 아님 — 공급자에서 다시 철회해야 함) ·
+ *   verify_current(P 는 정리됐지만 현재 토큰 C 의 유효성을 아직 확인하지 못함 — 봉인 없음, base_generation = 확인할 C 의 세대).
+ * - sealed_token: P 봉인(AAD purpose 'oauth_pending_token', 평문 없음). verify_current 만 비어 있다.
+ * - revision: 행을 바꿀 때마다 +1 — 공급자 호출 뒤 되쓰기는 읽은 revision 일 때만(낡은 판정 폐기).
+ * - attempts·next_attempt_at·last_result: 정리 시도마다(판정 불가 포함) 갱신 — worker 는 next_attempt_at 이 지난 행부터 고른다.
+ * 행이 하나라도 있으면 그 계정은 실행 차단(credentialHealth pendingKind). 연결 정보 행이 없어도 된다(첫 연결 — 자리 표시 행을 만들지 않는다).
+ * 모든 변경은 계정 → 연결 정보 잠금 아래. 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES). 키 교체가 다시 봉인한다.
+ */
+export const oauthPendingTokens = pgTable(
+  'oauth_pending_tokens',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    kind: text('kind').notNull(),
+    sealedToken: text('sealed_token'),
+    keyVersion: integer('key_version'),
+    /** refresh_unknown: 갱신 전에 읽은 세대(callback 은 null) · verify_current: 확인할 현재 토큰의 세대 */
+    baseGeneration: integer('base_generation'),
+    /** verify_current: C 가 무효로 확인되면 기록할 오류 코드(null 이면 공급자 코드) */
+    onInvalidCode: text('on_invalid_code'),
+    /** 어디서 생겼는가(refresh·callback·reconcile·migrated_0030 …) — 감사용 코드 */
+    source: text('source').notNull(),
+    revision: integer('revision').notNull().default(1),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: ts('next_attempt_at').notNull().defaultNow(),
+    lastResult: text('last_result'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    check('oauth_pending_tokens_kind_chk', sql`${t.kind} in ('refresh_unknown', 'cleanup_revoke', 'verify_current')`),
+    check('oauth_pending_tokens_token_chk', sql`(${t.kind} = 'verify_current') = (${t.sealedToken} is null)`),
+    check('oauth_pending_tokens_sealed_chk', sql`(${t.sealedToken} is null) = (${t.keyVersion} is null) and (${t.sealedToken} is null or ${t.sealedToken} like 'csk1:%')`),
+    check('oauth_pending_tokens_verify_chk', sql`${t.kind} <> 'verify_current' or ${t.baseGeneration} is not null`),
+    check('oauth_pending_tokens_counters_chk', sql`${t.revision} >= 1 and ${t.attempts} >= 0`),
+    index('oauth_pending_tokens_account_idx').on(t.ownerId, t.channelAccountId),
+    index('oauth_pending_tokens_next_attempt_idx').on(t.nextAttemptAt),
+    foreignKey({
+      name: 'oauth_pending_tokens_account_same_owner_fk',
       columns: [t.channelAccountId, t.ownerId],
       foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
     }).onDelete('restrict'),

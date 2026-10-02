@@ -219,6 +219,7 @@ describe('M1 게이트: 입력 → 검색 → 원고 수정 → export → 빈 D
     expect(exported.manifest.excluded_tables).toEqual([
       'export_runs',
       'oauth_credentials',
+      'oauth_pending_tokens',
       'oauth_states',
       'restore_drills',
       'restore_runs',

@@ -625,10 +625,10 @@ describe('할당량·401·거부·부분 성공·연결 정보', () => {
     const p = await plan([{ accountId: acc.id, variantId: v.variantId }]);
     await execute(p.planId);
     const cred = (await db.select().from(schema.oauthCredentials).where(eq(schema.oauthCredentials.channelAccountId, acc.id)))[0]!;
+    // FIX4-T13: 정리 대기는 oauth_pending_tokens 행
     await db
-      .update(schema.oauthCredentials)
-      .set({ pendingOpId: randomUUID(), pendingKind: 'cleanup_revoke', pendingToken: cred.encryptedToken, pendingKeyVersion: cred.keyVersion })
-      .where(eq(schema.oauthCredentials.id, cred.id));
+      .insert(schema.oauthPendingTokens)
+      .values({ ownerId: cred.ownerId, channelAccountId: acc.id, kind: 'cleanup_revoke', sealedToken: cred.encryptedToken, keyVersion: cred.keyVersion, source: 'test' });
     const calls = { ...api.calls };
     await tick();
     const job = await jobOf(p.items[0]!.id);

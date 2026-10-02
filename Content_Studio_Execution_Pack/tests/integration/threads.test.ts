@@ -503,10 +503,10 @@ describe('연결 정보를 쓸 수 없으면 보내지 않는다(T13 게이트)'
     const a3 = await linkedThreadsAccount();
     const p3 = await plan([{ accountId: a3.id, channel: 'threads', body: P1 }]);
     expect((await execute(p3.planId)).status).toBe(200);
+    // FIX4-T13: 정리 대기는 oauth_pending_tokens 행(계정마다 여러 건)
     await db
-      .update(schema.oauthCredentials)
-      .set({ pendingKind: 'cleanup_revoke', pendingOpId: randomUUID(), pendingToken: 'csk1:1:AAAA:BBBB:CCCC', pendingKeyVersion: 1 })
-      .where(eq(schema.oauthCredentials.channelAccountId, a3.id));
+      .insert(schema.oauthPendingTokens)
+      .values({ id: randomUUID(), ownerId: owner, channelAccountId: a3.id, kind: 'cleanup_revoke', sealedToken: 'csk1:1:AAAA:BBBB:CCCC', keyVersion: 1, source: 'test' });
     await tick();
     const j3 = await jobOf(p3.items[0]!.id);
     expect(j3.state).toBe('BLOCKED');

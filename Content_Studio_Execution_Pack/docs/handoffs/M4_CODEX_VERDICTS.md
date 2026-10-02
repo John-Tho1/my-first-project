@@ -43,3 +43,28 @@
 - [P1] packages/db/src/oauth.ts:1524 — 현재 토큰의 철회가 실패해도 `verify_current`를 삭제하여 재정리에 필요한 토큰을 잃는다
 - [P2] packages/db/src/oauth.ts:1077 — worker가 선택한 계정의 모든 행을 처리하여 행별 `next_attempt_at`을 무시한다
 - [P2] docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md:253 — 인계·리뷰 산출물을 추적되는 저장소 파일에 추가했다 → 코드 결함 아님, D28 로 처리(인계 사본은 docs 전용 커밋으로만, 코드 커밋에 섞지 않음)
+
+## FIX-T14 (6f766d2, T14 round 1) — CHANGES_REQUESTED (P1 1)
+- [P1] packages/db/src/jobs.ts:749 — 사용량과 진행 중 예약을 서로 다른 시점에 읽어 계정 한도를 초과할 수 있음
+
+## FIX5-T13 (492b1b9, T13 round 5) — CHANGES_REQUESTED (P1 1·P2 1)
+- [P1] packages/db/src/oauth.ts:1541 — 현재 토큰을 복호화하지 못한 경우에도 철회 의무를 남기지 않고 암호문을 삭제한다
+- [P2] packages/db/src/oauth.ts:1356 — stale 후처리가 다른 호출이 갱신한 다음 시도 시각을 앞당길 수 있다
+
+## FIX-T15 (cc26535, T15 round 1)
+PASS
+
+## FIX-M4screen (f2bb3b9, 화면 S1–S3)
+PASS
+
+## M4UI (fa37b1a, 화면 기능 G1·G2)
+CHANGES_REQUESTED
+- [P1] apps/web/lib/distribution.ts:161 — ‘공개 게시’를 선택해도 남아 있는 예약 공개 시각이 그대로 적용되는 요청을 만든다
+
+## FIX-M4screen2 (8d2cc64, 화면 S4·S5)
+CHANGES_REQUESTED
+- [P1] apps/web/lib/distribution.ts:860 — `PUBLISHED`라는 결과만으로 예약 공개가 적용되지 않았다고 단정한다
+
+## FIX-drill-mask (0c86db2, 업로드 세션 URI 이중 가림)
+CHANGES_REQUESTED
+- [P2] packages/db/src/bundle-tables.ts:79 — 가림 예외가 정상 마커 형식보다 넓어 비정상 값까지 그대로 내보낸다

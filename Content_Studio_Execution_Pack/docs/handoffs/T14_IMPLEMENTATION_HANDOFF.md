@@ -98,3 +98,60 @@
 3. 부분 게시 뒤 대기 중 취소를 UNKNOWN(`cancel_partial`)으로 둔 것과, 취소 요청 중 부분(D26 `thread_partial_cancel_requested`)을 같은 칸에 둔 것이 A11 에 맞는가? CANCELED + 부분 표식이 더 정확한가?
 4. 무료 재개를 "REMOTE_PROCESSING 에서의 resume"으로 한정하고 상한 20 을 둔 규칙이 무한 반복을 막으면서 정상 처리 지연을 허용하는가? RECONCILING 경유 REMOTE_PROCESSING 을 무료로 보는 것이 문제인가?
 5. 진행 중 예약(같은 어댑터·네 상태)과 advisory 잠금이 Codex 답 6 의 "엄격한 계정 한도"에 충분한가, 남은 구멍(RETRY_WAIT 부분 스레드 미예약·used=0 예외)을 지금 막아야 하는가?
+
+## FIX round 2 (Codex review-FIX-T14)
+- Orchestrator: HEAD_SHA 746aa3a (code only, D28) — reran lint·typecheck·build·unit 746·integration 572·drill:mock 0·real-DB drill:restore PASS.
+
+- BASE: `0691cf3` · HEAD: TBD (커밋하지 않음 — 오케스트레이터가 커밋 후 SHA 기입)
+- 입력: `.handoffs/review-FIX-T14.md`(CHANGES_REQUESTED, P1 1건 + 답 8 + 놓친 케이스)
+- 범위: 로컬 요청 제한 검사의 스냅샷 경쟁(P1)과 값싼 놓친 케이스(경계·여러 만료 시각). 정책 변경 없음(D26 `used=0` 예외 유지 — 질문으로 남김). 새 의존성·migration 없음.
+
+### 지적 → 변경 → 시험
+- **[P1] jobs.ts:749 사용량·진행 중 예약을 서로 다른 시점에 읽음** — READ COMMITTED 에서 B 가 `recentPublishUsage`(사용 0)를 읽은 뒤 A 가 게시 단계 2개를 기록하고 CONFIRMED 로 끝나면, B 의 `inflightRateUnits` 에도 A 가 없어 한도 3 에서 4개가 나간다.
+  - 변경(설계): (1) **한 스냅샷** — `remote-steps.ts` `accountRateSnapshot()` 이 계정의 창 안 사용 단위 수·가장 오래된 시각, 검사하는 작업 자신의 단계, 같은 계정의 진행 중(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED, attempt > 0) 다른 작업의 지금 시도 의도(`sanitized_details`)·항목 스냅샷 열·단계를 **SQL 한 문장**(스칼라 서브쿼리 + `json_agg`)으로 읽는다. PostgreSQL 은 한 문장 안의 모든 서브쿼리에 같은 스냅샷을 쓰므로, 진행 중 작업이 단계를 기록하면 그 단위는 "예약 → 사용"으로 옮겨 갈 뿐 합계에서 빠지지 않는다. 남은 단위 계산은 순수 함수(`rateUnitsFromSteps` — Threads `rateUnits − 단계 수`, YouTube `rateUnitsRemaining(steps)`; FIX-T15 규칙 그대로)로 바꿔 따로 조회하지 않는다. 자기 작업의 `needed` 도 같은 스냅샷에서 계산하므로 계정 잠금은 이제 rate_limit 가 있으면 `needed = 0` 이어도 잡는다(짧은 직렬화뿐). (2) **잠금 순서** — 스냅샷은 계정 advisory 잠금(`cs_rate:<계정>`, 배타, 트랜잭션 끝까지)을 잡은 **뒤** 읽는다 → 앞선 검사의 전송 의도는 커밋 뒤에야 잠금이 풀리므로 다음 검사의 스냅샷에 보인다(검사끼리 같은 잔여량을 쓰지 않음). (3) **두 번째 방어선** — `recordRemoteStep` 이 트랜잭션 시작에서 같은 키를 **공유**(`pg_advisory_xact_lock_shared`)로 잡는다: 검사 도중에는 어떤 단계 기록도 커밋되지 않고, 기록끼리는 서로 막지 않는다. 잠금 순서는 공유 잠금 → 단계 행 FOR UPDATE, 검사 쪽은 단계 행을 잠그지 않으므로 순환 없음. 작업 종료(예약 해제) 전이에는 잠금을 걸지 않았다 — 한 스냅샷에서는 종료가 원자적으로 보이고, 진행 중 상태에서 빠지는 전이는 앞으로 보낼 단위를 늘리지 않으며(다시 보내려면 `beginSend` 의 검사를 지남), 진행 중으로 들어가는 전이는 `send_start`(같은 잠금 안) 뿐이다.
+  - 왜 이것이 가장 단순한가: 사용량 + 예약을 순수 SQL 로 합치려면 어댑터별 단위 규칙(게시물 수·세션 상태)을 SQL 로 옮겨야 한다. 대신 필요한 행을 한 문장으로 가져와 JS 에서 같은 어댑터 규칙으로 계산한다.
+  - 시험 훅: `JobRunOptions.rateCheckHook(tx, { phase: 'before_snapshot' | 'after_usage', jobId, accountId })`(시험 전용, 같은 트랜잭션 안에서 호출). 이전 코드에서 `after_usage` 는 사용량 조회와 진행 중 조회 **사이**였고, 새 코드에서는 한 스냅샷 직후다.
+  - 시험: `tests/integration/threads.test.ts` "P1 round 2: 한도 3, A·B 각 2개 …" `it.each(['after_usage', 'before_snapshot'])` — A(2개, container_slow)가 REMOTE_PROCESSING·게시 단계 0 인 상태에서 B(2개)의 검사 중 훅이 A 의 게시 단계 2개를 넣고 A 를 CONFIRMED 로 바꾼다(PGlite 는 연결이 하나라 A 의 커밋을 B 의 tx 로 써서 흉내 냄 — B 의 다음 문장이 READ COMMITTED 에서 보게 될 상태와 같다). 기대: B RETRY_WAIT·`local_rate_limited`·전송 의도 0·게시 단계 0, 이벤트 `after_usage` → `{used 0, inflight 2, needed 2}`, `before_snapshot` → `{used 2, inflight 0, needed 2}`.
+  - **이전 코드에서 실패 확인**: 훅만 이전 코드(사용량 조회 → 훅 → 진행 중 조회)에 넣고 같은 시험을 돌림 → `after_usage` **실패**(B 가 `CONFIRMED` — 2 + 2 = 4개 게시, Codex 시나리오 그대로), `before_snapshot` 통과. 수정 뒤 둘 다 통과. (그때 시험의 모의 ID 문자열만 `mock-race-…` 였고, 내보내기 비밀 시험이 `mockthr_` 접두사를 요구해 `mockthr_post_race…` 로 바꿈 — 논리 동일.)
+- **놓친 케이스(값싼 것)**
+  - 창 경계: 사용량 조회를 `created_at >= since` → `> since` 로 바꿈(`accountRateSnapshot`·`recentPublishUsage`). 이전에는 `resetAt = 가장 오래된 기록 + 창` 시각에 다시 보면 그 기록이 아직 창 안이라 1초 더 막혔다.
+  - `packages/domain/src/jobs.test.ts` 새 단위 시험: 정확히 한도(1 + 2 = 3) 허용, 3 + 1 대기, 빈 창 `needed = max` 허용, 빈 창 `needed > max` 는 현재 D26 예외로 허용(명시 — 엄격 상한과 양립하지 않음, 질문 2), 서로 다른 시각에 만료되는 기록 3개(−50·−30·−10분)에서 첫 재검사는 +10분 → 여전히 대기·다음 재검사 +30분 → 허용(재검사 시각이 용량을 보장하지는 않지만 다음 기록 기준으로 이어짐).
+  - 손대지 않은 놓친 케이스: 무료 재개 20·21 경계, `maxAttempts=1`, 20개 스레드 교차, 복원 후 재연결 재확인, YouTube 복원→재내보내기(0c86db2 에서 별도 처리), `getAdapterById` 없는 레지스트리, 두 번째 게시물 403, 취소·LEASED 경쟁 — 이번 P1 범위 밖(다음 라운드 후보).
+
+### 바뀐 파일
+- `packages/db/src/remote-steps.ts` — `accountRateSnapshot()`(한 문장 스냅샷)·`RateInflightJob`/`AccountRateSnapshot` 타입, `recordRemoteStep` 의 공유 advisory 잠금, 창 경계 `gt`.
+- `packages/db/src/jobs.ts` — `rateUnitsNeeded`/`inflightRateUnits`(여러 조회) → 순수 `rateUnitsFromSteps`/`inflightRateUnitsOf`(스냅샷 행), `beginSend` 요청 제한 블록(잠금 → 스냅샷 → 판단), `JobRunOptions.rateCheckHook`(시험 전용).
+- `packages/domain/src/jobs.test.ts` — 경계·여러 만료 시각 단위 시험 1건.
+- `tests/integration/threads.test.ts` — P1 회귀 시험 2건(it.each).
+
+### Migrations / restore implications
+- 없음(스키마·트리거 변경 없음, 0035 미사용). 내보내기·복원 형식 그대로.
+
+### 실행한 명령과 결과(Windows 10, 포터블 Node 24.21.0, `corepack pnpm`, 순차 실행)
+- 이전 코드 + 훅 + 새 시험: `vitest run --project integration tests/integration/threads.test.ts -t "P1 round 2"` → **1 failed**(after_usage: B `CONFIRMED`) / 1 passed — 기대한 실패.
+- `pnpm lint` → pass
+- `pnpm typecheck` → pass
+- `pnpm build` → pass
+- `pnpm test` → pass 39 files / 746 tests
+- `pnpm test:integration`(단독) → pass 31 files / 572 tests, 461.6 s
+- `pnpm drill:mock` → exit 0, `불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK)`, YouTube fetch 0
+- not_run: 실제 PostgreSQL 다중 연결 병렬 시험(이 환경에 없음 — PGlite 한 연결만), `db:migrate`·`db:seed`·`drill:restore`(./data 금지), 운영 모드 smoke·브라우저, Codex 검증
+
+### 남은 위험
+- **실제 다중 연결 PostgreSQL 에서 관찰하지 않았다.** 한 문장 스냅샷·advisory 배타/공유 잠금의 동작은 PostgreSQL 의미론에 기댄 설계이고, 시험은 PGlite 한 연결에서 끼어드는 커밋을 같은 트랜잭션 쓰기로 흉내 낸 것이다(잠금 대기·교착은 관찰 불가).
+- `hashtext` 충돌로 서로 다른 계정이 같은 잠금 키를 쓰면 불필요한 직렬화만 생긴다(정확성 영향 없음).
+- lease 를 잃은 worker 가 원격 호출을 계속해 단계를 기록하는 경우(작업은 이미 RETRY_WAIT 등 진행 중 밖), 그 단위는 예약에 없다 — 사용량에는 커밋 뒤 잡힌다. 원격 호출 전 heartbeat(FIX-T11) 이 창을 좁히지만 0 은 아니다.
+- RETRY_WAIT 부분 스레드의 남은 게시물은 예약하지 않는다(돌아올 때 `beginSend` 에서 다시 검사 — Codex 답 5 가 허용한 조건).
+- `used = 0` 이면 한도보다 큰 작업도 허용하는 D26 예외는 그대로 — 엄격 상한이 아니다(질문 2).
+- `rateCheckHook` 은 운영 코드 경로에 있는 시험 전용 선택 인자다(web·CLI 는 넣지 않음).
+- 계정 잠금을 `needed = 0`(YouTube 세션 재개)에도 잡게 되어 같은 계정의 검사가 조금 더 직렬화된다.
+
+### 결정 기록 필요(DECISIONS.md 는 이번 범위에서 건드리지 않음)
+- D26 후속: "로컬 한도 = 계정 advisory 잠금(검사 배타·단계 기록 공유) + 사용량·예약 한 문장 스냅샷", "창 경계 created_at > since".
+
+### Codex 에게 묻는 것
+1. 한 문장 스냅샷(`accountRateSnapshot`) + 검사 배타 잠금만으로도 P1 이 닫힌다고 보았다(단계 기록은 예약→사용 이동, 종료 전이는 보낼 단위를 늘리지 않음). 작업 종료·취소·만료 복구 전이에도 같은 잠금이 필요한 경우가 남아 있는가?
+2. 빈 창 `needed > max_units` 를 지금처럼 허용할지, 보내지 않고 FAILED(`rate_units_exceed_limit`)로 닫을지 — 엄격 상한을 택하면 긴 스레드(예: 한도보다 게시물이 많은 경우)는 영원히 못 나간다. 사용자 결정으로 올릴 것인가?
+3. `recordRemoteStep` 의 공유 잠금(모든 단계 기록, YouTube 조각 진행 기록 포함)이 업로드 진행 기록을 검사 동안 잠시 막는 비용에 비해 가치가 있는가, 아니면 한 스냅샷만으로 충분하니 빼는 편이 나은가?
+4. PGlite 한 연결에서 "같은 tx 로 A 의 커밋을 흉내 내는" 훅 시험이 이 경쟁의 회귀 시험으로 충분한가, 아니면 실제 PostgreSQL 다중 연결 시험(선택 실행)을 요구할 것인가?
+5. 창 경계를 `>` 로 바꾼 것이 원격(Threads 24시간 창) 의미와 맞는가 — 정확히 창 길이만큼 지난 기록을 빼는 것이 원격보다 느슨할 위험은 없는가?

@@ -111,6 +111,22 @@ describe('봉인·열기', () => {
   });
 });
 
+describe('FIX-T13 Q6 — 비정규 base64url 거부', () => {
+  it('같은 바이트로 디코딩되는 다른 표기(남는 비트)는 malformed', () => {
+    const { ciphertext } = sealSecret(ring1, 'token-value', aad);
+    const parts = ciphertext.split(':');
+    const tag = parts[3]!;
+    const canonical = Buffer.from(tag, 'base64url');
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const alt = [...alphabet].map((c) => tag.slice(0, -1) + c).find((t) => t !== tag && Buffer.from(t, 'base64url').equals(canonical))!;
+    expect(alt).toBeDefined();
+    const p = [...parts];
+    p[3] = alt;
+    expect(problem(() => openSecret(ring1, p.join(':'), 1, aad))).toBe('malformed');
+    expect(openSecret(ring1, ciphertext, 1, aad)).toBe('token-value');
+  });
+});
+
 describe('키 교체(rotation)', () => {
   it('새 키 + 이전 키: 옛 암호문을 열고 새 키로 다시 봉인, 이전 키를 빼도 새 암호문은 열림, 현재 버전이면 null', () => {
     const old = sealSecret(ring1, 'rotate-me', aad);

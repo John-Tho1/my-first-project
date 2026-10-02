@@ -1,10 +1,11 @@
 /** T13(D24): OAuth 공통 — PKCE S256, state, scope, 연결 상태 판정, live 준비 상태(항상 준비 안 됨). */
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from './config';
+import { ConfigError, loadConfig } from './config';
 import {
   codeChallengeS256,
   credentialHealth,
   hashOAuthState,
+  isPlainRedirectUri,
   isWellFormedOAuthState,
   liveOAuthReadiness,
   newCodeVerifier,
@@ -102,5 +103,24 @@ describe('live 준비 상태 — T13 에는 live 어댑터가 없어 항상 준�
     const r = liveOAuthReadiness(config, { threadsAppSecretPresent: true, masterKeyConfigured: true });
     expect(r).toEqual({ ready: false, missing: ['LIVE_OAUTH_ADAPTER(T14 미구현)'] });
     expect(JSON.stringify(r)).not.toContain('placeholder-app-id');
+  });
+});
+
+describe('FIX-T13 P2 — redirect URI 는 query·fragment 없이', () => {
+  it('query·fragment·사용자 정보·http(s) 아님 → 설정 오류(ConfigError), 경로만 있는 주소는 통과', () => {
+    for (const bad of [
+      'http://localhost:3000/api/oauth/callback?tenant=x',
+      'http://localhost:3000/api/oauth/callback#frag',
+      'http://localhost:3000/api/oauth/callback?',
+      'http://user:pw@localhost:3000/api/oauth/callback',
+      'ftp://localhost/api/oauth/callback',
+    ]) {
+      expect(() => loadConfig({ OAUTH_REDIRECT_URI: bad }), bad).toThrow(ConfigError);
+      expect(isPlainRedirectUri(bad), bad).toBe(false);
+    }
+    expect(loadConfig({ OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback' }).OAUTH_REDIRECT_URI).toBe('https://studio.example.test/api/oauth/callback');
+    expect(isPlainRedirectUri('https://studio.example.test/api/oauth/callback')).toBe(true);
+    // 기본값은 APP_BASE_URL 의 origin 만 쓴다(경로·query 가 있어도)
+    expect(oauthRedirectUri(loadConfig({ APP_BASE_URL: 'http://localhost:3000/app?x=1' }))).toBe('http://localhost:3000/api/oauth/callback');
   });
 });

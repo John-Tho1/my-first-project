@@ -158,8 +158,23 @@ export const configSchema = z.object({
    * 서버가 존재 여부만 따로 확인한다(THREADS_APP_SECRET, SECRETS_MASTER_KEY).
    */
   OAUTH_MODE: opt(z.enum(['mock', 'live']).default('mock')),
-  /** callback 정확 일치 대상. 없으면 APP_BASE_URL + /api/oauth/callback. */
-  OAUTH_REDIRECT_URI: opt(z.url().optional()),
+  /**
+   * callback 정확 일치 대상. 없으면 APP_BASE_URL + /api/oauth/callback.
+   * FIX-T13: http(s) + host + path 만 — query·fragment·사용자 정보가 있으면 설정 오류(callback 과 절대 맞지 않음).
+   */
+  OAUTH_REDIRECT_URI: opt(
+    z
+      .url()
+      .refine((v) => {
+        try {
+          const u = new URL(v);
+          return (u.protocol === 'http:' || u.protocol === 'https:') && !u.search && !u.hash && !v.includes('?') && !v.includes('#') && !u.username && !u.password && `${u.origin}${u.pathname}` === v;
+        } catch {
+          return false;
+        }
+      })
+      .optional(),
+  ),
   OAUTH_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
   /** 앱 ID 는 비밀이 아니지만 화면에는 설정 여부만 보인다. */
   THREADS_APP_ID: opt(z.string().min(1).max(100).optional()),

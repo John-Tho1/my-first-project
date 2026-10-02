@@ -253,6 +253,7 @@ export interface AuditInput {
     | 'oauth.connected'
     | 'oauth.refreshed'
     | 'oauth.refresh_failed'
+    | 'oauth.refresh_discarded'
     | 'oauth.checked'
     | 'oauth.revoked'
     | 'oauth.key_rotated';

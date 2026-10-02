@@ -1429,6 +1429,11 @@ export const oauthCredentials = pgTable(
     isMock: boolean('is_mock').notNull(),
     encryptedToken: text('encrypted_token'),
     keyVersion: integer('key_version'),
+    /**
+     * FIX-T13: 토큰 세대 — 교환·갱신·다시 연결로 새 토큰을 저장할 때마다 +1. 키 교체(재암호화)는 바꾸지 않는다.
+     * 공급자 호출 뒤 되쓰기는 읽었던 세대와 같을 때만 한다(계정 → 연결 정보 순서로 잠근 뒤).
+     */
+    tokenGeneration: integer('token_generation').notNull().default(1),
     /** access token 만료 시각 */
     expiresAt: ts('expires_at'),
     scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
@@ -1445,7 +1450,9 @@ export const oauthCredentials = pgTable(
     unique('oauth_credentials_account_uq').on(t.channelAccountId),
     check('oauth_credentials_provider_chk', sql`${t.provider} in ('mock_threads', 'threads')`),
     check('oauth_credentials_mock_chk', sql`${t.isMock} = (${t.provider} = 'mock_threads')`),
-    check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoked')`),
+    // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
+    check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
+    check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
     check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
     check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
     check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),

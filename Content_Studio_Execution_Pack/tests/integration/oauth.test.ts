@@ -6,6 +6,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { inspect } from 'node:util';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, eq } from 'drizzle-orm';
 import {
@@ -17,7 +18,9 @@ import {
   createVariantDraft,
   ensureOwner,
   exportOwner,
+  formatRotationReport,
   getAccountHealth,
+  oauthTestHooks,
   getDb,
   listChannelAccounts,
   parseBundleZip,
@@ -29,8 +32,8 @@ import {
   setVariantLifecycle,
   type Db,
 } from '@cs/db';
-import { loadConfig, openSecret, requireSecretKeyring, type Channel } from '@cs/domain';
-import { createMockAdapterRegistry, LocalStorageAdapter, MockThreadsOAuthProvider } from '@cs/providers';
+import { buildBundle, loadConfig, openSecret, requireSecretKeyring, writeZip, type BundleTables, type Channel } from '@cs/domain';
+import { createMockAdapterRegistry, LocalStorageAdapter, mockOAuthStore, MockThreadsOAuthProvider } from '@cs/providers';
 import { GET as accountsGET } from '../../apps/web/app/api/channel-accounts/route';
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
 import { GET as healthGET } from '../../apps/web/app/api/channel-accounts/[id]/health/route';
@@ -169,6 +172,7 @@ beforeAll(async () => {
 beforeEach(() => {
   as(A);
   key1();
+  for (const k of Object.keys(oauthTestHooks) as Array<keyof typeof oauthTestHooks>) delete oauthTestHooks[k];
 });
 afterAll(async () => {
   vi.unstubAllEnvs();
@@ -179,7 +183,10 @@ afterAll(async () => {
 describe('전체 흐름 + 비밀이 어디에도 나가지 않음', () => {
   it('connect → 모의 동의 → callback → health → refresh → check → revoke: 토큰·code·verifier 는 응답·감사·내보내기·콘솔·DB 평문 어디에도 없다', async () => {
     const logs: string[] = [];
-    for (const m of ['log', 'info', 'warn', 'error', 'debug'] as const) vi.spyOn(console, m).mockImplementation((...args: unknown[]) => void logs.push(args.map(String).join(' ')));
+    // FIX-T13(Q7): 객체 인수도 깊게 직렬화해 검사한다(String() 은 객체 안의 비밀을 놓친다)
+    for (const m of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+      vi.spyOn(console, m).mockImplementation((...args: unknown[]) => void logs.push(args.map((a) => (typeof a === 'string' ? a : inspect(a, { depth: Infinity, getters: true }))).join(' ')));
+    }
     seen.length = 0;
     const accountId = await newThreadsAccount();
     const c = await connect(accountId);
@@ -312,7 +319,7 @@ describe('state·redirect·PKCE·거부', () => {
     expect((await (await callback(e.location!)).json()).error).toBe('oauth_state_used');
   });
 
-  it('다른 세션(같은 owner 의 새 로그인)으로 callback → oauth_state_invalid', async () => {
+  it('다른 세션(같은 owner 의 새 로그인)으로 callback → oauth_state_invalid, state 는 소비되지 않아 원래 세션은 성공(Codex Q1)', async () => {
     const accountId = await newThreadsAccount();
     const b = await begin(accountId);
     const token2 = await login(A);
@@ -320,6 +327,10 @@ describe('state·redirect·PKCE·거부', () => {
     expect(r.status).toBe(400);
     expect((await r.json()).error).toBe('oauth_state_invalid');
     expect(await credRow(accountId)).toBeNull();
+    const st = (await db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, accountId)))[0]!;
+    expect(st.usedAt).toBeNull();
+    expect((await callback(b.location!)).status).toBe(200);
+    expect((await (await callback(b.location!)).json()).error).toBe('oauth_state_used');
   });
 
   it('redirect URI 불일치: callback 주소가 다르면 oauth_redirect_mismatch, 공급자 쪽에서 redirect_uri 를 바꾸면 400', async () => {
@@ -512,8 +523,12 @@ describe('갱신·키 교체·변조', () => {
     // 교체 기간: v2 + 이전 v1
     useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
     expect((await check(accountId)).status).toBe(200);
+    const dry = await rotateSecretKeys(db, requireSecretKeyring(process.env), { dryRun: true });
+    expect(dry.credentials.toReseal).toBeGreaterThanOrEqual(2);
+    expect(dry.credentials.resealed).toBe(0);
+    expect((await credRow(accountId))!.keyVersion).toBe(1);
     const r = await rotateSecretKeys(db, requireSecretKeyring(process.env));
-    expect(r.resealed).toBeGreaterThanOrEqual(1);
+    expect(r.credentials.resealed).toBeGreaterThanOrEqual(2);
     expect((await credRow(accountId))!.keyVersion).toBe(2);
     expect((await credRow(accountId))!.encryptedToken!.startsWith('csk1:2:')).toBe(true);
     useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2' });
@@ -581,5 +596,307 @@ describe('/ops 숫자', () => {
     const bodyB = await (await opsSummaryGET(get('/api/ops/summary', tokenB), undefined)).json();
     expect(bodyB.ops.account_health.connected).toBe(0);
     expect(bodyB.ops.account_health.not_connected).toBe(4);
+  });
+});
+
+// ---------------- FIX round 1 (Codex review-T13 + D25) ----------------
+
+/** 모의 공급자에서 이 계정(사용자)에게 아직 유효한 토큰 수 */
+async function liveProviderTokens(accountId: string): Promise<number> {
+  const user = (await accountRow(accountId)).externalAccountId;
+  return [...mockOAuthStore().tokens.values()].filter((t) => t.user === user && !t.revoked).length;
+}
+const auditDetails = async (accountId: string, action: string) =>
+  (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.entityId, accountId), eq(schema.auditEvents.action, action)))).map(
+    (a) => a.sanitizedDetails as Record<string, unknown>,
+  );
+
+describe('FIX P1 #1 — 갱신 vs 키 교체·다시 연결(토큰 세대)', () => {
+  it('갱신 중 키 교체(재암호화) → 세대가 그대로라 새 토큰 T2 가 저장되고 유효, 옛 T1 은 철회', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const t1 = await decryptToken(ownerA, accountId);
+    const gen1 = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.afterProviderRefresh = async () => {
+      useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
+      const r = await rotateSecretKeys(db, requireSecretKeyring(process.env));
+      expect(r.credentials.resealed).toBeGreaterThanOrEqual(1);
+    };
+    const res = await refresh(accountId);
+    expect(res.status).toBe(200);
+    const row = (await credRow(accountId))!;
+    expect(row.tokenGeneration).toBe(gen1 + 1);
+    expect(row.keyVersion).toBe(2);
+    const t2 = await decryptToken(ownerA, accountId);
+    expect(t2).not.toBe(t1);
+    expect((await check(accountId)).status).toBe(200);
+    expect((await getAccountHealth(db, ownerA, accountId)).status).toBe('connected');
+    expect(await liveProviderTokens(accountId)).toBe(1);
+  });
+
+  it('갱신 중 다시 연결(세대 +1) → 갱신의 새 토큰은 저장하지 않고 공급자에서 철회, 409 credential_changed, 다시 연결 토큰은 유효', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.afterProviderRefresh = async () => {
+      delete oauthTestHooks.afterProviderRefresh;
+      await connectFully(accountId);
+    };
+    const res = await refresh(accountId);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'credential_refresh_failed', reason: 'credential_changed' });
+    expect((await check(accountId)).status).toBe(200);
+    expect((await getAccountHealth(db, ownerA, accountId)).status).toBe('connected');
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    expect((await auditDetails(accountId, 'oauth.refresh_discarded'))[0]).toMatchObject({ reason: 'credential_changed', issued_token_revoke: 'ok' });
+  });
+});
+
+describe('FIX P1 #2 — 옛 토큰의 확인 결과가 새 연결을 덮지 않음', () => {
+  it('확인이 T1 을 읽은 뒤 갱신이 T2 저장(T1 철회) → T1 확인 실패(token_revoked)는 버려지고 T2 는 connected 그대로', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.beforeProviderCheck = async () => {
+      delete oauthTestHooks.beforeProviderCheck;
+      expect((await refresh(accountId)).status).toBe(200);
+    };
+    const res = await check(accountId);
+    expect(res.status).toBe(200);
+    expect((await res.json()).account).toMatchObject({ status: 'connected', last_error_code: null });
+    const row = (await credRow(accountId))!;
+    expect(row.status).toBe('active');
+    expect(row.lastErrorCode).toBeNull();
+    expect((await auditDetails(accountId, 'oauth.checked')).some((d) => d.result === 'discarded_stale')).toBe(true);
+  });
+});
+
+describe('FIX P1 #3 — 연결 해제는 철회한 세대만 지운다', () => {
+  it('해제 진행 중(revoking): 갱신 409 credential_busy, 다시 연결 저장도 거부(받은 토큰 철회), 실행 차단 → 해제 완료 ok, 해제 전 연결 요청은 늦게 와도 거부', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const late = await begin(accountId); // 해제 전에 만든 연결 요청
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      expect((await getAccountHealth(db, ownerA, accountId)).status).toBe('revoked');
+      const rf = await refresh(accountId);
+      expect(rf.status).toBe(409);
+      expect((await rf.json()).error).toBe('credential_busy');
+      const b = await begin(accountId);
+      const cb = await callback(b.location!);
+      expect(cb.status).toBe(409);
+      expect((await cb.json()).error).toBe('credential_busy');
+    };
+    const rv = await revoke(accountId);
+    expect(await rv.json()).toMatchObject({ remote_revoke: 'ok', account: { status: 'revoked' } });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    const lateRes = await callback(late.location!);
+    expect(lateRes.status).toBe(400);
+    expect(['oauth_state_used', 'oauth_state_invalid']).toContain((await lateRes.json()).error);
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+  });
+
+  it('해제가 읽은 뒤 세대가 바뀌면 지우지 않고 incomplete(계속 차단), 다시 해제하면 마무리', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      await db.update(schema.oauthCredentials).set({ tokenGeneration: 99 }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    };
+    const rv = await revoke(accountId);
+    expect((await rv.json()).remote_revoke).toBe('incomplete');
+    const row = (await credRow(accountId))!;
+    expect(row.status).toBe('revoking');
+    expect(row.encryptedToken).not.toBeNull();
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(false);
+    const again = await revoke(accountId);
+    expect(again.status).toBe(200);
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+  });
+
+  it('해제가 먼저 커밋되면(revoking) 작업 처리기는 전송 의도를 만들지 않는다', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const { planId, itemId } = await approvedPlanFor(accountId);
+    expect((await execute(planId)).status).toBe(200);
+    await db.update(schema.oauthCredentials).set({ status: 'revoking' }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    await tick();
+    const job = (await db.select().from(schema.jobs).where(eq(schema.jobs.itemId, itemId)))[0]!;
+    expect(job.state).toBe('BLOCKED');
+    expect(job.lastErrorCode).toBe('credential_revoked');
+    expect(await db.select().from(schema.sendIntents).where(eq(schema.sendIntents.jobId, job.id))).toHaveLength(0);
+  });
+});
+
+describe('FIX — 교환 뒤 실패·늦은 callback', () => {
+  it('교환 성공 뒤 계정 정보 실패 → 400, 받은 토큰은 공급자에서 철회', async () => {
+    const accountId = await newThreadsAccount();
+    const b = await begin(accountId);
+    mockOAuthStore().failNext = { op: 'account', code: 'provider_error' };
+    const r = await callback(b.location!);
+    expect(r.status).toBe(400);
+    expect(await credRow(accountId)).toBeNull();
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.callback_rejected')).some((d) => d.reason === 'account_info_failed' && d.issued_token_revoke === 'ok')).toBe(true);
+  });
+
+  it('DB 저장 실패(예외) → 500 일반 오류(헤더 no-referrer·no-store), 받은 토큰 철회, 저장 없음', async () => {
+    const accountId = await newThreadsAccount();
+    const b = await begin(accountId);
+    oauthTestHooks.beforeCallbackStore = async () => {
+      throw new Error('simulated db failure');
+    };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const r = await callback(b.location!);
+    errors.mockRestore();
+    expect(r.status).toBe(500);
+    expect(r.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(r.headers.get('cache-control')).toBe('no-store');
+    expect(await credRow(accountId)).toBeNull();
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect((await auditDetails(accountId, 'oauth.callback_rejected')).some((d) => d.reason === 'store_failed' && d.issued_token_revoke === 'ok')).toBe(true);
+  });
+
+  it('저장 직전에 연결 해제가 끼어듦(요청 뒤 해제) → 저장 거부, 받은 토큰 철회', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const b = await begin(accountId);
+    oauthTestHooks.beforeCallbackStore = async () => {
+      delete oauthTestHooks.beforeCallbackStore;
+      await new Promise((r) => setTimeout(r, 5));
+      expect((await revoke(accountId)).status).toBe(200);
+    };
+    const r = await callback(b.location!);
+    expect(r.status).toBe(400);
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});
+
+describe('FIX Q7 — callback·동의 화면 응답 헤더', () => {
+  it('비로그인·HTML 실패·HTML 성공·동의 화면 400·303·비로그인 모두 Referrer-Policy no-referrer, Cache-Control no-store', async () => {
+    const accountId = await newThreadsAccount();
+    const responses: Response[] = [];
+    responses.push(await callbackGET(new Request(`${BASE}/api/oauth/callback?state=x&code=y`, { headers: { accept: 'application/json' } })));
+    responses.push(await callbackGET(new Request(`${BASE}/api/oauth/callback?state=x&code=y`, { headers: { accept: 'text/html', ...cookieHeader(tokenA) } })));
+    const b = await begin(accountId);
+    responses.push(b.authorizeRes);
+    const ok = await callbackGET(new Request(b.location!, { headers: { accept: 'text/html', ...cookieHeader(tokenA) } }));
+    expect(ok.status).toBe(303);
+    expect(ok.headers.get('location')).toBe('/settings?connected=1#accounts');
+    responses.push(ok);
+    const c = (await (await connect(accountId)).json()).authorize_url as string;
+    responses.push(await authorize(c, { redirect_uri: 'http://evil.example.test/cb' }));
+    responses.push(await mockAuthorizeGET(new Request(c, { headers: { accept: 'application/json' } })));
+    expect(responses[0]!.status).toBe(401);
+    expect(responses[1]!.status).toBe(303);
+    expect(responses[5]!.status).toBe(401);
+    for (const r of responses) {
+      expect(r.headers.get('referrer-policy'), String(r.status)).toBe('no-referrer');
+      expect(r.headers.get('cache-control'), String(r.status)).toBe('no-store');
+    }
+  });
+});
+
+describe('D25-3 — 모의 시험 매개변수는 운영에서 거부', () => {
+  it('NODE_ENV=production: mock_user·mock_grant·mock_deny → 400 mock_params_not_allowed, 매개변수 없으면 정상 303', async () => {
+    const accountId = await newThreadsAccount();
+    vi.stubEnv('NODE_ENV', 'production');
+    try {
+      for (const p of [{ mock_user: 'mock:threads:other' }, { mock_grant: 'threads_basic' }, { mock_deny: '1' }] as Array<Record<string, string>>) {
+        const url = (await (await connect(accountId)).json()).authorize_url as string;
+        const r = await authorize(url, p);
+        expect(r.status).toBe(400);
+        expect((await r.json()).error).toBe('mock_params_not_allowed');
+      }
+      const url = (await (await connect(accountId)).json()).authorize_url as string;
+      expect((await authorize(url)).status).toBe(303);
+    } finally {
+      vi.stubEnv('NODE_ENV', 'test');
+    }
+    const url = (await (await connect(accountId)).json()).authorize_url as string;
+    expect((await authorize(url, { mock_deny: '1' })).status).toBe(303);
+  });
+});
+
+describe('FIX Q6·D25-5 — 키 교체는 모든 봉인을 검사', () => {
+  it('현재 버전 행의 손상 태그·열/봉투 버전 불일치를 failed(종류별)로 세고 그대로 둔다, 미리보기는 변경 없음, 출력에 암호문·키 없음', async () => {
+    const good = await newThreadsAccount();
+    const bad = await newThreadsAccount();
+    const mism = await newThreadsAccount();
+    for (const a of [good, bad, mism]) await connectFully(a);
+    const cb = (await credRow(bad))!;
+    const parts = cb.encryptedToken!.split(':');
+    parts[4] = (parts[4]![0] === 'A' ? 'B' : 'A') + parts[4]!.slice(1);
+    await db.update(schema.oauthCredentials).set({ encryptedToken: parts.join(':') }).where(eq(schema.oauthCredentials.channelAccountId, bad));
+    const cm = (await credRow(mism))!;
+    await db.update(schema.oauthCredentials).set({ encryptedToken: cm.encryptedToken!.replace(/^csk1:1:/, 'csk1:7:') }).where(eq(schema.oauthCredentials.channelAccountId, mism));
+    const before = JSON.stringify(await db.select().from(schema.oauthCredentials));
+    const dry = await rotateSecretKeys(db, requireSecretKeyring(process.env), { dryRun: true });
+    expect(dry.credentials.failed.auth_failed).toBeGreaterThanOrEqual(1);
+    expect(dry.credentials.failed.version_mismatch).toBeGreaterThanOrEqual(1);
+    expect(dry.credentials.alreadyCurrent).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(await db.select().from(schema.oauthCredentials))).toBe(before);
+    const text = formatRotationReport(dry);
+    expect(text).toContain('미리보기');
+    expect(text).toContain('auth_failed');
+    for (const r of await db.select().from(schema.oauthCredentials)) if (r.encryptedToken) expect(text).not.toContain(r.encryptedToken);
+    expect(text).not.toContain(KEY1);
+    for (const a of [bad, mism]) expect((await revoke(a)).status).toBe(200);
+  });
+});
+
+describe('FIX P1 #4 — 복원의 연결 이력 규칙', () => {
+  it('add_missing: 로컬 none + 묶음 linked → needs_reconnect(미리보기·결과에 보고), 로컬 linked 는 그대로', async () => {
+    const x = await newThreadsAccount();
+    const y = await newThreadsAccount();
+    await connectFully(x);
+    await connectFully(y);
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'exp-p14') });
+    const zip = new Uint8Array(readFileSync(exported.zipPath));
+    // x 를 "연결 전 상태"(none, 연결 정보 없음)로 — 연결 전 백업을 복원한 대상 DB 를 흉내
+    await db.delete(schema.oauthCredentials).where(eq(schema.oauthCredentials.channelAccountId, x));
+    await db.update(schema.channelAccounts).set({ credentialState: 'none' }).where(eq(schema.channelAccounts.id, x));
+    expect((await getAccountHealth(db, ownerA, x)).status).toBe('not_connected');
+    const restoresDir = path.join(tmp, 'restores-p14');
+    const p = await createRestorePreview(db, ownerA, zip, { restoresDir, source: 'upload' });
+    expect(p.preview.reconnect_required_accounts).toContain(x);
+    expect(p.preview.reconnect_required_accounts).not.toContain(y);
+    expect((await accountRow(x)).credentialState).toBe('none');
+    const r = await commitRestore(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, p.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+    expect(r.reconnect_required_accounts).toContain(x);
+    expect((await accountRow(x)).credentialState).toBe('needs_reconnect');
+    expect(await getAccountHealth(db, ownerA, x)).toMatchObject({ status: 'needs_reconnect', usable_for_execution: false });
+    expect((await accountRow(y)).credentialState).toBe('linked');
+    expect((await getAccountHealth(db, ownerA, y)).status).toBe('connected');
+  });
+
+  it('0027 이전 묶음(credential_state 없음)도 복원되고 none', async () => {
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), ownerA, { outDir: path.join(tmp, 'exp-pre27') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(exported.zipPath)));
+    const tables = structuredClone(parsed.tables) as BundleTables;
+    for (const a of tables.channel_accounts as unknown as Array<Record<string, unknown>>) delete a.credential_state;
+    const zip = writeZip(
+      buildBundle({
+        exportId: randomUUID(),
+        exportedAt: new Date().toISOString(),
+        appVersion: parsed.manifest.app_version,
+        migrations: parsed.manifest.schema_migrations.filter((m) => !m.startsWith('0027') && !m.startsWith('0028')),
+        owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+        tables,
+        assetBytes: new Map(parsed.assetBytes),
+      }).entries,
+    );
+    const h = await createTestDb();
+    try {
+      const target = (await ensureOwner(h.db, 'restore-pre27@example.local')).id;
+      const restoresDir = path.join(tmp, 'restores-pre27');
+      const p = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+      const r = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-pre27')), target, p.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+      expect(r.restored.channel_accounts).toBeGreaterThan(0);
+      expect(r.reconnect_required_accounts).toEqual([]);
+      const states = new Set((await h.db.select().from(schema.channelAccounts)).map((a) => a.credentialState));
+      expect([...states]).toEqual(['none']);
+    } finally {
+      await h.close();
+    }
   });
 });

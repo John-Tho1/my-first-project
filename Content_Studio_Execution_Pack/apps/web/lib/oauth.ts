@@ -14,7 +14,7 @@ import {
   type AppConfig,
 } from '@cs/domain';
 import { MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
-import { seeOther } from './api';
+import { errorResponse, seeOther } from './api';
 
 export interface OAuthDeps {
   providerFor: ProviderFor;
@@ -65,6 +65,36 @@ export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
   server: '처리하지 못했습니다. 잠시 뒤 다시 시도하세요.',
 };
+
+/**
+ * FIX-T13(Codex Q7): callback·모의 동의 화면의 **모든** 응답(성공·실패·HTML·비로그인·예상하지 못한 예외)에
+ * Referrer-Policy: no-referrer, Cache-Control: no-store 를 붙인다 — code·state 가 든 URL 이 Referer·캐시로 새지 않게.
+ */
+export function withOAuthResponseHeaders(res: Response): Response {
+  const headers = new Headers(res.headers);
+  headers.set('referrer-policy', 'no-referrer');
+  headers.set('cache-control', 'no-store');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+/** callback·동의 화면 처리기를 감싼다: 어떤 예외도 일반 오류 응답으로 바꾸고 위 헤더를 붙인다. */
+export function oauthEndpoint(fn: (request: Request) => Promise<Response>): (request: Request) => Promise<Response> {
+  return async (request) => {
+    let res: Response;
+    try {
+      res = await fn(request);
+    } catch (e) {
+      res = errorResponse(e, request);
+    }
+    return withOAuthResponseHeaders(res);
+  };
+}
+
+/** D25-3: 모의 동의 화면의 시험용 매개변수 — 운영(NODE_ENV=production)에서는 거부 */
+export const MOCK_TEST_PARAMS = ['mock_user', 'mock_grant', 'mock_deny'] as const;
+export function mockTestParamsAllowed(env: Record<string, string | undefined> = process.env): boolean {
+  return env.NODE_ENV !== 'production';
+}
 
 /** 폼 제출 실패 → 설정 화면(오류 코드만 query 에 — 값·토큰 없음) */
 export function accountFormFailure(e: unknown): Response {

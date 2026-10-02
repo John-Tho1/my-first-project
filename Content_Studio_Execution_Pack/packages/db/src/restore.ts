@@ -130,6 +130,12 @@ export interface ApplyReport {
   unverifiedConfirmedItems: string[];
   /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
   revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
+  /**
+   * FIX-T13(Codex review-T13 P1 #4): 복원 뒤 "다시 연결 필요"가 된 계정 — 새로 넣은 연결 이력 계정(linked → needs_reconnect)과,
+   * 이미 있던(동일) 계정 중 로컬이 none 인데 묶음이 linked·needs_reconnect 인 계정(연결 이력을 잃지 않게 needs_reconnect 로 올림).
+   * 로컬이 linked·needs_reconnect 이면 그대로 둔다(로컬의 유효한 연결을 묶음이 덮지 않음).
+   */
+  reconnectRequiredAccounts: string[];
 }
 
 const MAX_CONFLICTS_LISTED = 200;
@@ -472,7 +478,33 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   for (const p of bundle.tables.distribution_plans) {
     if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
   }
-  return { tables, conflicts, insertedAssetIds, downgradedVariants, interruptedTranscriptions, blockedItems, unknownItems, unverifiedConfirmedItems, revokedApprovals };
+  // FIX-T13(P1 #4): 연결 이력 규칙 — 동일성 비교는 credential_state 를 빼지만(compareHash), 묶음에 연결 이력이 있으면 로컬 none 을 needs_reconnect 로
+  // 올린다(기존 행 UPDATE 의 예외 — 실행을 막는 쪽으로만 바꾼다). 로컬 linked(유효한 연결)·needs_reconnect 는 그대로.
+  const reconnectRequiredAccounts: string[] = [];
+  for (const a of bundle.tables.channel_accounts) {
+    const st = avail.channel_accounts!.get(a.id);
+    if (a.credential_state === 'none') continue;
+    if (st === 'inserted') {
+      reconnectRequiredAccounts.push(a.id);
+    } else if (st === 'same') {
+      const res = await tx.execute(
+        sql`update channel_accounts set credential_state = 'needs_reconnect' where id = ${a.id}::uuid and owner_id = ${ownerId}::uuid and credential_state = 'none' returning id`,
+      );
+      if ((res as unknown as { rows: unknown[] }).rows.length) reconnectRequiredAccounts.push(a.id);
+    }
+  }
+  return {
+    tables,
+    conflicts,
+    insertedAssetIds,
+    downgradedVariants,
+    interruptedTranscriptions,
+    blockedItems,
+    unknownItems,
+    unverifiedConfirmedItems,
+    revokedApprovals,
+    reconnectRequiredAccounts,
+  };
 }
 
 /** 드라이버가 감싼 오류의 메시지 사슬(cause 포함). */
@@ -551,6 +583,8 @@ export interface RestorePreview {
   unverified_confirmed_items: string[];
   /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
   revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX-T13: 복원하면 "다시 연결 필요"가 될 계정 */
+  reconnect_required_accounts: string[];
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
@@ -612,6 +646,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     unknown_items: r.unknownItems,
     unverified_confirmed_items: r.unverifiedConfirmedItems,
     revoked_approvals: r.revokedApprovals,
+    reconnect_required_accounts: r.reconnectRequiredAccounts,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
@@ -749,6 +784,8 @@ export interface CommitResult {
   /** FIX-T11 */
   unverified_confirmed_items: string[];
   revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX-T13: 복원 뒤 다시 연결이 필요한 계정 */
+  reconnect_required_accounts: string[];
 }
 
 async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
@@ -854,6 +891,7 @@ export async function commitRestore(
         unknown_items: report.unknownItems,
         unverified_confirmed_items: report.unverifiedConfirmedItems,
         revoked_approvals: report.revokedApprovals,
+        reconnect_required_accounts: report.reconnectRequiredAccounts,
         assets_written: written,
         assets_verified: verified,
         assets_missing: missing,

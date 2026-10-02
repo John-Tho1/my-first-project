@@ -414,9 +414,12 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 모의 연결은 **MOCK** 표시이며 실제 Threads 계정 연결이 아니고 실제 게시에 쓰이지 않는다(모의 계정의 결과는 지금처럼 항상 MOCK). 요청 scope 는 `threads_basic, threads_content_publish`(잠정 — T14 에서 공식 문서로 재확인), 답글·통계는 요청하지 않는다.
 - 보호: state 는 서버에 SHA-256 만(1회용, 로그인 세션·owner·계정에 묶임, 10분), PKCE S256(verifier 는 서버에 봉인), redirect URI 정확 일치. 토큰은 AES-256-GCM(Node 표준 crypto)으로 봉인하고 키 버전을 함께 저장한다(AAD = owner·계정·용도 — 다른 행으로 옮긴 암호문은 열리지 않음). 토큰·code·state·verifier 는 API 응답·감사·로그·내보내기·화면에 나오지 않는다.
 - 실행 차단: 연결했던 계정의 연결이 만료·해제·다시 연결 필요·오류이면 실행(409 `account_credential_blocked`)과 작업 전송(BLOCKED, `credential_<상태>`, 보내지 않음)을 막는다. 다시 연결하면 재시도할 수 있다. 연결한 적 없는 모의 계정은 M3 동작 그대로. 다시 연결·갱신은 승인을 유지하고(계정이 같을 때만 저장 — 다른 계정이면 409 `oauth_account_mismatch`), **연결 해제는 그 계정의 활성 승인을 철회**한다.
-- 내보내기·복원: `oauth_credentials`·`oauth_states` 는 묶음에서 제외. 연결했던 계정은 복원 후 "다시 연결 필요".
+- 내보내기·복원: `oauth_credentials`·`oauth_states` 는 묶음에서 제외. 연결했던 계정은 복원 후 "다시 연결 필요". 같은 환경에 `add_missing` 으로 복원할 때 로컬 계정이 연결 이력 없음(none)인데 묶음에는 연결 이력이 있으면 "다시 연결 필요"로 올리고 미리보기·결과의 `reconnect_required_accounts` 에 보고한다(로컬의 유효한 연결은 그대로).
+- 동시 변경: 연결 저장·갱신·확인·해제·키 교체는 계정별로 잠그고(계정 → 연결 정보 순서), 토큰 세대(`token_generation`)가 그대로일 때만 결과를 기록한다. 갱신 중 다른 변경이 먼저 끝나면 새로 받은 토큰은 저장하지 않고 공급자에서 바로 철회한다. 해제는 진행 중(`revoking`) 표시 뒤 공급자 철회 → 같은 세대만 삭제(바뀌었으면 `incomplete`, 계속 차단). 교환 뒤 저장하지 못한 토큰도 철회한다.
+- 모의 동의 화면의 시험용 매개변수(`mock_user`·`mock_grant`·`mock_deny`)는 운영(`NODE_ENV=production`)에서 400 `mock_params_not_allowed`(D25-3). callback·동의 화면의 모든 응답에 `Referrer-Policy: no-referrer`·`Cache-Control: no-store`.
+- `OAUTH_REDIRECT_URI` 는 http(s) + 호스트 + 경로만(query·fragment·사용자 정보가 있으면 설정 오류).
 - API: `POST /api/channel-accounts/{id}/connect|refresh|check|revoke`(같은 출처·로그인), `GET /api/channel-accounts/{id}/health`, `GET /api/oauth/callback`. 다른 owner 의 계정은 404.
-- 키 교체: 새 키를 `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(새 번호)에, 직전 키를 `SECRETS_MASTER_KEY_PREVIOUS`·`SECRETS_KEY_VERSION_PREVIOUS` 에 두면 옛 봉인도 읽힌다. 다시 봉인은 `rotateSecretKeys`(@cs/db, 시험으로 확인 — CLI 는 아직 없음). 끝나면 이전 키를 비운다.
+- 키 교체: 새 키를 `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(새 번호)에, 직전 키를 `SECRETS_MASTER_KEY_PREVIOUS`·`SECRETS_KEY_VERSION_PREVIOUS` 에 두면 옛 봉인도 읽힌다. 다시 봉인은 `corepack pnpm secrets:rotate`(서버를 끈 상태 — 미리보기, 숫자만) → `corepack pnpm secrets:rotate --confirm`(적용). 모든 봉인을 열어 현재 버전 행의 손상·버전 불일치도 센다. 끝나면 이전 키를 비운다(D25-5).
 
 ### 검증 명령
 | 명령 | 내용 | 기대 |
@@ -431,6 +434,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm drill:mock` | T12 M3 게이트 훈련(버리는 메모리 DB, 모의 어댑터 — 외부 호출 없음) 표 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(다시 봉인 대상·현재 키·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰은 출력하지 않음 | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금이면 안내 후 exit 1 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 

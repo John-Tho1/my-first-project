@@ -142,6 +142,13 @@ export class CredentialNotFoundError extends AppError {
   }
 }
 
+/** FIX-T13: 연결 해제가 진행 중이라 연결 정보를 바꿀 수 없음 */
+export class CredentialBusyError extends AppError {
+  constructor() {
+    super('conflict', 'credential_busy', '연결 해제가 진행 중입니다. 해제를 마친 뒤 다시 연결하세요.');
+  }
+}
+
 export class CredentialRefreshFailedError extends AppError {
   constructor(code: string) {
     super('conflict', 'credential_refresh_failed', '연결 정보를 갱신하지 못했습니다. 계정을 다시 연결하세요.', { reason: code });
@@ -179,10 +186,26 @@ export const hashOAuthState = (state: string): string => createHash('sha256').up
 /** RFC 7636 S256 */
 export const codeChallengeS256 = (verifier: string): string => createHash('sha256').update(verifier, 'ascii').digest('base64url');
 
-/** callback 의 redirect URI(정확 일치 대상). 설정이 없으면 APP_BASE_URL + /api/oauth/callback. */
+/**
+ * FIX-T13(Codex P2): redirect URI 는 scheme + host(+port) + path 만(query·fragment·사용자 정보 없음, http/https).
+ * callback 은 요청의 origin + path 와 정확히 비교하므로 query 가 있으면 절대 맞을 수 없다 — 설정 검증에서 거부한다.
+ */
+export function isPlainRedirectUri(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (u.search || u.hash || raw.includes('?') || raw.includes('#') || u.username || u.password) return false;
+  return `${u.origin}${u.pathname}` === raw;
+}
+
+/** callback 의 redirect URI(정확 일치 대상). 설정이 없으면 APP_BASE_URL(의 origin) + /api/oauth/callback. */
 export function oauthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): string {
   if (config.OAUTH_REDIRECT_URI) return config.OAUTH_REDIRECT_URI;
-  return new URL('/api/oauth/callback', config.APP_BASE_URL).toString();
+  return `${new URL(config.APP_BASE_URL).origin}/api/oauth/callback`;
 }
 
 /** 요청 URL 에서 query 를 뺀 origin + path(정확 일치 비교용). */
@@ -263,6 +286,8 @@ export function credentialHealth(input: CredentialHealthInput): CredentialHealth
     return out('not_connected');
   }
   if (credential.revokedAt || credential.status === 'revoked') return out('revoked');
+  // FIX-T13: 연결 해제 진행 중(공급자 철회 대기·불완전) — 실행 차단
+  if (credential.status === 'revoking') return out('revoked', 'revoking');
   if (credential.status === 'error') return out('error', credential.lastErrorCode ?? 'unknown');
   const granted = new Set(credential.scopes);
   const missing = requiredScopes.filter((s) => !granted.has(s));

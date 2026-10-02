@@ -24,7 +24,8 @@
     "restore:commit": "tsx packages/db/scripts/restore.ts commit",
     "worker": "tsx apps/worker/src/cli.ts",
     "drill:mock": "tsx packages/db/scripts/drill.ts",
-    "drill:restore": "tsx packages/db/scripts/restore-drill.ts"
+    "drill:restore": "tsx packages/db/scripts/restore-drill.ts",
+    "secrets:rotate": "tsx packages/db/scripts/secrets-rotate.ts"
   },
   "devDependencies": {
     "@cs/db": "workspace:*",

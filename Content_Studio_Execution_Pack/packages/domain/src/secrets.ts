@@ -188,6 +188,10 @@ function parseEnvelope(ciphertext: string): Envelope {
   const tag = Buffer.from(parts[3]!, 'base64url');
   const ct = Buffer.from(parts[4]!, 'base64url');
   if (iv.length !== IV_BYTES || tag.length !== TAG_BYTES) throw new SecretDecryptError('malformed');
+  // FIX-T13(Codex Q6): 비정규 base64url 표기(남는 비트 등)는 거부 — 다시 인코딩한 값이 같아야 한다.
+  if (iv.toString('base64url') !== parts[2] || tag.toString('base64url') !== parts[3] || ct.toString('base64url') !== parts[4]) {
+    throw new SecretDecryptError('malformed');
+  }
   return { version: Number(parts[1]), iv, tag, ct };
 }
 

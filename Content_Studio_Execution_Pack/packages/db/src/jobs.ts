@@ -57,6 +57,7 @@ import {
 } from '@cs/domain';
 import {
   activeApprovalsFor,
+  lockAccountsInOrder,
   lockItemsInOrder,
   recomputePlanStatus,
   requestCancelLocked,
@@ -152,6 +153,20 @@ async function itemRow(tx: DbOrTx, ownerId: string, itemId: string): Promise<Dis
 
 function adapterAccount(a: typeof channelAccounts.$inferSelect) {
   return { id: a.id, kind: a.kind === 'mock' ? ('mock' as const) : ('live' as const), platform: a.platform, external_account_id: a.externalAccountId };
+}
+
+/**
+ * FIX-T13(Codex review-T13 Q3): 항목의 계정을 전역 잠금 순서의 첫 단계로 FOR SHARE 잠근다(항목 잠금보다 먼저).
+ * 연결 정보 변경(연결·갱신·확인·해제·교체)은 같은 계정을 FOR UPDATE 로 잡으므로, 차단 상태가 먼저 커밋되면 이 트랜잭션은 그 뒤에 읽고
+ * 전송 의도를 만들지 않는다. 항목의 channel_account_id 는 스냅샷 열(트리거로 불변)이라 잠그기 전에 읽어도 바뀌지 않는다.
+ */
+async function shareLockItemAccount(tx: DbOrTx, ownerId: string, itemId: string): Promise<void> {
+  const rows = await tx
+    .select({ accountId: distributionItems.channelAccountId })
+    .from(distributionItems)
+    .where(and(eq(distributionItems.id, itemId), eq(distributionItems.ownerId, ownerId)))
+    .limit(1);
+  if (rows[0]) await lockAccountsInOrder(tx, ownerId, [rows[0].accountId], 'share');
 }
 
 async function lockItem(tx: DbOrTx, ownerId: string, itemId: string): Promise<DistributionItemRow> {
@@ -460,6 +475,7 @@ interface SendPlan {
 async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRow, opts: JobRunOptions, now: Date): Promise<SendPlan | JobState | 'lease_lost'> {
   const ownerId = leased.ownerId;
   return db.transaction(async (tx) => {
+    await shareLockItemAccount(tx, ownerId, leased.itemId!);
     const item = await lockItem(tx, ownerId, leased.itemId!);
     const active = await activeApprovalsFor(tx, ownerId, [item.id]);
     const job = await jobForUpdate(tx, ownerId, leased.id);
@@ -961,6 +977,7 @@ export interface RetryOutcome {
 export async function retryItem(db: Db, ownerId: string, itemId: string, now: Date = new Date()): Promise<RetryOutcome> {
   if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
   return db.transaction(async (tx) => {
+    await shareLockItemAccount(tx, ownerId, itemId);
     const item = await lockItem(tx, ownerId, itemId);
     // FIX-T11: 복원한 작업(읽기 전용 이력)은 다시 보내지 않는다 — 항목 표시가 없어도(복원 전부터 BLOCKED 였던 항목) 작업 표시로 거부.
     const restoredJob = await latestJobForItem(tx, ownerId, item.id, false);

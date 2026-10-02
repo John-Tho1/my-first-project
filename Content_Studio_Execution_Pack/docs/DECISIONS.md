@@ -411,3 +411,9 @@
 - 부분 게시 뒤 대기(QUEUED·RETRY_WAIT·BLOCKED) 중 취소 → UNKNOWN(cancel_partial, thread_partial_canceled) — "보내지 않음" 이라 말하지 않는다(A11).
 - 요청 제한 검사는 계정별 advisory 잠금 + 같은 계정 진행 중 작업의 남은 단위 예약. 창이 비면(used=0) 한도보다 큰 작업 허용 규칙은 그대로(잠정).
 - 별도 `pnpm worker` 프로세스는 web 이 발급한 모의 토큰을 모른다(프로세스 메모리) → 원격 401 → BLOCKED·게시 0. 실계정 어댑터에서는 DB 의 봉인 토큰을 쓰므로 해당 없음.
+
+### D27 후속 (T15 FIX round 1, Codex review-T15, 코드 cc26535)
+- 웹 요청 경로(POST /api/worker/tick·inline worker 의 health·목록 tick)는 영상 전체를 올리지 않는다: 작업당 조각 1개·5초 예산(`WEB_TICK_UPLOAD_SLICE`) 뒤 `upload_yield`(SENDING → RETRY_WAIT 즉시, resume_count+1 — 시도 아님, 받은 바이트가 늘어야만 yield). 별도 worker 프로세스는 예산 없음(30초 submit 제한은 그대로 — live 전 재검토).
+- 할당량 단위는 기록된 단계로 계산한다(어댑터 훅 rateUnitsRemaining): 영상이 있거나 살아 있을 수 있는 세션이면 0, 세션 없음·만료·오류면 1. 만료 세션은 창 안 사용량으로 남고 새 세션 비용을 상쇄하지 않는다. 사전 검사 뒤 세션이 만료돼 새 세션이 필요해지면 그 시도는 부수 효과 없이 끝나고(upload_session_requires_quota_check) 다음 시도가 할당량을 다시 검사한다.
+- 모의 시뮬레이터의 queryOffset 만료 주입은 완료된 세션에는 적용하지 않는다.
+- 남은 위험: yield 마다 전송 의도 1건(2GB 를 웹 tick 으로만 올리면 최대 256건), inline 모드는 웹 요청이 와야 진행.

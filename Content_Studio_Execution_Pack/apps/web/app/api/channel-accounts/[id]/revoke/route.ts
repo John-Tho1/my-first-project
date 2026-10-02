@@ -24,7 +24,7 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const deps = oauthDeps(config);
     const r = await revokeCredential(owner.db, { ownerId: owner.ownerId, accountId: id, providerFor: deps.providerFor, keyring: deps.keyring });
     if (html) return seeOther('/settings?revoked=1#accounts');
-    return json({ account: r.health, remote_revoke: r.remoteRevoke, revoked_approvals: r.revokedApprovals });
+    return json({ account: r.health, outcome: r.outcome, remote_revoke: r.remoteRevoke, revoked_approvals: r.revokedApprovals });
   } catch (e) {
     if (html) return accountFormFailure(e);
     return errorResponse(e, request);

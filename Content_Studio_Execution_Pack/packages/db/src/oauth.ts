@@ -238,10 +238,13 @@ export async function startOAuthConnect(
   const sealed = sealSecret(keyring, verifier, verifierAad(input.ownerId, account.id, stateId));
   const expiresAt = new Date(now.getTime() + OAUTH_STATE_TTL_MS);
   await db.transaction(async (tx) => {
+    // FIX2-T13: 발급 시점의 해제 세대를 계정 잠금 아래에서 읽어 기록한다(해제 시작과 직렬화).
+    const { cred } = await lockAccountCredential(tx, input.ownerId, account.id);
     await tx
       .delete(oauthStates)
       .where(and(eq(oauthStates.ownerId, input.ownerId), or(lte(oauthStates.expiresAt, now), isNotNull(oauthStates.usedAt))));
     await tx.insert(oauthStates).values({
+      revocationEpoch: cred?.revocationEpoch ?? 0,
       id: stateId,
       ownerId: input.ownerId,
       sessionId: input.sessionId,
@@ -286,6 +289,11 @@ export const oauthTestHooks: {
   beforeProviderCheck?: () => Promise<void>;
   afterRevokeMarked?: () => Promise<void>;
   beforeCallbackStore?: () => Promise<void>;
+  insideCallbackStore?: () => Promise<void>;
+  beforeRefreshSeal?: () => Promise<void>;
+  insideRefreshStore?: () => Promise<void>;
+  afterRefreshStoreCommit?: () => Promise<void>;
+  beforeRotateStateUpdate?: () => Promise<void>;
 } = {};
 
 interface Locked {
@@ -429,14 +437,18 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
     await discard('account_mismatch');
     throw new OAuthAccountMismatchError();
   }
-  const sealed = sealSecret(keyring, encodeTokens(tokens), tokenAad(ownerId, account.id));
+  // FIX2-T13(Codex P1 :575 같은 유형): 발급 뒤 봉인·저장 전체를 감싼다. 저장되지 않았음이 확인되면 철회, 결과가 불명확하면 다시 읽어 판정.
+  let sealedCt: string | null = null;
   try {
+    const sealed = sealSecret(keyring, encodeTokens(tokens), tokenAad(ownerId, account.id));
+    sealedCt = sealed.ciphertext;
     await oauthTestHooks.beforeCallbackStore?.();
     return await db.transaction(async (tx) => {
       const { account: acc, cred: existing } = await lockAccountCredential(tx, ownerId, account.id);
       if (existing?.status === 'revoking') throw new CredentialBusyError();
-      // 이 연결 요청을 만든 뒤에 연결이 해제됐다면(늦게 도착한 callback) 저장하지 않는다.
-      if (existing?.revokedAt && existing.revokedAt.getTime() > row.createdAt.getTime()) throw new OAuthFlowError('oauth_state_invalid', { reason: 'revoked_after_request' });
+      // FIX2-T13(Codex P1 :439): 이 연결 요청을 만든 뒤 연결 해제가 시작됐다면(해제 세대가 바뀜 — 그 뒤 다시 연결됐어도) 저장하지 않는다.
+      // 해제 세대는 다시 연결로 초기화되지 않으므로 시각 비교 없이 판정한다.
+      if ((existing?.revocationEpoch ?? 0) !== row.revocationEpoch) throw new OAuthFlowError('oauth_state_invalid', { reason: 'revoked_after_request' });
       const generation = (existing?.tokenGeneration ?? 0) + 1;
       const values = {
         encryptedToken: sealed.ciphertext,
@@ -450,6 +462,7 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
         lastRefreshedAt: null,
         lastErrorCode: null,
         revokedAt: null,
+        revokeOpId: null,
         updatedAt: now,
       };
       if (existing) {
@@ -460,6 +473,7 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
       if (acc.credentialState !== 'linked') {
         await tx.update(channelAccounts).set({ credentialState: 'linked' }).where(and(eq(channelAccounts.id, acc.id), eq(channelAccounts.ownerId, ownerId)));
       }
+      await oauthTestHooks.insideCallbackStore?.();
       const required = provider.requiredScopes();
       await recordAudit(tx, {
         ownerId,
@@ -471,6 +485,7 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
           mock: provider.mock,
           reconnect: existing !== null,
           token_generation: generation,
+          revocation_epoch: row.revocationEpoch,
           scopes: tokens.scopes.join(','),
           missing_scopes: required.filter((s) => !tokens.scopes.includes(s)).join(','),
           expires_at: tokens.expiresAt.toISOString(),
@@ -482,8 +497,44 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
       return accountHealthView({ ...acc, credentialState: 'linked' }, fresh, now);
     });
   } catch (e) {
+    const outcome = sealedCt ? await tokenStoredOutcome(db, ownerId, account.id, sealedCt, issued.accessToken, input.keyring) : 'not_stored';
+    if (outcome === 'stored') return getAccountHealth(db, ownerId, account.id, now);
+    if (outcome === 'unknown') {
+      // 저장됐을 수도 있으므로 철회하지 않는다(유효한 연결을 깨지 않음) — 다음 확인·갱신이 상태를 맞춘다.
+      await rejectCallback(db, ownerId, account.id, 'store_outcome_unknown', now).catch(() => undefined);
+      throw e;
+    }
     await discard('store_failed', { error: e instanceof AppError ? e.code : 'db_error' });
     throw e;
+  }
+}
+
+/**
+ * FIX2-T13: 저장 트랜잭션이 예외로 끝났을 때 이 토큰이 실제로 저장됐는지 계정 잠금 아래에서 다시 읽어 판정한다.
+ * 같은 봉인 문자열이거나(그 사이 키 교체가 있으면) 복호화한 access token 이 같으면 stored. 다시 읽기 자체가 실패하면 unknown.
+ */
+async function tokenStoredOutcome(
+  db: Db,
+  ownerId: string,
+  accountId: string,
+  sealedCiphertext: string,
+  accessToken: string,
+  keyring: KeyringSource,
+): Promise<'stored' | 'not_stored' | 'unknown'> {
+  try {
+    return await db.transaction(async (tx) => {
+      const { cred } = await lockAccountCredential(tx, ownerId, accountId);
+      if (!cred?.encryptedToken || cred.keyVersion === null || cred.revokedAt) return 'not_stored' as const;
+      if (cred.encryptedToken === sealedCiphertext) return 'stored' as const;
+      try {
+        const t = decodeTokens(openSecret(keyring(), cred.encryptedToken, cred.keyVersion, tokenAad(ownerId, accountId)));
+        return t.accessToken === accessToken ? ('stored' as const) : ('not_stored' as const);
+      } catch {
+        return 'unknown' as const;
+      }
+    });
+  } catch {
+    return 'unknown';
   }
 }
 
@@ -571,47 +622,77 @@ export async function refreshCredential(
     throw new CredentialRefreshFailedError(code);
   }
   await oauthTestHooks.afterProviderRefresh?.();
-  const sealed = sealSecret(input.keyring(), encodeTokens(tokens), tokenAad(input.ownerId, s.account.id));
-  const stored = await db.transaction(async (tx) => {
-    const { account, cred } = await lockAccountCredential(tx, input.ownerId, s.account.id);
-    if (!sameLiveGeneration(cred, s.generation)) return null;
-    const generation = s.generation + 1;
-    const updated = await tx
-      .update(oauthCredentials)
-      .set({
-        encryptedToken: sealed.ciphertext,
-        keyVersion: sealed.keyVersion,
-        tokenGeneration: generation,
-        expiresAt: tokens.expiresAt,
-        scopes: [...tokens.scopes],
-        status: 'active',
-        lastRefreshedAt: now,
-        lastErrorCode: null,
-        updatedAt: now,
-      })
-      .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, s.generation)))
-      .returning();
-    await recordAudit(tx, {
+  // FIX2-T13(Codex P1 :575): 발급(T2) 뒤의 봉인·저장 전체를 감싼다. 예외가 나면 잠금 아래에서 다시 읽어 T2 가 저장됐는지부터 판정:
+  // 저장됨 → 성공으로 돌려줌, 저장 안 됨 → T2 철회 + 감사(store_failed), 판정 불가 → 철회하지 않고(저장됐을 수 있음) 감사 후 실패.
+  const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
+  const discardIssued = async (reason: string, extra: Record<string, string | number | null> = {}) => {
+    const cleanup = await revokeAtProvider(s.provider, issued, now);
+    await recordAudit(db, {
       ownerId: input.ownerId,
-      action: 'oauth.refreshed',
+      action: 'oauth.refresh_discarded',
       entity: 'channel_account',
-      entityId: account.id,
-      details: { provider: s.provider.id, mock: s.provider.mock, expires_at: tokens.expiresAt.toISOString(), key_version: sealed.keyVersion, token_generation: generation, trigger },
+      entityId: s.account.id,
+      details: { provider: s.provider.id, mock: s.provider.mock, reason, token_generation: s.generation, issued_token_revoke: cleanup.result, issued_token_revoke_error: cleanup.code, trigger, ...extra },
       at: now,
+    }).catch(() => undefined);
+  };
+  let sealedCt: string | null = null;
+  let stored: AccountHealthView | null;
+  try {
+    await oauthTestHooks.beforeRefreshSeal?.();
+    const sealed = sealSecret(input.keyring(), encodeTokens(tokens), tokenAad(input.ownerId, s.account.id));
+    sealedCt = sealed.ciphertext;
+    stored = await db.transaction(async (tx) => {
+      const { account, cred } = await lockAccountCredential(tx, input.ownerId, s.account.id);
+      if (!sameLiveGeneration(cred, s.generation)) return null;
+      const generation = s.generation + 1;
+      const updated = await tx
+        .update(oauthCredentials)
+        .set({
+          encryptedToken: sealed.ciphertext,
+          keyVersion: sealed.keyVersion,
+          tokenGeneration: generation,
+          expiresAt: tokens.expiresAt,
+          scopes: [...tokens.scopes],
+          status: 'active',
+          lastRefreshedAt: now,
+          lastErrorCode: null,
+          updatedAt: now,
+        })
+        .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, s.generation)))
+        .returning();
+      await oauthTestHooks.insideRefreshStore?.();
+      await recordAudit(tx, {
+        ownerId: input.ownerId,
+        action: 'oauth.refreshed',
+        entity: 'channel_account',
+        entityId: account.id,
+        details: { provider: s.provider.id, mock: s.provider.mock, expires_at: tokens.expiresAt.toISOString(), key_version: sealed.keyVersion, token_generation: generation, trigger },
+        at: now,
+      });
+      return accountHealthView(account, updated[0]!, now);
     });
-    return accountHealthView(account, updated[0]!, now);
-  });
+    await oauthTestHooks.afterRefreshStoreCommit?.();
+  } catch (e) {
+    const outcome = sealedCt ? await tokenStoredOutcome(db, input.ownerId, s.account.id, sealedCt, issued.accessToken, input.keyring) : 'not_stored';
+    if (outcome === 'stored') return getAccountHealth(db, input.ownerId, s.account.id, now);
+    if (outcome === 'unknown') {
+      await recordAudit(db, {
+        ownerId: input.ownerId,
+        action: 'oauth.refresh_failed',
+        entity: 'channel_account',
+        entityId: s.account.id,
+        details: { provider: s.provider.id, mock: s.provider.mock, error_code: 'store_outcome_unknown', trigger, token_generation: s.generation },
+        at: now,
+      }).catch(() => undefined);
+      throw new CredentialRefreshFailedError('store_outcome_unknown');
+    }
+    await discardIssued('store_failed', { error: e instanceof AppError ? e.code : 'db_error' });
+    throw new CredentialRefreshFailedError('store_failed');
+  }
   if (stored) return stored;
   // 다른 변경이 먼저 커밋됨 — 받은 새 토큰은 저장하지 않고 공급자에서 철회한다(유효한 토큰을 잃어버린 채 남기지 않음).
-  const cleanup = await revokeAtProvider(s.provider, { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken }, now);
-  await recordAudit(db, {
-    ownerId: input.ownerId,
-    action: 'oauth.refresh_discarded',
-    entity: 'channel_account',
-    entityId: s.account.id,
-    details: { provider: s.provider.id, mock: s.provider.mock, reason: 'credential_changed', token_generation: s.generation, issued_token_revoke: cleanup.result, issued_token_revoke_error: cleanup.code, trigger },
-    at: now,
-  });
+  await discardIssued('credential_changed');
   throw new CredentialRefreshFailedError('credential_changed');
 }
 
@@ -662,20 +743,32 @@ export async function checkCredential(
   });
 }
 
+/**
+ * 연결 해제 결과(FIX2-T13, Codex review-FIX-T13 P1 :737):
+ * - revoked: 이 요청이 자기 해제 작업을 마무리했다(암호문 삭제·revoked_at).
+ * - already_revoked: 시작할 때 이미 해제돼 있었다(아무것도 하지 않음).
+ * - completed_by_other: 같은 해제 작업에 합류한 다른 요청이 먼저 마무리했다(이 요청은 아무것도 지우지 않음).
+ * - superseded: 이 요청의 해제 작업은 끝났고 그 뒤 명시적으로 다시 연결(또는 새 해제 작업)됐다 — 새 연결을 건드리지 않는다.
+ * - incomplete: 자기 작업이 아직 현재인데 토큰 세대가 바뀌어(정상 경로로는 생기지 않음 — 해제 중에는 갱신·다시 연결이 거부됨) 지우지 않았다.
+ *   연결 정보는 revoking 그대로(실행 차단), 다시 해제하면 같은 작업에 합류해 마무리한다.
+ */
+export type RevokeOutcome = 'revoked' | 'already_revoked' | 'completed_by_other' | 'superseded' | 'incomplete';
+
 export interface RevokeResult {
   health: AccountHealthView;
-  remoteRevoke: RemoteRevoke | 'skipped_no_key' | 'skipped_unreadable' | 'skipped_unsupported' | 'already_revoked' | 'incomplete';
+  outcome: RevokeOutcome;
+  remoteRevoke: RemoteRevoke | 'skipped_no_key' | 'skipped_unreadable' | 'skipped_unsupported' | 'already_revoked' | 'incomplete' | 'superseded';
   revokedApprovals: number;
 }
 
 /**
- * 연결 해제(Codex P1 #3) — 지우는 세대 = 공급자에서 철회한 세대:
- * 1) 잠금 아래: 세대 N 을 읽고 status='revoking'(갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단), 이 계정의 미사용 연결 요청을 사용 처리
- *    (늦게 도착한 callback 거부), 그 계정을 쓰는 활성 승인 철회(account_changed, D25-1), 토큰 복호화.
+ * 연결 해제(Codex P1 #3, FIX2 P1) — 해제 작업(revoke_op_id) 단위:
+ * 1) 잠금 아래: 이미 해제됐으면 끝. 진행 중인 해제 작업(status='revoking' + revoke_op_id)이 있으면 **그 작업에 합류**(해제 세대 그대로),
+ *    없으면 새 작업 ID 를 만들고 해제 세대(revocation_epoch) +1 · status='revoking'. 이 계정의 미사용 연결 요청을 사용 처리, 활성 승인 철회
+ *    (account_changed, D25-1), 토큰 복호화.
  * 2) 트랜잭션 밖: 공급자 철회(키가 없거나 읽을 수 없거나 공급자 오류면 그 결과를 그대로 보고).
- * 3) 잠금 아래: 세대가 아직 N 이면 암호문·키 버전 삭제 + revoked_at. 바뀌었으면 지우지 않고 'incomplete'(계정은 revoking 으로 계속 차단 —
- *    다시 해제하면 이어서 처리).
- * credential_state 는 linked 그대로 — 다시 연결하기 전까지 실행 차단.
+ * 3) 잠금 아래: 자기 작업이 아직 현재이고 세대가 그대로면 암호문·키 버전 삭제 + revoked_at(작업 ID 는 남김). 그 밖의 판정은 RevokeOutcome.
+ * credential_state 는 linked 그대로 — 다시 연결하기 전까지 실행 차단. 다시 연결은 revoke_op_id 를 지우지만 해제 세대는 그대로 둔다.
  */
 export async function revokeCredential(
   db: Db,
@@ -693,8 +786,16 @@ export async function revokeCredential(
     const { account: acc, cred } = await lockAccountCredential(tx, input.ownerId, account.id);
     if (!cred) throw new CredentialNotFoundError();
     if (cred.revokedAt) return { done: accountHealthView(acc, cred, now) };
-    if (cred.status !== 'revoking') {
-      await tx.update(oauthCredentials).set({ status: 'revoking', updatedAt: now }).where(eq(oauthCredentials.id, cred.id));
+    let opId = cred.revokeOpId;
+    let epoch = cred.revocationEpoch;
+    const joined = cred.status === 'revoking' && opId !== null;
+    if (!joined) {
+      opId = randomUUID();
+      epoch = cred.revocationEpoch + 1;
+      await tx
+        .update(oauthCredentials)
+        .set({ status: 'revoking', revokeOpId: opId, revocationEpoch: epoch, updatedAt: now })
+        .where(eq(oauthCredentials.id, cred.id));
     }
     await tx
       .update(oauthStates)
@@ -711,9 +812,9 @@ export async function revokeCredential(
         skip = e instanceof SecretDecryptError ? 'skipped_unreadable' : 'skipped_no_key';
       }
     }
-    return { generation: cred.tokenGeneration, tokens, skip, revokedApprovals: revoked.length, credId: cred.id };
+    return { generation: cred.tokenGeneration, tokens, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
   });
-  if ('done' in marked && marked.done) return { health: marked.done, remoteRevoke: 'already_revoked', revokedApprovals: 0 };
+  if ('done' in marked && marked.done) return { health: marked.done, outcome: 'already_revoked', remoteRevoke: 'already_revoked', revokedApprovals: 0 };
   if ('done' in marked) throw new CredentialNotFoundError();
   await oauthTestHooks.afterRevokeMarked?.();
   let remote: RevokeResult['remoteRevoke'] = marked.skip ?? 'ok';
@@ -726,15 +827,24 @@ export async function revokeCredential(
   return db.transaction(async (tx) => {
     const { account: acc, cred } = await lockAccountCredential(tx, input.ownerId, account.id);
     let row = cred;
-    if (cred && cred.id === marked.credId && cred.tokenGeneration === marked.generation && !cred.revokedAt) {
+    let outcome: RevokeOutcome;
+    const ownOpCurrent = !!cred && cred.id === marked.credId && cred.revokeOpId === marked.opId;
+    if (ownOpCurrent && cred!.revokedAt) {
+      outcome = 'completed_by_other';
+    } else if (ownOpCurrent && cred!.status === 'revoking' && cred!.tokenGeneration === marked.generation) {
       const updated = await tx
         .update(oauthCredentials)
         .set({ encryptedToken: null, keyVersion: null, revokedAt: now, status: 'revoked', lastErrorCode: remoteCode, updatedAt: now })
-        .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, marked.generation)))
+        .where(and(eq(oauthCredentials.id, cred!.id), eq(oauthCredentials.tokenGeneration, marked.generation), eq(oauthCredentials.revokeOpId, marked.opId)))
         .returning();
       row = updated[0] ?? cred;
-    } else {
+      outcome = 'revoked';
+    } else if (ownOpCurrent) {
+      outcome = 'incomplete';
       remote = 'incomplete';
+    } else {
+      outcome = 'superseded';
+      remote = 'superseded';
     }
     await recordAudit(tx, {
       ownerId: input.ownerId,
@@ -744,14 +854,17 @@ export async function revokeCredential(
       details: {
         provider: cred?.provider ?? null,
         mock: cred?.isMock ?? null,
+        outcome,
+        joined: marked.joined,
         remote_revoke: remote,
         remote_error: remoteCode,
         revoked_approvals: marked.revokedApprovals,
         token_generation: marked.generation,
+        revocation_epoch: marked.epoch,
       },
       at: now,
     });
-    return { health: accountHealthView(acc, row, now), remoteRevoke: remote, revokedApprovals: marked.revokedApprovals };
+    return { health: accountHealthView(acc, row, now), outcome, remoteRevoke: remote, revokedApprovals: marked.revokedApprovals };
   });
 }
 
@@ -800,6 +913,8 @@ export interface RotationCounts {
   toReseal: number;
   /** 실제로 다시 봉인한 수(dry-run 이면 0) */
   resealed: number;
+  /** FIX2-T13: 훑은 뒤 갱신 전에 바뀌거나 소비된 행(UPDATE 0행) — 다시 봉인으로 세지 않는다 */
+  skippedChanged: number;
   /** 열 수 없음 — 문제 종류별(malformed·version_mismatch·unknown_key_version·auth_failed) */
   failed: Record<string, number>;
 }
@@ -811,7 +926,7 @@ export interface RotationReport {
   states: RotationCounts;
 }
 
-const emptyCounts = (): RotationCounts => ({ total: 0, alreadyCurrent: 0, toReseal: 0, resealed: 0, failed: {} });
+const emptyCounts = (): RotationCounts => ({ total: 0, alreadyCurrent: 0, toReseal: 0, resealed: 0, skippedChanged: 0, failed: {} });
 const failedTotal = (c: RotationCounts) => Object.values(c.failed).reduce((a, b) => a + b, 0);
 
 /**
@@ -853,10 +968,15 @@ export async function rotateSecretKeys(db: Db, keyring: SecretKeyring, opts: { d
       c.toReseal++;
       if (dryRun) return;
       const r = resealSecret(keyring, cred.encryptedToken, cred.keyVersion, aad)!;
-      await tx
+      const u = await tx
         .update(oauthCredentials)
         .set({ encryptedToken: r.ciphertext, keyVersion: r.keyVersion, updatedAt: now })
-        .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, cred.tokenGeneration)));
+        .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, cred.tokenGeneration), eq(oauthCredentials.encryptedToken, cred.encryptedToken)))
+        .returning({ id: oauthCredentials.id });
+      if (u.length === 0) {
+        c.skippedChanged++;
+        return;
+      }
       c.resealed++;
       touchedOwners.add(ownerId);
     });
@@ -883,7 +1003,16 @@ export async function rotateSecretKeys(db: Db, keyring: SecretKeyring, opts: { d
     c.toReseal++;
     if (dryRun) continue;
     const r = resealSecret(keyring, s.encryptedVerifier, s.keyVersion, aad)!;
-    await db.update(oauthStates).set({ encryptedVerifier: r.ciphertext, keyVersion: r.keyVersion }).where(and(eq(oauthStates.id, s.id), isNull(oauthStates.usedAt)));
+    await oauthTestHooks.beforeRotateStateUpdate?.();
+    const u = await db
+      .update(oauthStates)
+      .set({ encryptedVerifier: r.ciphertext, keyVersion: r.keyVersion })
+      .where(and(eq(oauthStates.id, s.id), isNull(oauthStates.usedAt), eq(oauthStates.encryptedVerifier, s.encryptedVerifier)))
+      .returning({ id: oauthStates.id });
+    if (u.length === 0) {
+      c.skippedChanged++;
+      continue;
+    }
     c.resealed++;
     touchedOwners.add(s.ownerId);
   }
@@ -913,7 +1042,7 @@ export function formatRotationReport(r: RotationReport): string {
     const failed = Object.entries(c.failed)
       .map(([k, n]) => `${k} ${n}`)
       .join(', ');
-    return `${label}: 전체 ${c.total} · 현재 키 ${c.alreadyCurrent} · 다시 봉인 대상 ${c.toReseal} · 다시 봉인함 ${c.resealed} · 열 수 없음 ${failedTotal(c)}${failed ? ` (${failed})` : ''}`;
+    return `${label}: 전체 ${c.total} · 현재 키 ${c.alreadyCurrent} · 다시 봉인 대상 ${c.toReseal} · 다시 봉인함 ${c.resealed} · 그 사이 바뀌어 건너뜀 ${c.skippedChanged} · 열 수 없음 ${failedTotal(c)}${failed ? ` (${failed})` : ''}`;
   };
   return [
     r.dryRun ? `미리보기(변경 없음) — 현재 키 버전 ${r.keyVersion}. 적용하려면 --confirm` : `적용함 — 현재 키 버전 ${r.keyVersion}`,

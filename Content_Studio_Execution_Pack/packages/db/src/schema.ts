@@ -1434,6 +1434,13 @@ export const oauthCredentials = pgTable(
      * 공급자 호출 뒤 되쓰기는 읽었던 세대와 같을 때만 한다(계정 → 연결 정보 순서로 잠근 뒤).
      */
     tokenGeneration: integer('token_generation').notNull().default(1),
+    /**
+     * FIX2-T13(Codex review-FIX-T13 P1): 해제 세대 — 연결 해제를 **시작**할 때마다 +1, 다시 연결로 초기화되지 않는다(단조 증가).
+     * 연결 요청(oauth_states)은 발급 시 이 값을 기록하고, callback 저장은 계정 잠금 아래에서 값이 같을 때만 한다(시각 비교 없음).
+     */
+    revocationEpoch: integer('revocation_epoch').notNull().default(0),
+    /** FIX2-T13: 진행 중이거나 마지막으로 끝난 연결 해제 작업 ID. 다시 연결하면 null — 해제 요청이 자기 작업이 아직 현재인지 판정한다. */
+    revokeOpId: uuid('revoke_op_id'),
     /** access token 만료 시각 */
     expiresAt: ts('expires_at'),
     scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
@@ -1486,6 +1493,8 @@ export const oauthStates = pgTable(
     keyVersion: integer('key_version').notNull(),
     redirectUri: text('redirect_uri').notNull(),
     scopes: jsonb('scopes').$type<string[]>().notNull(),
+    /** FIX2-T13: 발급 시점의 계정 해제 세대(oauth_credentials.revocation_epoch, 연결 정보가 없으면 0) */
+    revocationEpoch: integer('revocation_epoch').notNull().default(0),
     expiresAt: ts('expires_at').notNull(),
     usedAt: ts('used_at'),
     createdAt: ts('created_at').notNull().defaultNow(),

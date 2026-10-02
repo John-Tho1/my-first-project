@@ -4,6 +4,7 @@ import { getRestoreRun, type CommitResult, type RestorePreview } from '@cs/db';
 import { EXPORTED_TABLES, formatMsk } from '@cs/domain';
 import { getSession } from '../../../../lib/auth';
 import { BACKUP_ERROR_TEXT } from '../../../../lib/backup';
+import { reconnectNotice } from '../../../../lib/restore-view';
 import { getAppDb, getConfig } from '../../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -55,6 +56,8 @@ export default async function RestorePage({
   const result = run.result as unknown as CommitResult | null;
   const err = str(q.error) ? (BACKUP_ERROR_TEXT[str(q.error)!] ?? BACKUP_ERROR_TEXT.server) : undefined;
   const committed = run.status === 'committed' && result;
+  // FIX2-T13: 복원으로 "다시 연결 필요"가 되는 배포 계정(이름·플랫폼만)
+  const reconnect = reconnectNotice(committed ? result : p, Boolean(committed));
 
   return (
     <main className="container">
@@ -126,6 +129,21 @@ export default async function RestorePage({
           </li>
           <li>DB migration: {p.schema_migrations.join(', ')}</li>
         </ul>
+        {reconnect ? (
+          <>
+            <h3>배포 계정 다시 연결 필요</h3>
+            <p className="notice" role="note">
+              {reconnect.title}
+            </p>
+            {reconnect.lines.length ? (
+              <ul className="list">
+                {reconnect.lines.map((l, i) => (
+                  <li key={i}>{l}</li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        ) : null}
         {p.warnings.length ? (
           <>
             <h3>경고</h3>

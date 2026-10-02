@@ -28,3 +28,4 @@ export * from './restore-expect';
 export * from './ops';
 export * from './retention';
 export * from './oauth';
+export * from './secrets-cli';

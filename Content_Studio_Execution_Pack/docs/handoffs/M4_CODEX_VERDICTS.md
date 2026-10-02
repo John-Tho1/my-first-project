@@ -10,4 +10,10 @@
 - [P2] packages/domain/src/oauth.ts:191 — 설정에서 허용한 query 포함 redirect URI로는 연결을 완료할 수 없다
 - 답 요지: 잠금 없는 실행 게이트는 승인 불가(계정 → 연결 정보 공통 잠금 순서 필요); 철회 시 승인 무효화는 보수적이고 타당; 콜백 세션 검사는 state 소비 전에; 회전은 현재 버전 행의 무결성도 검사해야; 실패 응답 헤더·객체 콘솔 출력 검사 보강.
 
-## FIX-T13 (round 1: review-T13 + D25 3·5) — (판정 대기)
+## FIX-T13 (5479a7f, round 1: review-T13 + D25 3·5) — CHANGES_REQUESTED (P1 3)
+- [P1] packages/db/src/oauth.ts:439 — 재연결이 `revokedAt`을 지우면 해제 전에 시작한 콜백이 다시 저장될 수 있음
+- [P1] packages/db/src/oauth.ts:737 — 중복 해제 요청에서는 `incomplete`가 실행 차단 상태를 보장하지 않음
+- [P1] packages/db/src/oauth.ts:575 — 갱신 토큰 저장 중 예외가 발생하면 발급 토큰 정리를 건너뜀
+- 답 요지: 세션 검사 후 state 소비·restore 단방향 needs_reconnect·회전 exit 1 은 타당; reconnect_required_accounts 는 복원 화면에도 표시 필요; 실제 PostgreSQL 잠금 대기·프록시 뒤 콜백·서버 접근 로그는 미확인(not_run).
+
+## FIX2-T13 (round 2: review-FIX-T13) — (판정 대기)

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { inspect } from 'node:util';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import {
   closeDb,
   commitRestore,
@@ -25,6 +25,7 @@ import {
   listChannelAccounts,
   parseBundleZip,
   refreshExpiringCredentials,
+  revokeCredential,
   rotateSecretKeys,
   runJobsTick,
   schema,
@@ -47,6 +48,7 @@ import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[
 import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
 import { GET as opsSummaryGET } from '../../apps/web/app/api/ops/summary/route';
+import { oauthDeps } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
 const A = 'owner@example.local';
@@ -879,7 +881,7 @@ describe('FIX P1 #4 — 복원의 연결 이력 규칙', () => {
         exportId: randomUUID(),
         exportedAt: new Date().toISOString(),
         appVersion: parsed.manifest.app_version,
-        migrations: parsed.manifest.schema_migrations.filter((m) => !m.startsWith('0027') && !m.startsWith('0028')),
+        migrations: parsed.manifest.schema_migrations.filter((m) => m < '0027'),
         owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
         tables,
         assetBytes: new Map(parsed.assetBytes),
@@ -900,3 +902,237 @@ describe('FIX P1 #4 — 복원의 연결 이력 규칙', () => {
     }
   });
 });
+
+// ---------------- FIX round 2 (Codex review-FIX-T13) ----------------
+
+const KEY3 = randomBytes(32).toString('base64');
+const deps = () => oauthDeps(loadConfig());
+const stateRowsOf = (accountId: string) => db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, accountId));
+
+describe('FIX2 P1 :439 — 해제 세대(revocation_epoch)', () => {
+  it('callback A 가 state 를 소비하고 멈춘 사이 해제 + 다시 연결 B 완료 → A 는 거부, B 의 토큰·scope 그대로, A 의 토큰은 철회', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const a = await begin(accountId, { mock_grant: 'threads_basic' }); // A 는 일부 scope 만
+    let bToken = '';
+    oauthTestHooks.beforeCallbackStore = async () => {
+      delete oauthTestHooks.beforeCallbackStore;
+      expect((await revoke(accountId)).status).toBe(200);
+      await connectFully(accountId); // B
+      bToken = await decryptToken(ownerA, accountId);
+    };
+    const r = await callback(a.location!);
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'oauth_state_invalid', reason: 'revoked_after_request' });
+    const row = (await credRow(accountId))!;
+    expect(row.status).toBe('active');
+    expect(row.scopes).toEqual(['threads_basic', 'threads_content_publish']);
+    expect(await decryptToken(ownerA, accountId)).toBe(bToken);
+    expect(row.revocationEpoch).toBe(1);
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    expect((await auditDetails(accountId, 'oauth.callback_rejected')).some((d) => d.reason === 'store_failed' && d.issued_token_revoke === 'ok')).toBe(true);
+  });
+
+  it('같은 밀리초: 해제 시각 = 연결 요청 발급 시각이어도 해제 세대로 거부(시각 비교 없음)', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const a = await begin(accountId);
+    const st = (await stateRowsOf(accountId)).find((s) => s.usedAt === null)!;
+    oauthTestHooks.beforeCallbackStore = async () => {
+      delete oauthTestHooks.beforeCallbackStore;
+      const d = deps();
+      const rv = await revokeCredential(db, { ownerId: ownerA, accountId, providerFor: d.providerFor, keyring: d.keyring, now: st.createdAt });
+      expect(rv.outcome).toBe('revoked');
+      expect((await credRow(accountId))!.revokedAt!.getTime()).toBe(st.createdAt.getTime());
+    };
+    const r = await callback(a.location!);
+    expect(r.status).toBe(400);
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});
+
+describe('FIX2 P1 :737 — 해제 작업 ID(revoke_op_id)', () => {
+  it('A 가 revoking 표시 후 멈춤 → B 가 같은 작업에 합류해 완료 → C 다시 연결 → A 는 superseded, C 는 그대로 active', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    let cGen = 0;
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      const b = await revoke(accountId);
+      expect(await b.json()).toMatchObject({ outcome: 'revoked' });
+      await connectFully(accountId); // C
+      cGen = (await credRow(accountId))!.tokenGeneration;
+    };
+    const a = await revoke(accountId);
+    expect(await a.json()).toMatchObject({ outcome: 'superseded', remote_revoke: 'superseded', account: { status: 'connected' } });
+    const row = (await credRow(accountId))!;
+    expect(row.status).toBe('active');
+    expect(row.tokenGeneration).toBe(cGen);
+    expect(row.revokeOpId).toBeNull();
+    expect(row.revocationEpoch).toBe(1); // 합류한 B 는 세대를 다시 올리지 않음
+    expect(await liveProviderTokens(accountId)).toBe(1);
+  });
+
+  it('A 가 멈춘 사이 B 가 합류해 완료(다시 연결 없음) → A 는 completed_by_other, 해제 상태 그대로', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      expect((await (await revoke(accountId)).json()).outcome).toBe('revoked');
+    };
+    const a = await revoke(accountId);
+    expect(await a.json()).toMatchObject({ outcome: 'completed_by_other', account: { status: 'revoked' } });
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+  });
+
+  it('incomplete 는 자기 작업이 현재일 때만: revoking·암호문 유지(차단), 다시 해제하면 같은 작업에 합류해 revoked', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      await db.update(schema.oauthCredentials).set({ tokenGeneration: 42 }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    };
+    const a = await (await revoke(accountId)).json();
+    expect(a).toMatchObject({ outcome: 'incomplete', remote_revoke: 'incomplete' });
+    const op = (await credRow(accountId))!.revokeOpId;
+    expect(op).not.toBeNull();
+    expect((await credRow(accountId))!.status).toBe('revoking');
+    const again = await (await revoke(accountId)).json();
+    expect(again.outcome).toBe('revoked');
+    expect((await credRow(accountId))!.revokeOpId).toBe(op);
+    expect((await credRow(accountId))!.revocationEpoch).toBe(1);
+  });
+});
+
+describe('FIX2 P1 :575 — 갱신 발급 뒤 봉인·저장 실패', () => {
+  it('봉인 전 실패 → 저장 안 됨 확인 → T2 철회, 409 store_failed, 세대 그대로', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.beforeRefreshSeal = async () => {
+      throw new Error('simulated seal failure');
+    };
+    const r = await refresh(accountId);
+    expect(r.status).toBe(409);
+    expect(await r.json()).toMatchObject({ error: 'credential_refresh_failed', reason: 'store_failed' });
+    expect((await credRow(accountId))!.tokenGeneration).toBe(gen);
+    expect(await liveProviderTokens(accountId)).toBe(0); // T1 은 공급자가 갱신 때 철회, T2 는 우리가 철회
+    expect((await auditDetails(accountId, 'oauth.refresh_discarded')).some((d) => d.reason === 'store_failed' && d.issued_token_revoke === 'ok')).toBe(true);
+  });
+
+  it('저장 트랜잭션 안(감사 INSERT 자리) 실패 → 되돌림 → T2 철회', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.insideRefreshStore = async () => {
+      throw new Error('simulated audit insert failure');
+    };
+    const r = await refresh(accountId);
+    expect((await r.json()).reason).toBe('store_failed');
+    expect((await credRow(accountId))!.tokenGeneration).toBe(gen);
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('커밋 뒤 예외(결과 불명) → 다시 읽어 저장 확인 → 성공으로 돌려줌, T2 유지', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const gen = (await credRow(accountId))!.tokenGeneration;
+    oauthTestHooks.afterRefreshStoreCommit = async () => {
+      throw new Error('simulated lost commit ack');
+    };
+    const r = await refresh(accountId);
+    expect(r.status).toBe(200);
+    expect((await credRow(accountId))!.tokenGeneration).toBe(gen + 1);
+    expect(await liveProviderTokens(accountId)).toBe(1);
+  });
+
+  it('다시 읽어도 판정할 수 없으면(봉인 바뀜 + 열 수 없음) 철회하지 않고 409 store_outcome_unknown', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    oauthTestHooks.afterRefreshStoreCommit = async () => {
+      delete oauthTestHooks.afterRefreshStoreCommit;
+      useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
+      await rotateSecretKeys(db, requireSecretKeyring(process.env));
+      useKeys({ SECRETS_MASTER_KEY: KEY3, SECRETS_KEY_VERSION: '3' });
+      throw new Error('simulated lost commit ack');
+    };
+    const r = await refresh(accountId);
+    expect(r.status).toBe(409);
+    expect((await r.json()).reason).toBe('store_outcome_unknown');
+    expect(await liveProviderTokens(accountId)).toBe(1);
+  });
+
+  it('callback: 저장 트랜잭션 안 실패 → 저장 안 됨 → 받은 토큰 철회', async () => {
+    const accountId = await newThreadsAccount();
+    const b = await begin(accountId);
+    oauthTestHooks.insideCallbackStore = async () => {
+      throw new Error('simulated audit insert failure');
+    };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const r = await callback(b.location!);
+    errors.mockRestore();
+    expect(r.status).toBe(500);
+    expect(await credRow(accountId)).toBeNull();
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});
+
+describe('FIX2 — 키 교체 집계: 훑은 뒤 바뀐 행은 skipped_changed', () => {
+  it('연결 요청이 갱신 전에 소비되면 resealed 로 세지 않는다', async () => {
+    const accountId = await newThreadsAccount();
+    await begin(accountId);
+    useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
+    oauthTestHooks.beforeRotateStateUpdate = async () => {
+      delete oauthTestHooks.beforeRotateStateUpdate;
+      await db.update(schema.oauthStates).set({ usedAt: new Date() }).where(isNullUsed());
+    };
+    const r = await rotateSecretKeys(db, requireSecretKeyring(process.env));
+    expect(r.states.toReseal).toBeGreaterThanOrEqual(1);
+    expect(r.states.skippedChanged).toBe(r.states.toReseal);
+    expect(r.states.resealed).toBe(0);
+    expect(formatRotationReport(r)).toContain('그 사이 바뀌어 건너뜀');
+  });
+});
+
+function isNullUsed() {
+  return isNull(schema.oauthStates.usedAt);
+}
+
+describe('FIX2 Q7 — 실패 경로의 콘솔 출력에도 비밀 없음', () => {
+  it('저장 실패(500) callback: console.error 를 깊게 직렬화해 code·state·verifier·발급 토큰을 찾는다 — 없음', async () => {
+    const accountId = await newThreadsAccount();
+    const b = await begin(accountId);
+    const st = (await stateRowsOf(accountId)).find((s) => s.usedAt === null)!;
+    const verifier = openSecret(requireSecretKeyring(process.env), st.encryptedVerifier, st.keyVersion, { ownerId: ownerA, channelAccountId: accountId, purpose: 'pkce_verifier', scopeId: st.id });
+    const issued: string[] = [];
+    const orig = MockThreadsOAuthProvider.prototype.exchangeCode;
+    const spyEx = vi.spyOn(MockThreadsOAuthProvider.prototype, 'exchangeCode').mockImplementation(async function (this: MockThreadsOAuthProvider, input) {
+      const t = await orig.call(this, input);
+      issued.push(t.accessToken);
+      return t;
+    });
+    const logs: string[] = [];
+    for (const m of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+      vi.spyOn(console, m).mockImplementation((...args: unknown[]) => void logs.push(args.map((x) => (typeof x === 'string' ? x : inspect(x, { depth: Infinity }))).join(' ')));
+    }
+    oauthTestHooks.beforeCallbackStore = async () => {
+      throw Object.assign(new Error(`db failure while storing ${b.state}`), { code: 'XX000' });
+    };
+    const r = await callback(b.location!);
+    vi.restoreAllMocks();
+    spyEx.mockRestore();
+    expect(r.status).toBe(500);
+    const body = await r.text();
+    const code = new URL(b.location!).searchParams.get('code')!;
+    expect(issued).toHaveLength(1);
+    expect(logs.length).toBeGreaterThan(0);
+    const audits = JSON.stringify(await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId, accountId)));
+    for (const [name, v] of Object.entries({ code, state: b.state, verifier, token: issued[0]! })) {
+      expect(logs.join('\n').includes(v), `${name} in console`).toBe(false);
+      expect(body.includes(v), `${name} in body`).toBe(false);
+      expect(audits.includes(v), `${name} in audit`).toBe(false);
+    }
+  });
+});
+

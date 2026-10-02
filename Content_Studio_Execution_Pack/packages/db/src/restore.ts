@@ -136,6 +136,15 @@ export interface ApplyReport {
    * 로컬이 linked·needs_reconnect 이면 그대로 둔다(로컬의 유효한 연결을 묶음이 덮지 않음).
    */
   reconnectRequiredAccounts: string[];
+  /** FIX2-T13(Codex Q11): 화면 표시용 — 플랫폼·표시 이름·기존 계정 여부만(ID·비밀 없음) */
+  reconnectRequiredLabels: ReconnectLabel[];
+}
+
+export interface ReconnectLabel {
+  platform: string;
+  display_name: string;
+  /** true = 이미 있던 계정이 이번 복원으로 실행 차단됨, false = 새로 들어오는 계정 */
+  existing: boolean;
 }
 
 const MAX_CONFLICTS_LISTED = 200;
@@ -481,16 +490,21 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   // FIX-T13(P1 #4): 연결 이력 규칙 — 동일성 비교는 credential_state 를 빼지만(compareHash), 묶음에 연결 이력이 있으면 로컬 none 을 needs_reconnect 로
   // 올린다(기존 행 UPDATE 의 예외 — 실행을 막는 쪽으로만 바꾼다). 로컬 linked(유효한 연결)·needs_reconnect 는 그대로.
   const reconnectRequiredAccounts: string[] = [];
+  const reconnectRequiredLabels: ReconnectLabel[] = [];
   for (const a of bundle.tables.channel_accounts) {
     const st = avail.channel_accounts!.get(a.id);
     if (a.credential_state === 'none') continue;
     if (st === 'inserted') {
       reconnectRequiredAccounts.push(a.id);
+      reconnectRequiredLabels.push({ platform: a.platform, display_name: a.display_name, existing: false });
     } else if (st === 'same') {
       const res = await tx.execute(
         sql`update channel_accounts set credential_state = 'needs_reconnect' where id = ${a.id}::uuid and owner_id = ${ownerId}::uuid and credential_state = 'none' returning id`,
       );
-      if ((res as unknown as { rows: unknown[] }).rows.length) reconnectRequiredAccounts.push(a.id);
+      if ((res as unknown as { rows: unknown[] }).rows.length) {
+        reconnectRequiredAccounts.push(a.id);
+        reconnectRequiredLabels.push({ platform: a.platform, display_name: a.display_name, existing: true });
+      }
     }
   }
   return {
@@ -504,6 +518,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     unverifiedConfirmedItems,
     revokedApprovals,
     reconnectRequiredAccounts,
+    reconnectRequiredLabels,
   };
 }
 
@@ -585,6 +600,8 @@ export interface RestorePreview {
   revoked_approvals: ApplyReport['revokedApprovals'];
   /** FIX-T13: 복원하면 "다시 연결 필요"가 될 계정 */
   reconnect_required_accounts: string[];
+  /** FIX2-T13: 같은 계정의 화면 표시용 이름(ID 없음) */
+  reconnect_required_labels: ReconnectLabel[];
 }
 
 /** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
@@ -647,6 +664,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     unverified_confirmed_items: r.unverifiedConfirmedItems,
     revoked_approvals: r.revokedApprovals,
     reconnect_required_accounts: r.reconnectRequiredAccounts,
+    reconnect_required_labels: r.reconnectRequiredLabels,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
@@ -786,6 +804,8 @@ export interface CommitResult {
   revoked_approvals: ApplyReport['revokedApprovals'];
   /** FIX-T13: 복원 뒤 다시 연결이 필요한 계정 */
   reconnect_required_accounts: string[];
+  /** FIX2-T13: 화면 표시용 이름(ID 없음) */
+  reconnect_required_labels: ReconnectLabel[];
 }
 
 async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
@@ -892,6 +912,7 @@ export async function commitRestore(
         unverified_confirmed_items: report.unverifiedConfirmedItems,
         revoked_approvals: report.revokedApprovals,
         reconnect_required_accounts: report.reconnectRequiredAccounts,
+        reconnect_required_labels: report.reconnectRequiredLabels,
         assets_written: written,
         assets_verified: verified,
         assets_missing: missing,

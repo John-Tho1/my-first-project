@@ -16,7 +16,7 @@
  *   token_generation +1(키 교체는 그대로). 공급자 호출 뒤 되쓰기는 읽었던 세대일 때만 — 아니면 결과를 버리고, 새로 받은 토큰은 공급자에서 철회.
  */
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, notExists, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, like, lt, lte, notExists, or, sql } from 'drizzle-orm';
 import {
   AppError,
   codeChallengeS256,
@@ -360,6 +360,10 @@ export const oauthTestHooks: {
   afterReconcileProvider?: () => Promise<void>;
   /** FIX5-T13: 연결 해제가 철회 확인 안 된 현재 토큰을 정리 대기로 봉인하기 직전 — 던지면 봉인 실패 */
   beforeRevokeCurrentSeal?: () => Promise<void>;
+  /** FIX6-T13: 모든 pass 가 낡은 판정으로 끝난 뒤 다음 시도 시각을 미루기 직전(다른 호출이 그 사이 예약을 바꾸는 교차 재현) */
+  beforeStaleBump?: () => Promise<void>;
+  /** FIX6-T13: 연결 해제 마무리 트랜잭션 안, 감사 기록 뒤(커밋 전) — 던지면 마무리 전체가 되돌려진다(시험 전용 — 트랜잭션 안에서 불린다) */
+  insideRevokeFinish?: () => Promise<void>;
 } = {};
 
 interface Locked {
@@ -909,6 +913,8 @@ const liveCredential = (cred: OAuthCredentialRow | null): cred is OAuthCredentia
 export const PENDING_BACKOFF_BASE_MS = 60_000;
 export const PENDING_BACKOFF_MAX_MS = 3600_000;
 export const pendingBackoffMs = (attempts: number) => Math.min(PENDING_BACKOFF_MAX_MS, PENDING_BACKOFF_BASE_MS * 2 ** Math.min(Math.max(attempts - 1, 0), 16));
+/** FIX6-T13(P2 :1356): 두 예약 중 늦은 쪽 — 다음 시도 시각을 앞당기지 않는다 */
+const laterOf = (a: Date, b: Date) => (a.getTime() >= b.getTime() ? a : b);
 
 async function auditPendingRecordFailed(db: DbOrTx, input: { ownerId: string; accountId: string; context: string; result: PendingRecordResult; now: Date }): Promise<void> {
   await recordAudit(db, {
@@ -1073,7 +1079,8 @@ export async function reconcilePendingCredential(
   const bump = (row: OAuthPendingRow, lastResult: string) => ({
     revision: row.revision + 1,
     attempts: row.attempts + 1,
-    nextAttemptAt: new Date(now.getTime() + pendingBackoffMs(row.attempts + 1)),
+    // FIX6-T13(P2 :1356): 다음 시도 시각은 앞당기지 않는다(사용자 확인이 기한 전 행을 처리해도 이미 미룬 예약 이후로만)
+    nextAttemptAt: laterOf(row.nextAttemptAt, new Date(now.getTime() + pendingBackoffMs(row.attempts + 1))),
     lastResult,
     updatedAt: now,
   });
@@ -1341,7 +1348,10 @@ export async function reconcilePendingCredential(
   // FIX5-T13(Codex review-FIX4-T13 놓친 케이스): 모든 pass 가 낡은 판정으로 끝남 — 아무 판정도 쓰지 않았지만 시도는 했으므로 마지막 pass 가 다룬 행의
   // 다음 시도 시각을 미룬다(같은 계정이 worker 의 차례를 계속 차지하지 않게). 판정에 쓰는 값(종류·봉인·revision)은 바꾸지 않는다 — 동시에 진행 중인
   // 해제·정리의 revision 비교를 깨지 않는다. 이 기록이 실패해도 차단은 그대로(행이 남아 있음).
+  // FIX6-T13(Codex review-FIX5-T13 P2 :1356): 그 사이 다른 호출이 이 행의 예약을 이미 이 계산보다 늦게(또는 같게) 미뤘으면 손대지 않는다 — 다음 시도
+  // 시각·시도 수·마지막 결과를 오래된 기준 시각으로 되돌리지 않는다. 미룰 때도 조건부 UPDATE(next_attempt_at < 계산값)로 기존 값보다 앞당기지 않는다.
   if (lastPassRowIds.length) {
+    await oauthTestHooks.beforeStaleBump?.();
     await db
       .transaction(async (tx) => {
         await lockAccountCredential(tx, input.ownerId, account.id);
@@ -1351,10 +1361,12 @@ export async function reconcilePendingCredential(
           .where(and(eq(oauthPendingTokens.ownerId, input.ownerId), eq(oauthPendingTokens.channelAccountId, account.id), inArray(oauthPendingTokens.id, lastPassRowIds)))
           .for('update');
         for (const r of rows) {
+          const next = new Date(now.getTime() + pendingBackoffMs(r.attempts + 1));
+          if (r.nextAttemptAt.getTime() >= next.getTime()) continue;
           await tx
             .update(oauthPendingTokens)
-            .set({ attempts: r.attempts + 1, nextAttemptAt: new Date(now.getTime() + pendingBackoffMs(r.attempts + 1)), lastResult: 'reconcile_stale', updatedAt: now })
-            .where(eq(oauthPendingTokens.id, r.id));
+            .set({ attempts: r.attempts + 1, nextAttemptAt: next, lastResult: 'reconcile_stale', updatedAt: now })
+            .where(and(eq(oauthPendingTokens.id, r.id), lt(oauthPendingTokens.nextAttemptAt, next)));
         }
       })
       .catch(() => undefined);
@@ -1428,7 +1440,18 @@ export interface RevokeResult {
   outcome: RevokeOutcome;
   remoteRevoke: RemoteRevoke | 'skipped_no_key' | 'skipped_unreadable' | 'skipped_unsupported' | 'already_revoked' | 'incomplete' | 'superseded';
   revokedApprovals: number;
+  /**
+   * FIX6-T13: outcome 'incomplete' 의 이유(코드 값만) — 현재 토큰을 그대로 둔 채 revoking(차단)으로 남은 경우.
+   * revoke_current_no_key(키 없음) · revoke_current_unreadable(키 버전 모름·인증 실패) · revoke_provider_unavailable(공급자 없음) · revoke_current_seal_failed(정리 대기 봉인 실패).
+   */
+  incompleteCode: RevokeIncompleteCode | null;
 }
+
+export type RevokeIncompleteCode = 'revoke_current_no_key' | 'revoke_current_unreadable' | 'revoke_provider_unavailable' | 'revoke_current_seal_failed';
+/** FIX6-T13: worker 가 이어서 해제할 수 있는 미완료 해제의 표시(oauth_credentials.last_error_code 접두어) */
+const REVOKE_INCOMPLETE_PREFIX = 'revoke_';
+/** FIX6-T13: 미완료 해제를 worker 가 다시 잇기 전 기다리는 시간(진행 중인 해제와 겹치지 않게) */
+export const REVOKE_RESUME_AFTER_MS = 60_000;
 
 /**
  * 연결 해제(Codex P1 #3, FIX2 P1) — 해제 작업(revoke_op_id) 단위:
@@ -1504,9 +1527,10 @@ export async function revokeCredential(
       }
       pendings.push({ id: p.id, revision: p.revision, kind: p.kind, tokens: t });
     }
-    return { generation: cred.tokenGeneration, tokens, pendings, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
+    const hadCiphertext = cred.encryptedToken !== null && cred.keyVersion !== null;
+    return { generation: cred.tokenGeneration, tokens, hadCiphertext, pendings, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
   });
-  if ('done' in marked && marked.done) return { health: marked.done, outcome: 'already_revoked', remoteRevoke: 'already_revoked', revokedApprovals: 0 };
+  if ('done' in marked && marked.done) return { health: marked.done, outcome: 'already_revoked', remoteRevoke: 'already_revoked', revokedApprovals: 0, incompleteCode: null };
   if ('done' in marked) throw new CredentialNotFoundError();
   await oauthTestHooks.afterRevokeMarked?.();
   let remote: RevokeResult['remoteRevoke'] = marked.skip ?? 'ok';
@@ -1537,7 +1561,10 @@ export async function revokeCredential(
   // FIX5-T13(Codex review-FIX4-T13 P1 :1524): 현재 토큰(C)의 철회가 확인되지 않았으면(failed·unknown) 암호문을 지우기 전에 C 를 정리 대기(cleanup_revoke)로
   // 봉인해 남긴다 — verify_current 삭제나 암호문 삭제로 철회 의무가 끝나지 않게. 같은 토큰을 가진 정리 대기 행의 철회가 확인됐으면(C == P) C 도 철회된 것.
   // 봉인이 실패하면 암호문을 지우지 않고 revoking(차단)으로 남긴다(outcome incomplete — 다시 해제하면 같은 작업에 합류해 다시 철회).
-  // 키가 없거나 열 수 없어 C 를 읽지 못한 경우(skipped_*)는 철회할 수단이 없으므로 기존 규칙 그대로(로컬 삭제).
+  // FIX6-T13(Codex review-FIX5-T13 P1 :1541): 키가 없거나 열 수 없거나 공급자가 없어 C 를 읽지·철회하지 못한 경우(skipped_*)는 철회 확인이 아니다 —
+  // 암호문(봉인 그대로)·키 버전을 지우지 않고 revoking(차단)으로 남긴다(outcome incomplete, last_error_code = 이유). 이 암호문이 곧 철회 의무다:
+  // 키가 다시 설정되면(키 교체가 다시 봉인해도 같은 토큰) worker 가 같은 해제 작업에 합류해 철회하고 마무리한다(refreshExpiringCredentials).
+  const currentUnreadable = marked.hadCiphertext && !marked.tokens;
   const currentRevokeConfirmed =
     !marked.tokens ||
     !cleanupFailed(remote as RemoteRevoke) ||
@@ -1576,12 +1603,19 @@ export async function revokeCredential(
         if (kept.length && marked.tokens && p.tokens?.accessToken === marked.tokens.accessToken) currentCoveredByPending = true;
       }
     }
-    let currentRecord: 'not_needed' | 'covered_by_pending' | 'recorded' | 'seal_failed' = 'not_needed';
+    let currentRecord: 'not_needed' | 'covered_by_pending' | 'recorded' | 'seal_failed' | 'unreadable_kept' = 'not_needed';
+    let incompleteCode: RevokeIncompleteCode | null = null;
     if (ownOpCurrent && cred!.revokedAt) {
       outcome = 'completed_by_other';
+    } else if (canFinish && currentUnreadable) {
+      // FIX6-T13: C 를 읽지 못함 — 철회도 봉인도 못 했으므로 암호문을 그대로 남기고 revoking(차단). 이유는 last_error_code 에(worker 가 이 표시로 다시 잇는다).
+      currentRecord = 'unreadable_kept';
+      incompleteCode = marked.skip === 'skipped_no_key' ? 'revoke_current_no_key' : marked.skip === 'skipped_unreadable' ? 'revoke_current_unreadable' : 'revoke_provider_unavailable';
+      outcome = 'incomplete';
     } else if (canFinish && !currentRevokeConfirmed && !currentCoveredByPending && !sealedCurrent) {
       // C 를 기록할 수 없음 — 암호문을 남기고 revoking(차단) 그대로
       currentRecord = 'seal_failed';
+      incompleteCode = 'revoke_current_seal_failed';
       outcome = 'incomplete';
     } else if (canFinish) {
       if (!currentRevokeConfirmed) {
@@ -1625,6 +1659,14 @@ export async function revokeCredential(
       outcome = 'superseded';
       remote = 'superseded';
     }
+    if (incompleteCode) {
+      // 암호문·키 버전·revoking·해제 작업 ID 는 그대로 — 이유만 남긴다(같은 작업일 때만)
+      await tx
+        .update(oauthCredentials)
+        .set({ lastErrorCode: incompleteCode, updatedAt: now })
+        .where(and(eq(oauthCredentials.id, cred!.id), eq(oauthCredentials.tokenGeneration, marked.generation), eq(oauthCredentials.revokeOpId, marked.opId)));
+      row = { ...cred!, lastErrorCode: incompleteCode, updatedAt: now };
+    }
     // verify_current 는 이 해제가 연결 정보를 해제 상태로 만들었을 때만 삭제(확인할 현재 토큰이 없어짐). C 의 철회가 확인되지 않았으면
     // 위에서 C 를 cleanup_revoke 로 남겼으므로(또는 같은 토큰의 행이 남았으므로) 의무는 사라지지 않는다.
     if (outcome === 'revoked') {
@@ -1652,16 +1694,24 @@ export async function revokeCredential(
         pending_tokens: withToken.length,
         pending_tokens_revoked: results.length - failedPending.length,
         current_token_record: currentRecord,
+        incomplete_code: incompleteCode,
       },
       at: now,
     });
     for (const f of failedPending) {
       await auditCleanupFailure(tx, { ownerId: input.ownerId, accountId: acc.id, context: 'revoke_pending', result: f.result, code: f.code, pendingRecord: 'kept', now });
     }
-    if (currentRecord !== 'not_needed') {
+    if (currentRecord !== 'not_needed' && currentRecord !== 'unreadable_kept') {
       await auditCleanupFailure(tx, { ownerId: input.ownerId, accountId: acc.id, context: 'revoke_current', result: remote as RemoteRevoke, code: remoteCode, pendingRecord: currentRecord, now });
     }
-    return { health: accountHealthView(acc, row, await pendingInfoOf(tx, input.ownerId, acc.id), now), outcome, remoteRevoke: remote, revokedApprovals: marked.revokedApprovals };
+    await oauthTestHooks.insideRevokeFinish?.();
+    return {
+      health: accountHealthView(acc, row, await pendingInfoOf(tx, input.ownerId, acc.id), now),
+      outcome,
+      remoteRevoke: remote,
+      revokedApprovals: marked.revokedApprovals,
+      incompleteCode,
+    };
   });
 }
 
@@ -1671,7 +1721,7 @@ export async function revokeCredential(
 export async function refreshExpiringCredentials(
   db: Db,
   input: { providerFor: ProviderFor; keyring: KeyringSource; now?: Date; ownerId?: string; limit?: number },
-): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number }> {
+): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number; revokeResumed: number; revokeWaiting: number }> {
   const now = input.now ?? new Date();
   // FIX3-T13: 정리 대기가 있는 계정을 먼저 정리한다(만료·상태와 무관 — 해제된 계정·연결 정보 행이 없는 계정 포함).
   // FIX4-T13(Codex review-FIX3-T13 P2 :1293): 다음 시도 시각(next_attempt_at)이 지난 행이 있는 계정만, 가장 이른 시각 순으로 고른다.
@@ -1708,6 +1758,40 @@ export async function refreshExpiringCredentials(
     if (r === 'still_pending') pendingRemaining++;
     else pendingResolved++;
   }
+  // FIX6-T13(Codex review-FIX5-T13 P1 :1541): 미완료 해제(revoking + 암호문 그대로 + last_error_code 'revoke_*')를 잇는다. 지금 키로 암호문을 열 수 있고
+  // 공급자가 있을 때만 같은 해제 작업에 합류한다(revokeCredential) — 아직 열 수 없으면 아무것도 쓰지 않고 넘긴다(감사·시도 기록 없음, 차단 유지).
+  // 진행 중인 해제와 겹치지 않게 마지막 갱신 뒤 REVOKE_RESUME_AFTER_MS 가 지난 행만.
+  const revokeConds = [
+    eq(oauthCredentials.status, 'revoking'),
+    isNull(oauthCredentials.revokedAt),
+    isNotNull(oauthCredentials.revokeOpId),
+    isNotNull(oauthCredentials.encryptedToken),
+    isNotNull(oauthCredentials.keyVersion),
+    like(oauthCredentials.lastErrorCode, `${REVOKE_INCOMPLETE_PREFIX}%`),
+    lte(oauthCredentials.updatedAt, new Date(now.getTime() - REVOKE_RESUME_AFTER_MS)),
+  ];
+  if (input.ownerId) revokeConds.push(eq(oauthCredentials.ownerId, input.ownerId));
+  const stuckRevokes = await db
+    .select()
+    .from(oauthCredentials)
+    .where(and(...revokeConds))
+    .orderBy(asc(oauthCredentials.updatedAt), asc(oauthCredentials.id))
+    .limit(input.limit ?? 20);
+  let revokeResumed = 0;
+  let revokeWaiting = 0;
+  for (const c of stuckRevokes) {
+    try {
+      const ring = input.keyring();
+      openSecret(ring, c.encryptedToken!, c.keyVersion!, tokenAad(c.ownerId, c.channelAccountId));
+      input.providerFor(await ownedAccount(db, c.ownerId, c.channelAccountId));
+    } catch {
+      revokeWaiting++;
+      continue;
+    }
+    const r = await revokeCredential(db, { ownerId: c.ownerId, accountId: c.channelAccountId, providerFor: input.providerFor, keyring: input.keyring, now }).catch(() => null);
+    if (r && (r.outcome === 'revoked' || r.outcome === 'completed_by_other' || r.outcome === 'already_revoked')) revokeResumed++;
+    else revokeWaiting++;
+  }
   const conds = [
     eq(oauthCredentials.status, 'active'),
     isNull(oauthCredentials.revokedAt),
@@ -1732,7 +1816,7 @@ export async function refreshExpiringCredentials(
       failed++;
     }
   }
-  return { refreshed, failed, pendingResolved, pendingRemaining };
+  return { refreshed, failed, pendingResolved, pendingRemaining, revokeResumed, revokeWaiting };
 }
 
 // ---- 키 교체 ----

@@ -423,6 +423,17 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - API: `POST /api/channel-accounts/{id}/connect|refresh|check|revoke`(같은 출처·로그인), `GET /api/channel-accounts/{id}/health`, `GET /api/oauth/callback`. 다른 owner 의 계정은 404.
 - 키 교체: 새 키를 `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(새 번호)에, 직전 키를 `SECRETS_MASTER_KEY_PREVIOUS`·`SECRETS_KEY_VERSION_PREVIOUS` 에 두면 옛 봉인도 읽힌다. 다시 봉인은 `corepack pnpm secrets:rotate`(서버를 끈 상태 — 미리보기, 숫자만) → `corepack pnpm secrets:rotate --confirm`(적용). 모든 봉인을 열어 현재 버전 행의 손상·버전 불일치도 센다. 끝나면 이전 키를 비운다(D25-5).
 
+### Threads 텍스트 (M4, T14 — 모의)
+결정 D26(docs/DECISIONS.md). **모의 어댑터만 — 실제 Threads·Meta API 호출·앱 등록·실계정·네트워크 0.** 실계정 시험(docs/05 "사용자가 정한 계정… 실계정 시험")은 **`blocked_external`**: D24 의 Meta 앱 등록·앱 ID 보관 방식·테스트 Threads 계정·redirect URI·마스터 키 위치·첫 시험 원고·공개 범위를 사용자에게 받기 전에는 하지 않는다. 모의 통과는 실계정 통과가 아니다.
+- 어댑터 선택(한 곳, `@cs/domain` `adapterIdFor`): 모의 계정 + Threads + T13 모의 연결을 쓴 적 있음(`credential_state` ≠ none) → **Threads 모의 어댑터**. 연결한 적 없는 seed 모의 계정은 M3 의 일반 모의 어댑터 그대로(그래서 M3 시험·`drill:mock` M3 표는 바뀌지 않는다). live 계정은 지금처럼 `LiveChannelNotConfiguredError`.
+- 흐름: 게시물마다 컨테이너 생성(`mockthr_ct_…`) → 상태 조회(FINISHED 까지, 한 번의 전송에서 최대 3회) → 게시(`mockthr_post_…`). 스레드(최대 20개, 각 500자 — 잠정값)는 앞 게시물에 답글로 순서대로 이어 붙인다. **각 원격 참조는 다음 원격 호출 전에 `remote_steps` 에 기록**하고, 재개·재확인은 기록을 먼저 읽어 같은 컨테이너를 재사용하며 이미 게시된 게시물은 다시 게시하지 않는다. 결과는 스레드 전체가 게시된 뒤에만 publication 1개(첫 게시물, `mock:threads:<게시 ID>`·`mock://threads/<게시 ID>`, MOCK).
+- 토큰: 작업 처리기 안에서 T13 연결 정보를 열어 어댑터 메모리에만 둔다(`SECRETS_MASTER_KEY` 필요). 응답·로그·감사·작업 이력·단계 기록·내보내기에 없다. 연결 정보를 쓸 수 없으면(만료·해제·정리 대기·다시 연결 필요) 실행 409·전송 BLOCKED(원격 호출 0) — T13 게이트 그대로.
+- 결과 불명·재개: 게시 응답 유실 → `RECONCILING` → 조회가 컨테이너로 게시물을 찾으면 CONFIRMED(재게시 없음). 끝났지만 게시되지 않은 컨테이너 → `resume`(새 시도·새 전송 의도가 **같은 컨테이너**로 게시). 컨테이너 처리 중 → `REMOTE_PROCESSING` → 나중에 같은 컨테이너로. 스레드 일부만 게시된 채 결과 불명 → 남은 게시물부터만. 기록을 잃은 원격(재시작)·만료 컨테이너 → 확인 불가 3회 뒤 `UNKNOWN`(자동 재게시 없음). 사용자 재확인은 조회만(`reconciled=resumable` 이어도 게시하지 않음).
+- 오류: 401 → BLOCKED("계정 다시 연결 필요", 자동 재시도 없음) + T13 확인 경로(연결 확인)를 한 번 부른다. 403·400 → FAILED(재시도 없음). 429 → Retry-After 를 지키는 재시도 대기. 5xx 부작용 없음 → 재시도, 5xx 부작용 불명·시간 초과 → 조회.
+- 요청 제한: 계정별 **로컬 제한**(잠정값 24시간 250개 — 확인일 없음, "provisional — 공식 자료 재확인 필요")을 `remote_steps` 의 게시 기록으로 센다. 넘으면 전송 의도 없이 `RETRY_WAIT`(`local_rate_limited`, 창이 풀리는 시각). 원격 429 도 같은 대기. 화면: `요청 제한 — HH:mm MSK 이후 재시도`.
+- 화면 `/distribute/[id]`: Threads 항목에 단계 목록(`게시물 n/m · 컨테이너 생성됨/컨테이너 준비됨/게시됨(MOCK)/컨테이너 오류 · 모의 ID`)과 T13 연결 상태 한 줄, MOCK 배지·"실제 발행 실적 아님". 개발용 시나리오: `threads_success`·`threads_container_slow`·`threads_publish_timeout_sent`·`threads_publish_timeout_not_sent`·`threads_thread_partial`·`threads_rate_limited`·`threads_token_invalid`·`threads_text_too_long`(Threads 모의 항목에만 — 일반 항목에는 400 `scenario_not_applicable`, `success` 는 둘 다). 시나리오는 시뮬레이터만 바꾸고 payload·hash 는 그대로.
+- 내보내기·복원: `remote_steps` 는 내보내기만(복원 안 함 — 원격 결과는 복원 환경이 다시 확인). `pnpm drill:mock` 은 M3 표 다음에 Threads 모의 표(중복 컨테이너·중복 게시·스레드 전체 전 publication 없음 불변식)를 찍는다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -435,7 +446,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
-| `pnpm drill:mock` | T12 M3 게이트 훈련(버리는 메모리 DB, 모의 어댑터 — 외부 호출 없음) 표 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
 | `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(연결 정보·진행 중 연결 요청·정리 대기 봉인별 다시 봉인 대상·현재 키·그 사이 바뀌어 건너뜀·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰·DB 오류 메시지 본문은 출력하지 않음(오류는 허용된 종류 이름·모양이 맞는 코드만) | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금·DB 닫기 실패면 안내 후 exit 1 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |

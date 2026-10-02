@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
-import { CHANNEL_LABEL, formatMsk, type CanonicalPayload, type Channel } from '@cs/domain';
+import { adapterIdFor, CHANNEL_LABEL, formatMsk, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
   bannersFromState,
@@ -11,10 +11,11 @@ import {
   ITEM_STATUS_LABEL,
   itemHeadline,
   jobStatusText,
-  MOCK_SCENARIO_OPTIONS,
+  mockScenarioOptionsFor,
   PLAN_STATUS_LABEL,
   problemLabel,
   reconciledNotice,
+  remoteStepLine,
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
@@ -84,9 +85,46 @@ function blockInfoOfItem(x: PlanItemDetail) {
   return blockInfoOf(x.events, x.jobs.at(-1) ?? null);
 }
 
+/** T14(D26): 항목의 어댑터(선택 규칙 @cs/domain adapterIdFor 한 곳). */
+function adapterOf(x: PlanItemDetail): AdapterId | null {
+  if (!x.account) return null;
+  return adapterIdFor({ kind: x.account.kind === 'mock' ? 'mock' : 'live', platform: x.account.platform, credential_state: x.account.credentialState });
+}
+
+/** T14: Threads 모의 단계(게시물 n/m · 컨테이너 생성됨/게시됨/오류 · 모의 ID)와 T13 연결 상태 한 줄. */
+function ThreadsSteps({ x }: { x: PlanItemDetail }) {
+  const total = Array.isArray(x.payload.text.posts) ? x.payload.text.posts.length : 0;
+  const latest = x.jobs.at(-1) ?? null;
+  const steps = latest ? x.remoteSteps.filter((r) => r.jobId === latest.id) : [];
+  return (
+    <>
+      <h4>Threads 단계(MOCK — 모의 Threads, 모의 ID)</h4>
+      {x.connection ? (
+        <p className="meta" role="status">
+          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
+        </p>
+      ) : null}
+      {steps.length ? (
+        <ol className="list">
+          {steps.map((st) => (
+            <li key={st.id} className="hash">
+              {remoteStepLine({ kind: st.kind, status: st.status, postIndex: st.postIndex, remoteId: st.remoteId }, total)}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="empty-text">아직 원격 단계 없음(게시물 {total}개 — 컨테이너 생성 → 게시 순서로 진행)</p>
+      )}
+      <p className="note">컨테이너·게시 ID 는 모의 ID 입니다(mockthr_…). 실제 Threads 로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.</p>
+    </>
+  );
+}
+
 /** T12: 개발용 모의 시나리오 선택(모의 계정·끝나지 않은 항목만). 승인 스냅샷 밖 — hash·승인 상태가 바뀌지 않는다. */
 function ScenarioForm({ x }: { x: PlanItemDetail }) {
   if (x.account?.kind !== 'mock' || FINISHED.includes(x.item.status)) return null;
+  const options = mockScenarioOptionsFor(adapterOf(x) ?? 'mock_generic');
   const current = x.mockScenario?.scenario ?? '';
   return (
     <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/mock-scenario`} aria-label="모의 시나리오">
@@ -94,7 +132,7 @@ function ScenarioForm({ x }: { x: PlanItemDetail }) {
       <label>
         모의 시나리오 <span className="note">개발용 · 모의 결과 선택 (실제 채널 없음)</span>{' '}
         <select name="scenario" defaultValue={current || 'success'}>
-          {MOCK_SCENARIO_OPTIONS.map((o) => (
+          {options.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>
@@ -242,6 +280,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           {retryable ? <p className="note">재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
         </>
       ) : null}
+      {adapterOf(x) === 'mock_threads' || x.remoteSteps.length ? <ThreadsSteps x={x} /> : null}
       <ScenarioForm x={x} />
       {x.publications.length ? (
         <>

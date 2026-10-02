@@ -19,6 +19,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import {
+  adapterIdFor,
   LiveChannelNotConfiguredError,
   MOCK_SCENARIO_VALUES,
   type AdapterAccount,
@@ -36,6 +37,7 @@ import {
   type RemoteVisibility,
   type ResultKind,
 } from '@cs/domain';
+import { ThreadsMockChannelAdapter } from './threads-mock';
 
 export type {
   AdapterAccount,
@@ -112,6 +114,8 @@ const DEFAULT_CAPS: AdapterCapabilities = { read: true, cancel: false, definitiv
 
 export class MockChannelAdapter implements ChannelAdapter {
   readonly kind = 'mock' as const;
+  /** T14(D26): 일반 모의 어댑터(연결한 적 없는 모의 계정 — M3 동작) */
+  readonly id = 'mock_generic' as const;
   private readonly remote = new Map<string, MockRemoteEntry>();
   /** 이 프로세스에서 submit 요청을 받은 intentKey. 모르는 key 는 "없음"이라고 단정하지 않는다(재시작 뒤 맹목 재전송 방지). */
   private readonly seen = new Set<string>();
@@ -364,11 +368,29 @@ export class MockChannelAdapter implements ChannelAdapter {
   }
 }
 
+/**
+ * 모의 어댑터 레지스트리. T14(D26) 선택 규칙은 @cs/domain adapterIdFor 한 곳:
+ * 모의 + threads + credential_state ≠ none → ThreadsMockChannelAdapter, 그 밖의 모의 계정 → MockChannelAdapter(M3 그대로),
+ * live → LiveChannelNotConfiguredError(live 어댑터 없음).
+ */
 export class MockChannelAdapterRegistry implements ChannelAdapterRegistry {
-  constructor(readonly mock: MockChannelAdapter) {}
-  getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform'>): ChannelAdapter {
-    if (account.kind === 'mock') return this.mock;
+  readonly threads: ThreadsMockChannelAdapter;
+  constructor(
+    readonly mock: MockChannelAdapter,
+    threads?: ThreadsMockChannelAdapter,
+  ) {
+    this.threads = threads ?? new ThreadsMockChannelAdapter();
+  }
+  getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): ChannelAdapter {
+    const id = adapterIdFor(account);
+    if (id === 'mock_threads') return this.threads;
+    if (id === 'mock_generic') return this.mock;
     throw new LiveChannelNotConfiguredError();
+  }
+  getAdapterById(id: string): ChannelAdapter | null {
+    if (id === 'mock_threads') return this.threads;
+    if (id === 'mock_generic') return this.mock;
+    return null;
   }
 }
 

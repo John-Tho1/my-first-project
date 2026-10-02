@@ -1397,12 +1397,66 @@ export const mockScenarios = pgTable(
     unique('mock_scenarios_item_uq').on(t.distributionItemId),
     check(
       'mock_scenarios_scenario_chk',
-      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported')`,
+      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported', 'threads_success', 'threads_container_slow', 'threads_publish_timeout_sent', 'threads_publish_timeout_not_sent', 'threads_thread_partial', 'threads_rate_limited', 'threads_token_invalid', 'threads_text_too_long')`,
     ),
     check('mock_scenarios_delay_chk', sql`${t.delayMs} between 0 and 5000`),
     foreignKey({
       name: 'mock_scenarios_item_same_owner_fk',
       columns: [t.distributionItemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T14 Threads 원격 단계 참조(결정 D26, migration 0031) ----
+
+/**
+ * 원격 단계 기록(remote_steps) — 두 단계 게시(Threads: 컨테이너 생성 → 게시)의 원격 참조를 **다음 원격 호출 전에** 남긴다.
+ * 재개·재확인은 이 기록을 먼저 읽고 이미 만든 컨테이너를 다시 만들지 않으며, 이미 게시된 게시물을 다시 게시하지 않는다(A08).
+ * - (job, post_index, kind) unique: 게시물마다 컨테이너 1개·게시 1개. remote_id 전체 unique(같은 원격 ID 는 한 번만).
+ * - remote_id CHECK `LIKE 'mock%'`: live 어댑터가 없는 동안 모의 ID 만(D26 — live 어댑터를 붙일 때 다시 정한다).
+ * - kind='publish' 는 status='published' 만, kind='container' 는 created·finished·error.
+ * - 트리거 remote_steps_guard: DELETE 거부, remote_id·식별 열 변경 거부, published 는 바뀌지 않음, INSERT 때 전송 의도가 같은 작업·owner 인지 확인.
+ * 내보내기만(복원 안 함 — send_intents·publications 와 같이 원격 결과는 복원 환경이 다시 확인할 사실).
+ */
+export const remoteSteps = pgTable(
+  'remote_steps',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    intentId: uuid('intent_id')
+      .notNull()
+      .references(() => sendIntents.id, { onDelete: 'restrict' }),
+    itemId: uuid('item_id').notNull(),
+    stepIndex: integer('step_index').notNull(),
+    kind: text('kind').notNull(),
+    postIndex: integer('post_index').notNull(),
+    remoteId: text('remote_id').notNull(),
+    status: text('status').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('remote_steps_job_post_kind_uq').on(t.jobId, t.postIndex, t.kind),
+    unique('remote_steps_remote_id_uq').on(t.remoteId),
+    index('remote_steps_item_idx').on(t.itemId),
+    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish')`),
+    check('remote_steps_status_chk', sql`${t.status} in ('created', 'finished', 'published', 'error')`),
+    check('remote_steps_kind_status_chk', sql`(${t.kind} = 'publish') = (${t.status} = 'published')`),
+    check('remote_steps_post_index_chk', sql`${t.postIndex} >= 0`),
+    check('remote_steps_step_index_chk', sql`${t.stepIndex} >= 0`),
+    check('remote_steps_mock_id_chk', sql`${t.remoteId} like 'mock%'`),
+    foreignKey({
+      name: 'remote_steps_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'remote_steps_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
       foreignColumns: [distributionItems.id, distributionItems.ownerId],
     }).onDelete('restrict'),
   ],

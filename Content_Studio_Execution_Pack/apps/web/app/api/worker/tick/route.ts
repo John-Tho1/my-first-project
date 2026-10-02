@@ -3,6 +3,7 @@ import { assertSameOrigin, isUuid, tickSchema } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../lib/body';
 import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../lib/distribution';
+import { jobCredentials } from '../../../../lib/oauth';
 import { getChannelAdapters, getConfig } from '../../../../lib/server';
 import { requireOwner } from '../../../../lib/session';
 
@@ -40,6 +41,7 @@ export async function POST(request: Request): Promise<Response> {
       ownerId: owner.ownerId,
       maxJobs: parsed.data.max_jobs ?? 5,
       submitTimeoutMs: uiTickTimeoutMs(config, body.kind === 'form'),
+      credentials: jobCredentials(config, owner.db),
     });
     await recordAudit(owner.db, {
       ownerId: owner.ownerId,

@@ -25,6 +25,7 @@ import {
   uploadStoreFor,
   type AssetDeleter,
   type Db,
+  type JobRunOptions,
   type JobsTickResult,
   type RetentionResult,
   type TranscriberLike,
@@ -91,6 +92,8 @@ export interface WorkerTickInput {
   leaseTtlMs?: number;
   /** T13: 만료 7일 안의 연결 정보 갱신기(호출자가 공급자·키를 넣는다). 없으면 건너뛴다. */
   credentialRefresh?: (now: Date) => Promise<{ refreshed: number; failed: number }>;
+  /** T14(D26): 배포 작업의 연결 정보 의존성(키 묶음·401 뒤 확인). 없으면 작업 처리기 기본값(process.env 키, 확인 없음). */
+  jobCredentials?: JobRunOptions['credentials'];
 }
 
 export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick> {
@@ -114,6 +117,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
       submitTimeoutMs: config.JOB_SUBMIT_TIMEOUT_MS,
       maxJobs: Math.min(Math.max(input.maxJobs ?? 5, 1), 20),
       ownerId: input.ownerId,
+      credentials: input.jobCredentials,
     });
   }
   const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);

@@ -45,6 +45,7 @@ export const BUNDLE_TABLES: Record<ExportedTable, PgTable> = {
   send_intents: schema.sendIntents,
   publications: schema.publications,
   mock_scenarios: schema.mockScenarios,
+  remote_steps: schema.remoteSteps,
   audit_events: schema.auditEvents,
 };
 

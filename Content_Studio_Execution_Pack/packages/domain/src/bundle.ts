@@ -65,6 +65,8 @@ export const EXPORTED_TABLES = [
   'publications',
   // T12(0018, 결정 D19): 항목별 모의 시나리오(개발·시험용) — 내보내기만. 복원 환경의 모의 결과를 미리 정해 두지 않는다.
   'mock_scenarios',
+  // T14(0031, 결정 D26): 원격 단계 참조(Threads 컨테이너·게시 ID, 모의) — 내보내기만. 복원 환경은 원격을 다시 확인해야 한다.
+  'remote_steps',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -95,6 +97,7 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   send_intents: '0017_t11_jobs',
   publications: '0017_t11_jobs',
   mock_scenarios: '0018_t12_mock_scenarios',
+  remote_steps: '0031_t14_threads_steps',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -115,9 +118,9 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
  * FIX-T11(P1, Codex review-T11 bundle.ts:110): jobs·send_intents·publications 는 **읽기 전용 이력**으로 복원한다 — 확인된 결과의 근거
  * (외부 ID·공개 범위·MOCK 표식)와 재확인용 원격 참조(전송 의도 key)를 잃지 않게. 자동 재개는 없다: 작업은 끝난 상태(CONFIRMED·FAILED·CANCELED·
  * BLOCKED) 또는 UNKNOWN 으로만 들어가고 restored_needs_review 가 켜진다(worker 는 lease 하지 않고, 재시도 API 는 거부, 재확인은 조회만).
- * job_events·execute_commands·mock_scenarios·users·audit_events 는 계속 내보내기만.
+ * job_events·execute_commands·mock_scenarios·users·audit_events 는 계속 내보내기만. T14(D26): remote_steps(원격 단계 참조)도 내보내기만.
  */
-export const NON_RESTORED_TABLES = ['users', 'audit_events', 'job_events', 'execute_commands', 'mock_scenarios'] as const satisfies readonly ExportedTable[];
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'job_events', 'execute_commands', 'mock_scenarios', 'remote_steps'] as const satisfies readonly ExportedTable[];
 export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
   (typeof NON_RESTORED_TABLES)[number]
@@ -552,6 +555,20 @@ export const ROW_SCHEMAS = {
     distribution_item_id: uuid,
     scenario: str,
     delay_ms: int.min(0),
+    created_at: ts,
+    updated_at: ts,
+  }),
+  // T14(0031)
+  remote_steps: z.strictObject({
+    id: uuid,
+    job_id: uuid,
+    intent_id: uuid,
+    item_id: uuid,
+    step_index: int.min(0),
+    kind: z.enum(['container', 'publish']),
+    post_index: int.min(0),
+    remote_id: z.string().regex(/^mock/),
+    status: z.enum(['created', 'finished', 'published', 'error']),
     created_at: ts,
     updated_at: ts,
   }),
@@ -1339,6 +1356,11 @@ function checkDistributionIntegrity(
     }
   }
   for (const m of t.mock_scenarios) need('mock_scenarios', 'distribution_item_id', m.distribution_item_id, 'distribution_items');
+  for (const r of t.remote_steps) {
+    need('remote_steps', 'job_id', r.job_id, 'jobs');
+    need('remote_steps', 'intent_id', r.intent_id, 'send_intents');
+    need('remote_steps', 'item_id', r.item_id, 'distribution_items');
+  }
 }
 
 /** owner 를 뺀 행 비교용 해시(같은 ID 의 기존 행과 내용이 같은지). */

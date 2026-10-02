@@ -60,6 +60,10 @@ export const JOB_EVENTS = [
   'lease_expired_after_intent',
   'unblock',
   'late_result',
+  // T14(D26): 원격에 남긴 단계 참조(컨테이너 등)로 이어서 보낼 수 있음 — 새 시도(새 전송 의도)가 같은 참조를 재사용한다(새 원격 객체 없음).
+  'resume',
+  // T14(D26): 계정별 로컬 요청 제한 — 전송 의도를 만들지 않고 창(window)이 풀리는 시각까지 대기.
+  'local_rate_limited',
 ] as const;
 export type JobEvent = (typeof JOB_EVENTS)[number];
 
@@ -81,6 +85,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     permanent_failure: 'FAILED',
     lease_expired_before_intent: 'QUEUED',
     late_result: 'RECONCILING',
+    local_rate_limited: 'RETRY_WAIT',
   },
   SENDING: {
     remote_accepted: 'REMOTE_PROCESSING',
@@ -102,6 +107,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     reconcile_unsupported: 'UNKNOWN',
     cancel_requested: 'CANCEL_REQUESTED',
     lease_expired_after_intent: 'RECONCILING',
+    resume: 'RETRY_WAIT',
   },
   // FIX-T11(P0): late_result — lease 를 잃은 옛 시도가 부작용이 있을 수 있는 결과(accepted·processing·ambiguous)를 늦게 돌려주면
   // 다음 시도(새 의도)로 가지 않고 조회로 돌린다(맹목 재전송 금지).
@@ -114,6 +120,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     reconcile_retry: 'RECONCILING',
     permanent_failure: 'FAILED',
     cancel_requested: 'CANCEL_REQUESTED',
+    resume: 'RETRY_WAIT',
   },
   UNKNOWN: { reconciled_found: 'CONFIRMED', remote_accepted: 'REMOTE_PROCESSING', reconcile_retry: 'UNKNOWN' },
   CANCEL_REQUESTED: {
@@ -232,15 +239,21 @@ export interface AdapterResult {
   error_code?: string;
 }
 
-/** reconcile 결과. read 권한이 없으면 unsupported, 조회했지만 판단 불가면 unknown. not_found 는 capabilities.definitive_not_found 일 때만 "보내지 않았음"으로 믿는다. */
+/**
+ * reconcile 결과. read 권한이 없으면 unsupported, 조회했지만 판단 불가면 unknown. not_found 는 capabilities.definitive_not_found 일 때만 "보내지 않았음"으로 믿는다.
+ * T14(D26) resumable: 원격에 남긴 단계 참조(remote_steps — 예: Threads 컨테이너)로 확인해 보니 **남은 단계는 아직 게시되지 않았음**이 확실하고,
+ * 같은 참조를 재사용해 이어 보낼 수 있다(새 원격 객체를 만들지 않음). published_parts = 이미 게시된 부분 수(스레드의 앞 게시물 등).
+ * 작업 처리기는 이것을 새 시도(새 전송 의도)로 이어 보낸다 — 사용자 재확인은 조회만(이어 보내지 않음).
+ */
 export interface ReconcileResult {
-  status: 'found' | 'processing' | 'not_found' | 'unsupported' | 'unknown';
+  status: 'found' | 'processing' | 'not_found' | 'unsupported' | 'unknown' | 'resumable';
   result_kind?: ResultKind;
   external_id?: string;
   permalink?: string;
   remote_visibility?: RemoteVisibility;
   provider_request_id?: string;
   error_code?: string;
+  published_parts?: number;
 }
 
 export interface CancelResult {
@@ -257,6 +270,32 @@ export interface AdapterCapabilities {
   definitive_not_found: boolean;
   /** 모의 어댑터(결과는 MOCK — 실제 발행 실적이 아님) */
   mock: boolean;
+  /** T14(D26): 어댑터 식별자(mock_generic·mock_threads). 전송 의도에 기록해 조회 때 같은 어댑터를 쓴다. */
+  adapter?: string;
+  /** T14: 미디어 첨부 지원 여부(Threads T14 = 텍스트만 → false) */
+  media?: boolean;
+  /** T14: 글자 수·게시물 수 한도(잠정값 — 확인일·API 버전과 함께, docs/03 "숫자를 사실로 고정하지 않음") */
+  text?: ChannelTextLimits;
+  /** T14: 계정별 요청 제한(잠정값). 있으면 작업 처리기가 전송 의도 전에 로컬로 센다(local_rate_limited). */
+  rate_limit?: ChannelRateLimit;
+}
+
+export interface ChannelTextLimits {
+  max_post_chars: number;
+  max_posts: number;
+  unit: 'code_point';
+  checked_at: string | null;
+  api_version: string | null;
+  source: string;
+}
+
+export interface ChannelRateLimit {
+  /** 창(window) 안에서 허용할 게시 단위 수(게시물 1개 = 1) */
+  max_units: number;
+  window_sec: number;
+  checked_at: string | null;
+  api_version: string | null;
+  source: string;
 }
 
 export interface AdapterAccount {
@@ -264,6 +303,74 @@ export interface AdapterAccount {
   kind: 'mock' | 'live';
   platform: string;
   external_account_id: string;
+  /** T13: channel_accounts.credential_state(none·linked·needs_reconnect). T14 어댑터 선택 규칙(D26)에 쓴다. */
+  credential_state?: string;
+}
+
+/** T14(D26): 어댑터 식별자. */
+export const ADAPTER_IDS = ['mock_generic', 'mock_threads'] as const;
+export type AdapterId = (typeof ADAPTER_IDS)[number];
+
+/**
+ * T14(D26) 어댑터 선택 규칙(한 곳): 모의 계정 + platform='threads' + 연결 정보를 쓴 적 있음(credential_state ≠ none)
+ * → Threads 모의 어댑터(mock_threads, 컨테이너 → 게시 2단계, T13 연결 정보 사용). 연결한 적 없는 모의 계정(M3 seed 계정)
+ * → 일반 모의 어댑터(mock_generic, M3 동작 그대로). live 계정 → null(어댑터 없음 — LiveChannelNotConfiguredError).
+ */
+export function adapterIdFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): AdapterId | null {
+  if (account.kind !== 'mock') return null;
+  if (account.platform === 'threads' && account.credential_state !== undefined && account.credential_state !== 'none') return 'mock_threads';
+  return 'mock_generic';
+}
+
+/** T14: 원격 단계 기록(remote_steps) — 어댑터가 외부 호출 사이에 남기는 참조. ID 는 모의 ID 만(DB CHECK remote_id LIKE 'mock%'). */
+export const REMOTE_STEP_KINDS = ['container', 'publish'] as const;
+export type RemoteStepKind = (typeof REMOTE_STEP_KINDS)[number];
+export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error'] as const;
+export type RemoteStepStatus = (typeof REMOTE_STEP_STATUSES)[number];
+
+export interface RemoteStep {
+  kind: RemoteStepKind;
+  post_index: number;
+  step_index: number;
+  remote_id: string;
+  status: RemoteStepStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * T14: 작업 처리기가 어댑터에 주는 단계 기록 창구(작업 단위). 각 호출은 **자기 짧은 트랜잭션**(원격 호출 동안 DB 잠금 없음).
+ * record 는 (job, post_index, kind) 가 없으면 넣고, 있으면 같은 remote_id 일 때만 상태를 바꾼다 — 다른 remote_id 면 던진다(참조는 바뀌지 않음).
+ */
+export interface RemoteStepsPort {
+  list(): Promise<RemoteStep[]>;
+  record(step: { kind: RemoteStepKind; post_index: number; remote_id: string; status: RemoteStepStatus }): Promise<RemoteStep>;
+}
+
+/**
+ * T14: 서버 쪽에서 계정 연결 토큰을 꺼내는 창구(작업 처리기 안에서만, T13 봉인 해제). 토큰은 어댑터 메모리에만 —
+ * 로그·오류·감사·작업 이력·응답·단계 기록에 넣지 않는다. 쓸 수 없으면 code 만(credential_<상태>·secrets_not_configured·decrypt_<문제>).
+ */
+export interface CredentialPort {
+  accessToken(): Promise<{ ok: true; token: string } | { ok: false; code: string }>;
+}
+
+/**
+ * T14(D26) 로컬 요청 제한 판단(순수). used = 창 안에서 이미 쓴 단위, needed = 이번 작업이 더 쓸 단위, oldestAt = 창 안 가장 오래된 사용 시각.
+ * used + needed > max 이면 대기(resetAt = oldestAt + 창). 단, 창 안 사용이 0 이면 허용(한도보다 큰 작업도 영원히 막히지 않게).
+ */
+export function localRateLimitDecision(input: {
+  used: number;
+  needed: number;
+  limit: Pick<ChannelRateLimit, 'max_units' | 'window_sec'>;
+  oldestAt: Date | null;
+  now: Date;
+}): { allowed: true } | { allowed: false; resetAt: Date } {
+  const { used, needed, limit, oldestAt, now } = input;
+  if (needed <= 0 || used <= 0 || used + needed <= limit.max_units) return { allowed: true };
+  const base = oldestAt ?? now;
+  const resetAt = new Date(Math.max(base.getTime() + limit.window_sec * 1000, now.getTime() + 1000));
+  return { allowed: false, resetAt };
 }
 
 /** 어댑터가 받는 승인 스냅샷(항목의 불변 canonical payload). */
@@ -310,8 +417,25 @@ export const MOCK_SCENARIO_VALUES = [
   'hang',
   'cancel_supported',
   'reconcile_unsupported',
+  // T14(D26): Threads 모의 어댑터(mock_threads) 전용 — 시뮬레이터 동작만 정한다(payload·hash 는 그대로).
+  'threads_success',
+  'threads_container_slow',
+  'threads_publish_timeout_sent',
+  'threads_publish_timeout_not_sent',
+  'threads_thread_partial',
+  'threads_rate_limited',
+  'threads_token_invalid',
+  'threads_text_too_long',
 ] as const;
 export type MockScenarioValue = (typeof MOCK_SCENARIO_VALUES)[number];
+/** T14: Threads 모의 어댑터에만 쓰는 시나리오. 'success' 는 두 어댑터 모두에 쓸 수 있다(Threads 에서는 threads_success). */
+export const THREADS_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.startsWith('threads_')) as readonly MockScenarioValue[];
+export const isThreadsMockScenario = (s: string): boolean => s.startsWith('threads_');
+/** 어댑터에 맞는 시나리오인가(API 가 다르면 400 scenario_not_applicable). */
+export function scenarioApplies(adapter: AdapterId, scenario: string): boolean {
+  if (scenario === 'success') return true;
+  return adapter === 'mock_threads' ? isThreadsMockScenario(scenario) : !isThreadsMockScenario(scenario);
+}
 export const MOCK_SCENARIO_MAX_DELAY_MS = 5000;
 
 /** 항목별 모의 시나리오(작업 처리기가 mock 계정 항목에 대해서만 mock_scenarios 표에서 읽어 넣는다). */
@@ -333,10 +457,20 @@ export interface AdapterContext {
   heartbeat(): Promise<void>;
   /** T12: 항목별 모의 시나리오(모의 계정 항목만, 없으면 null). live 어댑터는 무시한다. */
   mockScenario?: MockScenarioSetting | null;
+  /** T14: 이 작업의 원격 단계 기록(remote_steps). 작업 처리기가 넣는다. */
+  steps?: RemoteStepsPort;
+  /** T14: 서버 쪽 연결 토큰 창구(T13). 작업 처리기가 넣는다. */
+  credential?: CredentialPort;
+  /** T14: 조회(reconcile) 때도 승인 스냅샷이 필요한 어댑터용(예: 스레드 게시물 수). */
+  snapshot?: PublishSnapshot;
 }
 
 export interface ChannelAdapter {
   readonly kind: 'mock' | 'live';
+  /** T14: 어댑터 식별자(전송 의도 sanitized_details.adapter_id 에 기록). 없으면 kind 로만 고른다(M3 호환). */
+  readonly id?: AdapterId;
+  /** T14: 이 스냅샷이 쓸 요청 제한 단위 수(예: 스레드 게시물 수). capabilities.rate_limit 과 함께 쓴다. */
+  rateUnits?(snapshot: PublishSnapshot): number;
   /** ctx.mockScenario 는 모의 어댑터가 항목별 capabilities(cancel 등)를 정할 때만 쓴다. */
   capabilities(account: AdapterAccount, ctx?: Pick<AdapterContext, 'mockScenario'>): AdapterCapabilities;
   validate(snapshot: PublishSnapshot): { ok: true } | { ok: false; error_code: string };
@@ -348,7 +482,9 @@ export interface ChannelAdapter {
 
 export interface ChannelAdapterRegistry {
   /** live 계정은 LiveChannelNotConfiguredError(M3 에는 live 어댑터 없음). */
-  getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform'>): ChannelAdapter;
+  getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): ChannelAdapter;
+  /** T14: 전송 의도에 기록된 어댑터로 조회한다(계정 연결 상태가 그 뒤 바뀌어도 보낸 어댑터로 확인). 모르면 null. */
+  getAdapterById?(id: string): ChannelAdapter | null;
 }
 
 // ---- 결과 분류 ----
@@ -487,6 +623,20 @@ export class NotRetryableError extends AppError {
 export class NotMockAccountError extends AppError {
   constructor() {
     super('bad_request', 'not_mock_account', '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다(실제 채널에는 없는 개념)');
+  }
+}
+
+/** T14(D26): 항목의 어댑터(일반 모의·Threads 모의)에 맞지 않는 모의 시나리오. */
+export class ScenarioNotApplicableError extends AppError {
+  constructor(adapter: AdapterId) {
+    super(
+      'bad_request',
+      'scenario_not_applicable',
+      adapter === 'mock_threads'
+        ? '이 항목은 Threads 모의 연결 계정이라 threads_* 시나리오(또는 success)만 정할 수 있습니다'
+        : 'threads_* 시나리오는 모의 연결(Threads 형 OAuth)한 Threads 계정 항목에만 정할 수 있습니다',
+      { adapter },
+    );
   }
 }
 

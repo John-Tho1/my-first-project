@@ -2,7 +2,7 @@
  * T10 배포함 — 폼 → API 입력, 폼 오류 리다이렉트, 화면 문구(서버 전용).
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
-import { AppError, MOCK_SCENARIO_VALUES } from '@cs/domain';
+import { AppError, MOCK_SCENARIO_VALUES, scenarioApplies, type AdapterId } from '@cs/domain';
 import { errorResponse, seeOther } from './api';
 
 export const MAX_DISTRIBUTION_REQUEST = 64 * 1024;
@@ -89,6 +89,7 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
   not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
   item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
+  scenario_not_applicable: '이 항목의 모의 어댑터(일반 모의·Threads 모의)에 맞지 않는 시나리오입니다. threads_* 는 모의 연결한 Threads 계정 항목에만 쓸 수 있습니다.',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -173,7 +174,16 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
   credential_revoked: '계정 연결 해제됨 — 다시 연결 필요(보내지 않음)',
   credential_needs_reconnect: '계정 다시 연결 필요(보내지 않음)',
   credential_error: '계정 연결 오류 — 다시 연결 필요(보내지 않음)',
+  // T14: Threads 모의 어댑터의 401·연결 정보 문제(원격 호출 없음 또는 거절)
+  auth_invalid_token: '계정 다시 연결 필요(401 — 자동 재시도 안 함)',
+  credential_unavailable: '계정 다시 연결 필요(연결 정보를 쓸 수 없음 — 보내지 않음)',
+  credential_missing: '계정 다시 연결 필요(연결 정보 없음 — 보내지 않음)',
+  secrets_not_configured: '서버 암호화 키 없음 — 연결 정보를 열 수 없음(보내지 않음)',
 };
+
+/** T14(D26): 요청 제한으로 기다리는 재시도 대기(로컬 제한 또는 원격 429). */
+const RATE_LIMIT_CODES = new Set(['local_rate_limited', 'rate_limited']);
+export const isRateLimitWait = (job: { state: string; lastErrorCode: string | null }) => job.state === 'RETRY_WAIT' && RATE_LIMIT_CODES.has(job.lastErrorCode ?? '');
 
 interface JobLike {
   state: string;
@@ -204,6 +214,7 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     case 'REMOTE_PROCESSING':
       return 'REMOTE_PROCESSING · 원격 처리 중(확인 대기)';
     case 'RETRY_WAIT':
+      if (isRateLimitWait(job)) return `RETRY_WAIT · 요청 제한 — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
       return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})`;
     case 'RECONCILING':
       return 'RECONCILING · 등록 여부 확인 필요';
@@ -246,9 +257,35 @@ export const MOCK_SCENARIO_LABEL: Record<(typeof MOCK_SCENARIO_VALUES)[number], 
   hang: '응답 없음(시간 초과) — 조회',
   cancel_supported: '원격 취소 지원(처리 중 → 취소 가능)',
   reconcile_unsupported: '원격 조회 불가 — 3회 뒤 확인 불가(UNKNOWN)',
+  // T14(D26): Threads 모의 어댑터(모의 연결 계정)
+  threads_success: 'Threads 모의: 컨테이너 → 게시 성공',
+  threads_container_slow: 'Threads 모의: 컨테이너 처리 지연 → 원격 처리 중 → 같은 컨테이너로 게시',
+  threads_publish_timeout_sent: 'Threads 모의: 게시 응답 유실(원격은 게시함) — 조회로 확인, 다시 게시 안 함',
+  threads_publish_timeout_not_sent: 'Threads 모의: 게시 시간 초과(원격 게시 안 됨) — 조회 뒤 같은 컨테이너로 게시',
+  threads_thread_partial: 'Threads 모의: 3번째 게시물 5xx(결과 불명) — 앞 게시물은 다시 게시 안 함',
+  threads_rate_limited: 'Threads 모의: 요청 제한(429, Retry-After 5초) 한 번',
+  threads_token_invalid: 'Threads 모의: 토큰 거절(401) — 계정 다시 연결 필요',
+  threads_text_too_long: 'Threads 모의: 형식 오류(400 글자 수) — 재시도 안 함',
 };
 
 export const MOCK_SCENARIO_OPTIONS = MOCK_SCENARIO_VALUES.map((v) => ({ value: v, label: `${v} — ${MOCK_SCENARIO_LABEL[v]}` }));
+
+/** T14: 항목 어댑터에 맞는 시나리오 선택지만(일반 모의 ↔ Threads 모의). */
+export function mockScenarioOptionsFor(adapter: AdapterId) {
+  return MOCK_SCENARIO_OPTIONS.filter((o) => scenarioApplies(adapter, o.value));
+}
+
+/** T14: 원격 단계 한 줄 — `게시물 2/3 · 컨테이너 생성됨 · mockthr_ct_…`. 모의 ID 만, "게시 완료" 라고 하지 않는다. */
+export const REMOTE_STEP_LABEL: Record<string, string> = {
+  'container:created': '컨테이너 생성됨',
+  'container:finished': '컨테이너 준비됨',
+  'container:error': '컨테이너 오류',
+  'publish:published': '게시됨(MOCK)',
+};
+export function remoteStepLine(step: { kind: string; status: string; postIndex: number; remoteId: string }, total: number): string {
+  const label = REMOTE_STEP_LABEL[`${step.kind}:${step.status}`] ?? `${step.kind} ${step.status}`;
+  return `게시물 ${step.postIndex + 1}/${total} · ${label} · ${step.remoteId}`;
+}
 
 const mskClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit', hour12: false });
 
@@ -361,6 +398,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
     case 'REMOTE_PROCESSING':
       return x.channel === 'youtube' ? '비공개 업로드 처리 중 — 확인 대기' : '원격 처리 중 — 확인 대기';
     case 'RETRY_WAIT':
+      if (job && isRateLimitWait(job)) return `요청 제한 — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
       return job ? `재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})` : '재시도 대기';
     case 'RECONCILING':
       return '등록 여부 확인 필요';
@@ -374,7 +412,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       return `실패${job?.lastErrorCode ? ` (${job.lastErrorCode})` : ''} — 자동 재시도 안 함`;
     case 'BLOCKED':
       if (!job) return '보류 — 복원된 항목(원격 결과 확인 필요, 자동 재전송 안 함)';
-      if (reason === 'auth' || job.lastRetryClass === 'auth' || reason === 'mock_401_unauthorized') return '계정 다시 연결 필요';
+      if (reason === 'auth' || job.lastRetryClass === 'auth' || reason === 'mock_401_unauthorized' || reason === 'auth_invalid_token') return '계정 다시 연결 필요';
       if (APPROVAL_BLOCK_REASONS.has(reason)) return '승인 없음 — 다시 승인 후 실행';
       return `보류 — ${BLOCK_REASON_LABEL[reason] ?? reason ?? '확인 필요'}`;
     case 'CONFIRMED': {
@@ -391,11 +429,11 @@ export function itemHeadline(x: ItemHeadlineInput): string {
 
 // ---- M3 화면 FIX(D8): 수동 재확인 결과 4종 ----
 
-export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown' | 'stale';
+export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown' | 'stale' | 'resumable';
 
 /** 재확인 결과(원격 조회 상태) → 리다이렉트 값. processing·unknown 은 "확인 못 함(unknown)" — 없다는 뜻이 아니다. */
 export function reconciledParam(remote: string): ReconciledKind {
-  if (remote === 'found' || remote === 'not_found' || remote === 'unsupported') return remote;
+  if (remote === 'found' || remote === 'not_found' || remote === 'unsupported' || remote === 'resumable') return remote;
   return 'unknown';
 }
 
@@ -405,6 +443,8 @@ export const RECONCILED_TEXT: Record<ReconciledKind, string> = {
   unsupported: '이 채널은 원격 조회를 지원하지 않아 확인하지 못했습니다. 원격에 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
   unknown: '원격 상태를 확인하지 못했습니다(진행 중이거나 기록이 없음). 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.',
   stale: '조회하는 사이 작업 상태(시도)가 바뀌어 조회 결과를 적용하지 않았습니다. 아래 현재 상태를 확인하세요. 다시 보내지 않았습니다.',
+  resumable:
+    '원격에 아직 게시되지 않은 단계가 있습니다(저장된 컨테이너로 이어서 게시할 수 있음). 재확인은 조회만 했고 게시하지 않았습니다 — 확인 중 작업은 작업 처리기가 같은 컨테이너로 이어 갑니다.',
 };
 
 /** 쿼리 reconciled 값 → 고정 문구. 알 수 없는 값·여러 값이면 null(아무 결과도 말하지 않는다). */

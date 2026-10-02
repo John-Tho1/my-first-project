@@ -622,6 +622,46 @@ async function readForUse(db: Db, ownerId: string, accountId: string, providerFo
   return r;
 }
 
+/**
+ * T14(D26): 작업 처리기(서버) 안에서 전송용 접근 토큰을 꺼낸다 — 어댑터 prepare/reconcile 의 ctx.credential 이 부른다.
+ * 계정 → 연결 정보 잠금(짧은 트랜잭션) 아래 health 가 usable 일 때만 봉인을 연다. 쓸 수 없으면 코드만 돌려준다:
+ * credential_<상태>(만료·해제·정리 대기·다시 연결 필요 …), credential_missing, secrets_not_configured, decrypt_<문제>(이때는 readForUse 와 같은
+ * 규칙으로 같은 세대일 때만 error 기록). 토큰은 반환값으로만 나가며 로그·감사·오류에 넣지 않는다.
+ */
+export async function readAccessTokenForSend(
+  db: Db,
+  input: { ownerId: string; accountId: string; keyring: KeyringSource; now?: Date },
+): Promise<{ ok: true; token: string } | { ok: false; code: string }> {
+  const now = input.now ?? new Date();
+  let ring: SecretKeyring;
+  try {
+    ring = input.keyring();
+  } catch {
+    return { ok: false, code: 'secrets_not_configured' };
+  }
+  try {
+    return await db.transaction(async (tx): Promise<{ ok: true; token: string } | { ok: false; code: string }> => {
+      const { account, cred } = await lockAccountCredential(tx, input.ownerId, input.accountId);
+      const health = healthOf(account, cred, now);
+      if (!health.usable) return { ok: false, code: `credential_${health.status}` };
+      if (!cred || cred.revokedAt || !cred.encryptedToken || cred.keyVersion === null) return { ok: false, code: 'credential_missing' };
+      try {
+        const tokens = decodeTokens(openSecret(ring, cred.encryptedToken, cred.keyVersion, tokenAad(input.ownerId, account.id)));
+        return { ok: true, token: tokens.accessToken };
+      } catch (e) {
+        if (!(e instanceof SecretDecryptError)) throw e;
+        await tx
+          .update(oauthCredentials)
+          .set({ status: 'error', lastErrorCode: `decrypt_${e.problem}`, updatedAt: now })
+          .where(and(eq(oauthCredentials.id, cred.id), eq(oauthCredentials.tokenGeneration, cred.tokenGeneration)));
+        return { ok: false, code: `decrypt_${e.problem}` };
+      }
+    });
+  } catch {
+    return { ok: false, code: 'credential_unavailable' };
+  }
+}
+
 /** 공급자 오류 → 저장할 상태. 만료는 상태를 바꾸지 않는다(health 가 expired 로 판정). 철회·무효 토큰은 error. */
 function providerFailureStatus(code: string): 'active' | 'error' {
   return code === 'token_revoked' || code === 'invalid_token' || code === 'invalid_grant' ? 'error' : 'active';

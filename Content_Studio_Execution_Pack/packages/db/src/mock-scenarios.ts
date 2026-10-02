@@ -4,16 +4,20 @@
  * - 승인 스냅샷(distribution_items.payload_json)·계정 capability_snapshot 밖의 별도 표(mock_scenarios)에 둔다. 그래서 시나리오를 바꿔도
  *   payload hash·승인 상태가 바뀌지 않는다.
  * - 모의(kind='mock') 계정 항목에만(서버 검사 400 not_mock_account + DB 트리거 mock_scenarios_mock_only). 끝난 항목은 409.
+ * - T14(D26): threads_* 는 Threads 모의 어댑터 항목(모의 연결한 threads 계정)에만, 나머지는 일반 모의 항목에만(400 scenario_not_applicable).
  * - 작업 처리기(jobs.ts)가 모의 계정 항목을 보낼·조회할 때 이 표를 읽어 AdapterContext.mockScenario 로 모의 어댑터에 넘긴다
  *   (없으면 어댑터가 MOCK_CHANNEL_SCENARIO(개발·시험) → success 로 정한다).
  */
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import {
+  adapterIdFor,
   AppError,
   isUuid,
   MOCK_SCENARIO_VALUES,
   NotFoundError,
   NotMockAccountError,
+  ScenarioNotApplicableError,
+  scenarioApplies,
   type MockScenarioInput,
   type MockScenarioSetting,
   type MockScenarioValue,
@@ -70,11 +74,14 @@ export async function setMockScenario(db: Db, ownerId: string, itemId: string, i
     const [item] = await lockItemsInOrder(tx, ownerId, [itemId]);
     if (!item) throw new NotFoundError('배포 항목을 찾을 수 없습니다');
     const acc = await tx
-      .select({ kind: channelAccounts.kind })
+      .select({ kind: channelAccounts.kind, platform: channelAccounts.platform, credentialState: channelAccounts.credentialState })
       .from(channelAccounts)
       .where(and(eq(channelAccounts.id, item.channelAccountId), eq(channelAccounts.ownerId, ownerId)))
       .limit(1);
     if (acc[0]?.kind !== 'mock') throw new NotMockAccountError();
+    // T14(D26): 항목의 어댑터(일반 모의·Threads 모의)에 맞는 시나리오만(success 는 둘 다).
+    const adapter = adapterIdFor({ kind: 'mock', platform: acc[0].platform, credential_state: acc[0].credentialState });
+    if (adapter && !scenarioApplies(adapter, input.scenario)) throw new ScenarioNotApplicableError(adapter);
     if (FINISHED_ITEM_STATUSES.includes(item.status)) {
       throw new AppError('conflict', 'item_finished', '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다', { status: item.status });
     }

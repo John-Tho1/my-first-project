@@ -2,7 +2,7 @@
  * T13(결정 D24) 서버 전용: 계정 연결(OAuth) 의존성 — 공급자 선택·키 묶음·redirect URI. 비밀 값은 process.env 에서만 읽고 돌려주지 않는다.
  * 기본·개발용 마스터 키는 없다: SECRETS_MASTER_KEY 가 없으면 연결 관련 동작만 503(secrets_not_configured), 나머지 앱은 그대로.
  */
-import type { KeyringSource, ProviderFor } from '@cs/db';
+import { checkCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
 import {
   AppError,
   envPresent,
@@ -28,6 +28,18 @@ export function oauthDeps(config: AppConfig, env: Record<string, string | undefi
     redirectUri,
     providerFor: (account) => resolveOAuthProvider(account, config, env, redirectUri),
     keyring: () => requireSecretKeyring(env),
+  };
+}
+
+/**
+ * T14(D26): 작업 처리기(배포 작업)용 연결 정보 의존성 — 키 묶음(전송 토큰 봉인 해제)과 401 뒤 T13 확인 경로(checkCredential).
+ * 토큰은 작업 처리기 안에서만 열린다(응답·로그 없음).
+ */
+export function jobCredentials(config: AppConfig, db: Db, env: Record<string, string | undefined> = process.env): NonNullable<JobRunOptions['credentials']> {
+  const deps = oauthDeps(config, env);
+  return {
+    keyring: deps.keyring,
+    check: (ownerId, accountId, now) => checkCredential(db, { ownerId, accountId, providerFor: deps.providerFor, keyring: deps.keyring, now }),
   };
 }
 

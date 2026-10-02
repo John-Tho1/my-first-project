@@ -9,10 +9,13 @@ import {
   blockDetailLabel,
   blockInfoOf,
   itemHeadline,
+  jobStatusText,
+  mockScenarioOptionsFor,
   planFormDefaults,
   planFormEcho,
   reconciledNotice,
   reconciledParam,
+  remoteStepLine,
   revocationCountParam,
   revocationNotice,
 } from './distribution';
@@ -221,5 +224,37 @@ describe('Codex review-FIX-M3screen — 취소 두 배너 분리·재시도 배�
     expect(bannersFromState({ retried: '1' }, { items: [row('SENDING', ['SENDING'], [ev({ event: 'unblock', transition: 'unblock', cause: 'user_retry' })])] }).retried).toBe(false);
     // 쿼리 없으면 상태가 맞아도 없음
     expect(bannersFromState({}, retried).retried).toBe(false);
+  });
+});
+
+describe('T14(D26) Threads 모의 화면 문구', () => {
+  it('요청 제한 대기(로컬·원격 429)는 "요청 제한 — HH:mm MSK 이후 재시도", 다른 재시도 대기는 기존 문구', () => {
+    const at = new Date('2030-01-01T09:05:00Z'); // 12:05 MSK
+    const w = (code: string | null) => ({ state: 'RETRY_WAIT', attempt: 1, maxAttempts: 5, nextRunAt: at, lastErrorCode: code });
+    expect(jobStatusText(w('local_rate_limited'))).toBe('RETRY_WAIT · 요청 제한 — 12:05 MSK 이후 재시도');
+    expect(jobStatusText(w('rate_limited'))).toBe('RETRY_WAIT · 요청 제한 — 12:05 MSK 이후 재시도');
+    expect(itemHeadline({ status: 'RETRY_WAIT', channel: 'threads', job: w('local_rate_limited'), pub: null, blockReason: null })).toBe('요청 제한 — 12:05 MSK 이후 재시도');
+    expect(jobStatusText(w('mock_503_not_sent'))).toBe('RETRY_WAIT · 재시도 대기 (1/5, 다음 12:05 MSK)');
+  });
+  it('401(auth_invalid_token) 보류는 "계정 다시 연결 필요", 재확인 resumable 은 고정 문구(게시하지 않음)', () => {
+    const j = { ...job('BLOCKED', 'auth_invalid_token'), lastRetryClass: 'auth' };
+    expect(itemHeadline({ status: 'BLOCKED', channel: 'threads', job: j, pub: null, blockReason: null })).toBe('계정 다시 연결 필요');
+    expect(reconciledParam('resumable')).toBe('resumable');
+    expect(reconciledNotice('resumable')).toMatch(/게시하지 않았습니다/);
+  });
+  it('단계 한 줄: 게시물 n/m · 상태 · 모의 ID, "게시 완료"라고 하지 않는다', () => {
+    expect(remoteStepLine({ kind: 'container', status: 'created', postIndex: 1, remoteId: 'mockthr_ct_x' }, 3)).toBe('게시물 2/3 · 컨테이너 생성됨 · mockthr_ct_x');
+    const pub = remoteStepLine({ kind: 'publish', status: 'published', postIndex: 0, remoteId: 'mockthr_post_y' }, 1);
+    expect(pub).toBe('게시물 1/1 · 게시됨(MOCK) · mockthr_post_y');
+    expect(pub).not.toMatch(/게시 완료/);
+  });
+  it('시나리오 선택지는 항목 어댑터에 맞는 것만(success 는 둘 다)', () => {
+    const thr = mockScenarioOptionsFor('mock_threads').map((o) => o.value);
+    const gen = mockScenarioOptionsFor('mock_generic').map((o) => o.value);
+    expect(thr).toContain('threads_thread_partial');
+    expect(thr).not.toContain('ambiguous_sent');
+    expect(gen).not.toContain('threads_success');
+    expect(thr).toContain('success');
+    expect(gen).toContain('success');
   });
 });

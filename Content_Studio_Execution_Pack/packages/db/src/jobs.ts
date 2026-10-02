@@ -27,6 +27,8 @@ import {
   classifyOutcome,
   decideRetry,
   DEFAULT_LEASE_TTL_MS,
+  localRateLimitDecision,
+  requireSecretKeyring,
   isUuid,
   LEASE_HELD_STATES,
   LeaseLostError,
@@ -71,7 +73,8 @@ import {
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
 import { mockScenarioFor } from './mock-scenarios';
-import { credentialGate } from './oauth';
+import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
+import { publishedStepCount, recentPublishUsage, remoteStepsPort } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
@@ -92,6 +95,14 @@ export interface JobRunOptions {
   random?: () => number;
   /** 한 owner 의 작업만(POST /api/worker/tick) */
   ownerId?: string;
+  /**
+   * T14(D26): 연결 정보가 필요한 어댑터(Threads 모의)용. keyring 이 없으면 process.env 의 마스터 키(@cs/domain requireSecretKeyring — 앱과 같은
+   * 출처)를 쓰고, 키가 없으면 어댑터가 원격 호출 없이 auth 로 닫는다. check = 401(auth) 뒤 T13 연결 확인 경로(checkCredential)를 한 번 부른다.
+   */
+  credentials?: {
+    keyring?: KeyringSource;
+    check?: (ownerId: string, accountId: string, now: Date) => Promise<unknown>;
+  };
 }
 
 export function newWorkerId(prefix: string): string {
@@ -152,7 +163,27 @@ async function itemRow(tx: DbOrTx, ownerId: string, itemId: string): Promise<Dis
 }
 
 function adapterAccount(a: typeof channelAccounts.$inferSelect) {
-  return { id: a.id, kind: a.kind === 'mock' ? ('mock' as const) : ('live' as const), platform: a.platform, external_account_id: a.externalAccountId };
+  return {
+    id: a.id,
+    kind: a.kind === 'mock' ? ('mock' as const) : ('live' as const),
+    platform: a.platform,
+    external_account_id: a.externalAccountId,
+    credential_state: a.credentialState,
+  };
+}
+
+/** 항목 스냅샷(어댑터가 받는 불변 payload). */
+function snapshotOf(item: DistributionItemRow, acc: typeof channelAccounts.$inferSelect, channel: string): PublishSnapshot {
+  return {
+    item_id: item.id,
+    channel,
+    account: adapterAccount(acc),
+    payload: item.payloadJson,
+    payload_hash: item.payloadHash,
+    visibility: item.visibility,
+    requested_result: item.requestedResult,
+    scheduled_at_utc: item.scheduledAtUtc ? item.scheduledAtUtc.toISOString() : null,
+  };
 }
 
 /**
@@ -260,7 +291,14 @@ async function fillIntent(
       outcome,
       providerRequestId: r.provider_request_id ?? null,
       remoteExternalId: r.external_id ?? null,
-      sanitizedDetails: { source, status: r.status ?? null, error_code: r.error_code ?? null, retry_class: r.retry_class ?? null },
+      // T14(D26): 보낸 어댑터 식별자는 결과를 채운 뒤에도 남긴다(조회는 보낸 어댑터로).
+      sanitizedDetails: {
+        source,
+        status: r.status ?? null,
+        error_code: r.error_code ?? null,
+        retry_class: r.retry_class ?? null,
+        ...(typeof intent.sanitizedDetails?.adapter_id === 'string' ? { adapter_id: intent.sanitizedDetails.adapter_id } : {}),
+      },
     })
     .where(and(eq(sendIntents.id, intent.id), eq(sendIntents.ownerId, ownerId), eq(sendIntents.outcome, 'pending')));
 }
@@ -418,12 +456,15 @@ function makeContext(
   db: Db,
   job: JobRow,
   intentKey: string,
-  opts: JobRunOptions,
+  opts: Pick<JobRunOptions, 'workerId' | 'clock' | 'leaseTtlMs' | 'credentials'>,
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
   onLeaseLost?: () => void,
+  extra?: { snapshot: PublishSnapshot },
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
+  const snapshot = extra?.snapshot;
+  const keyring: KeyringSource = opts.credentials?.keyring ?? (() => requireSecretKeyring(process.env));
   return {
     intentKey,
     attempt: job.attempt,
@@ -439,6 +480,12 @@ function makeContext(
       }
     },
     mockScenario,
+    // T14: 원격 단계 기록(작업 단위, 호출마다 짧은 트랜잭션)과 서버 쪽 토큰 창구(T13). 토큰은 어댑터 메모리에만.
+    steps: remoteStepsPort(db, { ownerId: job.ownerId, jobId: job.id, itemId: job.itemId!, intentKey, clock }),
+    credential: snapshot
+      ? { accessToken: () => readAccessTokenForSend(db, { ownerId: job.ownerId, accountId: snapshot.account.id, keyring, now: clock() }) }
+      : undefined,
+    snapshot,
   };
 }
 
@@ -540,16 +587,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       .from(variants)
       .where(and(eq(variants.id, item.variantId), eq(variants.ownerId, ownerId)))
       .limit(1);
-    const snapshot: PublishSnapshot = {
-      item_id: item.id,
-      channel: vRows[0]?.channel ?? acc.platform,
-      account: adapterAccount(acc),
-      payload: item.payloadJson,
-      payload_hash: item.payloadHash,
-      visibility: item.visibility,
-      requested_result: item.requestedResult,
-      scheduled_at_utc: item.scheduledAtUtc ? item.scheduledAtUtc.toISOString() : null,
-    };
+    const snapshot = snapshotOf(item, acc, vRows[0]?.channel ?? acc.platform);
     const valid = adapter.validate(snapshot);
     if (!valid.ok) {
       return settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'validate_failed', error_code: valid.error_code }, now, {
@@ -565,10 +603,41 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         lastErrorCode: 'attempts_exhausted',
       });
     }
+    const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(tx, ownerId, item.id) : null;
+    // T14(D26): 계정별 로컬 요청 제한(잠정값, capabilities.rate_limit). 넘으면 전송 의도를 만들지 않고 창이 풀리는 시각까지 RETRY_WAIT.
+    // 사용량은 remote_steps(게시된 단계)에서 센다 — 새 표 없음. 시도(attempt)는 쓰지 않는다(보내지 않았음이 확실).
+    const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
+    if (caps.rate_limit && adapter.rateUnits) {
+      const needed = adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, job.id));
+      if (needed > 0) {
+        const usage = await recentPublishUsage(tx, ownerId, acc.id, new Date(now.getTime() - caps.rate_limit.window_sec * 1000));
+        const d = localRateLimitDecision({ used: usage.used, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now });
+        if (!d.allowed) {
+          return settle(
+            tx,
+            ownerId,
+            job,
+            item,
+            'local_rate_limited',
+            {
+              reason: 'local_rate_limited',
+              not_sent: true,
+              used: usage.used,
+              needed,
+              max_units: caps.rate_limit.max_units,
+              window_sec: caps.rate_limit.window_sec,
+              reset_at: d.resetAt.toISOString(),
+              limit_source: caps.rate_limit.source,
+            },
+            now,
+            { ...CLEAR_LEASE, nextRunAt: d.resetAt, lastErrorCode: 'local_rate_limited', lastRetryClass: 'transient_no_side_effect' },
+          );
+        }
+      }
+    }
     const attempt = job.attempt + 1;
     const intentKey = `${job.id}:${attempt}`;
-    const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(tx, ownerId, item.id) : null;
-    await transitionJob(tx, ownerId, job, 'send_start', { attempt, intent_key: intentKey, mode, approval_id: approval.id }, now, { attempt });
+    await transitionJob(tx, ownerId, job, 'send_start', { attempt, intent_key: intentKey, mode, approval_id: approval.id, adapter_id: adapter.id ?? null }, now, { attempt });
     await syncItemStatus(tx, ownerId, item.id, 'SENDING', now);
     await tx.insert(sendIntents).values({
       ownerId,
@@ -577,7 +646,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       intentKey,
       createdAt: now,
       outcome: 'pending',
-      sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind },
+      sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind, adapter_id: adapter.id ?? null },
     });
     await recomputePlanStatus(tx, ownerId, item.planId, now);
     return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING', attempt }, mockScenario } satisfies SendPlan;
@@ -662,7 +731,7 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
     // FIX-T11(P0): 시간 초과 또는 lease 상실(heartbeat 실패) 중 먼저 온 것으로 중단한다.
     const lease = new AbortController();
     const signal = AbortSignal.any([timeoutSignal, lease.signal]);
-    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort());
+    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort(), { snapshot: begun.snapshot });
     let prepared;
     try {
       prepared = await begun.adapter.prepare(begun.snapshot, ctx);
@@ -677,7 +746,18 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
   const result: AdapterResult = r.ok
     ? r.value
     : { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: r.reason === 'timeout' ? 'submit_timeout' : 'adapter_error' };
-  return finishSend(db, begun, result, opts, clock());
+  const final = await finishSend(db, begun, result, opts, clock());
+  // T14(D26): 연결 정보를 쓰는 계정의 401(auth) → 작업은 BLOCKED(자동 재시도 없음). T13 의 확인 경로(checkCredential — 공급자에 한 번 묻고
+  // 무효면 연결 정보 error → 실행 게이트가 막음)를 한 번 부른다. 실패해도 작업 결과는 그대로(오류 이름만 남긴다).
+  const credState = begun.snapshot.account.credential_state;
+  if (final === 'BLOCKED' && result.retry_class === 'auth' && credState && credState !== 'none' && opts.credentials?.check) {
+    try {
+      await opts.credentials.check(begun.job.ownerId, begun.snapshot.account.id, clock());
+    } catch (e) {
+      console.error(`[jobs] 401 뒤 연결 확인 실패:${e instanceof Error ? e.name : typeof e}`);
+    }
+  }
+  return final;
 }
 
 /**
@@ -708,8 +788,24 @@ async function applyReconcile(
     return to;
   }
   if (opts.manual) {
-    // 사용자 재확인은 조회만: 찾지 못하면 상태를 바꾸지 않는다(재전송 없음).
-    return settle(tx, ownerId, job, item, 'reconcile_retry', base, now, {});
+    // 사용자 재확인은 조회만: 찾지 못하면 상태를 바꾸지 않는다(재전송 없음). resumable 이어도 여기서 이어 보내지 않는다.
+    return settle(tx, ownerId, job, item, 'reconcile_retry', { ...base, published_parts: r.published_parts ?? undefined }, now, {});
+  }
+  if (r.status === 'resumable') {
+    // T14(D26): 남은 단계가 원격에 아직 게시되지 않았음이 단계 기록으로 확인됨 — 새 시도(새 전송 의도)가 같은 원격 참조(컨테이너)를
+    // 재사용해 이어 보낸다(새 컨테이너·재게시 없음). 이미 게시된 앞부분은 다시 보내지 않는다.
+    const parts = r.published_parts ?? 0;
+    if (job.state === 'CANCEL_REQUESTED') {
+      if (parts === 0) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true, published_parts: 0 }, now, common);
+      // 스레드 일부가 이미 게시됨 — 취소 성공이라고 하지 않고(A11) 남은 부분도 보내지 않는다. UNKNOWN(사유 thread_partial_cancel_requested) — 사용자 확인.
+      return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...base, reason: 'thread_partial_cancel_requested', published_parts: parts }, now, {
+        ...common,
+        lastErrorCode: 'thread_partial_cancel_requested',
+      });
+    }
+    if (job.state === 'RECONCILING' || job.state === 'REMOTE_PROCESSING') {
+      return settle(tx, ownerId, job, item, 'resume', { ...base, published_parts: parts }, now, { ...common, nextRunAt: now, reconcileCount: 0 });
+    }
   }
   const count = job.reconcileCount + 1;
   if (r.status === 'processing') {
@@ -738,21 +834,25 @@ async function remoteCheck(
   job: JobRow,
   item: DistributionItemRow,
   signalMs: number,
-  opts: { workerId: string; clock?: () => Date; leaseTtlMs?: number; tryCancel: boolean },
+  opts: { workerId: string; clock?: () => Date; leaseTtlMs?: number; tryCancel: boolean; credentials?: JobRunOptions['credentials'] },
 ): Promise<{ r: ReconcileResult; caps: { definitive_not_found: boolean; mock: boolean }; cancel: CancelResult | null }> {
   const ownerId = job.ownerId;
   const acc = await accountOf(db, ownerId, item.channelAccountId);
   if (!acc) return { r: { status: 'unknown', error_code: 'account_missing' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
+  const intent = (job.attempt > 0 ? await intentFor(db, ownerId, job.id, job.attempt) : null) ?? (await latestIntent(db, ownerId, job.id));
   let adapter: ChannelAdapter;
   try {
-    adapter = registry.getAdapterFor(adapterAccount(acc));
+    // T14(D26): 보낸 어댑터(전송 의도에 기록된 adapter_id)로 조회한다 — 그 뒤 계정 연결 상태가 바뀌어 선택 규칙이 달라져도 같은 원격을 본다.
+    const sentWith = intent?.sanitizedDetails?.adapter_id;
+    const byId = typeof sentWith === 'string' && registry.getAdapterById ? registry.getAdapterById(sentWith) : null;
+    adapter = byId ?? registry.getAdapterFor(adapterAccount(acc));
   } catch {
     return { r: { status: 'unsupported', error_code: 'adapter_unavailable' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
   }
   const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(db, ownerId, item.id) : null;
   const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
-  const intent = (job.attempt > 0 ? await intentFor(db, ownerId, job.id, job.attempt) : null) ?? (await latestIntent(db, ownerId, job.id));
   if (!intent) return { r: { status: 'not_found', error_code: 'no_intent' }, caps: { definitive_not_found: true, mock: caps.mock }, cancel: null };
+  const snapshot = snapshotOf(item, acc, typeof item.payloadJson.channel === 'string' ? item.payloadJson.channel : acc.platform);
   const ref: RemoteReference = {
     platform: acc.platform,
     intent_key: intent.intentKey,
@@ -761,7 +861,7 @@ async function remoteCheck(
   };
   let cancel: CancelResult | null = null;
   const res = await withTimeout(signalMs, async (signal) => {
-    const ctx = makeContext(db as Db, job, intent.intentKey, { ...opts, config: { PUBLISH_MODE: 'disabled' } }, signal, mockScenario);
+    const ctx = makeContext(db as Db, job, intent.intentKey, opts, signal, mockScenario, undefined, { snapshot });
     if (opts.tryCancel && caps.cancel && ref.external_id) {
       cancel = await adapter.cancel(ref, ctx);
       if (cancel.status === 'canceled') return { status: 'not_found' } satisfies ReconcileResult;
@@ -924,14 +1024,14 @@ export async function reconcileItem(
   registry: ChannelAdapterRegistry,
   ownerId: string,
   itemId: string,
-  opts: { now?: Date; timeoutMs?: number } = {},
+  opts: { now?: Date; timeoutMs?: number; credentials?: JobRunOptions['credentials'] } = {},
 ): Promise<ReconcileOutcome> {
   if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
   const item = await itemRow(db, ownerId, itemId);
   if (!item) throw new NotFoundError(ITEM_NOT_FOUND);
   const job = await latestJobForItem(db, ownerId, item.id, false);
   if (!job || !(RECONCILABLE_JOB_STATES as readonly string[]).includes(job.state)) throw new NothingToReconcileError();
-  const { r, caps } = await remoteCheck(db, registry, job, item, opts.timeoutMs ?? 30_000, { workerId: 'user-reconcile', tryCancel: false });
+  const { r, caps } = await remoteCheck(db, registry, job, item, opts.timeoutMs ?? 30_000, { workerId: 'user-reconcile', tryCancel: false, credentials: opts.credentials });
   const now = opts.now ?? new Date();
   const { state, outcome } = await db.transaction(async (tx) => {
     const it = await lockItem(tx, ownerId, item.id);

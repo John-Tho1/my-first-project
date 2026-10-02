@@ -2,7 +2,7 @@
 import { refreshExpiringCredentials, type Db } from '@cs/db';
 import { readSecretKeyring, type AppConfig } from '@cs/domain';
 import { runWorkerTick, type WorkerTick } from '@cs/worker';
-import { oauthDeps } from './oauth';
+import { jobCredentials, oauthDeps } from './oauth';
 import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
 
 /**
@@ -16,7 +16,16 @@ export async function runInlineWorker(config: AppConfig, db: Db): Promise<Worker
   const credentialRefresh = readSecretKeyring(process.env).ok
     ? (now: Date) => refreshExpiringCredentials(db, { providerFor: deps.providerFor, keyring: deps.keyring, now })
     : undefined;
-  return runWorkerTick({ config, db, transcriber: getWorkerTranscriber(), files: getStorage(config), channelAdapters: getChannelAdapters(), maxJobs: 5, credentialRefresh });
+  return runWorkerTick({
+    config,
+    db,
+    transcriber: getWorkerTranscriber(),
+    files: getStorage(config),
+    channelAdapters: getChannelAdapters(),
+    maxJobs: 5,
+    credentialRefresh,
+    jobCredentials: jobCredentials(config, db),
+  });
 }
 
 /** 요청 본문 상한(전사 요청·세션 생성 등 작은 JSON) */

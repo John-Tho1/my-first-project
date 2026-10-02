@@ -29,3 +29,4 @@ export * from './ops';
 export * from './retention';
 export * from './oauth';
 export * from './secrets-cli';
+export * from './remote-steps';

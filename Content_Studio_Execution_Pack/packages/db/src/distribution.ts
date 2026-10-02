@@ -68,7 +68,8 @@ import {
 import type { Db } from './client';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
 import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
-import { credentialGate } from './oauth';
+import { credentialGate, getAccountHealth, type AccountHealthView } from './oauth';
+import { listRemoteStepsForItems, remoteStepView, type RemoteStepRow } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import {
   approvals,
@@ -479,6 +480,10 @@ export interface PlanItemDetail {
   problems: string[];
   /** T12: 개발용 모의 시나리오(모의 계정 항목, 없으면 null) — 승인 스냅샷 밖 */
   mockScenario: MockScenarioRow | null;
+  /** T14(D26): 원격 단계 기록(Threads 모의 — 게시물별 컨테이너·게시 ID, 모의 ID 만) */
+  remoteSteps: RemoteStepRow[];
+  /** T14: 계정 연결 상태(T13 health, 토큰 없음). 계정이 없으면 null */
+  connection: AccountHealthView | null;
 }
 
 export interface PlanDetail {
@@ -517,6 +522,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
         .orderBy(asc(publications.createdAt), asc(publications.id))
     : [];
   const scenarios = await mockScenariosForItems(db, ownerId, ids);
+  const allSteps = await listRemoteStepsForItems(db, ownerId, ids);
   const out: PlanItemDetail[] = [];
   for (const item of items) {
     const mineJobs = allJobs.filter((j) => j.itemId === item.id);
@@ -548,6 +554,8 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       events,
       problems: item.status === 'PLANNED' ? await snapshotProblems(db, ownerId, item, now) : [],
       mockScenario: scenarios.get(item.id) ?? null,
+      remoteSteps: allSteps.filter((r) => r.itemId === item.id),
+      connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
     });
   }
   return { plan, items: out };
@@ -1064,6 +1072,10 @@ export function planDetailView(d: PlanDetail) {
       publications: x.publications.map(publicationViewOf),
       problems: x.problems,
       mock_scenario: x.mockScenario ? mockScenarioView(x.mockScenario) : null,
+      remote_steps: x.remoteSteps.map(remoteStepView),
+      connection: x.connection
+        ? { status: x.connection.status, status_label: x.connection.status_label, usable_for_execution: x.connection.usable_for_execution, credential_state: x.connection.credential_state, mock: x.connection.mock }
+        : null,
     })),
   };
 }

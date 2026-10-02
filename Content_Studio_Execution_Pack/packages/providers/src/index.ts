@@ -11,6 +11,7 @@ export * from './oauth';
 export * from './publisher';
 export * from './storage';
 export * from './stt';
+export * from './threads-mock';
 
 export interface Providers {
   llm: LlmProvider;

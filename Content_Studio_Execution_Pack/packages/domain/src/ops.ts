@@ -49,6 +49,7 @@ export const RETENTION_PROTECTED_TABLES = [
   'send_intents',
   'publications',
   'mock_scenarios',
+  'remote_steps',
   'audit_events',
   'export_runs',
   'restore_runs',

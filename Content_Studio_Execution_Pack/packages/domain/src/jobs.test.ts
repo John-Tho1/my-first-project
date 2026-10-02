@@ -9,7 +9,11 @@ import {
   JOB_EVENTS,
   JOB_STATES,
   JOB_TRANSITIONS,
+  localRateLimitDecision,
+  MOCK_SCENARIO_VALUES,
   planStatusFrom,
+  scenarioApplies,
+  THREADS_MOCK_SCENARIOS,
   reconcileDelay,
   RETRY_AFTER_MAX_SEC,
   RETRY_CAP_MS,
@@ -223,5 +227,39 @@ describe('FIX-T11(P0) late_result 전이', () => {
   it('새 시도를 기다리는 상태(QUEUED·LEASED·RETRY_WAIT)에서 옛 시도의 늦은 결과 → RECONCILING, 그 밖에서는 불법', () => {
     for (const s of ['QUEUED', 'LEASED', 'RETRY_WAIT'] as const) expect(transitionJobState(s, 'late_result')).toBe('RECONCILING');
     for (const s of ['SENDING', 'CONFIRMED', 'UNKNOWN', 'BLOCKED'] as const) expect(canTransitionJob(s, 'late_result')).toBe(false);
+  });
+});
+
+describe('T14(D26) resume·local_rate_limited 전이, 로컬 요청 제한, 시나리오 적용', () => {
+  it('resume 은 조회 상태(RECONCILING·REMOTE_PROCESSING)에서만 RETRY_WAIT, UNKNOWN·CANCEL_REQUESTED·전송 상태에서는 불법', () => {
+    expect(transitionJobState('RECONCILING', 'resume')).toBe('RETRY_WAIT');
+    expect(transitionJobState('REMOTE_PROCESSING', 'resume')).toBe('RETRY_WAIT');
+    for (const s of ['UNKNOWN', 'CANCEL_REQUESTED', 'SENDING', 'QUEUED', 'BLOCKED', 'CONFIRMED'] as const) expect(canTransitionJob(s, 'resume')).toBe(false);
+  });
+  it('local_rate_limited 는 LEASED(전송 의도 전)에서만 RETRY_WAIT', () => {
+    expect(transitionJobState('LEASED', 'local_rate_limited')).toBe('RETRY_WAIT');
+    for (const s of ['SENDING', 'QUEUED', 'RETRY_WAIT', 'RECONCILING'] as const) expect(canTransitionJob(s, 'local_rate_limited')).toBe(false);
+  });
+  it('localRateLimitDecision: 창 안 사용 + 이번 단위 > 한도면 가장 오래된 사용 + 창까지 대기, 사용 0 이면 허용', () => {
+    const limit = { max_units: 3, window_sec: 3600 };
+    const oldest = new Date(NOW.getTime() - 600_000);
+    expect(localRateLimitDecision({ used: 1, needed: 2, limit, oldestAt: oldest, now: NOW })).toEqual({ allowed: true });
+    const d = localRateLimitDecision({ used: 2, needed: 2, limit, oldestAt: oldest, now: NOW });
+    expect(d).toEqual({ allowed: false, resetAt: new Date(oldest.getTime() + 3600_000) });
+    expect(localRateLimitDecision({ used: 0, needed: 9, limit, oldestAt: null, now: NOW })).toEqual({ allowed: true });
+    expect(localRateLimitDecision({ used: 5, needed: 0, limit, oldestAt: oldest, now: NOW })).toEqual({ allowed: true });
+    // 창이 이미 지난 기록만 남은 경우에도 resetAt 은 지금 이후
+    const stale = localRateLimitDecision({ used: 3, needed: 1, limit, oldestAt: new Date(NOW.getTime() - 7200_000), now: NOW });
+    expect(stale.allowed).toBe(false);
+    if (!stale.allowed) expect(stale.resetAt.getTime()).toBeGreaterThan(NOW.getTime());
+  });
+  it('scenarioApplies: threads_* 는 mock_threads 에만, 일반 시나리오는 mock_generic 에만, success 는 둘 다', () => {
+    expect(scenarioApplies('mock_threads', 'threads_thread_partial')).toBe(true);
+    expect(scenarioApplies('mock_threads', 'ambiguous_sent')).toBe(false);
+    expect(scenarioApplies('mock_generic', 'threads_success')).toBe(false);
+    expect(scenarioApplies('mock_generic', 'ambiguous_sent')).toBe(true);
+    expect(scenarioApplies('mock_threads', 'success')).toBe(true);
+    expect(THREADS_MOCK_SCENARIOS).toHaveLength(8);
+    for (const s of THREADS_MOCK_SCENARIOS) expect(MOCK_SCENARIO_VALUES).toContain(s);
   });
 });

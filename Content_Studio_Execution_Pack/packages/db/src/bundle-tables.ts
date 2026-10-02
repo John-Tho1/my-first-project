@@ -75,7 +75,8 @@ function selectExpr(name: ExportedTable, c: PgColumn): SQL {
   const ref = sql`${sql.identifier(name)}.${sql.identifier(c.name)}`;
   // T15(D27): 업로드 세션 URI 는 업로드 권한이 담긴 값으로 다룬다 — 묶음에는 가린 표시(sha256 앞 16자)만 넣는다(FIX-T14: 복원하면 가린 값이 그대로 들어간다 — 이어 올리기에 쓸 수 없고 조회는 unknown).
   if (name === 'remote_steps' && c.name === 'remote_id') {
-    return sql`case when "remote_steps"."kind" = 'upload_session' then 'mock-redacted:session:' || left(encode(sha256(convert_to("remote_steps"."remote_id", 'UTF8')), 'hex'), 16) else "remote_steps"."remote_id" end`;
+    // FIX(실제 DB drill:restore, 2026-10-03): 복원으로 이미 가린 값(mock-redacted:…)은 다시 가리지 않는다 — 내보내기→복원→내보내기가 같은 값을 내고, 복원 훈련이 대상 DB 를 같은 식으로 읽어도 이중 가림이 생기지 않게.
+    return sql`case when "remote_steps"."kind" = 'upload_session' and "remote_steps"."remote_id" not like 'mock-redacted:%' then 'mock-redacted:session:' || left(encode(sha256(convert_to("remote_steps"."remote_id", 'UTF8')), 'hex'), 16) else "remote_steps"."remote_id" end`;
   }
   const type = c.getSQLType();
   if (type.startsWith('timestamp')) return sql`to_char(${ref} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;

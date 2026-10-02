@@ -18,6 +18,7 @@ import {
   getDb,
   parseBundleZip,
   runJobsTick,
+  runRestoreDrill,
   schema,
   seed,
   setVariantAssets,
@@ -865,6 +866,24 @@ describe('비밀 — 토큰·세션 URI 는 어디에도 나가지 않는다', (
     expect(sessions.every((r) => /^mock-redacted:session:[0-9a-f]{16}$/.test(String(r.remote_id)))).toBe(true);
     expect(fetchCalls).toBe(0);
   });
+
+  it('업로드 세션이 있는 owner 의 복원 훈련 PASS — 이미 가린 세션 값을 다시 가리지 않는다(내보내기→복원→내보내기 같은 값)', async () => {
+    const before = await exportOwner(db, storage, owner, { outDir: path.join(tmp, 'exports-drill'), record: false });
+    const masked = (await parseBundleZip(readFileSync(before.zipPath))).tables.remote_steps.filter((r) => r.kind === 'upload_session');
+    expect(masked.length).toBeGreaterThan(0);
+    let reExported: string[] = [];
+    const r = await runRestoreDrill(db, storage, owner, {
+      trigger: 'test',
+      tmpRoot: tmp,
+      afterRestore: async (target, targetOwnerId) => {
+        const ex2 = await exportOwner(target, new LocalStorageAdapter(path.join(tmp, 'assets-drill-target')), targetOwnerId, { outDir: path.join(tmp, 'exports-drill-2'), record: false });
+        reExported = (await parseBundleZip(readFileSync(ex2.zipPath))).tables.remote_steps.filter((x) => x.kind === 'upload_session').map((x) => String(x.remote_id)).sort();
+      },
+    });
+    expect(r.mismatches).toEqual([]);
+    expect(r.result).toBe('pass');
+    expect(reExported).toEqual(masked.map((x) => String(x.remote_id)).sort());
+  }, 120_000);
 });
 
 describe('drill:mock 의 YouTube 행(같은 표)', () => {

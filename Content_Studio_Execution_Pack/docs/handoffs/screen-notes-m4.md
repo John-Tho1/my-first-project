@@ -30,3 +30,9 @@ BASE cbb8d38, 커밋 안 함(작업 트리 변경). 화면 표시만 — 작업�
 검사(Node 24.21.0, corepack pnpm): lint 통과 · typecheck 통과 · build 통과 · test 39 파일 731 통과 · test:integration(단독) 30 파일 563 통과 · drill:mock 통과(불변식 위반 0건, YouTube fetch 0). 화면 재확인은 하지 않음(dev 서버 꺼짐).
 
 - Orchestrator: 코드 커밋 f2bb3b9 (docs 분리, D28) — lint·typecheck·build·unit 731·integration 563·drill:mock 0·실제 DB drill:restore PASS. Codex 대기열 FIX-M4screen.
+
+## 재확인 (f2bb3b9, 내장 브라우저)
+- S1: T14 이전 일반 모의로 CONFIRMED 된 Threads 계획 → "일반 모의 어댑터로 처리됨 — Threads 단계 기록 없음(MOCK)". 전송 의도 없는 계획은 그대로 "아직 원격 단계 없음(게시물 2개 …)".
+- S2: 배너 "지금 단계(M4)는 모의 어댑터(일반·Threads·YouTube 모의)와 모의 계정 연결만 …".
+- S3: 배포 계정 목록 연결 상태 — 블로그·Instagram 연결 정보 없음, Threads·YouTube 연결됨, 실계정은 별도 승인(D24) 문구.
+- 서버 오류 로그 0건.

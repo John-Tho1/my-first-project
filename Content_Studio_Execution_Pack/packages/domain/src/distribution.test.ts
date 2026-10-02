@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildCanonicalPayload as buildT15, canonicalPayloadProblems as problemsT15, payloadHash as hashT15, providerMetadataOf as pmT15 } from './distribution';
 import {
+  approvalPurposeFor,
   approveSchema,
   buildCanonicalPayload,
   CanonicalKeyCollisionError,
@@ -191,6 +192,24 @@ describe('입력 스키마', () => {
     expect(approveSchema.safeParse({ ...ok, purpose: undefined }).success).toBe(false);
     // 선택하지 않은 항목의 hash(추가 키)는 무시
     expect(approveSchema.safeParse({ ...ok, expected_hashes: { [U1]: H, [U2]: H } }).success).toBe(true);
+  });
+  it('M4UI(G1) approveSchema.purposes: 항목별 목적(섞인 계획), 고른 항목마다 목적 필요, purpose 와 다르면 거부, 키는 소문자', () => {
+    const base = { item_ids: [U1, U2], expected_hashes: { [U1]: H, [U2]: H }, confirm: true };
+    const parsed = approveSchema.parse({ ...base, purposes: { [U1.toUpperCase()]: 'upload_private', [U2]: 'mock_publish' } });
+    expect(parsed.purposes).toEqual({ [U1]: 'upload_private', [U2]: 'mock_publish' });
+    expect(approvalPurposeFor(parsed, U1)).toBe('upload_private');
+    expect(approvalPurposeFor(parsed, U2)).toBe('mock_publish');
+    // 고른 항목 하나의 목적이 없음
+    expect(approveSchema.safeParse({ ...base, purposes: { [U1]: 'upload_private' } }).success).toBe(false);
+    // purpose 가 기본값으로 빈 곳을 채움
+    const filled = approveSchema.parse({ ...base, purpose: 'mock_publish', purposes: { [U2]: 'mock_publish' } });
+    expect(approvalPurposeFor(filled, U1)).toBe('mock_publish');
+    // purpose 와 purposes 가 다르면 거부
+    expect(approveSchema.safeParse({ ...base, purpose: 'mock_publish', purposes: { [U1]: 'upload_private' } }).success).toBe(false);
+    // 모르는 목적 값
+    expect(approveSchema.safeParse({ ...base, purposes: { [U1]: 'go_live', [U2]: 'mock_publish' } }).success).toBe(false);
+    // 목적이 아무것도 없으면 정해지지 않음
+    expect(approvalPurposeFor({}, U1)).toBeUndefined();
   });
   it('executeSchema: command_key 8~64 [A-Za-z0-9_-]', () => {
     expect(executeSchema.safeParse({ command_key: 'abcd1234' }).success).toBe(true);

@@ -3,10 +3,69 @@ import { notFound, redirect } from 'next/navigation';
 import { getContentRow, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
 import { CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
-import { DISTRIBUTE_ERROR_TEXT, planFormDefaults, VISIBILITY_LABEL } from '../../../lib/distribution';
+import {
+  DISTRIBUTE_ERROR_TEXT,
+  planAccountLabel,
+  planFormDefaults,
+  planResultSelect,
+  RESULT_CHOICE_LABEL,
+  VISIBILITY_LABEL,
+  type PlanFormDefaults,
+  type PlanResultSelect,
+} from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
+
+/**
+ * M4UI(G2, D27): 요청 결과(비공개 업로드·공개 게시·예약 공개 · MOCK 실행)와 예약 공개(모스크바 날짜·시각 → 서버가 UTC 로 저장).
+ * 이 채널 초안의 계정들이 고를 수 있는 결과만 보인다(Threads·seed 모의 계정만이면 "MOCK 실행" 고정 문구). 판정은 서버(createPlan)가 한다.
+ */
+function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; prev: PlanFormDefaults }) {
+  if (sel.fixed) {
+    return (
+      <p className="meta">
+        요청 결과: <strong>{RESULT_CHOICE_LABEL.mock_publish}</strong> <span className="tag warn">MOCK</span>
+      </p>
+    );
+  }
+  const prevChoice = prev.result[vid];
+  const def = prevChoice !== undefined && (prevChoice === '' || sel.choices.includes(prevChoice as never)) ? prevChoice : sel.accountDefault ? '' : sel.choices[0];
+  return (
+    <>
+      <label htmlFor={`res-${vid}`}>요청 결과(MOCK — 실제 채널로 보내지 않음)</label>
+      <select id={`res-${vid}`} name={`result_${vid}`} defaultValue={def}>
+        {sel.accountDefault ? <option value="">계정 기본값(모의 연결 YouTube = 비공개 업로드, 그 밖 = MOCK 실행)</option> : null}
+        {sel.choices.map((c) => (
+          <option key={c} value={c}>
+            {RESULT_CHOICE_LABEL[c]}
+          </option>
+        ))}
+      </select>
+      <p className="note">
+        비공개 업로드 = 공개 범위 비공개(private). 공개 게시 = 공개 범위 공개·일부 공개. 예약 공개 = 공개 범위 비공개(private)로 두고 아래 예약 공개 시각을 넣습니다.
+        {sel.accountDefault ? ' 계정 이름 옆에 그 계정이 고를 수 있는 결과가 있습니다(맞지 않으면 서버가 거부합니다).' : ''}
+      </p>
+      {sel.scheduledAllowed ? (
+        <>
+          <label htmlFor={`pdate-${vid}`}>예약 공개 날짜(모스크바, 예약 공개일 때만)</label>
+          <input id={`pdate-${vid}`} type="date" name={`publish_date_${vid}`} defaultValue={prev.publishDate[vid] ?? ''} />
+          <label htmlFor={`ptime-${vid}`}>예약 공개 시각(모스크바, HH:mm, 예약 공개일 때만)</label>
+          <input
+            id={`ptime-${vid}`}
+            type="text"
+            name={`publish_time_${vid}`}
+            placeholder="예: 18:00"
+            defaultValue={prev.publishTime[vid] ?? ''}
+            pattern="[0-2][0-9]:[0-5][0-9]"
+            maxLength={5}
+          />
+          <p className="note">예약 공개 시각은 모스크바 시각으로 받아 서버가 UTC 로 저장합니다(원격 publishAt — MOCK). 실행 예약이 있으면 그보다 뒤여야 합니다.</p>
+        </>
+      ) : null}
+    </>
+  );
+}
 
 const str = (v: string | string[] | undefined) => (typeof v === 'string' && v.trim() !== '' ? v : undefined);
 
@@ -66,7 +125,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                   <select id={`acc-${v.id}`} name={`account_${v.id}`} defaultValue={accs.some((a) => a.id === prev.account[v.id]) ? prev.account[v.id] : undefined}>
                     {accs.map((a) => (
                       <option key={a.id} value={a.id}>
-                        {`${a.displayName}${a.kind === 'mock' ? ' (MOCK)' : ''}`}
+                        {planAccountLabel(a)}
                       </option>
                     ))}
                   </select>
@@ -78,10 +137,11 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                       </option>
                     ))}
                   </select>
-                  <label htmlFor={`date-${v.id}`}>예약 날짜(모스크바, 선택)</label>
+                  <label htmlFor={`date-${v.id}`}>실행 예약 날짜(모스크바, 선택 — 비우면 즉시)</label>
                   <input id={`date-${v.id}`} type="date" name={`date_${v.id}`} defaultValue={prev.date[v.id] ?? ''} />
-                  <label htmlFor={`time-${v.id}`}>예약 시각(모스크바, HH:mm, 선택)</label>
+                  <label htmlFor={`time-${v.id}`}>실행 예약 시각(모스크바, HH:mm, 선택)</label>
                   <input id={`time-${v.id}`} type="text" name={`time_${v.id}`} placeholder="예: 12:00" defaultValue={prev.time[v.id] ?? ''} pattern="[0-2][0-9]:[0-5][0-9]" maxLength={5} />
+                  <ResultFields vid={v.id} sel={planResultSelect(accs)} prev={prev} />
                 </>
               )}
             </fieldset>

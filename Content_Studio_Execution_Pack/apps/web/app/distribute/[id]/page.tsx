@@ -16,6 +16,7 @@ import {
   problemLabel,
   reconciledNotice,
   remoteStepLine,
+  REQUESTED_RESULT_LABEL,
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
@@ -429,7 +430,6 @@ export default async function PlanPage({
   if (!d) notFound();
   const approvable = d.items.filter((x) => x.item.status === 'PLANNED' && !x.activeApproval && x.problems.length === 0);
   const executable = d.items.some((x) => x.item.status === 'PLANNED' && x.activeApproval);
-  const purpose = approvable[0]?.item.requestedResult ?? 'mock_publish';
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
   const banners = bannersFromState(q, d);
@@ -515,8 +515,17 @@ export default async function PlanPage({
             {approvable.map((x) => (
               <input key={x.item.id} type="hidden" name={`hash_${x.item.id}`} value={x.item.payloadHash} />
             ))}
-            <input type="hidden" name="purpose" value={purpose} />
+            {/* M4UI(G1): 항목마다 화면에 보인 그 항목의 요청 결과로 승인한다(목적이 섞인 계획도 한 번에). 서버가 항목의 requested_result 와 다시 대조한다. */}
+            {approvable.map((x) => (
+              <input key={`p-${x.item.id}`} type="hidden" name={`purpose_${x.item.id}`} value={x.item.requestedResult} />
+            ))}
             <p className="note">위 항목 카드에서 승인할 항목을 직접 고르세요(기본 선택 없음). 고른 항목의 위 내용 그대로(hash)만 승인됩니다.</p>
+            {new Set(approvable.map((x) => x.item.requestedResult)).size > 1 ? (
+              <p className="note">
+                이 계획에는 요청 결과가 다른 항목이 섞여 있습니다. 고른 항목은 각자 카드에 보인 요청 결과(
+                {[...new Set(approvable.map((x) => x.item.requestedResult))].map((r) => REQUESTED_RESULT_LABEL[r] ?? r).join(' · ')})로 승인됩니다(MOCK — 실제 게시 아님).
+              </p>
+            ) : null}
             <label className="choice">
               <input type="checkbox" name="confirm" value="yes" />
               내용을 확인했습니다

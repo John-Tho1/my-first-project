@@ -433,16 +433,33 @@ export const planCreateSchema = z.object({
 });
 export type PlanCreateInput = z.infer<typeof planCreateSchema>;
 
-/** POST /api/distribution-plans/{id}/approve. confirm 은 true 만, 고른 항목마다 예상 hash 필수. 모르는 키는 버린다. */
+/**
+ * POST /api/distribution-plans/{id}/approve. confirm 은 true 만, 고른 항목마다 예상 hash 필수. 모르는 키는 버린다.
+ * 목적: `purpose`(고른 항목 모두 같은 목적) 또는 M4UI(G1) `purposes`(항목 id → 그 항목의 목적 — 목적이 섞인 계획을 한 번에 승인).
+ * 고른 항목마다 목적이 하나로 정해져야 하고(purposes[id] ?? purpose), 둘 다 있으면 같아야 한다. 서버(approveItems)가 항목의 requested_result 와 다시 대조한다.
+ */
 export const approveSchema = z
   .object({
     item_ids: z.array(uuidStr).min(1).max(MAX_PLAN_ITEMS),
     expected_hashes: z.record(z.string(), z.string()),
     confirm: z.literal(true, { error: '내용을 확인했다는 표시(confirm)가 필요합니다' }),
-    purpose: z.enum(REQUESTED_RESULTS),
+    purpose: z.enum(REQUESTED_RESULTS).optional(),
+    purposes: z.record(z.string(), z.enum(REQUESTED_RESULTS)).optional(),
   })
   .superRefine((v, ctx) => {
     if (new Set(v.item_ids).size !== v.item_ids.length) ctx.addIssue({ code: 'custom', message: '같은 항목을 두 번 고를 수 없습니다', path: ['item_ids'] });
+    const per = new Map(Object.entries(v.purposes ?? {}).map(([k, p]) => [k.toLowerCase(), p]));
+    for (const id of v.item_ids) {
+      const p = per.get(id);
+      if (p === undefined && v.purpose === undefined) {
+        ctx.addIssue({ code: 'custom', message: '고른 항목마다 승인 목적(purpose 또는 purposes)이 필요합니다', path: ['purposes'] });
+        break;
+      }
+      if (p !== undefined && v.purpose !== undefined && p !== v.purpose) {
+        ctx.addIssue({ code: 'custom', message: '항목의 승인 목적(purposes)이 purpose 와 다릅니다', path: ['purposes'] });
+        break;
+      }
+    }
     const hashes = new Map(Object.entries(v.expected_hashes).map(([k, h]) => [k.toLowerCase(), h]));
     for (const id of v.item_ids) {
       const h = hashes.get(id);
@@ -452,10 +469,18 @@ export const approveSchema = z
       }
     }
   })
-  .transform((v) => ({
-    ...v,
-    expected_hashes: Object.fromEntries(Object.entries(v.expected_hashes).map(([k, h]) => [k.toLowerCase(), h])) as Record<string, string>,
-  }));
+  .transform((v) => {
+    const { purposes, ...rest } = v;
+    return {
+      ...rest,
+      expected_hashes: Object.fromEntries(Object.entries(v.expected_hashes).map(([k, h]) => [k.toLowerCase(), h])) as Record<string, string>,
+      ...(purposes ? { purposes: Object.fromEntries(Object.entries(purposes).map(([k, p]) => [k.toLowerCase(), p])) as Record<string, RequestedResult> } : {}),
+    };
+  });
+/** 승인 입력에서 항목 하나의 목적(purposes[id] ?? purpose). 정해지지 않으면 undefined — 서버는 이를 purpose_mismatch 로 거부한다. */
+export function approvalPurposeFor(input: { purpose?: RequestedResult | undefined; purposes?: Record<string, RequestedResult> | undefined }, itemId: string): RequestedResult | undefined {
+  return input.purposes?.[itemId.toLowerCase()] ?? input.purpose;
+}
 export type ApproveInput = z.infer<typeof approveSchema>;
 
 export const COMMAND_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;

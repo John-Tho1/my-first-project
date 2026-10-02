@@ -25,6 +25,7 @@ import {
   assertExecutionAllowed,
   BadRequestError,
   adapterIdFor,
+  approvalPurposeFor,
   buildCanonicalPayload,
   canVariantTransition,
   CHANNEL_LABEL,
@@ -693,7 +694,8 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
     }
     const mismatched = items.filter((i) => input.expected_hashes[i.id] !== i.payloadHash).map((i) => i.id);
     if (mismatched.length) throw new HashMismatchError(mismatched);
-    const wrongPurpose = items.filter((i) => i.requestedResult !== input.purpose).map((i) => i.id);
+    // M4UI(G1): 항목마다 그 항목의 목적(purposes[id] ?? purpose)이 저장된 requested_result 와 같아야 한다(정해지지 않은 목적도 거부).
+    const wrongPurpose = items.filter((i) => approvalPurposeFor(input, i.id) !== i.requestedResult).map((i) => i.id);
     if (wrongPurpose.length) throw new AppError('bad_request', 'purpose_mismatch', '승인 목적(purpose)이 항목의 요청 결과와 다릅니다', { item_ids: wrongPurpose });
     const active = await activeApprovalsFor(tx, ownerId, ids);
     if (active.size) throw new AppError('conflict', 'already_approved', '이미 승인한 항목이 있습니다', { item_ids: [...active.keys()] });

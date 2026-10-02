@@ -3,6 +3,7 @@
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
 import {
+  adapterIdFor,
   AppError,
   CREDENTIAL_STATUS_LABEL,
   formatMskInline,
@@ -83,8 +84,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   account_not_ready: '배포 계정이 준비되지 않았습니다.',
   account_credential_blocked: '배포 계정 연결이 만료·해제되었거나 다시 연결이 필요합니다. 설정 → 배포 계정 연결에서 다시 연결한 뒤 실행하세요.',
   mock_only: '모의(MOCK) 계정은 모의 실행만 할 수 있습니다.',
-  schedule_in_past: '예약 시각은 지금부터 1분 뒤 이후여야 합니다(모스크바 시각).',
-  invalid_schedule: '예약 날짜·시각 형식을 확인하세요(모스크바 시각).',
+  schedule_in_past: '예약 시각(실행 예약·예약 공개)은 지금부터 1분 뒤 이후여야 합니다(모스크바 시각).',
+  invalid_schedule: '예약 날짜·시각(실행 예약·예약 공개) 형식을 확인하세요(모스크바 시각). 예약 공개를 골랐으면 예약 공개 날짜·시각을 모두 넣으세요.',
   duplicate_item: '같은 채널 초안·계정 조합이 두 번 들어 있습니다.',
   asset_deleted: '원본을 지운 첨부 파일이 있어 배포할 수 없습니다.',
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
@@ -108,6 +109,7 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   publish_at_requires_public_publish: '비공개 업로드 계획에는 예약 공개를 넣을 수 없습니다(공개 계획으로 따로 승인해야 합니다).',
   publish_at_requires_private: '예약 공개는 private 영상에만 정할 수 있습니다.',
   publish_at_before_send: '예약 공개 시각은 업로드 시작 시각보다 뒤여야 합니다.',
+  requested_result_required: '실제 계정은 비공개 업로드 또는 공개 게시를 골라야 합니다(이 단계에서는 실제 게시하지 않음).',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -143,14 +145,79 @@ export function formToPlanCreate(f: Record<string, string>) {
     const vid = k.slice(4);
     const date = (f[`date_${vid}`] ?? '').trim();
     const time = (f[`time_${vid}`] ?? '').trim();
+    // M4UI(G2): 요청 결과(result_<vid>)와 예약 공개(publish_date_·publish_time_<vid>, 모스크바). 서버(createPlan)가 계정·공개 범위와의 조합을 판정한다.
+    const choice = f[`result_${vid}`] ?? '';
+    const pDate = (f[`publish_date_${vid}`] ?? '').trim();
+    const pTime = (f[`publish_time_${vid}`] ?? '').trim();
+    const scheduledPublish = choice === 'scheduled_publish';
     items.push({
       variant_id: vid,
       channel_account_id: f[`account_${vid}`] ?? '',
+      // 빈 값 = 계정 기본값(모의 연결 YouTube = 비공개 업로드, 그 밖 = MOCK 실행). 모르는 값은 그대로 넘겨 스키마가 거부한다.
+      requested_result: scheduledPublish ? 'public_publish' : choice || undefined,
       visibility: f[`visibility_${vid}`] || undefined,
       schedule: date || time ? { date, time } : undefined,
+      // 예약 공개를 골랐으면 날짜·시각이 비어도 넘겨 서버가 invalid_schedule 로 거부한다. 다른 결과에 넣은 예약 공개 시각도 숨기지 않고 넘긴다(서버가 거부).
+      publish_at: scheduledPublish || pDate || pTime ? { date: pDate, time: pTime } : undefined,
     });
   }
   return { items, target_summary: f.target_summary || undefined };
+}
+
+/** M4UI(G1): 저장된 요청 결과(requested_result) → 승인 화면 문구(MOCK). */
+export const REQUESTED_RESULT_LABEL: Record<string, string> = {
+  mock_publish: 'MOCK 실행',
+  upload_private: '비공개 업로드(MOCK)',
+  public_publish: '공개 게시 계획(MOCK)',
+};
+
+/** M4UI(G2): 계획 만들기 화면의 요청 결과 선택지(예약 공개 = public_publish + private + publish_at). */
+export type PlanResultChoice = 'mock_publish' | 'upload_private' | 'public_publish' | 'scheduled_publish';
+
+export const RESULT_CHOICE_LABEL: Record<PlanResultChoice, string> = {
+  mock_publish: 'MOCK 실행(실제 게시 아님)',
+  upload_private: '비공개 업로드(MOCK)',
+  public_publish: '공개 게시(MOCK — 공개 범위 공개·일부 공개)',
+  scheduled_publish: '예약 공개(MOCK — 비공개로 올린 뒤 예약 시각에 공개)',
+};
+
+/**
+ * M4UI(G2, D27): 계정마다 고를 수 있는 요청 결과(화면 안내용 — 판정은 서버 createPlan). 어댑터 선택 규칙은 @cs/domain adapterIdFor 한 곳.
+ * 모의 연결한 YouTube 계정 = 비공개 업로드·공개 게시·예약 공개, seed 모의 계정·Threads 계정 = MOCK 실행만. 실제(live) 계정은 이 화면에서 다루지 않는다.
+ */
+export function resultChoicesFor(acc: { kind: string; platform: string; credentialState: string }): PlanResultChoice[] {
+  if (acc.kind !== 'mock') return [];
+  const adapter = adapterIdFor({ kind: 'mock', platform: acc.platform, credential_state: acc.credentialState });
+  return adapter === 'mock_youtube' ? ['upload_private', 'public_publish', 'scheduled_publish'] : ['mock_publish'];
+}
+
+/** 계정 선택 목록의 한 줄(MOCK · 고를 수 있는 요청 결과). */
+export function planAccountLabel(acc: { displayName: string; kind: string; platform: string; credentialState: string }): string {
+  const choices = resultChoicesFor(acc);
+  const res = choices.length === 1 && choices[0] === 'mock_publish' ? 'MOCK 실행만' : choices.length ? '모의 연결 — 비공개 업로드·공개 게시·예약 공개' : '';
+  return `${acc.displayName}${acc.kind === 'mock' ? ' (MOCK)' : ''}${res ? ` · ${res}` : ''}`;
+}
+
+/**
+ * 한 채널 초안의 요청 결과 선택지(계정들의 합집합 — 순서 고정). 계정이 섞여 있으면(모의 연결 YouTube + seed) "계정 기본값"(빈 값)을 맨 앞에 둔다.
+ * MOCK 실행만 가능한 경우 select 없이 고정 문구로 보인다(fixed=true).
+ */
+export interface PlanResultSelect {
+  /** MOCK 실행만 가능(선택 없이 고정 문구) */
+  fixed: boolean;
+  /** 계정이 섞여 있어 "계정 기본값"(빈 값)을 둔다 */
+  accountDefault: boolean;
+  choices: PlanResultChoice[];
+  /** 예약 공개 날짜·시각 입력을 보인다 */
+  scheduledAllowed: boolean;
+}
+
+export function planResultSelect(accs: ReadonlyArray<{ kind: string; platform: string; credentialState: string }>): PlanResultSelect {
+  const all = new Set(accs.flatMap((a) => resultChoicesFor(a)));
+  const order: PlanResultChoice[] = ['upload_private', 'public_publish', 'scheduled_publish', 'mock_publish'];
+  const choices = order.filter((c) => all.has(c));
+  const fixed = choices.length <= 1 && (choices[0] ?? 'mock_publish') === 'mock_publish';
+  return { fixed, accountDefault: !fixed && all.has('mock_publish'), choices, scheduledAllowed: all.has('scheduled_publish') };
 }
 
 /**
@@ -163,7 +230,16 @@ export function formToApprove(f: Record<string, string>) {
     .map(([k]) => k.slice(5));
   const expected: Record<string, string> = {};
   for (const [k, v] of Object.entries(f)) if (k.startsWith('hash_')) expected[k.slice(5)] = v;
-  return { item_ids: itemIds, expected_hashes: expected, confirm: f.confirm === 'yes', purpose: f.purpose ?? '' };
+  // M4UI(G1): 숨은 purpose_<id> = 화면에 보인 그 항목의 요청 결과. 서버가 항목의 requested_result 와 다시 대조한다(다르면 purpose_mismatch).
+  const purposes: Record<string, string> = {};
+  for (const [k, v] of Object.entries(f)) if (k.startsWith('purpose_')) purposes[k.slice(8)] = v;
+  return {
+    item_ids: itemIds,
+    expected_hashes: expected,
+    confirm: f.confirm === 'yes',
+    ...(f.purpose !== undefined ? { purpose: f.purpose } : {}),
+    ...(Object.keys(purposes).length ? { purposes } : {}),
+  };
 }
 
 export function formToExecute(f: Record<string, string>) {
@@ -588,6 +664,7 @@ const ECHO_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 const ECHO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const ECHO_TIME = /^\d{2}:\d{2}$/u;
 const ECHO_VIS = new Set(['private', 'unlisted', 'public']);
+const ECHO_RESULT = new Set(['mock_publish', 'upload_private', 'public_publish', 'scheduled_publish']);
 const ECHO_NAME_MAX = 200;
 
 export interface PlanFormDefaults {
@@ -597,6 +674,11 @@ export interface PlanFormDefaults {
   visibility: Record<string, string>;
   date: Record<string, string>;
   time: Record<string, string>;
+  /** M4UI(G2): 요청 결과 선택(result_<vid>) */
+  result: Record<string, string>;
+  /** M4UI(G2): 예약 공개 날짜·시각(모스크바) */
+  publishDate: Record<string, string>;
+  publishTime: Record<string, string>;
   name: string;
 }
 
@@ -609,7 +691,7 @@ export function planFormEcho(f: Record<string, string>): string {
   const use: string[] = [];
   const vids = new Set<string>();
   for (const k of Object.keys(f)) {
-    const m = /^(use|account|visibility|date|time)_(.+)$/u.exec(k);
+    const m = /^(use|account|visibility|date|time|result|publish_date|publish_time)_(.+)$/u.exec(k);
     if (m && ECHO_UUID.test(m[2]!.toLowerCase())) vids.add(m[2]!.toLowerCase());
   }
   for (const vid of [...vids].sort()) {
@@ -622,6 +704,12 @@ export function planFormEcho(f: Record<string, string>): string {
     if (ECHO_DATE.test(date)) p.set(`e_date_${vid}`, date);
     const time = (f[`time_${vid}`] ?? '').trim();
     if (ECHO_TIME.test(time)) p.set(`e_time_${vid}`, time);
+    const res = f[`result_${vid}`] ?? '';
+    if (ECHO_RESULT.has(res)) p.set(`e_res_${vid}`, res);
+    const pDate = (f[`publish_date_${vid}`] ?? '').trim();
+    if (ECHO_DATE.test(pDate)) p.set(`e_pdate_${vid}`, pDate);
+    const pTime = (f[`publish_time_${vid}`] ?? '').trim();
+    if (ECHO_TIME.test(pTime)) p.set(`e_ptime_${vid}`, pTime);
   }
   if (use.length) p.set('e_use', use.join(','));
   const name = Array.from((f.target_summary ?? '').trim()).slice(0, ECHO_NAME_MAX).join('');
@@ -633,16 +721,19 @@ export function planFormEcho(f: Record<string, string>): string {
 /** 쿼리(`e_…`) → 폼 기본값. 형식이 틀린 값은 버린다(화면에는 React 가 escape 해서 넣는다). */
 export function planFormDefaults(q: Record<string, string | string[] | undefined>): PlanFormDefaults {
   const one = (k: string) => (typeof q[k] === 'string' ? (q[k] as string) : '');
-  const d: PlanFormDefaults = { use: new Set(), account: {}, visibility: {}, date: {}, time: {}, name: '' };
+  const d: PlanFormDefaults = { use: new Set(), account: {}, visibility: {}, date: {}, time: {}, result: {}, publishDate: {}, publishTime: {}, name: '' };
   for (const vid of one('e_use').split(',')) if (ECHO_UUID.test(vid)) d.use.add(vid);
   for (const k of Object.keys(q)) {
-    const m = /^e_(acc|vis|date|time)_(.+)$/u.exec(k);
+    const m = /^e_(acc|vis|date|time|res|pdate|ptime)_(.+)$/u.exec(k);
     if (!m || !ECHO_UUID.test(m[2]!)) continue;
     const v = one(k);
     if (m[1] === 'acc' && ECHO_UUID.test(v)) d.account[m[2]!] = v;
     if (m[1] === 'vis' && ECHO_VIS.has(v)) d.visibility[m[2]!] = v;
     if (m[1] === 'date' && ECHO_DATE.test(v)) d.date[m[2]!] = v;
     if (m[1] === 'time' && ECHO_TIME.test(v)) d.time[m[2]!] = v;
+    if (m[1] === 'res' && ECHO_RESULT.has(v)) d.result[m[2]!] = v;
+    if (m[1] === 'pdate' && ECHO_DATE.test(v)) d.publishDate[m[2]!] = v;
+    if (m[1] === 'ptime' && ECHO_TIME.test(v)) d.publishTime[m[2]!] = v;
   }
   d.name = Array.from(one('e_name')).slice(0, ECHO_NAME_MAX).join('');
   return d;

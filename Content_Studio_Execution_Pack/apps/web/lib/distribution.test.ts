@@ -9,12 +9,20 @@ import {
   bannersFromState,
   blockDetailLabel,
   blockInfoOf,
+  DISTRIBUTE_ERROR_TEXT,
+  formToApprove,
+  formToPlanCreate,
   itemHeadline,
   jobStatusText,
   mockScenarioOptionsFor,
+  planAccountLabel,
   planFormDefaults,
   planFormEcho,
+  planResultSelect,
   reconciledNotice,
+  REQUESTED_RESULT_LABEL,
+  RESULT_CHOICE_LABEL,
+  resultChoicesFor,
   reconciledParam,
   remoteStepLine,
   revocationCountParam,
@@ -199,6 +207,89 @@ describe('화면 확인 D10 — planFormEcho·planFormDefaults', () => {
     expect(d.account).toEqual({});
     expect(d.date).toEqual({});
     expect(Array.from(d.name)).toHaveLength(200);
+  });
+});
+
+describe('M4UI(G1·G2) — 승인 폼 항목별 목적, 계획 폼 요청 결과·예약 공개', () => {
+  const V = '11111111-2222-4333-8444-555555555555';
+  const I1 = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const I2 = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  it('formToApprove: purpose_<id> → purposes(체크 안 한 항목도 담기지만 item_ids 만 승인 대상), 단일 purpose 는 있을 때만', () => {
+    const r = formToApprove({ [`item_${I1}`]: 'on', [`hash_${I1}`]: 'h1', [`hash_${I2}`]: 'h2', [`purpose_${I1}`]: 'upload_private', [`purpose_${I2}`]: 'mock_publish', confirm: 'yes' });
+    expect(r).toEqual({ item_ids: [I1], expected_hashes: { [I1]: 'h1', [I2]: 'h2' }, confirm: true, purposes: { [I1]: 'upload_private', [I2]: 'mock_publish' } });
+    expect(formToApprove({ [`item_${I1}`]: 'on', purpose: 'mock_publish' })).toEqual({ item_ids: [I1], expected_hashes: {}, confirm: false, purpose: 'mock_publish' });
+  });
+  it('formToPlanCreate: 예약 공개 = public_publish + publish_at, 빈 값 = 계정 기본값, 예약 공개 날짜가 비어도 넘겨 서버가 거부', () => {
+    const base = { [`use_${V}`]: 'on', [`account_${V}`]: I1, [`visibility_${V}`]: 'private' };
+    const item = (f: Record<string, string>) => formToPlanCreate({ ...base, ...f }).items[0]!;
+    expect(item({ [`result_${V}`]: 'scheduled_publish', [`publish_date_${V}`]: '2030-01-02', [`publish_time_${V}`]: '09:30' })).toMatchObject({
+      requested_result: 'public_publish',
+      publish_at: { date: '2030-01-02', time: '09:30' },
+      schedule: undefined,
+    });
+    expect(item({ [`result_${V}`]: 'scheduled_publish' }).publish_at).toEqual({ date: '', time: '' });
+    expect(item({ [`result_${V}`]: '' })).toMatchObject({ requested_result: undefined, publish_at: undefined });
+    expect(item({})).toMatchObject({ requested_result: undefined, publish_at: undefined });
+    expect(item({ [`result_${V}`]: 'upload_private', [`publish_date_${V}`]: '2030-01-02' })).toMatchObject({ requested_result: 'upload_private', publish_at: { date: '2030-01-02', time: '' } });
+    // 모르는 값은 그대로 넘겨 스키마가 거부
+    expect(item({ [`result_${V}`]: 'go_live' }).requested_result).toBe('go_live');
+  });
+  it('resultChoicesFor·planResultSelect·planAccountLabel: D27 — 모의 연결 YouTube 만 비공개 업로드·공개 게시·예약 공개, seed·Threads 는 MOCK 실행만', () => {
+    const ytLinked = { kind: 'mock', platform: 'youtube', credentialState: 'linked', displayName: 'YT' };
+    const ytSeed = { kind: 'mock', platform: 'youtube', credentialState: 'none', displayName: 'YT seed' };
+    const thrLinked = { kind: 'mock', platform: 'threads', credentialState: 'linked', displayName: 'TH' };
+    expect(resultChoicesFor(ytLinked)).toEqual(['upload_private', 'public_publish', 'scheduled_publish']);
+    expect(resultChoicesFor(ytSeed)).toEqual(['mock_publish']);
+    expect(resultChoicesFor(thrLinked)).toEqual(['mock_publish']);
+    expect(resultChoicesFor({ ...ytLinked, credentialState: 'needs_reconnect' })).toEqual(['upload_private', 'public_publish', 'scheduled_publish']);
+    expect(planResultSelect([thrLinked])).toEqual({ fixed: true, accountDefault: false, choices: ['mock_publish'], scheduledAllowed: false });
+    expect(planResultSelect([ytLinked])).toEqual({ fixed: false, accountDefault: false, choices: ['upload_private', 'public_publish', 'scheduled_publish'], scheduledAllowed: true });
+    expect(planResultSelect([ytSeed, ytLinked])).toEqual({
+      fixed: false,
+      accountDefault: true,
+      choices: ['upload_private', 'public_publish', 'scheduled_publish', 'mock_publish'],
+      scheduledAllowed: true,
+    });
+    expect(planAccountLabel(ytLinked)).toBe('YT (MOCK) · 모의 연결 — 비공개 업로드·공개 게시·예약 공개');
+    expect(planAccountLabel(thrLinked)).toBe('TH (MOCK) · MOCK 실행만');
+    for (const l of Object.values(RESULT_CHOICE_LABEL)) expect(l).toContain('MOCK');
+  });
+  it('planFormEcho·planFormDefaults: 요청 결과·예약 공개 날짜·시각 왕복(목록 밖 값·형식 틀린 값은 버림)', () => {
+    const W = '99999999-2222-4333-8444-555555555555';
+    const qs = planFormEcho({
+      [`use_${V}`]: 'on',
+      [`result_${V}`]: 'scheduled_publish',
+      [`publish_date_${V}`]: '2030-01-02',
+      [`publish_time_${V}`]: '18:00',
+      [`result_${W}`]: 'go_live',
+      [`publish_date_${W}`]: '2030/01/02',
+      [`publish_time_${W}`]: '6pm',
+    });
+    const d = planFormDefaults(Object.fromEntries(new URLSearchParams(qs.slice(1)).entries()));
+    expect(d.result).toEqual({ [V]: 'scheduled_publish' });
+    expect(d.publishDate).toEqual({ [V]: '2030-01-02' });
+    expect(d.publishTime).toEqual({ [V]: '18:00' });
+    // 기존 예약(date_·time_)과 섞이지 않는다
+    expect(d.date).toEqual({});
+    expect(d.time).toEqual({});
+  });
+  it('오류 문구: 요청 결과·예약 공개 규칙 코드는 모두 한국어 문구가 있다', () => {
+    for (const c of [
+      'requested_result_not_supported',
+      'requested_result_required',
+      'visibility_mismatch',
+      'publish_at_not_supported',
+      'publish_at_requires_public_publish',
+      'publish_at_requires_private',
+      'publish_at_before_send',
+      'purpose_mismatch',
+      'mock_only',
+      'invalid_schedule',
+      'schedule_in_past',
+    ]) {
+      expect(DISTRIBUTE_ERROR_TEXT[c], c).toMatch(/[가-힣]/u);
+    }
+    expect(REQUESTED_RESULT_LABEL).toEqual({ mock_publish: 'MOCK 실행', upload_private: '비공개 업로드(MOCK)', public_publish: '공개 게시 계획(MOCK)' });
   });
 });
 

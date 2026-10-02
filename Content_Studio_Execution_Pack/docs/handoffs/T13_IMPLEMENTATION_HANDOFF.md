@@ -251,6 +251,7 @@ Tests are in `tests/integration/oauth.test.ts` unless noted.
 6. Q16: the virtual clock removes wall-clock lease expiry from the test entirely. Given the recorded failure with the batch lease reintroduced, is there still a real-time aspect of the original bug that this form no longer covers?
 
 # FIX round 4 (Codex review-FIX3-T13)
+- Orchestrator: HEAD_SHA ea85ac6 — reran lint·typecheck·build·unit 697·integration 534·drill:mock 0·db:migrate 0033·real-DB drill:restore PASS.
 - BASE_SHA: 7634bb1 · **HEAD_SHA: TBD** (the orchestrator commits; this section is written before the commit). Review fixed: `.handoffs/review-FIX3-T13.md` on 79201d6 (CHANGES_REQUESTED, P1×3 + P2×1, plus missed cases).
 - Environment: Windows 10, Git Bash, portable Node 24.21.0 (`source tools/env.sh`), pnpm via corepack. Dev server down. `./data` not opened (no db:migrate/seed/drill:restore/secrets:rotate). Tests use memory DBs. Unit and integration suites run separately, one after the other.
 - Migration: **new `0033_t13_fix4_pending_tokens`** (drizzle-kit output plus two hand-written data statements, marked in the file). 0030 is not amended.

@@ -48,3 +48,19 @@ BASE cbb8d38, 커밋 안 함(작업 트리 변경). 화면 표시만 — 작업�
 - S4 [P3] YouTube 업로드 패널이 세션이 없을 때 "아직 업로드 세션 없음" 과 "세션 URI 는 … 표시하지 않습니다(세션 있음)" 를 함께 보여 준다. 기대: 세션이 있을 때만 "(세션 있음)" 문구.
 - S5 [P3] 예약 공개를 요청했는데 원격이 비공개로 강제하고 publishAt 을 버린 결과(UPLOADED_PRIVATE)인데도 "예약 공개(원격 publishAt): 2026-10-04 10:00 (MSK)" 만 보인다. 기대: "요청한 예약 공개 시각 — 원격이 적용하지 않음(미검증 프로젝트, 비공개 강제)" 처럼 원격 결과와 구분.
 - 참고: 모의 OAuth 발급 기록이 프로세스 메모리라 dev 서버를 재시작할 때마다 모의 연결 계정이 다음 전송에서 차단된다(의도된 모의 한계, 실계정 어댑터는 DB 봉인 토큰 사용). 개발 중 불편 — 필요하면 모의 공급자 기록을 DB 에서 재수화하는 개선 후보.
+
+## S4·S5 수정 (BASE 5b92b2e, 미커밋 작업 트리 — 표시만, 작업·승인·재확인·어댑터 로직 변경 없음)
+- S4 → `apps/web/lib/distribution.ts` `youtubeSessionNote({ hasSession })`·`YOUTUBE_MOCK_DISCLAIMER`. `apps/web/app/distribute/[id]/page.tsx` YouTubeSteps 가 최근 작업의 upload_session 단계 수(`sessions.length > 0`)로 호출 — 세션 있을 때만 "세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음)" + 공통 MOCK 안내, 없으면 "아직 업로드 세션 없음(…)" 줄 + 공통 MOCK 안내만.
+  - 테스트: `distribution.test.ts` 「M4 화면 FIX(S4)」 2건(세션 없음: "세션 있음"·"세션 URI" 없음 / 세션 있음: 문구 + 공통 안내).
+- S5 → `publishAtView({ publishAt, resultKind, isMock })` → `{ state: requested | applied | not_applied, text, warn }` 또는 null. ItemCard 메타 줄이 승인 스냅샷 `provider_metadata.publish_at` 과 최근 작업의 원격 결과(`latestPub.resultKind`, D27 원격 보고값)로 표시:
+  - 결과 전: "요청한 예약 공개 시각: <MSK> — 원격 결과 전(요청만)"
+  - SCHEDULED_REMOTE: "예약 공개(원격 publishAt 적용): <MSK> (MOCK)"
+  - UPLOADED_PRIVATE: "요청한 예약 공개 시각: <MSK> — 원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, MOCK)" (경고 태그)
+  - 그 밖(PUBLISHED 등): "… — 원격이 적용하지 않음(원격 결과: <종류>)"
+  - 테스트: 「M4 화면 FIX(S5, D27)」 6건(없음 → null / 요청만 / 적용 / 비공개 강제로 미적용 / 다른 결과로 미적용 / 잘못된 시각).
+- 명령(`source tools/env.sh`, Node 24.21.0, `corepack pnpm`):
+  - `lint` pass · `typecheck` pass · `build` pass
+  - `test` pass — 39 파일 / 745 테스트
+  - `test:integration`(단독) pass — 31 파일 / 569 테스트
+  - `drill:mock` pass — 불변식 위반 0건, YouTube fetch 호출 0
+- 브라우저 재확인: not_run(dev 서버 내려 둠) — 다음 화면 확인에서 S4(세션 없는 YouTube 항목)·S5(publish_at + UPLOADED_PRIVATE) 육안 확인 필요.

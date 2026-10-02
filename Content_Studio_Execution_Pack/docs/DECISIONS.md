@@ -402,3 +402,12 @@
 - 배경: AGENTS.md 는 리뷰·인계 산출물을 gitignored `.handoffs/` 나 저장소 밖에 두라고 한다. 그러나 사용자가 로컬 ↔ 클라우드 세션 이동을 요청했고(2026-09-25 M3, 2026-10-02 M4), 클라우드는 로컬 `.handoffs/` 를 볼 수 없어 M2 이후 인계·판정 사본을 `docs/handoffs/` 에 커밋해 왔다.
 - Chosen option: `docs/handoffs/` 사본 추적은 유지한다(세션 간 인계에 필요). 대신 (1) 인계·판정 사본은 **docs 전용 커밋**으로만 넣고, 리뷰 대상 코드 커밋에는 섞지 않는다(ea85ac6 은 섞였음 — 이후 커밋부터 적용). (2) 리뷰 대상 HEAD 를 SHA 기록만을 위해 바꾸지 않는다(SHA 는 뒤따르는 docs 전용 커밋에 기록). (3) Codex 리뷰 전문은 계속 로컬 `.handoffs/` 에만 두고, docs/handoffs 에는 판정·지적 제목 요약만(클라우드 수정 라운드에 전문이 필요할 때만 사본).
 - Reversible?: 예. 사용자가 원하면 docs/handoffs 를 저장소 밖(예: 별도 브랜치)으로 옮긴다.
+
+### D26 후속 (T14 FIX round 1, Codex review-T14, 코드 6f766d2)
+- remote_steps 는 "내보내기만" 에서 **읽기 전용 이력 복원**으로 바꾼다(job·intent·item 과 함께, 업로드 세션 URI 는 가린 값 그대로). 복원한 작업의 조회가 not_found 면 unknown(단계 없음 restored_steps_missing / 단계 있음 restored_not_found_unverified).
+- 조회 어댑터는 의도에 기록된 것만 쓴다: adapter_id 없음 → `mock_generic`(T14 이전 유일 어댑터), 모르는 ID → unknown(adapter_unresolved). 현재 계정 상태로 고른 어댑터로 대체하지 않는다. 다른 어댑터로 기록된 단계가 있는 작업은 전송 차단(adapter_changed).
+- 만료 컨테이너의 publish 오류도 조회 경로(→ unknown).
+- 처리 지연(REMOTE_PROCESSING) 뒤의 재개는 시도 한도에 넣지 않는다(jobs.resume_count, migration 0034, 상한 20). 결과 불명 뒤 재개는 시도로 센다.
+- 부분 게시 뒤 대기(QUEUED·RETRY_WAIT·BLOCKED) 중 취소 → UNKNOWN(cancel_partial, thread_partial_canceled) — "보내지 않음" 이라 말하지 않는다(A11).
+- 요청 제한 검사는 계정별 advisory 잠금 + 같은 계정 진행 중 작업의 남은 단위 예약. 창이 비면(used=0) 한도보다 큰 작업 허용 규칙은 그대로(잠정).
+- 별도 `pnpm worker` 프로세스는 web 이 발급한 모의 토큰을 모른다(프로세스 메모리) → 원격 401 → BLOCKED·게시 0. 실계정 어댑터에서는 DB 의 봉인 토큰을 쓰므로 해당 없음.

@@ -318,3 +318,16 @@
 - sweep 은 3단계(계획 감사 커밋 → 파일 삭제 → 결과 감사, sweep_id 로 연결). 결과 없는 실행·일부만 처리된 실행은 뒤에 성공이 있어도 /ops 에 계속 표시된다. 프로세스 간 배타는 없음(단일 worker 전제, PostgreSQL 다중 worker 전 영속 sweep 상태 필요 — Codex 권고, 미구현).
 - 복원 훈련은 변환 열을 제외하지 않고 **전 컬럼** 을 비교한다. 기대값은 restore-expect.ts 가 묶음 행에서 독립 재계산하며(복원 코드 호출 없음), 복원 판정 시각은 commitRestore 의 now 로 주입한다. 검증 범위(빈 표·파일 0·검색 skipped·jobs/approvals 없음)는 restore_drills.scope_json(0026)에 저장되고 "PASS(부분 검증: …)" 로 표시된다. 예외도 fail 행 + error_code(0025).
 - Codex 권고 중 **미반영(사용자 결정)**: Q5 백업 나이는 완료 기록이 아니라 검증 가능한 파일·확인된 외부 사본 기준이어야 하고 보관 중인 과거 ZIP 의 복원 훈련은 별도 지표여야 함(현재는 마지막 완료 export 기준 그대로) → (c) 와 함께 결정. Q6 공개 `/api/health` 의 `ops` 숫자를 세션 뒤로 옮길지 → (e).
+
+## D23 — D22 사용자 결정 확정 (T20 운영·보존·백업)
+- Decision ID / date: D23 / 2026-10-02 (Europe/Moscow), 사용자 확정.
+- Question: D22 의 사용자 결정 항목 (a)~(e) 와 Codex T20 Q5·Q6 권고 처리.
+- Chosen option:
+  - (a) 기준값 확정: `BACKUP_MAX_AGE_HOURS` 24, `RETENTION_JOB_EVENTS_DAYS` 180, `RETENTION_PACKAGES_DAYS` 30, `RETENTION_EXPORT_RUNS_KEEP` 10. 코드 변경 없음.
+  - (b) 보존 정리 기본 `manual` 유지. (b2) 손상·접근 불가 ZIP 과 그 폴더 무기한 보존 규칙 유지. 코드 변경 없음.
+  - (c) 백업을 이 PC 밖으로 옮기지 않는다. 백업 나이는 **마지막 완료 export 기준을 유지**한다 — Codex Q5 권고(검증 가능한 파일·외부 사본 기준)는 채택하지 않음. /ops 는 백업 나이와 별도로 마지막 복원 훈련을 표시하고, 보존 정리는 이미 검증된 ZIP 만 백업으로 센다(D22 후속). 코드 변경 없음.
+  - (d) 외부 알림(이메일·메시지) 사용 안 함. /ops 화면만. 코드 변경 없음.
+  - (e) Codex Q6 채택: 공개 `/api/health` 에서 `ops` 블록을 뺐다. 같은 숫자는 로그인이 필요한 `GET /api/ops/summary` 로 옮겼고 **로그인한 owner 범위**로 센다(이전 health 는 모든 owner 합계). 폴더 바이트는 이 PC 폴더 전체 측정이라 owner 구분이 없다.
+- Evidence: tests/integration/ops-retention.test.ts "D23(e)" — health 에 ops·숫자 키 없음, summary 세션 없음·잘못된 세션 401(숫자 미노출), 새 owner 0·null(다른 owner 미집계), A 의 숫자 = opsSnapshot, 51개 계획 owner 정확히 51.
+- 남은 범위(이번 결정 밖): 공개 `/api/health` 에는 여전히 `jobs`(상태별 작업 수·`attention_plans`, T11/T12), `uploads`(업로드 임시 영역 사용량, T08), `db.captures`(소재 수)가 모든 owner 합계로 남아 있다. 이 숫자도 세션 뒤로 옮길지는 사용자 결정 대상.
+- Reversible?: 예.

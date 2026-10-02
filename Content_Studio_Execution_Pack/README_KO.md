@@ -405,7 +405,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
   - 배포 파일 ZIP 은 `RETENTION_PACKAGES_DAYS`(30일), 내보내기 ZIP 은 최근 `RETENTION_EXPORT_RUNS_KEEP`(10개)만 남긴다. 실행 기록은 남긴다.
   - 원문 소재·출처·원고 버전·파생본·승인·결과 기록은 지우지 않는다. 업로드 세션은 기존 24시간 자동 만료(D15) 그대로. 앱은 파일 로그를 쓰지 않아 로그 보존 설정은 없다.
   - `RETENTION_SWEEP_MODE=auto` 면 작업 처리기가 한 시간에 한 번 같은 정리를 적용한다(기본 manual).
-- `/api/health` 의 `ops`: `backup_age_hours`·`attention_plans`·`repeated_failures`·`pending_deletes`·`disk{db,assets,uploads,exports}`. 숫자만, 기록이 없으면 null. 폴더 크기는 60초 동안 같은 측정값을 쓴다.
+- 운영 숫자 `GET /api/ops/summary`(**로그인 필요**, 로그인한 owner 범위): `ops: {backup_age_hours, attention_plans, repeated_failures, pending_deletes, disk{db,assets,uploads,exports}, disk_partial}`. 숫자만, 기록이 없으면 null. 폴더 크기는 이 PC 폴더 전체 측정이며 60초 동안 같은 측정값을 쓴다. 공개 `/api/health` 에는 이 숫자가 없다(D23(e)).
 
 ### 검증 명령
 | 명령 | 내용 | 기대 |

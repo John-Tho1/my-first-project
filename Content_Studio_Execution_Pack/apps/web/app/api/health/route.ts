@@ -1,4 +1,4 @@
-import { countCaptures, getDb, healthOps, jobStateCounts, uploadStoreFor } from '@cs/db';
+import { countCaptures, getDb, jobStateCounts, uploadStoreFor } from '@cs/db';
 import { DISPLAY_TIMEZONE, formatMsk, getModes, liveLlmReadiness, loadConfig, sttLiveReadiness } from '@cs/domain';
 import { getLastTick } from '@cs/worker';
 import { runInlineWorker } from '../../../lib/stt';
@@ -12,8 +12,7 @@ export const runtime = 'nodejs';
  * WORKER_MODE=inline 이면 요청마다 worker tick 을 1회 실행해 last_tick_utc 를 갱신한다(T08: 업로드 만료 정리 + 모의 전사 한 단계).
  * T08: stt(모드·live 준비 안 됨·빠진 조건 이름) + 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트).
  * T11: jobs = 배포 작업 상태별 개수(집계만 — ID·내용 없음). inline tick 은 배포 작업을 최대 5개 처리한다(모의 어댑터).
- * T20: ops = 숫자만(마지막 내보내기 후 시간·확인 필요 계획·반복 실패 항목·파일 삭제 대기·폴더 바이트). 경로·ID 없음, 기록이 없으면 null.
- *      폴더 바이트는 60초 동안 같은 측정값을 쓴다(요청마다 폴더 전체를 걷지 않게).
+ * D23(e): 운영 숫자(백업 나이·확인 필요 계획·반복 실패·삭제 대기·폴더 바이트)는 공개 응답에서 빼고 로그인이 필요한 GET /api/ops/summary 로 옮겼다.
  */
 export async function GET(): Promise<Response> {
   const now = new Date();
@@ -45,7 +44,6 @@ export async function GET(): Promise<Response> {
     const last = getLastTick();
     const uploads = await uploadStoreFor(config).usage();
     const jobs = await jobStateCounts(handle.db);
-    const ops = await healthOps(handle.db, config, now);
     return Response.json(
       {
         status: 'ok',
@@ -56,7 +54,6 @@ export async function GET(): Promise<Response> {
         uploads,
         db: { driver: handle.driver, ok: true, migrated: handle.migrated, captures },
         jobs,
-        ops,
         worker: { mode: config.WORKER_MODE, last_tick_utc: last?.ranAt ?? null },
       },
       { headers: { 'cache-control': 'no-store' } },
@@ -72,7 +69,6 @@ export async function GET(): Promise<Response> {
         uploads: null,
         db: { driver: config.DB_DRIVER, ok: false, migrated: false, captures: null },
         jobs: null,
-        ops: null,
         worker: { mode: config.WORKER_MODE, last_tick_utc: getLastTick()?.ranAt ?? null },
       },
       { status: 503, headers: { 'cache-control': 'no-store' } },

@@ -1,5 +1,5 @@
 /**
- * T20(결정 D22): 운영 화면 숫자(opsSnapshot)·/api/health ops·복원 훈련(pass / 변조 → fail)·보존 정리(미리보기 무변경, 내보낸 뒤 삭제,
+ * T20(결정 D22): 운영 화면 숫자(opsSnapshot)·/api/ops/summary(D23: health 에서 옮김)·복원 훈련(pass / 변조 → fail)·보존 정리(미리보기 무변경, 내보낸 뒤 삭제,
  * 끝난 작업 이력만, 배포 파일·내보내기 ZIP 정책, 원문 표 불변, owner 격리, confirm 필수). 외부 호출 없음(모의 어댑터).
  */
 import { createHash, randomUUID } from 'node:crypto';
@@ -46,6 +46,7 @@ import { buildAssetKey, loadConfig, type AppConfig, type Channel } from '@cs/dom
 import { createMockAdapterRegistry, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
 import { POST as drillPOST } from '../../apps/web/app/api/ops/restore-drill/route';
+import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { POST as retentionPOST } from '../../apps/web/app/api/ops/retention/route';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
@@ -374,10 +375,42 @@ describe('보존 정리', () => {
   });
 });
 
-describe('/api/health ops', () => {
-  it('숫자만(경로·ID 없음): 백업 나이·확인 필요 계획·반복 실패·삭제 대기·폴더 바이트(메모리 DB 는 null)', async () => {
+const summary = (cookie: Record<string, string> = {}) => summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookie }), undefined);
+const OPS_KEYS = ['attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures'];
+
+describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops 없음, GET /api/ops/summary 는 owner 범위', () => {
+  it('공개 /api/health 는 ops 와 그 숫자 키를 내보내지 않는다', async () => {
     const res = await healthGET();
+    expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body).not.toHaveProperty('ops');
+    const text = JSON.stringify(body);
+    for (const k of ['backup_age_hours', 'repeated_failures', 'pending_deletes', 'disk_partial']) expect(text).not.toContain(k);
+  });
+
+  it('GET /api/ops/summary: 세션 없음·잘못된 세션 → 401, 숫자는 노출하지 않음', async () => {
+    for (const res of [await summary(), await summary(cookieHeader('not-a-real-token'))]) {
+      expect(res.status).toBe(401);
+      const text = await res.text();
+      for (const k of OPS_KEYS) expect(text).not.toContain(k);
+    }
+  });
+
+  it('다른 owner 의 기록은 세지 않는다(새 owner → 0·null)', async () => {
+    const B = await newOwner('ops-summary-b');
+    const body = await (await summary(cookieHeader(B.token))).json();
+    expect(Object.keys(body.ops).sort()).toEqual(OPS_KEYS);
+    expect(body.ops).toMatchObject({ backup_age_hours: null, attention_plans: 0, repeated_failures: 0, pending_deletes: 0 });
+    as(A.identity);
+  });
+
+  it('숫자만(경로·ID 없음): 백업 나이·확인 필요 계획·반복 실패·삭제 대기·폴더 바이트(메모리 DB 는 null)', async () => {
+    const res = await summary(cookieHeader(A.token));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const body = await res.json();
+    const s = await opsSnapshot(db, A.id, cfg());
+    expect(body.ops.attention_plans).toBe(s.jobs.attentionPlans.total);
     expect(Object.keys(body.ops).sort()).toEqual(['attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures']);
     expect(body.ops.disk_partial).toBe(false);
     expect(typeof body.ops.backup_age_hours).toBe('number');
@@ -511,9 +544,10 @@ describe('FIX round 1 (Codex review-T20) P2 — 50개 상한은 전체 개수와
     expect(s.jobs.attentionPlans.truncated).toBe(true);
     expect(s.jobs.attention).toMatchObject({ total: 0, items: [], truncated: false });
     expect(s.jobs.repeatedFailures).toMatchObject({ total: 0, items: [], truncated: false });
-    const body = await (await healthGET()).json();
-    expect(body.ops.attention_plans).toBeGreaterThanOrEqual(51);
+    const body = await (await summary(cookieHeader(o.token))).json();
+    expect(body.ops.attention_plans).toBe(51);
     expect(typeof body.ops.disk_partial).toBe('boolean');
+    as(A.identity);
   });
 });
 

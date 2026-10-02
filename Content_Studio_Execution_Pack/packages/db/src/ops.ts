@@ -138,7 +138,7 @@ const globalForOps = globalThis as typeof globalThis & {
 export const DISK_CACHE_MS = 60_000;
 
 /**
- * /ops·/api/health 공용: 같은 설정이면 60초 동안 측정값을 다시 쓰고, 측정 중이면 그 Promise 를 같이 기다린다(동시 요청이 폴더를 중복으로 걷지 않게).
+ * /ops·/api/ops/summary 공용: 같은 설정이면 60초 동안 측정값을 다시 쓰고, 측정 중이면 그 Promise 를 같이 기다린다(동시 요청이 폴더를 중복으로 걷지 않게).
  * 측정이 실패하면 캐시에 남기지 않는다.
  */
 export function cachedDiskUsage(
@@ -469,9 +469,10 @@ export async function incompleteRetentionSweeps(
   return { total, items: rows.map((r) => ({ sweepId: r.sweep_id, at: new Date(r.at), planned: Number(r.planned) })) };
 }
 
-// ---- /api/health (모든 owner 합계, 숫자만) ----
+// ---- GET /api/ops/summary (로그인한 owner 범위, 숫자만) ----
+// D23(e): 공개 /api/health 에서 옮겼다. 폴더 바이트는 이 PC 의 폴더 전체 측정(owner 구분 없음)이라 owner 범위가 아니다.
 
-export interface HealthOps {
+export interface OpsSummary {
   backup_age_hours: number | null;
   attention_plans: number;
   repeated_failures: number;
@@ -481,16 +482,16 @@ export interface HealthOps {
   disk_partial: boolean;
 }
 
-export async function healthOps(db: Db, config: AppConfig, now: Date = new Date()): Promise<HealthOps> {
-  const last = await lastExportAt(db, null);
+export async function opsSummary(db: Db, ownerId: string, config: AppConfig, now: Date = new Date()): Promise<OpsSummary> {
+  const last = await lastExportAt(db, ownerId);
   const disk = await cachedDiskUsage(config, now.getTime());
   const bytes = (u: DirUsage | null) => (u && u.present && u.status !== 'unavailable' ? u.bytes : null);
   const partial = [disk.db, disk.assets, disk.uploads, disk.exports].some((u) => u?.status === 'partial');
   return {
     backup_age_hours: last ? ageHours(last.createdAt, now) : null,
-    attention_plans: await countAttentionPlans(db, null),
-    repeated_failures: (await repeatedFailures(db, null, now)).length,
-    pending_deletes: (await pendingDeleteStats(db, null)).count,
+    attention_plans: await countAttentionPlans(db, ownerId),
+    repeated_failures: (await repeatedFailures(db, ownerId, now)).length,
+    pending_deletes: (await pendingDeleteStats(db, ownerId)).count,
     disk: { db: bytes(disk.db), assets: bytes(disk.assets), uploads: bytes(disk.uploads), exports: bytes(disk.exports) },
     disk_partial: partial,
   };

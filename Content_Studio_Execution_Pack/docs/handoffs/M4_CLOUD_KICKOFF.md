@@ -29,10 +29,23 @@ T13_CODEX_REVIEW_FIX2.md, T13_IMPLEMENTATION_HANDOFF.md, M4_CODEX_VERDICTS.md, d
 ```bash
 cd Content_Studio_Execution_Pack && git fetch origin && git checkout content-studio/m4 && git pull
 source tools/env.sh && corepack pnpm install --frozen-lockfile
-corepack pnpm db:migrate        # 0030 이후(dev 서버 끈 상태)
+corepack pnpm db:migrate        # 0030~0032 (dev 서버 끈 상태)
 corepack pnpm lint && corepack pnpm typecheck && corepack pnpm build && corepack pnpm test && corepack pnpm test:integration && corepack pnpm drill:mock
 corepack pnpm drill:restore     # 실제 로컬 DB 복원 훈련
-./scripts/codex-review-commit.sh <FIX3 커밋 SHA> FIX3-T13 docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md
-./scripts/codex-review-commit.sh <T14 커밋 SHA> T14 docs/handoffs/T14_IMPLEMENTATION_HANDOFF.md
+./scripts/codex-review-commit.sh 79201d6 FIX3-T13 docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md
+./scripts/codex-review-commit.sh 67ade9e T14 docs/handoffs/T14_IMPLEMENTATION_HANDOFF.md
+./scripts/codex-review-commit.sh 427dc71 T15 docs/handoffs/T15_IMPLEMENTATION_HANDOFF.md
 ```
 Codex 판정은 `.handoffs/review-<label>.md` 에 생기고, 요약은 `docs/handoffs/M4_CODEX_VERDICTS.md` 에 옮긴다.
+
+## 클라우드 세션 결과 (2026-10-02 갱신)
+FIX3-T13 `79201d6`, T14 `67ade9e`, T15 `427dc71` 커밋·푸시 완료(모두 Codex 미검증). 상세·결정 확인 항목(D26·D27)은 `M4_STATUS.md`.
+
+## 로컬 Claude Code 착수 프롬프트 (붙여넣기)
+```
+Content Studio M4 로컬 복귀. content-studio/m4 를 pull 하고 docs/handoffs/M4_STATUS.md, M4_CLOUD_KICKOFF.md "로컬 복귀 시"를 따른다.
+1) 설치·db:migrate(0030~0032)·lint/typecheck/build/test/test:integration(단위와 동시 실행 금지)/drill:mock/drill:restore 를 실행하고 결과를 기록한다.
+2) Codex 검증 3건을 순서대로 실행한다: 79201d6 FIX3-T13, 67ade9e T14, 427dc71 T15 (scripts/codex-review-commit.sh, 인계 문서 경로는 docs/handoffs/).
+   판정 요약을 docs/handoffs/M4_CODEX_VERDICTS.md 에 옮기고, P0/P1 은 prompts/CLAUDE_FIX.md 절차로 재현 → 최소 수정 → 재검증한다.
+3) D26·D27 확인 항목은 내가 답할 때까지 잠정값 유지. T16·M5 는 내가 지시할 때 착수한다.
+```

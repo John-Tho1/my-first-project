@@ -64,6 +64,7 @@ import {
   type PublishSnapshot,
   type ReconcileResult,
   type RemoteReference,
+  type RemoteStep,
   type RemoteStepKind,
   type UploadSliceBudget,
 } from '@cs/domain';
@@ -84,7 +85,7 @@ import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
-import { listRemoteSteps, publishedStepCount, recentPublishUsage, remoteStepOf, remoteStepsPort } from './remote-steps';
+import { accountRateSnapshot, listRemoteSteps, publishedStepCount, remoteStepsPort, type RateInflightJob } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
@@ -129,6 +130,11 @@ export interface JobRunOptions {
    * 다음 tick 이 같은 세션으로 이어 올린다. 없으면(별도 worker 프로세스) 제한 없음.
    */
   uploadSlice?: UploadSliceBudget;
+  /**
+   * 시험 전용(FIX-T14 round 2, Codex review-FIX-T14 P1): 로컬 요청 제한 검사 안(계정 advisory 잠금을 잡은 같은 트랜잭션)에서 부른다.
+   * phase = 'before_snapshot'(잠금 직후·읽기 전) | 'after_usage'(창 안 사용량을 읽은 직후). 다른 작업의 커밋이 끼어드는 순서를 강제하는 데만 쓴다.
+   */
+  rateCheckHook?: (tx: DbOrTx, at: { phase: 'before_snapshot' | 'after_usage'; jobId: string; accountId: string }) => Promise<void>;
 }
 
 /**
@@ -608,15 +614,13 @@ interface SendPlan {
 /**
  * FIX-T15(Codex review-T15 P1): 이 작업이 이번 시도에 새로 쓸 요청 제한 단위. 어댑터가 단계 기록으로 정하면(rateUnitsRemaining — YouTube:
  * 유효할 수 있는 세션 재개 = 0, 세션 없음·만료·오류 = 1) 그 값, 아니면 rateUnits − 이미 기록된 단계 수(Threads 게시물). 만료 세션은 창 안 사용량
- * (recentPublishUsage)에는 그대로 남고 새 세션 비용을 상계하지 않는다.
+ * 에는 그대로 남고 새 세션 비용을 상계하지 않는다.
+ * FIX-T14 round 2: 단계는 호출자가 한 스냅샷(accountRateSnapshot)에서 읽어 넘긴다(순수 계산 — 따로 조회하지 않는다).
  */
-async function rateUnitsNeeded(tx: DbOrTx, ownerId: string, jobId: string, adapter: ChannelAdapter, snapshot: PublishSnapshot, kinds: readonly RemoteStepKind[]): Promise<number> {
+function rateUnitsFromSteps(adapter: ChannelAdapter, snapshot: PublishSnapshot, steps: readonly RemoteStep[], kinds: readonly RemoteStepKind[]): number {
   if (!adapter.rateUnits) return 0;
-  if (adapter.rateUnitsRemaining) {
-    const steps = (await listRemoteSteps(tx, ownerId, jobId)).map(remoteStepOf);
-    return Math.max(0, adapter.rateUnitsRemaining(snapshot, steps));
-  }
-  return Math.max(0, adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, jobId, kinds)));
+  if (adapter.rateUnitsRemaining) return Math.max(0, adapter.rateUnitsRemaining(snapshot, steps));
+  return Math.max(0, adapter.rateUnits(snapshot) - steps.filter((st) => kinds.includes(st.kind)).length);
 }
 
 const INFLIGHT_RECHECK_MS = 60_000;
@@ -626,34 +630,25 @@ const INFLIGHT_RATE_STATES = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'CA
 /**
  * FIX-T14(Codex review-T14 Q6): 같은 계정에서 진행 중인 다른 작업이 아직 쓰지 않은 요청 제한 단위(= 그 스냅샷의 단위 − 이미 기록된 단계).
  * 같은 어댑터가 보낸 작업만(다른 어댑터는 다른 원격 한도) 센다. 본문·토큰은 읽지 않는다(스냅샷 payload 의 게시물 수만).
+ * FIX-T14 round 2: 사용량과 같은 스냅샷(accountRateSnapshot)의 행으로만 계산한다.
  */
-async function inflightRateUnits(
-  tx: DbOrTx,
-  ownerId: string,
-  acc: typeof channelAccounts.$inferSelect,
-  excludeJobId: string,
-  adapter: ChannelAdapter,
-  kinds: readonly RemoteStepKind[],
-): Promise<number> {
+function inflightRateUnitsOf(rows: readonly RateInflightJob[], acc: typeof channelAccounts.$inferSelect, adapter: ChannelAdapter, kinds: readonly RemoteStepKind[]): number {
   if (!adapter.rateUnits) return 0;
-  const rows = await tx
-    .select({ job: jobs, item: distributionItems })
-    .from(jobs)
-    .innerJoin(distributionItems, and(eq(distributionItems.id, jobs.itemId), eq(distributionItems.ownerId, jobs.ownerId)))
-    .where(
-      and(
-        eq(jobs.ownerId, ownerId),
-        eq(distributionItems.channelAccountId, acc.id),
-        inArray(jobs.state, [...INFLIGHT_RATE_STATES]),
-        sql`${jobs.id} <> ${excludeJobId}::uuid`,
-      ),
-    );
   let total = 0;
-  for (const { job, item } of rows) {
-    const intent = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt) : null;
-    if (!intent || recordedAdapterIdOf(intent.sanitizedDetails).id !== adapter.id) continue;
-    const channel = typeof item.payloadJson.channel === 'string' ? item.payloadJson.channel : acc.platform;
-    total += await rateUnitsNeeded(tx, ownerId, job.id, adapter, snapshotOf(item, acc, channel), kinds);
+  for (const j of rows) {
+    if (!j.intentDetails || recordedAdapterIdOf(j.intentDetails).id !== adapter.id) continue;
+    const channel = typeof j.item.payloadJson.channel === 'string' ? j.item.payloadJson.channel : acc.platform;
+    const snap: PublishSnapshot = {
+      item_id: j.item.id,
+      channel,
+      account: adapterAccount(acc),
+      payload: j.item.payloadJson,
+      payload_hash: j.item.payloadHash,
+      visibility: j.item.visibility,
+      requested_result: j.item.requestedResult,
+      scheduled_at_utc: j.item.scheduledAtUtc ? j.item.scheduledAtUtc.toISOString() : null,
+    };
+    total += rateUnitsFromSteps(adapter, snap, j.steps, kinds);
   }
   return total;
 }
@@ -765,16 +760,29 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     let rateUnitsReserved: number | undefined;
     if (caps.rate_limit && adapter.rateUnits) {
       // T15(D27): 셀 단계 종류는 어댑터가 정한다(Threads = 게시, YouTube = 업로드 세션 시작). 세션 재개는 새 단위가 아니다.
-      // FIX-T15(Codex review-T15 P1): 만료 세션 행 수를 "이미 쓴 단위"로 빼지 않는다 — 어댑터가 단계로 이번 시도의 새 단위를 정한다(rateUnitsNeeded).
+      // FIX-T15(Codex review-T15 P1): 만료 세션 행 수를 "이미 쓴 단위"로 빼지 않는다 — 어댑터가 단계로 이번 시도의 새 단위를 정한다(rateUnitsFromSteps).
       const kinds = adapter.rateStepKinds ?? ['publish'];
-      const needed = await rateUnitsNeeded(tx, ownerId, job.id, adapter, snapshot, kinds);
+      // FIX-T14(Codex review-T14 Q6): 같은 계정의 검사·의도 기록을 계정별 advisory 잠금(배타, 트랜잭션 끝까지)으로 줄 세운다 — 앞선 검사의 전송 의도는
+      // 커밋된 뒤에야 이 잠금이 풀리므로 아래 스냅샷에 보인다.
+      // FIX-T14 round 2(Codex review-FIX-T14 P1): 사용량·자기 단계·진행 중 작업의 남은 단위를 잠금 **뒤** 한 SQL 문장(한 스냅샷)으로 읽는다 — 다른 작업이
+      // 그 사이에 게시 단계를 기록하고 끝나도 "예약 → 사용"으로 옮겨 갈 뿐 합계에서 빠지지 않는다. 단계 기록(recordRemoteStep)은 같은 잠금을 공유로
+      // 잡으므로 이 검사 도중에는 커밋되지 않는다(두 번째 방어선).
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs_rate:${acc.id}`}))`);
+      await opts.rateCheckHook?.(tx, { phase: 'before_snapshot', jobId: job.id, accountId: acc.id });
+      const rs = await accountRateSnapshot(tx, {
+        ownerId,
+        accountId: acc.id,
+        jobId: job.id,
+        since: new Date(now.getTime() - caps.rate_limit.window_sec * 1000),
+        kinds,
+        inflightStates: INFLIGHT_RATE_STATES,
+      });
+      await opts.rateCheckHook?.(tx, { phase: 'after_usage', jobId: job.id, accountId: acc.id });
+      const needed = rateUnitsFromSteps(adapter, snapshot, rs.ownSteps, kinds);
       rateUnitsReserved = needed;
       if (needed > 0) {
-        // FIX-T14(Codex review-T14 Q6·missed case): 같은 계정의 검사·의도 기록을 계정별 advisory 잠금으로 줄 세우고(트랜잭션 끝까지), 이미 의도를
-        // 만들어 진행 중인 다른 작업의 남은 단위(예약)를 함께 센다 — 두 worker 가 같은 잔여량을 동시에 쓰지 않게.
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs_rate:${acc.id}`}))`);
-        const usage = await recentPublishUsage(tx, ownerId, acc.id, new Date(now.getTime() - caps.rate_limit.window_sec * 1000), kinds);
-        const inflight = await inflightRateUnits(tx, ownerId, acc, job.id, adapter, kinds);
+        const usage = { used: rs.used, oldestAt: rs.oldestAt };
+        const inflight = inflightRateUnitsOf(rs.inflight, acc, adapter, kinds);
         let d = localRateLimitDecision({ used: usage.used + inflight, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now });
         if (!d.allowed && inflight > 0 && localRateLimitDecision({ used: usage.used, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now }).allowed) {
           // 진행 중 예약 때문에만 막힘 — 창이 풀릴 때까지가 아니라 짧게 다시 본다(그 작업이 끝나면 실제 사용량으로 다시 계산).

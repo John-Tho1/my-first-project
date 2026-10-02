@@ -267,6 +267,27 @@ describe('T14(D26) resume·local_rate_limited 전이, 로컬 요청 제한, 시�
     expect(stale.allowed).toBe(false);
     if (!stale.allowed) expect(stale.resetAt.getTime()).toBeGreaterThan(NOW.getTime());
   });
+  it('FIX-T14 round 2 missed: 정확히 한도는 허용·한 단위 넘으면 대기, 빈 창의 needed > max 는 (D26 예외로) 허용, 서로 다른 시각에 만료되는 기록은 재검사 때 다음 기록 기준', () => {
+    const limit = { max_units: 3, window_sec: 3600 };
+    const oldest = new Date(NOW.getTime() - 600_000);
+    expect(localRateLimitDecision({ used: 1, needed: 2, limit, oldestAt: oldest, now: NOW })).toEqual({ allowed: true }); // 1 + 2 = 3 = 한도
+    expect(localRateLimitDecision({ used: 3, needed: 1, limit, oldestAt: oldest, now: NOW }).allowed).toBe(false); // 3 + 1 > 3
+    expect(localRateLimitDecision({ used: 0, needed: 3, limit, oldestAt: null, now: NOW })).toEqual({ allowed: true });
+    // 현재 D26 예외: 창이 비면 한도보다 큰 작업도 허용(영원히 막히지 않게) — 엄격한 상한과 양립하지 않음(인계 질문으로 남김)
+    expect(localRateLimitDecision({ used: 0, needed: 4, limit, oldestAt: null, now: NOW })).toEqual({ allowed: true });
+    // 미끄러지는 창: 기록 3개(−50분·−30분·−10분), 이번 2개. 첫 대기는 가장 오래된 기록 만료(+10분)까지, 그때 다시 보면 남은 2개 + 2 > 3 → 다음 기록(+30분)까지.
+    const at = [-50, -30, -10].map((m) => new Date(NOW.getTime() + m * 60_000));
+    const decideAt = (now: Date) => {
+      const inWindow = at.filter((t) => t.getTime() > now.getTime() - 3600_000);
+      return localRateLimitDecision({ used: inWindow.length, needed: 2, limit, oldestAt: inWindow[0] ?? null, now });
+    };
+    // 창 경계: 정확히 창 길이만큼 지난 기록은 빠진다(DB 도 created_at > since) — resetAt 에 다시 보면 그 기록은 실제로 풀려 있다.
+    const d1 = decideAt(NOW);
+    expect(d1).toEqual({ allowed: false, resetAt: new Date(NOW.getTime() + 10 * 60_000) });
+    const d2 = decideAt((d1 as { resetAt: Date }).resetAt);
+    expect(d2).toEqual({ allowed: false, resetAt: new Date(NOW.getTime() + 30 * 60_000) });
+    expect(decideAt((d2 as { resetAt: Date }).resetAt)).toEqual({ allowed: true }); // 남은 1 + 2 = 3
+  });
   it('scenarioApplies: threads_* 는 mock_threads 에만, 일반 시나리오는 mock_generic 에만, success 는 둘 다', () => {
     expect(scenarioApplies('mock_threads', 'threads_thread_partial')).toBe(true);
     expect(scenarioApplies('mock_threads', 'ambiguous_sent')).toBe(false);

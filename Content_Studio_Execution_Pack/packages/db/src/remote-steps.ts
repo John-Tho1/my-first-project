@@ -7,7 +7,7 @@
  * - 로컬 요청 제한(D26)은 이 표에서 센다(새 표 없음): 창 안에서 그 계정으로 게시된(publish·published) 단계 수.
  * - ID 는 모의 ID 만(CHECK remote_id LIKE 'mock%'). 토큰·본문은 넣지 않는다.
  */
-import { and, asc, eq, gte, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { AppError, type RemoteStep, type RemoteStepKind, type RemoteStepStatus, type RemoteStepsPort } from '@cs/domain';
 import type { Db } from './client';
 import type { DbOrTx } from './queries';
@@ -90,6 +90,15 @@ export async function recordRemoteStep(
   },
 ): Promise<RemoteStepRow> {
   return db.transaction(async (tx) => {
+    // FIX-T14 round 2(Codex review-FIX-T14 P1): 단계 기록(사용량·남은 단위를 바꾸는 쓰기)은 그 계정의 요청 제한 잠금(cs_rate:<계정>)을 **공유**로 잡는다.
+    // 검사(beginSend)는 같은 잠금을 배타로 잡으므로, 검사 도중에는 어떤 단계 기록도 커밋되지 않는다(기록끼리는 서로 막지 않음).
+    // 검사가 이미 한 스냅샷으로 읽으므로 이것은 두 번째 방어선이다. 잠금 순서: 이 잠금 → 단계 행(FOR UPDATE) — 검사 쪽은 단계 행을 잠그지 않는다.
+    const accRow = await tx
+      .select({ accountId: distributionItems.channelAccountId })
+      .from(distributionItems)
+      .where(and(eq(distributionItems.id, input.itemId), eq(distributionItems.ownerId, input.ownerId)))
+      .limit(1);
+    if (accRow[0]) await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`cs_rate:${accRow[0].accountId}`}))`);
     const existing = await tx
       .select()
       .from(remoteSteps)
@@ -208,9 +217,116 @@ export async function recentPublishUsage(
         eq(remoteSteps.ownerId, ownerId),
         eq(distributionItems.channelAccountId, accountId),
         inArray(remoteSteps.kind, [...kinds]),
-        gte(remoteSteps.createdAt, since),
+        gt(remoteSteps.createdAt, since),
       ),
     );
   const r = rows[0];
   return { used: Number(r?.n ?? 0), oldestAt: r?.oldest ? new Date(r.oldest) : null };
+}
+
+/** FIX-T14 round 2: 요청 제한 스냅샷 안의 진행 중 작업 하나(그 작업의 지금 시도 의도·항목 스냅샷 열·단계). */
+export interface RateInflightJob {
+  jobId: string;
+  intentDetails: Record<string, unknown> | null;
+  item: { id: string; payloadJson: Record<string, unknown>; payloadHash: string; visibility: string; requestedResult: string; scheduledAtUtc: Date | null };
+  steps: RemoteStep[];
+}
+export interface AccountRateSnapshot {
+  used: number;
+  oldestAt: Date | null;
+  /** 검사하는 작업 자신의 단계(이번 시도의 새 단위 계산) */
+  ownSteps: RemoteStep[];
+  inflight: RateInflightJob[];
+}
+
+const parseJson = <T>(v: unknown): T => (typeof v === 'string' ? (JSON.parse(v) as T) : (v as T));
+const stepJson = (alias: string) =>
+  sql.raw(
+    `json_build_object('kind', ${alias}.kind, 'post_index', ${alias}.post_index, 'step_index', ${alias}.step_index, 'remote_id', ${alias}.remote_id, ` +
+      `'status', ${alias}.status, 'received_bytes', ${alias}.received_bytes, 'total_bytes', ${alias}.total_bytes, 'resume_count', ${alias}.resume_count, ` +
+      `'created_at', ${alias}.created_at, 'updated_at', ${alias}.updated_at)`,
+  );
+function stepFromJson(r: Record<string, unknown>): RemoteStep {
+  const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+  return {
+    kind: r.kind as RemoteStepKind,
+    post_index: Number(r.post_index),
+    step_index: Number(r.step_index),
+    remote_id: String(r.remote_id),
+    status: r.status as RemoteStepStatus,
+    received_bytes: num(r.received_bytes),
+    total_bytes: num(r.total_bytes),
+    resume_count: Number(r.resume_count ?? 0),
+    created_at: new Date(String(r.created_at)).toISOString(),
+    updated_at: new Date(String(r.updated_at)).toISOString(),
+  };
+}
+
+/**
+ * FIX-T14 round 2(Codex review-FIX-T14 P1): 계정의 로컬 요청 제한 판단에 필요한 상태를 **한 SQL 문장**(= READ COMMITTED 에서도 한 스냅샷)으로 읽는다 —
+ * 창 안 사용 단위 수·가장 오래된 사용 시각, 검사하는 작업의 단계, 같은 계정에서 진행 중(states)인 다른 작업의 지금 시도 의도·항목·단계.
+ * 이전에는 사용량과 진행 중 예약을 서로 다른 문장으로 읽어, 그 사이에 다른 작업이 게시 단계를 기록하고 끝나면(사용량에도 예약에도 안 잡힘)
+ * 한도를 넘을 수 있었다. 한 스냅샷에서는 진행 중 작업의 단계 기록이 "예약 → 사용"으로 옮겨 갈 뿐 합계가 줄지 않는다.
+ * 호출자는 계정 advisory 잠금(cs_rate:<계정>)을 잡은 **뒤** 부른다(그래야 앞선 검사의 전송 의도가 이 스냅샷에 보인다).
+ */
+export async function accountRateSnapshot(
+  tx: DbOrTx,
+  input: { ownerId: string; accountId: string; jobId: string; since: Date; kinds: readonly RemoteStepKind[]; inflightStates: readonly string[] },
+): Promise<AccountRateSnapshot> {
+  const kinds = sql.join(
+    input.kinds.map((k) => sql`${k}`),
+    sql`, `,
+  );
+  const states = sql.join(
+    input.inflightStates.map((s) => sql`${s}`),
+    sql`, `,
+  );
+  const res = await tx.execute(sql`
+    select
+      u.used, u.oldest,
+      (select coalesce(json_agg(${stepJson('s')} order by s.step_index), '[]'::json)
+         from remote_steps s where s.owner_id = ${input.ownerId}::uuid and s.job_id = ${input.jobId}::uuid) as own_steps,
+      (select coalesce(json_agg(json_build_object(
+                'job_id', j.id,
+                'intent_details', si.sanitized_details,
+                'item', json_build_object('id', di.id, 'payload_json', di.payload_json, 'payload_hash', di.payload_hash, 'visibility', di.visibility,
+                                          'requested_result', di.requested_result, 'scheduled_at_utc', di.scheduled_at_utc),
+                'steps', (select coalesce(json_agg(${stepJson('s2')} order by s2.step_index), '[]'::json)
+                            from remote_steps s2 where s2.owner_id = j.owner_id and s2.job_id = j.id)
+              ) order by j.id), '[]'::json)
+         from jobs j
+         join distribution_items di on di.id = j.item_id and di.owner_id = j.owner_id
+         left join send_intents si on si.owner_id = j.owner_id and si.job_id = j.id and si.attempt = j.attempt
+        where j.owner_id = ${input.ownerId}::uuid and di.channel_account_id = ${input.accountId}::uuid
+          and j.state in (${states}) and j.id <> ${input.jobId}::uuid and j.attempt > 0) as inflight
+    from (
+      select count(*)::int as used, min(rs.created_at) as oldest
+        from remote_steps rs
+        join distribution_items di on di.id = rs.item_id and di.owner_id = rs.owner_id
+       where rs.owner_id = ${input.ownerId}::uuid and di.channel_account_id = ${input.accountId}::uuid
+         and rs.kind in (${kinds}) and rs.created_at > ${input.since.toISOString()}::timestamptz
+    ) u`);
+  const row = (res as unknown as { rows: Array<{ used: number; oldest: string | Date | null; own_steps: unknown; inflight: unknown }> }).rows[0];
+  const inflight = parseJson<Array<Record<string, unknown>>>(row?.inflight ?? '[]').map((j): RateInflightJob => {
+    const item = j.item as Record<string, unknown>;
+    return {
+      jobId: String(j.job_id),
+      intentDetails: (j.intent_details as Record<string, unknown> | null) ?? null,
+      item: {
+        id: String(item.id),
+        payloadJson: (item.payload_json as Record<string, unknown>) ?? {},
+        payloadHash: String(item.payload_hash),
+        visibility: String(item.visibility),
+        requestedResult: String(item.requested_result),
+        scheduledAtUtc: item.scheduled_at_utc ? new Date(String(item.scheduled_at_utc)) : null,
+      },
+      steps: ((j.steps as Array<Record<string, unknown>>) ?? []).map(stepFromJson),
+    };
+  });
+  return {
+    used: Number(row?.used ?? 0),
+    oldestAt: row?.oldest ? new Date(row.oldest) : null,
+    ownSteps: parseJson<Array<Record<string, unknown>>>(row?.own_steps ?? '[]').map(stepFromJson),
+    inflight,
+  };
 }

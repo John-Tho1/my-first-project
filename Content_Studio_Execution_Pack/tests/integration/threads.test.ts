@@ -1073,6 +1073,77 @@ describe('FIX round 1(Codex review-T14)', () => {
     expect(jb.nextRunAt.getTime() - t0).toBeLessThanOrEqual(61_000);
   });
 
+  /**
+   * FIX-T14 round 2(Codex review-FIX-T14 P1): 다른 작업(A)이 게시 단계를 기록하고 CONFIRMED 로 끝나는 커밋이 B 의 요청 제한 검사 **안**에
+   * 끼어드는 순서를 강제한다. PGlite 는 연결이 하나라 A 의 커밋을 B 의 트랜잭션(tx)에서 직접 써서 흉내 낸다 — READ COMMITTED 에서 B 의 다음
+   * 문장이 보게 되는 상태와 같다. 'after_usage' 는 이전 코드(사용량 조회 → 진행 중 조회가 서로 다른 문장)에서 B 가 한도를 넘던 순서다.
+   */
+  async function finishElsewhere(tx: Parameters<NonNullable<Parameters<typeof runJobsTick>[2]['rateCheckHook']>>[0], jobId: string, itemId: string, posts: number, at: Date) {
+    const intent = (await tx.select().from(schema.sendIntents).where(eq(schema.sendIntents.jobId, jobId)).orderBy(asc(schema.sendIntents.attempt))).at(-1)!;
+    const before = await tx.select().from(schema.remoteSteps).where(eq(schema.remoteSteps.jobId, jobId));
+    for (let k = 0; k < posts; k++) {
+      await tx.insert(schema.remoteSteps).values({
+        ownerId: owner,
+        jobId,
+        intentId: intent.id,
+        itemId,
+        stepIndex: before.length + k,
+        kind: 'publish',
+        postIndex: k,
+        remoteId: `mockthr_post_race${k}_${randomUUID().replace(/-/g, '')}`,
+        status: 'published',
+        resumeCount: 0,
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    await tx.update(schema.jobs).set({ state: 'CONFIRMED', doneAt: at, leaseOwner: null, leaseUntil: null }).where(eq(schema.jobs.id, jobId));
+  }
+
+  it.each(['after_usage', 'before_snapshot'] as const)(
+    'P1 round 2: 한도 3, A·B 각 2개 — A 의 게시 기록·CONFIRMED 가 B 의 검사 중(%s)에 커밋돼도 B 는 제한(전송 의도 0, 합계 ≤ 3)',
+    async (phase) => {
+      registry.threads.rateLimit = { ...THREADS_PROVISIONAL_RATE_LIMIT, max_units: 3, window_sec: 3600 };
+      const acc = await linkedThreadsAccount();
+      const a = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.slice(0, 2).join('\n\n'), scenario: 'threads_container_slow' }]);
+      await execute(a.planId);
+      await tick(1000);
+      const ja = await jobOf(a.items[0]!.id);
+      expect(ja.state).toBe('REMOTE_PROCESSING'); // 진행 중, 게시 단계 0(남은 2)
+      expect((await stepsOf(a.items[0]!.id)).filter((s) => s.kind === 'publish')).toHaveLength(0);
+      const b = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.slice(0, 2).join('\n\n') }]);
+      await execute(b.planId);
+      const jb0 = await jobOf(b.items[0]!.id);
+      let fired = 0;
+      vt += 1000;
+      await runJobsTick(db, registry, {
+        workerId: 't14-race-w',
+        config,
+        ownerId: owner,
+        clock: () => new Date(Date.now() + vt),
+        random: () => 0.5,
+        submitTimeoutMs: 5000,
+        maxJobs: 20,
+        credentials: jobCredentials(config, db),
+        rateCheckHook: async (tx, at) => {
+          if (at.jobId !== jb0.id || at.phase !== phase || fired++) return;
+          await finishElsewhere(tx, ja.id, a.items[0]!.id, 2, new Date(Date.now() + vt));
+        },
+      });
+      expect(fired).toBe(1);
+      expect((await jobOf(a.items[0]!.id)).state).toBe('CONFIRMED');
+      const jb = await jobOf(b.items[0]!.id);
+      expect(jb.state).toBe('RETRY_WAIT');
+      expect(jb.lastErrorCode).toBe('local_rate_limited');
+      expect(await intentsOf(jb.id)).toHaveLength(0);
+      expect((await stepsOf(b.items[0]!.id)).filter((s) => s.kind === 'publish')).toHaveLength(0);
+      const d = (await eventDetails(jb.id)).find((x) => x.transition === 'local_rate_limited')!;
+      // 한 스냅샷: 끼어든 커밋 앞이면 사용 0 + 예약 2, 뒤면 사용 2 + 예약 0 — 어느 쪽이든 합계 2 + 이번 2 > 3
+      expect(phase === 'after_usage' ? { used: 0, inflight: 2 } : { used: 2, inflight: 0 }).toEqual({ used: d.used, inflight: d.inflight });
+      expect(d.needed).toBe(2);
+    },
+  );
+
   it('missed: publish 성공 직후 단계 기록 실패 → 결과 불명 → 조회가 컨테이너로 게시물을 찾아 기록·CONFIRMED(재게시 0)', async () => {
     class FlakyStepThreads extends ThreadsMockChannelAdapter {
       failPublishRecord = true;

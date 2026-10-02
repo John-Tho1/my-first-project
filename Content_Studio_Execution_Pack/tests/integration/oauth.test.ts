@@ -1911,3 +1911,203 @@ describe('FIX4 P2 :1293 — worker 정리는 다음 시도 시각 순(열 수 �
     expect((await getAccountHealth(db, ownerB, bad)).usable_for_execution).toBe(false);
   });
 });
+
+// ---------------- FIX round 5 (Codex review-FIX4-T13) ----------------
+
+/** 정리 대기 봉인을 연다(시험만) */
+const openPending = (ownerId: string, accountId: string, sealed: string, keyVersion: number) =>
+  JSON.parse(openSecret(requireSecretKeyring(process.env), sealed, keyVersion, { ownerId, channelAccountId: accountId, purpose: 'oauth_pending_token' })).access_token as string;
+
+describe('FIX5 P1 :1524 — 연결 해제가 현재 토큰 철회를 확인하지 못하면 그 토큰을 cleanup_revoke 로 봉인해 남긴다', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** refresh_unknown(C == P) → C 확인 일시 오류 → 봉인 없는 verify_current */
+  async function verifyCurrentAccount() {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    await refreshUnknownStored(accountId);
+    mockOAuthStore().failNext = { op: 'account', code: 'provider_error' };
+    await check(accountId);
+    expect(await pendingRows(accountId)).toMatchObject([{ kind: 'verify_current', sealedToken: null }]);
+    const current = await decryptToken(ownerA, accountId);
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    return { accountId, current };
+  }
+
+  it.each([
+    { mode: 'failed', code: 'invalid_grant', audit: 'oauth.cleanup_revoke_failed' },
+    { mode: 'unknown', code: 'provider_error', audit: 'oauth.cleanup_revoke_unknown' },
+  ] as const)('verify_current + 해제의 C 철회 $mode → 암호문은 지우되 C 를 봉인한 cleanup_revoke 행이 남아 차단, worker 가 철회해 지움', async (c) => {
+    const { accountId, current } = await verifyCurrentAccount();
+    mockOAuthStore().failNext = { op: 'revoke', code: c.code }; // 정리 대기에 봉인 행이 없으므로 첫 철회 = C
+    const rv = await revoke(accountId);
+    expect(rv.status).toBe(200);
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked', remote_revoke: c.mode, account: { usable_for_execution: false, pending_reconcile: 'cleanup_revoke', pending_count: 1 } });
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null, keyVersion: null });
+    // verify_current 는 없어졌지만 철회 의무는 C 를 봉인한 cleanup_revoke 행으로 남는다
+    const rows = await pendingRows(accountId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'cleanup_revoke', source: 'revoke_current', keyVersion: 1, lastResult: c.code });
+    expect(rows[0]!.sealedToken!.startsWith('csk1:')).toBe(true);
+    expect(openPending(ownerA, accountId, rows[0]!.sealedToken!, rows[0]!.keyVersion!)).toBe(current);
+    expect(await liveProviderTokens(accountId)).toBe(1); // 공급자에서는 아직 살아 있다 — 기록과 함께
+    expect((await getAccountHealth(db, ownerA, accountId)).usable_for_execution).toBe(false);
+    expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ outcome: 'revoked', remote_revoke: c.mode, current_token_record: 'recorded' });
+    expect((await auditDetails(accountId, c.audit)).at(-1)).toMatchObject({ context: 'revoke_current', pending_record: 'recorded' });
+    // 감사에 C 가 없다
+    expect(JSON.stringify(await auditDetails(accountId, 'oauth.revoked'))).not.toContain(current);
+    expect(JSON.stringify(await auditDetails(accountId, c.audit))).not.toContain(current);
+    // worker(기한이 지난 행) → C 철회·행 삭제, 해제 상태 그대로
+    const w = await refreshExpiringCredentials(db, { providerFor: oauthDeps(config).providerFor, keyring: oauthDeps(config).keyring, ownerId: ownerA, now: new Date(Date.now() + 1000) });
+    expect(w.pendingResolved).toBeGreaterThanOrEqual(1);
+    expect(await pendingRows(accountId)).toHaveLength(0);
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect(await getAccountHealth(db, ownerA, accountId)).toMatchObject({ status: 'revoked', pending_count: 0 });
+    expect((await auditDetails(accountId, 'oauth.pending_reconciled')).at(-1)).toMatchObject({ kind: 'cleanup_revoke', result: 'resolved', issued_token_revoke: 'ok' });
+  });
+
+  it('C 봉인이 실패하면 암호문을 지우지 않고 revoking(차단) + verify_current 유지(incomplete) → 다시 해제가 합류해 철회·마무리', async () => {
+    const { accountId } = await verifyCurrentAccount();
+    const before = (await credRow(accountId))!;
+    oauthTestHooks.beforeRevokeCurrentSeal = async () => {
+      throw new Error('seal failure');
+    };
+    mockOAuthStore().failNext = { op: 'revoke', code: 'invalid_grant' };
+    const rv = await revoke(accountId);
+    delete oauthTestHooks.beforeRevokeCurrentSeal;
+    expect(rv.status).toBe(200);
+    expect(await rv.json()).toMatchObject({ outcome: 'incomplete', remote_revoke: 'failed', account: { usable_for_execution: false } });
+    const row = (await credRow(accountId))!;
+    expect(row).toMatchObject({ status: 'revoking', encryptedToken: before.encryptedToken, keyVersion: before.keyVersion, revokedAt: null });
+    expect((await pendingRows(accountId)).map((r) => r.kind)).toEqual(['verify_current']);
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ outcome: 'incomplete', current_token_record: 'seal_failed' });
+    expect((await auditDetails(accountId, 'oauth.cleanup_revoke_failed')).at(-1)).toMatchObject({ context: 'revoke_current', pending_record: 'seal_failed' });
+    // 다시 해제: 같은 작업에 합류(해제 세대 그대로), C 철회 성공 → 마무리
+    const again = await revoke(accountId);
+    expect(await again.json()).toMatchObject({ outcome: 'revoked', remote_revoke: 'ok', account: { status: 'revoked', pending_count: 0 } });
+    expect((await credRow(accountId))!).toMatchObject({ encryptedToken: null, revocationEpoch: row.revocationEpoch });
+    expect(await pendingRows(accountId)).toHaveLength(0);
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('C == P 인 refresh_unknown 행이 있고 두 철회가 모두 실패 → 같은 토큰을 진 행 하나만 cleanup_revoke(중복 없음), check 가 철회', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    await refreshUnknownStored(accountId);
+    const current = await decryptToken(ownerA, accountId);
+    const before = (await pendingRows(accountId))[0]!;
+    vi.spyOn(MockThreadsOAuthProvider.prototype, 'revoke').mockImplementation(async function () {
+      throw new OAuthProviderError('invalid_grant');
+    });
+    const rv = await revoke(accountId);
+    vi.restoreAllMocks();
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked', remote_revoke: 'failed' });
+    const rows = await pendingRows(accountId);
+    expect(rows).toMatchObject([{ id: before.id, kind: 'cleanup_revoke', revision: before.revision + 1 }]);
+    expect(openPending(ownerA, accountId, rows[0]!.sealedToken!, rows[0]!.keyVersion!)).toBe(current);
+    expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ current_token_record: 'covered_by_pending' });
+    expect(await liveProviderTokens(accountId)).toBe(1);
+    const ck = await check(accountId);
+    expect((await ck.json()).account).toMatchObject({ status: 'revoked', pending_count: 0 });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('C 철회 성공이면 행을 만들지 않는다(current_token_record not_needed)', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const rv = await revoke(accountId);
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked', remote_revoke: 'ok' });
+    expect(await pendingRows(accountId)).toHaveLength(0);
+    expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ current_token_record: 'not_needed' });
+  });
+});
+
+describe('FIX5 P2 :1077 — worker 는 기한이 지난 행만 처리(같은 계정의 기한 전 행은 손대지 않음), 수동 확인은 모두', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    as(A);
+  });
+  const sealFor = (accountId: string, accessToken: string) =>
+    sealSecret(requireSecretKeyring(process.env), JSON.stringify({ v: 1, access_token: accessToken, refresh_token: null }), {
+      ownerId: ownerB,
+      channelAccountId: accountId,
+      purpose: 'oauth_pending_token',
+    });
+  const workerDeps = () => ({ providerFor: oauthDeps(config).providerFor, keyring: oauthDeps(config).keyring, ownerId: ownerB });
+
+  it('행 A(다음 시도 +1시간)·행 B(기한 지남) → worker 는 B 만 철회, A 의 attempts·next_attempt_at·revision 그대로, 계정 차단 유지 → 수동 확인은 A 도 처리', async () => {
+    const T = new Date(Date.now() + DAY);
+    const accountId = await newThreadsAccount(ownerB);
+    const tokA = `mockthr_at_rowA_${randomUUID()}`;
+    const tokB = `mockthr_at_rowB_${randomUUID()}`;
+    const sa = sealFor(accountId, tokA);
+    const sb = sealFor(accountId, tokB);
+    const nextA = new Date(T.getTime() + 3600_000);
+    const [rowA] = await db
+      .insert(schema.oauthPendingTokens)
+      .values({ ownerId: ownerB, channelAccountId: accountId, kind: 'cleanup_revoke', sealedToken: sa.ciphertext, keyVersion: sa.keyVersion, source: 'test', attempts: 3, nextAttemptAt: nextA, lastResult: 'invalid_grant' })
+      .returning();
+    await db
+      .insert(schema.oauthPendingTokens)
+      .values({ ownerId: ownerB, channelAccountId: accountId, kind: 'cleanup_revoke', sealedToken: sb.ciphertext, keyVersion: sb.keyVersion, source: 'test', nextAttemptAt: new Date(T.getTime() - 5 * 60_000) });
+    const revoked: string[] = [];
+    vi.spyOn(MockThreadsOAuthProvider.prototype, 'revoke').mockImplementation(async function (this: MockThreadsOAuthProvider, input) {
+      revoked.push(input.tokens.accessToken);
+    });
+    const w = await refreshExpiringCredentials(db, { ...workerDeps(), now: T });
+    expect(w.pendingRemaining).toBeGreaterThanOrEqual(1);
+    expect(revoked).toEqual([tokB]); // A 는 공급자에 묻지 않았다
+    const rows = await pendingRows(accountId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: rowA!.id, attempts: 3, revision: rowA!.revision, lastResult: 'invalid_grant' });
+    expect(rows[0]!.nextAttemptAt.getTime()).toBe(nextA.getTime());
+    expect(await getAccountHealth(db, ownerB, accountId, T)).toMatchObject({ usable_for_execution: false, pending_reconcile: 'cleanup_revoke', pending_count: 1 });
+    // 같은 시각에 다시 돌아도 A 는 기한 전이라 그대로
+    await refreshExpiringCredentials(db, { ...workerDeps(), now: T });
+    expect(revoked).toEqual([tokB]);
+    expect((await pendingRows(accountId))[0]).toMatchObject({ attempts: 3, revision: rowA!.revision });
+    // 수동 확인(사용자)은 백오프를 무시하고 A 도 처리
+    as(B);
+    const ck = await check(accountId, tokenB);
+    expect(ck.status).toBe(200);
+    expect((await ck.json()).account).toMatchObject({ pending_count: 0, usable_for_execution: true });
+    expect(revoked).toEqual([tokB, tokA]);
+    expect(await pendingRows(accountId)).toHaveLength(0);
+  });
+
+  it('놓친 케이스: 세 번 모두 낡은 판정(동시 변경)으로 끝나면 그 행의 다음 시도 시각을 미룬다(종류·봉인은 그대로, revision 은 다른 쓰기만 올림)', async () => {
+    const T = new Date(Date.now() + DAY);
+    const accountId = await newThreadsAccount(ownerB);
+    const s = sealFor(accountId, `mockthr_at_stale_${randomUUID()}`);
+    const [row] = await db
+      .insert(schema.oauthPendingTokens)
+      .values({ ownerId: ownerB, channelAccountId: accountId, kind: 'cleanup_revoke', sealedToken: s.ciphertext, keyVersion: s.keyVersion, source: 'test', nextAttemptAt: new Date(T.getTime() - 60_000) })
+      .returning();
+    let calls = 0;
+    vi.spyOn(MockThreadsOAuthProvider.prototype, 'revoke').mockImplementation(async function () {
+      calls++;
+    });
+    // 공급자 호출 뒤마다 다른 쓰기가 같은 행을 바꾼다(revision +1) → 되쓰기는 매번 낡은 판정
+    oauthTestHooks.afterReconcileProvider = async () => {
+      const cur = (await pendingRows(accountId))[0];
+      if (cur) await db.update(schema.oauthPendingTokens).set({ revision: cur.revision + 1 }).where(eq(schema.oauthPendingTokens.id, cur.id));
+    };
+    const w = await refreshExpiringCredentials(db, { ...workerDeps(), now: T });
+    delete oauthTestHooks.afterReconcileProvider;
+    expect(w.pendingRemaining).toBeGreaterThanOrEqual(1);
+    expect(calls).toBe(3);
+    const after = (await pendingRows(accountId))[0]!;
+    expect(after).toMatchObject({ id: row!.id, kind: 'cleanup_revoke', sealedToken: s.ciphertext, attempts: 1, lastResult: 'reconcile_stale', revision: row!.revision + 3 });
+    expect(after.nextAttemptAt.getTime()).toBe(T.getTime() + 60_000);
+    // 미뤄진 동안 worker 는 이 행을 다시 처리하지 않는다
+    await refreshExpiringCredentials(db, { ...workerDeps(), now: T });
+    expect(calls).toBe(3);
+    // 기한이 지나면 다시 시도해 정리
+    await refreshExpiringCredentials(db, { ...workerDeps(), now: new Date(T.getTime() + 61_000) });
+    expect(calls).toBe(4);
+    expect(await pendingRows(accountId)).toHaveLength(0);
+  });
+});

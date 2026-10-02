@@ -358,6 +358,8 @@ export const oauthTestHooks: {
   insidePendingRecord?: () => Promise<void>;
   /** FIX3-T13: 정리 대기 처리의 공급자 호출 뒤·되쓰기 전 */
   afterReconcileProvider?: () => Promise<void>;
+  /** FIX5-T13: 연결 해제가 철회 확인 안 된 현재 토큰을 정리 대기로 봉인하기 직전 — 던지면 봉인 실패 */
+  beforeRevokeCurrentSeal?: () => Promise<void>;
 } = {};
 
 interface Locked {
@@ -739,7 +741,7 @@ export async function refreshCredential(
   const now = input.now ?? new Date();
   const trigger = input.trigger ?? 'manual';
   // FIX3-T13: 정리 대기가 있으면 먼저 정리한다 — 하나라도 남으면 갱신하지 않는다(발급을 더 늘리지 않음).
-  if ((await reconcilePendingCredential(db, { ...input, now })) === 'still_pending') throw new CredentialRefreshFailedError('pending_reconcile');
+  if ((await reconcilePendingCredential(db, { ...input, now, ignoreBackoff: trigger !== 'auto' })) === 'still_pending') throw new CredentialRefreshFailedError('pending_reconcile');
   const s = await readForUse(db, input.ownerId, input.accountId, input.providerFor, input.keyring, now);
   let tokens: OAuthTokenSet;
   try {
@@ -1043,13 +1045,31 @@ type RowPlan =
  * | verify_current  | 세대 바뀜·해제됨           | 없음                   | 삭제(그 세대는 다시 연결이 새로 확인한 토큰 — 해제면 이미 차단) |
  * 상태(active·error) 기록은 읽었던 세대가 그대로이고 살아 있을 때만. C 확인이 일시 오류(provider_error 등)면 상태를 바꾸지 않고 의무를 남긴다.
  * 행이 하나라도 남으면 still_pending(계정 차단 유지). 연결 정보 행은 지우지 않는다(FIX3 자리 표시 행 없음).
+ * FIX5-T13(P2 :1077): 기본은 next_attempt_at <= now 인 행만 처리(worker). 기한 전 행은 열지도·바꾸지도 않지만 남아 있으므로 차단은 유지된다.
+ * 사용자 확인·수동 갱신은 ignoreBackoff 로 모든 행을 처리한다. 모든 pass 가 낡은 판정으로 끝나면 다룬 행의 다음 시도 시각만 미룬다.
  */
 export async function reconcilePendingCredential(
   db: Db,
-  input: { ownerId: string; accountId: string; providerFor: ProviderFor; keyring: KeyringSource; now?: Date },
+  input: {
+    ownerId: string;
+    accountId: string;
+    providerFor: ProviderFor;
+    keyring: KeyringSource;
+    /** 처리 기준 시각 — 기본은 다음 시도 시각(next_attempt_at)이 이 시각 이하인 행만 처리한다 */
+    now?: Date;
+    /**
+     * FIX5-T13(Codex review-FIX4-T13 P2 :1077): true 면 행별 백오프를 무시하고 모든 행을 처리한다 — 사용자가 직접 누른 확인·갱신만.
+     * worker(refreshExpiringCredentials)는 넘기지 않으므로 기한이 지난 행만 처리하고, 기한 전 행은 손대지 않되 계정 차단은 유지한다.
+     */
+    ignoreBackoff?: boolean;
+  },
 ): Promise<ReconcileResult> {
   const now = input.now ?? new Date();
+  const ignoreBackoff = input.ignoreBackoff === true;
+  const isDue = (row: OAuthPendingRow) => ignoreBackoff || row.nextAttemptAt.getTime() <= now.getTime();
   const account = await ownedAccount(db, input.ownerId, input.accountId);
+  /** 마지막 pass 가 다룬(기한이 지난) 행 — 다시 정리가 모두 낡은 판정으로 끝나면 이 행들의 다음 시도 시각을 미룬다 */
+  let lastPassRowIds: string[] = [];
   const bump = (row: OAuthPendingRow, lastResult: string) => ({
     revision: row.revision + 1,
     attempts: row.attempts + 1,
@@ -1068,15 +1088,18 @@ export async function reconcilePendingCredential(
       globalProblem: string | null;
       rows: Array<{ row: OAuthPendingRow; pending: StoredOAuthTokens | null; problem: string | null }>;
     };
-    const snap = await db.transaction(async (tx): Promise<Snapshot | null> => {
+    const snap = await db.transaction(async (tx): Promise<Snapshot | 'none' | 'not_due'> => {
       const { cred } = await lockAccountCredential(tx, input.ownerId, account.id);
-      const rows = await tx
+      const allRows = await tx
         .select()
         .from(oauthPendingTokens)
         .where(and(eq(oauthPendingTokens.ownerId, input.ownerId), eq(oauthPendingTokens.channelAccountId, account.id)))
         .orderBy(asc(oauthPendingTokens.createdAt), asc(oauthPendingTokens.id))
         .for('update');
-      if (!rows.length) return null;
+      if (!allRows.length) return 'none';
+      // FIX5-T13(P2 :1077): 기한 전 행은 읽지도(열지도) 처리하지도 않는다 — 남아 있으므로 계정은 계속 차단된다
+      const rows = allRows.filter(isDue);
+      if (!rows.length) return 'not_due';
       const live = liveCredential(cred);
       let ring: SecretKeyring | null = null;
       let globalProblem: string | null = cred?.status === 'revoking' ? 'revoking' : null;
@@ -1107,7 +1130,9 @@ export async function reconcilePendingCredential(
       }
       return out;
     });
-    if (!snap) return pass === 0 ? 'none' : 'resolved';
+    if (snap === 'none') return pass === 0 ? 'none' : 'resolved';
+    if (snap === 'not_due') return 'still_pending';
+    lastPassRowIds = snap.rows.map((r) => r.row.id);
 
     // 2) 판정·공급자 호출
     let provider: OAuthProvider | null = null;
@@ -1313,6 +1338,27 @@ export async function reconcilePendingCredential(
     }
     return written.remaining > 0 ? 'still_pending' : 'resolved';
   }
+  // FIX5-T13(Codex review-FIX4-T13 놓친 케이스): 모든 pass 가 낡은 판정으로 끝남 — 아무 판정도 쓰지 않았지만 시도는 했으므로 마지막 pass 가 다룬 행의
+  // 다음 시도 시각을 미룬다(같은 계정이 worker 의 차례를 계속 차지하지 않게). 판정에 쓰는 값(종류·봉인·revision)은 바꾸지 않는다 — 동시에 진행 중인
+  // 해제·정리의 revision 비교를 깨지 않는다. 이 기록이 실패해도 차단은 그대로(행이 남아 있음).
+  if (lastPassRowIds.length) {
+    await db
+      .transaction(async (tx) => {
+        await lockAccountCredential(tx, input.ownerId, account.id);
+        const rows = await tx
+          .select()
+          .from(oauthPendingTokens)
+          .where(and(eq(oauthPendingTokens.ownerId, input.ownerId), eq(oauthPendingTokens.channelAccountId, account.id), inArray(oauthPendingTokens.id, lastPassRowIds)))
+          .for('update');
+        for (const r of rows) {
+          await tx
+            .update(oauthPendingTokens)
+            .set({ attempts: r.attempts + 1, nextAttemptAt: new Date(now.getTime() + pendingBackoffMs(r.attempts + 1)), lastResult: 'reconcile_stale', updatedAt: now })
+            .where(eq(oauthPendingTokens.id, r.id));
+        }
+      })
+      .catch(() => undefined);
+  }
   return 'still_pending';
 }
 
@@ -1327,7 +1373,7 @@ export async function checkCredential(
   const now = input.now ?? new Date();
   // FIX3-T13: 정리 대기 표시가 있으면 먼저 정리하고(판정표는 reconcilePendingCredential) 그 결과를 돌려준다 — 정리되지 않으면(철회 실패·판정 불가)
   // 차단 상태 그대로. 이번 확인은 정리가 한 공급자 확인으로 갈음한다(다시 확인하면 일반 확인).
-  if ((await reconcilePendingCredential(db, { ...input, now })) !== 'none') return getAccountHealth(db, input.ownerId, input.accountId, now);
+  if ((await reconcilePendingCredential(db, { ...input, now, ignoreBackoff: true })) !== 'none') return getAccountHealth(db, input.ownerId, input.accountId, now);
   const s = await readForUse(db, input.ownerId, input.accountId, input.providerFor, input.keyring, now);
   let status: 'active' | 'error' = 'active';
   let errorCode: string | null = null;
@@ -1392,6 +1438,9 @@ export interface RevokeResult {
  * 2) 트랜잭션 밖: 공급자 철회(키가 없거나 읽을 수 없거나 공급자 오류면 그 결과를 그대로 보고).
  * 3) 잠금 아래: 자기 작업이 아직 현재이고 세대가 그대로면 암호문·키 버전 삭제 + revoked_at(작업 ID 는 남김). 그 밖의 판정은 RevokeOutcome.
  * credential_state 는 linked 그대로 — 다시 연결하기 전까지 실행 차단. 다시 연결은 revoke_op_id 를 지우지만 해제 세대는 그대로 둔다.
+ * FIX5-T13(Codex review-FIX4-T13 P1 :1524): 3) 에서 현재 토큰의 철회가 확인되지 않았으면(failed·unknown) 같은 트랜잭션에서 그 토큰을 봉인한
+ * cleanup_revoke 행을 넣은 뒤에만 암호문을 지운다(같은 토큰을 진 정리 대기 행이 cleanup_revoke 로 남으면 그 행이 대신한다). 봉인할 수 없으면 암호문을
+ * 지우지 않고 revoking(차단) 그대로 — outcome incomplete, 다시 해제하면 같은 작업에 합류해 다시 철회한다.
  */
 export async function revokeCredential(
   db: Db,
@@ -1485,14 +1534,76 @@ export async function revokeCredential(
     remote = r.result;
     remoteCode = r.code;
   }
+  // FIX5-T13(Codex review-FIX4-T13 P1 :1524): 현재 토큰(C)의 철회가 확인되지 않았으면(failed·unknown) 암호문을 지우기 전에 C 를 정리 대기(cleanup_revoke)로
+  // 봉인해 남긴다 — verify_current 삭제나 암호문 삭제로 철회 의무가 끝나지 않게. 같은 토큰을 가진 정리 대기 행의 철회가 확인됐으면(C == P) C 도 철회된 것.
+  // 봉인이 실패하면 암호문을 지우지 않고 revoking(차단)으로 남긴다(outcome incomplete — 다시 해제하면 같은 작업에 합류해 다시 철회).
+  // 키가 없거나 열 수 없어 C 를 읽지 못한 경우(skipped_*)는 철회할 수단이 없으므로 기존 규칙 그대로(로컬 삭제).
+  const currentRevokeConfirmed =
+    !marked.tokens ||
+    !cleanupFailed(remote as RemoteRevoke) ||
+    marked.pendings.some((p) => p.tokens?.accessToken === marked.tokens!.accessToken && pendingResults.has(p.id) && !cleanupFailed(pendingResults.get(p.id)!.result));
+  let sealedCurrent: SealedSecret | null = null;
+  if (!currentRevokeConfirmed) {
+    try {
+      await oauthTestHooks.beforeRevokeCurrentSeal?.();
+      sealedCurrent = sealSecret(input.keyring(), encodePending(marked.tokens!), pendingAad(input.ownerId, account.id));
+    } catch {
+      sealedCurrent = null;
+    }
+  }
   return db.transaction(async (tx) => {
     const { account: acc, cred } = await lockAccountCredential(tx, input.ownerId, account.id);
     let row = cred;
     let outcome: RevokeOutcome;
     const ownOpCurrent = !!cred && cred.id === marked.credId && cred.revokeOpId === marked.opId;
+    const canFinish = ownOpCurrent && !cred!.revokedAt && cred!.status === 'revoking' && cred!.tokenGeneration === marked.generation;
+    // FIX4-T13: 1단계에서 본 정리 대기 행만, 같은 revision 일 때만 바꾼다(그 사이 다른 정리가 바꿨으면 손대지 않음).
+    // 철회 확인 → 삭제. 실패·불명 → cleanup_revoke(해제가 시작됐으므로 P 는 더는 현재 토큰으로 남지 않는다 — 다시 철회해야 함).
+    // FIX5-T13: 실패·불명으로 cleanup_revoke 로 남긴 행 중 C 와 같은 토큰이 있으면 C 의 철회 의무는 그 행이 이미 진다(중복 행을 만들지 않음).
+    let currentCoveredByPending = false;
+    for (const p of marked.pendings) {
+      if (p.kind === 'verify_current') continue;
+      const same = and(eq(oauthPendingTokens.id, p.id), eq(oauthPendingTokens.revision, p.revision));
+      const r = pendingResults.get(p.id);
+      if (r && !cleanupFailed(r.result)) {
+        await tx.delete(oauthPendingTokens).where(same);
+      } else if (r) {
+        const kept = await tx
+          .update(oauthPendingTokens)
+          .set({ kind: 'cleanup_revoke', baseGeneration: null, onInvalidCode: null, revision: p.revision + 1, lastResult: r.code ?? r.result, updatedAt: now })
+          .where(same)
+          .returning({ id: oauthPendingTokens.id });
+        if (kept.length && marked.tokens && p.tokens?.accessToken === marked.tokens.accessToken) currentCoveredByPending = true;
+      }
+    }
+    let currentRecord: 'not_needed' | 'covered_by_pending' | 'recorded' | 'seal_failed' = 'not_needed';
     if (ownOpCurrent && cred!.revokedAt) {
       outcome = 'completed_by_other';
-    } else if (ownOpCurrent && cred!.status === 'revoking' && cred!.tokenGeneration === marked.generation) {
+    } else if (canFinish && !currentRevokeConfirmed && !currentCoveredByPending && !sealedCurrent) {
+      // C 를 기록할 수 없음 — 암호문을 남기고 revoking(차단) 그대로
+      currentRecord = 'seal_failed';
+      outcome = 'incomplete';
+    } else if (canFinish) {
+      if (!currentRevokeConfirmed) {
+        if (currentCoveredByPending) {
+          currentRecord = 'covered_by_pending';
+        } else {
+          // 암호문 삭제와 같은 트랜잭션 — 이 INSERT 가 실패하면 삭제도 되돌려진다(암호문·revoking 유지)
+          await tx.insert(oauthPendingTokens).values({
+            ownerId: input.ownerId,
+            channelAccountId: acc.id,
+            kind: 'cleanup_revoke',
+            sealedToken: sealedCurrent!.ciphertext,
+            keyVersion: sealedCurrent!.keyVersion,
+            source: 'revoke_current',
+            lastResult: remoteCode ?? remote,
+            nextAttemptAt: now,
+            createdAt: now,
+            updatedAt: now,
+          });
+          currentRecord = 'recorded';
+        }
+      }
       const updated = await tx
         .update(oauthCredentials)
         .set({
@@ -1514,21 +1625,11 @@ export async function revokeCredential(
       outcome = 'superseded';
       remote = 'superseded';
     }
-    // FIX4-T13: 1단계에서 본 정리 대기 행만, 같은 revision 일 때만 바꾼다(그 사이 다른 정리가 바꿨으면 손대지 않음).
-    // 철회 확인 → 삭제. 실패·불명 → cleanup_revoke(해제가 시작됐으므로 P 는 더는 현재 토큰으로 남지 않는다 — 다시 철회해야 함).
-    // verify_current 는 이 해제가 연결 정보를 해제 상태로 만들었을 때만 삭제(확인할 현재 토큰이 없어짐).
-    for (const p of marked.pendings) {
-      const same = and(eq(oauthPendingTokens.id, p.id), eq(oauthPendingTokens.revision, p.revision));
-      const r = pendingResults.get(p.id);
-      if (p.kind === 'verify_current') {
-        if (outcome === 'revoked') await tx.delete(oauthPendingTokens).where(same);
-      } else if (r && !cleanupFailed(r.result)) {
-        await tx.delete(oauthPendingTokens).where(same);
-      } else if (r) {
-        await tx
-          .update(oauthPendingTokens)
-          .set({ kind: 'cleanup_revoke', baseGeneration: null, onInvalidCode: null, revision: p.revision + 1, lastResult: r.code ?? r.result, updatedAt: now })
-          .where(same);
+    // verify_current 는 이 해제가 연결 정보를 해제 상태로 만들었을 때만 삭제(확인할 현재 토큰이 없어짐). C 의 철회가 확인되지 않았으면
+    // 위에서 C 를 cleanup_revoke 로 남겼으므로(또는 같은 토큰의 행이 남았으므로) 의무는 사라지지 않는다.
+    if (outcome === 'revoked') {
+      for (const p of marked.pendings) {
+        if (p.kind === 'verify_current') await tx.delete(oauthPendingTokens).where(and(eq(oauthPendingTokens.id, p.id), eq(oauthPendingTokens.revision, p.revision)));
       }
     }
     await recordAudit(tx, {
@@ -1550,11 +1651,15 @@ export async function revokeCredential(
         pending_token_revoke_error: pendingRevokeCode,
         pending_tokens: withToken.length,
         pending_tokens_revoked: results.length - failedPending.length,
+        current_token_record: currentRecord,
       },
       at: now,
     });
     for (const f of failedPending) {
       await auditCleanupFailure(tx, { ownerId: input.ownerId, accountId: acc.id, context: 'revoke_pending', result: f.result, code: f.code, pendingRecord: 'kept', now });
+    }
+    if (currentRecord !== 'not_needed') {
+      await auditCleanupFailure(tx, { ownerId: input.ownerId, accountId: acc.id, context: 'revoke_current', result: remote as RemoteRevoke, code: remoteCode, pendingRecord: currentRecord, now });
     }
     return { health: accountHealthView(acc, row, await pendingInfoOf(tx, input.ownerId, acc.id), now), outcome, remoteRevoke: remote, revokedApprovals: marked.revokedApprovals };
   });
@@ -1584,7 +1689,8 @@ export async function refreshExpiringCredentials(
   let pendingResolved = 0;
   let pendingRemaining = 0;
   for (const p of pendingRows) {
-    const r = await reconcilePendingCredential(db, { ownerId: p.ownerId, accountId: p.accountId, providerFor: input.providerFor, keyring: input.keyring, now }).catch(
+    // FIX5-T13(P2 :1077): ignoreBackoff 없음 — 이 계정에서도 기한이 지난 행만 처리한다
+    const r = await reconcilePendingCredential(db, { ownerId: p.ownerId, accountId: p.accountId, providerFor: input.providerFor, keyring: input.keyring, now, ignoreBackoff: false }).catch(
       async () => {
         // 정리 자체가 예외로 끝남 — 그래도 다음 시도 시각은 미룬다(같은 계정이 다음 tick 을 독점하지 않게)
         await db

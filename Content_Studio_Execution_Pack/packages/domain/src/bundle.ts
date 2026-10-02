@@ -104,6 +104,8 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   restore_drills: '복원 훈련 기록(T20, 운영 기록, 환경마다 다름)',
   upload_sessions: '업로드 세션(T08) — 전송 중 임시 상태. 완료된 파일은 assets 로 내보낸다',
   upload_chunks: '업로드 조각(T08) — 전송 중 임시 파일 목록. 조각 바이트는 묶음에 넣지 않는다',
+  oauth_credentials: '계정 연결 정보(T13, D24) — 봉인한 토큰. 인증 비밀이므로 다른 환경으로 옮기지 않는다(복원한 계정은 "다시 연결 필요")',
+  oauth_states: '진행 중인 계정 연결 요청(T13) — 10분짜리 임시 상태',
 };
 
 /**
@@ -417,6 +419,8 @@ export const ROW_SCHEMAS = {
     state: z.enum(['mock_ready', 'connected', 'disconnected', 'revoked']),
     capability_snapshot: z.record(z.string(), z.unknown()),
     created_at: ts,
+    // T13(0027): 연결 정보 관계(none·linked·needs_reconnect). 0027 이전 묶음에는 없으므로 none. 복원은 linked → needs_reconnect(연결 정보는 묶음 밖).
+    credential_state: z.enum(['none', 'linked', 'needs_reconnect']).default('none'),
   }),
   distribution_plans: z.strictObject({
     id: uuid,

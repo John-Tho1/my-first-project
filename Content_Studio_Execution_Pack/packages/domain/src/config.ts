@@ -43,6 +43,10 @@ const LABELS: Record<string, string> = {
   RETENTION_EXPORT_RUNS_KEEP: 'RETENTION_EXPORT_RUNS_KEEP(남길 내보내기 ZIP 수)',
   RETENTION_JOB_EVENTS_DAYS: 'RETENTION_JOB_EVENTS_DAYS(끝난 작업 이력 보존 일수)',
   RETENTION_SWEEP_MODE: 'RETENTION_SWEEP_MODE(보존 정리 방식)',
+  OAUTH_MODE: 'OAUTH_MODE(계정 연결 모드)',
+  OAUTH_REDIRECT_URI: 'OAUTH_REDIRECT_URI(계정 연결 redirect URI)',
+  OAUTH_LIVE_APPROVAL_REF: 'OAUTH_LIVE_APPROVAL_REF(실제 계정 연결 승인 기록)',
+  THREADS_APP_ID: 'THREADS_APP_ID(Threads 앱 ID)',
 };
 
 /** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
@@ -148,6 +152,17 @@ export const configSchema = z.object({
   RETENTION_JOB_EVENTS_DAYS: opt(intRange(1, 3650, 180)),
   /** T20: 보존 정리 실행 방식. manual(기본) = /ops 에서 미리보기 → confirm 으로만, auto = worker tick 이 한 시간에 한 번 적용. */
   RETENTION_SWEEP_MODE: opt(z.enum(['manual', 'auto']).default('manual')),
+  /**
+   * T13(결정 D24): 계정 연결(OAuth). mock(기본) = 모의 계정만 프로세스 안 모의 공급자로 연결(외부 호출 0). live = 실제 계정용이지만
+   * T13 에는 live 어댑터가 없어 준비 상태(liveOAuthReadiness)가 항상 거부한다. 비밀(앱 secret·마스터 키)은 이 스키마에 넣지 않는다 —
+   * 서버가 존재 여부만 따로 확인한다(THREADS_APP_SECRET, SECRETS_MASTER_KEY).
+   */
+  OAUTH_MODE: opt(z.enum(['mock', 'live']).default('mock')),
+  /** callback 정확 일치 대상. 없으면 APP_BASE_URL + /api/oauth/callback. */
+  OAUTH_REDIRECT_URI: opt(z.url().optional()),
+  OAUTH_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /** 앱 ID 는 비밀이 아니지만 화면에는 설정 여부만 보인다. */
+  THREADS_APP_ID: opt(z.string().min(1).max(100).optional()),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

@@ -190,6 +190,13 @@
       "when": 1790891336027,
       "tag": "0026_t20_fix3_drill_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790923670668,
+      "tag": "0027_t13_oauth_credentials",
+      "breakpoints": true
     }
   ]
 }

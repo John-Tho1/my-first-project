@@ -246,7 +246,16 @@ export interface AuditInput {
     | 'worker.tick'
     | 'restore_drill.run'
     | 'retention.sweep'
-    | 'retention.files';
+    | 'retention.files'
+    // T13 계정 연결(OAuth) — details 에 토큰·code·state·verifier·암호문을 넣지 않는다(코드 값만)
+    | 'oauth.connect_start'
+    | 'oauth.callback_rejected'
+    | 'oauth.connected'
+    | 'oauth.refreshed'
+    | 'oauth.refresh_failed'
+    | 'oauth.checked'
+    | 'oauth.revoked'
+    | 'oauth.key_rotated';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

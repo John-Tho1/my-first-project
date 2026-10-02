@@ -407,6 +407,17 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
   - `RETENTION_SWEEP_MODE=auto` 면 작업 처리기가 한 시간에 한 번 같은 정리를 적용한다(기본 manual).
 - 운영 숫자 `GET /api/ops/summary`(**로그인 필요**, 로그인한 owner 범위): `ops: {backup_age_hours, attention_plans, repeated_failures, pending_deletes, disk{db,assets,uploads,exports}, disk_partial}`. 숫자만, 기록이 없으면 null. 폴더 크기는 이 PC 폴더 전체 측정이며 60초 동안 같은 측정값을 쓴다. 공개 `/api/health` 에는 이 숫자가 없다(D23(e)).
 
+### 계정 연결(모의)·비밀 보호 (M4, T13 — 로컬·모의 범위)
+결정 D24(docs/DECISIONS.md). **실제 Threads·Meta 연결 0, 외부 호출 0.** 실계정 연결(T14)은 사용자 승인 후.
+- 준비: `.env.local` 에 `SECRETS_MASTER_KEY`(base64, 32바이트 — 직접 만든 난수)와 `SECRETS_KEY_VERSION=1` 을 넣고 서버를 다시 시작한다. 없으면 계정 연결만 503(`secrets_not_configured`)이고 나머지는 그대로 동작한다. 기본·개발용 키는 없다.
+- 화면: 설정 → **배포 계정 연결**. Threads 모의 계정의 "연결(모의)" → 앱 안의 모의 동의 화면(`/api/oauth/mock-threads/authorize`) → `/api/oauth/callback` → 설정 화면으로 돌아온다. 상태(연결됨·곧 만료·만료됨·연결 해제됨·다시 연결 필요·오류·연결 정보 없음), 만료 시각, 필요/허락 scope, 마지막 확인 시각, "지금 갱신·연결 확인·연결 해제". `/ops` 에는 상태별 계정 수.
+- 모의 연결은 **MOCK** 표시이며 실제 Threads 계정 연결이 아니고 실제 게시에 쓰이지 않는다(모의 계정의 결과는 지금처럼 항상 MOCK). 요청 scope 는 `threads_basic, threads_content_publish`(잠정 — T14 에서 공식 문서로 재확인), 답글·통계는 요청하지 않는다.
+- 보호: state 는 서버에 SHA-256 만(1회용, 로그인 세션·owner·계정에 묶임, 10분), PKCE S256(verifier 는 서버에 봉인), redirect URI 정확 일치. 토큰은 AES-256-GCM(Node 표준 crypto)으로 봉인하고 키 버전을 함께 저장한다(AAD = owner·계정·용도 — 다른 행으로 옮긴 암호문은 열리지 않음). 토큰·code·state·verifier 는 API 응답·감사·로그·내보내기·화면에 나오지 않는다.
+- 실행 차단: 연결했던 계정의 연결이 만료·해제·다시 연결 필요·오류이면 실행(409 `account_credential_blocked`)과 작업 전송(BLOCKED, `credential_<상태>`, 보내지 않음)을 막는다. 다시 연결하면 재시도할 수 있다. 연결한 적 없는 모의 계정은 M3 동작 그대로. 다시 연결·갱신은 승인을 유지하고(계정이 같을 때만 저장 — 다른 계정이면 409 `oauth_account_mismatch`), **연결 해제는 그 계정의 활성 승인을 철회**한다.
+- 내보내기·복원: `oauth_credentials`·`oauth_states` 는 묶음에서 제외. 연결했던 계정은 복원 후 "다시 연결 필요".
+- API: `POST /api/channel-accounts/{id}/connect|refresh|check|revoke`(같은 출처·로그인), `GET /api/channel-accounts/{id}/health`, `GET /api/oauth/callback`. 다른 owner 의 계정은 404.
+- 키 교체: 새 키를 `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(새 번호)에, 직전 키를 `SECRETS_MASTER_KEY_PREVIOUS`·`SECRETS_KEY_VERSION_PREVIOUS` 에 두면 옛 봉인도 읽힌다. 다시 봉인은 `rotateSecretKeys`(@cs/db, 시험으로 확인 — CLI 는 아직 없음). 끝나면 이전 키를 비운다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

@@ -1023,8 +1023,14 @@ export const channelAccounts = pgTable(
     state: text('state').notNull(),
     capabilitySnapshot: jsonb('capability_snapshot').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     createdAt: ts('created_at').notNull().defaultNow(),
+    /**
+     * T13(D24): 연결 정보(oauth_credentials) 관계 — none(연결한 적 없음 · 모의 계정은 M3 동작 그대로) · linked(연결함 — 실행에 유효한 연결 정보 필요)
+     * · needs_reconnect(복원 등으로 연결 정보 없이 들어옴 — 다시 연결 전까지 실행 차단). 묶음에는 들어가지만 복원 동일성 비교에서는 뺀다(운영 상태).
+     */
+    credentialState: text('credential_state').notNull().default('none'),
   },
   (t) => [
+    check('channel_accounts_credential_state_chk', sql`${t.credentialState} in ('none', 'linked', 'needs_reconnect')`),
     unique('channel_accounts_owner_platform_external_uq').on(t.ownerId, t.platform, t.externalAccountId),
     unique('channel_accounts_id_owner_uq').on(t.id, t.ownerId),
     check('channel_accounts_platform_chk', sql`${t.platform} in ('threads', 'instagram', 'youtube', 'blog')`),
@@ -1398,6 +1404,94 @@ export const mockScenarios = pgTable(
       name: 'mock_scenarios_item_same_owner_fk',
       columns: [t.distributionItemId, t.ownerId],
       foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T13 계정 연결(OAuth)·비밀 보호(결정 D24) ----
+
+/**
+ * 계정 연결 정보(oauth_credentials). 계정마다 한 행. 토큰 평문은 저장하지 않는다 — encrypted_token 은 AES-256-GCM 봉인
+ * (`csk1:` 형식, @cs/domain secrets.ts, AAD = owner + 계정 + 용도), key_version 은 봉인한 키 버전.
+ * 연결 해제(revoke)는 암호문·키 버전을 지우고 revoked_at·status='revoked' 를 남긴다(행은 남김 — 감사·상태 표시).
+ * is_mock = (provider = 'mock_threads'), 그리고 트리거가 계정 kind 와 맞는지 확인한다 — 모의 토큰은 실제 계정에 붙을 수 없다.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES). 복원한 계정은 "다시 연결 필요".
+ */
+export const oauthCredentials = pgTable(
+  'oauth_credentials',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    provider: text('provider').notNull(),
+    isMock: boolean('is_mock').notNull(),
+    encryptedToken: text('encrypted_token'),
+    keyVersion: integer('key_version'),
+    /** access token 만료 시각 */
+    expiresAt: ts('expires_at'),
+    scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    status: text('status').notNull(),
+    connectedAt: ts('connected_at').notNull(),
+    lastCheckedAt: ts('last_checked_at'),
+    lastRefreshedAt: ts('last_refreshed_at'),
+    lastErrorCode: text('last_error_code'),
+    revokedAt: ts('revoked_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('oauth_credentials_account_uq').on(t.channelAccountId),
+    check('oauth_credentials_provider_chk', sql`${t.provider} in ('mock_threads', 'threads')`),
+    check('oauth_credentials_mock_chk', sql`${t.isMock} = (${t.provider} = 'mock_threads')`),
+    check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoked')`),
+    check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
+    check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
+    check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),
+    check('oauth_credentials_sealed_chk', sql`${t.encryptedToken} is null or ${t.encryptedToken} like 'csk1:%'`),
+    foreignKey({
+      name: 'oauth_credentials_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 진행 중인 연결 요청(oauth_states). state 원문은 저장하지 않고 SHA-256 만(state_hash). 한 번만 쓰임(used_at), owner + 로그인 세션 + 계정에 묶임,
+ * TTL 10분. PKCE verifier 는 봉인해 둔다(encrypted_verifier, AAD 에 이 행 ID). 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES).
+ */
+export const oauthStates = pgTable(
+  'oauth_states',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    provider: text('provider').notNull(),
+    stateHash: text('state_hash').notNull(),
+    encryptedVerifier: text('encrypted_verifier').notNull(),
+    keyVersion: integer('key_version').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    scopes: jsonb('scopes').$type<string[]>().notNull(),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('oauth_states_hash_uq').on(t.stateHash),
+    check('oauth_states_provider_chk', sql`${t.provider} in ('mock_threads', 'threads')`),
+    check('oauth_states_sealed_chk', sql`${t.encryptedVerifier} like 'csk1:%'`),
+    index('oauth_states_owner_expires_idx').on(t.ownerId, t.expiresAt),
+    foreignKey({
+      name: 'oauth_states_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
     }).onDelete('restrict'),
   ],
 );

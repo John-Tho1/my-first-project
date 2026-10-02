@@ -27,3 +27,4 @@ export * from './restore-drill';
 export * from './restore-expect';
 export * from './ops';
 export * from './retention';
+export * from './oauth';

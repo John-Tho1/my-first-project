@@ -5,10 +5,11 @@
 import { lstat, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { and, asc, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
-import { ageHours, backupState, budgetPolicy, cutoffDays, type AppConfig, type BackupState } from '@cs/domain';
+import { ageHours, backupState, budgetPolicy, cutoffDays, type AppConfig, type BackupState, type CredentialStatus } from '@cs/domain';
 import { monthlyUsage, type CurrencyUsage } from './budget';
 import type { Db } from './client';
 import type { DbOrTx } from './queries';
+import { credentialHealthCounts } from './oauth';
 import { resolveFromRoot } from './paths';
 import { latestRestoreDrill, type RestoreDrillRow } from './restore-drill';
 import { assets, auditEvents, distributionItems, distributionPlans, exportRuns, jobs, sendIntents, uploadSessions, variants } from './schema';
@@ -300,6 +301,8 @@ export interface OpsSnapshot {
   incompleteRetention: { total: number; items: Array<{ sweepId: string; at: Date; planned: number }> };
   /** 결과가 partial 인 정리 실행(뒤의 성공이 가리지 않음) */
   partialRetention: { total: number; items: Array<{ sweepId: string | null; at: Date }> };
+  /** T13: 배포 계정 연결 상태별 개수(owner 범위) */
+  accounts: Record<CredentialStatus, number>;
 }
 
 export async function opsSnapshot(
@@ -399,6 +402,7 @@ export async function opsSnapshot(
     lastRetention: await lastRetentionSweep(db, ownerId),
     incompleteRetention: await incompleteRetentionSweeps(db, ownerId),
     partialRetention: await partialRetentionSweeps(db, ownerId),
+    accounts: await credentialHealthCounts(db, ownerId, now),
   };
 }
 
@@ -480,6 +484,8 @@ export interface OpsSummary {
   /** unavailable(폴더 없음·읽기 실패)이면 null. partial 이면 하한값이고 disk_partial = true */
   disk: { db: number | null; assets: number | null; uploads: number | null; exports: number | null };
   disk_partial: boolean;
+  /** T13: 배포 계정 연결 상태별 개수(숫자만) */
+  account_health: Record<CredentialStatus, number>;
 }
 
 export async function opsSummary(db: Db, ownerId: string, config: AppConfig, now: Date = new Date()): Promise<OpsSummary> {
@@ -494,5 +500,6 @@ export async function opsSummary(db: Db, ownerId: string, config: AppConfig, now
     pending_deletes: (await pendingDeleteStats(db, ownerId)).count,
     disk: { db: bytes(disk.db), assets: bytes(disk.assets), uploads: bytes(disk.uploads), exports: bytes(disk.exports) },
     disk_partial: partial,
+    account_health: await credentialHealthCounts(db, ownerId, now),
   };
 }

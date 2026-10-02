@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import {
+  AccountCredentialBlockedError,
   AccountNotReadyError,
   AlreadyExecutedError,
   AppError,
@@ -67,6 +68,7 @@ import {
 import type { Db } from './client';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
 import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
+import { credentialGate } from './oauth';
 import { recordAudit, type DbOrTx } from './queries';
 import {
   approvals,
@@ -851,6 +853,18 @@ export async function executePlan(
         if (problems.length) stale.push({ item_id: item.id, reasons: problems });
       }
       if (stale.length) return { stale };
+      // T13(D24): 연결 정보가 필요한 계정(live·연결한 적 있는 계정)은 유효한 연결(연결됨·곧 만료)일 때만 — 만료·해제·다시 연결 필요면 409(아무것도 대기열에 넣지 않음).
+      const gate = await credentialGate(
+        tx,
+        ownerId,
+        selected.map((i) => i.channelAccountId),
+        now,
+      );
+      const credBlocked = selected.flatMap((i) => {
+        const h = gate.get(i.channelAccountId);
+        return h && !h.usable ? [{ item_id: i.id, account_id: i.channelAccountId, status: h.status }] : [];
+      });
+      if (credBlocked.length) throw new AccountCredentialBlockedError(credBlocked);
       const queued: ExecuteResult['queued'] = [];
       for (const item of selected) {
         const approval = active.get(item.id)!;
@@ -960,6 +974,7 @@ export function channelAccountView(a: ChannelAccountRow) {
     display_name: a.displayName,
     state: a.state,
     ready: accountReady(a),
+    credential_state: a.credentialState,
     capability_snapshot: a.capabilitySnapshot,
     created_at: a.createdAt.toISOString(),
   };

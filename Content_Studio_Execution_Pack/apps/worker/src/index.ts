@@ -44,6 +44,8 @@ export interface WorkerTick {
   jobs: JobsTickResult | null;
   /** T20: 보존 정리(RETENTION_SWEEP_MODE=auto 이고 한 시간이 지났을 때만, owner 별 결과). manual 이면 null */
   retention: RetentionResult[] | null;
+  /** T13: 만료가 가까운 연결 정보 갱신(갱신기가 주어졌을 때만 — 모의 공급자, 외부 호출 없음) */
+  credentials: { refreshed: number; failed: number } | null;
   note: string;
 }
 
@@ -87,6 +89,8 @@ export interface WorkerTickInput {
   clock?: () => Date;
   random?: () => number;
   leaseTtlMs?: number;
+  /** T13: 만료 7일 안의 연결 정보 갱신기(호출자가 공급자·키를 넣는다). 없으면 건너뛴다. */
+  credentialRefresh?: (now: Date) => Promise<{ refreshed: number; failed: number }>;
 }
 
 export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick> {
@@ -113,6 +117,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
     });
   }
   const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);
+  const credentials = input.credentialRefresh ? await input.credentialRefresh(at) : null;
   const tick: WorkerTick = {
     ranAt: at.toISOString(),
     mode: config.WORKER_MODE,
@@ -124,6 +129,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
     cleanup,
     jobs,
     retention,
+    credentials,
     note:
       (transcriber
         ? `T08: 업로드 만료 정리 + 전사 job 진행(${transcriber.mode === 'mock' ? '모의 전사기, 외부 호출 없음' : 'live'})`

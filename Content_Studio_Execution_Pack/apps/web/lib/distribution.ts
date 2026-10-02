@@ -71,6 +71,7 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   unconfirmed_experience_claims: '확인하지 않은 1인칭 경험 주장이 있습니다.',
   channel_mismatch: '채널 초안의 채널과 계정 플랫폼이 다릅니다.',
   account_not_ready: '배포 계정이 준비되지 않았습니다.',
+  account_credential_blocked: '배포 계정 연결이 만료·해제되었거나 다시 연결이 필요합니다. 설정 → 배포 계정 연결에서 다시 연결한 뒤 실행하세요.',
   mock_only: '모의(MOCK) 계정은 모의 실행만 할 수 있습니다.',
   schedule_in_past: '예약 시각은 지금부터 1분 뒤 이후여야 합니다(모스크바 시각).',
   invalid_schedule: '예약 날짜·시각 형식을 확인하세요(모스크바 시각).',
@@ -166,6 +167,12 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
   auth: '계정 인증 필요(자동 재시도 안 함)',
   execution_not_allowed: '실행 모드가 허용하지 않음',
   account_missing: '계정 없음',
+  // T13: 연결 정보 차단(보내지 않음 — 다시 연결 뒤 재시도)
+  credential_blocked: '계정 연결 만료·해제 — 다시 연결 필요(보내지 않음)',
+  credential_expired: '계정 연결 만료 — 다시 연결 필요(보내지 않음)',
+  credential_revoked: '계정 연결 해제됨 — 다시 연결 필요(보내지 않음)',
+  credential_needs_reconnect: '계정 다시 연결 필요(보내지 않음)',
+  credential_error: '계정 연결 오류 — 다시 연결 필요(보내지 않음)',
 };
 
 interface JobLike {

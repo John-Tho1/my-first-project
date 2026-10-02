@@ -63,7 +63,10 @@ export default async function DistributePage({ searchParams }: { searchParams: P
 
       <section className="card archive" aria-labelledby="accounts-title">
         <h3 id="accounts-title">배포 계정</h3>
-        <p className="note">모의(MOCK) 계정만 있습니다. 실제 계정 연결(OAuth)은 M4(T13) 이후이며, 이 앱에는 인증 비밀이 저장되어 있지 않습니다.</p>
+        <p className="note">
+          모의(MOCK) 계정만 있습니다. 계정 연결 상태·모의 연결(T13)은 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>에서 봅니다. 실제 Threads 계정
+          연결은 아직 없으며(T14, 별도 승인), 모의 연결 정보로는 실제 게시가 일어나지 않습니다.
+        </p>
         <ul className="list">
           {accounts.map((a) => (
             <li key={a.id}>

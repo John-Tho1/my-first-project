@@ -16,6 +16,7 @@
  *  - variants(이어서): 원본 approved 이고 강등되지 않았는데 기대 활성 승인(그 파생본의 현재 버전을 가리키는 항목)이 없으면 review(updated_at = 원본 또는 복원 시각).
  *  - distribution_plans: 상태 = planStatusFrom(기대 항목 상태·기대 활성 승인). 원본과 다르면 revision + 1, updated_at = 복원 시각.
  *  - transcription_jobs: queued·running → canceled, error 고정 문구, finished_at = 원본 값 또는 복원 시각.
+ *  - channel_accounts(T13): credential_state linked → needs_reconnect(연결 정보는 묶음 밖).
  *  - usage_ledger: 그 중단된 전사의 reserved 원장 → settled, actual_amount = reserved_amount, failed = true, settled_at = 복원 시각. 그 밖의 금액은 그대로.
  * 판정 시각(decisionAt)으로 정해지는 값(승인 철회 시각·계획/파생본 updated_at)은 그 시각과 정확히 같아야 한다. DB now() 로 정해지는 값(원장 settled_at·
  * 전사 finished_at)은 실제 복원 호출 직전~직후 구간 안인지 본다. 원래 시각을 보존해야 하는 열은 정확히 비교한다.
@@ -237,6 +238,8 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
       confirmed[0].done_at = null;
     }
   }
+  // T13(D24): 연결했던 계정은 연결 정보 없이 들어오므로 "다시 연결 필요"
+  for (const a of out.channel_accounts?.values() ?? []) if (a.credential_state === 'linked') a.credential_state = 'needs_reconnect';
   const at = bundleTime(derived.decisionAt);
   // 승인 철회(독립 계산, 판정 시각으로 확정)
   for (const a of out.approvals?.values() ?? []) {

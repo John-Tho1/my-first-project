@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import {
+  AccountCredentialBlockedError,
   AppError,
   assertExecutionAllowed,
   CANCEL_PENDING_MESSAGE,
@@ -69,6 +70,7 @@ import {
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
 import { mockScenarioFor } from './mock-scenarios';
+import { credentialGate } from './oauth';
 import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
@@ -495,6 +497,15 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     }
     const acc = await accountOf(tx, ownerId, item.channelAccountId);
     if (!acc) return settle(tx, ownerId, job, item, 'blocked', { reason: 'account_missing' }, now, { ...CLEAR_LEASE, lastErrorCode: 'account_missing' });
+    // T13(D24): 연결 정보가 만료·해제·다시 연결 필요면 보내지 않고 BLOCKED(보내지 않았음이 확실 — 다시 연결 뒤 재시도 가능). 사유 코드 credential_<상태>.
+    const cred = (await credentialGate(tx, ownerId, [acc.id], now)).get(acc.id);
+    if (cred && !cred.usable) {
+      const code = `credential_${cred.status}`;
+      return settle(tx, ownerId, job, item, 'blocked', { reason: 'credential_blocked', credential_status: cred.status, not_sent: true }, now, {
+        ...CLEAR_LEASE,
+        lastErrorCode: code,
+      });
+    }
     let mode: 'MOCK';
     let adapter: ChannelAdapter;
     try {
@@ -986,6 +997,9 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
     }
     const problems = (await snapshotProblems(tx, ownerId, item, now)).filter((p) => p !== 'schedule_passed');
     if (problems.length) throw new SnapshotStaleError([{ item_id: item.id, reasons: problems }]);
+    // T13: 연결 정보가 아직 쓸 수 없으면(만료·해제·다시 연결 필요) 다시 대기열에 넣지 않는다 — 먼저 다시 연결.
+    const cred = (await credentialGate(tx, ownerId, [item.channelAccountId], now)).get(item.channelAccountId);
+    if (cred && !cred.usable) throw new AccountCredentialBlockedError([{ item_id: item.id, account_id: item.channelAccountId, status: cred.status }]);
     await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id }, now, {
       ...CLEAR_LEASE,
       nextRunAt: now,

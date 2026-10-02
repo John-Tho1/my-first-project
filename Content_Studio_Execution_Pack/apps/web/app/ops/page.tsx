@@ -3,6 +3,8 @@ import { redirect } from 'next/navigation';
 import { DRILL_PARTIAL_LABEL, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
 import {
   CHANNEL_LABEL,
+  CREDENTIAL_STATUS_LABEL,
+  CREDENTIAL_STATUSES,
   describeModes,
   formatAgeHours,
   formatByteSize,
@@ -13,6 +15,7 @@ import {
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { exportsDir } from '../../lib/backup';
+import { oauthReadinessView } from '../../lib/oauth';
 import { OPS_ERROR_TEXT } from '../../lib/ops';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -53,6 +56,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const err = str(q.error) ? (OPS_ERROR_TEXT[str(q.error)!] ?? OPS_ERROR_TEXT.server) : undefined;
   const live = liveLlmReadiness(config);
   const sttLive = sttLiveReadiness(config);
+  const oauth = oauthReadinessView(config);
   const drill = s.backup.lastDrill;
   const drillMismatches = (drill?.mismatchJson ?? []) as Array<{ kind?: string; table?: string; sample_ids?: string[]; columns?: string[] }>;
   const drillScope = (drill?.scopeJson ?? null) as null | { partial: boolean; partial_reasons: string[]; empty_tables: string[]; search_probe: string };
@@ -201,6 +205,21 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         </p>
       </section>
 
+      <section className="card archive" aria-labelledby="accounts-health-title">
+        <h3 id="accounts-health-title">배포 계정 연결</h3>
+        <ul className="list">
+          {CREDENTIAL_STATUSES.map((st) => (
+            <li key={st}>
+              {CREDENTIAL_STATUS_LABEL[st]}: {s.accounts[st]}개
+            </li>
+          ))}
+        </ul>
+        <p className="note">
+          만료·해제·다시 연결 필요인 계정은 그 계정의 배포 실행이 차단됩니다. 자세한 상태·연결은 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>. 현재
+          연결은 모두 모의(MOCK)입니다.
+        </p>
+      </section>
+
       <section className="card archive" aria-labelledby="disk-title">
         <h3 id="disk-title">용량</h3>
         <p className="note">측정 시각 {formatMsk(s.disk.measuredAt)}(60초 동안 같은 측정값을 씁니다).</p>
@@ -249,6 +268,10 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         </p>
         <p className="note">AI live 준비 안 됨: {live.missing.length ? live.missing.join(', ') : '없음'}</p>
         <p className="note">음성 전사 live 준비 안 됨: {sttLive.missing.length ? sttLive.missing.join(', ') : '없음'}</p>
+        <p className="note">
+          계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 계정 연결 준비 안 됨:{' '}
+          {oauth.live.missing.join(', ')}
+        </p>
       </section>
 
       <section className="card archive" id="retention" aria-labelledby="retention-title">

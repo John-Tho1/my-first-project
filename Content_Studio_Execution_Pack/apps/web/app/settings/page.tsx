@@ -1,9 +1,10 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
-import { budgetPolicy, formatMsk, fromMicro, liveLlmReadiness, sttBudgetPolicy, sttLiveReadiness } from '@cs/domain';
+import { listAccountHealth, listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
+import { budgetPolicy, CHANNEL_LABEL, formatMsk, fromMicro, liveLlmReadiness, sttBudgetPolicy, sttLiveReadiness, type Channel } from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
+import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { getAppDb, getConfig } from '../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -40,6 +41,11 @@ export default async function SettingsPage({
   const restores = await listRestoreRuns(db, session.ownerId, 10);
   const exported = str(q.exported) ? exports.find((e) => e.id === str(q.exported)) : undefined;
   const err = str(q.error) ? (BACKUP_ERROR_TEXT[str(q.error)!] ?? BACKUP_ERROR_TEXT.server) : undefined;
+  // T13: 계정 연결 상태(토큰·암호문 없음 — 상태·만료·scope 이름만)
+  const accounts = await listAccountHealth(db, session.ownerId);
+  const oauth = oauthReadinessView(config);
+  const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
+  const accountDone = q.connected ? '계정을 연결했습니다(MOCK).' : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : q.revoked ? '연결을 해제했습니다. 다시 연결하기 전까지 이 계정으로는 배포하지 않습니다.' : undefined;
 
   return (
     <main className="container">
@@ -94,6 +100,114 @@ export default async function SettingsPage({
         <p className="notice" role="note">
           음성 전사 live 준비 안 됨: {sttLive.missing.join(', ')}
         </p>
+      </section>
+
+      <section className="card archive" id="accounts" aria-labelledby="accounts-title">
+        <h3 id="accounts-title">배포 계정 연결</h3>
+        {accountDone ? (
+          <p className="saved" role="status">
+            {accountDone}
+          </p>
+        ) : null}
+        {accountErr ? (
+          <p className="notice" role="alert">
+            {accountErr}
+          </p>
+        ) : null}
+        <p className="note">
+          지금은 Threads 모의(MOCK) 계정만 연결할 수 있습니다. 모의 연결은 앱 안에서만 동작하며 실제 Threads 계정 연결이 아니고, 실제 게시에 쓰이지
+          않습니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을 복원하면 연결했던 계정은 &quot;다시
+          연결 필요&quot;가 됩니다.
+        </p>
+        <p className="meta">
+          <span className={oauth.secrets.configured ? 'tag' : 'tag warn'}>
+            서버 암호화 키: {oauth.secrets.configured ? `설정됨(키 버전 ${oauth.secrets.currentVersion}${oauth.secrets.hasPrevious ? ', 이전 키 있음' : ''})` : '설정 안 됨'}
+          </span>
+          <span>redirect URI: {oauth.redirectUri}</span>
+        </p>
+        {!oauth.secrets.configured ? (
+          <p className="notice" role="note">
+            계정 연결 불가: {oauth.secrets.problems.join(', ')} — .env.local 에 SECRETS_MASTER_KEY·SECRETS_KEY_VERSION 을 넣고 서버를 다시 시작하세요(다른 기능은 그대로).
+          </p>
+        ) : null}
+        <p className="notice" role="note">
+          실제 계정 연결 준비 안 됨: {oauth.live.missing.join(', ')}
+        </p>
+        {accounts.length ? (
+          <div className="table-scroll">
+            <table className="compare">
+              <thead>
+                <tr>
+                  <th scope="col">계정</th>
+                  <th scope="col">연결 상태</th>
+                  <th scope="col">만료</th>
+                  <th scope="col">권한(scope)</th>
+                  <th scope="col">마지막 확인</th>
+                  <th scope="col">동작</th>
+                </tr>
+              </thead>
+              <tbody>
+                {accounts.map((a) => {
+                  const connectable = a.mock && a.platform === 'threads';
+                  const hasCredential = a.connected_at !== null && a.revoked_at === null;
+                  return (
+                    <tr key={a.account_id}>
+                      <td>
+                        {a.mock ? <span className="tag warn">MOCK</span> : null} {a.display_name} · {CHANNEL_LABEL[a.platform as Channel] ?? a.platform}
+                      </td>
+                      <td>
+                        <span className={a.usable_for_execution ? 'tag' : 'tag warn'}>{a.status_label}</span>
+                        {a.status === 'not_connected' && a.mock ? ' (모의 배포는 연결 없이 가능 — 결과는 항상 MOCK)' : ''}
+                        {a.reason && a.status !== 'connected' ? ` · ${a.reason}` : ''}
+                        {a.last_error_code ? ` · 오류 ${a.last_error_code}` : ''}
+                        {a.credential_required && !a.usable_for_execution ? ' · 이 계정 배포 실행 차단' : ''}
+                      </td>
+                      <td>{a.expires_at ? formatMsk(new Date(a.expires_at)) : '—'}</td>
+                      <td>
+                        {a.scopes_required.length ? `필요 ${a.scopes_required.join(', ')}` : '—'}
+                        {a.scopes_granted.length ? ` · 허락 ${a.scopes_granted.join(', ')}` : ''}
+                        {a.missing_scopes.length ? ` · 부족 ${a.missing_scopes.join(', ')}` : ''}
+                      </td>
+                      <td>{a.last_checked_at ? formatMsk(new Date(a.last_checked_at)) : '—'}</td>
+                      <td>
+                        {connectable ? (
+                          <form method="post" action={`/api/channel-accounts/${a.account_id}/connect`}>
+                            <button type="submit" className="link-button" disabled={!oauth.secrets.configured}>
+                              {a.connected_at ? '다시 연결(모의)' : '연결(모의)'}
+                            </button>
+                          </form>
+                        ) : (
+                          <span className="muted-text">연결 미지원(T13)</span>
+                        )}
+                        {hasCredential ? (
+                          <>
+                            <form method="post" action={`/api/channel-accounts/${a.account_id}/refresh`}>
+                              <button type="submit" className="link-button">
+                                지금 갱신
+                              </button>
+                            </form>
+                            <form method="post" action={`/api/channel-accounts/${a.account_id}/check`}>
+                              <button type="submit" className="link-button">
+                                연결 확인
+                              </button>
+                            </form>
+                            <form method="post" action={`/api/channel-accounts/${a.account_id}/revoke`}>
+                              <button type="submit" className="link-button">
+                                연결 해제
+                              </button>
+                            </form>
+                          </>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="empty-text">배포 계정이 없습니다. `pnpm db:seed` 를 실행하면 모의 계정이 만들어집니다.</p>
+        )}
       </section>
 
       <section className="card archive" aria-labelledby="brand-title">

@@ -38,6 +38,16 @@ import {
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
 import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
+
+/**
+ * 기존 행과 묶음 행의 동일성 비교 hash. T13: channel_accounts.credential_state 는 운영 상태(연결 여부)라 비교에서 뺀다 —
+ * 같은 계정을 다시 연결·해제했다고 같은 환경 복원(add_missing)이 계정과 그 밑의 계획·항목을 "충돌"로 막지 않게.
+ */
+function compareHash(name: RestoredTable, row: Record<string, unknown>): string {
+  if (name !== 'channel_accounts') return rowHash(row);
+  const { credential_state: _ignored, ...rest } = row;
+  return rowHash(rest);
+}
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
 import { variantReviewBlockers } from './variants';
 import { recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
@@ -227,7 +237,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     for (let i = 0; i < rows.length; i += 500) {
       const ids = rows.slice(i, i + 500).map((r) => r.id);
       for (const e of await selectBundleRows(tx, name, idIn(name, ids))) {
-        existing.set(String(e.row.id), { owner: e.owner, hash: rowHash(e.row) });
+        existing.set(String(e.row.id), { owner: e.owner, hash: compareHash(name, e.row) });
       }
     }
     const conflict = (id: string, reason: RestoreConflict['reason']) => {
@@ -240,7 +250,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       if (ex) {
         if (ex.owner !== ownerId) {
           conflict(row.id, 'id_in_use');
-        } else if (ex.hash === rowHash(row)) {
+        } else if (ex.hash === compareHash(name, row)) {
           counts.existing_same++;
           map.set(row.id, 'same');
         } else {
@@ -296,6 +306,8 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
         overrides.status = restoredStatus;
         overrides.restored_needs_review = true;
       }
+      // T13(D24): 연결 정보(oauth_credentials)는 묶음 밖이다 — 연결했던 계정은 새 환경에서 "다시 연결 필요"로 넣는다(그 전까지 실행 차단).
+      if (name === 'channel_accounts' && row.credential_state === 'linked') overrides.credential_state = 'needs_reconnect';
       // FIX-T11(P1): 작업은 읽기 전용 이력 — 끝난 상태·BLOCKED·UNKNOWN 으로만, lease 없이, 복원 표시(자동 lease·재시도 없음).
       if (name === 'jobs') {
         overrides.state = restoredJobState(String(row.state));

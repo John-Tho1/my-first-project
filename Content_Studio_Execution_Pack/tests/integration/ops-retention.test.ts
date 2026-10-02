@@ -376,7 +376,7 @@ describe('보존 정리', () => {
 });
 
 const summary = (cookie: Record<string, string> = {}) => summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookie }), undefined);
-const OPS_KEYS = ['attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures'];
+const OPS_KEYS = ['account_health', 'attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures'];
 
 describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops 없음, GET /api/ops/summary 는 owner 범위', () => {
   it('공개 /api/health 는 ops 와 그 숫자 키를 내보내지 않는다', async () => {
@@ -411,7 +411,7 @@ describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops �
     const body = await res.json();
     const s = await opsSnapshot(db, A.id, cfg());
     expect(body.ops.attention_plans).toBe(s.jobs.attentionPlans.total);
-    expect(Object.keys(body.ops).sort()).toEqual(['attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures']);
+    expect(Object.keys(body.ops).sort()).toEqual(['account_health', 'attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures']);
     expect(body.ops.disk_partial).toBe(false);
     expect(typeof body.ops.backup_age_hours).toBe('number');
     expect(body.ops.repeated_failures).toBe(1);

@@ -38,3 +38,8 @@
 - [P1] packages/providers/src/youtube-mock.ts:794 — 파일 읽기 도중 작업이 중단되어도 다음 조각을 전송한다
 - [P1] packages/db/src/jobs.ts:683 — 만료된 세션까지 차감하여 새 세션 생성 시 할당량 검사를 건너뛴다
 - [P1] apps/web/app/api/worker/tick/route.ts:45 — 웹 요청 안에서 영상 전체 업로드를 수행하는 경로를 추가했다
+
+## FIX4-T13 (ea85ac6, round 4: review-FIX3-T13) — CHANGES_REQUESTED (P1 1·P2 2)
+- [P1] packages/db/src/oauth.ts:1524 — 현재 토큰의 철회가 실패해도 `verify_current`를 삭제하여 재정리에 필요한 토큰을 잃는다
+- [P2] packages/db/src/oauth.ts:1077 — worker가 선택한 계정의 모든 행을 처리하여 행별 `next_attempt_at`을 무시한다
+- [P2] docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md:253 — 인계·리뷰 산출물을 추적되는 저장소 파일에 추가했다 → 코드 결함 아님, D28 로 처리(인계 사본은 docs 전용 커밋으로만, 코드 커밋에 섞지 않음)

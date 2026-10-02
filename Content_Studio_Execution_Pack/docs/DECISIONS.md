@@ -396,3 +396,9 @@
 - Exact authorized scope (if applicable): 외부 호출 0(모의 시뮬레이터·모의 공급자만, 네트워크 없음), 새 의존성 0, 비밀 0(시험 키는 실행 중 난수), 실계정·OAuth 앱 등록 0.
 - Consequences: 모의 연결한 YouTube 계정으로 개발 화면에서 재개 업로드·처리·결과 종류를 끝까지 볼 수 있다. 모든 결과는 MOCK 이며 실제 발행 실적이 아니다. remote_steps 의 모의 ID CHECK 는 그대로라 live 어댑터는 이 표 규칙을 다시 정하는 migration 없이 붙일 수 없다(의도된 차단). 한 번의 submit 이 파일 전체를 올리므로 실제 2GB 업로드는 `JOB_SUBMIT_TIMEOUT_MS`(기본 30초)를 넘는다 — 모의는 메모리라 빠르지만 live 전에 진행 기반 시간 제한(조각마다 연장)으로 바꿔야 한다.
 - When to revisit: 실계정 연결 승인 시(공식 scope·할당량 단위·하루 초기화 시각·조각 단위 규칙·세션 만료·refresh token 회전 여부·미검증 프로젝트 제한·publishAt 규칙 재확인, remote_steps CHECK 개정, submit 시간 제한), PostgreSQL 전환.
+
+## D28 — 인계·판정 사본을 docs/handoffs/ 에 추적하되 코드 커밋과 분리 (AGENTS.md "gitignored .handoffs/" 규칙의 예외 범위)
+- Decision ID / date: D28 / 2026-10-02. Codex FIX4-T13 P2(docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md:253)에 대한 처리.
+- 배경: AGENTS.md 는 리뷰·인계 산출물을 gitignored `.handoffs/` 나 저장소 밖에 두라고 한다. 그러나 사용자가 로컬 ↔ 클라우드 세션 이동을 요청했고(2026-09-25 M3, 2026-10-02 M4), 클라우드는 로컬 `.handoffs/` 를 볼 수 없어 M2 이후 인계·판정 사본을 `docs/handoffs/` 에 커밋해 왔다.
+- Chosen option: `docs/handoffs/` 사본 추적은 유지한다(세션 간 인계에 필요). 대신 (1) 인계·판정 사본은 **docs 전용 커밋**으로만 넣고, 리뷰 대상 코드 커밋에는 섞지 않는다(ea85ac6 은 섞였음 — 이후 커밋부터 적용). (2) 리뷰 대상 HEAD 를 SHA 기록만을 위해 바꾸지 않는다(SHA 는 뒤따르는 docs 전용 커밋에 기록). (3) Codex 리뷰 전문은 계속 로컬 `.handoffs/` 에만 두고, docs/handoffs 에는 판정·지적 제목 요약만(클라우드 수정 라운드에 전문이 필요할 때만 사본).
+- Reversible?: 예. 사용자가 원하면 docs/handoffs 를 저장소 밖(예: 별도 브랜치)으로 옮긴다.

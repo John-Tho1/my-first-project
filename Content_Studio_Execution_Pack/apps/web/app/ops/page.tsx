@@ -276,9 +276,18 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
                 Number(s.lastRetention.details.candidates_damaged_kept ?? 0) > 0
                   ? ` · 지울 예정이던 백업 ${String(s.lastRetention.details.candidates_damaged_kept)}개가 손상·읽기 실패로 확인되어 ZIP·폴더를 남겼습니다`
                   : ''
+              }${
+                Number(s.lastRetention.details.candidates_zip_reappeared ?? 0) > 0
+                  ? ` · 폴더만 정리하려던 기록 ${String(s.lastRetention.details.candidates_zip_reappeared)}개에 정상 ZIP 이 다시 생겨 남겼습니다(손상 아님)`
+                  : ''
               }${s.lastRetention.details.outcome === 'partial' ? ' · 결과: 일부만 처리(전체 성공 아님)' : ''}`
             : '기록 없음'}
         </p>
+        {s.partialRetention.total ? (
+          <p className="notice">
+            일부만 처리된 정리 실행 {s.partialRetention.total}개(최근 {s.partialRetention.items.map((i) => formatMsk(i.at)).join(', ')}) — 뒤의 정상 실행과 관계없이 남깁니다.
+          </p>
+        ) : null}
         {s.incompleteRetention.total ? (
           <div className="notice" role="alert">
             결과 기록이 없는 정리 실행 {s.incompleteRetention.total}개(파일 삭제 중 중단됐을 수 있음 — 아래 미리보기로 남은 파일을 확인하세요):

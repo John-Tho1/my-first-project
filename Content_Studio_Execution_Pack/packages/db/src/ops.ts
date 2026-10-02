@@ -165,6 +165,23 @@ export function cachedDiskUsage(
   return value;
 }
 
+/**
+ * 결과가 partial(일부만 처리 — 내보내기 중단·실패·남긴 후보)인 정리 실행(최근 것부터)과 전체 수. 뒤의 complete 실행이 가리지 않는다(FIX round 6).
+ */
+export async function partialRetentionSweeps(
+  db: DbOrTx,
+  ownerId: string,
+  limit = 5,
+): Promise<{ total: number; items: Array<{ sweepId: string | null; at: Date }> }> {
+  const where = sql`f.owner_id = ${ownerId}::uuid and f.action = 'retention.files' and f.sanitized_details->>'outcome' = 'partial'`;
+  const c = await db.execute(sql`select count(*)::int as n from audit_events f where ${where}`);
+  const total = Number((c as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0);
+  if (!total) return { total: 0, items: [] };
+  const l = await db.execute(sql`select f.sanitized_details->>'sweep_id' as sweep_id, f.at::text as at from audit_events f where ${where} order by f.at desc, f.id desc limit ${limit}`);
+  const rows = (l as unknown as { rows: Array<{ sweep_id: string | null; at: string }> }).rows;
+  return { total, items: rows.map((r) => ({ sweepId: r.sweep_id, at: new Date(r.at) })) };
+}
+
 /** 시험 전용: 캐시 비우기. */
 export function resetDiskCache(): void {
   globalForOps.__csDiskCache = undefined;
@@ -281,6 +298,8 @@ export interface OpsSnapshot {
   lastRetention: { at: Date; details: Record<string, unknown>; resultMissing: boolean; sweepId: string | null } | null;
   /** 결과 기록이 없는 정리 실행(실행 ID 기준) */
   incompleteRetention: { total: number; items: Array<{ sweepId: string; at: Date; planned: number }> };
+  /** 결과가 partial 인 정리 실행(뒤의 성공이 가리지 않음) */
+  partialRetention: { total: number; items: Array<{ sweepId: string | null; at: Date }> };
 }
 
 export async function opsSnapshot(
@@ -379,6 +398,7 @@ export async function opsSnapshot(
     },
     lastRetention: await lastRetentionSweep(db, ownerId),
     incompleteRetention: await incompleteRetentionSweeps(db, ownerId),
+    partialRetention: await partialRetentionSweeps(db, ownerId),
   };
 }
 
@@ -434,8 +454,10 @@ export async function incompleteRetentionSweeps(
   ownerId: string,
   limit = 20,
 ): Promise<{ total: number; items: Array<{ sweepId: string; at: Date; planned: number }> }> {
-  const planned = sql`coalesce((p.sanitized_details->>'planned_packages')::int, 0) + coalesce((p.sanitized_details->>'planned_export_zips')::int, 0) + coalesce((p.sanitized_details->>'planned_export_dirs')::int, 0)`;
-  const where = sql`p.owner_id = ${ownerId}::uuid and p.action = 'retention.sweep' and p.sanitized_details ? 'sweep_id' and ${planned} > 0
+  // FIX round 6: JSON 값이 숫자가 아니거나 sweep_id 가 문자열이 아니면(손상·옛 형식) 오류 없이 미완료로 세지 않는다
+  const num = (k: string) => sql`(case when jsonb_typeof(p.sanitized_details->${k}) = 'number' then (p.sanitized_details->>${k})::numeric else 0 end)`;
+  const planned = sql`(${num('planned_packages')} + ${num('planned_export_zips')} + ${num('planned_export_dirs')})`;
+  const where = sql`p.owner_id = ${ownerId}::uuid and p.action = 'retention.sweep' and jsonb_typeof(p.sanitized_details->'sweep_id') = 'string' and ${planned} > 0
     and not exists (select 1 from audit_events f where f.owner_id = p.owner_id and f.action = 'retention.files' and f.sanitized_details->>'sweep_id' = p.sanitized_details->>'sweep_id')`;
   const countRes = await db.execute(sql`select count(*)::int as n from audit_events p where ${where}`);
   const total = Number((countRes as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0);

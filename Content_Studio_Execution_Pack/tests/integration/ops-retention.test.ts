@@ -12,6 +12,7 @@ import {
   applyRetention,
   approveItems,
   closeDb,
+  partialRetentionSweeps,
   DRILL_PARTIAL_LABEL,
   appendContentVersion,
   incompleteRetentionSweeps,
@@ -339,7 +340,7 @@ describe('보존 정리', () => {
       exportsAborted: null,
       jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
       packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
-      exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0, candidatesDamagedKept: 0 },
+      exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0, candidatesDamagedKept: 0, candidatesZipReappeared: 0 },
       outcome: 'complete',
     });
   });
@@ -794,7 +795,7 @@ describe('FIX round 3 (Codex review-FIX-T20 · review-FIX2-T20) — 보존 정�
         },
       },
     });
-    expect(r1.exports).toEqual({ deleted: 1, failed: 0, bytes: old.zipBytes, errorCodes: ['EACCES'], dirsDeleted: 0, dirsFailed: 1, candidatesDamagedKept: 0 });
+    expect(r1.exports).toEqual({ deleted: 1, failed: 0, bytes: old.zipBytes, errorCodes: ['EACCES'], dirsDeleted: 0, dirsFailed: 1, candidatesDamagedKept: 0, candidatesZipReappeared: 0 });
     expect(r1.outcome).toBe('partial');
     expect(existsSync(old.zipPath)).toBe(false);
     expect(existsSync(old.dirPath)).toBe(true);
@@ -802,7 +803,7 @@ describe('FIX round 3 (Codex review-FIX-T20 · review-FIX2-T20) — 보존 정�
       .sanitizedDetails as Record<string, unknown>;
     expect(files1).toMatchObject({ exports_deleted: 1, exports_bytes: old.zipBytes, export_dirs_deleted: 0, export_dirs_failed: 1, error_codes: 'EACCES' });
     const r2 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true });
-    expect(r2.exports).toEqual({ deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 1, dirsFailed: 0, candidatesDamagedKept: 0 });
+    expect(r2.exports).toEqual({ deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 1, dirsFailed: 0, candidatesDamagedKept: 0, candidatesZipReappeared: 0 });
     expect(r2.outcome).toBe('complete');
     expect(existsSync(old.dirPath)).toBe(false);
   });
@@ -1223,5 +1224,173 @@ describe('FIX round 5 (Codex review-FIX4-T20)', () => {
     expect(r.scope.partial_reasons).not.toContain('no_distribution');
     expect(r.scope.partial_reasons).not.toContain('empty:approvals');
     expect(DRILL_PARTIAL_LABEL['empty:jobs']).toMatch(/작업/u);
+  }, 60_000);
+});
+
+describe('FIX round 6 (Codex review-FIX5-T20)', () => {
+  const pol1 = () => ({ ...cfg(), RETENTION_EXPORT_RUNS_KEEP: 1 });
+  const filesAudit = async (owner: string) =>
+    (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, owner), eq(schema.auditEvents.action, 'retention.files')))).map(
+      (a) => a.sanitizedDetails as Record<string, unknown>,
+    );
+  /** 폴더만 남은 오래된 기록(old) + 남길 최신(kept). old 의 ZIP 을 따로 보관해 두었다가 계획 뒤 되돌린다. */
+  const dirOnlySetup = async (prefix: string) => {
+    const o = await newOwner(prefix);
+    const old = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const saved = readFileSync(old.zipPath);
+    rmSync(old.zipPath);
+    return { o, old, saved };
+  };
+
+  it('P2: 폴더만 정리하려던 기록에 **정상** ZIP 이 다시 생김 → 실행 기록 zip_bytes 로 검증, "다시 생김"으로 따로 세고 손상으로 세지 않음', async () => {
+    const { o, old, saved } = await dirOnlySetup('ops-r6-reappear');
+    let oldStats = 0;
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, {
+      confirm: true,
+      fs: {
+        rmDir: async () => {
+          throw new Error('rmDir must not run');
+        },
+      },
+      zipFs: {
+        // 계획 단계(① 트랜잭션) 뒤, 삭제 직전 재검사 때는 ZIP 이 다시 있다
+        stat: async (f: string) => {
+          if (path.resolve(f) === path.resolve(old.zipPath) && ++oldStats === 2) writeFileSync(old.zipPath, saved); // 1번째 = 계획(없음), 2번째 = 삭제 직전(다시 생김)
+          return statSync(f);
+        },
+        readFile: async (f: string) => new Uint8Array(readFileSync(f)),
+      },
+    });
+    expect(r.exports).toMatchObject({ candidatesZipReappeared: 1, candidatesDamagedKept: 0, dirsDeleted: 0 });
+    expect((await filesAudit(o.id))[0]).toMatchObject({ candidates_zip_reappeared: 1, candidates_damaged_kept: 0 });
+    expect(existsSync(old.dirPath)).toBe(true);
+  });
+
+  it('P2: 다시 생긴 ZIP 이 손상(같은 길이) → 손상으로 세고 ZIP·폴더 남김', async () => {
+    const { o, old, saved } = await dirOnlySetup('ops-r6-reappear-bad');
+    let oldStats = 0;
+    const bad = Buffer.from(saved);
+    bad[Math.floor(bad.length / 2)] = bad[Math.floor(bad.length / 2)]! ^ 0xff;
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, {
+      confirm: true,
+      zipFs: {
+        stat: async (f: string) => {
+          if (path.resolve(f) === path.resolve(old.zipPath) && ++oldStats === 2) writeFileSync(old.zipPath, bad);
+          return statSync(f);
+        },
+        readFile: async (f: string) => new Uint8Array(readFileSync(f)),
+      },
+    });
+    expect(r.exports).toMatchObject({ candidatesZipReappeared: 0, candidatesDamagedKept: 1, dirsDeleted: 0 });
+    expect(existsSync(old.dirPath)).toBe(true);
+  });
+
+  for (const mode of ['stat EACCES', 'read EACCES', 'stat 와 read 사이 ENOENT'] as const) {
+    it(`후보 재검증 ${mode} → 보존·집계·감사`, async () => {
+      const o = await newOwner(`ops-r6-${mode.length}`);
+      const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+      await exportOwner(db, storage, o.id, { outDir: exportsDir });
+      const target = path.resolve(older.zipPath);
+      let stats = 0;
+      let reads = 0;
+      const zipFs = {
+        stat: async (f: string) => {
+          if (path.resolve(f) === target && ++stats > 1 && mode === 'stat EACCES') throw Object.assign(new Error('x'), { code: 'EACCES' });
+          return statSync(f);
+        },
+        readFile: async (f: string) => {
+          if (path.resolve(f) === target && ++reads > 1) {
+            if (mode === 'read EACCES') throw Object.assign(new Error('x'), { code: 'EACCES' });
+            if (mode === 'stat 와 read 사이 ENOENT') {
+              rmSync(f);
+              throw Object.assign(new Error('x'), { code: 'ENOENT' });
+            }
+          }
+          return new Uint8Array(readFileSync(f));
+        },
+      };
+      const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, zipFs });
+      const [a] = await filesAudit(o.id);
+      if (mode === 'stat 와 read 사이 ENOENT') {
+        // ZIP 이 사라짐 = 이미 없음 → 폴더만 정리
+        expect(r.exports).toMatchObject({ deleted: 0, candidatesDamagedKept: 0, dirsDeleted: 1 });
+        expect(r.alreadyAbsent).toBeGreaterThanOrEqual(1);
+        expect(existsSync(older.dirPath)).toBe(false);
+        expect(a).toMatchObject({ export_dirs_deleted: 1, sweep_id: r.sweepId });
+      } else {
+        expect(r.exports).toMatchObject({ deleted: 0, candidatesDamagedKept: 1, dirsDeleted: 0 });
+        expect(r.outcome).toBe('partial');
+        expect(existsSync(older.zipPath)).toBe(true);
+        expect(existsSync(older.dirPath)).toBe(true);
+        expect(a).toMatchObject({ candidates_damaged_kept: 1, outcome: 'partial' });
+      }
+    });
+  }
+
+  it('incompleteRetentionSweeps: 다른 owner 의 같은 sweep_id 결과는 미완료를 풀지 못하고, 표시 한도보다 많아도 전체 수·순서가 정확', async () => {
+    const o = await newOwner('ops-r6-iso');
+    const other = await newOwner('ops-r6-iso-b');
+    const base = Date.now() - DAY;
+    const ids = Array.from({ length: 7 }, () => randomUUID());
+    await db.insert(schema.auditEvents).values(
+      ids.map((id, k) => ({ ownerId: o.id, action: 'retention.sweep' as const, entity: 'retention', sanitizedDetails: { sweep_id: id, planned_packages: 1 }, at: new Date(base + k * 1000) })),
+    );
+    // 다른 owner 가 같은 sweep_id 로 결과를 가진다
+    await db.insert(schema.auditEvents).values({ ownerId: other.id, action: 'retention.files', entity: 'retention', sanitizedDetails: { sweep_id: ids[0], packages_deleted: 1 }, at: new Date(base) });
+    const inc = await incompleteRetentionSweeps(db, o.id, 3);
+    expect(inc.total).toBe(7);
+    expect(inc.items.map((i) => i.sweepId)).toEqual([ids[6], ids[5], ids[4]]);
+  });
+
+  it('JSON 값이 이상한 감사(sweep_id null·숫자 아닌 계획 수): 조회가 오류 없이 미완료로 세지 않는다', async () => {
+    const o = await newOwner('ops-r6-json');
+    await db.insert(schema.auditEvents).values([
+      { ownerId: o.id, action: 'retention.sweep', entity: 'retention', sanitizedDetails: { sweep_id: null, planned_packages: 2 } },
+      { ownerId: o.id, action: 'retention.sweep', entity: 'retention', sanitizedDetails: { sweep_id: randomUUID(), planned_packages: 'many' } },
+      { ownerId: o.id, action: 'retention.sweep', entity: 'retention', sanitizedDetails: { sweep_id: 12345, planned_packages: 1 } },
+    ]);
+    expect(await incompleteRetentionSweeps(db, o.id)).toEqual({ total: 0, items: [] });
+    await expect(lastRetentionSweep(db, o.id)).resolves.toBeTruthy();
+    await expect(opsSnapshot(db, o.id, cfg())).resolves.toBeTruthy();
+  });
+
+  it('앞선 partial 실행은 뒤의 complete 실행 뒤에도 /ops 데이터에 남는다', async () => {
+    const o = await newOwner('ops-r6-partial');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const r1 = await applyRetention(db, o.id, pol1(), exportsDir, {
+      confirm: true,
+      fs: {
+        unlink: async () => {
+          throw Object.assign(new Error('x'), { code: 'EACCES' });
+        },
+      },
+    });
+    expect(r1.outcome).toBe('partial');
+    const r2 = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true });
+    expect(r2.outcome).toBe('complete');
+    expect(existsSync(older.zipPath)).toBe(false);
+    const snap = await opsSnapshot(db, o.id, cfg());
+    expect(snap.partialRetention).toMatchObject({ total: 1, items: [{ sweepId: r1.sweepId }] });
+    expect(snap.lastRetention).toMatchObject({ sweepId: r2.sweepId });
+    expect(await partialRetentionSweeps(db, o.id, 1)).toEqual({ total: 1, items: [{ sweepId: r1.sweepId, at: expect.any(Date) }] });
+  });
+
+  it('드릴 범위: 작업은 있고 승인이 없는 owner → "승인(approvals) 없음"(empty:approvals)', async () => {
+    const o = await newOwner('ops-r6-scope');
+    await putAsset(o.id);
+    const { content } = await createContent(db, o.id, { title: '작업만', body: BODY });
+    const { variant } = await createVariantDraft(db, o.id, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, o.id, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const { items } = await createPlan(db, o.id, { items: [{ variant_id: variant.id, channel_account_id: o.accounts.threads }] });
+    // 승인 없이 보류된 작업(정상 경로로는 만들 수 없어 직접 넣는다 — 승인 행은 지울 수 없으므로)
+    await db.insert(schema.jobs).values({ ownerId: o.id, kind: 'publish', itemId: items[0]!.id, payloadRef: items[0]!.payloadHash, state: 'BLOCKED', nextRunAt: new Date(), idempotencyKey: `r6-${randomUUID()}` });
+    const r = await runRestoreDrill(db, storage, o.id, { trigger: 'test', tmpRoot: tmp });
+    expect(r.mismatches).toEqual([]);
+    expect(r.result).toBe('pass');
+    expect(r.scope.partial_reasons).toContain('empty:approvals');
+    expect(r.scope.partial_reasons).not.toContain('empty:jobs');
+    expect(r.scope.partial_reasons).not.toContain('no_distribution');
   }, 60_000);
 });

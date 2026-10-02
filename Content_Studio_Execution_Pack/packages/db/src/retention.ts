@@ -46,13 +46,23 @@ export interface RetentionPlan {
    * 지울 내보내기: kind 'zip' = 최근 keep 개 밖의 검증된 백업(ZIP + 폴더), 'dir_only' = ZIP 이 없고(ENOENT) 폴더만 남은 기록 중
    * 남기는 가장 최근 검증된 백업보다 오래된 것(폴더만 지운다, zipBytes 0).
    */
-  exports: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string; filePresent: boolean; kind: 'zip' | 'dir_only' }>;
+  exports: Array<{
+    id: string;
+    createdAt: Date;
+    /** 지울 ZIP 바이트(dir_only 는 0) */
+    zipBytes: number;
+    /** 실행 기록의 zip_bytes — 다시 생긴 ZIP 을 검증할 때 쓴다(FIX round 6) */
+    runZipBytes: number;
+    manifestSha256: string;
+    filePresent: boolean;
+    kind: 'zip' | 'dir_only';
+  }>;
   /** 검증된 백업 수 — 보존 개수는 이것으로 센다 */
   exportsExisting: number;
   /** 지울 것이 있을 때 남길 검증된 백업(가장 최근 keep 개) — 적용은 삭제 직전에 이것을 캐시 없이 다시 검증한다 */
   exportsKept: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string }>;
   /** 검증되지 않은 기록(ZIP 없음·손상·읽기 실패) — 보존 개수에 세지 않는다. dirPresent = 풀어 둔 폴더는 남아 있음 */
-  exportsMissingFile: Array<{ id: string; createdAt: Date; manifestSha256: string; dirPresent: boolean; zipState: Exclude<ZipState, 'verified'> }>;
+  exportsMissingFile: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string; dirPresent: boolean; zipState: Exclude<ZipState, 'verified'> }>;
 }
 
 async function eligibleJobIds(db: DbOrTx, ownerId: string, cutoff: Date): Promise<Array<{ id: string; n: number }>> {
@@ -175,7 +185,7 @@ async function exportsBeyondKeep(
   for (const r of runs) {
     const st = await zipState(exportsDir, r, fs);
     if (st === 'verified') verified.push(r);
-    else missing.push({ id: r.id, createdAt: r.createdAt, manifestSha256: r.manifestSha256, dirPresent: await dirPresent(path.join(exportsDir, r.id)), zipState: st });
+    else missing.push({ id: r.id, createdAt: r.createdAt, zipBytes: r.zipBytes, manifestSha256: r.manifestSha256, dirPresent: await dirPresent(path.join(exportsDir, r.id)), zipState: st });
   }
   const effectiveKeep = Math.max(1, keep);
   // 검증된 백업이 keep 보다 적으면 내보내기는 아무것도 지우지 않는다
@@ -185,6 +195,7 @@ async function exportsBeyondKeep(
     id: r.id,
     createdAt: r.createdAt,
     zipBytes: r.zipBytes,
+    runZipBytes: r.zipBytes,
     manifestSha256: r.manifestSha256,
     filePresent: true,
     kind: 'zip' as const,
@@ -193,7 +204,7 @@ async function exportsBeyondKeep(
   for (const m of missing) {
     // ZIP 이 없다고 확인된(absent) 기록의 폴더만. 손상·읽기 실패 ZIP 의 폴더는 마지막으로 읽을 수 있는 사본일 수 있어 남긴다.
     if (m.zipState === 'absent' && m.dirPresent && olderThan(m, newestKept)) {
-      prune.push({ id: m.id, createdAt: m.createdAt, zipBytes: 0, manifestSha256: m.manifestSha256, filePresent: true, kind: 'dir_only' });
+      prune.push({ id: m.id, createdAt: m.createdAt, zipBytes: 0, runZipBytes: m.zipBytes, manifestSha256: m.manifestSha256, filePresent: true, kind: 'dir_only' });
     }
   }
   return { prune, existing: verified.length, missing, kept: prune.length ? kept : [] };
@@ -236,8 +247,10 @@ export interface FileDeleteResult {
 export interface ExportDeleteResult extends FileDeleteResult {
   dirsDeleted: number;
   dirsFailed: number;
-  /** 삭제 직전 재검증에서 손상·읽기 실패(또는 폴더만 정리할 기록에 ZIP 이 다시 생김)로 확인되어 ZIP·폴더를 남긴 후보 수 */
+  /** 삭제 직전 재검증에서 ZIP 이 손상·읽기 실패로 확인되어 ZIP·폴더를 남긴 후보 수 */
   candidatesDamagedKept: number;
+  /** 폴더만 정리하려던 기록에 정상(검증된) ZIP 이 다시 생겨 남긴 후보 수(FIX round 6 — 손상과 구분) */
+  candidatesZipReappeared: number;
 }
 
 export interface RetentionResult {
@@ -354,7 +367,7 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
     exportsAborted: null,
     jobEvents: { jobs: 0, deleted: 0, archive: null, archiveSha256: null, archiveBytes: 0 },
     packages: { deleted: 0, failed: 0, bytes: 0, errorCodes: [] },
-    exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0, candidatesDamagedKept: 0 },
+    exports: { deleted: 0, failed: 0, bytes: 0, errorCodes: [], dirsDeleted: 0, dirsFailed: 0, candidatesDamagedKept: 0, candidatesZipReappeared: 0 },
     outcome: 'complete',
   };
 
@@ -491,8 +504,12 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
         }
       } else result.alreadyAbsent++;
     } else {
-      // 폴더만 정리: 그 사이 ZIP 이 다시 생겼으면(absent 가 아님) 건드리지 않는다
-      const st = await zipState(exportsDir, { id: e.id, zipBytes: e.zipBytes, manifestSha256: e.manifestSha256 }, opts.zipFs, { noCache: true });
+      // 폴더만 정리: 그 사이 ZIP 이 다시 생겼으면 건드리지 않는다. 실행 기록의 zip_bytes 로 검증해 정상(다시 생김)과 손상을 나눈다(FIX round 6).
+      const st = await zipState(exportsDir, { id: e.id, zipBytes: e.runZipBytes, manifestSha256: e.manifestSha256 }, opts.zipFs, { noCache: true });
+      if (st === 'verified') {
+        result.exports.candidatesZipReappeared++;
+        continue;
+      }
       if (st !== 'absent') {
         result.exports.candidatesDamagedKept++;
         continue;
@@ -510,7 +527,7 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
   result.exports.errorCodes.sort();
 
   // ③ 실제 결과 기록
-  if (result.exportsAborted || result.packages.failed || result.exports.failed || result.exports.dirsFailed || result.exports.candidatesDamagedKept) result.outcome = 'partial';
+  if (result.exportsAborted || result.packages.failed || result.exports.failed || result.exports.dirsFailed || result.exports.candidatesDamagedKept || result.exports.candidatesZipReappeared) result.outcome = 'partial';
   // FIX round 4(P2): 파일 계획이 있었으면 실제 삭제가 0건이어도(모두 이미 없음·내보내기 중단) 결과를 남긴다 — 중단과 구분
   if (plan.packages.length + plan.exports.length > 0) {
     await recordAudit(db, {
@@ -524,6 +541,7 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
         exports_aborted: result.exportsAborted,
         outcome: result.outcome,
         candidates_damaged_kept: result.exports.candidatesDamagedKept,
+        candidates_zip_reappeared: result.exports.candidatesZipReappeared,
         packages_deleted: result.packages.deleted,
         packages_failed: result.packages.failed,
         packages_bytes: result.packages.bytes,

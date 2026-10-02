@@ -16,4 +16,9 @@
 - [P1] packages/db/src/oauth.ts:575 — 갱신 토큰 저장 중 예외가 발생하면 발급 토큰 정리를 건너뜀
 - 답 요지: 세션 검사 후 state 소비·restore 단방향 needs_reconnect·회전 exit 1 은 타당; reconnect_required_accounts 는 복원 화면에도 표시 필요; 실제 PostgreSQL 잠금 대기·프록시 뒤 콜백·서버 접근 로그는 미확인(not_run).
 
-## FIX2-T13 (round 2: review-FIX-T13) — (판정 대기)
+## FIX2-T13 (dfc9842, round 2: review-FIX-T13) — CHANGES_REQUESTED (P1 1·P2 1)
+- [P1] packages/db/src/oauth.ts:690 — 갱신 토큰 저장 실패 후 무효화된 기존 토큰을 `active` 상태로 남긴다
+- [P2] packages/db/src/secrets-cli.ts:51 — DB 종료 오류를 삼켜 CLI가 성공을 반환한다
+- 답 요지: 해제 번호·작업 식별자·저장 결과 불명 시 즉시 철회 안 함은 타당; 결과 불명 T2 의 나중 정리를 보장하려면 내구성 있는 기록 필요; lease 테스트는 시간 확대보다 명시적 장벽·제어 시계 권고.
+
+## FIX3-T13 (round 3: review-FIX2-T13) — (클라우드 세션에서 구현 중, 로컬 복귀 후 Codex 검증)

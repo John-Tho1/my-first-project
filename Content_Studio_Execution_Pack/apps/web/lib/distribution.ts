@@ -6,6 +6,7 @@ import {
   adapterIdFor,
   AppError,
   CREDENTIAL_STATUS_LABEL,
+  formatMsk,
   formatMskInline,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
@@ -815,4 +816,46 @@ export function accountHealthLine(a: AccountHealthLike): { label: string; warn: 
   if (a.status === 'not_connected' && a.mock && !blocked) parts.push('모의 배포는 연결 없이 가능(결과는 MOCK)');
   if (blocked) parts.push('배포 실행 차단');
   return { label, warn: !a.usable_for_execution, text: parts.join(' — ') };
+}
+
+// ---- M4 화면 FIX(S4·S5): YouTube 업로드 패널 세션 문구 · 예약 공개 시각 요청/적용 구분 ----
+
+/** M4 화면 FIX(S4): 공통 MOCK 안내(세션 유무와 무관). */
+export const YOUTUBE_MOCK_DISCLAIMER = '실제 YouTube 로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.';
+
+/**
+ * M4 화면 FIX(S4): YouTube 업로드 패널 아래 안내. 최근 작업에 upload_session 단계가 있을 때만 "(세션 있음)" 문구를 붙인다.
+ * 세션이 없으면 "아직 업로드 세션 없음" 줄(패널 본문)과 공통 MOCK 안내만 남는다. 세션 URI 는 어느 경우에도 내지 않는다.
+ */
+export function youtubeSessionNote(x: { hasSession: boolean }): string {
+  return x.hasSession ? `세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음). ${YOUTUBE_MOCK_DISCLAIMER}` : YOUTUBE_MOCK_DISCLAIMER;
+}
+
+export type PublishAtState = 'requested' | 'applied' | 'not_applied';
+
+export interface PublishAtView {
+  state: PublishAtState;
+  text: string;
+  /** 원격이 적용하지 않음 — 경고 표시. */
+  warn: boolean;
+}
+
+/**
+ * M4 화면 FIX(S5, D27): 요청한 예약 공개 시각(승인 스냅샷 provider_metadata.publish_at)과 원격이 보고한 결과를 구분한다.
+ * - 결과 전: 요청한 시각(요청만, 원격 결과 전).
+ * - SCHEDULED_REMOTE: 원격이 예약을 보고함 → 적용.
+ * - 그 밖의 결과(UPLOADED_PRIVATE·PUBLISHED 등): 원격이 적용하지 않음. UPLOADED_PRIVATE 는 미검증 프로젝트가 비공개로 강제하고 publishAt 을 버린 경우.
+ * publish_at 이 없으면 null(표시 없음). 결과 종류는 원격이 보고한 값만 쓴다(요청값으로 추정하지 않음).
+ */
+export function publishAtView(x: { publishAt: string | null | undefined; resultKind: string | null | undefined; isMock: boolean }): PublishAtView | null {
+  if (!x.publishAt) return null;
+  const at = Number.isFinite(Date.parse(x.publishAt)) ? formatMsk(x.publishAt) : '시각 미확인';
+  const mock = x.isMock ? ', MOCK' : '';
+  if (!x.resultKind) return { state: 'requested', text: `요청한 예약 공개 시각: ${at} — 원격 결과 전(요청만)`, warn: false };
+  if (x.resultKind === 'SCHEDULED_REMOTE') return { state: 'applied', text: `예약 공개(원격 publishAt 적용): ${at}${x.isMock ? ' (MOCK)' : ''}`, warn: false };
+  const why =
+    x.resultKind === 'UPLOADED_PRIVATE'
+      ? `미검증 프로젝트 등으로 비공개로 강제${mock}`
+      : `원격 결과: ${RESULT_KIND_LABEL[x.resultKind] ?? x.resultKind}${mock}`;
+  return { state: 'not_applied', text: `요청한 예약 공개 시각: ${at} — 원격이 적용하지 않음(${why})`, warn: true };
 }

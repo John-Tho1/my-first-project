@@ -28,6 +28,9 @@ import {
   revocationCountParam,
   revocationNotice,
   stepsPanelView,
+  publishAtView,
+  YOUTUBE_MOCK_DISCLAIMER,
+  youtubeSessionNote,
 } from './distribution';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
@@ -446,5 +449,69 @@ describe('accountHealthLine — M4 화면 FIX(S3): 배포 계정 연결 상태(�
   it('다시 연결 필요·만료됨: 배포 실행 차단', () => {
     expect(h('needs_reconnect').text).toBe('다시 연결 필요 — 배포 실행 차단');
     expect(h('expired').text).toBe('만료됨 — 배포 실행 차단');
+  });
+});
+
+describe('M4 화면 FIX(S4) — YouTube 업로드 패널: "(세션 있음)" 은 세션이 있을 때만', () => {
+  it('세션 없음: 공통 MOCK 안내만, "세션 있음" 문구 없음', () => {
+    const t = youtubeSessionNote({ hasSession: false });
+    expect(t).toBe(YOUTUBE_MOCK_DISCLAIMER);
+    expect(t).not.toContain('세션 있음');
+    expect(t).not.toContain('세션 URI');
+  });
+
+  it('세션 있음: 세션 URI 미표시 안내(세션 있음) + 공통 MOCK 안내', () => {
+    const t = youtubeSessionNote({ hasSession: true });
+    expect(t).toContain('세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음)');
+    expect(t.endsWith(YOUTUBE_MOCK_DISCLAIMER)).toBe(true);
+  });
+});
+
+describe('M4 화면 FIX(S5, D27) — 요청한 예약 공개 시각과 원격 결과 구분(publishAtView)', () => {
+  const publishAt = '2026-10-04T07:00:00.000Z'; // 10:00 MSK
+
+  it('publish_at 없음: 표시 없음', () => {
+    expect(publishAtView({ publishAt: null, resultKind: 'UPLOADED_PRIVATE', isMock: true })).toBeNull();
+    expect(publishAtView({ publishAt: undefined, resultKind: null, isMock: true })).toBeNull();
+  });
+
+  it('결과 전: 요청만(원격 결과 전), 경고 아님, "적용" 이라고 하지 않음', () => {
+    const v = publishAtView({ publishAt, resultKind: null, isMock: true })!;
+    expect(v.state).toBe('requested');
+    expect(v.warn).toBe(false);
+    expect(v.text).toContain('요청한 예약 공개 시각');
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).toContain('원격 결과 전');
+    expect(v.text).not.toContain('적용');
+  });
+
+  it('SCHEDULED_REMOTE: 원격 적용으로 표시(MOCK 이면 MOCK)', () => {
+    const v = publishAtView({ publishAt, resultKind: 'SCHEDULED_REMOTE', isMock: true })!;
+    expect(v.state).toBe('applied');
+    expect(v.warn).toBe(false);
+    expect(v.text).toMatch(/^예약 공개\(원격 publishAt 적용\): .+ \(MOCK\)$/);
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).not.toContain('적용하지 않음');
+  });
+
+  it('UPLOADED_PRIVATE(미검증 프로젝트가 비공개 강제·publishAt 버림): 원격이 적용하지 않음 + 경고', () => {
+    const v = publishAtView({ publishAt, resultKind: 'UPLOADED_PRIVATE', isMock: true })!;
+    expect(v.state).toBe('not_applied');
+    expect(v.warn).toBe(true);
+    expect(v.text).toContain('요청한 예약 공개 시각');
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).toContain('원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, MOCK)');
+    expect(v.text).not.toContain('원격 publishAt 적용');
+  });
+
+  it('PUBLISHED 등 다른 결과: 원격이 적용하지 않음 + 원격 결과 종류', () => {
+    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: false })!;
+    expect(v.state).toBe('not_applied');
+    expect(v.text).toContain('원격이 적용하지 않음(원격 결과: 게시)');
+    expect(v.text).not.toContain('MOCK');
+  });
+
+  it('잘못된 시각: 시각 미확인', () => {
+    expect(publishAtView({ publishAt: 'nope', resultKind: null, isMock: true })!.text).toContain('시각 미확인');
   });
 });

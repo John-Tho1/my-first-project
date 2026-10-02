@@ -14,6 +14,7 @@ import {
   mockScenarioOptionsFor,
   PLAN_STATUS_LABEL,
   problemLabel,
+  publishAtView,
   reconciledNotice,
   remoteStepLine,
   REQUESTED_RESULT_LABEL,
@@ -24,6 +25,7 @@ import {
   VISIBILITY_LABEL,
   YOUTUBE_STEP_LABEL,
   youtubeProgressLine,
+  youtubeSessionNote,
 } from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
 
@@ -196,7 +198,8 @@ function YouTubeSteps({ x }: { x: PlanItemDetail }) {
           {requested !== 'private' && pub.remoteVisibility === 'private' ? ' — 미검증 프로젝트 등으로 비공개로 제한됨(공개 성공 아님)' : ''}
         </p>
       ) : null}
-      <p className="note">세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음). 실제 YouTube 로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.</p>
+      {/* M4 화면 FIX(S4): "(세션 있음)" 은 upload_session 단계가 있을 때만 */}
+      <p className="note">{youtubeSessionNote({ hasSession: sessions.length > 0 })}</p>
     </>
   );
 }
@@ -247,6 +250,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     publishAt: providerMetadataOf(p).publish_at ?? null,
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
   });
+  // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
+  const publishAt = publishAtView({ publishAt: providerMetadataOf(p).publish_at ?? null, resultKind: latestPub?.resultKind ?? null, isMock: latestPub?.isMock ?? x.account?.kind === 'mock' });
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
@@ -278,7 +283,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               ? `비공개 업로드(upload_private${x.account?.kind === 'mock' ? ' — MOCK' : ''})`
               : `공개 게시 계획(public_publish${x.account?.kind === 'mock' ? ' — MOCK' : ''})`}
         </span>
-        {providerMetadataOf(p).publish_at ? <span>예약 공개(원격 publishAt): {formatMsk(providerMetadataOf(p).publish_at!)}</span> : null}
+        {publishAt ? <span className={publishAt.warn ? 'tag warn' : undefined}>{publishAt.text}</span> : null}
         {x.activeApproval ? <span className="tag">승인됨</span> : null}
       </p>
       {x.problems.length ? (

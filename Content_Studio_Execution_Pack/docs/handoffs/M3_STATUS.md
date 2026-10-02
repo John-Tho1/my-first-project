@@ -53,3 +53,8 @@ D20: M4/T13(OAuth·비밀 암호화)은 사용자가 첫 채널(Threads 권고)�
 - 보존 정리의 동시 실행·JSONL 줄 수는 같지만 내용 손상·삭제 도중 부분 실패는 테스트 밖(Codex 놓친 케이스).
 - 훈련 PASS 는 "지금 DB 를 빈 환경에 복원하면 같아진다"는 뜻. 보관 중인 과거 ZIP 의 온전함은 별도 훈련이 필요(Q5).
 - 운영(PostgreSQL) 환경 훈련 통과는 M7/운영 전 별도.
+
+## D23 — D22 사용자 결정 확정 (2026-10-02)
+(a) 기준값 확정, (b)(b2) manual·손상 ZIP 무기한 보존 유지, (c) 백업은 PC 안, 백업 나이는 마지막 완료 export 기준 유지, (d) 외부 알림 없음 — 코드 변경 없음.
+(e) 공개 `/api/health` 에서 `ops` 제거, 로그인 필요한 `GET /api/ops/summary`(owner 범위)로 이동 — 커밋 f7fbae8, Codex **PASS**. 검사: lint·typecheck·build·unit 589·integration 415·drill:mock 0. 실서버 확인: health 200(ops 없음), summary 무세션 401.
+남은 사용자 결정: 공개 health 의 `jobs`·`uploads`·`db.captures` 도 세션 뒤로 옮길지(Codex 권고: 옮김).

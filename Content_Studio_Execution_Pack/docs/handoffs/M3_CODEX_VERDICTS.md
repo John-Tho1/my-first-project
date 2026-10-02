@@ -77,3 +77,7 @@
 
 ## FIX6-T20 (6e99eef, round 6: review-FIX5-T20 반영) — **PASS** (지적 없음)
 - 남은 "놓친 케이스"(테스트 보강 제안, 결함 아님): 재등장 테스트에서 outcome partial·rmDir 0회 직접 검증, partialRetentionSweeps 의 owner 격리·표시 한도·동일 시각 정렬, 재등장으로 보존한 ZIP 의 다음 정리 재평가, 감사 JSON 의 배열·불리언·음수·빈 문자열 sweep_id. 실제 PostgreSQL 다중 프로세스 삭제 경쟁은 not_run.
+
+## D23 (f7fbae8, 공개 /api/health 에서 ops 제거 → GET /api/ops/summary) — **PASS** (지적 없음)
+- 답 요지: 공개 health 에 남은 `jobs`(attention_plans 포함)·`uploads`·`db.captures` 도 세션 뒤로 옮기기를 권고(이번 결정 범위 밖 → 사용자 결정 대상). 폴더 바이트를 owner 응답에 포함하는 것은 단일 owner 배포에서만 허용 가능.
+- 놓친 케이스(테스트 보강 제안): 503 응답에도 ops 없음, A·B 각각 비영 데이터 분리, 만료 세션 401, 반복 실패 50개 초과 — 마지막 항목은 오케스트레이터가 확인: `repeatedFailures` 쿼리에 상한 없음(결함 아님).

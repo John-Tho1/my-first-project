@@ -76,9 +76,16 @@ const verifierAad = (ownerId: string, accountId: string, stateId: string): Secre
   scopeId: stateId,
 });
 
-function encodeTokens(t: OAuthTokenSet): string {
-  return JSON.stringify({ v: 1, access_token: t.accessToken, refresh_token: t.refreshToken });
+/**
+ * 봉인할 평문. T15(D27): Google 형 공급자의 짧은 access token 만료(access_expires_at)는 있을 때만 넣는다 — Threads 토큰의 평문 모양은 그대로.
+ */
+function encodeTokens(t: OAuthTokenSet | StoredOAuthTokens): string {
+  const accessExp = 'accessExpiresAt' in t && t.accessExpiresAt ? (t.accessExpiresAt instanceof Date ? t.accessExpiresAt.toISOString() : t.accessExpiresAt) : null;
+  return JSON.stringify({ v: 1, access_token: t.accessToken, refresh_token: t.refreshToken, ...(accessExp ? { access_expires_at: accessExp } : {}) });
 }
+
+/** T15: 보내기 전에 갱신할 여유(access token 이 이 시간 안에 만료되면 갱신). */
+export const ACCESS_TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
 
 function decodeTokens(plain: string): StoredOAuthTokens {
   let v: unknown;
@@ -87,11 +94,18 @@ function decodeTokens(plain: string): StoredOAuthTokens {
   } catch {
     throw new SecretDecryptError('malformed');
   }
-  const o = v as { v?: unknown; access_token?: unknown; refresh_token?: unknown };
+  const o = v as { v?: unknown; access_token?: unknown; refresh_token?: unknown; access_expires_at?: unknown };
   if (o.v !== 1 || typeof o.access_token !== 'string' || !(o.refresh_token === null || typeof o.refresh_token === 'string')) {
     throw new SecretDecryptError('malformed');
   }
-  return { accessToken: o.access_token, refreshToken: o.refresh_token };
+  if (o.access_expires_at !== undefined && (typeof o.access_expires_at !== 'string' || !Number.isFinite(Date.parse(o.access_expires_at)))) {
+    throw new SecretDecryptError('malformed');
+  }
+  return {
+    accessToken: o.access_token,
+    refreshToken: o.refresh_token,
+    ...(typeof o.access_expires_at === 'string' ? { accessExpiresAt: o.access_expires_at } : {}),
+  };
 }
 
 async function ownedAccount(db: DbOrTx, ownerId: string, accountId: string, lock?: 'update'): Promise<AccountRow> {
@@ -451,7 +465,7 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
     throw new OAuthFlowError('oauth_exchange_failed', { reason: code });
   }
   // 여기부터 공급자에 유효한 토큰이 있다 — 저장하지 못하면 철회한다.
-  const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
+  const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, accessExpiresAt: tokens.accessExpiresAt ? tokens.accessExpiresAt.toISOString() : null };
   const placeholder = { provider: provider.id, isMock: provider.mock };
   // FIX3-T13(놓친 케이스): 정리 철회가 실패·불명이면 받은 토큰을 봉인해 정리 대기(cleanup_revoke)로 남긴다 — 연결 정보 행이 없으면
   // (첫 연결) 해제 상태의 자리 표시 행에. 정리될 때까지 이 계정 실행 차단, 다음 확인·tick 이 다시 철회한다.
@@ -647,6 +661,10 @@ export async function readAccessTokenForSend(
       if (!cred || cred.revokedAt || !cred.encryptedToken || cred.keyVersion === null) return { ok: false, code: 'credential_missing' };
       try {
         const tokens = decodeTokens(openSecret(ring, cred.encryptedToken, cred.keyVersion, tokenAad(input.ownerId, account.id)));
+        // T15(D27): 짧은 access token(Google 형)이 만료(또는 곧 만료)면 토큰을 내주지 않는다 — 호출자가 T13 갱신 경로를 한 번 부른 뒤 다시 읽는다.
+        if (tokens.accessExpiresAt && Date.parse(tokens.accessExpiresAt) <= now.getTime() + ACCESS_TOKEN_REFRESH_MARGIN_MS) {
+          return { ok: false, code: 'credential_access_token_stale' };
+        }
         return { ok: true, token: tokens.accessToken };
       } catch (e) {
         if (!(e instanceof SecretDecryptError)) throw e;
@@ -712,7 +730,7 @@ export async function refreshCredential(
   // FIX3-T13(Codex review-FIX2-T13 P1 :690·Q14·놓친 케이스): 저장 안 됨이 확인되면 T2 를 철회하고 **읽었던 세대가 아직 현재일 때만** 연결 정보를
   // error(refresh_store_failed)로 — 공급자가 T1 을 이미 무효로 했을 수 있으므로 실행 차단. 판정 불가(refresh_unknown)·정리 철회 실패/불명
   // (cleanup_revoke)는 T2 를 봉인해 정리 대기 표시로 남기고 error(차단) — 다음 확인·갱신·worker tick 이 정리한다(reconcilePendingCredential).
-  const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
+  const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, accessExpiresAt: tokens.accessExpiresAt ? tokens.accessExpiresAt.toISOString() : null };
   const afterIssuanceFailure = async (reason: 'store_failed' | 'credential_changed', extra: Record<string, string | number | null> = {}) => {
     const cleanup = await revokeAtProvider(s.provider, issued, now);
     const failedCleanup = cleanupFailed(cleanup.result);
@@ -847,7 +865,7 @@ interface IssuanceMark {
 
 const pendingAad = (ownerId: string, accountId: string): SecretAad => ({ ownerId, channelAccountId: accountId, purpose: 'oauth_pending_token' });
 
-const encodePending = (t: StoredOAuthTokens) => JSON.stringify({ v: 1, access_token: t.accessToken, refresh_token: t.refreshToken });
+const encodePending = (t: StoredOAuthTokens) => encodeTokens(t);
 
 /** 살아 있는 연결 정보(토큰 있음·해제 아님·해제 중 아님) */
 const liveCredential = (cred: OAuthCredentialRow | null): cred is OAuthCredentialRow =>

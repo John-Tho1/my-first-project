@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { canTransitionJob as canT15, decideRetryAt as decideRetryAtT15, REMOTE_STEP_KIND_STATUSES as KS15 } from './jobs';
 import {
   ACTIVE_JOB_STATES,
   canTransitionJob,
@@ -261,5 +262,27 @@ describe('T14(D26) resume·local_rate_limited 전이, 로컬 요청 제한, 시�
     expect(scenarioApplies('mock_threads', 'success')).toBe(true);
     expect(THREADS_MOCK_SCENARIOS).toHaveLength(8);
     for (const s of THREADS_MOCK_SCENARIOS) expect(MOCK_SCENARIO_VALUES).toContain(s);
+  });
+});
+
+// ---- T15(D27) ----
+
+describe('T15(D27) 전이·재시도 시각·단계 상태', () => {
+  it('CANCEL_REQUESTED 에서 원격 처리 실패 확인 → FAILED(취소 성공이라고 하지 않음), UNKNOWN 에는 여전히 재전송 전이 없음', () => {
+    expect(canT15('CANCEL_REQUESTED', 'permanent_failure')).toBe(true);
+    expect(canT15('UNKNOWN', 'lease')).toBe(false);
+    expect(canT15('UNKNOWN', 'resume')).toBe(false);
+  });
+  it('decideRetryAt: 한도 안이면 그 시각(최소 지금 + 1초), 한도면 FAILED — Retry-After 1시간 상한을 쓰지 않는다', () => {
+    const now = new Date('2026-10-02T10:00:00Z');
+    const at = new Date('2026-10-03T07:00:00Z');
+    expect(decideRetryAtT15(1, 5, at, now)).toEqual({ retry: true, nextRunAt: at });
+    expect(decideRetryAtT15(1, 5, new Date(now.getTime() - 5000), now)).toEqual({ retry: true, nextRunAt: new Date(now.getTime() + 1000) });
+    expect(decideRetryAtT15(5, 5, at, now)).toEqual({ retry: false, reason: 'max_attempts' });
+  });
+  it('단계 종류별 상태(DB CHECK 와 같은 표)', () => {
+    expect(KS15.upload_session).toEqual(['created', 'finished', 'expired', 'error']);
+    expect(KS15.video).toEqual(['uploaded', 'processed', 'error']);
+    expect(KS15.publish).toEqual(['published']);
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { buildCanonicalPayload as buildT15, canonicalPayloadProblems as problemsT15, payloadHash as hashT15, providerMetadataOf as pmT15 } from './distribution';
 import {
   approveSchema,
   buildCanonicalPayload,
@@ -302,5 +303,42 @@ describe('FIX-T10(P0) restoredItemStatus — 복원은 결과 불명을 BLOCKED 
     for (const s of ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED']) expect(restoredItemStatus(s), s).toBe('UNKNOWN');
     for (const s of ['QUEUED', 'RETRY_WAIT']) expect(restoredItemStatus(s), s).toBe('BLOCKED');
     for (const s of ['PLANNED', 'CONFIRMED', 'BLOCKED', 'CANCELED', 'FAILED', 'PARTIAL']) expect(restoredItemStatus(s), s).toBeNull();
+  });
+});
+
+// ---- T15(D27): provider_metadata.publish_at ----
+
+describe('T15(D27) provider_metadata.publish_at', () => {
+  const base = {
+    contentVersionId: '00000000-0000-4000-8000-000000000001',
+    variantVersionId: '00000000-0000-4000-8000-000000000002',
+    brandProfileVersionId: null,
+    channelAccountId: '00000000-0000-4000-8000-000000000003',
+    providerAccountId: 'mock:youtube:x',
+    channel: 'youtube' as const,
+    body: '제목\n설명',
+    metadata: { title: '제목', description: '설명', script: '제목\n설명', tags: [] },
+    assets: [],
+    visibility: 'private' as const,
+    scheduledAtUtc: null,
+    timezone: 'Europe/Moscow',
+  };
+  it('publish_at 이 없으면 provider_metadata 는 {} — 기존 payload·hash 그대로, 있으면 hash 가 달라진다(승인 대상)', () => {
+    const a = buildT15(base);
+    const b = buildT15({ ...base, providerMetadata: null });
+    const c = buildT15({ ...base, providerMetadata: { publish_at: '2026-10-09T09:00:00.000Z' } });
+    expect(a.provider_metadata).toEqual({});
+    expect(hashT15(a)).toBe(hashT15(b));
+    expect(c.provider_metadata).toEqual({ publish_at: '2026-10-09T09:00:00.000Z' });
+    expect(hashT15(c)).not.toBe(hashT15(a));
+    expect(pmT15(c)).toEqual({ publish_at: '2026-10-09T09:00:00.000Z' });
+    expect(pmT15(a)).toEqual({});
+  });
+  it('묶음 스키마: YouTube 만 publish_at 허용, 다른 채널·모르는 키는 거부', () => {
+    const c = buildT15({ ...base, providerMetadata: { publish_at: '2026-10-09T09:00:00.000Z' } });
+    expect(problemsT15(c)).toEqual([]);
+    expect(problemsT15({ ...c, provider_metadata: { publish_at: '2026-10-09T09:00:00.000Z', extra: 1 } })).not.toEqual([]);
+    const t = buildT15({ ...base, channel: 'threads', metadata: { text: '제목', thread_parts: ['제목'] } });
+    expect(problemsT15({ ...t, provider_metadata: { publish_at: '2026-10-09T09:00:00.000Z' } })).not.toEqual([]);
   });
 });

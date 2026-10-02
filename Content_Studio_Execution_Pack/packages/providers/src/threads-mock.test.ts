@@ -60,7 +60,18 @@ function memSteps(): RemoteStepsPort & { rows: RemoteStep[] } {
         if ((rank[s.status] ?? 0) > (rank[ex.status] ?? 0)) ex.status = s.status;
         return { ...ex };
       }
-      const r: RemoteStep = { ...s, step_index: rows.length, created_at: now, updated_at: now };
+      const r: RemoteStep = {
+        kind: s.kind,
+        post_index: s.post_index,
+        remote_id: s.remote_id,
+        status: s.status,
+        received_bytes: s.received_bytes ?? null,
+        total_bytes: s.total_bytes ?? null,
+        resume_count: 0,
+        step_index: rows.length,
+        created_at: now,
+        updated_at: now,
+      };
       rows.push(r);
       return { ...r };
     },

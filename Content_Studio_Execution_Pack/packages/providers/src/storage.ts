@@ -7,7 +7,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import path from 'node:path';
 import { assertValidStorageKey, ObjectStorageNotImplementedError, type AppConfig } from '@cs/domain';
@@ -23,7 +23,15 @@ export interface StorageAdapter {
   putFile(key: string, srcPath: string): Promise<void>;
   /** T08: 스트리밍 읽기(큰 파일 다운로드). 없으면 null. */
   openStream(key: string): Promise<{ stream: ReadableStream<Uint8Array>; bytes: number } | null>;
+  /**
+   * T15(D27): [start, end) 바이트만 읽는다(YouTube 재개 업로드의 조각 — 큰 영상을 메모리에 한꺼번에 올리지 않음).
+   * 파일이 없거나 범위가 파일 밖이면 던진다(짧게 읽고 성공한 척하지 않는다).
+   */
+  readRange(key: string, start: number, end: number): Promise<Uint8Array>;
 }
+
+/** T15: 한 번에 읽을 수 있는 최대 범위(조각 크기 상한 — 실수로 2GB 를 한 번에 읽지 않게). */
+export const STORAGE_MAX_RANGE_BYTES = 64 * 1024 * 1024;
 
 export class LocalStorageAdapter implements StorageAdapter {
   readonly driver = 'local' as const;
@@ -96,6 +104,24 @@ export class LocalStorageAdapter implements StorageAdapter {
         await rm(/*turbopackIgnore: true*/ tmp, { force: true }).catch(() => undefined);
       }
       await rm(/*turbopackIgnore: true*/ srcPath, { force: true });
+    }
+  }
+
+  async readRange(key: string, start: number, end: number): Promise<Uint8Array> {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) throw new RangeError('잘못된 읽기 범위입니다');
+    if (end - start > STORAGE_MAX_RANGE_BYTES) throw new RangeError('한 번에 읽을 수 있는 범위를 넘었습니다');
+    const fh = await open(/*turbopackIgnore: true*/ this.pathFor(key), 'r');
+    try {
+      const out = new Uint8Array(end - start);
+      let got = 0;
+      while (got < out.byteLength) {
+        const { bytesRead } = await fh.read(out, got, out.byteLength - got, start + got);
+        if (bytesRead === 0) throw new RangeError('파일 끝을 넘는 읽기 범위입니다');
+        got += bytesRead;
+      }
+      return out;
+    } finally {
+      await fh.close();
     }
   }
 

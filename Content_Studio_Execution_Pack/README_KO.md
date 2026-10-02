@@ -434,6 +434,19 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 화면 `/distribute/[id]`: Threads 항목에 단계 목록(`게시물 n/m · 컨테이너 생성됨/컨테이너 준비됨/게시됨(MOCK)/컨테이너 오류 · 모의 ID`)과 T13 연결 상태 한 줄, MOCK 배지·"실제 발행 실적 아님". 개발용 시나리오: `threads_success`·`threads_container_slow`·`threads_publish_timeout_sent`·`threads_publish_timeout_not_sent`·`threads_thread_partial`·`threads_rate_limited`·`threads_token_invalid`·`threads_text_too_long`(Threads 모의 항목에만 — 일반 항목에는 400 `scenario_not_applicable`, `success` 는 둘 다). 시나리오는 시뮬레이터만 바꾸고 payload·hash 는 그대로.
 - 내보내기·복원: `remote_steps` 는 내보내기만(복원 안 함 — 원격 결과는 복원 환경이 다시 확인). `pnpm drill:mock` 은 M3 표 다음에 Threads 모의 표(중복 컨테이너·중복 게시·스레드 전체 전 publication 없음 불변식)를 찍는다.
 
+### YouTube 재개 업로드 (M4, T15 — 모의)
+결정 D27(docs/DECISIONS.md). **모의 어댑터·모의 Google OAuth 만 — 실제 Google/YouTube API 호출·OAuth 앱 등록·실계정·네트워크 0.** 실계정 시험은 **`blocked_external`**(Google Cloud 프로젝트·OAuth 동의 화면·실제 scope 이름·테스트 채널·API 프로젝트 감사 여부·첫 시험 영상과 공개 범위를 사용자에게 받고 정확한 범위를 승인받기 전에는 하지 않는다). 모의 통과는 실계정 통과가 아니다.
+- 연결: 설정 → 배포 계정 연결에서 YouTube 모의 계정 `연결(모의)` → 앱 안의 **Google 형 모의 동의 화면**(`/api/oauth/mock-google/authorize`, authorization code + PKCE S256 + state) → T13 callback. scope 는 업로드용 **자리 표시 이름 `youtube.upload(mock)`**(실제 Google scope 이름 아님 — live 전에 공식 문서로 확인). access token(`mockyt_at_…`) 1시간·refresh token(`mockyt_rt_…`) 180일(모의 값), 연결 만료 표시는 refresh 기준. 보내기 직전에 access token 이 지났으면 T13 갱신 경로(세대·정리 규칙 그대로)로 한 번 갱신한다. 토큰은 T13 과 같이 봉인 저장, 응답·로그·내보내기에 없다.
+- 어댑터 선택(`adapterIdFor`): 모의 + YouTube + 연결한 적 있음 → **YouTube 모의 어댑터**. seed 모의 계정(연결 없음)은 M3 일반 어댑터 그대로(M3·Threads 시험·훈련 불변).
+- 계획: 연결한 YouTube 모의 계정은 `upload_private`(기본) 또는 `public_publish` 만(`mock_publish` 400). `upload_private` = private + 예약 공개 없음. `public_publish` = public·unlisted, 또는 private + **예약 공개 `publish_at`**(MSK, 미래만 — 승인 스냅샷 `provider_metadata.publish_at` 에 들어가 hash 대상). 비공개 업로드 계획에 publish_at → 400. 예약 공개 시각이 지나면 승인 무효(`publish_at_passed`).
+- 업로드: VERIFIED 영상 파일(T08)을 저장소에서 **조각(기본 8MiB)씩 범위로 읽어** 올린다(파일 전체를 메모리에 올리지 않음). 세션 URI 는 첫 조각 전에, 받은 바이트는 조각마다 `remote_steps`(`upload_session` — 받은 바이트는 DB 트리거로 앞으로만)에 짧은 트랜잭션으로 기록, 조각마다 heartbeat·취소 확인. 끊김·시간 초과 → `RECONCILING` → 조회가 같은 세션의 받은 바이트를 물어 `resumable` → 다음 시도가 **같은 세션**으로 이어 올린다(A14 — 처음부터 다시 올리지 않음). 마지막 조각 응답 유실 → 조회가 영상 ID 를 찾는다(A08 — 두 번째 업로드 없음). 만료된 세션(영상 없음이 확인됨) → 새 세션. 세션을 모르는 원격(재시작) → 확인 불가 3회 뒤 `UNKNOWN`.
+- 처리·결과: 마지막 조각 뒤 영상 ID(`mockyt_v_…`)를 기록하고 `REMOTE_PROCESSING` → 조회가 처리 끝을 확인하면 CONFIRMED + 결과 종류 `UPLOADED_PRIVATE`(비공개) / `SCHEDULED_REMOTE`(비공개 + publishAt) / `PUBLISHED`(검증된 프로젝트의 public·unlisted 만). 처리 실패·거부 → FAILED. **미검증 API 프로젝트(모의 기본값)는 public 요청도 private 로 강제** — CONFIRMED 지만 화면은 `비공개 업로드 완료, 공개 전환 확인 필요`, 작업 이력에 요청·실제 공개 범위를 함께 남긴다(A12). 결과는 `mock:youtube:…`·`mock://youtube/watch/…`, MOCK.
+- 화면 `/distribute/[id]`: `업로드 n% (x/y MB) · 세션 재개 n회`, 처리 상태, 결과 문구(`비공개 업로드 완료, 공개 전환 확인 필요` / `비공개 업로드 + 예약 공개 YYYY-MM-DD HH:mm MSK (원격 예약, 확인 필요)` / `공개 게시 확인(MOCK)`) — "게시 완료" 없음, MOCK 배지·"실제 발행 실적 아님". 세션 URI 는 화면·API·로그에 내지 않는다(`세션 있음`), 내보내기 묶음에서는 가린다(`mock-redacted:session:…`).
+- 할당량: 잠정 로컬 할당량(24시간 업로드 시작 6회 = 10,000 ÷ 1,600 단위 추정, 확인일 없음)을 `upload_session` 기록으로 센다 — 넘으면 전송 의도·세션 없이 `RETRY_WAIT`(`할당량 소진 — HH:mm MSK 이후 재시도`). 원격 403 quotaExceeded 도 초기화 시각까지 대기(세션 없음).
+- 취소: 영상이 생기기 전이면 멈추고 CANCELED. 업로드 뒤에는 삭제가 범위 밖이라 원격 확인 뒤 CONFIRMED + `업로드됨 — 삭제는 별도 동작(범위 밖)`.
+- 개발용 시나리오(YouTube 모의 항목에만): `youtube_success_private`·`youtube_processing_slow`·`youtube_network_drop`·`youtube_response_lost_after_complete`·`youtube_session_expired_before_complete`·`youtube_quota_exceeded`·`youtube_token_invalid`·`youtube_rejected`·`youtube_public_unverified_forced_private`·`youtube_scheduled_private`·`youtube_project_verified`(시험·개발 전용 — 검증된 프로젝트 흉내). payload·hash 는 바꾸지 않는다.
+- `pnpm drill:mock` 은 Threads 표 다음에 YouTube 모의 표(영상 1개·유효 세션 재사용·보낸 바이트 < 2×·미검증 프로젝트 PUBLISHED 없음·처리 전 publication 없음)를 찍는다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -446,7 +459,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
-| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
 | `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(연결 정보·진행 중 연결 요청·정리 대기 봉인별 다시 봉인 대상·현재 키·그 사이 바뀌어 건너뜀·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰·DB 오류 메시지 본문은 출력하지 않음(오류는 허용된 종류 이름·모양이 맞는 코드만) | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금·DB 닫기 실패면 안내 후 exit 1 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |

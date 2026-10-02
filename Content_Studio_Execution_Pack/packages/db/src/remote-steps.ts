@@ -22,14 +22,27 @@ export function remoteStepOf(r: RemoteStepRow): RemoteStep {
     step_index: r.stepIndex,
     remote_id: r.remoteId,
     status: r.status as RemoteStepStatus,
+    received_bytes: r.receivedBytes ?? null,
+    total_bytes: r.totalBytes ?? null,
+    resume_count: r.resumeCount ?? 0,
     created_at: r.createdAt.toISOString(),
     updated_at: r.updatedAt.toISOString(),
   };
 }
 
-/** 화면·API 용(모의 ID 만, 토큰·본문 없음). */
+/**
+ * T15(D27): 업로드 세션 URI 는 원격 업로드 권한이 담긴 값으로 다룬다(docs/02 — 브라우저·로그·AI 입력에 넣지 않는다). 화면·API·감사에는
+ * 짧은 표시(`세션 있음`)만 — 모의 값(mock://…)이어도 같은 규칙.
+ */
+export const SESSION_URI_LABEL = '세션 있음';
+export function redactRemoteId(kind: string, remoteId: string): string {
+  return kind === 'upload_session' ? SESSION_URI_LABEL : remoteId;
+}
+
+/** 화면·API 용(모의 ID 만, 토큰·본문·세션 URI 없음). */
 export function remoteStepView(r: RemoteStepRow) {
-  return { job_id: r.jobId, ...remoteStepOf(r), mock: r.remoteId.startsWith('mock') };
+  const s = remoteStepOf(r);
+  return { job_id: r.jobId, ...s, remote_id: redactRemoteId(r.kind, r.remoteId), mock: r.remoteId.startsWith('mock') };
 }
 
 export async function listRemoteSteps(db: DbOrTx, ownerId: string, jobId: string): Promise<RemoteStepRow[]> {
@@ -49,15 +62,32 @@ export async function listRemoteStepsForItems(db: DbOrTx, ownerId: string, itemI
     .orderBy(asc(remoteSteps.jobId), asc(remoteSteps.stepIndex));
 }
 
-const STATUS_RANK: Record<string, number> = { created: 0, finished: 1, error: 2, published: 3 };
+const STATUS_RANK: Record<string, number> = { created: 0, uploaded: 1, finished: 1, error: 2, expired: 2, published: 3, processed: 3 };
+/** 끝난 상태(DB 트리거도 바꾸지 못하게 한다) */
+const FINAL_STATUSES = new Set(['published', 'processed', 'expired', 'error']);
 
 /**
  * 단계 기록(한 트랜잭션). 없으면 넣고(step_index = 그 작업의 다음 번호, intent = 지금 시도의 전송 의도), 있으면 같은 remote_id 일 때만
- * 상태를 앞으로만 바꾼다(created 로 되돌리지 않음, published 는 그대로). 다른 remote_id 면 409 remote_step_conflict.
+ * 상태를 앞으로만 바꾼다(created 로 되돌리지 않음, 끝난 상태는 그대로). 다른 remote_id 면 409 remote_step_conflict.
+ * T15: received_bytes 는 앞으로만(더 작은 값은 409 remote_step_regress — 원격이 확인한 값만 기록하므로 줄어들면 원격 상태가 이상하다),
+ * total_bytes 는 처음 값과 같아야 하고(다르면 409), resumed 면 resume_count + 1.
  */
 export async function recordRemoteStep(
   db: Db,
-  input: { ownerId: string; jobId: string; itemId: string; intentKey: string; kind: RemoteStepKind; postIndex: number; remoteId: string; status: RemoteStepStatus; now: Date },
+  input: {
+    ownerId: string;
+    jobId: string;
+    itemId: string;
+    intentKey: string;
+    kind: RemoteStepKind;
+    postIndex: number;
+    remoteId: string;
+    status: RemoteStepStatus;
+    now: Date;
+    receivedBytes?: number;
+    totalBytes?: number;
+    resumed?: boolean;
+  },
 ): Promise<RemoteStepRow> {
   return db.transaction(async (tx) => {
     const existing = await tx
@@ -71,10 +101,23 @@ export async function recordRemoteStep(
       if (row.remoteId !== input.remoteId) {
         throw new AppError('conflict', 'remote_step_conflict', '같은 게시물 단계에 다른 원격 ID 를 기록할 수 없습니다', { kind: input.kind, post_index: input.postIndex });
       }
-      if (row.status === input.status || (STATUS_RANK[input.status] ?? 0) < (STATUS_RANK[row.status] ?? 0) || row.status === 'published') return row;
+      if (input.totalBytes !== undefined && row.totalBytes !== null && row.totalBytes !== input.totalBytes) {
+        throw new AppError('conflict', 'remote_step_conflict', '같은 업로드 세션의 전체 크기를 바꿀 수 없습니다', { kind: input.kind, post_index: input.postIndex });
+      }
+      if (input.receivedBytes !== undefined && row.receivedBytes !== null && input.receivedBytes < row.receivedBytes) {
+        throw new AppError('conflict', 'remote_step_regress', '업로드 세션의 받은 바이트 수는 줄어들 수 없습니다', { kind: input.kind, post_index: input.postIndex });
+      }
+      const statusForward =
+        row.status !== input.status && !FINAL_STATUSES.has(row.status) && (STATUS_RANK[input.status] ?? 0) >= (STATUS_RANK[row.status] ?? 0);
+      const set: Partial<typeof remoteSteps.$inferInsert> = {};
+      if (statusForward) set.status = input.status;
+      if (input.receivedBytes !== undefined && (row.receivedBytes === null || input.receivedBytes > row.receivedBytes)) set.receivedBytes = input.receivedBytes;
+      if (input.totalBytes !== undefined && row.totalBytes === null) set.totalBytes = input.totalBytes;
+      if (input.resumed) set.resumeCount = row.resumeCount + 1;
+      if (Object.keys(set).length === 0) return row;
       const updated = await tx
         .update(remoteSteps)
-        .set({ status: input.status, updatedAt: input.now })
+        .set({ ...set, updatedAt: input.now })
         .where(and(eq(remoteSteps.id, row.id), eq(remoteSteps.ownerId, input.ownerId)))
         .returning();
       return updated[0]!;
@@ -101,6 +144,9 @@ export async function recordRemoteStep(
         postIndex: input.postIndex,
         remoteId: input.remoteId,
         status: input.status,
+        receivedBytes: input.receivedBytes ?? null,
+        totalBytes: input.totalBytes ?? null,
+        resumeCount: 0,
         createdAt: input.now,
         updatedAt: input.now,
       })
@@ -125,22 +171,34 @@ export function remoteStepsPort(db: Db, input: { ownerId: string; jobId: string;
           remoteId: step.remote_id,
           status: step.status,
           now: input.clock(),
+          receivedBytes: step.received_bytes,
+          totalBytes: step.total_bytes,
+          resumed: step.resumed,
         }),
       ),
   };
 }
 
-/** 이 작업에서 이미 게시된 게시물 수(요청 제한의 "남은 단위" 계산). */
-export async function publishedStepCount(db: DbOrTx, ownerId: string, jobId: string): Promise<number> {
+/** 이 작업에서 이미 쓴 요청 제한 단위 수(기본 게시 단계 — T15 는 업로드 세션 단계). 요청 제한의 "남은 단위" 계산. */
+export async function publishedStepCount(db: DbOrTx, ownerId: string, jobId: string, kinds: readonly RemoteStepKind[] = ['publish']): Promise<number> {
   const rows = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(remoteSteps)
-    .where(and(eq(remoteSteps.ownerId, ownerId), eq(remoteSteps.jobId, jobId), eq(remoteSteps.kind, 'publish')));
+    .where(and(eq(remoteSteps.ownerId, ownerId), eq(remoteSteps.jobId, jobId), inArray(remoteSteps.kind, [...kinds])));
   return Number(rows[0]?.n ?? 0);
 }
 
-/** 계정의 창 안 게시 수와 가장 오래된 게시 시각(로컬 요청 제한 — 단계 기록에서 파생, 새 표 없음). */
-export async function recentPublishUsage(db: DbOrTx, ownerId: string, accountId: string, since: Date): Promise<{ used: number; oldestAt: Date | null }> {
+/**
+ * 계정의 창 안 사용 단위 수와 가장 오래된 사용 시각(로컬 요청 제한 — 단계 기록에서 파생, 새 표 없음).
+ * 기본은 게시 단계(Threads), T15 YouTube 는 업로드 세션 단계(업로드 시작 = 할당량 사용).
+ */
+export async function recentPublishUsage(
+  db: DbOrTx,
+  ownerId: string,
+  accountId: string,
+  since: Date,
+  kinds: readonly RemoteStepKind[] = ['publish'],
+): Promise<{ used: number; oldestAt: Date | null }> {
   const rows = await db
     .select({ n: sql<number>`count(*)::int`, oldest: sql<string | null>`min(${remoteSteps.createdAt})` })
     .from(remoteSteps)
@@ -149,7 +207,7 @@ export async function recentPublishUsage(db: DbOrTx, ownerId: string, accountId:
       and(
         eq(remoteSteps.ownerId, ownerId),
         eq(distributionItems.channelAccountId, accountId),
-        eq(remoteSteps.kind, 'publish'),
+        inArray(remoteSteps.kind, [...kinds]),
         gte(remoteSteps.createdAt, since),
       ),
     );

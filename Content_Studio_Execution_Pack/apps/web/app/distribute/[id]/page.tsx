@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
-import { adapterIdFor, CHANNEL_LABEL, formatMsk, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
+import { adapterIdFor, CHANNEL_LABEL, formatMsk, providerMetadataOf, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
   bannersFromState,
@@ -20,6 +20,8 @@ import {
   revocationCountParam,
   revocationNotice,
   VISIBILITY_LABEL,
+  YOUTUBE_STEP_LABEL,
+  youtubeProgressLine,
 } from '../../../lib/distribution';
 import { getAppDb, getConfig } from '../../../lib/server';
 
@@ -121,6 +123,57 @@ function ThreadsSteps({ x }: { x: PlanItemDetail }) {
   );
 }
 
+/**
+ * T15(D27): YouTube 모의 재개 업로드 진행(업로드 n% (x/y MB) · 세션 재개 n회)·처리 상태와 T13 연결 상태 한 줄.
+ * 세션 URI 는 화면에 내지 않는다(`세션 있음`) — 영상 ID 는 모의 ID(mockyt_v_…)만.
+ */
+function YouTubeSteps({ x }: { x: PlanItemDetail }) {
+  const latest = x.jobs.at(-1) ?? null;
+  const steps = latest ? x.remoteSteps.filter((r) => r.jobId === latest.id) : [];
+  const sessions = steps.filter((r) => r.kind === 'upload_session').sort((a, b) => a.postIndex - b.postIndex);
+  const current = sessions.at(-1) ?? null;
+  const video = steps.find((r) => r.kind === 'video') ?? null;
+  const resumes = sessions.reduce((n, r) => n + r.resumeCount, 0);
+  const requested = x.item.visibility;
+  const pub = latest ? (x.publications.find((p) => p.jobId === latest.id) ?? null) : null;
+  return (
+    <>
+      <h4>YouTube 업로드(MOCK — 모의 YouTube, 모의 ID)</h4>
+      {x.connection ? (
+        <p className="meta" role="status">
+          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
+        </p>
+      ) : null}
+      {current ? (
+        <p className="status-line" role="status">
+          {youtubeProgressLine({ received: current.receivedBytes, total: current.totalBytes, resumes, sessions: sessions.length })}
+        </p>
+      ) : (
+        <p className="empty-text">아직 업로드 세션 없음(실행하면 VERIFIED 영상 파일을 조각으로 올립니다)</p>
+      )}
+      {steps.length ? (
+        <ol className="list">
+          {steps.map((st) => (
+            <li key={st.id} className="hash">
+              {YOUTUBE_STEP_LABEL[`${st.kind}:${st.status}`] ?? `${st.kind} ${st.status}`}
+              {st.kind === 'video' ? ` · ${st.remoteId}` : ''}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {video && video.status === 'uploaded' ? <p className="note">처리 중 — 처리가 끝나야 결과(비공개 업로드·원격 예약·공개)를 확인합니다. 업로드 성공은 공개 게시 성공이 아닙니다.</p> : null}
+      {pub ? (
+        <p className="note">
+          요청한 공개 범위: {VISIBILITY_LABEL[requested] ?? requested} · 원격이 보고한 공개 범위: {pub.remoteVisibility}
+          {requested !== 'private' && pub.remoteVisibility === 'private' ? ' — 미검증 프로젝트 등으로 비공개로 제한됨(공개 성공 아님)' : ''}
+        </p>
+      ) : null}
+      <p className="note">세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음). 실제 YouTube 로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.</p>
+    </>
+  );
+}
+
 /** T12: 개발용 모의 시나리오 선택(모의 계정·끝나지 않은 항목만). 승인 스냅샷 밖 — hash·승인 상태가 바뀌지 않는다. */
 function ScenarioForm({ x }: { x: PlanItemDetail }) {
   if (x.account?.kind !== 'mock' || FINISHED.includes(x.item.status)) return null;
@@ -164,6 +217,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     blockDetail: block.detail,
     activeApproval: x.activeApproval !== null,
     needsNewPlan: x.problems.length > 0,
+    publishAt: providerMetadataOf(p).publish_at ?? null,
+    cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
   });
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   return (
@@ -188,7 +243,15 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         <span>
           일정: {scheduled ? `${formatMsk(scheduled)} (UTC ${scheduled.toISOString()})` : '즉시(실행 후 대기열)'}
         </span>
-        <span>요청 결과: {x.item.requestedResult === 'mock_publish' ? 'MOCK 실행(실제 게시 아님)' : x.item.requestedResult}</span>
+        <span>
+          요청 결과:{' '}
+          {x.item.requestedResult === 'mock_publish'
+            ? 'MOCK 실행(실제 게시 아님)'
+            : x.item.requestedResult === 'upload_private'
+              ? `비공개 업로드(upload_private${x.account?.kind === 'mock' ? ' — MOCK' : ''})`
+              : `공개 게시 계획(public_publish${x.account?.kind === 'mock' ? ' — MOCK' : ''})`}
+        </span>
+        {providerMetadataOf(p).publish_at ? <span>예약 공개(원격 publishAt): {formatMsk(providerMetadataOf(p).publish_at!)}</span> : null}
         {x.activeApproval ? <span className="tag">승인됨</span> : null}
       </p>
       {x.problems.length ? (
@@ -248,9 +311,10 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               const reason = block.code;
               return (
                 <li key={j.id} className="hash">
-                  <strong>{jobStatusText(j, pub, reason)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
+                  <strong>{jobStatusText(j, pub, reason, channel)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
                   {j.state === 'QUEUED' ? ` · 예정 ${formatMsk(j.nextRunAt)}` : ''}
-                  {j.cancelRequestedAt && j.state === 'CONFIRMED' ? ' · 취소 불가(이미 전송됨)' : ''} · <a href={`/api/jobs/${j.id}`}>작업 JSON</a>
+                  {j.cancelRequestedAt && j.state === 'CONFIRMED' ? (channel === 'youtube' ? ' · 취소 불가 — 업로드됨, 삭제는 별도 동작(범위 밖)' : ' · 취소 불가(이미 전송됨)') : ''} ·{' '}
+                  <a href={`/api/jobs/${j.id}`}>작업 JSON</a>
                 </li>
               );
             })}
@@ -280,7 +344,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           {retryable ? <p className="note">재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
         </>
       ) : null}
-      {adapterOf(x) === 'mock_threads' || x.remoteSteps.length ? <ThreadsSteps x={x} /> : null}
+      {adapterOf(x) === 'mock_threads' || x.remoteSteps.some((r) => r.kind === 'container' || r.kind === 'publish') ? <ThreadsSteps x={x} /> : null}
+      {adapterOf(x) === 'mock_youtube' || x.remoteSteps.some((r) => r.kind === 'upload_session' || r.kind === 'video') ? <YouTubeSteps x={x} /> : null}
       <ScenarioForm x={x} />
       {x.publications.length ? (
         <>

@@ -73,6 +73,10 @@ export function bundleColumns(name: ExportedTable): PgColumn[] {
 
 function selectExpr(name: ExportedTable, c: PgColumn): SQL {
   const ref = sql`${sql.identifier(name)}.${sql.identifier(c.name)}`;
+  // T15(D27): 업로드 세션 URI 는 업로드 권한이 담긴 값으로 다룬다 — 묶음에는 가린 표시(sha256 앞 16자)만 넣는다(remote_steps 는 복원하지 않음).
+  if (name === 'remote_steps' && c.name === 'remote_id') {
+    return sql`case when "remote_steps"."kind" = 'upload_session' then 'mock-redacted:session:' || left(encode(sha256(convert_to("remote_steps"."remote_id", 'UTF8')), 'hex'), 16) else "remote_steps"."remote_id" end`;
+  }
   const type = c.getSQLType();
   if (type.startsWith('timestamp')) return sql`to_char(${ref} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
   if (type === 'bigint') return sql`${ref}::float8`;

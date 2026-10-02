@@ -196,6 +196,16 @@ export interface CanonicalPayloadInput {
   visibility: Visibility;
   scheduledAtUtc: Date | null;
   timezone: string;
+  /**
+   * T15(D27): 채널별 추가 메타데이터(승인 스냅샷 안 — hash 에 들어간다). 지금은 YouTube 의 원격 예약 공개 시각 `publish_at`(ISO UTC)만.
+   * 없거나 빈 객체면 payload 의 provider_metadata 는 {} — 기존 payload·hash 는 그대로다.
+   */
+  providerMetadata?: ProviderMetadata | null;
+}
+
+/** T15(D27): provider_metadata 에 들어갈 수 있는 값(YouTube publish_at 만). */
+export interface ProviderMetadata {
+  publish_at?: string;
 }
 
 export interface CanonicalPayload {
@@ -255,9 +265,16 @@ export function buildCanonicalPayload(input: CanonicalPayloadInput): CanonicalPa
     visibility: input.visibility,
     scheduled_at_utc: input.scheduledAtUtc ? input.scheduledAtUtc.toISOString() : null,
     timezone: input.timezone,
-    provider_metadata: {},
+    provider_metadata: input.providerMetadata?.publish_at ? { publish_at: input.providerMetadata.publish_at } : {},
     snapshot_version: SNAPSHOT_VERSION,
   };
+}
+
+/** T15: 저장된 payload 의 provider_metadata(publish_at 만 꺼낸다 — 재계산·화면용). */
+export function providerMetadataOf(payload: unknown): ProviderMetadata {
+  const pm = (payload as { provider_metadata?: unknown } | null)?.provider_metadata;
+  const at = pm && typeof pm === 'object' ? (pm as { publish_at?: unknown }).publish_at : undefined;
+  return typeof at === 'string' ? { publish_at: at } : {};
 }
 
 /**
@@ -296,7 +313,13 @@ export const canonicalPayloadSchema = z
   .discriminatedUnion('channel', [
     z.strictObject({ ...payloadBase, channel: z.literal('threads'), text: payloadTextSchemas.threads }),
     z.strictObject({ ...payloadBase, channel: z.literal('instagram'), text: payloadTextSchemas.instagram }),
-    z.strictObject({ ...payloadBase, channel: z.literal('youtube'), text: payloadTextSchemas.youtube }),
+    // T15(D27): YouTube 만 provider_metadata.publish_at(원격 예약 공개 시각, ISO UTC)을 가질 수 있다.
+    z.strictObject({
+      ...payloadBase,
+      channel: z.literal('youtube'),
+      text: payloadTextSchemas.youtube,
+      provider_metadata: z.strictObject({ publish_at: z.iso.datetime().optional() }),
+    }),
     z.strictObject({ ...payloadBase, channel: z.literal('blog'), text: payloadTextSchemas.blog }),
   ])
   .superRefine((p, ctx) => {
@@ -400,6 +423,8 @@ export const planCreateSchema = z.object({
         requested_result: z.enum(REQUESTED_RESULTS).optional(),
         visibility: z.enum(VISIBILITIES).optional(),
         schedule: z.object({ date: z.string().max(20), time: z.string().max(10) }).nullable().optional(),
+        /** T15(D27): YouTube 원격 예약 공개(MSK 벽시계) — public_publish + private 일 때만. */
+        publish_at: z.object({ date: z.string().max(20), time: z.string().max(10) }).nullable().optional(),
       }),
     )
     .min(1)

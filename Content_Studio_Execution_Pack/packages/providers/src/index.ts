@@ -12,6 +12,7 @@ export * from './publisher';
 export * from './storage';
 export * from './stt';
 export * from './threads-mock';
+export * from './youtube-mock';
 
 export interface Providers {
   llm: LlmProvider;

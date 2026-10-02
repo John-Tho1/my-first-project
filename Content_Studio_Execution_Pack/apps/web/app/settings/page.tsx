@@ -115,8 +115,9 @@ export default async function SettingsPage({
           </p>
         ) : null}
         <p className="note">
-          지금은 Threads 모의(MOCK) 계정만 연결할 수 있습니다. 모의 연결은 앱 안에서만 동작하며 실제 Threads 계정 연결이 아니고, 실제 게시에 쓰이지
-          않습니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을 복원하면 연결했던 계정은 &quot;다시
+          지금은 Threads·YouTube 모의(MOCK) 계정만 연결할 수 있습니다(YouTube 는 Google 형 모의 OAuth — scope 이름은 자리 표시 `youtube.upload(mock)`).
+          모의 연결은 앱 안에서만 동작하며 실제 Threads·Google 계정 연결이 아니고, 실제 게시에 쓰이지 않습니다. YouTube 모의 연결의 만료는 refresh token
+          기준이며 1시간짜리 access token 은 보내기 전에 자동 갱신합니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을 복원하면 연결했던 계정은 &quot;다시
           연결 필요&quot;가 됩니다.
         </p>
         <p className="meta">
@@ -148,7 +149,7 @@ export default async function SettingsPage({
               </thead>
               <tbody>
                 {accounts.map((a) => {
-                  const connectable = a.mock && a.platform === 'threads';
+                  const connectable = a.mock && (a.platform === 'threads' || a.platform === 'youtube');
                   const hasCredential = a.connected_at !== null && a.revoked_at === null;
                   return (
                     <tr key={a.account_id}>
@@ -177,7 +178,7 @@ export default async function SettingsPage({
                             </button>
                           </form>
                         ) : (
-                          <span className="muted-text">연결 미지원(T13)</span>
+                          <span className="muted-text">연결 미지원(Threads·YouTube 모의만)</span>
                         )}
                         {hasCredential ? (
                           <>

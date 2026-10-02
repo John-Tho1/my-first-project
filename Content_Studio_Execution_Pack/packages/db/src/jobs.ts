@@ -26,6 +26,7 @@ import {
   CHECK_LEASE_STATES,
   classifyOutcome,
   decideRetry,
+  decideRetryAt,
   DEFAULT_LEASE_TTL_MS,
   localRateLimitDecision,
   requireSecretKeyring,
@@ -52,6 +53,8 @@ import {
   type ChannelAdapterRegistry,
   type JobEvent,
   type JobState,
+  type MediaPort,
+  type MediaReader,
   type MockScenarioSetting,
   type PublishSnapshot,
   type ReconcileResult,
@@ -76,7 +79,7 @@ import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
 import { publishedStepCount, recentPublishUsage, remoteStepsPort } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
-import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
+import { assets, channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
 export type SendIntentRow = typeof sendIntents.$inferSelect;
 export type PublicationRow = typeof publications.$inferSelect;
@@ -102,6 +105,55 @@ export interface JobRunOptions {
   credentials?: {
     keyring?: KeyringSource;
     check?: (ownerId: string, accountId: string, now: Date) => Promise<unknown>;
+    /**
+     * T15(D27): Google 형(짧은 access token) 연결 정보 — 봉인한 access token 이 만료(또는 곧 만료)면 보내기 전에 T13 갱신 경로(refreshCredential)를
+     * 한 번 부르고 다시 읽는다. 없으면 갱신하지 않는다(어댑터는 credential_access_token_stale 로 원격 호출 없이 닫는다).
+     */
+    refresh?: (ownerId: string, accountId: string, now: Date) => Promise<unknown>;
+  };
+  /**
+   * T15(D27): 업로드할 미디어 파일을 저장소에서 범위로 읽는 함수(web·CLI 는 로컬 저장소). 없으면 미디어가 필요한 어댑터(YouTube 모의)는
+   * 원격 호출 없이 media_reader_unavailable 로 닫는다.
+   */
+  media?: MediaReader;
+}
+
+/**
+ * T15(D27): 작업 처리기 쪽 미디어 창구 — 승인 스냅샷의 첨부(id·checksum·mime)와 같은 owner 의 **VERIFIED·지워지지 않은** asset 만 연다.
+ * 읽기는 짧은 조회 하나(잠금 없음) + 저장소 범위 읽기(호출마다 [start, end) 만).
+ */
+export function mediaPortFor(db: DbOrTx, ownerId: string, reader: MediaReader | undefined): MediaPort {
+  return {
+    open: async (want) => {
+      if (!reader) return { ok: false, code: 'media_reader_unavailable' };
+      if (!isUuid(want.id)) return { ok: false, code: 'media_not_found' };
+      const rows = await db
+        .select({ key: assets.key, mime: assets.mime, bytes: assets.bytes, checksum: assets.checksum, state: assets.verificationState, deletedAt: assets.deletedAt })
+        .from(assets)
+        .where(and(eq(assets.id, want.id), eq(assets.ownerId, ownerId)))
+        .limit(1);
+      const a = rows[0];
+      if (!a) return { ok: false, code: 'media_not_found' };
+      if (a.deletedAt) return { ok: false, code: 'media_deleted' };
+      if (a.state !== 'VERIFIED') return { ok: false, code: 'media_not_verified' };
+      if (a.checksum !== want.checksum || a.mime !== want.mime) return { ok: false, code: 'media_changed' };
+      const key = a.key;
+      const size = Number(a.bytes);
+      return {
+        ok: true,
+        file: {
+          bytes: size,
+          mime: a.mime,
+          checksum: a.checksum,
+          read: async (start: number, end: number) => {
+            if (!(start >= 0 && end > start && end <= size)) throw new RangeError('media read out of range');
+            const out = await reader.readRange(key, start, end);
+            if (out.byteLength !== end - start) throw new Error('media short read');
+            return out;
+          },
+        },
+      };
+    },
   };
 }
 
@@ -456,7 +508,7 @@ function makeContext(
   db: Db,
   job: JobRow,
   intentKey: string,
-  opts: Pick<JobRunOptions, 'workerId' | 'clock' | 'leaseTtlMs' | 'credentials'>,
+  opts: Pick<JobRunOptions, 'workerId' | 'clock' | 'leaseTtlMs' | 'credentials' | 'media'>,
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
   onLeaseLost?: () => void,
@@ -483,9 +535,27 @@ function makeContext(
     // T14: 원격 단계 기록(작업 단위, 호출마다 짧은 트랜잭션)과 서버 쪽 토큰 창구(T13). 토큰은 어댑터 메모리에만.
     steps: remoteStepsPort(db, { ownerId: job.ownerId, jobId: job.id, itemId: job.itemId!, intentKey, clock }),
     credential: snapshot
-      ? { accessToken: () => readAccessTokenForSend(db, { ownerId: job.ownerId, accountId: snapshot.account.id, keyring, now: clock() }) }
+      ? {
+          accessToken: async () => {
+            const read = () => readAccessTokenForSend(db, { ownerId: job.ownerId, accountId: snapshot.account.id, keyring, now: clock() });
+            const r = await read();
+            // T15(D27): 짧은 access token(Google 형)이 만료됐으면 T13 갱신 경로를 한 번 부르고 다시 읽는다(실패해도 코드만 — 토큰·오류 내용 없음).
+            if (r.ok || r.code !== 'credential_access_token_stale' || !opts.credentials?.refresh) return r;
+            try {
+              await opts.credentials.refresh(job.ownerId, snapshot.account.id, clock());
+            } catch {
+              return { ok: false as const, code: 'credential_refresh_failed' };
+            }
+            return read();
+          },
+        }
       : undefined,
     snapshot,
+    media: mediaPortFor(db, job.ownerId, opts.media),
+    cancelRequested: async () => {
+      const rows = await db.select({ state: jobs.state }).from(jobs).where(and(eq(jobs.id, job.id), eq(jobs.ownerId, job.ownerId))).limit(1);
+      return rows[0]?.state === 'CANCEL_REQUESTED';
+    },
   };
 }
 
@@ -608,9 +678,11 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     // 사용량은 remote_steps(게시된 단계)에서 센다 — 새 표 없음. 시도(attempt)는 쓰지 않는다(보내지 않았음이 확실).
     const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
     if (caps.rate_limit && adapter.rateUnits) {
-      const needed = adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, job.id));
+      // T15(D27): 셀 단계 종류는 어댑터가 정한다(Threads = 게시, YouTube = 업로드 세션 시작). 이 작업이 이미 쓴 단위는 빼고 센다(세션 재개는 새 단위 아님).
+      const kinds = adapter.rateStepKinds ?? ['publish'];
+      const needed = adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, job.id, kinds));
       if (needed > 0) {
-        const usage = await recentPublishUsage(tx, ownerId, acc.id, new Date(now.getTime() - caps.rate_limit.window_sec * 1000));
+        const usage = await recentPublishUsage(tx, ownerId, acc.id, new Date(now.getTime() - caps.rate_limit.window_sec * 1000), kinds);
         const d = localRateLimitDecision({ used: usage.used, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now });
         if (!d.allowed) {
           return settle(
@@ -694,7 +766,16 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
     const isMock = plan.adapter.kind === 'mock';
     switch (cls.event) {
       case 'confirmed': {
-        const to = await settle(tx, ownerId, job, item, cancel ? 'cancel_too_late' : 'confirmed', { ...base, result_kind: result.result_kind ?? null }, now, common);
+        const to = await settle(
+          tx,
+          ownerId,
+          job,
+          item,
+          cancel ? 'cancel_too_late' : 'confirmed',
+          { ...base, result_kind: result.result_kind ?? null, requested_visibility: item.visibility, remote_visibility: result.remote_visibility ?? null },
+          now,
+          common,
+        );
         await insertPublication(tx, ownerId, item, job.id, isMock, result, now);
         return to;
       }
@@ -703,7 +784,12 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         return settle(tx, ownerId, job, item, 'remote_accepted', base, now, { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS), reconcileCount: 0 });
       case 'transient_failure': {
         if (cancel) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
-        const d = decideRetry(job.attempt, job.maxAttempts, result.retry_after_sec, now, random);
+        // T15(D27): 원격이 정한 다음 시각(할당량 초기화 등)이 있으면 그 시각까지 기다린다(Retry-After 1시간 상한 대신, 시도 한도는 그대로).
+        const retryAt = result.retry_at ? new Date(result.retry_at) : null;
+        const d =
+          retryAt && Number.isFinite(retryAt.getTime())
+            ? decideRetryAt(job.attempt, job.maxAttempts, retryAt, now)
+            : decideRetry(job.attempt, job.maxAttempts, result.retry_after_sec, now, random);
         if (d.retry) return settle(tx, ownerId, job, item, 'transient_failure', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
         return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
       }
@@ -783,9 +869,34 @@ async function applyReconcile(
   if (r.status === 'found') {
     await fillIntent(tx, ownerId, intent, 'accepted', r, now, 'reconcile');
     const event: JobEvent = job.state === 'CANCEL_REQUESTED' ? 'cancel_too_late' : 'reconciled_found';
-    const to = await settle(tx, ownerId, job, item, event, { ...base, external_id: r.external_id ?? null, result_kind: r.result_kind ?? null }, now, common);
+    // T15(D27): 요청한 공개 범위(승인 스냅샷)와 원격이 실제로 보고한 공개 범위를 함께 남긴다(미검증 프로젝트의 강제 비공개 등, A12).
+    const to = await settle(
+      tx,
+      ownerId,
+      job,
+      item,
+      event,
+      {
+        ...base,
+        external_id: r.external_id ?? null,
+        result_kind: r.result_kind ?? null,
+        requested_visibility: item.visibility,
+        remote_visibility: r.remote_visibility ?? null,
+      },
+      now,
+      common,
+    );
     await insertPublication(tx, ownerId, item, job.id, caps.mock, r, now);
     return to;
+  }
+  if (r.status === 'failed' && !opts.manual) {
+    // T15(D27): 원격이 받은 결과를 스스로 거부·처리 실패로 끝냄(YouTube uploadStatus failed/rejected) — 영구 실패, 다시 보내지 않는다.
+    await fillIntent(tx, ownerId, intent, 'accepted', r, now, 'reconcile');
+    return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: 'remote_failed' }, now, {
+      ...common,
+      lastErrorCode: r.error_code ?? 'remote_failed',
+      lastRetryClass: 'permanent',
+    });
   }
   if (opts.manual) {
     // 사용자 재확인은 조회만: 찾지 못하면 상태를 바꾸지 않는다(재전송 없음). resumable 이어도 여기서 이어 보내지 않는다.

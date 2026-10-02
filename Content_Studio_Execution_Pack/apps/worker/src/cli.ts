@@ -4,9 +4,9 @@
  * dev 서버가 같은 PGlite 디렉터리를 열고 있으면 먼저 종료한다(한 디렉터리 한 프로세스).
  * 모의 어댑터는 @cs/providers 에서 가져온다(apps/worker/package.json 에 workspace 의존성으로 선언 — CLI 진입점만 쓰고, runWorkerTick 은 레지스트리를 주입받는다).
  */
-import { checkCredential, DbLockedError, loadRootEnv, newWorkerId, openDb } from '@cs/db';
+import { checkCredential, DbLockedError, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
 import { loadConfig, oauthRedirectUri, requireSecretKeyring } from '@cs/domain';
-import { createMockAdapterRegistry, resolveOAuthProvider } from '@cs/providers';
+import { createMockAdapterRegistry, createStorage, resolveOAuthProvider } from '@cs/providers';
 import { assertWorkerModeSupported, runWorkerTick, WorkerModeError } from './index';
 
 function parseLoop(argv: readonly string[]): number | null {
@@ -44,11 +44,15 @@ const channelAdapters = createMockAdapterRegistry();
 // T14(D26): Threads 모의 어댑터의 전송 토큰(서버 안 봉인 해제)과 401 뒤 T13 확인 경로. 키는 환경변수에서만(값 출력 없음).
 const keyring = () => requireSecretKeyring(process.env);
 const redirectUri = oauthRedirectUri(config);
+const providerFor = (acc: Parameters<typeof resolveOAuthProvider>[0]) => resolveOAuthProvider(acc, config, process.env, redirectUri);
 const jobCredentials = {
   keyring,
-  check: (ownerId: string, accountId: string, now: Date) =>
-    checkCredential(handle.db, { ownerId, accountId, providerFor: (acc) => resolveOAuthProvider(acc, config, process.env, redirectUri), keyring, now }),
+  check: (ownerId: string, accountId: string, now: Date) => checkCredential(handle.db, { ownerId, accountId, providerFor, keyring, now }),
+  // T15(D27): 짧은 access token(Google 형 모의)은 보내기 전에 T13 갱신 경로로 한 번 갱신
+  refresh: (ownerId: string, accountId: string, now: Date) => refreshCredential(handle.db, { ownerId, accountId, providerFor, keyring, now, trigger: 'auto' }),
 };
+// T15(D27): YouTube 모의 업로드가 VERIFIED 영상 파일을 조각으로 읽는 로컬 저장소
+const media = createStorage(config, resolveFromRoot);
 let stopping = false;
 let wake: (() => void) | null = null;
 const stop = () => {
@@ -59,7 +63,7 @@ process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 try {
   do {
-    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters, workerId, maxJobs: 20, jobCredentials });
+    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters, workerId, maxJobs: 20, jobCredentials, media });
     console.log(JSON.stringify(tick));
     if (loopMs === null || stopping) break;
     await new Promise<void>((resolve) => {

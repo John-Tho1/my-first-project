@@ -5,6 +5,7 @@
  */
 import { formatDrillTable, runDrill } from './drill-matrix';
 import { formatThreadsDrillTable, runThreadsDrill } from './drill-threads';
+import { formatYouTubeDrillTable, runYouTubeDrill } from './drill-youtube';
 
 const started = Date.now();
 const r = await runDrill();
@@ -18,10 +19,15 @@ const t = await runThreadsDrill();
 console.log('\nT14 Threads 모의 훈련(MOCK — 모의 OAuth·모의 Threads, 실제 발행 실적 아님, 외부 호출 없음)\n');
 console.log(formatThreadsDrillTable(t));
 console.log(`Threads fetch 호출 ${t.fetch_calls}`);
-const violations = [...r.violations, ...t.violations];
+// T15(D27): YouTube 모의(Google 형 모의 OAuth 연결 계정 — 재개 업로드·처리·조건부 예약) 표.
+const y = await runYouTubeDrill();
+console.log('\nT15 YouTube 모의 훈련(MOCK — 모의 Google OAuth·모의 YouTube, 합성 영상, 실제 발행 실적 아님, 외부 호출 없음)\n');
+console.log(formatYouTubeDrillTable(y));
+console.log(`YouTube fetch 호출 ${y.fetch_calls}`);
+const violations = [...r.violations, ...t.violations, ...y.violations];
 if (violations.length) {
   console.error(`\n불변식 위반 ${violations.length}건:`);
   for (const v of violations) console.error(`- ${v}`);
   process.exit(1);
 }
-console.log('불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK)');
+console.log('불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK)');

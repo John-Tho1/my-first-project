@@ -13,7 +13,10 @@ import type { AppConfig } from './config';
 import { AppError, GuardError } from './errors';
 import type { Channel } from './channel';
 
-export const OAUTH_PROVIDER_IDS = ['mock_threads', 'threads'] as const;
+/** T15(D27): mock_google = Google(YouTube) 형 모의 공급자(프로세스 안, 네트워크 없음). 실제 Google 공급자는 없다. */
+export const OAUTH_PROVIDER_IDS = ['mock_threads', 'threads', 'mock_google'] as const;
+/** 모의 공급자 ID(연결 정보 is_mock = true — DB CHECK 와 같아야 한다). */
+export const MOCK_OAUTH_PROVIDER_IDS = ['mock_threads', 'mock_google'] as const;
 export type OAuthProviderId = (typeof OAUTH_PROVIDER_IDS)[number];
 
 /** T13 잠정 scope(D24 — T14 에서 공식 문서로 재확인). 게시에 필요한 최소만. */
@@ -21,9 +24,19 @@ export const THREADS_REQUIRED_SCOPES = ['threads_basic', 'threads_content_publis
 /** 기본 연결에서 요청하지 않는 scope(답글·통계). 공급자가 이 값을 요청 URL 에 넣으면 시험이 실패한다. */
 export const THREADS_NOT_REQUESTED_BY_DEFAULT = ['threads_manage_replies', 'threads_read_replies', 'threads_manage_insights'] as const;
 
-/** 채널별 필요한 최소 scope(T13 은 Threads 만 — 다른 채널은 연결 공급자가 없어 빈 목록). */
+/**
+ * T15(D27): YouTube 업로드에 필요한 최소 scope — **모의 자리 표시 이름**(실제 Google scope 이름이 아니다). live 전에 공식 문서로
+ * 실제 이름(업로드 전용 scope)을 다시 확인한다. 읽기·관리·분석 scope 는 요청하지 않는다.
+ */
+export const YOUTUBE_REQUIRED_SCOPES = ['youtube.upload(mock)'] as const;
+/** 기본 연결에서 요청하지 않는 scope(모의 자리 표시 — 전체 관리·분석). */
+export const YOUTUBE_NOT_REQUESTED_BY_DEFAULT = ['youtube.manage(mock)', 'youtube.analytics(mock)'] as const;
+
+/** 채널별 필요한 최소 scope(Threads·YouTube — 다른 채널은 연결 공급자가 없어 빈 목록). */
 export function requiredScopesForPlatform(platform: string): readonly string[] {
-  return platform === 'threads' ? THREADS_REQUIRED_SCOPES : [];
+  if (platform === 'threads') return THREADS_REQUIRED_SCOPES;
+  if (platform === 'youtube') return YOUTUBE_REQUIRED_SCOPES;
+  return [];
 }
 
 export const OAUTH_STATE_TTL_MS = 10 * 60_000;
@@ -43,7 +56,13 @@ export interface OAuthTokenSet {
   accessToken: string;
   /** Threads 는 별도 refresh token 이 없다(장기 토큰 자체로 갱신) — null */
   refreshToken: string | null;
+  /**
+   * 연결 정보의 만료(oauth_credentials.expires_at — health 판정). Threads = 장기 access token 만료.
+   * T15(D27) Google 형: refresh token 이 있는 동안 연결은 유효하므로 refresh token 의 수명(모의 180일)을 쓴다.
+   */
   expiresAt: Date;
+  /** T15(D27): access token 자체의 짧은 만료(Google 형 ~1시간). 봉인한 토큰 안에만 둔다 — 지나면 보내기 전에 갱신한다. Threads 는 없음. */
+  accessExpiresAt?: Date | null;
   scopes: string[];
 }
 
@@ -56,6 +75,8 @@ export interface OAuthAccountInfo {
 export interface StoredOAuthTokens {
   accessToken: string;
   refreshToken: string | null;
+  /** T15: access token 만료(ISO, 봉인 안). 없으면 연결 정보 만료(expires_at)만 본다. */
+  accessExpiresAt?: string | null;
 }
 
 /**
@@ -126,7 +147,7 @@ export class OAuthFlowError extends AppError {
 
 export class OAuthNotSupportedError extends AppError {
   constructor() {
-    super('bad_request', 'oauth_not_supported', 'T13 에서는 Threads 모의 계정만 연결할 수 있습니다(다른 채널·실제 계정 연결은 이후 작업).');
+    super('bad_request', 'oauth_not_supported', 'Threads·YouTube 모의 계정만 연결할 수 있습니다(다른 채널·실제 계정 연결은 이후 작업).');
   }
 }
 

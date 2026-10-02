@@ -23,6 +23,7 @@
  */
 import {
   buildCanonicalPayload,
+  providerMetadataOf,
   isVariantStale,
   mediaCompleteness,
   payloadHash,
@@ -183,6 +184,7 @@ export function deriveRestoreTransforms(t: BundleTables, decisionAt: Date): Deri
           visibility: item.visibility as Visibility,
           scheduledAtUtc: item.scheduled_at_utc ? new Date(String(item.scheduled_at_utc)) : null,
           timezone: String(item.schedule_timezone),
+          providerMetadata: providerMetadataOf(item.payload_json),
         } as Parameters<typeof buildCanonicalPayload>[0]);
         if (payloadHash(recomputed) !== item.payload_hash) problems.push('payload_changed');
       } else problems.push('variant_changed');
@@ -191,6 +193,8 @@ export function deriveRestoreTransforms(t: BundleTables, decisionAt: Date): Deri
     if (str(brand?.id) !== str(item.brand_profile_id)) problems.push('brand_changed');
     if (variant && (blockersOf.get(String(variant.id)) ?? []).length) problems.push('blocked');
     if (item.scheduled_at_utc && Date.parse(String(item.scheduled_at_utc)) <= decisionAt.getTime()) problems.push('schedule_passed');
+    const publishAt = providerMetadataOf(item.payload_json).publish_at;
+    if (publishAt && Date.parse(publishAt) <= decisionAt.getTime()) problems.push('publish_at_passed');
     if (problems.length) revokedApprovals.add(String(a.id));
   }
   return { downgradedVariants, revokedApprovals, decisionAt };

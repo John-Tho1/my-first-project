@@ -126,6 +126,8 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
   CANCEL_REQUESTED: {
     cancel_too_late: 'CONFIRMED',
     canceled: 'CANCELED',
+    // T15(D27): 취소 요청 중 원격이 업로드한 영상을 거부(처리 실패)했다고 조회로 확인 — 실패(공개된 것 없음, 취소 성공이라고 하지 않음).
+    permanent_failure: 'FAILED',
     reconcile_retry: 'CANCEL_REQUESTED',
     reconcile_unsupported: 'UNKNOWN',
     lease_expired_after_intent: 'CANCEL_REQUESTED',
@@ -207,6 +209,15 @@ export function decideRetry(
   return { retry: true, nextRunAt: retryDelay(attempt, retryAfterSec, now, random) };
 }
 
+/**
+ * T15(D27): 원격이 정한 다음 시각(할당량 초기화 등)까지 기다리는 부작용 없는 일시 오류. 시도 한도 안이면 그 시각(지금 + 1초 이상)까지 RETRY_WAIT,
+ * 한도에 이르면 FAILED. Retry-After 1시간 상한은 쓰지 않는다(할당량은 하루 단위로 풀린다 — 잠정).
+ */
+export function decideRetryAt(attempt: number, maxAttempts: number, retryAt: Date, now: Date): RetryDecision {
+  if (attempt >= maxAttempts) return { retry: false, reason: 'max_attempts' };
+  return { retry: true, nextRunAt: new Date(Math.max(retryAt.getTime(), now.getTime() + 1000)) };
+}
+
 /** 조회 재시도 간격: 10초 × 2^(n-1), 15분 상한. n = 지금까지 확인 불가 횟수(1부터). */
 export function reconcileDelay(count: number, now: Date): Date {
   const n = Math.max(1, Math.floor(count));
@@ -235,6 +246,11 @@ export interface AdapterResult {
   remote_visibility?: RemoteVisibility;
   retry_class?: RetryClass;
   retry_after_sec?: number;
+  /**
+   * T15(D27): 원격 할당량처럼 "이 시각까지는 다시 보내도 같은 거절"인 부작용 없는 일시 오류의 다음 시도 시각(ISO). 있으면 작업 처리기는
+   * Retry-After 1시간 상한(retry_after_too_long) 대신 이 시각까지 RETRY_WAIT 로 기다린다(시도 한도는 그대로).
+   */
+  retry_at?: string;
   provider_request_id?: string;
   error_code?: string;
 }
@@ -244,9 +260,10 @@ export interface AdapterResult {
  * T14(D26) resumable: 원격에 남긴 단계 참조(remote_steps — 예: Threads 컨테이너)로 확인해 보니 **남은 단계는 아직 게시되지 않았음**이 확실하고,
  * 같은 참조를 재사용해 이어 보낼 수 있다(새 원격 객체를 만들지 않음). published_parts = 이미 게시된 부분 수(스레드의 앞 게시물 등).
  * 작업 처리기는 이것을 새 시도(새 전송 의도)로 이어 보낸다 — 사용자 재확인은 조회만(이어 보내지 않음).
+ * T15(D27) failed: 원격이 받은 결과를 스스로 거부·처리 실패로 끝냈음이 확인됨(예: YouTube uploadStatus failed/rejected) — 영구 실패(FAILED).
  */
 export interface ReconcileResult {
-  status: 'found' | 'processing' | 'not_found' | 'unsupported' | 'unknown' | 'resumable';
+  status: 'found' | 'processing' | 'not_found' | 'unsupported' | 'unknown' | 'resumable' | 'failed';
   result_kind?: ResultKind;
   external_id?: string;
   permalink?: string;
@@ -307,26 +324,41 @@ export interface AdapterAccount {
   credential_state?: string;
 }
 
-/** T14(D26): 어댑터 식별자. */
-export const ADAPTER_IDS = ['mock_generic', 'mock_threads'] as const;
+/** T14(D26)·T15(D27): 어댑터 식별자. */
+export const ADAPTER_IDS = ['mock_generic', 'mock_threads', 'mock_youtube'] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
 
 /**
  * T14(D26) 어댑터 선택 규칙(한 곳): 모의 계정 + platform='threads' + 연결 정보를 쓴 적 있음(credential_state ≠ none)
  * → Threads 모의 어댑터(mock_threads, 컨테이너 → 게시 2단계, T13 연결 정보 사용). 연결한 적 없는 모의 계정(M3 seed 계정)
  * → 일반 모의 어댑터(mock_generic, M3 동작 그대로). live 계정 → null(어댑터 없음 — LiveChannelNotConfiguredError).
+ * T15(D27): 모의 계정 + platform='youtube' + 연결 정보를 쓴 적 있음 → YouTube 모의 어댑터(mock_youtube, 재개 업로드, Google 형 모의 OAuth 연결 정보 사용).
  */
 export function adapterIdFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): AdapterId | null {
   if (account.kind !== 'mock') return null;
-  if (account.platform === 'threads' && account.credential_state !== undefined && account.credential_state !== 'none') return 'mock_threads';
+  const linked = account.credential_state !== undefined && account.credential_state !== 'none';
+  if (account.platform === 'threads' && linked) return 'mock_threads';
+  if (account.platform === 'youtube' && linked) return 'mock_youtube';
   return 'mock_generic';
 }
 
-/** T14: 원격 단계 기록(remote_steps) — 어댑터가 외부 호출 사이에 남기는 참조. ID 는 모의 ID 만(DB CHECK remote_id LIKE 'mock%'). */
-export const REMOTE_STEP_KINDS = ['container', 'publish'] as const;
+/**
+ * T14: 원격 단계 기록(remote_steps) — 어댑터가 외부 호출 사이에 남기는 참조. ID 는 모의 ID 만(DB CHECK remote_id LIKE 'mock%').
+ * T15(D27): YouTube 재개 업로드 — upload_session(세션 URI, post_index = 세션 순번, 받은 바이트 수는 단조 증가) · video(영상 ID, post_index 0).
+ * 종류별 상태: container created|finished|error · publish published · upload_session created(진행 중)|finished(다 보냄)|expired|error ·
+ * video uploaded|processed|error.
+ */
+export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video'] as const;
 export type RemoteStepKind = (typeof REMOTE_STEP_KINDS)[number];
-export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error'] as const;
+export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed'] as const;
 export type RemoteStepStatus = (typeof REMOTE_STEP_STATUSES)[number];
+/** 종류별 허용 상태(DB CHECK remote_steps_kind_status_chk 와 같아야 한다). */
+export const REMOTE_STEP_KIND_STATUSES: Readonly<Record<RemoteStepKind, readonly RemoteStepStatus[]>> = {
+  container: ['created', 'finished', 'error'],
+  publish: ['published'],
+  upload_session: ['created', 'finished', 'expired', 'error'],
+  video: ['uploaded', 'processed', 'error'],
+};
 
 export interface RemoteStep {
   kind: RemoteStepKind;
@@ -334,6 +366,12 @@ export interface RemoteStep {
   step_index: number;
   remote_id: string;
   status: RemoteStepStatus;
+  /** T15: 업로드 세션의 원격이 확인한 받은 바이트 수(단조 증가 — DB 트리거). 다른 종류는 null. */
+  received_bytes: number | null;
+  /** T15: 업로드할 전체 바이트 수(처음 기록 뒤 불변). */
+  total_bytes: number | null;
+  /** T15: 같은 세션을 다음 시도가 이어 받은 횟수(단조 증가). */
+  resume_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -344,7 +382,36 @@ export interface RemoteStep {
  */
 export interface RemoteStepsPort {
   list(): Promise<RemoteStep[]>;
-  record(step: { kind: RemoteStepKind; post_index: number; remote_id: string; status: RemoteStepStatus }): Promise<RemoteStep>;
+  /**
+   * T15: received_bytes 는 앞으로만(더 작으면 409 remote_step_regress), total_bytes 는 처음 값 그대로(다르면 409), resumed=true 면 resume_count + 1.
+   */
+  record(step: {
+    kind: RemoteStepKind;
+    post_index: number;
+    remote_id: string;
+    status: RemoteStepStatus;
+    received_bytes?: number;
+    total_bytes?: number;
+    resumed?: boolean;
+  }): Promise<RemoteStep>;
+}
+
+/**
+ * T15(D27): 업로드할 미디어 파일 창구(작업 처리기가 넣는다). 승인 스냅샷의 첨부(id·checksum·mime)와 같은 **VERIFIED·지워지지 않은** owner 의
+ * asset 만 연다(아니면 code). read 는 [start, end) 바이트만 읽는다 — 큰 영상을 메모리에 한꺼번에 올리지 않는다.
+ */
+export interface MediaFile {
+  bytes: number;
+  mime: string;
+  checksum: string;
+  read(start: number, end: number): Promise<Uint8Array>;
+}
+export interface MediaPort {
+  open(asset: { id: string; checksum: string; mime: string }): Promise<{ ok: true; file: MediaFile } | { ok: false; code: string }>;
+}
+/** T15: 저장소에서 key 의 [start, end) 바이트를 읽는 함수(작업 처리기 옵션 — web·CLI 가 로컬 저장소로 넣는다). */
+export interface MediaReader {
+  readRange(key: string, start: number, end: number): Promise<Uint8Array>;
 }
 
 /**
@@ -426,15 +493,32 @@ export const MOCK_SCENARIO_VALUES = [
   'threads_rate_limited',
   'threads_token_invalid',
   'threads_text_too_long',
+  // T15(D27): YouTube 모의 어댑터(mock_youtube) 전용 — 시뮬레이터 동작만 정한다(payload·hash 는 그대로).
+  'youtube_success_private',
+  'youtube_processing_slow',
+  'youtube_network_drop',
+  'youtube_response_lost_after_complete',
+  'youtube_session_expired_before_complete',
+  'youtube_quota_exceeded',
+  'youtube_token_invalid',
+  'youtube_rejected',
+  'youtube_public_unverified_forced_private',
+  'youtube_scheduled_private',
+  'youtube_project_verified',
 ] as const;
 export type MockScenarioValue = (typeof MOCK_SCENARIO_VALUES)[number];
 /** T14: Threads 모의 어댑터에만 쓰는 시나리오. 'success' 는 두 어댑터 모두에 쓸 수 있다(Threads 에서는 threads_success). */
 export const THREADS_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.startsWith('threads_')) as readonly MockScenarioValue[];
 export const isThreadsMockScenario = (s: string): boolean => s.startsWith('threads_');
+/** T15: YouTube 모의 어댑터에만 쓰는 시나리오. */
+export const YOUTUBE_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.startsWith('youtube_')) as readonly MockScenarioValue[];
+export const isYouTubeMockScenario = (s: string): boolean => s.startsWith('youtube_');
 /** 어댑터에 맞는 시나리오인가(API 가 다르면 400 scenario_not_applicable). */
 export function scenarioApplies(adapter: AdapterId, scenario: string): boolean {
   if (scenario === 'success') return true;
-  return adapter === 'mock_threads' ? isThreadsMockScenario(scenario) : !isThreadsMockScenario(scenario);
+  if (adapter === 'mock_threads') return isThreadsMockScenario(scenario);
+  if (adapter === 'mock_youtube') return isYouTubeMockScenario(scenario);
+  return !isThreadsMockScenario(scenario) && !isYouTubeMockScenario(scenario);
 }
 export const MOCK_SCENARIO_MAX_DELAY_MS = 5000;
 
@@ -463,6 +547,10 @@ export interface AdapterContext {
   credential?: CredentialPort;
   /** T14: 조회(reconcile) 때도 승인 스냅샷이 필요한 어댑터용(예: 스레드 게시물 수). */
   snapshot?: PublishSnapshot;
+  /** T15: 업로드할 미디어(VERIFIED asset 만, 범위 읽기). 작업 처리기가 넣는다. */
+  media?: MediaPort;
+  /** T15: 이 작업에 취소 요청이 들어왔는가(짧은 읽기). 긴 업로드가 조각 사이에 확인하고 영상이 생기기 전이면 멈춘다. */
+  cancelRequested?: () => Promise<boolean>;
 }
 
 export interface ChannelAdapter {
@@ -471,6 +559,8 @@ export interface ChannelAdapter {
   readonly id?: AdapterId;
   /** T14: 이 스냅샷이 쓸 요청 제한 단위 수(예: 스레드 게시물 수). capabilities.rate_limit 과 함께 쓴다. */
   rateUnits?(snapshot: PublishSnapshot): number;
+  /** T15: 요청 제한 사용량을 셀 원격 단계 종류(기본 ['publish'] — Threads 게시. YouTube 는 ['upload_session'] = 업로드 시작 수). */
+  readonly rateStepKinds?: readonly RemoteStepKind[];
   /** ctx.mockScenario 는 모의 어댑터가 항목별 capabilities(cancel 등)를 정할 때만 쓴다. */
   capabilities(account: AdapterAccount, ctx?: Pick<AdapterContext, 'mockScenario'>): AdapterCapabilities;
   validate(snapshot: PublishSnapshot): { ok: true } | { ok: false; error_code: string };
@@ -634,7 +724,9 @@ export class ScenarioNotApplicableError extends AppError {
       'scenario_not_applicable',
       adapter === 'mock_threads'
         ? '이 항목은 Threads 모의 연결 계정이라 threads_* 시나리오(또는 success)만 정할 수 있습니다'
-        : 'threads_* 시나리오는 모의 연결(Threads 형 OAuth)한 Threads 계정 항목에만 정할 수 있습니다',
+        : adapter === 'mock_youtube'
+          ? '이 항목은 YouTube 모의 연결 계정이라 youtube_* 시나리오(또는 success)만 정할 수 있습니다'
+          : 'threads_*·youtube_* 시나리오는 모의 연결(OAuth)한 Threads·YouTube 계정 항목에만 정할 수 있습니다',
       { adapter },
     );
   }

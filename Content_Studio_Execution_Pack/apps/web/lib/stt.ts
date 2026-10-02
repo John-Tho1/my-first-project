@@ -25,6 +25,7 @@ export async function runInlineWorker(config: AppConfig, db: Db): Promise<Worker
     maxJobs: 5,
     credentialRefresh,
     jobCredentials: jobCredentials(config, db),
+    media: getStorage(config),
   });
 }
 

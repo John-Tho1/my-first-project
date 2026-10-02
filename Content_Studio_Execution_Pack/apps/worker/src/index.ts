@@ -30,7 +30,7 @@ import {
   type RetentionResult,
   type TranscriberLike,
 } from '@cs/db';
-import type { AppConfig, ChannelAdapterRegistry } from '@cs/domain';
+import type { AppConfig, ChannelAdapterRegistry, MediaReader } from '@cs/domain';
 
 export interface WorkerTick {
   ranAt: string;
@@ -94,6 +94,8 @@ export interface WorkerTickInput {
   credentialRefresh?: (now: Date) => Promise<{ refreshed: number; failed: number }>;
   /** T14(D26): 배포 작업의 연결 정보 의존성(키 묶음·401 뒤 확인). 없으면 작업 처리기 기본값(process.env 키, 확인 없음). */
   jobCredentials?: JobRunOptions['credentials'];
+  /** T15(D27): 배포 작업이 올릴 미디어 파일 범위 읽기(로컬 저장소). 없으면 미디어가 필요한 어댑터는 원격 호출 없이 닫는다. */
+  media?: MediaReader;
 }
 
 export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick> {
@@ -118,6 +120,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
       maxJobs: Math.min(Math.max(input.maxJobs ?? 5, 1), 20),
       ownerId: input.ownerId,
       credentials: input.jobCredentials,
+      media: input.media,
     });
   }
   const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);

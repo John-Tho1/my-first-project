@@ -2,7 +2,7 @@
  * T13(결정 D24) 서버 전용: 계정 연결(OAuth) 의존성 — 공급자 선택·키 묶음·redirect URI. 비밀 값은 process.env 에서만 읽고 돌려주지 않는다.
  * 기본·개발용 마스터 키는 없다: SECRETS_MASTER_KEY 가 없으면 연결 관련 동작만 503(secrets_not_configured), 나머지 앱은 그대로.
  */
-import { checkCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
+import { checkCredential, refreshCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
 import {
   AppError,
   envPresent,
@@ -13,7 +13,7 @@ import {
   secretsReadiness,
   type AppConfig,
 } from '@cs/domain';
-import { MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
+import { MockGoogleOAuthProvider, MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
 import { errorResponse, seeOther } from './api';
 
 export interface OAuthDeps {
@@ -40,7 +40,14 @@ export function jobCredentials(config: AppConfig, db: Db, env: Record<string, st
   return {
     keyring: deps.keyring,
     check: (ownerId, accountId, now) => checkCredential(db, { ownerId, accountId, providerFor: deps.providerFor, keyring: deps.keyring, now }),
+    // T15(D27): 짧은 access token(Google 형)이 만료됐으면 보내기 전에 T13 갱신 경로를 한 번(세대·정리 규칙 그대로)
+    refresh: (ownerId, accountId, now) => refreshCredential(db, { ownerId, accountId, providerFor: deps.providerFor, keyring: deps.keyring, now, trigger: 'auto' }),
   };
+}
+
+/** T15(D27): Google(YouTube) 형 모의 "동의 화면" 경로가 쓰는 공급자(등록 redirect URI = 설정값) */
+export function mockGoogleProvider(config: AppConfig): MockGoogleOAuthProvider {
+  return new MockGoogleOAuthProvider({ registeredRedirectUri: oauthRedirectUri(config), appBaseUrl: config.APP_BASE_URL });
 }
 
 /** 모의 "동의 화면" 경로가 쓰는 공급자(등록 redirect URI = 설정값) */
@@ -60,7 +67,7 @@ export function oauthReadinessView(config: AppConfig, env: Record<string, string
 
 export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   secrets_not_configured: '서버 비밀 암호화 키(SECRETS_MASTER_KEY·SECRETS_KEY_VERSION)가 설정되지 않아 계정을 연결할 수 없습니다. 다른 기능은 그대로 쓸 수 있습니다.',
-  oauth_not_supported: 'T13 에서는 Threads 모의 계정만 연결할 수 있습니다.',
+  oauth_not_supported: 'Threads·YouTube 모의 계정만 연결할 수 있습니다.',
   live_oauth_not_configured: '실제 계정 연결은 아직 준비되지 않았습니다(T14, 별도 승인 후). 외부로 아무것도 보내지 않았습니다.',
   oauth_state_invalid: '연결 요청을 확인할 수 없습니다. 다시 연결하세요.',
   oauth_state_expired: '연결 요청 시간이 지났습니다(10분). 다시 연결하세요.',

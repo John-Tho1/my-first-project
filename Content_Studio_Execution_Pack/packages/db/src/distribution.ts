@@ -24,6 +24,7 @@ import {
   ApprovalRequiredForExecuteError,
   assertExecutionAllowed,
   BadRequestError,
+  adapterIdFor,
   buildCanonicalPayload,
   canVariantTransition,
   CHANNEL_LABEL,
@@ -36,6 +37,7 @@ import {
   MOCK_EXTERNAL_PREFIX,
   NotFoundError,
   payloadHash,
+  providerMetadataOf,
   scheduleFromMsk,
   SCHEDULE_TIMEZONE,
   SnapshotStaleError,
@@ -299,6 +301,8 @@ export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: Distri
         visibility: item.visibility as Visibility,
         scheduledAtUtc: item.scheduledAtUtc,
         timezone: item.scheduleTimezone,
+        // T15: 원격 예약 공개 시각은 항목 열이 아니라 payload 에만 있다(불변 스냅샷 — hash 는 따로 다시 확인한다)
+        providerMetadata: providerMetadataOf(item.payloadJson),
       });
       if (payloadHash(recomputed) !== item.payloadHash) problems.push('payload_changed');
     } else {
@@ -309,6 +313,9 @@ export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: Distri
   const brand = await getCurrentBrandProfile(tx, ownerId);
   if ((brand?.id ?? null) !== item.brandProfileId) problems.push('brand_changed');
   if (item.scheduledAtUtc && item.scheduledAtUtc.getTime() <= now.getTime()) problems.push('schedule_passed');
+  // T15(D27): 원격 예약 공개 시각(YouTube publishAt)이 지났으면 그 승인은 쓸 수 없다 — 과거 publishAt 은 즉시 공개 효과(docs/03, A13).
+  const publishAt = providerMetadataOf(item.payloadJson).publish_at;
+  if (publishAt && Date.parse(publishAt) <= now.getTime()) problems.push('publish_at_passed');
   if (variant) {
     const blockers = await variantReviewBlockers(tx, ownerId, variant.id);
     for (const b of blockers) problems.push(`blocked:${b}`);
@@ -323,7 +330,7 @@ export function invalidationReasonOf(problems: readonly string[]): InvalidationR
   if (problems.includes('variant_changed')) return 'body_changed';
   if (problems.includes('account_changed')) return 'account_changed';
   if (problems.includes('brand_changed')) return 'brand_changed';
-  if (problems.includes('schedule_passed')) return 'schedule_passed';
+  if (problems.includes('schedule_passed') || problems.includes('publish_at_passed')) return 'schedule_passed';
   return 'snapshot_changed';
 }
 
@@ -378,7 +385,15 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       if (acc.platform !== variant.channel) throw new ChannelMismatchError();
       if (!accountReady(acc)) throw new AccountNotReadyError();
       let requested: RequestedResult;
-      if (acc.kind === 'mock') {
+      // T15(D27): 모의 연결(Google 형 OAuth)한 YouTube 계정은 실제 계정과 같은 목적(upload_private·public_publish)을 쓴다 — 결과는 여전히 MOCK.
+      // 연결한 적 없는 모의 계정(seed)·Threads 모의 연결 계정은 T10 규칙 그대로 mock_publish 만.
+      const youtubeLinked = adapterIdFor({ kind: acc.kind === 'mock' ? 'mock' : 'live', platform: acc.platform, credential_state: acc.credentialState }) === 'mock_youtube';
+      if (youtubeLinked) {
+        requested = it.requested_result ?? 'upload_private';
+        if (requested === 'mock_publish') {
+          throw new AppError('bad_request', 'requested_result_not_supported', '모의 연결한 YouTube 계정은 비공개 업로드(upload_private) 또는 공개 게시(public_publish)를 지정합니다(결과는 MOCK)');
+        }
+      } else if (acc.kind === 'mock') {
         requested = it.requested_result ?? 'mock_publish';
         if (requested !== 'mock_publish') throw new AppError('bad_request', 'mock_only', '모의(MOCK) 계정은 모의 실행(mock_publish)만 할 수 있습니다');
       } else {
@@ -388,6 +403,21 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       const visibility: Visibility = it.visibility ?? 'private';
       if (requested === 'upload_private' && visibility !== 'private') throw new AppError('bad_request', 'visibility_mismatch', '비공개 업로드는 공개 범위가 private 이어야 합니다');
       const scheduledAtUtc = it.schedule ? scheduleFromMsk(it.schedule.date, it.schedule.time, now) : null;
+      // T15(D27): YouTube 원격 예약 공개(publishAt) — 처음부터 명확히 승인한 공개 계획(public_publish)의 private 영상에만, 미래 시각만(A13).
+      let publishAtUtc: Date | null = null;
+      if (it.publish_at) {
+        if (variant.channel !== 'youtube') throw new AppError('bad_request', 'publish_at_not_supported', '원격 예약 공개(publish_at)는 YouTube 항목에만 정할 수 있습니다');
+        if (requested !== 'public_publish') {
+          throw new AppError('bad_request', 'publish_at_requires_public_publish', '비공개 업로드만 승인하는 계획에는 예약 공개(publishAt)를 넣을 수 없습니다(공개 계획 public_publish 로 만드세요)');
+        }
+        if (visibility !== 'private') throw new AppError('bad_request', 'publish_at_requires_private', '예약 공개는 private 영상에만 정할 수 있습니다(예약 시각에 공개로 바뀜)');
+        publishAtUtc = scheduleFromMsk(it.publish_at.date, it.publish_at.time, now);
+        if (scheduledAtUtc && publishAtUtc.getTime() <= scheduledAtUtc.getTime()) {
+          throw new AppError('bad_request', 'publish_at_before_send', '예약 공개 시각은 업로드 시작(일정) 시각보다 뒤여야 합니다');
+        }
+      } else if (youtubeLinked && requested === 'public_publish' && visibility === 'private') {
+        throw new AppError('bad_request', 'visibility_mismatch', '공개 게시(public_publish)는 공개 범위 public·unlisted 또는 private + 예약 공개(publish_at)여야 합니다');
+      }
       const vv = await tx
         .select()
         .from(variantVersions)
@@ -410,6 +440,7 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
         visibility,
         scheduledAtUtc,
         timezone: SCHEDULE_TIMEZONE,
+        providerMetadata: publishAtUtc ? { publish_at: publishAtUtc.toISOString() } : null,
       });
       channels.push(variant.channel);
       prepared.push({

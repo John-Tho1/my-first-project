@@ -38,6 +38,7 @@ import {
   type ResultKind,
 } from '@cs/domain';
 import { ThreadsMockChannelAdapter } from './threads-mock';
+import { YouTubeMockChannelAdapter } from './youtube-mock';
 
 export type {
   AdapterAccount,
@@ -370,25 +371,32 @@ export class MockChannelAdapter implements ChannelAdapter {
 
 /**
  * 모의 어댑터 레지스트리. T14(D26) 선택 규칙은 @cs/domain adapterIdFor 한 곳:
- * 모의 + threads + credential_state ≠ none → ThreadsMockChannelAdapter, 그 밖의 모의 계정 → MockChannelAdapter(M3 그대로),
+ * 모의 + threads + credential_state ≠ none → ThreadsMockChannelAdapter, 모의 + youtube + credential_state ≠ none → YouTubeMockChannelAdapter(T15),
+ * 그 밖의 모의 계정 → MockChannelAdapter(M3 그대로),
  * live → LiveChannelNotConfiguredError(live 어댑터 없음).
  */
 export class MockChannelAdapterRegistry implements ChannelAdapterRegistry {
   readonly threads: ThreadsMockChannelAdapter;
+  /** T15(D27): 모의 연결(Google 형 OAuth)한 YouTube 계정 → 재개 업로드 모의 어댑터 */
+  readonly youtube: YouTubeMockChannelAdapter;
   constructor(
     readonly mock: MockChannelAdapter,
     threads?: ThreadsMockChannelAdapter,
+    youtube?: YouTubeMockChannelAdapter,
   ) {
     this.threads = threads ?? new ThreadsMockChannelAdapter();
+    this.youtube = youtube ?? new YouTubeMockChannelAdapter();
   }
   getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): ChannelAdapter {
     const id = adapterIdFor(account);
     if (id === 'mock_threads') return this.threads;
+    if (id === 'mock_youtube') return this.youtube;
     if (id === 'mock_generic') return this.mock;
     throw new LiveChannelNotConfiguredError();
   }
   getAdapterById(id: string): ChannelAdapter | null {
     if (id === 'mock_threads') return this.threads;
+    if (id === 'mock_youtube') return this.youtube;
     if (id === 'mock_generic') return this.mock;
     return null;
   }

@@ -2,7 +2,7 @@
  * T10 배포함 — 폼 → API 입력, 폼 오류 리다이렉트, 화면 문구(서버 전용).
  * 모든 성공 문구에는 MOCK 이 들어가고 "게시 완료" 같은 말은 쓰지 않는다(M3 은 모의 실행만, 실제 게시 없음).
  */
-import { AppError, MOCK_SCENARIO_VALUES, scenarioApplies, type AdapterId } from '@cs/domain';
+import { AppError, formatMskInline, MOCK_SCENARIO_VALUES, scenarioApplies, type AdapterId } from '@cs/domain';
 import { errorResponse, seeOther } from './api';
 
 export const MAX_DISTRIBUTION_REQUEST = 64 * 1024;
@@ -46,6 +46,7 @@ export const PROBLEM_LABEL: Record<string, string> = {
   payload_changed: '배포 내용이 스냅샷과 다름',
   schedule_passed: '예약 시각이 지남',
   brand_changed: '브랜드 프로필이 새 버전으로 바뀜',
+  publish_at_passed: '예약 공개 시각(publishAt)이 지남',
 };
 
 export function problemLabel(p: string): string {
@@ -89,7 +90,15 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
   not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
   item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
-  scenario_not_applicable: '이 항목의 모의 어댑터(일반 모의·Threads 모의)에 맞지 않는 시나리오입니다. threads_* 는 모의 연결한 Threads 계정 항목에만 쓸 수 있습니다.',
+  scenario_not_applicable:
+    '이 항목의 모의 어댑터(일반 모의·Threads 모의·YouTube 모의)에 맞지 않는 시나리오입니다. threads_* 는 모의 연결한 Threads 계정, youtube_* 는 모의 연결한 YouTube 계정 항목에만 쓸 수 있습니다.',
+  // T15(D27): YouTube 모의 연결 계정의 목적·공개 범위·예약 공개 규칙
+  requested_result_not_supported: '모의 연결한 YouTube 계정은 비공개 업로드 또는 공개 게시 계획만 만들 수 있습니다(결과는 MOCK).',
+  visibility_mismatch: '요청 결과와 공개 범위가 맞지 않습니다(비공개 업로드 = private, 공개 게시 = public·unlisted 또는 private + 예약 공개).',
+  publish_at_not_supported: '예약 공개(publishAt)는 YouTube 항목에만 정할 수 있습니다.',
+  publish_at_requires_public_publish: '비공개 업로드 계획에는 예약 공개를 넣을 수 없습니다(공개 계획으로 따로 승인해야 합니다).',
+  publish_at_requires_private: '예약 공개는 private 영상에만 정할 수 있습니다.',
+  publish_at_before_send: '예약 공개 시각은 업로드 시작 시각보다 뒤여야 합니다.',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -182,7 +191,7 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
 };
 
 /** T14(D26): 요청 제한으로 기다리는 재시도 대기(로컬 제한 또는 원격 429). */
-const RATE_LIMIT_CODES = new Set(['local_rate_limited', 'rate_limited']);
+const RATE_LIMIT_CODES = new Set(['local_rate_limited', 'rate_limited', 'quota_exceeded']);
 export const isRateLimitWait = (job: { state: string; lastErrorCode: string | null }) => job.state === 'RETRY_WAIT' && RATE_LIMIT_CODES.has(job.lastErrorCode ?? '');
 
 interface JobLike {
@@ -203,7 +212,7 @@ interface PubLike {
  * 작업 상태 한 줄(docs/03 상태 분리 문구). 예: `RETRY_WAIT · 재시도 대기 (2/5, 다음 18:04 MSK)`,
  * `CONFIRMED · MOCK 게시 확인 (mock://threads/…)`. 모의 결과는 항상 MOCK 을 붙이고 "게시 완료"라고 하지 않는다.
  */
-export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: string | null): string {
+export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: string | null, channel?: string): string {
   switch (job.state) {
     case 'QUEUED':
       return 'QUEUED · 대기';
@@ -214,7 +223,8 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     case 'REMOTE_PROCESSING':
       return 'REMOTE_PROCESSING · 원격 처리 중(확인 대기)';
     case 'RETRY_WAIT':
-      if (isRateLimitWait(job)) return `RETRY_WAIT · 요청 제한 — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
+      // T15: YouTube 는 할당량(업로드 시작 수) — "할당량 소진"
+      if (isRateLimitWait(job)) return `RETRY_WAIT · ${channel === 'youtube' ? '할당량 소진' : '요청 제한'} — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
       return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})`;
     case 'RECONCILING':
       return 'RECONCILING · 등록 여부 확인 필요';
@@ -266,6 +276,18 @@ export const MOCK_SCENARIO_LABEL: Record<(typeof MOCK_SCENARIO_VALUES)[number], 
   threads_rate_limited: 'Threads 모의: 요청 제한(429, Retry-After 5초) 한 번',
   threads_token_invalid: 'Threads 모의: 토큰 거절(401) — 계정 다시 연결 필요',
   threads_text_too_long: 'Threads 모의: 형식 오류(400 글자 수) — 재시도 안 함',
+  // T15(D27): YouTube 모의 어댑터(모의 연결 계정 — 재개 업로드)
+  youtube_success_private: 'YouTube 모의: 재개 업로드 → 처리 → 비공개 업로드 확인',
+  youtube_processing_slow: 'YouTube 모의: 업로드 뒤 처리 지연(조회 3회) → 확인',
+  youtube_network_drop: 'YouTube 모의: 50% 지점에서 연결 끊김 → 같은 세션으로 이어 올리기',
+  youtube_response_lost_after_complete: 'YouTube 모의: 마지막 조각 응답 유실(원격은 받음) — 조회로 확인, 다시 올리지 않음',
+  youtube_session_expired_before_complete: 'YouTube 모의: 업로드 중 세션 만료(영상 없음 확인) → 새 세션',
+  youtube_quota_exceeded: 'YouTube 모의: 할당량 초과(403 quotaExceeded) → 초기화 시각까지 대기',
+  youtube_token_invalid: 'YouTube 모의: 토큰 거절(401) — 계정 다시 연결 필요',
+  youtube_rejected: 'YouTube 모의: 업로드 뒤 처리 거부(rejected) — 실패, 재시도 안 함',
+  youtube_public_unverified_forced_private: 'YouTube 모의: 미검증 프로젝트 — public 요청도 비공개로 강제',
+  youtube_scheduled_private: 'YouTube 모의: 검증된 프로젝트 + 예약 공개(payload 의 publish_at) → 원격 예약',
+  youtube_project_verified: 'YouTube 모의(시험·개발 전용): 검증된 프로젝트 — public 요청이면 공개 결과',
 };
 
 export const MOCK_SCENARIO_OPTIONS = MOCK_SCENARIO_VALUES.map((v) => ({ value: v, label: `${v} — ${MOCK_SCENARIO_LABEL[v]}` }));
@@ -286,6 +308,30 @@ export function remoteStepLine(step: { kind: string; status: string; postIndex: 
   const label = REMOTE_STEP_LABEL[`${step.kind}:${step.status}`] ?? `${step.kind} ${step.status}`;
   return `게시물 ${step.postIndex + 1}/${total} · ${label} · ${step.remoteId}`;
 }
+
+/**
+ * T15(D27): YouTube 재개 업로드 진행 한 줄 — `업로드 50% (0.2/0.3 MB) · 세션 재개 1회`. 세션 URI 는 넣지 않는다(`세션 있음`만).
+ * received·total 은 원격이 확인한 값(remote_steps). 100% 여도 "게시"가 아니다.
+ */
+export function youtubeProgressLine(p: { received: number | null; total: number | null; resumes: number; sessions: number }): string {
+  const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+  const total = p.total ?? 0;
+  const received = Math.min(p.received ?? 0, total);
+  const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+  const extra = p.sessions > 1 ? ` · 새 세션 ${p.sessions - 1}회(만료)` : '';
+  return `업로드 ${pct}% (${mb(received)}/${mb(total)} MB) · 세션 재개 ${p.resumes}회${extra}`;
+}
+
+/** T15: YouTube 단계 상태 문구(모의 ID 만 — 세션 URI 는 `세션 있음`). */
+export const YOUTUBE_STEP_LABEL: Record<string, string> = {
+  'upload_session:created': '업로드 세션 진행 중(세션 있음)',
+  'upload_session:finished': '업로드 세션 완료(모든 바이트 받음)',
+  'upload_session:expired': '업로드 세션 만료(영상 없음 확인)',
+  'upload_session:error': '업로드 세션 오류',
+  'video:uploaded': '영상 업로드됨 — 처리 중',
+  'video:processed': '영상 처리 끝(MOCK)',
+  'video:error': '영상 처리 실패·거부',
+};
 
 const mskClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit', hour12: false });
 
@@ -371,6 +417,10 @@ export interface ItemHeadlineInput {
   activeApproval?: boolean;
   /** FIX-T12: 스냅샷이 지금 행과 달라 이 계획을 다시 승인할 수 없음(snapshotProblems 있음) */
   needsNewPlan?: boolean;
+  /** T15: YouTube 원격 예약 공개 시각(승인 스냅샷 provider_metadata.publish_at) — 원격 예약 문구에 쓴다 */
+  publishAt?: string | null;
+  /** T15: 영상 업로드 뒤 삭제는 범위 밖 — 취소 요청 뒤 업로드가 확인된 항목 */
+  cancelTooLate?: boolean;
 }
 
 /**
@@ -398,7 +448,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
     case 'REMOTE_PROCESSING':
       return x.channel === 'youtube' ? '비공개 업로드 처리 중 — 확인 대기' : '원격 처리 중 — 확인 대기';
     case 'RETRY_WAIT':
-      if (job && isRateLimitWait(job)) return `요청 제한 — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
+      if (job && isRateLimitWait(job)) return `${x.channel === 'youtube' ? '할당량 소진' : '요청 제한'} — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
       return job ? `재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})` : '재시도 대기';
     case 'RECONCILING':
       return '등록 여부 확인 필요';
@@ -417,6 +467,16 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       return `보류 — ${BLOCK_REASON_LABEL[reason] ?? reason ?? '확인 필요'}`;
     case 'CONFIRMED': {
       const kind = x.pub?.resultKind;
+      if (x.channel === 'youtube') {
+        // T15(D27): CONFIRMED ≠ 공개. 원격이 보고한 결과 종류로만 말하고 "게시 완료"라고 하지 않는다(A12).
+        const tail = x.cancelTooLate ? ' · 업로드됨 — 삭제는 별도 동작(범위 밖)' : '';
+        if (kind === 'UPLOADED_PRIVATE') return `비공개 업로드 완료, 공개 전환 확인 필요${tail}`;
+        if (kind === 'SCHEDULED_REMOTE') {
+          const at = x.publishAt && Number.isFinite(Date.parse(x.publishAt)) ? formatMskInline(x.publishAt) : '시각 미확인';
+          return `비공개 업로드 + 예약 공개 ${at} (원격 예약, 확인 필요)${tail}`;
+        }
+        if (kind === 'PUBLISHED') return `공개 게시 확인(MOCK)${tail}`;
+      }
       if (kind === 'UPLOADED_PRIVATE') return x.channel === 'youtube' ? '비공개 업로드 완료, 공개 전환 확인 필요' : 'MOCK 비공개 결과 확인';
       if (kind === 'SCHEDULED_REMOTE') return 'MOCK 원격 예약 확인';
       if (kind === 'PUBLISHED') return 'MOCK 공개 결과 확인';

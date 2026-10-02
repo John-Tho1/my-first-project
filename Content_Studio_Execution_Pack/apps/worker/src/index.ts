@@ -96,6 +96,11 @@ export interface WorkerTickInput {
   jobCredentials?: JobRunOptions['credentials'];
   /** T15(D27): 배포 작업이 올릴 미디어 파일 범위 읽기(로컬 저장소). 없으면 미디어가 필요한 어댑터는 원격 호출 없이 닫는다. */
   media?: MediaReader;
+  /**
+   * FIX-T15(Codex review-T15 P1): 전송 실행 하나의 조각 예산. inline 모드(web 요청 안 — /api/health·목록 조회)는 WEB_TICK_UPLOAD_SLICE 를 넣어
+   * 영상 전체를 한 요청에서 올리지 않는다(docs/02). 별도 worker 프로세스(CLI)는 넣지 않는다(제한 없음 — 시간 제한만).
+   */
+  uploadSlice?: JobRunOptions['uploadSlice'];
 }
 
 export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick> {
@@ -121,6 +126,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
       ownerId: input.ownerId,
       credentials: input.jobCredentials,
       media: input.media,
+      uploadSlice: input.uploadSlice,
     });
   }
   const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);

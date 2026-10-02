@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import {
   adapterIdFor,
   codeChallengeS256,
+  LeaseLostError,
   scenarioApplies,
   YOUTUBE_REQUIRED_SCOPES,
   type AdapterContext,
@@ -451,6 +452,184 @@ describe('YouTubeMockChannelAdapter submit/reconcile', () => {
       error_code: 'youtube_delete_out_of_scope',
     });
     expect(a.capabilities({ id: 'acc', kind: 'mock', platform: 'youtube', external_account_id: USER })).toMatchObject({ cancel: false, read: true, mock: true, media: true });
+  });
+});
+
+// FIX-T15(Codex review-T15 on 427dc71): 읽기 도중 중단·lease 상실·취소, 요청 제한 단위(만료 세션), 조각 예산(web tick), 조회 장애 주입이 완료를 가리지 않음
+describe('FIX-T15 — 읽기 도중 중단·요청 제한 단위·조각 예산·조회 장애', () => {
+  /** read(start) 가 at 이면 release() 까지 기다리는 미디어(그 사이에 중단·취소를 일으킨다). */
+  function gatedMedia(at: number) {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const reached = new Promise<void>((r) => (entered = r));
+    const media: MediaPort = {
+      open: async () => ({
+        ok: true,
+        file: {
+          bytes: VIDEO.byteLength,
+          mime: 'video/mp4',
+          checksum: sha(VIDEO),
+          read: async (s, e) => {
+            if (s === at) {
+              entered();
+              await gate;
+            }
+            return VIDEO.slice(s, e);
+          },
+        },
+      }),
+    };
+    return { media, release, reached };
+  }
+  const ref = (k: string) => ({ platform: 'youtube', intent_key: k, external_id: null, provider_request_id: null });
+
+  it.each([
+    ['중간 조각', 2 * 64 * KIB],
+    ['마지막 조각', 4 * 64 * KIB],
+  ])('읽기 도중 abort(%s) → 그 조각을 보내지 않음(putChunk 추가 0, 영상 없음), 세션은 resumable, 다음 시도가 받은 바이트부터', async (_l, at) => {
+    const a = adapter();
+    const steps = memSteps();
+    const ac = new AbortController();
+    const g = gatedMedia(at);
+    const ctx1 = ctxOf(steps, { signal: ac.signal, media: g.media });
+    const p = send(a, snapshot(), ctx1);
+    await g.reached;
+    const putsAtAbort = a.api.calls.putChunk;
+    ac.abort();
+    g.release();
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+    expect(a.api.calls.putChunk).toBe(putsAtAbort);
+    expect(a.api.videosOf(USER)).toHaveLength(0);
+    expect(steps.rows.find((s) => s.kind === 'upload_session')).toMatchObject({ status: 'created', received_bytes: at });
+    expect(await a.reconcile(ref(ctx1.intentKey), ctx1)).toMatchObject({ status: 'resumable' });
+    const r2 = await send(a, snapshot(), ctxOf(steps, { attempt: 2 }));
+    expect(r2.status).toBe('processing');
+    expect(a.api.calls.initResumable).toBe(1);
+    expect(a.api.bytesSent).toBe(VIDEO.byteLength);
+    expect(a.api.videosOf(USER)).toHaveLength(1);
+    expect(a.api.videosOf(USER)[0]!.sha256).toBe(sha(VIDEO));
+  });
+
+  it('읽기 도중 lease 상실(heartbeat 실패) → LeaseLostError, 그 조각을 보내지 않음', async () => {
+    const a = adapter();
+    const steps = memSteps();
+    const g = gatedMedia(64 * KIB);
+    let lost = false;
+    const ctx = ctxOf(steps, {
+      media: g.media,
+      heartbeat: async () => {
+        if (lost) throw new LeaseLostError();
+      },
+    });
+    const p = send(a, snapshot(), ctx);
+    await g.reached;
+    const puts = a.api.calls.putChunk;
+    lost = true;
+    g.release();
+    await expect(p).rejects.toBeInstanceOf(LeaseLostError);
+    expect(a.api.calls.putChunk).toBe(puts);
+    expect(steps.rows.find((s) => s.kind === 'upload_session')!.received_bytes).toBe(64 * KIB);
+  });
+
+  it('읽기 도중 취소 요청 → 그 조각을 보내지 않고 canceled_before_upload_complete(영상 없음)', async () => {
+    const a = adapter();
+    const g = gatedMedia(3 * 64 * KIB);
+    let canceled = false;
+    const p = send(a, snapshot(), ctxOf(memSteps(), { media: g.media, cancelRequested: async () => canceled }));
+    await g.reached;
+    const puts = a.api.calls.putChunk;
+    canceled = true;
+    g.release();
+    expect(await p).toMatchObject({ status: 'rejected', error_code: 'canceled_before_upload_complete' });
+    expect(a.api.calls.putChunk).toBe(puts);
+    expect(a.api.videosOf(USER)).toHaveLength(0);
+  });
+
+  it('rateUnitsRemaining: 단계 없음·마지막 세션 만료/오류 → 1, 유효할 수 있는 세션(created·finished)·영상 있음 → 0', () => {
+    const a = adapter();
+    const step = (kind: RemoteStep['kind'], post_index: number, status: RemoteStep['status']): RemoteStep => ({
+      kind,
+      post_index,
+      status,
+      remote_id: 'mock',
+      step_index: 0,
+      received_bytes: null,
+      total_bytes: null,
+      resume_count: 0,
+      created_at: '',
+      updated_at: '',
+    });
+    expect(a.rateUnitsRemaining(snapshot(), [])).toBe(1);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'created')])).toBe(0);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'finished')])).toBe(0);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'expired')])).toBe(1);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'error')])).toBe(1);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'created'), step('upload_session', 1, 'expired')])).toBe(1);
+    expect(a.rateUnitsRemaining(snapshot(), [step('upload_session', 0, 'expired'), step('video', 0, 'uploaded')])).toBe(0);
+  });
+
+  it('사전 검사 때 유효하던 세션이 보낼 때 만료 → 예약 단위 0 이면 새 세션을 만들지 않고 부작용 없이 닫음(다음 시도가 할당량 재검사)', async () => {
+    const a = adapter();
+    const steps = memSteps();
+    const ctx1 = ctxOf(steps, { mockScenario: { scenario: 'youtube_network_drop', delay_ms: 0 } });
+    expect((await send(a, snapshot(), ctx1)).status).toBe('ambiguous');
+    a.api.expireSession(a.api.sessionUris(USER)[0]!);
+    const r = await send(a, snapshot(), ctxOf(steps, { attempt: 2, rateUnitsReserved: 0 }));
+    expect(r).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'upload_session_requires_quota_check' });
+    expect(a.api.calls.initResumable).toBe(1);
+    expect(steps.rows.find((s) => s.kind === 'upload_session')!.status).toBe('expired');
+    expect(a.rateUnitsRemaining(snapshot(), await steps.list())).toBe(1);
+    const r3 = await send(a, snapshot(), ctxOf(steps, { attempt: 3, rateUnitsReserved: 1 }));
+    expect(r3.status).toBe('processing');
+    expect(a.api.calls.initResumable).toBe(2);
+    expect(a.api.videosOf(USER)).toHaveLength(1);
+  });
+
+  it('조각 예산(web tick): 실행마다 조각 1개만 보내고 upload_yield(받은 바이트) → 같은 세션으로 이어 올려 끝까지, 합계 = 파일', async () => {
+    const a = adapter();
+    const steps = memSteps();
+    const chunks = Math.ceil(VIDEO.byteLength / (64 * KIB));
+    let last: Awaited<ReturnType<typeof send>> | null = null;
+    for (let i = 1; i <= chunks; i++) {
+      const before = a.api.calls.putChunk;
+      last = await send(a, snapshot(), ctxOf(steps, { attempt: i, uploadSlice: { max_bytes: 1, max_ms: 60_000 } }));
+      expect(a.api.calls.putChunk - before).toBe(1);
+      if (i < chunks) {
+        expect(last).toMatchObject({ status: 'processing', error_code: 'upload_slice_yield', upload_yield: { received_bytes: i * 64 * KIB, total_bytes: VIDEO.byteLength } });
+        expect(last.external_id).toBeUndefined();
+      }
+    }
+    expect(last).toMatchObject({ status: 'processing', external_id: expect.stringMatching(/^mock:youtube:mockyt_v_/) });
+    expect(last!.upload_yield).toBeUndefined();
+    expect(a.api.calls.initResumable).toBe(1);
+    expect(a.api.bytesSent).toBe(VIDEO.byteLength);
+    expect(a.api.videosOf(USER)[0]!.sha256).toBe(sha(VIDEO));
+    // 시간 예산 0 이어도 최소 한 조각은 보낸다(진행 보장)
+    const b = adapter();
+    const r = await send(b, snapshot(), ctxOf(memSteps(), { uploadSlice: { max_bytes: Number.MAX_SAFE_INTEGER, max_ms: 0 } }));
+    expect(r).toMatchObject({ status: 'processing', upload_yield: { received_bytes: 64 * KIB } });
+    expect(b.api.calls.putChunk).toBe(1);
+  });
+
+  it('Q1 복합 장애: 마지막 조각 응답 유실 + 조회의 "만료" 장애 주입 → 완료 세션은 만료로 답하지 않음(영상 확인, 두 번째 영상 없음)', async () => {
+    const a = adapter();
+    const steps = memSteps();
+    const ctx = ctxOf(steps, { mockScenario: { scenario: 'youtube_response_lost_after_complete', delay_ms: 0 } });
+    expect((await send(a, snapshot(), ctx)).status).toBe('ambiguous');
+    a.api.injectFault({ op: 'queryOffset', kind: 'session_expired', code: 'session_expired' });
+    expect(await a.reconcile(ref(ctx.intentKey), ctx)).toMatchObject({ status: 'found' });
+    const r2 = await send(a, snapshot(), ctxOf(steps, { attempt: 2 }));
+    expect(r2.status).toBe('processing');
+    expect(a.api.calls.initResumable).toBe(1);
+    expect(a.api.videosOf(USER)).toHaveLength(1);
+    // 끝나지 않은 세션에는 주입한 만료가 그대로(시험용 장애 경로 유지)
+    const b = adapter();
+    const s2 = memSteps();
+    const c2 = ctxOf(s2, { mockScenario: { scenario: 'youtube_network_drop', delay_ms: 0 } });
+    await send(b, snapshot(), c2);
+    b.api.injectFault({ op: 'queryOffset', kind: 'session_expired', code: 'session_expired' });
+    expect(await b.reconcile(ref(c2.intentKey), c2)).toMatchObject({ status: 'not_found' });
   });
 });
 

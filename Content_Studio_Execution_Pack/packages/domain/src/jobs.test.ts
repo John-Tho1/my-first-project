@@ -14,6 +14,7 @@ import {
   JOB_EVENTS,
   JOB_STATES,
   JOB_TRANSITIONS,
+  WEB_TICK_UPLOAD_SLICE,
   localRateLimitDecision,
   MOCK_SCENARIO_VALUES,
   planStatusFrom,
@@ -240,6 +241,14 @@ describe('T14(D26) resume·local_rate_limited 전이, 로컬 요청 제한, 시�
     expect(transitionJobState('RECONCILING', 'resume')).toBe('RETRY_WAIT');
     expect(transitionJobState('REMOTE_PROCESSING', 'resume')).toBe('RETRY_WAIT');
     for (const s of ['UNKNOWN', 'CANCEL_REQUESTED', 'SENDING', 'QUEUED', 'BLOCKED', 'CONFIRMED'] as const) expect(canTransitionJob(s, 'resume')).toBe(false);
+  });
+  it('FIX-T15 upload_yield 는 SENDING(조각 예산 소진)에서만 RETRY_WAIT, 조회·취소·대기 상태에서는 불법; web tick 예산은 조각 1개', () => {
+    expect(transitionJobState('SENDING', 'upload_yield')).toBe('RETRY_WAIT');
+    for (const s of ['LEASED', 'REMOTE_PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED', 'RETRY_WAIT', 'QUEUED', 'UNKNOWN', 'CONFIRMED'] as const) {
+      expect(canTransitionJob(s, 'upload_yield')).toBe(false);
+    }
+    expect(WEB_TICK_UPLOAD_SLICE).toEqual({ max_bytes: 1, max_ms: 5000 });
+    expect(Object.isFrozen(WEB_TICK_UPLOAD_SLICE)).toBe(true);
   });
   it('local_rate_limited 는 LEASED(전송 의도 전)에서만 RETRY_WAIT', () => {
     expect(transitionJobState('LEASED', 'local_rate_limited')).toBe('RETRY_WAIT');

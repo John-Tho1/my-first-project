@@ -65,6 +65,7 @@ import {
   type ReconcileResult,
   type RemoteReference,
   type RemoteStepKind,
+  type UploadSliceBudget,
 } from '@cs/domain';
 import {
   activeApprovalsFor,
@@ -83,7 +84,7 @@ import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
-import { listRemoteSteps, publishedStepCount, recentPublishUsage, remoteStepsPort } from './remote-steps';
+import { listRemoteSteps, publishedStepCount, recentPublishUsage, remoteStepOf, remoteStepsPort } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
@@ -122,6 +123,12 @@ export interface JobRunOptions {
    * 원격 호출 없이 media_reader_unavailable 로 닫는다.
    */
   media?: MediaReader;
+  /**
+   * FIX-T15(Codex review-T15 P1, docs/02 "웹 요청 안에서 전체 영상 처리 금지"): 한 번의 전송 실행이 보낼 조각 예산. web 요청 안의 tick
+   * (POST /api/worker/tick·inline worker)은 이 값을 넣는다 — 어댑터는 예산을 쓰면 받은 바이트를 기록하고 양보(upload_yield → RETRY_WAIT 즉시),
+   * 다음 tick 이 같은 세션으로 이어 올린다. 없으면(별도 worker 프로세스) 제한 없음.
+   */
+  uploadSlice?: UploadSliceBudget;
 }
 
 /**
@@ -514,11 +521,11 @@ function makeContext(
   db: Db,
   job: JobRow,
   intentKey: string,
-  opts: Pick<JobRunOptions, 'workerId' | 'clock' | 'leaseTtlMs' | 'credentials' | 'media'>,
+  opts: Pick<JobRunOptions, 'workerId' | 'clock' | 'leaseTtlMs' | 'credentials' | 'media' | 'uploadSlice'>,
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
   onLeaseLost?: () => void,
-  extra?: { snapshot: PublishSnapshot },
+  extra?: { snapshot: PublishSnapshot; rateUnitsReserved?: number },
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
   const snapshot = extra?.snapshot;
@@ -562,6 +569,8 @@ function makeContext(
       const rows = await db.select({ state: jobs.state }).from(jobs).where(and(eq(jobs.id, job.id), eq(jobs.ownerId, job.ownerId))).limit(1);
       return rows[0]?.state === 'CANCEL_REQUESTED';
     },
+    ...(opts.uploadSlice ? { uploadSlice: { ...opts.uploadSlice } } : {}),
+    ...(extra?.rateUnitsReserved !== undefined ? { rateUnitsReserved: extra.rateUnitsReserved } : {}),
   };
 }
 
@@ -592,6 +601,22 @@ interface SendPlan {
   job: JobRow;
   /** T12: 모의 계정 항목의 시나리오(개발·시험 전용, 승인 스냅샷 밖) */
   mockScenario: MockScenarioSetting | null;
+  /** FIX-T15: 이 시도에 확인·예약한 요청 제한 단위(rate_limit 이 있을 때만) */
+  rateUnitsReserved?: number;
+}
+
+/**
+ * FIX-T15(Codex review-T15 P1): 이 작업이 이번 시도에 새로 쓸 요청 제한 단위. 어댑터가 단계 기록으로 정하면(rateUnitsRemaining — YouTube:
+ * 유효할 수 있는 세션 재개 = 0, 세션 없음·만료·오류 = 1) 그 값, 아니면 rateUnits − 이미 기록된 단계 수(Threads 게시물). 만료 세션은 창 안 사용량
+ * (recentPublishUsage)에는 그대로 남고 새 세션 비용을 상계하지 않는다.
+ */
+async function rateUnitsNeeded(tx: DbOrTx, ownerId: string, jobId: string, adapter: ChannelAdapter, snapshot: PublishSnapshot, kinds: readonly RemoteStepKind[]): Promise<number> {
+  if (!adapter.rateUnits) return 0;
+  if (adapter.rateUnitsRemaining) {
+    const steps = (await listRemoteSteps(tx, ownerId, jobId)).map(remoteStepOf);
+    return Math.max(0, adapter.rateUnitsRemaining(snapshot, steps));
+  }
+  return Math.max(0, adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, jobId, kinds)));
 }
 
 const INFLIGHT_RECHECK_MS = 60_000;
@@ -628,8 +653,7 @@ async function inflightRateUnits(
     const intent = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt) : null;
     if (!intent || recordedAdapterIdOf(intent.sanitizedDetails).id !== adapter.id) continue;
     const channel = typeof item.payloadJson.channel === 'string' ? item.payloadJson.channel : acc.platform;
-    const units = adapter.rateUnits(snapshotOf(item, acc, channel));
-    total += Math.max(0, units - (await publishedStepCount(tx, ownerId, job.id, kinds)));
+    total += await rateUnitsNeeded(tx, ownerId, job.id, adapter, snapshotOf(item, acc, channel), kinds);
   }
   return total;
 }
@@ -738,10 +762,13 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     // T14(D26): 계정별 로컬 요청 제한(잠정값, capabilities.rate_limit). 넘으면 전송 의도를 만들지 않고 창이 풀리는 시각까지 RETRY_WAIT.
     // 사용량은 remote_steps(게시된 단계)에서 센다 — 새 표 없음. 시도(attempt)는 쓰지 않는다(보내지 않았음이 확실).
     const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
+    let rateUnitsReserved: number | undefined;
     if (caps.rate_limit && adapter.rateUnits) {
-      // T15(D27): 셀 단계 종류는 어댑터가 정한다(Threads = 게시, YouTube = 업로드 세션 시작). 이 작업이 이미 쓴 단위는 빼고 센다(세션 재개는 새 단위 아님).
+      // T15(D27): 셀 단계 종류는 어댑터가 정한다(Threads = 게시, YouTube = 업로드 세션 시작). 세션 재개는 새 단위가 아니다.
+      // FIX-T15(Codex review-T15 P1): 만료 세션 행 수를 "이미 쓴 단위"로 빼지 않는다 — 어댑터가 단계로 이번 시도의 새 단위를 정한다(rateUnitsNeeded).
       const kinds = adapter.rateStepKinds ?? ['publish'];
-      const needed = adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, job.id, kinds));
+      const needed = await rateUnitsNeeded(tx, ownerId, job.id, adapter, snapshot, kinds);
+      rateUnitsReserved = needed;
       if (needed > 0) {
         // FIX-T14(Codex review-T14 Q6·missed case): 같은 계정의 검사·의도 기록을 계정별 advisory 잠금으로 줄 세우고(트랜잭션 끝까지), 이미 의도를
         // 만들어 진행 중인 다른 작업의 남은 단위(예약)를 함께 센다 — 두 worker 가 같은 잔여량을 동시에 쓰지 않게.
@@ -791,7 +818,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind, adapter_id: adapter.id ?? null },
     });
     await recomputePlanStatus(tx, ownerId, item.planId, now);
-    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING', attempt }, mockScenario } satisfies SendPlan;
+    return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING', attempt }, mockScenario, rateUnitsReserved } satisfies SendPlan;
   });
 }
 
@@ -834,6 +861,21 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
     };
     const common = { ...CLEAR_LEASE, lastErrorCode: result.error_code ?? null, lastRetryClass: cls.retryClass };
     const isMock = plan.adapter.kind === 'mock';
+    if (!cancel && cls.event === 'remote_accepted' && result.upload_yield && !result.external_id) {
+      // FIX-T15(Codex review-T15 P1): 조각 예산을 다 쓰고 양보(원격이 받은 바이트를 확인, 세션 유효, 영상 아직 없음). 결과 불명이 아니므로 조회 없이
+      // 즉시 다음 시도(같은 세션 재개). 진행이 있어야만 오므로 시도 한도에 넣지 않는다(resume_count + 1 — 받은 바이트 단조 증가가 끝을 보장).
+      const free = job.resumeCount < job.attempt;
+      return settle(
+        tx,
+        ownerId,
+        job,
+        item,
+        'upload_yield',
+        { ...base, received_bytes: result.upload_yield.received_bytes, total_bytes: result.upload_yield.total_bytes, counted: !free },
+        now,
+        { ...common, nextRunAt: now, ...(free ? { resumeCount: job.resumeCount + 1 } : {}) },
+      );
+    }
     switch (cls.event) {
       case 'confirmed': {
         const to = await settle(
@@ -887,7 +929,10 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
     // FIX-T11(P0): 시간 초과 또는 lease 상실(heartbeat 실패) 중 먼저 온 것으로 중단한다.
     const lease = new AbortController();
     const signal = AbortSignal.any([timeoutSignal, lease.signal]);
-    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort(), { snapshot: begun.snapshot });
+    const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort(), {
+      snapshot: begun.snapshot,
+      rateUnitsReserved: begun.rateUnitsReserved,
+    });
     let prepared;
     try {
       prepared = await begun.adapter.prepare(begun.snapshot, ctx);

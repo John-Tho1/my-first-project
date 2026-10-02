@@ -193,6 +193,8 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
 /** T14(D26): 요청 제한으로 기다리는 재시도 대기(로컬 제한 또는 원격 429). */
 const RATE_LIMIT_CODES = new Set(['local_rate_limited', 'rate_limited', 'quota_exceeded']);
 export const isRateLimitWait = (job: { state: string; lastErrorCode: string | null }) => job.state === 'RETRY_WAIT' && RATE_LIMIT_CODES.has(job.lastErrorCode ?? '');
+/** FIX-T15: web tick 의 조각 예산을 쓰고 양보한 업로드(장애 아님 — 다음 처리에서 같은 세션으로 이어 올림). */
+export const isUploadSliceWait = (job: { state: string; lastErrorCode: string | null }) => job.state === 'RETRY_WAIT' && job.lastErrorCode === 'upload_slice_yield';
 
 interface JobLike {
   state: string;
@@ -225,6 +227,7 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     case 'RETRY_WAIT':
       // T15: YouTube 는 할당량(업로드 시작 수) — "할당량 소진"
       if (isRateLimitWait(job)) return `RETRY_WAIT · ${channel === 'youtube' ? '할당량 소진' : '요청 제한'} — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
+      if (isUploadSliceWait(job)) return 'RETRY_WAIT · 업로드 진행 중 — 다음 처리에서 같은 세션으로 이어 올림';
       return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})`;
     case 'RECONCILING':
       return 'RECONCILING · 등록 여부 확인 필요';
@@ -449,6 +452,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       return x.channel === 'youtube' ? '비공개 업로드 처리 중 — 확인 대기' : '원격 처리 중 — 확인 대기';
     case 'RETRY_WAIT':
       if (job && isRateLimitWait(job)) return `${x.channel === 'youtube' ? '할당량 소진' : '요청 제한'} — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
+      if (job && isUploadSliceWait(job)) return '비공개 업로드 진행 중 — 다음 처리에서 이어 올림';
       return job ? `재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})` : '재시도 대기';
     case 'RECONCILING':
       return '등록 여부 확인 필요';

@@ -24,7 +24,7 @@ import {
   setVariantLifecycle,
   type Db,
 } from '@cs/db';
-import { adapterIdFor, loadConfig, MIB, type MediaReader } from '@cs/domain';
+import { adapterIdFor, countedAttempts, loadConfig, MIB, WEB_TICK_UPLOAD_SLICE, type MediaReader } from '@cs/domain';
 import { createMockAdapterRegistry, LocalStorageAdapter, mockOAuthStore, YOUTUBE_PROVISIONAL_RATE_LIMIT } from '@cs/providers';
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
 import { GET as callbackGET } from '../../apps/web/app/api/oauth/callback/route';
@@ -44,12 +44,15 @@ import { PUT as chunkPUT } from '../../apps/web/app/api/uploads/sessions/[id]/ch
 import { POST as completePOST } from '../../apps/web/app/api/uploads/sessions/[id]/complete/route';
 import { itemHeadline, jobStatusText, youtubeProgressLine } from '../../apps/web/lib/distribution';
 import { jobCredentials } from '../../apps/web/lib/oauth';
+import { runInlineWorker } from '../../apps/web/lib/stt';
 import { formatYouTubeDrillTable, runYouTubeDrill, youtubeDrillTableRows } from '../../packages/db/scripts/drill-youtube';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 const KEY = randomBytes(32).toString('base64');
 const MIN = 60_000;
+/** FIX-T15(Codex missed case): 고정 미래 날짜는 지나면 깨진다 — 지금부터 60일 뒤(UTC 날짜, 09:30 MSK = 06:30Z 같은 날). */
+const FUTURE_DAY = new Date(Date.now() + 60 * 86_400_000).toISOString().slice(0, 10);
 const KIB = 1024;
 const CHUNK = 64 * KIB;
 const VIDEO_BYTES = 300 * KIB;
@@ -484,28 +487,28 @@ describe('공개 범위·예약(A12·A13·docs/03 승인 스냅샷)', () => {
     const acc = await linkedAccount();
     const v = await youtubeVariant();
     const p = await plan([
-      { accountId: acc.id, variantId: v.variantId, requested: 'public_publish', visibility: 'private', publishAt: { date: '2026-12-01', time: '09:30' }, scenario: 'youtube_scheduled_private' },
+      { accountId: acc.id, variantId: v.variantId, requested: 'public_publish', visibility: 'private', publishAt: { date: FUTURE_DAY, time: '09:30' }, scenario: 'youtube_scheduled_private' },
     ]);
-    expect((p.items[0]!.payload as { provider_metadata: unknown }).provider_metadata).toEqual({ publish_at: '2026-12-01T06:30:00.000Z' });
+    expect((p.items[0]!.payload as { provider_metadata: unknown }).provider_metadata).toEqual({ publish_at: `${FUTURE_DAY}T06:30:00.000Z` });
     await execute(p.planId);
     const itemId = p.items[0]!.id;
     expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
     const [pub] = await pubsOf(itemId);
     expect(pub).toMatchObject({ resultKind: 'SCHEDULED_REMOTE', remoteVisibility: 'private' });
-    expect(api.videosOf(acc.external)[0]!.publishAt).toBe('2026-12-01T06:30:00.000Z');
-    expect(headlineOf(await itemOf(itemId), await jobOf(itemId), pub!)).toBe('비공개 업로드 + 예약 공개 2026-12-01 09:30 MSK (원격 예약, 확인 필요)');
+    expect(api.videosOf(acc.external)[0]!.publishAt).toBe(`${FUTURE_DAY}T06:30:00.000Z`);
+    expect(headlineOf(await itemOf(itemId), await jobOf(itemId), pub!)).toBe(`비공개 업로드 + 예약 공개 ${FUTURE_DAY} 09:30 MSK (원격 예약, 확인 필요)`);
   });
 
   it('비공개 업로드 승인 + publishAt: 계획 API 가 400, 스냅샷에 섞여 들어와도 어댑터 validate 가 업로드 전에 approval_mismatch', async () => {
     const acc = await linkedAccount();
     const v = await youtubeVariant();
-    const bad = await rec(await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'upload_private', publishAt: { date: '2026-12-01', time: '09:30' } }]));
+    const bad = await rec(await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'upload_private', publishAt: { date: FUTURE_DAY, time: '09:30' } }]));
     expect(bad.status).toBe(400);
     expect((await bad.json()).error).toBe('publish_at_requires_public_publish');
     const past = await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'public_publish', visibility: 'private', publishAt: { date: '2020-01-01', time: '09:00' } }]);
     expect(past.status).toBe(400);
     expect((await past.json()).error).toBe('schedule_in_past');
-    const pubVis = await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'public_publish', visibility: 'public', publishAt: { date: '2026-12-01', time: '09:30' } }]);
+    const pubVis = await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'public_publish', visibility: 'public', publishAt: { date: FUTURE_DAY, time: '09:30' } }]);
     expect((await pubVis.json()).error).toBe('publish_at_requires_private');
     const mockOnly = await createPlanApi([{ accountId: acc.id, variantId: v.variantId, requested: 'mock_publish' }]);
     expect((await mockOnly.json()).error).toBe('requested_result_not_supported');
@@ -518,7 +521,7 @@ describe('공개 범위·예약(A12·A13·docs/03 승인 스냅샷)', () => {
       item_id: item.id,
       channel: 'youtube',
       account: { id: acc.id, kind: 'mock', platform: 'youtube', external_account_id: accRow.externalAccountId, credential_state: accRow.credentialState },
-      payload: { ...item.payloadJson, provider_metadata: { publish_at: '2026-12-01T06:30:00.000Z' } },
+      payload: { ...item.payloadJson, provider_metadata: { publish_at: `${FUTURE_DAY}T06:30:00.000Z` } },
       payload_hash: item.payloadHash,
       visibility: item.visibility,
       requested_result: item.requestedResult,
@@ -551,6 +554,81 @@ describe('할당량·401·거부·부분 성공·연결 정보', () => {
     await tick(61 * MIN);
     expect(await drainUntil(p2.items[0]!.id, DONE)).toBe('CONFIRMED');
     expect(api.videosOf(acc.external)).toHaveLength(2);
+  });
+
+  it('FIX-T15 P1: 한도 1에서 세션 만료 뒤 새 세션 → 만료 세션도 창 안 사용량이라 새 세션은 local_rate_limited(의도·세션 없이), 창이 풀리면 새 세션', async () => {
+    yt.rateLimit = { ...YOUTUBE_PROVISIONAL_RATE_LIMIT, max_units: 1, window_sec: 3600 };
+    const acc = await linkedAccount();
+    const v = await youtubeVariant();
+    const p = await plan([{ accountId: acc.id, variantId: v.variantId, scenario: 'youtube_session_expired_before_complete' }]);
+    await execute(p.planId);
+    const itemId = p.items[0]!.id;
+    const init0 = api.calls.initResumable;
+    await tick();
+    expect((await jobOf(itemId)).state).toBe('RECONCILING');
+    // 조회: 만료 확인 → not_found → RETRY_WAIT. 다음 시도는 새 세션이 필요하다(단위 1) — 만료 세션 행이 이를 상계하지 않는다.
+    let limited = false;
+    for (let i = 0; i < 6 && !limited; i++) {
+      await tick(20_000);
+      const j = await jobOf(itemId);
+      limited = j.state === 'RETRY_WAIT' && j.lastErrorCode === 'local_rate_limited';
+    }
+    expect(limited).toBe(true);
+    const job = await jobOf(itemId);
+    expect(await intentsOf(job.id)).toHaveLength(1);
+    expect(api.calls.initResumable - init0).toBe(1);
+    expect((await sessionsOf(itemId)).map((s) => `${s.postIndex}:${s.status}`)).toEqual(['0:expired']);
+    const ev = (await eventsOf(job.id)).find((e) => (e.sanitizedDetails as { transition?: string }).transition === 'local_rate_limited')!;
+    expect(ev.sanitizedDetails).toMatchObject({ used: 1, needed: 1, not_sent: true });
+    await tick(61 * MIN);
+    expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
+    expect((await sessionsOf(itemId)).map((s) => `${s.postIndex}:${s.status}`)).toEqual(['0:expired', '1:finished']);
+    expect(api.videosOf(acc.external)).toHaveLength(1);
+  });
+
+  it('FIX-T15 P1: 한도 1에서 유효한 세션 재개는 할당량을 쓰지 않는다(local_rate_limited 없음, 세션 1·의도 2)', async () => {
+    yt.rateLimit = { ...YOUTUBE_PROVISIONAL_RATE_LIMIT, max_units: 1, window_sec: 3600 };
+    const acc = await linkedAccount();
+    const v = await youtubeVariant();
+    const p = await plan([{ accountId: acc.id, variantId: v.variantId, scenario: 'youtube_network_drop' }]);
+    await execute(p.planId);
+    const itemId = p.items[0]!.id;
+    await tick();
+    expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
+    const job = await jobOf(itemId);
+    const transitions = (await eventsOf(job.id)).map((e) => (e.sanitizedDetails as { transition?: string }).transition);
+    expect(transitions).toContain('resume');
+    expect(transitions).not.toContain('local_rate_limited');
+    expect(await sessionsOf(itemId)).toHaveLength(1);
+    expect(await intentsOf(job.id)).toHaveLength(2);
+  });
+
+  it('FIX-T15 P1: 사전 검사(재개 — 단위 0) 직후 세션 만료 → 그 시도는 새 세션을 만들지 않음(부작용 없음), 다음 시도가 할당량 재검사 → local_rate_limited', async () => {
+    yt.rateLimit = { ...YOUTUBE_PROVISIONAL_RATE_LIMIT, max_units: 1, window_sec: 3600 };
+    const acc = await linkedAccount();
+    const v = await youtubeVariant();
+    const p = await plan([{ accountId: acc.id, variantId: v.variantId, scenario: 'youtube_network_drop' }]);
+    await execute(p.planId);
+    const itemId = p.items[0]!.id;
+    await tick();
+    expect((await jobOf(itemId)).state).toBe('RECONCILING');
+    await tick(20_000); // 조회 → resumable → RETRY_WAIT(즉시)
+    expect((await jobOf(itemId)).state).toBe('RETRY_WAIT');
+    // 사전 검사는 유효한 세션(단위 0)을 보지만 원격에서는 이미 만료 — 보낼 때 확인된다
+    for (const uri of api.sessionUris(acc.external)) api.expireSession(uri);
+    const init0 = api.calls.initResumable;
+    await tick(1000);
+    let job = await jobOf(itemId);
+    expect(job).toMatchObject({ state: 'RETRY_WAIT', lastErrorCode: 'upload_session_requires_quota_check' });
+    expect(api.calls.initResumable).toBe(init0);
+    expect((await sessionsOf(itemId)).map((s) => s.status)).toEqual(['expired']);
+    await tick(5 * MIN);
+    job = await jobOf(itemId);
+    expect(job).toMatchObject({ state: 'RETRY_WAIT', lastErrorCode: 'local_rate_limited' });
+    expect(api.calls.initResumable).toBe(init0);
+    await tick(61 * MIN);
+    expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
+    expect(api.videosOf(acc.external)).toHaveLength(1);
   });
 
   it('원격 403 quotaExceeded → 세션 없이 RETRY_WAIT(초기화 시각까지, Retry-After 1시간 상한으로 FAILED 되지 않음) → 뒤에 업로드', async () => {
@@ -702,15 +780,65 @@ describe('DB 규칙·앱 경로', () => {
     await expect(db.execute(sql`update remote_steps set status = 'published' where id = ${s!.id}::uuid`)).rejects.toThrow();
   });
 
-  it('web tick route(앱 경로)도 YouTube 모의 어댑터·로컬 저장소로 처리한다 — 응답은 MOCK', async () => {
+  it('FIX-T15 P1(docs/02): web tick route 는 요청마다 조각 1개만 올리고 양보(RETRY_WAIT upload_slice_yield) — 다음 요청이 같은 세션으로 이어 올려 끝까지, 합계 = 파일', async () => {
     const acc = await linkedAccount();
     const v = await youtubeVariant();
     const p = await plan([{ accountId: acc.id, variantId: v.variantId }]);
     await execute(p.planId);
-    const res = await rec(await tickPOST(post('/api/worker/tick', { max_jobs: 5 })));
-    expect(res.status).toBe(200);
-    expect((await res.json()).mode).toBe('MOCK');
-    expect((await jobOf(p.items[0]!.id)).state).toBe('REMOTE_PROCESSING');
+    const itemId = p.items[0]!.id;
+    const chunks = Math.ceil(v.bytes / CHUNK);
+    expect(chunks).toBeGreaterThan(2);
+    const sent0 = api.bytesSent;
+    const init0 = api.calls.initResumable;
+    for (let i = 1; i <= chunks; i++) {
+      const put0 = api.calls.putChunk;
+      const res = await rec(await tickPOST(post('/api/worker/tick', { max_jobs: 5 })));
+      expect(res.status).toBe(200);
+      expect((await res.json()).mode).toBe('MOCK');
+      expect(api.calls.putChunk - put0).toBe(1);
+      const job = await jobOf(itemId);
+      const [session] = await sessionsOf(itemId);
+      if (i < chunks) {
+        expect(job).toMatchObject({ state: 'RETRY_WAIT', lastErrorCode: 'upload_slice_yield' });
+        expect(session!.receivedBytes).toBe(i * CHUNK);
+        expect(jobStatusText(job, null, null, 'youtube')).toBe('RETRY_WAIT · 업로드 진행 중 — 다음 처리에서 같은 세션으로 이어 올림');
+        expect(await pubsOf(itemId)).toHaveLength(0);
+      } else {
+        expect(job.state).toBe('REMOTE_PROCESSING');
+        expect(session).toMatchObject({ status: 'finished', receivedBytes: v.bytes });
+      }
+    }
+    expect(api.bytesSent - sent0).toBe(v.bytes);
+    expect(api.calls.initResumable - init0).toBe(1);
+    const job = await jobOf(itemId);
+    // 양보는 장애가 아니다 — 시도 한도에 넣지 않는다(의도는 조각마다, 센 시도 1)
+    expect(await intentsOf(job.id)).toHaveLength(chunks);
+    expect(countedAttempts(job)).toBe(1);
+    expect((await eventsOf(job.id)).filter((e) => (e.sanitizedDetails as { transition?: string }).transition === 'upload_yield')).toHaveLength(chunks - 1);
+    expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
+    expect(api.videosOf(acc.external)).toHaveLength(1);
+    expect(api.videosOf(acc.external)[0]!.sha256).toBe(v.checksum);
+  });
+
+  it('FIX-T15 P1: inline worker(web 요청 안 — health·목록)도 같은 조각 예산(작업당 조각 1개)', async () => {
+    // 실행 환경 설정(시험용 저장소 위치 — beforeAll 의 env)으로 web 과 같은 inline 경로를 부른다
+    const live = loadConfig();
+    expect(live.WORKER_MODE).toBe('inline');
+    expect(WEB_TICK_UPLOAD_SLICE.max_bytes).toBeLessThanOrEqual(CHUNK);
+    const acc = await linkedAccount();
+    const v = await youtubeVariant();
+    const p = await plan([{ accountId: acc.id, variantId: v.variantId }]);
+    await execute(p.planId);
+    const itemId = p.items[0]!.id;
+    const put0 = api.calls.putChunk;
+    const t = await runInlineWorker(live, db);
+    expect(t).not.toBeNull();
+    expect(api.calls.putChunk - put0).toBe(1);
+    expect(await jobOf(itemId)).toMatchObject({ state: 'RETRY_WAIT', lastErrorCode: 'upload_slice_yield' });
+    expect((await sessionsOf(itemId))[0]!.receivedBytes).toBe(CHUNK);
+    // 별도 worker 처리(예산 없음)가 나머지를 한 번에 이어 올린다
+    expect(await drainUntil(itemId, DONE)).toBe('CONFIRMED');
+    expect(await sessionsOf(itemId)).toHaveLength(1);
   });
 });
 

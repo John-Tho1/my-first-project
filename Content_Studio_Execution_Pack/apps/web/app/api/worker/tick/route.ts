@@ -1,5 +1,5 @@
 import { newWorkerId, recordAudit, runJobsTick } from '@cs/db';
-import { assertSameOrigin, isUuid, tickSchema } from '@cs/domain';
+import { assertSameOrigin, isUuid, tickSchema, WEB_TICK_UPLOAD_SLICE } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../lib/body';
 import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../lib/distribution';
@@ -16,6 +16,8 @@ export const runtime = 'nodejs';
  * 외부 호출 없음(모의 어댑터만). CSRF(같은 출처) 검사.
  * 화면 폼(버튼)은 작업당 전송 시간 제한을 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS)(기본 10초)로 줄인다(화면 확인 D7) —
  * 넘으면 기존 시간 초과 → RECONCILING(다시 보내지 않고 조회). JSON 호출은 JOB_SUBMIT_TIMEOUT_MS 그대로.
+ * FIX-T15(Codex review-T15 P1, docs/02 "웹 요청 안에서 전체 영상 처리 금지"): 영상 업로드는 작업당 조각 1개(WEB_TICK_UPLOAD_SLICE — 5초 상한)만
+ * 보내고 받은 바이트를 기록한 뒤 양보한다(RETRY_WAIT 즉시, upload_yield). 다음 tick 이 같은 세션으로 이어 올린다.
  */
 /** 화면 폼이면 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS), 아니면 JOB_SUBMIT_TIMEOUT_MS. */
 function uiTickTimeoutMs(config: { JOB_SUBMIT_TIMEOUT_MS: number; WORKER_UI_TICK_TIMEOUT_MS: number }, form: boolean): number {
@@ -43,6 +45,7 @@ export async function POST(request: Request): Promise<Response> {
       submitTimeoutMs: uiTickTimeoutMs(config, body.kind === 'form'),
       credentials: jobCredentials(config, owner.db),
       media: getStorage(config),
+      uploadSlice: WEB_TICK_UPLOAD_SLICE,
     });
     await recordAudit(owner.db, {
       ownerId: owner.ownerId,

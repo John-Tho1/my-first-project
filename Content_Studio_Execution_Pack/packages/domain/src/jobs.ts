@@ -67,6 +67,10 @@ export const JOB_EVENTS = [
   // FIX-T14(Codex review-T14 missed case): 아직 시작하지 않은(QUEUED·RETRY_WAIT·BLOCKED) 작업을 취소하는데 스레드 일부가 이미 원격에 게시됨 —
   // 남은 부분은 보내지 않지만 취소 성공(CANCELED·"보내지 않음")이라고 하지 않는다(A11). → UNKNOWN(사유 thread_partial_canceled).
   'cancel_partial',
+  // FIX-T15(Codex review-T15 P1 — docs/02 "웹 요청 안에서 전체 영상 처리 금지"): 조각 예산이 있는 실행(web tick)이 원격이 확인한 받은 바이트를
+  // 늘린 뒤 남은 조각을 다음 실행으로 넘긴다. 세션은 살아 있고 결과 불명이 아니다 → RETRY_WAIT(즉시), 다음 시도가 같은 세션으로 이어 올린다.
+  // 진행이 있어야만 쓰이므로(받은 바이트 단조 증가) 시도 한도에 넣지 않는다(resume_count + 1).
+  'upload_yield',
 ] as const;
 export type JobEvent = (typeof JOB_EVENTS)[number];
 
@@ -99,6 +103,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     ambiguous: 'RECONCILING',
     cancel_requested: 'CANCEL_REQUESTED',
     lease_expired_after_intent: 'RECONCILING',
+    upload_yield: 'RETRY_WAIT',
   },
   REMOTE_PROCESSING: {
     remote_processing: 'REMOTE_PROCESSING',
@@ -266,7 +271,28 @@ export interface AdapterResult {
   retry_at?: string;
   provider_request_id?: string;
   error_code?: string;
+  /**
+   * FIX-T15(Codex review-T15 P1): 조각 예산(ctx.uploadSlice) 안에서 일부 조각만 올리고 양보함 — status 는 'processing'(원격이 받은 바이트를
+   * 확인함, 결과 불명 아님), 영상 ID 없음. 작업 처리기는 RETRY_WAIT(즉시, upload_yield)로 두고 다음 시도가 같은 세션으로 이어 올린다.
+   * received_bytes 는 원격이 확인한 값이며 이번 실행 전보다 커야 한다(진행 없는 양보는 쓰지 않는다).
+   */
+  upload_yield?: { received_bytes: number; total_bytes: number };
 }
+
+/**
+ * FIX-T15(Codex review-T15 P1, docs/02 "장시간 영상 업로드"): 한 번의 실행이 원격에 보낼 수 있는 조각의 예산. web 요청 안의 tick 은 이 예산을
+ * 넣어 영상 전체를 한 요청 안에서 올리지 않는다. 어댑터는 최소 한 조각을 보낸 뒤 보낸 바이트 ≥ max_bytes 이거나 경과 ≥ max_ms 이면 양보한다.
+ */
+export interface UploadSliceBudget {
+  max_bytes: number;
+  max_ms: number;
+}
+
+/**
+ * FIX-T15: web 요청 안의 tick(POST /api/worker/tick·inline worker) 예산 — 작업 하나당 조각 1개(max_bytes 1 = 첫 조각 뒤 바로 양보), 시간 5초.
+ * 기본 조각 8MiB 이므로 한 요청이 올리는 양은 작업당 최대 8MiB(tick 당 작업 최대 5개). 나머지는 다음 tick 이 같은 세션으로 이어 올린다.
+ */
+export const WEB_TICK_UPLOAD_SLICE: UploadSliceBudget = Object.freeze({ max_bytes: 1, max_ms: 5000 });
 
 /**
  * reconcile 결과. read 권한이 없으면 unsupported, 조회했지만 판단 불가면 unknown. not_found 는 capabilities.definitive_not_found 일 때만 "보내지 않았음"으로 믿는다.
@@ -577,6 +603,14 @@ export interface AdapterContext {
   media?: MediaPort;
   /** T15: 이 작업에 취소 요청이 들어왔는가(짧은 읽기). 긴 업로드가 조각 사이에 확인하고 영상이 생기기 전이면 멈춘다. */
   cancelRequested?: () => Promise<boolean>;
+  /** FIX-T15: 이번 실행의 조각 예산(web tick). 없으면 제한 없음(별도 worker 프로세스 — 시간 제한만). */
+  uploadSlice?: UploadSliceBudget;
+  /**
+   * FIX-T15(Codex review-T15 P1): 작업 처리기가 이 시도에 확인·예약한 요청 제한 단위 수(capabilities.rate_limit 이 있을 때만 정의).
+   * 새 원격 단위(예: 새 업로드 세션)가 필요한데 예약이 모자라면(사전 검사 뒤 세션 만료) 어댑터는 그 단위를 쓰지 않고 부작용 없이 닫는다 —
+   * 다음 시도가 요청 제한 검사를 다시 거친다.
+   */
+  rateUnitsReserved?: number;
 }
 
 export interface ChannelAdapter {
@@ -592,6 +626,12 @@ export interface ChannelAdapter {
   rateUnits?(snapshot: PublishSnapshot): number;
   /** T15: 요청 제한 사용량을 셀 원격 단계 종류(기본 ['publish'] — Threads 게시. YouTube 는 ['upload_session'] = 업로드 시작 수). */
   readonly rateStepKinds?: readonly RemoteStepKind[];
+  /**
+   * FIX-T15(Codex review-T15 P1): 이 작업이 기록한 단계로 보아 이번 시도가 새로 쓸 요청 제한 단위 수. 없으면 rateUnits − (rateStepKinds 단계 수).
+   * YouTube: 영상이 있거나 마지막 세션이 유효할 수 있으면(created·finished — 재개) 0, 세션이 없거나 만료·오류면 1(새 세션 = 새 단위).
+   * 만료 세션도 창 안 사용량에는 그대로 센다(recentPublishUsage) — 이 값은 새 세션 비용을 상계하지 않는다.
+   */
+  rateUnitsRemaining?(snapshot: PublishSnapshot, steps: readonly RemoteStep[]): number;
   /** ctx.mockScenario 는 모의 어댑터가 항목별 capabilities(cancel 등)를 정할 때만 쓴다. */
   capabilities(account: AdapterAccount, ctx?: Pick<AdapterContext, 'mockScenario'>): AdapterCapabilities;
   validate(snapshot: PublishSnapshot): { ok: true } | { ok: false; error_code: string };

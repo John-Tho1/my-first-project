@@ -390,7 +390,12 @@ export class YouTubeMockApi {
     const now = req.now ?? new Date();
     this.auth(req.accessToken, req.userId, now);
     const f = this.takeFault('queryOffset', opts.fault);
-    if (f) this.fail(f);
+    // FIX-T15(Codex review-T15 Q1): "만료" 장애 주입이 실제 상태를 가리지 않게 — 끝난(영상이 생긴) 세션은 만료로 답하지 않는다(시뮬레이터 규칙:
+    // 완료 세션은 만료되지 않음). 그 밖의 장애(5xx·끊김 등)는 상태와 무관하게 그대로.
+    if (f && f.kind === 'session_expired') {
+      const known = this.sessions.get(req.sessionUri);
+      if (!(known && known.userId === req.userId && known.state === 'complete')) this.fail(f);
+    } else if (f) this.fail(f);
     const s = this.ownSession(req.sessionUri, req.userId, now);
     if (s.state === 'expired') throw new YouTubeMockApiError('session_expired', { code: 'session_expired' });
     return { received: s.received, size: s.size, videoId: s.videoId };
@@ -587,9 +592,19 @@ export class YouTubeMockChannelAdapter implements ChannelAdapter {
     };
   }
 
-  /** 업로드 시작 1회 = 1 단위(재개는 새 단위가 아니다 — 작업 처리기가 이 작업의 세션 단계 수를 뺀다). */
+  /** 업로드 시작 1회 = 1 단위(재개는 새 단위가 아니다). */
   rateUnits(_snapshot: PublishSnapshot): number {
     return 1;
+  }
+
+  /**
+   * FIX-T15(Codex review-T15 P1): 이번 시도가 새로 쓸 단위 — 영상이 있거나 마지막 세션이 유효할 수 있으면(created·finished — 재개) 0,
+   * 세션이 없거나 마지막 세션이 만료·오류면 1(새 세션 = 새 업로드 시작). 만료 세션 행은 창 안 사용량에 남지만 새 세션 비용을 상계하지 않는다.
+   */
+  rateUnitsRemaining(_snapshot: PublishSnapshot, steps: readonly RemoteStep[]): number {
+    if (steps.some((s) => s.kind === 'video')) return 0;
+    const last = steps.filter((s) => s.kind === 'upload_session').sort((a, b) => a.post_index - b.post_index).at(-1);
+    return last && (last.status === 'created' || last.status === 'finished') ? 0 : 1;
   }
 
   /**
@@ -684,6 +699,19 @@ export class YouTubeMockChannelAdapter implements ChannelAdapter {
     if (ctx.signal.aborted) throw abortError();
   }
 
+  /**
+   * FIX-T15(Codex review-T15 P1): 원격 쓰기 **바로 앞**의 마지막 확인 — 파일 읽기 등 기다림 뒤에 lease(heartbeat)·중단 신호·취소 요청을 다시 본다.
+   * 이 함수가 끝난 뒤 원격 호출까지 await 가 없어야 한다(putChunk·initResumable 은 동기 호출). 취소 요청이면 'canceled'.
+   */
+  private async gateWrite(ctx: AdapterContext): Promise<'ok' | 'canceled'> {
+    if (ctx.signal.aborted) throw abortError();
+    await ctx.heartbeat();
+    if (ctx.signal.aborted) throw abortError();
+    if (ctx.cancelRequested && (await ctx.cancelRequested())) return 'canceled';
+    if (ctx.signal.aborted) throw abortError();
+    return 'ok';
+  }
+
   async submit(prepared: PreparedSubmission, ctx: AdapterContext): Promise<AdapterResult> {
     this.calls.submit++;
     const snap = prepared.snapshot;
@@ -762,9 +790,15 @@ export class YouTubeMockChannelAdapter implements ChannelAdapter {
     }
     if (!videoId && !session) {
       // 새 세션(처음이거나 앞 세션이 만료·오류). 할당량은 작업 처리기가 의도 전에 로컬로 먼저 셌다.
+      // FIX-T15(Codex review-T15 P1): 사전 검사 때는 유효한 세션이 있어(재개 — 단위 0) 예약하지 않았는데 지금 만료가 확인됐으면, 새 세션(새 단위)을
+      // 이 시도에서 만들지 않는다 — 부작용 없이 닫고 다음 시도가 요청 제한 검사를 다시 거친다(만료 세션이 할당량을 우회하지 않게).
+      if (ctx.rateUnitsReserved !== undefined && ctx.rateUnitsReserved < 1) {
+        return res({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'upload_session_requires_quota_check', retry_after_sec: 1 });
+      }
       const t = youtubeTextOf(snap);
       const nextIndex = sessions.length ? sessions.at(-1)!.post_index + 1 : 0;
       await this.beforeWrite(ctx);
+      if (ctx.signal.aborted) throw abortError();
       let created: { sessionUri: string };
       try {
         created = this.api.initResumable(
@@ -788,12 +822,22 @@ export class YouTubeMockChannelAdapter implements ChannelAdapter {
     }
     if (!videoId) {
       const chunk = Math.max(1, Math.floor(this.chunkBytes));
+      // FIX-T15(Codex review-T15 P1): 조각 예산(web tick) — 최소 한 조각을 보낸 뒤 보낸 바이트·경과 시간이 예산에 닿으면 양보한다.
+      const slice = ctx.uploadSlice;
+      const sliceStart = performance.now();
+      const offsetAtStart = offset;
+      let sentThisRun = 0;
       while (offset < file.bytes) {
-        // 영상이 생기기 전 취소 요청 → 멈춘다(받은 조각은 세션에 남지만 영상은 없다). 그 뒤 취소는 "업로드됨 — 삭제는 범위 밖".
-        if (ctx.cancelRequested && (await ctx.cancelRequested())) return res({ status: 'rejected', retry_class: 'permanent', error_code: 'canceled_before_upload_complete' });
-        await this.beforeWrite(ctx);
+        if (slice && sentThisRun > 0 && (sentThisRun >= slice.max_bytes || performance.now() - sliceStart >= slice.max_ms) && offset > offsetAtStart) {
+          return res({ status: 'processing', error_code: 'upload_slice_yield', upload_yield: { received_bytes: offset, total_bytes: file.bytes } });
+        }
+        if (ctx.signal.aborted) throw abortError();
         const end = Math.min(file.bytes, offset + chunk);
         const bytes = await file.read(offset, end);
+        // FIX-T15(Codex review-T15 P1): 읽기를 기다리는 동안 시간 초과·lease 상실·취소가 일어났을 수 있다 — 보내기 직전에 다시 확인하고,
+        // 중단이면 이 조각을 보내지 않는다(세션은 받은 바이트 그대로 — 조회가 resumable 로 이어 간다).
+        // 영상이 생기기 전 취소 요청 → 멈춘다(받은 조각은 세션에 남지만 영상은 없다). 그 뒤 취소는 "업로드됨 — 삭제는 범위 밖".
+        if ((await this.gateWrite(ctx)) === 'canceled') return res({ status: 'rejected', retry_class: 'permanent', error_code: 'canceled_before_upload_complete' });
         let r: { status: 308; received: number } | { status: 201; videoId: string; received: number };
         try {
           r = this.api.putChunk(
@@ -810,6 +854,7 @@ export class YouTubeMockChannelAdapter implements ChannelAdapter {
           break;
         }
         if (r.received <= offset) return res({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'upload_no_progress' });
+        sentThisRun += end - offset;
         offset = r.received;
         await steps.record({ kind: 'upload_session', post_index: session!.post_index, remote_id: session!.remote_id, status: 'created', received_bytes: offset, total_bytes: file.bytes });
       }

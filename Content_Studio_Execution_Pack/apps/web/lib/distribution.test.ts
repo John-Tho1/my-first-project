@@ -235,6 +235,9 @@ describe('T14(D26) Threads 모의 화면 문구', () => {
     expect(jobStatusText(w('rate_limited'))).toBe('RETRY_WAIT · 요청 제한 — 12:05 MSK 이후 재시도');
     expect(itemHeadline({ status: 'RETRY_WAIT', channel: 'threads', job: w('local_rate_limited'), pub: null, blockReason: null })).toBe('요청 제한 — 12:05 MSK 이후 재시도');
     expect(jobStatusText(w('mock_503_not_sent'))).toBe('RETRY_WAIT · 재시도 대기 (1/5, 다음 12:05 MSK)');
+    // FIX-T15: web tick 조각 예산으로 양보한 업로드는 장애·재시도 횟수가 아니라 진행 중
+    expect(jobStatusText(w('upload_slice_yield'), null, null, 'youtube')).toBe('RETRY_WAIT · 업로드 진행 중 — 다음 처리에서 같은 세션으로 이어 올림');
+    expect(itemHeadline({ status: 'RETRY_WAIT', channel: 'youtube', job: w('upload_slice_yield'), pub: null, blockReason: null })).toBe('비공개 업로드 진행 중 — 다음 처리에서 이어 올림');
   });
   it('401(auth_invalid_token) 보류는 "계정 다시 연결 필요", 재확인 resumable 은 고정 문구(게시하지 않음)', () => {
     const j = { ...job('BLOCKED', 'auth_invalid_token'), lastRetryClass: 'auth' };

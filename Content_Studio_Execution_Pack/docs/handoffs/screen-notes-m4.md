@@ -36,3 +36,15 @@ BASE cbb8d38, 커밋 안 함(작업 트리 변경). 화면 표시만 — 작업�
 - S2: 배너 "지금 단계(M4)는 모의 어댑터(일반·Threads·YouTube 모의)와 모의 계정 연결만 …".
 - S3: 배포 계정 목록 연결 상태 — 블로그·Instagram 연결 정보 없음, Threads·YouTube 연결됨, 실계정은 별도 승인(D24) 문구.
 - 서버 오류 로그 0건.
+
+## G1·G2 화면 확인 (fa37b1a, 내장 브라우저, 오케스트레이터 직접 — 모의만)
+- G2 /distribute/new?content_id=…: YouTube(모의 연결) 초안에 요청 결과 3종(비공개 업로드·공개 게시·예약 공개)과 예약 공개 날짜·시각(MSK), 블로그·Instagram 은 "MOCK 실행만" 고정. 예약 공개 + 블로그로 계획 생성 → YouTube `public_publish` + 원격 publishAt 2026-10-04 10:00 MSK, 블로그 `mock_publish`.
+- G1 /distribute/{id}: 승인 폼에 항목별 숨김 purpose(public_publish·mock_publish), 한 번 제출로 2개 승인(`approved=2`).
+- 실행 → tick: 블로그 CONFIRMED(MOCK). YouTube 는 **BLOCKED credential_refresh_failed** — 연결 뒤 dev 서버가 재시작돼 모의 공급자(프로세스 메모리)가 refresh token 을 모름(D26 후속에 적힌 재시작 동작과 같음, 전송 0·거짓 성공 없음). 설정 화면도 "오류 · invalid_token · 이 계정 배포 실행 차단" 표시. 다시 연결(모의) → 재시도 → 웹 tick(각 40–180 ms) → 업로드 완료 → REMOTE_PROCESSING → CONFIRMED **UPLOADED_PRIVATE**(미검증 프로젝트 강제 비공개, D27). 화면: "비공개 업로드 완료, 공개 전환 확인 필요", 요청 공개 범위와 원격 보고 공개 범위 분리 표시.
+- 첨부가 매우 작아 조각 1개로 끝나 "웹 요청당 조각 1개" 분할은 화면에서 보이지 않음(통합 테스트가 덮음).
+- 서버 오류 로그 0건.
+
+## 추가 결함 (표시만)
+- S4 [P3] YouTube 업로드 패널이 세션이 없을 때 "아직 업로드 세션 없음" 과 "세션 URI 는 … 표시하지 않습니다(세션 있음)" 를 함께 보여 준다. 기대: 세션이 있을 때만 "(세션 있음)" 문구.
+- S5 [P3] 예약 공개를 요청했는데 원격이 비공개로 강제하고 publishAt 을 버린 결과(UPLOADED_PRIVATE)인데도 "예약 공개(원격 publishAt): 2026-10-04 10:00 (MSK)" 만 보인다. 기대: "요청한 예약 공개 시각 — 원격이 적용하지 않음(미검증 프로젝트, 비공개 강제)" 처럼 원격 결과와 구분.
+- 참고: 모의 OAuth 발급 기록이 프로세스 메모리라 dev 서버를 재시작할 때마다 모의 연결 계정이 다음 전송에서 차단된다(의도된 모의 한계, 실계정 어댑터는 DB 봉인 토큰 사용). 개발 중 불편 — 필요하면 모의 공급자 기록을 DB 에서 재수화하는 개선 후보.

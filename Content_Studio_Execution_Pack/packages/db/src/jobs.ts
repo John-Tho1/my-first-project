@@ -25,9 +25,12 @@ import {
   CANCEL_PENDING_MESSAGE,
   CHECK_LEASE_STATES,
   classifyOutcome,
+  countedAttempts,
   decideRetry,
   decideRetryAt,
   DEFAULT_LEASE_TTL_MS,
+  FREE_RESUME_MAX,
+  LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
   requireSecretKeyring,
   isUuid,
@@ -44,8 +47,10 @@ import {
   reconcileDelay,
   REMOTE_POLL_MAX,
   REMOTE_POLL_MS,
+  recordedAdapterIdOf,
   SEND_LEASE_STATES,
   type AdapterContext,
+  type AdapterId,
   type AdapterResult,
   type AppConfig,
   type CancelResult,
@@ -59,6 +64,7 @@ import {
   type PublishSnapshot,
   type ReconcileResult,
   type RemoteReference,
+  type RemoteStepKind,
 } from '@cs/domain';
 import {
   activeApprovalsFor,
@@ -77,7 +83,7 @@ import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
-import { publishedStepCount, recentPublishUsage, remoteStepsPort } from './remote-steps';
+import { listRemoteSteps, publishedStepCount, recentPublishUsage, remoteStepsPort } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
@@ -588,6 +594,46 @@ interface SendPlan {
   mockScenario: MockScenarioSetting | null;
 }
 
+const INFLIGHT_RECHECK_MS = 60_000;
+/** 전송 의도를 만든 뒤 아직 끝나지 않은(원격에 더 보낼 수 있는) 상태 — 로컬 요청 제한 예약으로 센다. */
+const INFLIGHT_RATE_STATES = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED'] as const;
+
+/**
+ * FIX-T14(Codex review-T14 Q6): 같은 계정에서 진행 중인 다른 작업이 아직 쓰지 않은 요청 제한 단위(= 그 스냅샷의 단위 − 이미 기록된 단계).
+ * 같은 어댑터가 보낸 작업만(다른 어댑터는 다른 원격 한도) 센다. 본문·토큰은 읽지 않는다(스냅샷 payload 의 게시물 수만).
+ */
+async function inflightRateUnits(
+  tx: DbOrTx,
+  ownerId: string,
+  acc: typeof channelAccounts.$inferSelect,
+  excludeJobId: string,
+  adapter: ChannelAdapter,
+  kinds: readonly RemoteStepKind[],
+): Promise<number> {
+  if (!adapter.rateUnits) return 0;
+  const rows = await tx
+    .select({ job: jobs, item: distributionItems })
+    .from(jobs)
+    .innerJoin(distributionItems, and(eq(distributionItems.id, jobs.itemId), eq(distributionItems.ownerId, jobs.ownerId)))
+    .where(
+      and(
+        eq(jobs.ownerId, ownerId),
+        eq(distributionItems.channelAccountId, acc.id),
+        inArray(jobs.state, [...INFLIGHT_RATE_STATES]),
+        sql`${jobs.id} <> ${excludeJobId}::uuid`,
+      ),
+    );
+  let total = 0;
+  for (const { job, item } of rows) {
+    const intent = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt) : null;
+    if (!intent || recordedAdapterIdOf(intent.sanitizedDetails).id !== adapter.id) continue;
+    const channel = typeof item.payloadJson.channel === 'string' ? item.payloadJson.channel : acc.platform;
+    const units = adapter.rateUnits(snapshotOf(item, acc, channel));
+    total += Math.max(0, units - (await publishedStepCount(tx, ownerId, job.id, kinds)));
+  }
+  return total;
+}
+
 /** 1단계(한 트랜잭션): 재검사 + SENDING + 전송 의도. 보낼 수 없으면 상태를 정하고 null. */
 async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRow, opts: JobRunOptions, now: Date): Promise<SendPlan | JobState | 'lease_lost'> {
   const ownerId = leased.ownerId;
@@ -652,6 +698,21 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       const code = e instanceof Error && 'code' in e ? String((e as { code: unknown }).code).toLowerCase() : 'execution_not_allowed';
       return settle(tx, ownerId, job, item, 'blocked', { reason: 'execution_not_allowed', code }, now, { ...CLEAR_LEASE, lastErrorCode: code });
     }
+    // FIX-T14(Codex review-T14 P0·Q5): 새 전송 의도에는 반드시 어댑터 ID 를 남긴다(없으면 보내지 않음 — 조회가 다른 어댑터로 대신하지 않게).
+    // 이 작업에 원격 단계 기록이 있는데 그 기록을 남긴 어댑터(이전 의도의 adapter_id)와 지금 고른 어댑터가 다르면 이어 보내지 않는다(BLOCKED).
+    if (!adapter.id) {
+      return settle(tx, ownerId, job, item, 'blocked', { reason: 'adapter_id_missing', not_sent: true }, now, { ...CLEAR_LEASE, lastErrorCode: 'adapter_id_missing' });
+    }
+    if (job.attempt > 0) {
+      const prev = await intentFor(tx, ownerId, job.id, job.attempt);
+      const prevAdapter = prev ? recordedAdapterIdOf(prev.sanitizedDetails).id : null;
+      if (prev && prevAdapter !== adapter.id && (await listRemoteSteps(tx, ownerId, job.id)).length > 0) {
+        return settle(tx, ownerId, job, item, 'blocked', { reason: 'adapter_changed', previous_adapter: prevAdapter, adapter_id: adapter.id, not_sent: true }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: 'adapter_changed',
+        });
+      }
+    }
     const vRows = await tx
       .select({ channel: variants.channel })
       .from(variants)
@@ -667,7 +728,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       });
     }
     // FIX-T11 round 2(P1): 시도는 여기서(전송 의도와 같은 트랜잭션) 센다. 한도를 다 쓴 작업은 보내지 않고 FAILED.
-    if (job.attempt >= job.maxAttempts) {
+    if (countedAttempts(job) >= job.maxAttempts) {
       return settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'attempts_exhausted', not_sent: true, attempt: job.attempt }, now, {
         ...CLEAR_LEASE,
         lastErrorCode: 'attempts_exhausted',
@@ -682,8 +743,16 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       const kinds = adapter.rateStepKinds ?? ['publish'];
       const needed = adapter.rateUnits(snapshot) - (await publishedStepCount(tx, ownerId, job.id, kinds));
       if (needed > 0) {
+        // FIX-T14(Codex review-T14 Q6·missed case): 같은 계정의 검사·의도 기록을 계정별 advisory 잠금으로 줄 세우고(트랜잭션 끝까지), 이미 의도를
+        // 만들어 진행 중인 다른 작업의 남은 단위(예약)를 함께 센다 — 두 worker 가 같은 잔여량을 동시에 쓰지 않게.
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs_rate:${acc.id}`}))`);
         const usage = await recentPublishUsage(tx, ownerId, acc.id, new Date(now.getTime() - caps.rate_limit.window_sec * 1000), kinds);
-        const d = localRateLimitDecision({ used: usage.used, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now });
+        const inflight = await inflightRateUnits(tx, ownerId, acc, job.id, adapter, kinds);
+        let d = localRateLimitDecision({ used: usage.used + inflight, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now });
+        if (!d.allowed && inflight > 0 && localRateLimitDecision({ used: usage.used, needed, limit: caps.rate_limit, oldestAt: usage.oldestAt, now }).allowed) {
+          // 진행 중 예약 때문에만 막힘 — 창이 풀릴 때까지가 아니라 짧게 다시 본다(그 작업이 끝나면 실제 사용량으로 다시 계산).
+          d = { allowed: false, resetAt: new Date(now.getTime() + INFLIGHT_RECHECK_MS) };
+        }
         if (!d.allowed) {
           return settle(
             tx,
@@ -695,6 +764,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
               reason: 'local_rate_limited',
               not_sent: true,
               used: usage.used,
+              inflight,
               needed,
               max_units: caps.rate_limit.max_units,
               window_sec: caps.rate_limit.window_sec,
@@ -788,8 +858,8 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         const retryAt = result.retry_at ? new Date(result.retry_at) : null;
         const d =
           retryAt && Number.isFinite(retryAt.getTime())
-            ? decideRetryAt(job.attempt, job.maxAttempts, retryAt, now)
-            : decideRetry(job.attempt, job.maxAttempts, result.retry_after_sec, now, random);
+            ? decideRetryAt(countedAttempts(job), job.maxAttempts, retryAt, now)
+            : decideRetry(countedAttempts(job), job.maxAttempts, result.retry_after_sec, now, random);
         if (d.retry) return settle(tx, ownerId, job, item, 'transient_failure', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
         return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
       }
@@ -915,7 +985,15 @@ async function applyReconcile(
       });
     }
     if (job.state === 'RECONCILING' || job.state === 'REMOTE_PROCESSING') {
-      return settle(tx, ownerId, job, item, 'resume', { ...base, published_parts: parts }, now, { ...common, nextRunAt: now, reconcileCount: 0 });
+      // FIX-T14(Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING) 뒤의 재개는 장애가 아니다 — 시도 한도에서 뺀다(resume_count + 1,
+      // 상한 FREE_RESUME_MAX). 장애(결과 불명 → RECONCILING) 뒤의 재개는 시도로 센다(끝없는 재개 반복 방지).
+      const free = job.state === 'REMOTE_PROCESSING' && job.resumeCount < FREE_RESUME_MAX && job.resumeCount < job.attempt;
+      return settle(tx, ownerId, job, item, 'resume', { ...base, published_parts: parts, counted: !free }, now, {
+        ...common,
+        nextRunAt: now,
+        reconcileCount: 0,
+        ...(free ? { resumeCount: job.resumeCount + 1 } : {}),
+      });
     }
   }
   const count = job.reconcileCount + 1;
@@ -930,7 +1008,7 @@ async function applyReconcile(
     await fillIntent(tx, ownerId, intent, 'rejected', { error_code: 'not_found_on_remote' }, now, 'reconcile');
     if (job.state === 'CANCEL_REQUESTED') return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
     // 원격에 확실히 없음 → 다시 보내도 된다(새 시도 = 새 전송 의도). 시도 한도 안에서만.
-    const d = decideRetry(job.attempt, job.maxAttempts, null, now, opts.random ?? Math.random);
+    const d = decideRetry(countedAttempts(job), job.maxAttempts, null, now, opts.random ?? Math.random);
     if (d.retry) return settle(tx, ownerId, job, item, 'reconciled_not_found', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
     return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
   }
@@ -951,14 +1029,28 @@ async function remoteCheck(
   const acc = await accountOf(db, ownerId, item.channelAccountId);
   if (!acc) return { r: { status: 'unknown', error_code: 'account_missing' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
   const intent = (job.attempt > 0 ? await intentFor(db, ownerId, job.id, job.attempt) : null) ?? (await latestIntent(db, ownerId, job.id));
+  const unresolved = (code: string) => ({
+    r: { status: 'unknown', error_code: code } satisfies ReconcileResult,
+    caps: { definitive_not_found: false, mock: acc.kind === 'mock' },
+    cancel: null,
+  });
   let adapter: ChannelAdapter;
-  try {
-    // T14(D26): 보낸 어댑터(전송 의도에 기록된 adapter_id)로 조회한다 — 그 뒤 계정 연결 상태가 바뀌어 선택 규칙이 달라져도 같은 원격을 본다.
-    const sentWith = intent?.sanitizedDetails?.adapter_id;
-    const byId = typeof sentWith === 'string' && registry.getAdapterById ? registry.getAdapterById(sentWith) : null;
-    adapter = byId ?? registry.getAdapterFor(adapterAccount(acc));
-  } catch {
-    return { r: { status: 'unsupported', error_code: 'adapter_unavailable' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
+  if (!intent) {
+    // 전송 의도가 없으면 보낸 적이 없다 — 어떤 어댑터인지는 판정에 쓰이지 않는다(not_found no_intent, M3 그대로).
+    try {
+      adapter = registry.getAdapterFor(adapterAccount(acc));
+    } catch {
+      return { r: { status: 'unsupported', error_code: 'adapter_unavailable' }, caps: { definitive_not_found: false, mock: false }, cancel: null };
+    }
+  } else {
+    // T14(D26)·FIX-T14(Codex review-T14 P0 :848): **보낸 어댑터**(전송 의도의 adapter_id)로만 조회한다. 현재 계정 상태로 고른 어댑터로 대신하지 않는다.
+    // adapter_id 가 없는 의도(T14 이전에 만든 것)는 그때 유일했던 일반 모의 어댑터(LEGACY_SEND_ADAPTER_ID)로 명시적으로 읽는다.
+    // 기록된 어댑터를 찾을 수 없으면 not_found 가 아니라 unknown(확인 불가 → 한도 뒤 UNKNOWN, 자동 재전송 없음).
+    const rec = recordedAdapterIdOf(intent.sanitizedDetails);
+    if (rec.id === null) return unresolved('adapter_unresolved');
+    const resolved = resolveAdapterById(registry, rec.id, acc);
+    if (!resolved) return unresolved('adapter_unresolved');
+    adapter = resolved;
   }
   const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(db, ownerId, item.id) : null;
   const caps = adapter.capabilities(adapterAccount(acc), { mockScenario });
@@ -980,8 +1072,27 @@ async function remoteCheck(
     if (!caps.read) return { status: 'unsupported', error_code: 'read_unsupported' } satisfies ReconcileResult;
     return adapter.reconcile(ref, ctx);
   });
-  const r: ReconcileResult = res.ok ? res.value : { status: 'unknown', error_code: res.reason === 'timeout' ? 'reconcile_timeout' : 'adapter_error' };
-  return { r, caps: { definitive_not_found: caps.definitive_not_found, mock: caps.mock }, cancel };
+  let r: ReconcileResult = res.ok ? res.value : { status: 'unknown', error_code: res.reason === 'timeout' ? 'reconcile_timeout' : 'adapter_error' };
+  // FIX-T14(Codex review-T14 P1 bundle.ts:123): 복원한 작업은 단계 기록이 묶음과 함께 왔는지(이전 묶음·제외) 이 환경이 확정할 수 없다.
+  // 단계 기록에 기대는 어댑터의 not_found(“기록 없음 → 보내지 않음”)를 믿지 않고 unknown 으로 둔다(복원 작업은 재전송 경로도 없다).
+  if (r.status === 'not_found' && job.restoredNeedsReview && adapter.usesRemoteSteps) {
+    const steps = await listRemoteSteps(db, ownerId, job.id);
+    r = { status: 'unknown', error_code: steps.length === 0 ? 'restored_steps_missing' : 'restored_not_found_unverified' };
+  }
+  return { r, caps: { definitive_not_found: caps.definitive_not_found && !job.restoredNeedsReview, mock: caps.mock }, cancel };
+}
+
+/**
+ * FIX-T14(P0): 기록된 어댑터 ID → 레지스트리의 그 어댑터. getAdapterById 가 없는 레지스트리는 현재 선택 결과가 **같은 ID 일 때만** 쓴다(다르면 null).
+ */
+function resolveAdapterById(registry: ChannelAdapterRegistry, id: AdapterId, acc: typeof channelAccounts.$inferSelect): ChannelAdapter | null {
+  if (registry.getAdapterById) return registry.getAdapterById(id);
+  try {
+    const current = registry.getAdapterFor(adapterAccount(acc));
+    return (current.id ?? LEGACY_SEND_ADAPTER_ID) === id ? current : null;
+  } catch {
+    return null;
+  }
 }
 
 async function checkJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow, opts: JobRunOptions): Promise<JobState | 'lease_lost'> {
@@ -1049,7 +1160,9 @@ export async function runJobsTick(db: Db, registry: ChannelAdapterRegistry, opts
 
 export type CancelOutcome =
   | { item_id: string; job_id: string; canceled: true; cancel_requested: false; state: 'CANCELED'; message: string }
-  | { item_id: string; job_id: string; canceled: false; cancel_requested: true; state: 'CANCEL_REQUESTED'; message: string };
+  | { item_id: string; job_id: string; canceled: false; cancel_requested: true; state: 'CANCEL_REQUESTED'; message: string }
+  /** FIX-T14: 스레드 일부가 이미 게시된 작업의 취소 — 남은 부분은 보내지 않지만 취소 성공이라고 하지 않는다(UNKNOWN). */
+  | { item_id: string; job_id: string; canceled: false; cancel_requested: false; state: 'UNKNOWN'; published_parts: number; message: string };
 
 async function latestJobForItem(tx: DbOrTx, ownerId: string, itemId: string, lock: boolean): Promise<JobRow | null> {
   const q = tx
@@ -1079,10 +1192,31 @@ export async function cancelItem(db: Db, ownerId: string, itemId: string, now: D
     switch (job.state) {
       case 'QUEUED':
       case 'RETRY_WAIT':
-      case 'BLOCKED':
+      case 'BLOCKED': {
+        // FIX-T14(Codex review-T14 missed case): 스레드 일부가 이미 원격에 게시됐으면(이전 시도 — 2번째 이후 게시물에서 401·429·재개 대기 등)
+        // "보내지 않음"·취소 성공이라고 하지 않는다(A11). 남은 게시물은 보내지 않고 UNKNOWN(thread_partial_canceled) — 단계 목록이 게시된 범위를 보여 준다.
+        const parts = await publishedStepCount(tx, ownerId, job.id, ['publish', 'video']);
+        if (parts > 0) {
+          await settle(tx, ownerId, job, item, 'cancel_partial', { cause: 'user', not_sent: false, published_parts: parts }, now, {
+            ...CLEAR_LEASE,
+            cancelRequestedAt: now,
+            lastErrorCode: 'thread_partial_canceled',
+          });
+          out = {
+            item_id: item.id,
+            job_id: job.id,
+            canceled: false,
+            cancel_requested: false,
+            state: 'UNKNOWN',
+            published_parts: parts,
+            message: `남은 부분은 보내지 않습니다. 이미 게시된 ${parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
+          };
+          break;
+        }
         await settle(tx, ownerId, job, item, 'canceled', { cause: 'user', not_sent: true }, now, { cancelRequestedAt: now });
         out = { item_id: item.id, job_id: job.id, canceled: true, cancel_requested: false, state: 'CANCELED', message: '취소했습니다(아직 보내지 않은 작업)' };
         break;
+      }
       case 'LEASED':
       case 'SENDING':
       case 'REMOTE_PROCESSING':
@@ -1220,7 +1354,7 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
     if (!approval || approval.payloadHash !== item.payloadHash) {
       throw new NotRetryableError('approval_required', '유효한 승인이 없어 재시도하지 않았습니다(다시 승인하거나 새 계획을 만드세요)');
     }
-    if (job.attempt >= job.maxAttempts) {
+    if (countedAttempts(job) >= job.maxAttempts) {
       throw new NotRetryableError('attempts_exhausted', `시도 한도(${job.maxAttempts}회)에 이르렀습니다. 새 배포 계획을 만드세요.`);
     }
     const problems = (await snapshotProblems(tx, ownerId, item, now)).filter((p) => p !== 'schedule_passed');

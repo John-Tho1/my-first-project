@@ -1214,6 +1214,11 @@ export const jobs = pgTable(
     restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
     /** FIX-T11 round 2(0022): 전송 의도 없이 lease 가 만료된 횟수(시도가 아님 — 한도 PRE_INTENT_EXPIRY_LIMIT 에 이르면 FAILED). */
     leaseExpiredBeforeIntent: integer('lease_expired_before_intent').notNull().default(0),
+    /**
+     * FIX-T14(0034, Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING) 뒤의 재개(resume) 횟수 — 장애가 아니므로 시도 한도에서 뺀다
+     * (센 시도 = attempt - resume_count). 상한 FREE_RESUME_MAX. 장애 뒤(RECONCILING)의 재개는 여기 넣지 않는다(시도로 센다).
+     */
+    resumeCount: integer('resume_count').notNull().default(0),
   },
   (t) => [
     unique('jobs_idempotency_key_uq').on(t.idempotencyKey),
@@ -1232,6 +1237,7 @@ export const jobs = pgTable(
     check('jobs_max_attempts_chk', sql`${t.maxAttempts} between 1 and 20`),
     check('jobs_reconcile_count_chk', sql`${t.reconcileCount} >= 0`),
     check('jobs_lease_expired_before_intent_chk', sql`${t.leaseExpiredBeforeIntent} >= 0`),
+    check('jobs_resume_count_chk', sql`${t.resumeCount} >= 0 and ${t.resumeCount} <= ${t.attempt}`),
     check('jobs_retry_class_chk', sql`${t.lastRetryClass} is null or ${t.lastRetryClass} in ('transient_no_side_effect', 'transient_unknown_side_effect', 'permanent', 'auth')`),
     check('jobs_lease_pair_chk', sql`(${t.leaseOwner} is null) = (${t.leaseUntil} is null)`),
     foreignKey({

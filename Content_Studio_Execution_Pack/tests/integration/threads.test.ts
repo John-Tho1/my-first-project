@@ -9,9 +9,49 @@ import path from 'node:path';
 import { inspect } from 'node:util';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { asc, eq, sql } from 'drizzle-orm';
-import { closeDb, createContent, createVariantDraft, exportOwner, getDb, listChannelAccounts, parseBundleZip, runJobsTick, schema, seed, setVariantLifecycle, type Db } from '@cs/db';
-import { loadConfig, openSecret, requireSecretKeyring, type Channel } from '@cs/domain';
-import { createMockAdapterRegistry, LocalStorageAdapter, mockOAuthStore, THREADS_PROVISIONAL_RATE_LIMIT } from '@cs/providers';
+import {
+  closeDb,
+  commitRestore,
+  createContent,
+  createRestorePreview,
+  createTestDb,
+  createVariantDraft,
+  ensureOwner,
+  exportOwner,
+  getDb,
+  listChannelAccounts,
+  parseBundleZip,
+  reconcileItem,
+  runJobsTick,
+  schema,
+  seed,
+  setVariantLifecycle,
+  type Db,
+} from '@cs/db';
+import {
+  buildBundle,
+  loadConfig,
+  openSecret,
+  requireSecretKeyring,
+  RESTORED_TABLES,
+  writeZip,
+  type BundleTables,
+  type Channel,
+  type ChannelAdapterRegistry,
+  type RemoteStepsPort,
+} from '@cs/domain';
+import {
+  createMockAdapterRegistry,
+  LocalStorageAdapter,
+  MockChannelAdapter,
+  MockChannelAdapterRegistry,
+  MockOAuthStore,
+  mockOAuthStore,
+  mockOAuthTokenCheck,
+  THREADS_PROVISIONAL_RATE_LIMIT,
+  ThreadsMockApi,
+  ThreadsMockChannelAdapter,
+} from '@cs/providers';
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
 import { POST as revokePOST } from '../../apps/web/app/api/channel-accounts/[id]/revoke/route';
 import { GET as callbackGET } from '../../apps/web/app/api/oauth/callback/route';
@@ -644,6 +684,473 @@ describe('시나리오·DB 규칙', () => {
     expect(job.state).toBe('CONFIRMED');
     const detail = await rec(await jobGET(get(`/api/jobs/${job.id}`), ctx(job.id)));
     expect(detail.status).toBe(200);
+  });
+});
+
+describe('FIX round 1(Codex review-T14)', () => {
+  /** 다른 레지스트리로 작업 처리기 1회(같은 가상 시계) */
+  async function tickWith(reg: ChannelAdapterRegistry, advanceMs = 0, workerId = 't14-fix-w') {
+    vt += advanceMs;
+    return runJobsTick(db, reg, {
+      workerId,
+      config,
+      ownerId: owner,
+      clock: () => new Date(Date.now() + vt),
+      random: () => 0.5,
+      submitTimeoutMs: 5000,
+      maxJobs: 20,
+      credentials: jobCredentials(config, db),
+    });
+  }
+  const cancel = async (itemId: string) => rec(await cancelPOST(post(`/api/distribution-items/${itemId}/cancel`), ctx(itemId)));
+  const eventDetails = async (jobId: string) =>
+    (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, jobId)).orderBy(asc(schema.jobEvents.eventSeq))).map(
+      (e) => e.sanitizedDetails as Record<string, unknown>,
+    );
+
+  /** T14 이전 코드가 만든 것처럼 전송 의도의 adapter_id 를 없앤다(그때 의도에는 이 키가 없었다 — 트리거를 잠시 끄고 이 시험 행만). */
+  async function stripAdapterId(jobId: string) {
+    await db.execute(sql`alter table send_intents disable trigger send_intents_guard`);
+    try {
+      await db.execute(sql`update send_intents set sanitized_details = sanitized_details - 'adapter_id' where job_id = ${jobId}::uuid`);
+    } finally {
+      await db.execute(sql`alter table send_intents enable trigger send_intents_guard`);
+    }
+    for (const i of await intentsOf(jobId)) expect(i.sanitizedDetails).not.toHaveProperty('adapter_id');
+  }
+
+  /** T14 이전 선택 규칙: 모든 모의 계정 → 일반 모의 어댑터(getAdapterById 없음) */
+  const legacyRegistry = (generic: MockChannelAdapter): ChannelAdapterRegistry => ({ getAdapterFor: () => generic });
+
+  async function legacyAmbiguousSend(generic: MockChannelAdapter) {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1 }]);
+    const itemId = p.items[0]!.id;
+    // 일반 모의 시나리오(응답 유실, 원격은 받음) — T14 이전에는 Threads 항목도 일반 시나리오를 썼다(API 적용 검사를 거치지 않고 넣는다).
+    await db.insert(schema.mockScenarios).values({ ownerId: owner, distributionItemId: itemId, scenario: 'ambiguous_sent', delayMs: 0 });
+    expect((await execute(p.planId)).status).toBe(200);
+    await tickWith(legacyRegistry(generic));
+    const job = await jobOf(itemId);
+    expect(job.state).toBe('RECONCILING');
+    expect(generic.calls.submit).toBeGreaterThan(0);
+    await stripAdapterId(job.id);
+    return { acc, itemId, jobId: job.id };
+  }
+
+  it('P0 업그레이드: adapter_id 없는 미확정 의도(T13 연결 Threads 계정·일반 모의로 전송·응답 유실) → T14 조회는 기록된(legacy) 일반 모의 어댑터로 — 같은 원격이면 CONFIRMED, Threads 조회·재전송 0', async () => {
+    const generic = new MockChannelAdapter({ readEnv: false });
+    const x = await legacyAmbiguousSend(generic);
+    const t14 = new MockChannelAdapterRegistry(generic, registry.threads);
+    const thrReconciles = registry.threads.calls.reconcile;
+    const thrSubmits = registry.threads.calls.submit;
+    const genericSubmits = generic.calls.submit;
+    await tickWith(t14, 11_000);
+    const job = await jobOf(x.itemId);
+    expect(job.state).toBe('CONFIRMED');
+    expect(registry.threads.calls.reconcile).toBe(thrReconciles);
+    expect(registry.threads.calls.submit).toBe(thrSubmits);
+    expect(generic.calls.submit).toBe(genericSubmits);
+    expect(await intentsOf(job.id)).toHaveLength(1);
+    expect(api.postsOf(x.acc.external)).toHaveLength(0);
+  });
+
+  it('P0 업그레이드: 같은 의도를 원격 기록이 없는(재시작) 환경에서 조회 → not_found 아님(unknown → UNKNOWN), 재전송·새 의도 0', async () => {
+    const generic = new MockChannelAdapter({ readEnv: false });
+    const x = await legacyAmbiguousSend(generic);
+    const restarted = new MockChannelAdapterRegistry(new MockChannelAdapter({ readEnv: false }), registry.threads);
+    const thrReconciles = registry.threads.calls.reconcile;
+    for (let i = 0; i < 6; i++) await tickWith(restarted, 20 * MIN);
+    const job = await jobOf(x.itemId);
+    expect(job.state).toBe('UNKNOWN');
+    const ev = await eventsOf(job.id);
+    expect(ev).not.toContain('reconciled_not_found');
+    expect(ev.filter((e) => e === 'send_start')).toHaveLength(1);
+    expect(await intentsOf(job.id)).toHaveLength(1);
+    expect(registry.threads.calls.reconcile).toBe(thrReconciles); // 현재 선택(Threads)으로 대신 조회하지 않는다
+    expect(api.postsOf(x.acc.external)).toHaveLength(0);
+    expect(await pubsOf(x.itemId)).toHaveLength(0);
+  });
+
+  it('P0: 기록된 adapter_id 를 레지스트리가 모르면 unknown(adapter_unresolved) — not_found·재전송 없음', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1, scenario: 'threads_publish_timeout_not_sent' }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tick();
+    const job = await jobOf(itemId);
+    expect(job.state).toBe('RECONCILING');
+    const unknownReg: ChannelAdapterRegistry = { getAdapterFor: () => registry.threads, getAdapterById: () => null };
+    const creates = api.calls.createContainer;
+    const publishes = api.calls.publish;
+    for (let i = 0; i < 4; i++) await tickWith(unknownReg, 20 * MIN);
+    expect((await jobOf(itemId)).state).toBe('UNKNOWN');
+    expect((await eventDetails(job.id)).some((d) => d.error_code === 'adapter_unresolved')).toBe(true);
+    expect(api.calls.createContainer).toBe(creates);
+    expect(api.calls.publish).toBe(publishes);
+    expect(await intentsOf(job.id)).toHaveLength(1);
+  });
+
+  it('P1: 응답 유실·부분 스레드를 내보내고 복원 → remote_steps 가 읽기 전용 이력으로 함께 들어오고 수동 재확인은 not_found 가 아님, 단계 없는(이전) 묶음 → unknown(restored_steps_missing)', async () => {
+    const a1 = await linkedThreadsAccount();
+    const lost = await plan([{ accountId: a1.id, channel: 'threads', body: P1, scenario: 'threads_publish_timeout_sent' }]);
+    await execute(lost.planId);
+    await tick();
+    const a2 = await linkedThreadsAccount();
+    const partial = await plan([{ accountId: a2.id, channel: 'threads', body: THREE.join('\n\n'), scenario: 'threads_thread_partial' }]);
+    await execute(partial.planId);
+    await tick();
+    const lostId = lost.items[0]!.id;
+    const partId = partial.items[0]!.id;
+    expect((await jobOf(lostId)).state).toBe('RECONCILING');
+    expect((await jobOf(partId)).state).toBe('RECONCILING');
+    const sig = (rows: Array<typeof schema.remoteSteps.$inferSelect>) => rows.map((s) => `${s.id}:${s.kind}:${s.postIndex}:${s.remoteId}:${s.status}`);
+    const srcSteps = new Map([
+      [lostId, sig(await stepsOf(lostId))],
+      [partId, sig(await stepsOf(partId))],
+    ]);
+    expect(srcSteps.get(partId)).toHaveLength(5);
+    const ex = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), owner, { outDir: path.join(tmp, 'exports') });
+    const parsed = await parseBundleZip(new Uint8Array(readFileSync(ex.zipPath)));
+    const bundleOf = (tables: BundleTables) =>
+      writeZip(
+        buildBundle({
+          exportId: randomUUID(),
+          exportedAt: new Date().toISOString(),
+          appVersion: parsed.manifest.app_version,
+          migrations: parsed.manifest.schema_migrations,
+          owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+          tables,
+          assetBytes: new Map(parsed.assetBytes),
+        }).entries,
+      );
+    const restoreInto = async (zip: Uint8Array) => {
+      const h = await createTestDb();
+      const target = (await ensureOwner(h.db, `restore-t14fix-${randomUUID().slice(0, 6)}@example.local`)).id;
+      const restoresDir = path.join(tmp, 'restores');
+      const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+      await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, `assets-r-${randomUUID().slice(0, 6)}`)), target, pv.restoreId, {
+        mode: 'empty_only',
+        confirm: true,
+        restoresDir,
+      });
+      return { h, target };
+    };
+    const lastReconcileCode = async (hdb: Db, itemId: string) => {
+      const j = (await hdb.select().from(schema.jobs).where(eq(schema.jobs.itemId, itemId)))[0]!;
+      const evs = await hdb.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, j.id)).orderBy(asc(schema.jobEvents.eventSeq));
+      return (evs.at(-1)!.sanitizedDetails as { error_code?: string }).error_code;
+    };
+    expect(RESTORED_TABLES as readonly string[]).toContain('remote_steps');
+    // (1) 현재 묶음: 단계가 같은 ID·값으로 함께 복원된다
+    {
+      const { h, target } = await restoreInto(bundleOf(structuredClone(parsed.tables) as BundleTables));
+      try {
+        for (const itemId of [lostId, partId]) {
+          const rs = await h.db.select().from(schema.remoteSteps).where(eq(schema.remoteSteps.itemId, itemId)).orderBy(asc(schema.remoteSteps.stepIndex));
+          expect(sig(rs)).toEqual(srcSteps.get(itemId));
+          expect(rs.every((s) => s.ownerId === target)).toBe(true);
+          const j = (await h.db.select().from(schema.jobs).where(eq(schema.jobs.itemId, itemId)))[0]!;
+          expect(j).toMatchObject({ restoredNeedsReview: true, leaseOwner: null });
+          const submits = registry.threads.calls.submit;
+          const rc = await reconcileItem(h.db, registry, target, itemId);
+          // 연결 정보는 묶음 밖 — 이 환경에서는 확인할 수 없다(unknown). not_found 로 단정하지 않는다. 전송 0.
+          expect(rc.remote).toBe('unknown');
+          expect(registry.threads.calls.submit).toBe(submits);
+        }
+        expect((await runJobsTick(h.db, registry, { workerId: 'restored-w', config, ownerId: target, submitTimeoutMs: 500 })).leased).toBe(0);
+      } finally {
+        await h.close();
+      }
+    }
+    // (2) 이전 묶음(단계 기록 없음): 조회는 not_found 가 아니라 unknown(restored_steps_missing)
+    {
+      const old = structuredClone(parsed.tables) as BundleTables;
+      old.remote_steps = [];
+      const { h, target } = await restoreInto(bundleOf(old));
+      try {
+        for (const itemId of [lostId, partId]) {
+          expect(await h.db.select().from(schema.remoteSteps).where(eq(schema.remoteSteps.itemId, itemId))).toHaveLength(0);
+          const rc = await reconcileItem(h.db, registry, target, itemId);
+          expect(rc.remote).toBe('unknown');
+          expect(await lastReconcileCode(h.db, itemId)).toBe('restored_steps_missing');
+        }
+      } finally {
+        await h.close();
+      }
+    }
+    expect(api.postsOf(a1.external)).toHaveLength(1);
+    expect(api.postsOf(a2.external)).toHaveLength(2);
+  }, 180_000);
+
+  it('P2: publish 429 → RETRY_WAIT 중 컨테이너 만료 → 재시도는 영구 FAILED 가 아니라 조회 → UNKNOWN(새 컨테이너·게시 0)', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1 }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    api.setRateBudget(acc.external, 0, 60);
+    await tick();
+    expect((await jobOf(itemId)).state).toBe('RETRY_WAIT');
+    api.clearRateBudget(acc.external);
+    const [container] = await containersOf(itemId);
+    api.expireContainer(container!);
+    expect(await drainUntil(itemId, ['CONFIRMED', 'FAILED', 'UNKNOWN'], 20)).toBe('UNKNOWN');
+    const job = await jobOf(itemId);
+    expect(await eventsOf(job.id)).not.toContain('permanent_failure');
+    expect(await containersOf(itemId)).toEqual([container]);
+    expect(api.containerIds(acc.external)).toEqual([container]);
+    expect(api.postsOf(acc.external)).toHaveLength(0);
+  });
+
+  it('P2: resumable 판정(resume) 뒤 컨테이너 만료 → 다음 시도 ambiguous → UNKNOWN, FAILED 아님', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1, scenario: 'threads_publish_timeout_not_sent' }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tick();
+    await tick(11_000);
+    expect((await jobOf(itemId)).state).toBe('RETRY_WAIT');
+    const [container] = await containersOf(itemId);
+    api.expireContainer(container!);
+    expect(await drainUntil(itemId, ['CONFIRMED', 'FAILED', 'UNKNOWN'], 20)).toBe('UNKNOWN');
+    expect(api.containerIds(acc.external)).toEqual([container]);
+    expect(api.postsOf(acc.external)).toHaveLength(0);
+  });
+
+  /** 3개 스레드에서 1번째 게시 뒤 2번째 publish 429 → RETRY_WAIT(게시 1) */
+  async function partialAfter429() {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.join('\n\n') }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    api.setRateBudget(acc.external, 1, 60);
+    await tick();
+    const job = await jobOf(itemId);
+    expect(job.state).toBe('RETRY_WAIT');
+    expect(job.lastErrorCode).toBe('rate_limited');
+    expect(api.postsOf(acc.external)).toHaveLength(1);
+    api.clearRateBudget(acc.external);
+    return { acc, itemId };
+  }
+
+  it('missed: 2번째 게시물 429 뒤 RETRY_WAIT 취소 → CANCELED("보내지 않음")가 아니라 UNKNOWN(thread_partial_canceled), 남은 게시물 보내지 않음', async () => {
+    const x = await partialAfter429();
+    const c = await cancel(x.itemId);
+    expect(c.status).toBe(200);
+    expect(await c.json()).toMatchObject({ canceled: false, cancel_requested: false, state: 'UNKNOWN', published_parts: 1 });
+    const job = await jobOf(x.itemId);
+    expect(job).toMatchObject({ state: 'UNKNOWN', lastErrorCode: 'thread_partial_canceled' });
+    expect((await eventDetails(job.id)).at(-1)).toMatchObject({ transition: 'cancel_partial', not_sent: false, published_parts: 1 });
+    await tick(20 * MIN);
+    await tick(20 * MIN);
+    expect(api.postsOf(x.acc.external)).toHaveLength(1);
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job, pub: null, blockReason: null })).toMatch(/^일부만 게시됨\(MOCK\)/);
+    expect((await retry(x.itemId)).status).toBe(409);
+  });
+
+  it('missed: 2번째 게시물 429 뒤 대기 → 2번째부터 이어서 CONFIRMED, 1번째 재게시 없음', async () => {
+    const x = await partialAfter429();
+    expect(await drainUntil(x.itemId, ['CONFIRMED', 'FAILED', 'UNKNOWN'])).toBe('CONFIRMED');
+    expect(api.postsOf(x.acc.external)).toHaveLength(3);
+    for (const c of await containersOf(x.itemId)) expect(api.publishCount.get(c)).toBe(1);
+  });
+
+  it('missed: 2번째 게시물 401 → BLOCKED(게시 1) → 재시도 → 2번째부터 이어서 CONFIRMED / 같은 상황 취소 → UNKNOWN(부분)', async () => {
+    for (const action of ['retry', 'cancel'] as const) {
+      const x = await partialAfter429();
+      api.injectFault({ op: 'publish', kind: 'auth_invalid_token', userId: x.acc.external });
+      await tick(2 * MIN);
+      expect(await jobOf(x.itemId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'auth_invalid_token' });
+      expect(api.postsOf(x.acc.external)).toHaveLength(1);
+      if (action === 'retry') {
+        expect((await retry(x.itemId)).status).toBe(200);
+        await tick(1000);
+        expect((await jobOf(x.itemId)).state).toBe('CONFIRMED');
+        expect(api.postsOf(x.acc.external)).toHaveLength(3);
+        for (const c of await containersOf(x.itemId)) expect(api.publishCount.get(c)).toBe(1);
+      } else {
+        expect(await (await cancel(x.itemId)).json()).toMatchObject({ state: 'UNKNOWN', published_parts: 1 });
+        await tick(20 * MIN);
+        expect(api.postsOf(x.acc.external)).toHaveLength(1);
+      }
+    }
+  });
+
+  it('missed: 2번째 게시물 400 → FAILED(게시 1, 단계 목록이 보여 줌), 취소·재시도 409', async () => {
+    const x = await partialAfter429();
+    api.injectFault({ op: 'publish', kind: 'invalid_parameter', userId: x.acc.external });
+    await tick(2 * MIN);
+    expect((await jobOf(x.itemId)).state).toBe('FAILED');
+    expect((await stepSig(x.itemId)).filter((s) => s.startsWith('publish:'))).toEqual(['publish:0:published']);
+    expect((await cancel(x.itemId)).status).toBe(409);
+    expect((await retry(x.itemId)).status).toBe(409);
+    expect(api.postsOf(x.acc.external)).toHaveLength(1);
+  });
+
+  it('missed: 부분 스레드 resume 직후(RETRY_WAIT) 취소 → UNKNOWN(부분), 3번째 게시 없음', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.join('\n\n'), scenario: 'threads_thread_partial' }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tick();
+    await tick(11_000);
+    const j = await jobOf(itemId);
+    expect(j.state).toBe('RETRY_WAIT');
+    expect(await eventsOf(j.id)).toContain('resume');
+    expect(await (await cancel(itemId)).json()).toMatchObject({ state: 'UNKNOWN', published_parts: 2 });
+    await tick(20 * MIN);
+    expect(api.postsOf(acc.external)).toHaveLength(2);
+    expect(await pubsOf(itemId)).toHaveLength(0);
+  });
+
+  it('missed: 게시된 것이 없는 RETRY_WAIT 취소는 그대로 CANCELED(보내지 않음)', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1, scenario: 'threads_rate_limited' }]);
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.items[0]!.id)).state).toBe('RETRY_WAIT');
+    expect(await (await cancel(p.items[0]!.id)).json()).toMatchObject({ canceled: true, state: 'CANCELED' });
+  });
+
+  it('missed: 처리 지연 재개(REMOTE_PROCESSING → resume)는 시도 한도를 쓰지 않는다 — 게시물 7개가 모두 처리 지연이어도 max_attempts 5 안에서 CONFIRMED', async () => {
+    const slow = new ThreadsMockChannelAdapter({ api, pollBudget: 2 });
+    // 모든 컨테이너가 조회 예산만큼 IN_PROGRESS(시험 전용 — 시뮬레이터 동작만 바꿈, payload 불변)
+    (slow as unknown as { faultFor: (...a: unknown[]) => unknown }).faultFor = (_s: unknown, op: unknown) => (op === 'createContainer' ? { finishAfterPolls: 2 } : {});
+    const reg = new MockChannelAdapterRegistry(registry.mock, slow);
+    const acc = await linkedThreadsAccount();
+    const posts = Array.from({ length: 7 }, (_, i) => `${i + 1}번째 — 처리 지연 시험 문장.`);
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: posts.join('\n\n') }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    let state = '';
+    for (let i = 0; i < 40; i++) {
+      await tickWith(reg, 20_000);
+      state = (await jobOf(itemId)).state;
+      if (['CONFIRMED', 'FAILED', 'UNKNOWN'].includes(state)) break;
+    }
+    const job = await jobOf(itemId);
+    expect(state).toBe('CONFIRMED');
+    expect(job.maxAttempts).toBe(5);
+    expect(job.attempt).toBeGreaterThan(job.maxAttempts);
+    expect(job.resumeCount).toBe(job.attempt - 1);
+    expect(api.postsOf(acc.external)).toHaveLength(7);
+    for (const c of await containersOf(itemId)) expect(api.publishCount.get(c)).toBe(1);
+    expect((await eventDetails(job.id)).filter((d) => d.transition === 'resume').every((d) => d.counted === false)).toBe(true);
+  }, 120_000);
+
+  it('missed: 결과 불명(RECONCILING) 뒤의 재개는 시도로 센다(끝없는 재개 없음)', async () => {
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1, scenario: 'threads_publish_timeout_not_sent' }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tick();
+    await tick(11_000);
+    const j = await jobOf(itemId);
+    expect(j.state).toBe('RETRY_WAIT');
+    expect(j.resumeCount).toBe(0);
+    expect((await eventDetails(j.id)).find((d) => d.transition === 'resume')).toMatchObject({ counted: true });
+  });
+
+  it('missed: 로컬 요청 제한은 같은 계정에서 진행 중인 다른 작업의 남은 단위를 예약으로 센다(계정별 advisory 잠금 안) — 실제 사용량만으로는 통과해도 짧게 대기', async () => {
+    registry.threads.rateLimit = { ...THREADS_PROVISIONAL_RATE_LIMIT, max_units: 3, window_sec: 3600 };
+    const acc = await linkedThreadsAccount();
+    const first = await plan([{ accountId: acc.id, channel: 'threads', body: P1 }]);
+    await execute(first.planId);
+    await tick();
+    expect((await jobOf(first.items[0]!.id)).state).toBe('CONFIRMED'); // 사용 1
+    const a = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.slice(0, 2).join('\n\n'), scenario: 'threads_container_slow' }]);
+    await execute(a.planId);
+    await tick(1000);
+    expect((await jobOf(a.items[0]!.id)).state).toBe('REMOTE_PROCESSING'); // 진행 중(남은 2)
+    const b = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.slice(0, 2).join('\n\n') }]);
+    await execute(b.planId);
+    const t0 = Date.now() + vt + 1000;
+    await tick(1000);
+    const jb = await jobOf(b.items[0]!.id);
+    expect(jb.state).toBe('RETRY_WAIT');
+    expect(jb.lastErrorCode).toBe('local_rate_limited');
+    expect(await intentsOf(jb.id)).toHaveLength(0);
+    expect((await eventDetails(jb.id)).find((x) => x.transition === 'local_rate_limited')).toMatchObject({ used: 1, inflight: 2, needed: 2 });
+    expect(jb.nextRunAt.getTime() - t0).toBeLessThanOrEqual(61_000);
+  });
+
+  it('missed: publish 성공 직후 단계 기록 실패 → 결과 불명 → 조회가 컨테이너로 게시물을 찾아 기록·CONFIRMED(재게시 0)', async () => {
+    class FlakyStepThreads extends ThreadsMockChannelAdapter {
+      failPublishRecord = true;
+      override async submit(prepared: Parameters<ThreadsMockChannelAdapter['submit']>[0], c: Parameters<ThreadsMockChannelAdapter['submit']>[1]) {
+        const steps = c.steps!;
+        const wrapped: RemoteStepsPort = {
+          list: () => steps.list(),
+          record: async (s) => {
+            if (s.kind === 'publish' && this.failPublishRecord) {
+              this.failPublishRecord = false;
+              throw new Error('simulated db failure');
+            }
+            return steps.record(s);
+          },
+        };
+        return super.submit(prepared, { ...c, steps: wrapped });
+      }
+    }
+    const reg = new MockChannelAdapterRegistry(registry.mock, new FlakyStepThreads({ api }));
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1 }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tickWith(reg);
+    expect((await jobOf(itemId)).state).toBe('RECONCILING');
+    expect(await stepSig(itemId)).toEqual(['container:0:finished']);
+    expect(api.postsOf(acc.external)).toHaveLength(1);
+    await tick(11_000);
+    expect((await jobOf(itemId)).state).toBe('CONFIRMED');
+    expect(await stepSig(itemId)).toEqual(['container:0:finished', 'publish:0:published']);
+    expect(api.postsOf(acc.external)).toHaveLength(1);
+    expect(api.publishCount.get((await containersOf(itemId))[0]!)).toBe(1);
+  });
+
+  it('missed: 단계 기록 직후 lease 상실(다음 원격 호출 전 heartbeat 실패) → 만료 복구 → 조회 → 남은 게시물만 이어서, 재게시 0', async () => {
+    class LeaseThief extends ThreadsMockChannelAdapter {
+      stolen = false;
+      override async submit(prepared: Parameters<ThreadsMockChannelAdapter['submit']>[0], c: Parameters<ThreadsMockChannelAdapter['submit']>[1]) {
+        const steps = c.steps!;
+        const wrapped: RemoteStepsPort = {
+          list: () => steps.list(),
+          record: async (s) => {
+            const r = await steps.record(s);
+            if (s.kind === 'publish' && !this.stolen) {
+              this.stolen = true;
+              await db.execute(sql`update jobs set lease_owner = 'thief', lease_until = now() - interval '1 second' where id = ${c.jobId}::uuid`);
+            }
+            return r;
+          },
+        };
+        return super.submit(prepared, { ...c, steps: wrapped });
+      }
+    }
+    const reg = new MockChannelAdapterRegistry(registry.mock, new LeaseThief({ api }));
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: THREE.slice(0, 2).join('\n\n') }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tickWith(reg);
+    expect(api.postsOf(acc.external)).toHaveLength(1);
+    expect(await drainUntil(itemId, ['CONFIRMED', 'FAILED', 'UNKNOWN'], 20)).toBe('CONFIRMED');
+    expect(api.postsOf(acc.external)).toHaveLength(2);
+    for (const c of await containersOf(itemId)) expect(api.publishCount.get(c)).toBe(1);
+  });
+
+  it('조사: 별도 worker 프로세스(모의 OAuth·Threads 시뮬레이터 메모리가 비어 있음) → 원격 401 → BLOCKED, 게시·결과 0(거짓 성공 없음)', async () => {
+    // 같은 DB, 다른 프로세스 흉내: 이 프로세스의 OAuth 발급 기록을 모르는 시뮬레이터
+    const freshApi = new ThreadsMockApi({ tokenCheck: mockOAuthTokenCheck(new MockOAuthStore()) });
+    const reg = new MockChannelAdapterRegistry(registry.mock, new ThreadsMockChannelAdapter({ api: freshApi }));
+    const acc = await linkedThreadsAccount();
+    const p = await plan([{ accountId: acc.id, channel: 'threads', body: P1 }]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    await tickWith(reg);
+    expect(await jobOf(itemId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'auth_invalid_token' });
+    expect(freshApi.postsOf(acc.external)).toHaveLength(0);
+    expect(api.postsOf(acc.external)).toHaveLength(0);
+    expect(await pubsOf(itemId)).toHaveLength(0);
   });
 });
 

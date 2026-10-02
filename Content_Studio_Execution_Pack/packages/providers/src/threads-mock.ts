@@ -407,6 +407,9 @@ export function classifyThreadsError(e: unknown, op: ThreadsOp): AdapterResult {
     case 'invalid_parameter':
       // 이미 게시된 컨테이너 — 게시는 원격에 있다. 조회로 확인한다(다시 보내지 않음).
       if (e.code === 'container_already_published') return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: e.code };
+      // FIX-T14(Codex review-T14 P2 :622): 기록된 컨테이너가 만료됨(429 대기·resumable 판정 뒤 등) — 영구 실패로 닫지 않고 조회 경로로 보낸다.
+      // 조회는 만료 컨테이너를 unknown 으로 보고(게시물당 컨테이너 1개 — 새로 만들지 않음) 3회 뒤 UNKNOWN(README·D26 과 같은 종료 정책).
+      if (e.code === 'container_expired') return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: e.code };
       return { status: 'rejected', retry_class: 'permanent', error_code: e.code === 'invalid_parameter' ? 'invalid_parameter' : `invalid_parameter:${e.code}` };
     case 'not_found':
       // 게시할 컨테이너를 원격이 모른다(재시작 등) — 원격 사실을 단정하지 않고 조회로.
@@ -427,6 +430,8 @@ export function classifyThreadsError(e: unknown, op: ThreadsOp): AdapterResult {
 export class ThreadsMockChannelAdapter implements ChannelAdapter {
   readonly kind = 'mock' as const;
   readonly id = THREADS_ADAPTER_ID;
+  /** FIX-T14(P1): 조회 판정이 remote_steps 에 기댄다 — 복원한 작업의 not_found 는 믿지 않는다(작업 처리기가 unknown 으로). */
+  readonly usesRemoteSteps = true;
   readonly api: ThreadsMockApi;
   pollBudget: number;
   pollIntervalMs: number;
@@ -605,6 +610,10 @@ export class ThreadsMockChannelAdapter implements ChannelAdapter {
         if (status === 'PUBLISHED') {
           // 이전 시도의 게시가 원격에 있다 — 다시 게시하지 않고 조회로 확인한다.
           return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_already_published', provider_request_id: requestId };
+        }
+        if (status === 'EXPIRED') {
+          // FIX-T14(P2): 만료는 조회 경로로(위 publish 오류와 같은 종료 정책 — 새 컨테이너 없음, 3회 뒤 UNKNOWN). 오류 기록으로 닫지 않는다.
+          return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_expired', provider_request_id: requestId };
         }
         if (status !== 'FINISHED') {
           await steps.record({ kind: 'container', post_index: i, remote_id: ct.remote_id, status: 'error' });

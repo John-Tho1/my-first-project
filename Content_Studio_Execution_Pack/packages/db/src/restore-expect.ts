@@ -17,6 +17,8 @@
  *  - distribution_plans: 상태 = planStatusFrom(기대 항목 상태·기대 활성 승인). 원본과 다르면 revision + 1, updated_at = 복원 시각.
  *  - transcription_jobs: queued·running → canceled, error 고정 문구, finished_at = 원본 값 또는 복원 시각.
  *  - channel_accounts(T13): credential_state linked → needs_reconnect(연결 정보는 묶음 밖).
+ *  - remote_steps(FIX-T14, Codex review-T14 P1): 이제 RESTORED_TABLES — 변환 없이 묶음 행 그대로(ID·작업·의도·remote_id·상태·바이트·시각).
+ *    업로드 세션 URI 는 내보낼 때 이미 가린 값(mock-redacted:session:…)이므로 기대값도 그 값이다.
  *  - usage_ledger: 그 중단된 전사의 reserved 원장 → settled, actual_amount = reserved_amount, failed = true, settled_at = 복원 시각. 그 밖의 금액은 그대로.
  * 판정 시각(decisionAt)으로 정해지는 값(승인 철회 시각·계획/파생본 updated_at)은 그 시각과 정확히 같아야 한다. DB now() 로 정해지는 값(원장 settled_at·
  * 전사 finished_at)은 실제 복원 호출 직전~직후 구간 안인지 본다. 원래 시각을 보존해야 하는 열은 정확히 비교한다.

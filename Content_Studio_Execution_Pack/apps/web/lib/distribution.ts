@@ -453,6 +453,8 @@ export function itemHeadline(x: ItemHeadlineInput): string {
     case 'RECONCILING':
       return '등록 여부 확인 필요';
     case 'UNKNOWN':
+      // FIX-T14: 스레드 일부가 게시된 뒤 취소(요청) — 남은 부분은 보내지 않음, 게시된 부분은 원격에 남음(취소 성공이라고 하지 않는다 A11)
+      if (reason === 'thread_partial_canceled' || reason === 'thread_partial_cancel_requested') return '일부만 게시됨(MOCK) — 취소 뒤 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음';
       return '확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
     case 'CANCEL_REQUESTED':
       return '취소 확인 중';

@@ -222,6 +222,12 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'item_id', table: 'distribution_items', owned: true },
     { col: 'job_id', table: 'jobs', owned: true },
   ],
+  // FIX-T14(Codex review-T14 P1): 원격 단계 기록도 읽기 전용 이력 — 그 작업·의도·항목이 이번에 들어갔을 때만(기존 작업에 단계를 덧붙이지 않는다).
+  remote_steps: [
+    { col: 'job_id', table: 'jobs', owned: true },
+    { col: 'intent_id', table: 'send_intents', owned: true },
+    { col: 'item_id', table: 'distribution_items', owned: true },
+  ],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

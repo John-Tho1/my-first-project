@@ -65,7 +65,8 @@ export const EXPORTED_TABLES = [
   'publications',
   // T12(0018, 결정 D19): 항목별 모의 시나리오(개발·시험용) — 내보내기만. 복원 환경의 모의 결과를 미리 정해 두지 않는다.
   'mock_scenarios',
-  // T14(0031, 결정 D26): 원격 단계 참조(Threads 컨테이너·게시 ID, 모의) — 내보내기만. 복원 환경은 원격을 다시 확인해야 한다.
+  // T14(0031, 결정 D26): 원격 단계 참조(Threads 컨테이너·게시 ID, 모의). FIX-T14(Codex review-T14 P1): 작업·전송 의도와 함께 읽기 전용 이력으로 복원한다
+  // (게시된 부분의 근거·재확인용 참조 보존). 업로드 세션 URI 는 묶음에서 가린 값 그대로 들어간다.
   'remote_steps',
   'audit_events',
 ] as const;
@@ -119,9 +120,11 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
  * FIX-T11(P1, Codex review-T11 bundle.ts:110): jobs·send_intents·publications 는 **읽기 전용 이력**으로 복원한다 — 확인된 결과의 근거
  * (외부 ID·공개 범위·MOCK 표식)와 재확인용 원격 참조(전송 의도 key)를 잃지 않게. 자동 재개는 없다: 작업은 끝난 상태(CONFIRMED·FAILED·CANCELED·
  * BLOCKED) 또는 UNKNOWN 으로만 들어가고 restored_needs_review 가 켜진다(worker 는 lease 하지 않고, 재시도 API 는 거부, 재확인은 조회만).
- * job_events·execute_commands·mock_scenarios·users·audit_events 는 계속 내보내기만. T14(D26): remote_steps(원격 단계 참조)도 내보내기만.
+ * job_events·execute_commands·mock_scenarios·users·audit_events 는 계속 내보내기만. T14(D26) 는 remote_steps 를 내보내기만 했으나
+ * FIX-T14(Codex review-T14 P1 :123): remote_steps 도 작업·의도와 같이 **읽기 전용 이력**으로 복원한다(부분 스레드의 게시 근거·재확인 참조).
+ * 복원한 작업의 조회는 단계 기록이 없으면 unknown(restored_steps_missing — 이전 묶음), not_found 로 단정하지 않는다.
  */
-export const NON_RESTORED_TABLES = ['users', 'audit_events', 'job_events', 'execute_commands', 'mock_scenarios', 'remote_steps'] as const satisfies readonly ExportedTable[];
+export const NON_RESTORED_TABLES = ['users', 'audit_events', 'job_events', 'execute_commands', 'mock_scenarios'] as const satisfies readonly ExportedTable[];
 export const RESTORED_TABLES = EXPORTED_TABLES.filter((t) => !(NON_RESTORED_TABLES as readonly string[]).includes(t)) as Exclude<
   ExportedTable,
   (typeof NON_RESTORED_TABLES)[number]
@@ -507,6 +510,8 @@ export const ROW_SCHEMAS = {
     restored_needs_review: z.boolean().default(false),
     // FIX-T11 round 2(0022): 의도 없이 만료된 lease 횟수. 이전 묶음에는 없으므로 기본 0.
     lease_expired_before_intent: int.min(0).default(0),
+    // FIX-T14(0034): 처리 지연 재개 수(시도 한도에서 뺌). 이전 묶음에는 없으므로 기본 0.
+    resume_count: int.min(0).default(0),
   }),
   job_events: z.strictObject({
     id: uuid,

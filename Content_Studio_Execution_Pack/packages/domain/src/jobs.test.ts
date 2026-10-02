@@ -4,7 +4,11 @@ import {
   ACTIVE_JOB_STATES,
   canTransitionJob,
   classifyOutcome,
+  countedAttempts,
   decideRetry,
+  FREE_RESUME_MAX,
+  LEGACY_SEND_ADAPTER_ID,
+  recordedAdapterIdOf,
   IllegalJobTransitionError,
   itemStatusForJob,
   JOB_EVENTS,
@@ -284,5 +288,28 @@ describe('T15(D27) 전이·재시도 시각·단계 상태', () => {
     expect(KS15.upload_session).toEqual(['created', 'finished', 'expired', 'error']);
     expect(KS15.video).toEqual(['uploaded', 'processed', 'error']);
     expect(KS15.publish).toEqual(['published']);
+  });
+});
+
+describe('FIX-T14(Codex review-T14): 기록된 어댑터 해석·처리 지연 재개·부분 취소 전이', () => {
+  it('adapter_id 없음·null → mock_generic(legacy, 현재 계정 상태로 대신하지 않음), 아는 ID 그대로, 모르는 값 → null', () => {
+    expect(recordedAdapterIdOf(undefined)).toEqual({ id: LEGACY_SEND_ADAPTER_ID, legacy: true });
+    expect(recordedAdapterIdOf({ mode: 'MOCK' })).toEqual({ id: 'mock_generic', legacy: true });
+    expect(recordedAdapterIdOf({ adapter_id: null })).toEqual({ id: 'mock_generic', legacy: true });
+    expect(recordedAdapterIdOf({ adapter_id: 'mock_threads' })).toEqual({ id: 'mock_threads', legacy: false });
+    expect(recordedAdapterIdOf({ adapter_id: 'live_threads' })).toMatchObject({ id: null });
+    expect(recordedAdapterIdOf({ adapter_id: 7 })).toMatchObject({ id: null });
+  });
+  it('센 시도 = attempt − resume_count(음수 없음), 상한 상수', () => {
+    expect(countedAttempts({ attempt: 6, resumeCount: 4 })).toBe(2);
+    expect(countedAttempts({ attempt: 3 })).toBe(3);
+    expect(countedAttempts({ attempt: 1, resumeCount: 5 })).toBe(0);
+    expect(FREE_RESUME_MAX).toBe(20);
+  });
+  it('cancel_partial 은 아직 시작하지 않은 상태(QUEUED·RETRY_WAIT·BLOCKED)에서만 UNKNOWN', () => {
+    for (const s of ['QUEUED', 'RETRY_WAIT', 'BLOCKED'] as const) expect(transitionJobState(s, 'cancel_partial')).toBe('UNKNOWN');
+    for (const s of ['LEASED', 'SENDING', 'RECONCILING', 'REMOTE_PROCESSING', 'CANCEL_REQUESTED', 'UNKNOWN', 'CONFIRMED', 'FAILED', 'CANCELED'] as const) {
+      expect(canTransitionJob(s, 'cancel_partial')).toBe(false);
+    }
   });
 });

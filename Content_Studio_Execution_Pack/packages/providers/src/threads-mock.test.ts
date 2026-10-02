@@ -417,6 +417,50 @@ describe('ThreadsMockChannelAdapter', () => {
     expect(r2.status).toBe(scenario === 'threads_text_too_long' ? 'rejected' : 'accepted');
   });
 
+  it('FIX-T14(P2): publish 429 대기 중 컨테이너 만료 → 다음 시도의 publish container_expired 는 영구 실패가 아니라 조회(ambiguous) → 조회 unknown, 새 컨테이너 없음', async () => {
+    const api = new ThreadsMockApi({ tokenCheck });
+    const a = new ThreadsMockChannelAdapter({ api });
+    const steps = memSteps();
+    const snap = snapshot(['한 줄']);
+    api.injectFault({ op: 'publish', kind: 'rate_limited', retryAfterSec: 5, userId: USER });
+    const c1 = ctxOf(steps);
+    const r1 = await a.submit(await a.prepare(snap, c1), c1);
+    expect(classifyOutcome(r1).event).toBe('transient_failure');
+    expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']);
+    api.expireContainer(steps.rows[0]!.remote_id);
+    const c2 = ctxOf(steps, { attempt: 2 });
+    const r2 = await a.submit(await a.prepare(snap, c2), c2);
+    expect(r2).toMatchObject({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_expired' });
+    expect(classifyOutcome(r2).event).toBe('ambiguous');
+    expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']); // 오류로 닫지 않음
+    expect(await a.reconcile(ref, ctxOf(steps, { snapshot: snap }))).toMatchObject({ status: 'unknown', error_code: 'container_expired' });
+    expect(api.containerIds(USER)).toHaveLength(1);
+    expect(api.postsOf(USER)).toHaveLength(0);
+  });
+
+  it('FIX-T14(P2): resumable 판정 뒤 컨테이너 만료 → 다음 시도 ambiguous(container_expired), 처리 지연 중 만료 → ambiguous(오류 기록 없음)', async () => {
+    const api = new ThreadsMockApi({ tokenCheck });
+    const a = new ThreadsMockChannelAdapter({ api });
+    const steps = memSteps();
+    const snap = snapshot(['한 줄']);
+    const c1 = ctxOf(steps, scen('threads_publish_timeout_not_sent'));
+    await a.submit(await a.prepare(snap, c1), c1);
+    expect(await a.reconcile(ref, ctxOf(steps, { snapshot: snap }))).toMatchObject({ status: 'resumable' });
+    api.expireContainer(steps.rows[0]!.remote_id);
+    const c2 = ctxOf(steps, { ...scen('threads_publish_timeout_not_sent'), attempt: 2 });
+    expect(await a.submit(await a.prepare(snap, c2), c2)).toMatchObject({ status: 'ambiguous', error_code: 'container_expired' });
+    expect(api.containerIds(USER)).toHaveLength(1);
+    // 처리 지연(created) 중 만료: 조회 단계에서 EXPIRED → ambiguous, 단계는 error 로 기록하지 않는다
+    const s2 = memSteps();
+    const slow = new ThreadsMockChannelAdapter({ api, pollBudget: 2 });
+    const c3 = ctxOf(s2, scen('threads_container_slow'));
+    expect((await slow.submit(await slow.prepare(snap, c3), c3)).status).toBe('processing');
+    api.expireContainer(s2.rows[0]!.remote_id);
+    const c4 = ctxOf(s2, { ...scen('threads_container_slow'), attempt: 2 });
+    expect(await slow.submit(await slow.prepare(snap, c4), c4)).toMatchObject({ status: 'ambiguous', error_code: 'container_expired' });
+    expect(s2.rows.map((s) => s.status)).toEqual(['created']);
+  });
+
   it('원격 취소는 지원하지 않는다(성공을 꾸며내지 않음)', async () => {
     const a = new ThreadsMockChannelAdapter({ api: new ThreadsMockApi({ tokenCheck }) });
     expect(await a.cancel(ref, ctxOf(memSteps()))).toMatchObject({ status: 'unsupported' });

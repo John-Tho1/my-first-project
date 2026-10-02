@@ -64,6 +64,9 @@ export const JOB_EVENTS = [
   'resume',
   // T14(D26): 계정별 로컬 요청 제한 — 전송 의도를 만들지 않고 창(window)이 풀리는 시각까지 대기.
   'local_rate_limited',
+  // FIX-T14(Codex review-T14 missed case): 아직 시작하지 않은(QUEUED·RETRY_WAIT·BLOCKED) 작업을 취소하는데 스레드 일부가 이미 원격에 게시됨 —
+  // 남은 부분은 보내지 않지만 취소 성공(CANCELED·"보내지 않음")이라고 하지 않는다(A11). → UNKNOWN(사유 thread_partial_canceled).
+  'cancel_partial',
 ] as const;
 export type JobEvent = (typeof JOB_EVENTS)[number];
 
@@ -76,7 +79,7 @@ export type JobEvent = (typeof JOB_EVENTS)[number];
  * - lease_expired_*: lease 만료 복구 — 의도 기록 전이면 다시 대기, 뒤면 RECONCILING(재전송 금지 A20).
  */
 export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<JobEvent, JobState>>>>> = {
-  QUEUED: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING' },
+  QUEUED: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING', cancel_partial: 'UNKNOWN' },
   LEASED: {
     send_start: 'SENDING',
     blocked: 'BLOCKED',
@@ -111,7 +114,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
   },
   // FIX-T11(P0): late_result — lease 를 잃은 옛 시도가 부작용이 있을 수 있는 결과(accepted·processing·ambiguous)를 늦게 돌려주면
   // 다음 시도(새 의도)로 가지 않고 조회로 돌린다(맹목 재전송 금지).
-  RETRY_WAIT: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING' },
+  RETRY_WAIT: { lease: 'LEASED', blocked: 'BLOCKED', canceled: 'CANCELED', late_result: 'RECONCILING', cancel_partial: 'UNKNOWN' },
   RECONCILING: {
     reconciled_found: 'CONFIRMED',
     remote_accepted: 'REMOTE_PROCESSING',
@@ -132,7 +135,7 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     reconcile_unsupported: 'UNKNOWN',
     lease_expired_after_intent: 'CANCEL_REQUESTED',
   },
-  BLOCKED: { unblock: 'QUEUED', canceled: 'CANCELED' },
+  BLOCKED: { unblock: 'QUEUED', canceled: 'CANCELED', cancel_partial: 'UNKNOWN' },
   CANCELED: {},
   CONFIRMED: {},
   FAILED: {},
@@ -178,6 +181,16 @@ export const DEFAULT_LEASE_TTL_MS = 60_000;
  * 이 횟수가 한도에 이르면 보내지 않은 채 FAILED(lease_expired_before_intent) — 보내기 전에 되풀이해 죽는 작업이 끝없이 lease 되지 않게.
  */
 export const PRE_INTENT_EXPIRY_LIMIT = 5;
+/**
+ * FIX-T14(Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING → resume) 뒤의 재개는 장애가 아니므로 시도 한도에서 빼는 최대 횟수.
+ * 게시물마다 컨테이너는 한 번만 IN_PROGRESS → FINISHED 가 되므로 정상 흐름의 지연 재개는 게시물 수(최대 20) 이하다 — 그 이상은 시도로 센다.
+ */
+export const FREE_RESUME_MAX = 20;
+
+/** FIX-T14: 시도 한도에 세는 시도 수 = 전송 의도 수(attempt) − 처리 지연 재개 수(resume_count). */
+export function countedAttempts(job: { attempt: number; resumeCount?: number | null }): number {
+  return Math.max(0, job.attempt - Math.max(0, job.resumeCount ?? 0));
+}
 
 /**
  * 다음 시도 시각. 지연 = min(30초 × 2^(attempt-1), 15분) × (1 ± 20%) 이고 Retry-After(초)보다 짧지 않다.
@@ -340,6 +353,19 @@ export function adapterIdFor(account: Pick<AdapterAccount, 'kind' | 'platform' |
   if (account.platform === 'threads' && linked) return 'mock_threads';
   if (account.platform === 'youtube' && linked) return 'mock_youtube';
   return 'mock_generic';
+}
+
+/**
+ * FIX-T14(Codex review-T14 P0 jobs.ts:848): T14 이전 코드가 만든 전송 의도에는 adapter_id 가 없다. 그때 어댑터는 일반 모의 어댑터 하나뿐이었다
+ * (live 는 어댑터 없음 — 의도 자체가 생기지 않음). 그래서 adapter_id 가 없거나 null 이면 **명시적으로** mock_generic 으로 읽는다 — 현재 계정 상태로
+ * 고른 어댑터(adapterIdFor)로 대신하지 않는다. 문자열이지만 모르는 값이면 null(조회는 unknown 으로 닫는다).
+ */
+export const LEGACY_SEND_ADAPTER_ID: AdapterId = 'mock_generic';
+export function recordedAdapterIdOf(sanitizedDetails: Record<string, unknown> | null | undefined): { id: AdapterId; legacy: boolean } | { id: null; raw: string } {
+  const v = sanitizedDetails?.adapter_id;
+  if (v === undefined || v === null) return { id: LEGACY_SEND_ADAPTER_ID, legacy: true };
+  if (typeof v === 'string' && (ADAPTER_IDS as readonly string[]).includes(v)) return { id: v as AdapterId, legacy: false };
+  return { id: null, raw: typeof v === 'string' ? v.slice(0, 64) : typeof v };
 }
 
 /**
@@ -557,6 +583,11 @@ export interface ChannelAdapter {
   readonly kind: 'mock' | 'live';
   /** T14: 어댑터 식별자(전송 의도 sanitized_details.adapter_id 에 기록). 없으면 kind 로만 고른다(M3 호환). */
   readonly id?: AdapterId;
+  /**
+   * FIX-T14(Codex review-T14 P1): 조회 판정이 이 환경의 원격 단계 기록(remote_steps)에 기대는 어댑터(Threads·YouTube 모의). 복원한 작업은
+   * 기록이 묶음과 함께 왔는지 알 수 없으므로 이런 어댑터의 not_found 를 믿지 않는다(unknown).
+   */
+  readonly usesRemoteSteps?: boolean;
   /** T14: 이 스냅샷이 쓸 요청 제한 단위 수(예: 스레드 게시물 수). capabilities.rate_limit 과 함께 쓴다. */
   rateUnits?(snapshot: PublishSnapshot): number;
   /** T15: 요청 제한 사용량을 셀 원격 단계 종류(기본 ['publish'] — Threads 게시. YouTube 는 ['upload_session'] = 업로드 시작 수). */

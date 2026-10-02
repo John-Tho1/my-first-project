@@ -550,6 +550,8 @@ export function classifyYouTubeError(e: unknown, op: YouTubeOp): AdapterResult {
 export class YouTubeMockChannelAdapter implements ChannelAdapter {
   readonly kind = 'mock' as const;
   readonly id = YOUTUBE_ADAPTER_ID;
+  /** FIX-T14(P1): 조회 판정이 remote_steps 에 기댄다 — 복원한 작업의 not_found 는 믿지 않는다(작업 처리기가 unknown 으로). */
+  readonly usesRemoteSteps = true;
   readonly rateStepKinds = ['upload_session'] as const;
   readonly api: YouTubeMockApi;
   chunkBytes: number;

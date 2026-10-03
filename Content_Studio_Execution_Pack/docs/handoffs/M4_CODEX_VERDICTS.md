@@ -113,3 +113,5 @@ CHANGES_REQUESTED
 
 ## FIX-M4DEV1 (b3041c0, 재수화 round 1) — CHANGES_REQUESTED (P1 1)
 - [P1] packages/db/src/oauth.ts:778 — cleanup_revoke 해소 후에도 현재 토큰의 검증 상태가 복구되지 않는다
+
+## FIX2-M4DEV1 (63ad062, 재수화 round 2) — **PASS** → 모의 OAuth 재수화 종결

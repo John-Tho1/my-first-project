@@ -107,3 +107,9 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - T16 Codex 결과 반영(필요 시 FIX3).
 - 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
 - T17(추가 채널) — 사용자 선택 필요. M5: T18 Notion·Drive 가져오기(모의), T19 허용 소스 수집(모의, 기본 OFF).
+
+## 2026-10-03 10:00 — 아침 마감
+- M4-DEV1(모의 OAuth 재수화, dev 서버 재시작 뒤 모의 연결 유지): 0d9911b → FIX1 b3041c0 → **FIX2 63ad062 Codex PASS**.
+- 열린 Codex 지적 없음. M4 모의 범위(T13~T16)·화면·가림·재수화 모두 종결.
+- 마지막 검사(63ad062): lint·typecheck·build·unit 831·integration 647·drill:mock(M3·Threads·YouTube·Instagram) 0건·실제 로컬 DB drill:restore PASS.
+- Codex 상주 실행기는 정지(`.handoffs/codex-daemon.stop`). 다시 쓰려면 stop 파일을 지우고 `nohup bash .handoffs/run-codex-daemon.sh &`.

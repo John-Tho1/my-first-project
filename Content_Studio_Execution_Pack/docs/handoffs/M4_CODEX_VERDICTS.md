@@ -110,3 +110,6 @@ CHANGES_REQUESTED
 ## M4DEV1 (0d9911b, 모의 OAuth 재수화) — CHANGES_REQUESTED (P1 2)
 - [P1] apps/web/app/api/channel-accounts/[id]/check/route.ts:25 — 재주입 실패를 무시하고 진행하여 일시적 로딩 실패가 연결 오류로 굳어질 수 있다
 - [P1] packages/db/src/oauth.ts:781 — 정리 대기를 무시하면 회전으로 무효화된 이전 토큰을 유효하게 복원한다
+
+## FIX-M4DEV1 (b3041c0, 재수화 round 1) — CHANGES_REQUESTED (P1 1)
+- [P1] packages/db/src/oauth.ts:778 — cleanup_revoke 해소 후에도 현재 토큰의 검증 상태가 복구되지 않는다

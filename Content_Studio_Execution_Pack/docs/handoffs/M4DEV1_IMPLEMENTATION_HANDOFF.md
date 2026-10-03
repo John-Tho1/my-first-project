@@ -100,3 +100,55 @@
 1. 정리 대기 계정 제외를 kind 구분 없이(cleanup_revoke 포함) 했다. cleanup_revoke 만 있는 계정의 현재 토큰은 등록해도 되는 경우가 있는가, 아니면 지금처럼 일괄 제외가 맞는가(위험 1)?
 2. 실패 시 web route 는 503 으로 막고 inline worker·CLI 는 그 tick 의 배포 작업·만료 임박 갱신을 통째로 건너뛴다. 연결 정보를 쓰지 않는 배포 작업(일반 모의 어댑터)까지 미루는 것이 불변식상 문제 되는 경로가 있는가?
 3. `checkCredential` 은 정리 대기를 정리하면 공급자 확인 없이 health 를 돌려준다(기존 T13 규칙). 다시 채우지 않은 cleanup_revoke 계정이 그 직후 잠깐 connected 로 보이는 것을 이번 범위에서 막아야 하는가?
+
+---
+
+## FIX round 2 (Codex review-FIX-M4DEV1)
+- Orchestrator: HEAD_SHA 63ad062 (code only, D28) — reran lint·typecheck·build·unit 831·integration 647·drill:mock 0·real-DB drill:restore PASS.
+
+- 대상 판정: `.handoffs/review-FIX-M4DEV1.md`(CHANGES_REQUESTED, BASE `558f0aa` · HEAD `b3041c0`) — P1 1건 + 놓친 케이스.
+- BASE: `b9812b8`(현재 HEAD) · HEAD_SHA: TBD(커밋하지 않음 — 오케스트레이터가 커밋). 브랜치 `content-studio/m4`. migration 없음. 새 의존성·네트워크 없음.
+
+### 선택한 방법과 이유
+두 안 중 **정리 대기 행마다 "현재 토큰(C)을 무효로 만들 수 있는가"를 판정해 그런 행이 있을 때만 제외**하는 안을 골랐다(재수화 훅을 정리 뒤에 다는 안은 고르지 않음).
+- 모의 공급자는 발급(교환·갱신)마다 새 grant 를 만들고, 갱신은 이전 토큰(Google 형은 이전 grant)을 무효로, 철회는 그 토큰(Google 형은 그 grant)만 무효로 한다. 그래서 C 를 무효로 만들 수 있는 정리 대기는 "C 로 한 갱신의 결과를 모름"(refresh_unknown, base = C 의 세대)과 "C 의 유효성을 아직 확인 못 함"(verify_current, base = C 의 세대)뿐이고, C 와 토큰을 공유하지 않는 cleanup_revoke(P 철회 의무)는 C 에 닿지 않는다.
+- 정리 뒤 훅 안은 "정리가 끝났다"는 사실만으로 C 의 유효성 근거가 생기지 않는다(refresh_unknown 정리 뒤에도 C 는 이미 무효일 수 있음). 판정 근거가 같은 이상, 재시작 시점에 행 단위로 판정하면 정리 순서·재시작 시점과 무관하게 같은 결과가 나오고(정리 직후 재시작 포함), 모의 전용 가드(`ensureMockOAuthRehydrated` 1회 경로)를 새로 늘리지 않는다.
+- 판정 불가는 모두 제외(봉인을 열 수 없음·내용 없음·base 없음·알 수 없는 종류) — 되살리지 않는 쪽으로 실패한다.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+| --- | --- | --- |
+| [P1] db/oauth.ts:778 — cleanup_revoke 만 있던 계정은 재시작 뒤 C 가 등록되지 않아, 첫 확인(정리로 갈음)이 connected 를 보여 준 뒤 다음 사용에서 `invalid_token` → error → 수동 다시 연결 | `loadMockCredentialsForRehydration`: `notExists(oauth_pending_tokens)` 를 빼고 후보 계정의 정리 대기를 읽어 `pendingMayInvalidateCurrent(row, C 세대, C 토큰)` 로 판정. **제외**: refresh_unknown·verify_current 중 base 없음 또는 base ≥ C 세대, cleanup_revoke 중 P 가 C 와 access·refresh 를 하나라도 공유하거나 봉인을 열 수 없음(용도 `oauth_pending_token`)·내용 없음, 그 밖의 종류. **등록**: 그 밖(C 와 무관한 cleanup_revoke, C 보다 이전 세대의 낡은 refresh_unknown·verify_current). 한 행이라도 제외 조건이면 계정 제외. 정리 대기 토큰 P 는 여전히 등록하지 않고, 로더는 여전히 읽기 전용. `checkCredential`·정리 판정(T13)은 바꾸지 않았다. | 통합 "cleanup_revoke 만 남은 계정(실제 callback 정리 철회 불명) …": 다시 연결 시도 중 저장 실패(`beforeCallbackStore`) + P 철회 공급자 오류 → 실제 cleanup_revoke(P ≠ C, 세대 그대로) → 재시작 → C 등록·P 미등록 → **첫 확인 200 `connected`·`usable_for_execution: true`·`pending_reconcile: null`**, 정리 대기 0, P 무효 → 바로 새 계획 실행 → CONFIRMED·게시 1, 세대 그대로(다시 연결 없음) → 두 번째 확인 connected → 정리 직후 재시작 → 확인 connected. |
+| 같은 세대 refresh_unknown·verify_current 는 옛 토큰을 등록하지 않고 확인될 때까지 차단 | 위 판정(동작 유지) | 통합 "refresh_unknown(실제 공급자 갱신으로 C 무효) …": 실제 `refresh` route 로 공급자가 P 발급·C 무효 → 저장 트랜잭션 실패(`insideRefreshStore`) + 저장 여부 읽기 실패(`beforeStoredOutcomeRead`) → refresh_unknown(base = C 세대) → 재시작 → C·P 미등록 → 첫 확인에서 C 확인이 공급자 일시 오류 → verify_current(base = C 세대)로 남음·connected 아님·실행 불가 → **정리 대기 일부가 걷힌 직후(C 검증 전) 재시작** → C 미등록 → 확인 → error·실행 불가·정리 대기 0 → 다시 재시작해도 미등록. |
+| 판정 규칙 전체(합성 행) | — | 통합 "판정 규칙 …": 제외 = 같은 세대 refresh_unknown, 같은 세대 verify_current, base 없는 refresh_unknown(callback), P == C 인 cleanup_revoke, C 와 무관한 cleanup_revoke + 같은 세대 refresh_unknown 혼합, Google 형 P 가 C 의 refresh 를 공유. 등록 = 지난 세대 refresh_unknown·verify_current, C 와 무관한 cleanup_revoke(Threads·Google). P 는 어떤 경우에도 로더 결과·모의 공급자 메모리에 없음, 정리 대기 행 그대로, 등록된 계정도 정리 대기가 남은 동안 실행 불가. 기존 "해제·오류 …" 시험의 정리 대기 행(용도가 다른 봉인 — 열 수 없음)은 판정 불가 → 현재 토큰 미등록으로 기대값 그대로(주석만 갱신). |
+| 놓친 케이스: 여러 요청·worker 가 동시에 재수화 실패 → 함께 회복 | 코드 변경 없음 | 통합 "동시 요청·worker …": 읽기 실패 주입 중 check×2·tick route·inline worker 를 동시에 → 세 route 503 `mock_rehydration_unavailable`, inline worker `jobs`·`credentials` null, 메모리 0·표식 null, 연결 정보 active → 회복 뒤 check×2·tick route 동시에 → 모두 200·connected, **읽기 1회**, 토큰 등록. |
+| 놓친 케이스: Google 토큰 쌍 중 한쪽만 이미 알려졌거나 철회된 경우 | 코드 변경 없음(`already_known` 판정이 둘 중 하나라도 알면 묶음을 새로 만들지 않음) | 단위 "FIX2-M4DEV1: Google 형 토큰 쌍 중 한쪽만 …": 철회된 묶음의 access 만 같은 항목·refresh 만 같은 항목 모두 `already_known`, 다른 쪽도 등록 안 됨(refresh → invalid_grant, access → invalid_token), 원래 access 는 token_revoked 유지. |
+| 놓친 케이스: CLI 실패·회복 | — | not_run(워커 CLI 실제 실행 없음 — 이전 라운드와 같음). |
+
+음성 대조: 판정 함수를 항상 true(= FIX1 처럼 정리 대기 계정 일괄 제외)로 바꾸면 이 파일 19개 중 2개(판정 규칙·cleanup_revoke 회복) 실패, 항상 false(= 정리 대기 무시)로 바꾸면 3개(기존 "해제·오류 …"·판정 규칙·refresh_unknown 실제 갱신) 실패를 확인하고 되돌렸다.
+
+### 바꾼 파일
+`packages/db/src/oauth.ts`(로더 + `pendingMayInvalidateCurrent`), `tests/integration/mock-oauth-rehydrate.test.ts`(FIX1 정리 대기 describe 를 FIX2 describe 4개 시험으로 교체, 16 → 19개), `packages/providers/src/oauth.test.ts`(단위 1개 추가).
+
+### 실행한 명령과 결과(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, dev 서버 꺼짐)
+| 명령 | 결과 |
+| --- | --- |
+| `corepack pnpm lint` | pass(exit 0) |
+| `corepack pnpm typecheck` | pass(exit 0) |
+| `corepack pnpm build` | pass(exit 0) |
+| `corepack pnpm test` | pass — 42 files, 831 tests |
+| `corepack pnpm test:integration`(단독) | pass — 33 files, 647 tests(566 s) |
+| `corepack pnpm drill:mock` | pass(exit 0) — "불변식 위반 0건", 재시작 행(M3·Threads·YouTube·Instagram) 이전과 같음 |
+| worker CLI 실제 실행 | not_run |
+| `corepack pnpm test:e2e` | not_run(요청 범위 밖) |
+
+### 남은 위험
+1. 판정은 모의 공급자의 grant 규칙(발급마다 새 grant, 철회는 그 grant 만)에 기대어 있다. 이 규칙이 바뀌면(예: 같은 사용자 전체 철회) cleanup_revoke 판정도 다시 봐야 한다. 실제 공급자에는 다시 채우기 자체가 없다.
+2. 지난 세대 refresh_unknown·verify_current 는 "세대가 넘어갔으면 C 는 그 뒤 저장된 토큰"이라는 T13 규칙(C 를 무효로 만드는 갱신·해제는 새 세대·error·해제 상태·새 정리 대기 행을 남김)에 기댄다. 정리 대기 기록마저 실패하고 error 표시도 실패한 경우(T13 `refresh_pending_record_failed` 의 최악 경로)는 DB 에 흔적이 없어 이전 위험 1(DB 를 그대로 믿음)과 같다.
+3. 로더는 연결 정보와 정리 대기를 두 번에 나눠 읽는다(한 트랜잭션 스냅샷 아님). 같은 프로세스에서는 모든 경로가 다시 채우기를 먼저 기다리므로 사이에 변경이 없고, 다른 프로세스 동시 변경은 이전 위험 2 와 같다.
+4. `checkCredential` 은 여전히 정리만 한 확인에서 C 를 공급자에 다시 묻지 않는다(T13 규칙). 이번 변경으로 다시 채우기 경로에서는 그 C 가 실제로 등록돼 있어 응답과 일치하지만, 제외된 cleanup_revoke(P == C — 정상 흐름에서는 생기지 않음) 계정은 정리 뒤 잠깐 connected 로 보일 수 있다.
+5. verify_current(같은 세대)는 C 가 실제로 유효했어도(예: 갱신이 저장됐고 확인만 일시 실패) 재시작 뒤 error 로 끝나 다시 연결이 필요하다 — 되살리지 않는 쪽의 의도된 실패.
+
+### Codex 에 묻는 것
+1. `pendingMayInvalidateCurrent` 의 등록 조건(C 와 토큰을 공유하지 않는 cleanup_revoke, C 보다 이전 세대의 refresh_unknown·verify_current)에서, T13 흐름(갱신·callback·정리·해제·키 교체)으로 C 가 이미 무효인데도 이 조건을 만족하는 DB 상태가 만들어지는 경로가 있는가?
+2. 위험 4 — 정리만 한 확인에서 C 를 공급자에 다시 묻지 않는 T13 규칙을 이번 범위에서 바꿔야 하는가(다시 채우기 경로에서는 C 가 등록돼 응답과 일치), 아니면 별도 과제로 두는 것이 맞는가?

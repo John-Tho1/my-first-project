@@ -87,3 +87,23 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 마지막 검사(c82c721): lint·typecheck·build·unit 759·integration 600·drill:mock(M3·T14·T15) 0건·db:migrate(0035)·실제 로컬 DB drill:restore PASS.
 - migration 0030~0035 로컬 적용. 외부 호출·새 의존성·비밀·실제 게시 0.
 - 실계정 연결은 여전히 사용자 준비물·승인 대기(D24). D26(a~f)·D27(a~h) 사용자 확인 대기(잠정대로 진행 중).
+
+## 2026-10-03 아침 — 밤사이 진행 (Codex 한도 복귀 후 00:55 ~)
+- Codex 대기열 → 상주 실행기(`.handoffs/run-codex-daemon.sh`, 대기열 파일에 줄을 추가하면 자동 검토).
+- **종결(Codex PASS)**: T13(FIX8 c82c721) · T14(FIX2 746aa3a) · T15(FIX1 cc26535) · 화면(S1–S5, G1·G2, 해제 안내 cd0a2aa) · 업로드 세션 가림(75dd988).
+- **T16 Instagram(모의)**: 구현 620ed86(D29 잠정) → FIX1 165f0df(체크섬 대조·쓰기 5xx ambiguous·캐러셀 부모 요청 표식 0037) → FIX2 914ac36(sideEffect unknown 전 상태 코드 조회·표식 없는 옛 작업 부모 조회) — Codex 재검증 중.
+- 마지막 검사(914ac36): lint·typecheck·build·unit 825·integration 628·drill:mock(M3·Threads·YouTube·Instagram) 0건·db:migrate(0037)·실제 로컬 DB drill:restore PASS. migration 0030~0037 로컬 적용.
+- 외부 호출·새 의존성·비밀·실제 게시 0. 모의 연결용 로컬 시험 마스터 키는 `.env.local`(git 무시)에만.
+
+## 사용자 결정 대기 (모아 보기)
+1. **D26 (Threads, T14)** a~f — 잠정대로 진행 중(모의 Threads 어댑터 선택 규칙, 401 뒤 연결 확인, 잠정 요청 제한 250/24h, 부분 스레드 처리, 취소 중 부분 → UNKNOWN, 모의 공개 범위 가정).
+2. **D27 (YouTube, T15)** a~h — 잠정(자리표시 scope, 갱신 시 refresh token 회전, 요청 결과 규칙, 예약 공개 표현, 잠정 할당량 6/24h, 업로드 뒤 취소, 썸네일 실패, 세션 URI 가림).
+3. **D29 (Instagram, T16)** — 특히 **공개 미디어 URL 방식**(실제 Instagram 은 공개 URL 로 미디어를 가져감 — 이 앱이 짧은 서명 URL 을 열지/외부 호스트/수동 게시), scope 이름, 미디어 규격 수치, 요청 제한 25/24h, 캐러셀·영상 범위, Business/Creator 계정 유형, 공개 게시만.
+4. **D23 남은 항목** — 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(Codex 권고: 옮김).
+5. **D28** — 인계 사본을 docs/handoffs/ 에 추적하는 방식 유지 여부(AGENTS.md 규칙의 예외).
+6. **실계정 연결 준비물(D24)** — Meta 앱(Threads·Instagram)·Google Cloud/YouTube API 감사, 테스트 계정, redirect URI, 마스터 키 보관 위치, 첫 실계정 시험 원고·공개 범위.
+
+## 다음 후보
+- T16 Codex 결과 반영(필요 시 FIX3).
+- 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
+- T17(추가 채널) — 사용자 선택 필요. M5: T18 Notion·Drive 가져오기(모의), T19 허용 소스 수집(모의, 기본 OFF).

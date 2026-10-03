@@ -703,6 +703,8 @@ export function htmlToText(html: string, stats?: HtmlScanStats): { text: string;
       if (titleRaw === null) titleRaw = content.slice(0, 1000);
     } else if (name === 'textarea') emitText(content);
     else if (name === 'xmp') emitRaw(content);
+    // FIX-T18 round 4 (Codex review-FIX3-T18 P2 :706): 닫는 태그를 여기서 직접 소비해도 블록 요소(textarea·xmp)는 일반 닫는 태그처럼 줄을 나눈다.
+    if (HTML_BLOCK_TAGS.has(name)) out.push('\n');
     const end = finishEndTag(r.e);
     pending = i = end < 0 ? n : end;
   }

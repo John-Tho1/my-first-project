@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { computeDuplicates, getCaptureDetail, getCapturesByIds, getImportOriginForCapture, listCaptureDerivations } from '@cs/db';
+import { computeDuplicates, getCaptureDetail, getCapturesByIds, getCollectedOriginForCapture, getImportOriginForCapture, listCaptureDerivations } from '@cs/db';
 import { formatMsk, formatMskInline, ideaSeedFromCapture, IMPORT_KIND_LABEL, isFetchableUrl, MAX_IDEA, MAX_TITLE, MAX_USER_NOTE, type ImportSourceKind } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
@@ -50,6 +50,8 @@ export default async function CaptureDetailPage({
   const derived = await listCaptureDerivations(db, session.ownerId, c.id);
   // T18: 가져온 사본이면 원본 종류·원래 경로(읽기만 — 원본은 바뀌지 않음)
   const importOrigin = await getImportOriginForCapture(db, session.ownerId, c.id);
+  // T19(D33 제안): 수집(모의)으로 만든 소재면 소스·원래 링크·수집 기록
+  const collectedOrigin = await getCollectedOriginForCapture(db, session.ownerId, c.id);
   const related = await getCapturesByIds(db, session.ownerId, [
     ...dups.exact.map((d) => d.id),
     ...dups.similar.map((d) => d.id),
@@ -130,6 +132,19 @@ export default async function CaptureDetailPage({
             ) : importOrigin.sourceVersionId ? (
               <>
                 {' · '}원본 바이트 없음(0039 이전 가져오기) — 같은 파일을 다시 올려 &quot;원본 보충&quot; 을 고르면 채울 수 있습니다
+              </>
+            ) : null}
+          </p>
+        ) : null}
+        {collectedOrigin ? (
+          <p className="note">
+            <span className="tag warn">수집(모의)</span> 소스 {collectedOrigin.sourceLabel ?? collectedOrigin.sourceUrl}
+            {collectedOrigin.publishedText ? ` · 원문 게시 표시 ${collectedOrigin.publishedText}` : ''} ·{' '}
+            <Link href={`/collect/runs/${collectedOrigin.runId}`}>수집 기록</Link>
+            {collectedOrigin.sourceVersionId ? (
+              <>
+                {' · '}
+                <a href={`/api/imports/originals/${collectedOrigin.sourceVersionId}`}>수집한 원본 조각 그대로 받기</a>
               </>
             ) : null}
           </p>

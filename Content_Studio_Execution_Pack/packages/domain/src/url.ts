@@ -210,7 +210,7 @@ export function isBlockedIPv6(g: number[]): boolean {
 
 const BLOCKED_HOST_SUFFIXES = ['.localhost', '.local', '.internal', '.home.arpa', '.arpa', '.lan'];
 
-function isBlockedHostname(host: string): boolean {
+export function isBlockedHostname(host: string): boolean {
   if (host === 'localhost') return true;
   // 점이 없는 이름(intranet, metadata 등)은 검색 도메인을 통해 내부로 풀릴 수 있어 거부한다.
   if (!host.includes('.')) return true;

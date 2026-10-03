@@ -55,6 +55,11 @@ export const RETENTION_PROTECTED_TABLES = [
   'import_items',
   // FIX-T18 round 1(0039): 가져온 원본 그대로 — 원본 보존(AGENTS)
   'source_version_originals',
+  // T19(D33 제안): 수집 소스·실행·항목 원장·재추천 닫기 — 사용자 설정·수집 출처 이력
+  'collector_sources',
+  'collector_runs',
+  'collected_items',
+  'recommendation_dismissals',
   'audit_events',
   'export_runs',
   'restore_runs',

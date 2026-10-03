@@ -27,6 +27,7 @@ const LABELS: Record<string, string> = {
   STT_PRICE_PER_MINUTE: 'STT_PRICE_PER_MINUTE(음성 1분 가격)',
   PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
+  COLLECTOR_SCHEDULER: 'COLLECTOR_SCHEDULER(주기 수집 실행)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
   AUTH_ALLOWED_IDENTITY: 'AUTH_ALLOWED_IDENTITY(허용 사용자)',
   AUTH_MODE: 'AUTH_MODE(인증 방식)',
@@ -97,7 +98,16 @@ export const configSchema = z.object({
   STT_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
   STT_PRICE_PER_MINUTE: opt(decimalString.optional()),
   PUBLISH_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
-  COLLECTOR_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
+  /**
+   * 수집. disabled(기본) = 꺼짐. mock(T19, D33 제안) = 모의 수집기만(메모리 고정 자료, 실제 웹 요청 0). enabled = 실제 수집 요청 —
+   * 실제 수집기가 없어 T03 추출은 501, T19 수집은 준비 안 됨(503 collector_live_not_ready). 어떤 값에서도 네트워크 요청은 없다.
+   */
+  COLLECTOR_MODE: opt(z.enum(['disabled', 'mock', 'enabled']).default('disabled')),
+  /**
+   * T19(D33 제안): 주기 수집 실행. off(기본) = 소스의 주기 설정은 저장만 하고 실행하지 않는다. on = COLLECTOR_MODE=mock 일 때만 worker tick 이
+   * 기한이 된 소스를 모의 수집해 **미리보기만** 만든다(소재 자동 생성 없음 — 사용자가 골라야 저장).
+   */
+  COLLECTOR_SCHEDULER: opt(z.enum(['off', 'on']).default('off')),
   WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),
   AUTH_ALLOWED_IDENTITY: opt(z.string().min(3).default('owner@example.local')),
   /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T13, 미구현 → 로그인 거부). */
@@ -244,7 +254,7 @@ export function describeModes(config: AppConfig): ModeBadge[] {
     },
     {
       key: 'collectors',
-      label: `수집: ${config.COLLECTOR_MODE === 'enabled' ? '활성' : '비활성'}`,
+      label: `수집: ${config.COLLECTOR_MODE === 'enabled' ? '활성' : config.COLLECTOR_MODE === 'mock' ? '모의' : '비활성'}`,
       live: config.COLLECTOR_MODE === 'enabled',
     },
   ];

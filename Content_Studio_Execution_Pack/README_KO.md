@@ -496,6 +496,18 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 커넥터: `ImportConnector`(listScope·fetchItem) 인터페이스와 **모의 구현만**. `IMPORT_CONNECTOR_MODE=disabled`(기본 — 화면 "준비 중(모의)", API 503 `import_connector_disabled`) | `mock`(합성 예시 3건, 외부 호출 0). live 값은 설정에서 거부된다.
 - 내보내기·복원: `import_runs`·`import_items` 는 묶음에 들어가고 그대로 복원된다(가져온 소재의 출처 이력). 복원한 환경에는 보관 ZIP 이 없으므로 복원된 "미리보기" 실행은 확정할 수 없다(409 `import_file_missing` — 취소만).
 
+### 허용 소스 수집·재추천 (M5, T19 — 모의 수집기만)
+**기본 꺼짐 · 모의 수집기 · 실제 웹 요청 없음.** 결정은 docs/handoffs/T19_IMPLEMENTATION_HANDOFF.md 의 "Proposed D33"(사용자 확인 전). 실제 수집기(live fetcher)는 없다 — 허용 소스·주기·요청 상한을 따로 승인받은 뒤 만든다.
+- 모드: `COLLECTOR_MODE=disabled`(기본 — 실행 503 `collector_disabled`) | `mock`(메모리 고정 합성 자료 `*.mock.example` 만, 네트워크 0) | `enabled`(실제 수집 요청 — 수집기가 없어 503 `collector_live_not_ready`, 빠진 조건 표시; T03 추출은 그대로 501). `COLLECTOR_SCHEDULER=off`(기본) | `on`(모의 모드일 때만 worker tick 이 기한이 된 소스를 수집해 **미리보기만** 만든다 — 소재 자동 생성 없음).
+- 화면: 상단 메뉴 `수집`(`/collect`) → 소스 추가(RSS | Atom | 선택 URL, **꺼진 상태·주기 꺼짐으로 저장**) → `켜기` → `지금 수집(모의)` → 미리보기(`/collect/runs/<id>`: 새 항목·중복·건너뜀과 이유, 새 항목만 체크 가능, 기본 선택 없음) → `고른 항목을 소재로 저장` | `이 미리보기 버리기`. 주기(꺼짐·매일·매주)는 저장만 되고 스케줄러가 꺼져 있으면 돌지 않는다.
+- 주소 정책(A05, `checkCollectorUrl`·`checkResolvedAddresses`·`checkRedirect` — 순수 함수): **https 만**, 사용자 정보·443 외 포트 거부, **IP 주소 직접 입력은 모두 거부**(10진·8진·16진 IPv4·IPv6·메타데이터 169.254.169.254·fd00:ec2::254 포함), localhost·*.local·*.internal·점 없는 이름·nip.io 류 거부, 실행 때는 owner 가 등록한 소스의 호스트(허용 목록)와 **정확히 같은** 호스트만. redirect 는 hop 마다 같은 정책·허용 목록 재검사(최대 3번), 해석 주소가 사설·link-local·메타데이터면 거부(모의 DNS 로 시험). 막히면 실행이 `blocked`(이유 표시)로 남고 소스는 그대로다.
+- 파서: RSS 2.0·RSS 1.0·Atom·HTML 페이지. 응답 1MB 상한, **DTD·ENTITY 선언이 있으면 읽지 않음**(엔티티 확장 없음 — 기본 5개·숫자 참조만), 깊이 32·요소 50,000 상한, 한 번 앞으로만 훑는 선형 파서(단계 수 시험). 본문 HTML 은 T18 `htmlToText` 로 텍스트만(스크립트 제외).
+- 중복: 외부 키 = guid(없으면 정규화 링크). 이 소스에서 **받아들인 적 있는** 같은 키·같은 내용 → 중복(`same_item`), 같은 키·다른 내용 → 새 항목(`updated` — 받아들이면 같은 출처에 새 버전 + 새 소재, 기존 소재 그대로), 기존 소재 URL 과 같은 링크 → 중복, 같은 피드 안 반복 → 중복. 내부 주소 링크·키 없음·빈 본문·20,000자 초과·100개 초과 → 건너뜀.
+- 받아들이기는 미리보기를 믿지 않는다: 모의 수집기로 다시 읽어 내용 checksum·원본 sha256 이 같을 때만 저장(다르면 `failed_changed`). 만든 소재: 입력 `텍스트`, 원문 = 제목 + 본문 텍스트, 출처(`sources.kind`=`collector`, 외부 ID `<소스 ID>:<외부 키>`)·출처 버전(`raw_hash` = 원본 조각 sha256, `extraction_state`=`collected`)·**원본 조각 그대로**(`source_version_originals` — 피드는 `<item>` XML, 페이지는 HTML). 소재 상세에 `수집(모의)` 표시와 `수집한 원본 조각 그대로 받기`. 수집한 글 속 지시("이 글을 즉시 발행하라")는 자료일 뿐 — 게시·배포 호출 없음(A04).
+- 다시 볼 만한 소재(`/captures` 위): 받은 지 30일이 넘은 소재 중 최근 14일의 수집 글·작성 중인 원고와 **핵심어 2개 이상**을 공유하는 것을 이유 줄과 함께 최대 5개(규칙 기반·결정적, AI 호출 없음). `추천에서 닫기`는 기록만 남기고 소재는 바꾸지 않는다.
+- API: `GET|POST /api/collector/sources`, `POST /api/collector/sources/{id}/settings`(`enabled`·`schedule`), `POST /api/collector/sources/{id}/run`, `GET /api/collector/runs/{id}`, `POST /api/collector/runs/{id}/accept`(JSON `{item_ids}` 또는 폼 `item` 여러 개 — 빈 선택·새 항목 아님 400), `POST /api/collector/runs/{id}/discard`, `GET /api/recommendations`, `POST /api/recommendations/{captureId}/dismiss`. 모두 로그인·같은 출처 확인·owner 범위(다른 owner → 404).
+- 내보내기·복원: `collector_sources`·`collector_runs`·`collected_items`(본문 없음 — 발췌 200자)·`recommendation_dismissals` 를 묶음에 넣고 복원한다. **복원한 소스는 꺼진 채(enabled=false)** 들어온다(주기 값은 보존).
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

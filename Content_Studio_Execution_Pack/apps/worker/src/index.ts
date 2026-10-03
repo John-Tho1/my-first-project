@@ -21,16 +21,18 @@ import {
   maybeAutoRetention,
   resolveFromRoot,
   newWorkerId,
+  runDueCollectorSources,
   runJobsTick,
   uploadStoreFor,
   type AssetDeleter,
   type Db,
+  type DueRunsResult,
   type JobRunOptions,
   type JobsTickResult,
   type RetentionResult,
   type TranscriberLike,
 } from '@cs/db';
-import type { AppConfig, ChannelAdapterRegistry, MediaReader } from '@cs/domain';
+import type { AppConfig, ChannelAdapterRegistry, CollectorAdapter, MediaReader } from '@cs/domain';
 
 export interface WorkerTick {
   ranAt: string;
@@ -47,6 +49,11 @@ export interface WorkerTick {
   retention: RetentionResult[] | null;
   /** T13: 만료가 가까운 연결 정보 갱신(갱신기가 주어졌을 때만 — 모의 공급자, 외부 호출 없음) */
   credentials: { refreshed: number; failed: number } | null;
+  /**
+   * T19(D33 제안): 주기 수집 — COLLECTOR_SCHEDULER=on 이고 COLLECTOR_MODE=mock 일 때만 기한이 된 소스를 모의 수집해 **미리보기만** 만든다(소재 0).
+   * 그 밖에는 skipped(scheduler_off | collector_not_mock).
+   */
+  collector: DueRunsResult;
   note: string;
 }
 
@@ -101,6 +108,8 @@ export interface WorkerTickInput {
    * 영상 전체를 한 요청에서 올리지 않는다(docs/02). 별도 worker 프로세스(CLI)는 넣지 않는다(제한 없음 — 시간 제한만).
    */
   uploadSlice?: JobRunOptions['uploadSlice'];
+  /** T19(D33 제안): 모의 수집 어댑터(COLLECTOR_MODE=mock 일 때 호출자가 넣음). 없으면 주기 수집은 collector_not_mock 으로 건너뛴다. */
+  collector?: CollectorAdapter | null;
 }
 
 export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick> {
@@ -131,6 +140,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
   }
   const retention = await maybeAutoRetention(db, config, resolveFromRoot(config.EXPORT_LOCAL_DIR), at);
   const credentials = input.credentialRefresh ? await input.credentialRefresh(at) : null;
+  const collector = await runDueCollectorSources(db, config, input.collector ?? null, at);
   const tick: WorkerTick = {
     ranAt: at.toISOString(),
     mode: config.WORKER_MODE,
@@ -143,6 +153,7 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
     jobs,
     retention,
     credentials,
+    collector,
     note:
       (transcriber
         ? `T08: 업로드 만료 정리 + 전사 job 진행(${transcriber.mode === 'mock' ? '모의 전사기, 외부 호출 없음' : 'live'})`

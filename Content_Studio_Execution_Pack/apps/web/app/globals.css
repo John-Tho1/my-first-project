@@ -472,3 +472,11 @@ mark {
   font-size: 0.8125rem;
   word-break: break-all;
 }
+
+/* T19: 수집 소스 한 줄의 버튼 묶음(켜기·주기·지금 수집) */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}

@@ -6,7 +6,7 @@
  */
 import { checkCredential, DbLockedError, loadMockCredentialsForRehydration, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
 import { loadConfig, oauthRedirectUri, readSecretKeyring, requireSecretKeyring } from '@cs/domain';
-import { createMockAdapterRegistry, createStorage, ensureMockOAuthRehydrated, mockCredentialWorkAllowed, resolveOAuthProvider } from '@cs/providers';
+import { createCollectorAdapter, createMockAdapterRegistry, createStorage, ensureMockOAuthRehydrated, mockCredentialWorkAllowed, resolveOAuthProvider } from '@cs/providers';
 import { assertWorkerModeSupported, runWorkerTick, WorkerModeError } from './index';
 
 function parseLoop(argv: readonly string[]): number | null {
@@ -71,7 +71,7 @@ try {
       ? await ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(handle.db, { keyring: ring.keyring }) })
       : null;
     const credWork = mockCredentialWorkAllowed(rehydrated);
-    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters: credWork ? channelAdapters : undefined, workerId, maxJobs: 20, jobCredentials, media });
+    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters: credWork ? channelAdapters : undefined, workerId, maxJobs: 20, jobCredentials, media, collector: createCollectorAdapter(config) });
     console.log(JSON.stringify(tick));
     if (loopMs === null || stopping) break;
     await new Promise<void>((resolve) => {

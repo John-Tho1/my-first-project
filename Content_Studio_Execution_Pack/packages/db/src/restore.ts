@@ -44,6 +44,11 @@ import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
  * 같은 계정을 다시 연결·해제했다고 같은 환경 복원(add_missing)이 계정과 그 밑의 계획·항목을 "충돌"로 막지 않게.
  */
 function compareHash(name: RestoredTable, row: Record<string, unknown>): string {
+  // T19(D33 제안): 수집 소스의 운영 상태(켜짐·마지막 실행·갱신 시각)는 비교에서 뺀다 — 복원은 꺼진 채로 넣고, 그 뒤 실행해도 같은 소스로 본다.
+  if (name === 'collector_sources') {
+    const { enabled: _e, last_run_at: _l, last_status: _s, updated_at: _u, ...rest } = row;
+    return rowHash(rest);
+  }
   if (name !== 'channel_accounts') return rowHash(row);
   const { credential_state: _ignored, ...rest } = row;
   return rowHash(rest);
@@ -238,6 +243,15 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
   ],
   // FIX-T18 round 1(0039): 원본은 그 출처 버전이 있을 때만(버전 행·sha256 일치는 DB 트리거가 다시 확인).
   source_version_originals: [{ col: 'source_version_id', table: 'source_versions' }],
+  // T19(D33 제안): 실행은 그 소스가, 항목은 그 실행(이번에 들어간 실행에만 — 기존 실행에 덧붙이지 않음)·소스·소재·출처 버전이 있을 때만. 닫기는 소재가 있을 때만.
+  collector_runs: [{ col: 'source_id', table: 'collector_sources' }],
+  collected_items: [
+    { col: 'run_id', table: 'collector_runs', owned: true },
+    { col: 'source_id', table: 'collector_sources' },
+    { col: 'capture_id', table: 'captures' },
+    { col: 'source_version_id', table: 'source_versions' },
+  ],
+  recommendation_dismissals: [{ col: 'capture_id', table: 'captures' }],
 };
 
 type Avail = 'inserted' | 'same' | 'different';
@@ -339,6 +353,8 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       }
       // T13(D24): 연결 정보(oauth_credentials)는 묶음 밖이다 — 연결했던 계정은 새 환경에서 "다시 연결 필요"로 넣는다(그 전까지 실행 차단).
       if (name === 'channel_accounts' && row.credential_state === 'linked') overrides.credential_state = 'needs_reconnect';
+      // T19(D33 제안): 수집 소스는 꺼진 채로 들어온다 — 복원한 환경이 사용자 확인 없이 (주기) 수집을 시작하지 않게. 주기 설정 값은 그대로 보존.
+      if (name === 'collector_sources') overrides.enabled = false;
       // FIX-T11(P1): 작업은 읽기 전용 이력 — 끝난 상태·BLOCKED·UNKNOWN 으로만, lease 없이, 복원 표시(자동 lease·재시도 없음).
       if (name === 'jobs') {
         overrides.state = restoredJobState(String(row.state));

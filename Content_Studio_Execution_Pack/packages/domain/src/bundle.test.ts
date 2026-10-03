@@ -100,7 +100,7 @@ function tables(): BundleTables {
     ],
     transcription_jobs: [],
     transcripts: [],
-    audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [], send_intents: [], publications: [], mock_scenarios: [], remote_steps: [], import_runs: [], import_items: [], source_version_originals: [],
+    audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [], send_intents: [], publications: [], mock_scenarios: [], remote_steps: [], import_runs: [], import_items: [], source_version_originals: [], collector_sources: [], collector_runs: [], collected_items: [], recommendation_dismissals: [],
   };
 }
 

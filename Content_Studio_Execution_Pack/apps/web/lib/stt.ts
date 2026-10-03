@@ -1,7 +1,7 @@
 /** T08 서버 전용: inline worker 실행·응답 모양. */
 import { refreshExpiringCredentials, type Db } from '@cs/db';
 import { readSecretKeyring, WEB_TICK_UPLOAD_SLICE, type AppConfig } from '@cs/domain';
-import { mockCredentialWorkAllowed } from '@cs/providers';
+import { createCollectorAdapter, mockCredentialWorkAllowed } from '@cs/providers';
 import { runWorkerTick, type WorkerTick } from '@cs/worker';
 import { ensureMockOAuthReady, jobCredentials, oauthDeps } from './oauth';
 import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
@@ -34,6 +34,8 @@ export async function runInlineWorker(config: AppConfig, db: Db): Promise<Worker
     jobCredentials: jobCredentials(config, db),
     media: getStorage(config),
     uploadSlice: WEB_TICK_UPLOAD_SLICE,
+    // T19(D33 제안): 주기 수집은 COLLECTOR_SCHEDULER=on + COLLECTOR_MODE=mock 일 때만(미리보기만, 실제 웹 요청 없음)
+    collector: createCollectorAdapter(config),
   });
 }
 

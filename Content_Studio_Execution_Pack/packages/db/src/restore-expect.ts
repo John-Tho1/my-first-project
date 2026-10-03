@@ -246,6 +246,8 @@ export function expectedRestoredRows(t: BundleTables, derived: DerivedTransforms
   }
   // T13(D24): 연결했던 계정은 연결 정보 없이 들어오므로 "다시 연결 필요"
   for (const a of out.channel_accounts?.values() ?? []) if (a.credential_state === 'linked') a.credential_state = 'needs_reconnect';
+  // T19(D33 제안): 수집 소스는 꺼진 채로(enabled=false) — 주기 설정·나머지 열은 그대로
+  for (const s of out.collector_sources?.values() ?? []) s.enabled = false;
   const at = bundleTime(derived.decisionAt);
   // 승인 철회(독립 계산, 판정 시각으로 확정)
   for (const a of out.approvals?.values() ?? []) {

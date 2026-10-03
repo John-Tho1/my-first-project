@@ -73,6 +73,12 @@ export const EXPORTED_TABLES = [
   'import_items',
   // FIX-T18 round 1(0039, Codex review-T18 P0): 가져온 텍스트 파일의 원본 그대로(출처 버전마다 하나). 출처 버전보다 뒤. 변환 없이 복원한다.
   'source_version_originals',
+  // T19(0041, D33 제안): 허용 수집 소스·수집 실행·수집 항목 원장·재추천 닫기 — 사용자 설정과 수집한 소재의 출처 이력. 소재·출처 버전보다 뒤.
+  // 복원 때 collector_sources.enabled 는 false 로 들어간다(새 환경에서 사용자가 다시 켤 때까지 수집 없음).
+  'collector_sources',
+  'collector_runs',
+  'collected_items',
+  'recommendation_dismissals',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -107,6 +113,10 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   import_runs: '0038_t18_imports',
   import_items: '0038_t18_imports',
   source_version_originals: '0039_t18_fix1_originals',
+  collector_sources: '0041_t19_collector',
+  collector_runs: '0041_t19_collector',
+  collected_items: '0041_t19_collector',
+  recommendation_dismissals: '0041_t19_collector',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -636,6 +646,63 @@ export const ROW_SCHEMAS = {
     sha256: z.string().regex(/^[0-9a-f]{64}$/),
     content_base64: z.string().regex(/^[A-Za-z0-9+/]*={0,2}$/),
     created_at: ts,
+  }),
+  // T19(0041, D33 제안): 수집 소스·실행·항목·재추천 닫기. 자격 증명 없음, 항목에는 발췌(200자)만.
+  collector_sources: z.strictObject({
+    id: uuid,
+    kind: z.enum(['rss', 'atom', 'url']),
+    url: z.string().regex(/^https:\/\//),
+    normalized_url: z.string().regex(/^https:\/\//),
+    host: str,
+    label: nstr,
+    enabled: z.boolean(),
+    schedule: z.enum(['off', 'daily', 'weekly']),
+    last_run_at: ts.nullable(),
+    last_status: z.enum(['preview', 'failed', 'blocked']).nullable(),
+    created_at: ts,
+    updated_at: ts,
+  }),
+  collector_runs: z.strictObject({
+    id: uuid,
+    source_id: uuid,
+    trigger: z.enum(['manual', 'scheduled']),
+    mode: z.literal('mock'),
+    status: z.enum(['preview', 'accepted', 'discarded', 'failed', 'blocked']),
+    error_code: nstr,
+    counts: z.record(z.string(), z.number()),
+    result: z.record(z.string(), z.number()).nullable(),
+    created_at: ts,
+    accepted_at: ts.nullable(),
+    closed_at: ts.nullable(),
+  }),
+  collected_items: z.strictObject({
+    id: uuid,
+    run_id: uuid,
+    source_id: uuid,
+    position: int.min(0),
+    external_key: nstr,
+    guid: nstr,
+    link: nstr,
+    link_normalized: nstr,
+    title: nstr,
+    excerpt: str,
+    published_text: nstr,
+    published_at: ts.nullable(),
+    content_checksum: z.string().regex(/^[0-9a-f]{64}$/),
+    raw_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    byte_size: int.min(0),
+    decision: z.enum(['new', 'duplicate', 'skipped']),
+    reason: z.enum(['new', 'updated', 'same_item', 'existing_capture', 'in_feed', 'no_id', 'blocked_link', 'empty', 'too_long', 'limit']),
+    outcome: z.enum(['accepted', 'not_selected', 'skipped_duplicate', 'failed_changed']).nullable(),
+    capture_id: uuid.nullable(),
+    source_version_id: uuid.nullable(),
+    accepted_at: ts.nullable(),
+    created_at: ts,
+  }),
+  recommendation_dismissals: z.strictObject({
+    id: uuid,
+    capture_id: uuid,
+    dismissed_at: ts,
   }),
   audit_events: z.strictObject({
     id: uuid,
@@ -1357,6 +1424,20 @@ export function checkIntegrity(t: BundleTables): void {
     const bytes = new Uint8Array(Buffer.from(o.content_base64, 'base64'));
     if (bytes.byteLength !== o.byte_size || sha256Hex(bytes) !== o.sha256) problems.push('source_version_originals.content_base64 → sha256·크기');
   }
+  // T19(0041): 실행은 소스를, 항목은 실행·소스(실행의 소스와 같아야 함)·받아들여 만든 소재·출처 버전을 가리킨다. 닫기는 소재를.
+  const runSource = new Map(t.collector_runs.map((r) => [r.id, r.source_id]));
+  for (const r of t.collector_runs) need('collector_runs', 'source_id', r.source_id, 'collector_sources');
+  for (const i of t.collected_items) {
+    need('collected_items', 'run_id', i.run_id, 'collector_runs');
+    need('collected_items', 'source_id', i.source_id, 'collector_sources');
+    need('collected_items', 'capture_id', i.capture_id, 'captures');
+    need('collected_items', 'source_version_id', i.source_version_id, 'source_versions');
+    if (runSource.has(i.run_id) && runSource.get(i.run_id) !== i.source_id) problems.push('collected_items.source_id → 실행의 소스');
+    if (i.capture_id !== null && i.source_version_id !== null && captureSource.has(i.capture_id) && versionSource.has(i.source_version_id) && captureSource.get(i.capture_id) !== versionSource.get(i.source_version_id)) {
+      problems.push('collected_items.capture_id → 같은 출처의 소재·버전');
+    }
+  }
+  for (const d of t.recommendation_dismissals) need('recommendation_dismissals', 'capture_id', d.capture_id, 'captures');
   if (problems.length) {
     throw new BundleError('integrity', '묶음 안의 관계(ID 참조)가 맞지 않습니다', { problems: [...new Set(problems)].slice(0, 20) });
   }

@@ -267,7 +267,14 @@ export interface AuditInput {
     // T18(D32 제안): 가져오기 원장(건수만 — 파일 이름·경로·본문 없음)
     | 'import.preview'
     | 'import.commit'
-    | 'import.cancel';
+    | 'import.cancel'
+    // T19(D33 제안): 수집 소스·실행·받아들이기·재추천 닫기(건수·호스트만 — 제목·본문 없음)
+    | 'collector.source.create'
+    | 'collector.source.settings'
+    | 'collector.run'
+    | 'collector.discard'
+    | 'collector.accept'
+    | 'recommendation.dismiss';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

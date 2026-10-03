@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { exactDuplicateIds, listCapturesPage } from '@cs/db';
+import { exactDuplicateIds, listArchiveRecommendations, listCapturesPage } from '@cs/db';
 import { decodeCaptureCursor, encodeCaptureCursor, formatMsk } from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../lib/labels';
@@ -29,6 +29,8 @@ export default async function CapturesPage({
     page.items.map((i) => i.capture.id),
   );
   const next = page.next ? encodeCaptureCursor(page.next.receivedAt, page.next.id) : null;
+  // T19(D33 제안): 다시 볼 만한 소재(첫 페이지에서만) — 결정적 규칙, AI 호출 없음
+  const recs = rawCursor ? [] : await listArchiveRecommendations(db, session.ownerId);
 
   return (
     <main className="container">
@@ -48,6 +50,26 @@ export default async function CapturesPage({
         <p className="notice" role="alert">
           목록 위치 정보가 올바르지 않아 처음부터 보여 줍니다.
         </p>
+      ) : null}
+      {recs.length ? (
+        <section className="card archive" aria-labelledby="recs-title">
+          <h3 id="recs-title">다시 볼 만한 소재</h3>
+          <p className="note">받은 지 30일이 넘은 소재 중 최근 14일의 수집 글·작성 중인 원고와 겹치는 단어가 2개 이상인 것(규칙 기반, AI 호출 없음).</p>
+          <ul className="list">
+            {recs.map((r) => (
+              <li key={r.captureId} className="capture">
+                <p className="capture-text">
+                  <Link href={`/captures/${r.captureId}`}>{r.title ?? '(제목 없음)'}</Link>
+                  <span className="muted-text"> · {formatMsk(r.receivedAt)}</span>
+                </p>
+                <p className="note">{r.reason}</p>
+                <form className="form inline" method="post" action={`/api/recommendations/${r.captureId}/dismiss`}>
+                  <button type="submit">추천에서 닫기</button>
+                </form>
+              </li>
+            ))}
+          </ul>
+        </section>
       ) : null}
       <section className="card archive">
         {page.items.length ? (

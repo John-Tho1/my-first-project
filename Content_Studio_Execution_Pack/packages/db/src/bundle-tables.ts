@@ -49,6 +49,10 @@ export const BUNDLE_TABLES: Record<ExportedTable, PgTable> = {
   import_runs: schema.importRuns,
   import_items: schema.importItems,
   source_version_originals: schema.sourceVersionOriginals,
+  collector_sources: schema.collectorSources,
+  collector_runs: schema.collectorRuns,
+  collected_items: schema.collectedItems,
+  recommendation_dismissals: schema.recommendationDismissals,
   audit_events: schema.auditEvents,
 };
 

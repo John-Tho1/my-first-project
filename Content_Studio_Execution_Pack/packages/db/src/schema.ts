@@ -1802,3 +1802,166 @@ export const sourceVersionOriginals = pgTable(
     index('source_version_originals_owner_idx').on(t.ownerId),
   ],
 );
+
+/**
+ * T19(제안 결정 D33) 허용 수집 소스(allowlist). owner 가 등록한 RSS·Atom 피드 또는 선택 URL(페이지)만 수집한다.
+ * 기본 꺼짐(enabled=false)·주기 꺼짐(schedule='off'). https 만(CHECK) — 주소 정책(@cs/domain checkCollectorUrl)은 등록·실행·redirect 마다 다시 적용한다.
+ * 자격 증명 열 없음(공개 피드만). host = 정규화 호스트(허용 목록 비교용). 내보내기·복원 포함(복원 때 enabled=false 로 — 새 환경에서 자동 수집하지 않게).
+ */
+export const collectorSources = pgTable(
+  'collector_sources',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    url: text('url').notNull(),
+    normalizedUrl: text('normalized_url').notNull(),
+    host: text('host').notNull(),
+    label: text('label'),
+    enabled: boolean('enabled').notNull().default(false),
+    schedule: text('schedule').notNull().default('off'),
+    lastRunAt: ts('last_run_at'),
+    lastStatus: text('last_status'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('collector_sources_id_owner_uq').on(t.id, t.ownerId),
+    unique('collector_sources_owner_url_uq').on(t.ownerId, t.normalizedUrl),
+    check('collector_sources_kind_chk', sql`${t.kind} in ('rss', 'atom', 'url')`),
+    check('collector_sources_schedule_chk', sql`${t.schedule} in ('off', 'daily', 'weekly')`),
+    check('collector_sources_https_chk', sql`${t.url} like 'https://%' and ${t.normalizedUrl} like 'https://%'`),
+    check('collector_sources_status_chk', sql`${t.lastStatus} is null or ${t.lastStatus} in ('preview', 'failed', 'blocked')`),
+    index('collector_sources_owner_created_idx').on(t.ownerId, t.createdAt, t.id),
+  ],
+);
+
+/**
+ * T19 수집 실행(수동 | 주기). 실행은 **미리보기만** 만든다(status preview) — 사용자가 항목을 골라 받아들일 때만 소재가 생긴다(accepted).
+ * failed(응답·형식 오류)·blocked(주소 정책) 실행은 항목 없이 error_code 만 남는다. counts: 판정 건수, result: 받아들인 결과 건수.
+ */
+export const collectorRuns = pgTable(
+  'collector_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sourceId: uuid('source_id').notNull(),
+    trigger: text('trigger').notNull(),
+    mode: text('mode').notNull().default('mock'),
+    status: text('status').notNull(),
+    errorCode: text('error_code'),
+    counts: jsonb('counts').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result').$type<Record<string, number>>(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    acceptedAt: ts('accepted_at'),
+    closedAt: ts('closed_at'),
+  },
+  (t) => [
+    unique('collector_runs_id_owner_uq').on(t.id, t.ownerId),
+    check('collector_runs_trigger_chk', sql`${t.trigger} in ('manual', 'scheduled')`),
+    check('collector_runs_mode_chk', sql`${t.mode} = 'mock'`),
+    check('collector_runs_status_chk', sql`${t.status} in ('preview', 'accepted', 'discarded', 'failed', 'blocked')`),
+    check('collector_runs_error_chk', sql`(${t.status} in ('failed', 'blocked')) = (${t.errorCode} is not null)`),
+    check('collector_runs_accepted_chk', sql`(${t.status} = 'accepted') = (${t.acceptedAt} is not null)`),
+    index('collector_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+    index('collector_runs_source_idx').on(t.sourceId, t.createdAt.desc()),
+    foreignKey({
+      name: 'collector_runs_source_same_owner_fk',
+      columns: [t.sourceId, t.ownerId],
+      foreignColumns: [collectorSources.id, collectorSources.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * T19 수집 항목(실행의 줄). 본문 전체는 넣지 않는다 — 발췌(200자)만. 받아들일 때 수집기로 다시 읽어 checksum 이 같을 때만 소재를 만든다.
+ * decision: new | duplicate | skipped, reason: 세부 이유(@cs/domain COLLECTED_REASONS). outcome(받아들인 뒤, new 만): accepted | not_selected | skipped_duplicate | failed_changed.
+ * capture_id·source_version_id·accepted_at: 받아들여 만든 소재·출처 버전(같은 owner — 소재는 복합 FK) — outcome=accepted 일 때만. 외부 키 = guid 또는 정규화 링크.
+ */
+export const collectedItems = pgTable(
+  'collected_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    position: integer('position').notNull(),
+    externalKey: text('external_key'),
+    guid: text('guid'),
+    link: text('link'),
+    linkNormalized: text('link_normalized'),
+    title: text('title'),
+    excerpt: text('excerpt').notNull().default(''),
+    publishedText: text('published_text'),
+    publishedAt: ts('published_at'),
+    contentChecksum: text('content_checksum').notNull(),
+    rawSha256: text('raw_sha256').notNull(),
+    byteSize: integer('byte_size').notNull(),
+    decision: text('decision').notNull(),
+    reason: text('reason').notNull(),
+    outcome: text('outcome'),
+    captureId: uuid('capture_id'),
+    sourceVersionId: uuid('source_version_id').references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    acceptedAt: ts('accepted_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('collected_items_run_position_uq').on(t.runId, t.position),
+    check('collected_items_decision_chk', sql`${t.decision} in ('new', 'duplicate', 'skipped')`),
+    check(
+      'collected_items_reason_chk',
+      sql`(${t.decision} = 'new' and ${t.reason} in ('new', 'updated')) or (${t.decision} = 'duplicate' and ${t.reason} in ('same_item', 'existing_capture', 'in_feed')) or (${t.decision} = 'skipped' and ${t.reason} in ('no_id', 'blocked_link', 'empty', 'too_long', 'limit'))`,
+    ),
+    check('collected_items_outcome_chk', sql`${t.outcome} is null or (${t.decision} = 'new' and ${t.outcome} in ('accepted', 'not_selected', 'skipped_duplicate', 'failed_changed'))`),
+    check(
+      'collected_items_accepted_chk',
+      sql`(${t.outcome} = 'accepted' and ${t.captureId} is not null and ${t.sourceVersionId} is not null and ${t.acceptedAt} is not null) or (${t.outcome} is distinct from 'accepted' and ${t.captureId} is null and ${t.sourceVersionId} is null and ${t.acceptedAt} is null)`,
+    ),
+    check('collected_items_checksum_chk', sql`${t.contentChecksum} ~ '^[0-9a-f]{64}$' and ${t.rawSha256} ~ '^[0-9a-f]{64}$'`),
+    check('collected_items_key_chk', sql`${t.externalKey} is not null or ${t.reason} in ('no_id', 'limit')`),
+    index('collected_items_owner_key_idx').on(t.ownerId, t.sourceId, t.externalKey),
+    index('collected_items_owner_capture_idx').on(t.ownerId, t.captureId),
+    foreignKey({
+      name: 'collected_items_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [collectorRuns.id, collectorRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'collected_items_source_same_owner_fk',
+      columns: [t.sourceId, t.ownerId],
+      foreignColumns: [collectorSources.id, collectorSources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'collected_items_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** T19 재추천 닫기("다시 볼 만한 소재" 목록에서 뺌). owner·소재마다 하나. 소재 자체는 바뀌지 않는다. 내보내기·복원 포함. */
+export const recommendationDismissals = pgTable(
+  'recommendation_dismissals',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    captureId: uuid('capture_id').notNull(),
+    dismissedAt: ts('dismissed_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('recommendation_dismissals_owner_capture_uq').on(t.ownerId, t.captureId),
+    foreignKey({
+      name: 'recommendation_dismissals_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);

@@ -24,3 +24,5 @@ export * from './secrets';
 export * from './oauth';
 export * from './instagram';
 export * from './imports';
+export * from './collector';
+export * from './recommend';

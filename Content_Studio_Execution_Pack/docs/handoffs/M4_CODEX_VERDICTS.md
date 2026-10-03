@@ -126,3 +126,8 @@ CHANGES_REQUESTED
 - [P2] tests/setup/no-meta-network.ts:37 — fetch 래퍼만으로는 문서에 명시한 Meta 요청 차단 범위를 보장하지 못함
 
 ## FIX-D30H (a25fa47) — **PASS** → 공개 health 정리(D23·D30-3) 종결
+
+## FIX-LIVET1 (1b01226, LIVE-T1 round 1) — CHANGES_REQUESTED (P0 1·P2 2)
+- [P0] packages/providers/src/threads-live-oauth.ts:138 — 메시지 분기가 일시 오류 코드를 덮어써 결과 불명을 확정 실패로 기록한다
+- [P2] packages/providers/src/threads-live-oauth.ts:127 — HTTP 429 이외의 제한 응답에서 Retry-After 정보가 유실된다
+- [P2] tests/setup/no-meta-network.ts:169 — DNS 가드가 모듈 함수 일부만 감싸므로 Resolver 인스턴스 경로가 남는다

@@ -441,3 +441,9 @@
 - **승인 범위 밖(별도 승인 필요)**: 실제 게시(3단계, 컨테이너 생성·threads_publish), 다른 계정·채널, 운영 배포, 터널 등 앱을 외부에 노출하는 일.
 - 설정: `OAUTH_MODE=live`, `OAUTH_LIVE_APPROVAL_REF=D31`, `PUBLISH_MODE` 는 **disabled 유지**(게시 불가). 앱 ID·시크릿·redirect URI 는 사용자가 `.env.local` 에 직접 넣는다(대화·저장소·로그에 값 없음).
 - redirect URI: 앱 대시보드의 유효한 OAuth 리디렉션 URI 와 정확히 일치해야 함(공식 문서 2026-08-12 판 확인). 로컬 기본값 `http://localhost:3000/api/oauth/callback`. Meta 가 http 를 거부하면 HTTPS 로컬 주소가 필요 — 그때 방법을 다시 정한다(외부 노출 방식은 별도 승인).
+
+## D32 — T18 Notion·Drive 선택 가져오기(파일·모의): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+- Decision ID / date: D32 / 2026-10-03. 코드 1427118. 출처: docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md "Proposed D32".
+- 상태: **잠정**. 실제 Notion·Drive 연결(OAuth·API)은 하지 않으며 별도 승인 대상.
+
+## Proposed D32 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)

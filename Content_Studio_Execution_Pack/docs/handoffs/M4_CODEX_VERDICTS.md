@@ -131,3 +131,11 @@ CHANGES_REQUESTED
 - [P0] packages/providers/src/threads-live-oauth.ts:138 — 메시지 분기가 일시 오류 코드를 덮어써 결과 불명을 확정 실패로 기록한다
 - [P2] packages/providers/src/threads-live-oauth.ts:127 — HTTP 429 이외의 제한 응답에서 Retry-After 정보가 유실된다
 - [P2] tests/setup/no-meta-network.ts:169 — DNS 가드가 모듈 함수 일부만 감싸므로 Resolver 인스턴스 경로가 남는다
+
+## T18 (1427118, Notion·Drive 가져오기 — 파일·모의) — CHANGES_REQUESTED (P0 3·P1 2·P2 1)
+- [P0] `packages/domain/src/imports.ts:293` — HTML 원본을 추출 텍스트로 대체하고 원본 바이트를 보존하지 않는다
+- [P0] `packages/domain/src/imports.ts:328` — 중첩 ZIP의 누적 압축 해제량과 전체 항목 수 제한을 우회할 수 있다
+- [P0] `packages/domain/src/imports.ts:248` — HTML 제거 정규식에 서비스 거부를 일으킬 수 있는 반복 탐색 경로가 있다
+- [P1] `packages/db/src/imports.ts:244` — 서로 다른 실행의 동시 확정에서 출처 재판정과 삽입이 직렬화되지 않는다
+- [P1] `apps/web/lib/imports.ts:122` — 실제 선택 항목이 없어도 미리보기를 확정하고 ZIP을 삭제한다
+- [P2] `packages/domain/src/imports.ts:339` — ZIP의 unsigned 크기를 DB의 signed `integer`에 그대로 저장한다

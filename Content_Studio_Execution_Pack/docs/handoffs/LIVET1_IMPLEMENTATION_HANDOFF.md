@@ -173,3 +173,81 @@ WebFetch 로 받은 본문(마크다운 변환)에 "Updated" 날짜가 보이지
 1. 상태 우선 분류에서 **4xx + 형식 맞는 본문 + 코드 1/2** 를 쓰기 단계 ambiguous 로 둔 것(4xx 는 HTTP 상 미처리 거절이지만 Meta 코드 1 은 "알 수 없는 오류")과, exchange 의 모르는 4xx 코드를 ambiguous=false provider_error 로 둔 것이 불변식("불명은 UNKNOWN")에 맞는가?
 2. 실제 갱신 차단을 `refreshCredential` 의 계정 kind 검사(공급자·봉인·정리 대기보다 먼저) + 공급자 `refreshEnabled` 두 겹으로 둔 것이 충분한가? 정리 대기(pending)가 있는 실제 계정도 refresh 요청 시 reconcile 없이 거부되는데, 이것이 정리 지연 위험을 만드는가(정리는 check·worker tick 이 계속 한다)?
 3. 네트워크 가드의 undici 전역 dispatcher Proxy·`net.Socket.prototype.connect` 패치 방식에 우회 경로(예: `http2.connect`, `fetch` 에 `dispatcher` 옵션으로 별도 Agent 전달 — 이 저장소엔 undici 패키지가 없어 Agent 생성 불가)가 남는가? `http2` 도 막아야 하는가?
+
+---
+
+# FIX round 2 (Codex review-FIX-LIVET1)
+- Orchestrator: HEAD_SHA e51ae72 (code only, D28) — reran lint·typecheck·build·unit 1010·integration 692·drill:mock 0·real-DB drill:restore PASS.
+
+- 대상 판정: `.handoffs/review-FIX-LIVET1.md`(CHANGES_REQUESTED — P0 1, P2 2) on `1b01226`
+- BASE_SHA: `16a22b13a8a3bf4387d51b72b8334588942d1cdd`(현재 HEAD, docs 전용 커밋) · HEAD_SHA: TBD(커밋 안 함 — 오케스트레이터가 커밋 후 기록)
+- 범위: D31 1단계 그대로 — Threads·Meta 로 실제 요청 0, fixture 만, 실제 자격 증명·`.env.local`·`./data` 손대지 않음, 실제 게시·실제 갱신 없음. 새 의존성 없음.
+
+## 지적 → 변경 → 시험
+
+### [P0] threads-live-oauth.ts:138 — 메시지 분기가 일시 코드를 확정 실패로 덮어씀
+- 재현: `mapThreadsError('exchange', 400, { error: { code: 1|2, message: 'Error validating client secret.' | 'redirect_uri …' } })` → 수정 전 `invalid_client`·`redirect_mismatch`(ambiguous 없음 → 감사 `outcome_ambiguous=no`, 응답에 `outcome: unknown` 없음). 수정 전 단위 시험 2곳(「앱 시크릿 거부」 코드 1 fixture, 표 행 「400 + 코드 1 "Error validating client secret."」)이 바로 그 잘못된 동작을 고정하고 있었다 → 기대값을 결과 불명으로 바꿨다(약화가 아니라 불변식 쪽으로 강화).
+- 변경: `mapThreadsError` 를 엄격한 표 기반 순서로 다시 짰다(위가 이긴다):
+  1) 전송·상태(429 → rate_limited · 5xx → server_error · 408 → timeout · 4xx 아닌 오류 본문 → malformed_response · 4xx 비형식 → 쓰기 단계 http_error ambiguous) — FIX1 그대로
+  2) **일시 표 `THREADS_TRANSIENT_CODES`**(export): 1·2 → server_error(쓰기 단계 ambiguous), 4·17·32·341·613·80000~80014 → rate_limited. Graph 오류 객체의 `is_transient: true` 도 일시(코드가 190 이어도 일시가 이긴다). **문구는 보지 않는다.**
+  3) 확정 표 `definiteByCode`: 101 → invalid_client, 190(463 expired·458/460 revoked) → invalid_token 계열, 10·200~299 → scope_not_allowed, 교환 400·100 → invalid_grant, 그 밖 단계 100 → invalid_request. 범용 매개변수 오류 **100 만** 문구로 더 구체적인 확정 오류(redirect_mismatch·invalid_client)로 좁힌다(확정 → 확정, ambiguous 영향 없음).
+  4) 문구는 **코드·하위 코드가 모두 없을 때만**(redirect_uri → redirect_mismatch(교환), 앱 ID·시크릿 → invalid_client), 문자열 `invalid_grant`(교환) → invalid_grant.
+  5) 나머지(모르는 코드·하위 코드만 있음·분류 안 되는 본문): 쓰기 단계면 provider_error(oauth_exception, **ambiguous=true** — Codex 답 Q7 "확정 거절로 검증된 응답과 나머지를 구분"), 읽기 단계(account)는 401 → invalid_token, 그 밖 → invalid_request(FIX1 은 교환의 모르는 코드를 ambiguous=false 로 두었음 → 바꿈).
+  - `parseThreadsErrorBody` 가 `is_transient`(불리언만)를 읽는다. 문자열 코드("1")도 숫자로 읽는 기존 규칙 그대로.
+- 시험: `packages/providers/src/threads-live-oauth.test.ts`
+  - 「오류 분류 순서」 표 +20행: 400 + 코드 1/2 + 시크릿 문구(Codex 재현 2건), 코드 1 + redirect_uri, long_lived 코드 2 + client_id, 403 + 코드 4 + 시크릿 → rate_limited, 341·80002 + 문구 → rate_limited, 모르는 코드 + is_transient + 시크릿 → ambiguous, 190 + is_transient → 일시, 문자열 코드 "1" + 시크릿, 읽기 단계 코드 2(ambiguous=false), 코드 없음 + 시크릿 → invalid_client, 코드 없음 + redirect → redirect_mismatch, 하위 코드만 + 시크릿 → 문구 안 봄(ambiguous), 모르는 코드 + 시크릿 → 문구 안 봄(ambiguous), 코드 100 + 시크릿 → invalid_client, long_lived 모르는 코드 → ambiguous, refresh 100 → invalid_request, account 모르는 코드 400/401 → invalid_request/invalid_token. exchange 401·404·405 형식 본문 3행은 ambiguous=true 로 기대값 변경(Q7).
+  - 공급자 경유 새 시험: 코드 교환 400 + {코드 1·2} × {시크릿·redirect 문구} 4건 → `detail` 이 정확히 `{reason: server_error, step: exchange, httpStatus: 400, providerCode, ambiguous: true}`, 장기 교환 안 부름. 기존 「앱 시크릿 거부」는 코드 101 fixture 로 바꿔 invalid_client 경로를 유지.
+  - 매핑 표 +2행(341·80014 → rate_limited).
+  - 통합 `tests/integration/live-threads-oauth.test.ts` +2건(it.each): callback 코드 교환 400 + 코드 2 "Temporary error validating client secret" / 코드 1 + redirect_uri 문구 → 400 `oauth_exchange_failed` + `reason: provider_error` + `outcome: unknown`, 감사 `provider_reason=server_error`·`outcome_ambiguous=yes`, 감사에 문구 원문 없음, 연결 정보 없음, fixture 호출 1회.
+
+### [P2] threads-live-oauth.ts:127 — 429 밖 제한 응답에서 Retry-After 유실
+- 변경: 제한 분류(429 와 일시 표의 rate_limited 코드 전부)가 공통 `parseRetryAfterSec(hints)`(export)를 쓴다. 힌트는 `{ retryAfter, businessUseCaseUsage }` — `Retry-After` 는 0~999999 의 정수 초만(음수·소수·HTTP-date·너무 큼은 버림), `X-Business-Use-Case-Usage` JSON(8 KiB 이하)의 `estimated_time_to_regain_access`(분, 양의 정수)의 최댓값 × 60. 둘 다 있으면 긴 쪽. 결과는 기존 필드 `detail.retryAfterSec`(초 — domain `OAuthProviderErrorDetail`·`retryDelay` 와 같은 단위라 ms 필드는 새로 만들지 않았다). 원 헤더 값은 어디에도 남기지 않는다. `X-App-Usage` 는 사용률(%)만 있고 시간이 없어 읽지 않는다. 확정·5xx 오류에는 붙이지 않는다. `#call` 이 두 헤더를 넘긴다. 문자열 4번째 인자(기존 호출 형태)는 Retry-After 로 그대로 받는다.
+- 시험: 「제한 응답의 다시 시도 시간(FIX2-LIVET1 P2)」 13행(400 + 코드 4 + Retry-After 120(Codex 재현), 403 + 17 + 문자열 인자, 613 + BUC 5분, 32 + 둘 다 → 긴 쪽, 429 + BUC 만, 429 + 0, 음수·소수·HTTP-date·너무 큼·깨진 JSON·BUC 음수/문자·힌트 없음 → 필드 없음, 모든 행에서 detail 에 헤더 원문 없음) + 확정·5xx 에는 붙지 않음 1건 + 공급자 경유 1건(/me 400 + 코드 4 + Retry-After 90 + BUC 1분 + X-App-Usage → detail 이 정확히 `{reason, step, httpStatus, providerCode: 4, retryAfterSec: 90}`).
+
+### [P2] tests/setup/no-meta-network.ts:169 — DNS 가드가 Resolver 인스턴스를 놓침
+- 변경: dns 모듈 함수는 기본 Resolver 에 묶인 사본이라 프로토타입 패치가 반영되지 않는다 → 둘 다 감싼다. (1) 이름 목록을 고정하지 않고 `node:dns`·`dns.promises` 의 `lookup` + `resolve*` 전부(이 Node 에 있는 것 — resolveTxt·resolveMx·resolveSrv·resolveNs·resolveSoa·resolveCaa·resolveNaptr·resolvePtr·resolveTlsa 등), (2) `dns.Resolver.prototype`·`dns.promises.Resolver.prototype` 의 `resolve*` 자체 메서드(하위 클래스는 프로토타입 사슬로 포함). 콜백 형은 동기 throw, promise 형은 reject, 기록 경로 이름 `dns.Resolver.<fn>`·`dns.promises.Resolver.<fn>`. `reverse`·`lookupService` 는 IP 를 받아 판별 불가 → 남은 위험(머리 주석·README 에 명시). `GuardState.dnsResolverGuarded` 표시 추가.
+- 증명(probe — 실제 Meta 로 나가지 않게): 가드 정규식에 임시로 `guard-probe.invalid` 추가, Resolver 서버를 닫힌 로컬 포트 `127.0.0.1:9` 로 둔 임시 시험 `packages/providers/src/zz-dns-resolver-probe.test.ts`:
+  - **수정 전 가드**: `new dns.Resolver().resolve4('b.guard-probe.invalid')` 동기 throw 없음, `new dns.promises.Resolver().resolveTxt('c.guard-probe.invalid')` → `queryTxt ECONNREFUSED`(가드를 지나 실제 조회 함수까지 감), 기록 `[]` — Codex 지적 재현.
+  - **수정 후 가드**: 둘 다 BLOCKED, 기록 `dns.Resolver.resolve4`·`dns.promises.Resolver.resolveTxt`. 같은 probe 에서 `http2.connect('https://d.guard-probe.invalid')` → `tls.connect` 에서 동기 throw(별도 http2 패치 불필요 — Codex 답 Q9 의 "net/tls 가드에서 전송 전에 차단됨을 검증").
+  - probe 파일 삭제, 정규식 원복, `guard-probe` 참조 0건 확인.
+- 영구 시험 `packages/providers/src/no-meta-network.test.ts` +3(11 → 14): Resolver 콜백(resolve4·resolveTxt·resolve, 대문자·끝의 점)·promises(resolve4·resolveTxt·resolveAny)·하위 클래스(resolveSrv)·모듈 resolveTxt·resolveMx·promises.resolveNs 10경로의 기록 순서; 허용 이름(`allowed.guard-test.invalid`)은 Resolver 가드를 지나 원래 조회 함수로 감(닫힌 로컬 서버 → 연결 거부, 기록 없음); `http2.connect('https://graph.threads.net')` → `tls.connect` 에서 막힘. 마지막 정리 시험의 최소 시도 수 20 → 35.
+- 문서: 가드 머리 주석, `README_KO.md` D31 절(막는 경로에 Resolver 인스턴스·http2, 막지 못하는 것에 reverse/lookupService·undici 패키지 별도 dispatcher(시험 없음)).
+
+### 그 밖 놓친 케이스(review 목록 중 싼 것)
+- 반영: 400 코드 1/2 + client secret·redirect_uri 문구와 UNKNOWN 감사(단위·통합), 429 아닌 제한 코드의 유효·무효 Retry-After, callback·promise Resolver 인스턴스·누락 조회 함수·http2 의 차단 시험과 `.invalid` 허용 경로 시험.
+- 미반영(남은 위험 — FIX1 과 같음): 별도 undici dispatcher(패키지 없음 — 만들 수 없어 시험 불가), pending 있는 실제 계정 갱신 거부 뒤 독립 정리 완료 시험, 서로 다른 state 로 같은 code 순차·동시 전달(code 지문 원자 예약), 두 pending 행의 같은 프로필 동시 묶기·동시 계정 생성 고유 제약 → 409, 부분 권한 허용·프로필 조회/저장 실패 뒤 원격 토큰 잔존 기록.
+
+## 바뀐 파일(FIX round 2)
+- `packages/providers/src/threads-live-oauth.ts` — 표 기반 분류(`THREADS_TRANSIENT_CODES`·`definiteByCode`·`refineByMessage`), `is_transient`, `parseRetryAfterSec`·`ThreadsRateLimitHints`, `#call` 이 Retry-After·BUC 헤더 전달
+- `tests/setup/no-meta-network.ts` — dns 모듈 함수 전부 + Resolver.prototype(콜백·promises), 주석
+- 시험: `packages/providers/src/threads-live-oauth.test.ts`, `packages/providers/src/no-meta-network.test.ts`, `tests/integration/live-threads-oauth.test.ts`
+- 문서: `README_KO.md`(D31 절 한 문장), 이 인계 문서(추가만)
+- 손대지 않음: T18 인계·DECISIONS·M4_CODEX_VERDICTS·M4_STATUS·다른 인계, `.env.local`, `./data`. (작업 트리의 `docs/handoffs/M4_CODEX_VERDICTS.md` 변경은 이 라운드가 만든 것이 아니다.)
+
+## 실행한 명령(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`)
+| 명령 | 결과 |
+|---|---|
+| 임시 probe(수정 전 가드, `.invalid`·127.0.0.1:9) | Resolver 2경로 **안 막힘**(기록 0, ECONNREFUSED) — 지적 재현 |
+| 임시 probe(수정 후 가드) | Resolver 2경로 + http2 막힘(기록 3) → 파일 삭제·정규식 원복 |
+| `vitest run --project unit` 두 파일(no-meta-network·threads-live-oauth) | PASS — 2 files, 140 tests |
+| `corepack pnpm lint` | PASS |
+| `corepack pnpm typecheck` | PASS |
+| `corepack pnpm build` | PASS(exit 0) |
+| `corepack pnpm test` (unit) | PASS — 46 files, 1010 tests |
+| `corepack pnpm test:integration` (단독, unit 과 동시 실행 안 함) | PASS — 35 files, 692 tests |
+| `corepack pnpm drill:mock` | PASS — exit 0, "불변식 위반 0건"(M3·T14·T15·T16), Instagram fetch 호출 0 |
+
+(README 수정은 lint·typecheck·build·test 전에 했다. 이 인계 추가는 명령 뒤의 문서 변경.)
+
+## 남은 위험(FIX round 2 기준)
+1. 일시·확정 코드 표는 Meta Graph API 일반 규약(Handling Errors·Rate Limiting) 기준 — Threads 문서에 같은 표가 있는지는 이번 라운드에 다시 열람하지 않았다. 표에 없는 코드는 쓰기 단계에서 UNKNOWN 으로 남기므로(보수적) 잘못 분류되면 "확정 실패를 불명으로" 쪽이다. 2단계 실제 응답으로 보정.
+2. 교환 단계에서 모르는 4xx 코드·코드 없는 비분류 본문이 이제 `outcome: unknown` — 사용자는 "결과 불명, 다시 연결" 안내를 더 자주 볼 수 있다(state 는 이미 소비, code 는 1회용이라 재전송 위험은 없음).
+3. 코드 100 만 문구로 좁히는 예외(확정 → 확정). 문구가 바뀌면 redirect_mismatch·invalid_client 대신 invalid_grant 로 보일 뿐 ambiguous 판정은 바뀌지 않는다.
+4. Retry-After 의 HTTP-date 형식은 읽지 않는다(현재 시각 의존을 피함) — 날짜형이면 retryAfterSec 없음 → 기본 백오프. Threads 가 BUC 헤더를 실제로 보내는지 미확인.
+5. 네트워크 가드: dns.reverse·lookupService(IP), IP 직접 연결, 자식 프로세스·worker_threads, 네이티브 애드온, undici 패키지의 별도 dispatcher(시험 없음 — net/tls 단계가 막는다고 보지만 미확인)는 여전히 범위 밖.
+6. FIX1 의 미반영 놓친 케이스(같은 code 재전달·동시 묶기·부분 scope·pending 정리 완료 시험) 그대로.
+7. HEAD 미정 — 커밋 후 SHA 기록 필요.
+
+## Codex 에게 묻는 것(FIX round 2)
+1. 우선순위 "전송·상태 → 일시 코드/is_transient → 확정 코드(100 만 문구로 좁힘) → 코드·하위 코드 없을 때만 문구 → 나머지는 쓰기 단계 UNKNOWN" 이 불변식에 맞는가? 특히 (a) 코드 100 의 문구 좁히기(확정 → 확정)를 허용한 것, (b) 하위 코드만 있고 코드가 없는 본문에서도 문구를 보지 않게 한 것, (c) 일시 표에 341·80000~80014(BUC)를 넣은 것이 과하거나 부족한가?
+2. 제한 정보를 기존 `retryAfterSec`(초, domain `retryDelay` 와 같은 단위)에 Retry-After 정수 초와 `X-Business-Use-Case-Usage.estimated_time_to_regain_access`(분) 중 긴 쪽으로 싣는 것이 충분한가 — HTTP-date Retry-After 를 버리는 것과 X-App-Usage 를 읽지 않는 것이 실제 소비 경로(현재 OAuth 경로는 갱신이 막혀 있어 소비자가 거의 없음)에 위험을 만드는가?

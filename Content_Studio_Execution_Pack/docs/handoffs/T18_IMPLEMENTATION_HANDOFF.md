@@ -170,3 +170,63 @@
 1. 구간 겹침 거부(정렬 후 이웃 비교, 디렉터리 레코드 제외)와 압축 입력 예산으로 같은 압축 바이트를 되풀이해 푸는 경로가 모두 막혔는가? 디렉터리 레코드의 local header 를 검사하지 않는 것, 데이터 디스크립터 구간을 범위에 넣지 않는 것이 남은 틈인가?
 2. "원본 보충" 을 새 outcome(`original_backfilled`) + 명시 선택(backfill_ids, 원본이 빠진 동일 항목만)으로 둔 것이 "선택 규칙을 넓히지 않는 별도 경로" 로 충분한가? 같은 raw_hash 버전이 여럿일 때 모두 채우는 것, 원장 target 이 소재 없이 출처·버전만 가리키는 것(0040 CHECK)이 묶음 무결성·복원과 맞는가?
 3. 걸음 계수 기반 선형성 시험(글자당 ≤ 4, 크기 비율 대비 ≤ 1.125배, 작은 크기부터 판정)이 제곱 회귀를 잡기에 충분한가? `findTagEnd` 의 따옴표 처리(`=` 뒤 따옴표만, 닫히지 않으면 나머지 버림)가 선형이고 브라우저와 어긋나 본문을 잃는 경우가 있는가?
+
+## FIX round 3 (Codex review-FIX2-T18, WHATWG 상태 기계)
+- Orchestrator: HEAD_SHA d9e482d (code only, D28) — reran lint·typecheck·build·unit 1212·integration 710·drill:mock 0·real-DB drill:restore PASS.
+- 입력: `.handoffs/review-FIX2-T18.md`(CHANGES_REQUESTED, e294aca 대상, P1 :453 · P2 :338 + 놓친 케이스). BASE_SHA: 0074c513cd9795e17dc80b420c577b03cc516c10 · HEAD_SHA: TBD(커밋 안 한 작업 트리 — 오케스트레이터가 커밋).
+- 범위: 파일·모의만. 네트워크·자격 증명·live 커넥터 0, 새 의존성 0, migration 0, `./data` 열지 않음, dev 서버 꺼짐.
+- 건드리지 않음: `docs/DECISIONS.md`, `M4_CODEX_VERDICTS.md`(작업 트리에서 수정된 상태지만 이 작업의 변경 아님), `M4_STATUS.md`, `LIVET1_IMPLEMENTATION_HANDOFF.md`, 다른 handoff.
+- 방향(오케스트레이터): 원본 바이트는 이미 그대로 보존되므로 추출 텍스트는 파생 값 — 글 손실이 가장 나쁘고, 마크업·코드가 조금 보이는 것은 받아들인다. 매 라운드 새 경계 사례가 나오는 손짜기 토크나이저를 **WHATWG 토크나이저 상태를 그대로 옮긴 한 번 훑는 상태 기계**로 바꿈.
+
+### 구조(`packages/domain/src/imports.ts` htmlToText 주변 — `findTagEnd`·`findClosingTag`·`HTML_RAW_TEXT_TAGS` 제거)
+- `scanTag`(tag name) + `scanTagAttributes`: before/after attribute name · attribute name · before attribute value · attribute value(큰따옴표·작은따옴표·따옴표 없음) · after attribute value(quoted) · self-closing start tag. "다시 읽음"(reconsume)은 위치를 옮기지 않고 상태만 바꿈. 따옴표 값은 indexOf 로 건너뜀. EOF → 태그 버림(eof-in-tag, 사양).
+- tag open / end tag open: `<` + 글자 아님 → 글자, `</` + EOF → 글자 `</`, `</>` → 없음, `</` + 글자 아님 → bogus comment.
+- markup declaration: `<!--` → `scanComment`(`<!-->`·`<!--->`·`-->`(대시 여럿)·`--!>`, 안의 `--` 는 끝 아님, EOF → 나머지 주석), 그 밖의 `<!…`(DOCTYPE·`[CDATA[`·`<!x>`)·`<?` → bogus comment(첫 `>`).
+- raw text: `matchEndTag` = appropriate end tag(`</name` ASCII 대소문자 무시 + 공백·`/`·`>`; `</script=`·`</scriptx`·`</script1`·EOF 직전 `</script` 는 아님) → 이어서 일반 속성 상태로 닫는 태그 끝. `findRawTextEnd`(RAWTEXT·RCDATA, 안의 따옴표 의미 없음), `findScriptEnd`(script data + escaped `<!--` + double escaped `<!--<script>`).
+- 요소 분류(scripting 꺼짐 기준): script·style → 내용 버림, 닫히지 않으면 끝까지(브라우저와 같음). iframe·noembed·noframes → RAWTEXT 버림. title → RCDATA, 제목만. textarea → RCDATA 글자로 남김, xmp → RAWTEXT 글자 그대로, plaintext → 나머지 전부 글자. noscript·template → 일반 요소(글자 남김).
+- **사양과 일부러 다른 곳(글 손실 방지)**: 닫히지 않은 title·iframe·noembed·noframes 는 사양상 끝까지 그 요소 글자(본문에 안 보임)인데, 일반 HTML 로 다시 읽어 글자를 남긴다. 이름마다 "이 위치 뒤에는 닫는 태그 없음" 을 기억(`noEndFrom`)해 같은 이름으로 두 번 끝까지 훑지 않음 → 글자마다 최대 5번(선형).
+- 문자 참조: 데이터·RCDATA 글자 조각마다 한 번만 풂(태그를 건너 잇지 않음 — `a&am<b></b>p;` 는 그대로). 전체 결과를 다시 풀던 방식과 h1 제목의 두 번 풀기(`&amp;lt;` → `<`)를 없앰.
+- 주석·script 자리에 공백을 넣던 것을 없앰(사양의 보이는 글자: `앞<!-- -->뒤` → `앞뒤`). 블록 닫는 태그·`<br>`·`</br>`(사양상 `<br>`) → 줄바꿈은 그대로.
+- 걸음 계수기(`HtmlScanStats.steps`)는 모든 상태 함수에 그대로 — 선형성 시험 유지.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+|---|---|---|
+| [P1] imports.ts:453 `<script>let x='</script="';</script><p>본문</p>` → 뒤 본문 전부 버림 | appropriate end tag 는 이름 뒤가 공백·`/`·`>` 일 때만(`matchEndTag`). raw text 안 따옴표는 의미 없음. 닫는 태그 뒤 속성은 사양 상태 기계로 | `imports-fix3.test.ts` 차등 표 첫 줄(Codex 재현) → `본문`, 가짜 닫는 태그·대소문자·`</script >`·`</script/>`·`</script1`·`</scrip`·escaped/double escaped·EOF 직전 `</script` 등 17줄, "글 손실 방지" 6개 머리 + 뒤쪽 본문 남음 |
+| [P2] imports.ts:338 `<p data-x=a=">본문</p>` → 본문 버림 | 따옴표 없는 값 상태: 공백·`>` 에서만 끝, `=`·따옴표·`<` 는 값의 글자 | 차등 표 둘째 줄(Codex 재현) → `본문`, 따옴표 없는 값 `=` 여러 개·`?a=b&c=d`, missing-whitespace, `=` 로 시작하는 이름, `/` 끼임, 빈 값, 이름 안 따옴표 등 14줄 |
+
+- 차등 표: **69줄**(≥ 40). 각 줄 = 입력 · 사양대로 손으로 적은 보이는 글자(+ 필요하면 제목) · 이유, 사양과 다른 2줄은 `deviation` 에 사양 결과를 적음. 각 줄에서 걸음 ≤ 6·n + 32 도 확인. 사양 구현(parse5 등)은 node_modules 에 없고 새 의존성 금지라 기계 대조는 하지 않았다 — 기대값은 사양 상태 표를 따라 손으로 적음.
+- 기존 시험 변경 1건: `imports-fix1.test.ts` `<noscript/>n</noscript>본문` 의 기대값 `본문` → `n본문`. round 2 는 noscript 를 RAWTEXT 로 봤는데, scripting 꺼짐 기준 사양은 일반 요소다(지시: noscript·template 는 일반 요소). 나머지 기존 HTML 시험(round 1·2 의 닫히지 않은 주석·script, `<script/>`·`<style/>`·`<SCRIPT />`·`<title/>`, 따옴표 값 안 `>`, 닫히지 않은 따옴표, 엔티티, h1/title 제목)은 그대로 통과.
+- 선형성: round 2 시험(15종, 글자당 ≤ 4, 크기 비율 1.125배, 2MB CPU < 1초) 그대로 통과. 새 14종 추가(`imports-fix3.test.ts`: script 안 `<!--<script>` 오가기, script 안 `</scriptx`, 따옴표 없는 값 `a=b="`, 주석 안 `--!`·`-x`, 닫히지 않은 title/iframe/noembed/noframes 반복, `<textarea>` 뒤 `</textare`, `<!`·`</ `·`/`·속성 이름 반복, 그리고 놓친 케이스 "계수기 밖 후처리" 로 공백·줄바꿈만 · `&amp;` 만 · `&` 만 2MB — CPU < 1초). 일부러 `noEndFrom` 기억을 끄면 2건 fail(`글자당 걸음(16354자): expected 15748902 to be less than or equal to 98140`, `닫히지 않은 title·iframe 반복` 6,200,350,004 걸음) → 되돌린 뒤 pass.
+
+### 놓친 케이스(리뷰 파일)에서 함께 처리한 것
+- script 문자열 안 `</script="` 뒤 실제 닫는 태그·본문, 따옴표 없는 값 안 `=`·따옴표 → 위 차등 표·글 손실 시험.
+- HTML 후처리의 긴 공백·엔티티 비용 → 위 2MB 시험 3종(CPU 시간 보조).
+- 원본 보충의 반복 폼 값·다른 실행의 항목 ID·다른 owner 의 항목 ID → `tests/integration/imports.test.ts`(round 2 보충 시험 6단계에 추가): `backfill=c&backfill=a`(a 는 후보 아님) → 303 `?error=import_invalid_selection`(두 값 모두 읽음 — 첫 값만 읽었다면 c 가 채워졌을 것), 첫 실행의 원장 항목 ID → 400, B 의 실행 항목 ID → 400, 원본 수·실행 상태(preview) 그대로.
+- 처리하지 않음(비싸거나 이 라운드 범위 밖): 같은 출처·같은 raw_hash 버전 중 일부만 원본 없는 경우, PostgreSQL 별도 연결 동시 보충·복원 끼어들기(DB_DRIVER=postgres 없음), `original_backfilled` 원장의 잘못된 target 묶음 거부.
+
+### 변경 파일
+- 수정: `packages/domain/src/imports.ts`(htmlToText 상태 기계), `packages/domain/src/imports-fix1.test.ts`(noscript 기대값 1줄), `tests/integration/imports.test.ts`(보충 선택 거부 단언).
+- 새 파일: `packages/domain/src/imports-fix3.test.ts`(차등 표 69 + 글 손실 2 + 선형성 14 + 표 크기 1 = 86 시험).
+
+### 명령과 결과(로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `corepack pnpm lint`: 첫 실행 fail(`no-useless-assignment` 5건 — break 직전 `i = n`) → 고친 뒤 pass.
+- `corepack pnpm typecheck`: pass.
+- `corepack pnpm build`: pass.
+- `corepack pnpm test`(unit): pass — 49 files, 1212 tests.
+- `corepack pnpm test:integration`(혼자): 첫 실행 fail 1 — 새 단언에서 B 로 미리보기할 때 `as(B)` 를 빠뜨려 401(시험 코드 실수) → 고친 뒤 그 파일만 27 pass, 전체 재실행 결과는 아래.
+- `corepack pnpm test:integration`(혼자, 재실행): pass — 로그 "Test Files 35 passed (35)" · "Tests 710 passed (710)", 484s(`tests/integration/imports.test.ts` 27). 재실행 전 lint·typecheck 다시 pass.
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건".
+- 일부러 `noEndFrom` 기억을 끔 → 선형성 2건 fail, 되돌린 뒤 pass.
+- 실제 로컬 DB `db:migrate`·`drill:restore`: not_run(migration 없음, `./data` 를 열지 말라는 지시).
+
+### 남은 위험
+- 사양 대조는 손으로 적은 기대값뿐 — 브라우저·parse5 로 기계 대조하지 않았다(새 의존성·네트워크 금지).
+- 다루지 않는 사양 부분: 외래 콘텐츠(svg·math 안 `<style>`·`<script/>` 는 사양상 RAWTEXT 가 아니고 자체 종료 가능 — 여기서는 HTML 요소로 봄), 트리 구성 단계(`<title>` 이 body 안에 있어도 RCDATA 로 봄 — 사양과 같음, `<textarea>` 가 select 안에 있는 등 삽입 모드에 따른 차이는 무시), 세미콜론 없는 이름 문자 참조(`&amp` → 그대로 둠), 아는 이름 6개 외 이름 참조, CR/LF 전처리(공백 판정에만 CR 포함).
+- 사양과 일부러 다른 곳: 닫히지 않은 title·iframe·noembed·noframes 는 글자를 남김(위). eof-in-tag(닫히지 않은 따옴표 값 등)는 사양대로 나머지를 버린다 — 글 손실이지만 브라우저와 같고, 원본은 보존됨.
+- 주석·script 자리 공백을 없애 `a<!-- -->b` 가 `ab` 로 붙는다(사양과 같음). 예전 결과(`a b`)와 다르다 — 이미 가져온 소재 원문은 바뀌지 않고, 같은 파일을 다시 올려도 판정은 바이트 checksum 이라 영향 없음.
+- 걸음 계수기는 토큰 순회만 센다. decodeEntities·공백 정리 정규식은 CPU 시간 보조 확인만.
+
+### Codex 에게 질문
+1. 상태 기계(`scanTagAttributes`·`matchEndTag`·`findRawTextEnd`·`findScriptEnd`·`scanComment`)가 WHATWG 토크나이저와 어긋나 **글을 잃는** 입력이 남았는가? 특히 script data escaped/double escaped 의 대시·`<` 처리와, 닫는 태그 뒤 속성 상태(`</script x="…`)에서 EOF 까지 버리는 경우를 봐 달라.
+2. 사양과 일부러 다르게 한 두 가지(닫히지 않은 title·iframe·noembed·noframes 를 일반 HTML 로 다시 읽어 글자를 남김 + 이름별 `noEndFrom` 기억으로 선형 유지, noscript·template 를 일반 요소로 봄)가 "원본은 보존, 추출 텍스트는 파생" 원칙에서 받아들일 만한가? eof-in-tag(닫히지 않은 따옴표 값)도 글을 남기는 쪽으로 바꿔야 하는가?

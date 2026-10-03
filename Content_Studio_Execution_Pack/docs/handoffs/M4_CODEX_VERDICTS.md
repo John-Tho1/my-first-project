@@ -154,3 +154,6 @@ CHANGES_REQUESTED
 ## FIX2-T18 (e294aca, T18 round 2) — CHANGES_REQUESTED (P1 1·P2 1)
 - [P1] packages/domain/src/imports.ts:453 — 가짜 raw-text 닫는 태그와 따옴표가 결합하면 정상 HTML의 뒤쪽 본문까지 버린다
 - [P2] packages/domain/src/imports.ts:338 — 따옴표 없는 속성 값 내부의 = 를 새 속성 값 시작으로 해석한다
+
+## FIX4-LIVET1 (f6c3736, LIVE-T1 round 4 정규화 일원화) — **PASS** → D31 1단계(Threads 실제 OAuth 코드, 실제 호출 없음) 종결
+- LIVE-T1: 1f16583 → FIX1 1b01226 → FIX2 e51ae72 → FIX3 9273517 → **FIX4 f6c3736 PASS**. 2단계(실계정 연결·프로필 조회)는 사용자와 함께 진행(D31).

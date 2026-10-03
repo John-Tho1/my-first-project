@@ -113,3 +113,8 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 열린 Codex 지적 없음. M4 모의 범위(T13~T16)·화면·가림·재수화 모두 종결.
 - 마지막 검사(63ad062): lint·typecheck·build·unit 831·integration 647·drill:mock(M3·Threads·YouTube·Instagram) 0건·실제 로컬 DB drill:restore PASS.
 - Codex 상주 실행기는 정지(`.handoffs/codex-daemon.stop`). 다시 쓰려면 stop 파일을 지우고 `nohup bash .handoffs/run-codex-daemon.sh &`.
+
+## 2026-10-03 23:00 — T19 종결
+- T19(허용 소스 수집, 모의·기본 OFF): 4a2e02f → FIX1 66e1257 → **FIX2 f07153c Codex PASS**. 마지막 검사(f07153c): lint·typecheck·build·unit 1269·integration 738·drill:mock 0건·db:migrate·drill:restore PASS.
+- M5 모의 범위(T18·T19) 종결. 남은 것: T17(보류), T21 운영 배포(승인 필요 — D30-1 서명 URL 의 전제), Threads 2단계(사용자와 함께, D31), D32·D33 사용자 확인.
+- 다음(로컬·결정 불필요): T19 남은 위험 중 소스 등록 상한 경쟁(동시 등록으로 51개) 보강.

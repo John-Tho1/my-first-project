@@ -174,3 +174,6 @@ CHANGES_REQUESTED
 ## FIX-T19 (66e1257, T19 round 1) — CHANGES_REQUESTED (P2 2, P0·P1 없음)
 - [P2] packages/domain/src/collector.ts:560 — `Buffer` 입력에서는 원본 바이트가 복사되지 않고 입력 버퍼와 공유된다
 - [P2] packages/db/src/collector.ts:563 — 주간 SQL 기한의 `interval '7 days'`가 고정 168시간 규칙과 DST에서 달라진다
+
+## FIX2-T19 (f07153c, T19 round 2) — **PASS** → T19 허용 소스 수집·재추천(모의, 기본 OFF) 종결
+- T19: 4a2e02f → FIX1 66e1257 → **FIX2 f07153c PASS**. 지적 없음. Codex 는 테스트를 직접 실행하지 않았고 diff 범위만 검토(동시 수락·연결 계층 IP 고정은 미확인으로 남김).

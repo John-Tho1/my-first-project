@@ -80,3 +80,8 @@ CHANGES_REQUESTED
 
 ## FIX-M4UI (2fed5b4, 화면 기능 round 1) — CHANGES_REQUESTED (P2 1)
 - [P2] apps/web/lib/revoke-view.ts:14 — 해제 미완료 안내가 오류 해소 여부와 무관하게 자동 완료를 약속함
+
+## FIX7-T13 (f07d96a, T13 round 7) — CHANGES_REQUESTED (P2 1, P1 없음)
+- [P2] packages/db/src/oauth.ts:1508 — worker가 잠금 안에서 갱신된 재개 시각을 확인하지 않아 같은 해제를 중복 재개할 수 있다
+
+## FIX2-M4UI (cd0a2aa, 화면 기능 round 2) — **PASS** → 화면 기능 G1·G2·S4·S5·해제 안내 종결

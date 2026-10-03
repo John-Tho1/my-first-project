@@ -491,3 +491,48 @@ Before this round the worker resumed only rows with `last_error_code LIKE 'revok
 3. The in-memory failure path defers with backoff but does not write `last_error_code` (for example, it does not change `revoke_current_no_key` to `revoke_provider_unavailable` if the cause changed). Is a stale reason code on the row acceptable, given that it is only updated by a real disconnect attempt?
 4. When a user joins an op, phase 1 also pushes `revoke_resume_at` later (backoff on attempts). Should a user-initiated join instead reset attempts, so that the worker's schedule after a user retry stays short?
 5. Is 0035 (two columns on `oauth_credentials`) acceptable, or would you prefer the obligation and schedule to live in an `oauth_pending_tokens` row kind (this would need a new AAD purpose for the `oauth_token` ciphertext)?
+
+# FIX round 8 (Codex review-FIX7-T13)
+- Orchestrator: HEAD_SHA c82c721 (code only, D28) — reran lint·typecheck·build·unit 759·integration 600·drill:mock 0·real-DB drill:restore PASS.
+- BASE_SHA: d767842 (T13 FIX round 7 · M4UI FIX round 2 handoff/verdict docs commit) · **HEAD_SHA: TBD** (the orchestrator commits; this section is written before the commit). Review fixed: `.handoffs/review-FIX7-T13.md` (CHANGES_REQUESTED: P2×1, plus missed cases), reviewed range 9698885 → f07d96a.
+- Environment: Windows 10, Git Bash, portable Node 24.21.0 (`source tools/env.sh`), pnpm via corepack. Dev server down. `./data` not opened. Tests use memory DBs. Unit and integration suites run one after the other, never together.
+- Code changed: `packages/db/src/oauth.ts`, `tests/integration/oauth.test.ts`. **No migration** (0035 columns are enough). No new dependencies, no external calls. No UI change.
+- Not touched: `docs/DECISIONS.md`, `M4_STATUS.md`, `docs/handoffs/M4_CODEX_VERDICTS.md` (the working tree already shows an uncommitted change to it that this round did not make), `M4UI_IMPLEMENTATION_HANDOFF.md`, other handoffs.
+
+## Finding → change → test
+Tests are in `tests/integration/oauth.test.ts` (97 → **102** tests; no existing test changed).
+
+| Finding | Change | Test |
+|---|---|---|
+| **[P2] oauth.ts:1508** — under the lock the worker re-checked op id, generation and epoch, but not `revoke_resume_at`. A second worker, or a user disconnect that had just joined and renewed the 60 s lease, could be resumed again by a worker that scanned the row earlier → two provider revoke calls for the same op | `RevokeResumeExpectation` now also carries the scanned `resumeAt` (`revoke_resume_at`, null for pre-0035 rows) and `attempts` (`revoke_resume_attempts`). In the first locked transaction of `revokeCredentialOp`, the worker path additionally requires: (1) `revoke_resume_at` and attempts are **unchanged** from the scan, and (2) the row is **still due** at the worker's `now` (`coalesce(revoke_resume_at, updated_at + 60 s) <= now`). Otherwise it returns `'skipped_busy'` with no write and no provider call. If both hold, the existing join branch in the **same transaction** sets attempts + 1 and `revoke_resume_at = now + max(60 s, backoff(attempts))` (the claim) and commits before any provider call — so any other resumer that scanned the same row sees a changed lease and skips. `refreshExpiringCredentials` returns a new counter `revokeSkippedBusy`. The user path (`revokeCredential`, `expect = null`) is unchanged: it still joins the op immediately (and renews the lease); it never gets `skipped_busy` (mapped to `CredentialNotFoundError` defensively, unreachable) | `FIX8 P2 :1508` (a) two workers, limit 1, row put first (`revoke_resume_at = epoch 0`): A scans → in `beforeRevokeResume` A starts B and waits until B has scanned → B waits until A's phase 1 (claim) has committed → A's `afterRevokeMarked` waits for B to finish before the provider call. Result: A `revokeResumed 1`, B `revokeSkippedBusy 1` (`revokeSkippedChanged 0`, `revokeWaiting 0`), B saw the lease at `T + 2 min` (attempts 2), **one** provider revoke of the token, row `revoked` on the same op/epoch, 0 live tokens, one new `oauth.revoked` audit. (b) worker scans → user disconnect (route) joins and is held in `afterRevokeMarked` (lease renewed, attempts + 1) → worker resumes: `revokeSkippedBusy 1`, the row after the worker's attempt is `toEqual` the row right after the user's phase 1 (no write), then the user call finishes `revoked`/`ok` with **one** provider revoke |
+
+### Missed cases from the review
+| Case | Result | Test |
+|---|---|---|
+| Only the lease of the same op is extended after the scan | Worker skips: no provider call, lease, attempts and audits unchanged; a tick after that lease resumes | `FIX8` (c): hook sets `revoke_resume_at = T + 1 h` → `revokeSkippedBusy 1`, row `toEqual` the extended row, 0 provider calls, audit count unchanged; worker at `T + 61 min` → `revoked`, one provider call |
+| Two workers on real PostgreSQL scanning the same candidate | Logic covered by (a) with hook-forced interleaving; the claim is in the same transaction as the row lock (`FOR UPDATE` via `lockAccountCredential`), so on PostgreSQL the second locker reads the committed lease | real PostgreSQL parallel run: not_run (PGlite single connection) |
+| Key rotation between scan and lock (op/generation/lease same, ciphertext changed) | Proceeds and revokes using the ciphertext read under the lock (rotation does not touch `revoke_resume_at`/attempts) | `FIX8` (e): hook rotates KEY1 → KEY2 and drops KEY1 → row `keyVersion 2`, new ciphertext, same op/generation/lease → `revokeResumed 1`, one provider revoke of the original token, `revoked`, 0 live tokens |
+| Pre-0035 `revoking` row (lease null, attempts 0, error code null) at the `updated_at + 60 s` boundary | 1 ms before → not scanned, row unchanged, no provider call; exactly at the boundary → resumed | `FIX8` (d) |
+| Provider call longer than 60 s (same-op double finish, pending cleanup) | Not changed. The lease is still a lease: if a worker's or user's provider call exceeds `max(60 s, backoff)`, another worker can claim and call the provider again. The finish step still lets only one call finish (`completed_by_other` for the other) and pending rows are only changed when their revision matches | covered by earlier FIX4–FIX6 finish tests; >60 s real provider not_run |
+
+## Commands (Windows, Git Bash, `source tools/env.sh`, sequential; dev server down)
+- `corepack pnpm lint`: exit 0.
+- `corepack pnpm typecheck`: exit 0.
+- `corepack pnpm build`: exit 0.
+- `corepack pnpm test`: exit 0, **40 files / 759 tests**.
+- `corepack pnpm test:integration` (run alone): exit 0, **31 files / 600 tests** (364 s). `oauth.test.ts` 97 → **102**.
+- `corepack pnpm drill:mock`: exit 0, 불변식 위반 0건 (M3, T14 Threads, T15 YouTube), YouTube fetch 0.
+- Mutation check (`oauth.test.ts -t FIX8` only, then `oauth.ts` restored from a saved copy): the new lease/due check disabled → 3 fail (a, b, c); (d) and (e) pass as expected (they test that the check does not block valid resumes).
+- Logs: `.handoffs/checks-FIX8-T13.*.log`.
+- not_run: `db:migrate`/`drill:restore` on `./data` (no migration this round), real PostgreSQL parallel transactions, real provider, browser check (no UI change).
+
+## Remaining risks
+- **Still a lease, not a lock** (Codex FIX7 Q2): a provider call longer than the lease lets one more resumer call the provider for the same op. Provider revoke is treated as idempotent (`invalid_token` = already revoked) — must be confirmed against the real provider.
+- A user disconnect always joins immediately, even while a worker holds the lease (intended: explicit user action). That can still produce one extra provider call per user click during an in-flight worker resume.
+- The due check compares DB timestamps with the worker's `now`; a worker with a clock far behind the DB writer only skips more (never resumes early) because the lease equality check is clock-independent.
+- Concurrency remains hook-injected on PGlite's single connection.
+
+## Questions for Codex
+1. The claim relies on lease **equality** with the scanned `(revoke_resume_at, revoke_resume_attempts)` plus "still due at the worker's `now`". Is comparing attempts redundant or useful here (a user join always changes both), and is millisecond Date equality on `timestamptz` acceptable?
+2. Should a user disconnect that arrives while a worker holds a fresh lease (not yet due) wait or report "in progress" instead of joining and calling the provider again, or is an extra idempotent revoke on explicit user action acceptable?
+3. `revokeSkippedBusy` is a new field in the worker result (only `apps/web/lib/stt.ts` consumes the function). Should busy skips be surfaced anywhere (ops summary), or is the counter enough?

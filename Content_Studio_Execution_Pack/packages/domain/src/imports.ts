@@ -289,12 +289,37 @@ function decodeEntities(s: string): string {
 /** FIX-T18 round 1: htmlToText 입력 상한(문자 수) — 텍스트 항목 상한과 같다. 넘으면 처리하지 않는다. */
 export const HTML_TO_TEXT_MAX_INPUT = IMPORT_MAX_TEXT_ENTRY_BYTES;
 
-/** 내용을 통째로 건너뛰는 요소(닫는 태그까지). title 은 제목으로만 쓰고 본문에는 넣지 않는다. */
-const HTML_RAW_TEXT_TAGS = new Set(['script', 'style', 'noscript', 'template', 'title']);
+/*
+ * FIX-T18 round 3(Codex review-FIX2-T18 P1 :453 · P2 :338): 손으로 짠 태그·raw text 처리를 WHATWG HTML 토크나이저 상태
+ * (https://html.spec.whatwg.org/multipage/parsing.html#tokenization) 중 텍스트 추출에 필요한 것만 그대로 옮긴 **한 번 훑는 상태 기계**로 바꿨다.
+ *   data → tag open → (end tag open) → tag name → before/after attribute name → attribute name → before attribute value →
+ *   attribute value (double-quoted / single-quoted / unquoted) → after attribute value (quoted) → self-closing start tag,
+ *   markup declaration open → comment(start/start dash/comment/end dash/end/end bang) · bogus comment(DOCTYPE·CDATA·`<?`·`</ ` 포함),
+ *   RAWTEXT·RCDATA(appropriate end tag 에서만 끝남), script data(escaped·double escaped 포함).
+ * 문자 참조는 텍스트 조각마다 아는 이름·숫자만 푼다(속성 값은 출력하지 않으므로 풀지 않는다).
+ *
+ * 요소 분류(트리 구성 단계에서 정해지는 토크나이저 상태를 그대로 따름, scripting 은 꺼진 것으로 본다):
+ *   script → script data, 내용 버림(닫히지 않으면 끝까지 — 브라우저와 같음)
+ *   style → RAWTEXT, 내용 버림(닫히지 않으면 끝까지 — 브라우저와 같음)
+ *   iframe·noembed·noframes → RAWTEXT, 내용 버림. 닫히지 않으면 **사양과 달리** 내용을 일반 HTML 로 다시 읽어 글자를 남긴다(글 손실 방지)
+ *   title → RCDATA, 제목으로만 씀. 닫히지 않으면 **사양과 달리** 내용을 일반 HTML 로 다시 읽어 본문에 남긴다(글 손실 방지)
+ *   textarea → RCDATA, 내용은 보이는 글자(엔티티 풂). xmp → RAWTEXT, 내용은 보이는 글자 그대로. plaintext → 나머지 전부 글자 그대로
+ *   noscript·template → 일반 요소(scripting 꺼짐 기준 — 안의 글자를 남김)
+ * 끝(EOF) 처리는 사양 그대로: 태그·속성 도중 EOF → 그 태그는 버림, 주석·bogus 주석 도중 EOF → 나머지는 주석.
+ * 원본 바이트는 source_version_originals 에 그대로 남으므로 추출 텍스트는 파생 값이다 — 애매하면 글자를 남기는 쪽을 고른다.
+ */
+
+/** 내용을 버리는 RAWTEXT 요소. 닫히지 않으면 style 만 끝까지 버리고(브라우저와 같음), 나머지는 다시 읽어 글자를 남긴다. */
+const HTML_RAWTEXT_DROP = new Set(['style', 'iframe', 'noembed', 'noframes']);
+/** 닫히지 않았을 때 끝까지 버리는 요소(script 는 script data 상태로 따로 처리). */
+const HTML_RAWTEXT_DROP_TO_EOF = new Set(['style']);
 /** 닫는 태그 뒤 줄바꿈 */
-const HTML_BLOCK_TAGS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr', 'blockquote', 'pre', 'section', 'article', 'ul', 'ol', 'table']);
+const HTML_BLOCK_TAGS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr', 'blockquote', 'pre', 'section', 'article', 'ul', 'ol', 'table', 'xmp', 'textarea']);
 const isAsciiLetter = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-const isTagNameChar = (c: number) => isAsciiLetter(c) || (c >= 48 && c <= 57) || c === 45 || c === 58;
+/** 토크나이저 공백: TAB·LF·FF·SPACE(+ CR — 전처리에서 LF 로 바뀌는 글자) */
+const isHtmlSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 12 || c === 13;
+/** 아는 태그 이름의 최대 길이(plaintext = 9) — 더 긴 이름은 조각 문자열을 만들지 않고 모르는 태그로 본다. */
+const HTML_MAX_KNOWN_NAME = 10;
 
 /**
  * FIX-T18 round 2(선형성 검사): htmlToText 가 실제로 살펴본 글자 수(탐색 구간 길이 + 글자 단위 비교 + 반복 횟수)를 세는 계수기.
@@ -304,68 +329,244 @@ export interface HtmlScanStats {
   steps: number;
 }
 
-/** from 부터 `</name`(대소문자 무시, 뒤가 이름 글자가 아님) 의 위치. 없으면 -1. 앞으로만 훑는다(선형). */
-function findClosingTag(html: string, name: string, from: number, st: HtmlScanStats): number {
+/** 태그 상태 기계 결과: end = 태그를 끝낸 `>` 다음 위치(EOF 면 -1), selfClosing = `/>` 로 끝남. */
+interface HtmlTagEnd {
+  end: number;
+  selfClosing: boolean;
+}
+
+// WHATWG 태그 상태(이름 뒤부터). 숫자 상수 — const enum 대신(모듈 단독 변환 호환).
+const BEFORE_ATTR_NAME = 0;
+const ATTR_NAME = 1;
+const AFTER_ATTR_NAME = 2;
+const BEFORE_ATTR_VALUE = 3;
+const ATTR_VALUE_UNQUOTED = 4;
+const AFTER_ATTR_VALUE_QUOTED = 5;
+const SELF_CLOSING_START_TAG = 6;
+
+/**
+ * 태그 이름이 끝난 자리(k = 공백·`/`·`>` 중 하나, 또는 EOF)부터 WHATWG 의 속성 상태들을 따라 태그 끝을 찾는다.
+ * - 따옴표 값(`"…"`·`'…'`)은 짝 따옴표까지 — 그 안의 `>`·`=`·`<` 는 글자.
+ * - 따옴표 없는 값은 공백·`>` 에서만 끝난다 — 그 안의 `=`·따옴표·`<` 는 값의 글자(P2 :338).
+ * - 속성 이름 안의 따옴표·`<` 도 글자. 이름 시작의 `=` 는 이름의 첫 글자.
+ * 글자마다 한 번만 본다(따옴표 값은 indexOf 로 건너뜀, "다시 읽음" 은 위치를 옮기지 않고 상태만 바꿈 — 연속 두 번 이상 없음) — 선형.
+ */
+function scanTagAttributes(html: string, k: number, st: HtmlScanStats): HtmlTagEnd {
+  const n = html.length;
+  let s = BEFORE_ATTR_NAME;
+  while (k < n) {
+    const c = html.charCodeAt(k);
+    st.steps++;
+    const space = isHtmlSpace(c);
+    if (s === BEFORE_ATTR_NAME) {
+      if (c === 47 /* / */) s = SELF_CLOSING_START_TAG;
+      else if (c === 62 /* > */) return { end: k + 1, selfClosing: false };
+      else if (!space) s = ATTR_NAME; // '=' 도 이름의 첫 글자
+      k++;
+    } else if (s === ATTR_NAME) {
+      if (space) s = AFTER_ATTR_NAME;
+      else if (c === 47) s = SELF_CLOSING_START_TAG;
+      else if (c === 62) return { end: k + 1, selfClosing: false };
+      else if (c === 61 /* = */) s = BEFORE_ATTR_VALUE;
+      k++;
+    } else if (s === AFTER_ATTR_NAME) {
+      if (c === 47) s = SELF_CLOSING_START_TAG;
+      else if (c === 61) s = BEFORE_ATTR_VALUE;
+      else if (c === 62) return { end: k + 1, selfClosing: false };
+      else if (!space) s = ATTR_NAME;
+      k++;
+    } else if (s === BEFORE_ATTR_VALUE) {
+      if (c === 34 /* " */ || c === 39 /* ' */) {
+        const close = html.indexOf(c === 34 ? '"' : "'", k + 1);
+        st.steps += (close < 0 ? n : close) - k;
+        if (close < 0) return { end: -1, selfClosing: false }; // eof-in-tag(따옴표 값 도중)
+        s = AFTER_ATTR_VALUE_QUOTED;
+        k = close + 1;
+        continue;
+      }
+      if (c === 62) return { end: k + 1, selfClosing: false }; // missing-attribute-value
+      if (!space) s = ATTR_VALUE_UNQUOTED;
+      k++;
+    } else if (s === ATTR_VALUE_UNQUOTED) {
+      if (space) s = BEFORE_ATTR_NAME;
+      else if (c === 62) return { end: k + 1, selfClosing: false };
+      k++; // '=', '"', "'", '<', '`' 모두 값의 글자
+    } else if (s === AFTER_ATTR_VALUE_QUOTED) {
+      if (c === 62) return { end: k + 1, selfClosing: false };
+      if (c === 47) {
+        s = SELF_CLOSING_START_TAG;
+        k++;
+      } else if (space) {
+        s = BEFORE_ATTR_NAME;
+        k++;
+      } else s = BEFORE_ATTR_NAME; // missing-whitespace-between-attributes: 같은 글자를 다시 읽음
+    } else {
+      // SELF_CLOSING_START_TAG
+      if (c === 62) return { end: k + 1, selfClosing: true };
+      s = BEFORE_ATTR_NAME; // unexpected-solidus-in-tag: 같은 글자를 다시 읽음
+    }
+  }
+  return { end: -1, selfClosing: false }; // eof-in-tag: 태그는 버린다
+}
+
+/**
+ * 태그 이름 상태: nameStart(ASCII 글자)부터 공백·`/`·`>`·EOF 전까지가 이름(그 밖의 글자 — 따옴표·`<`·`=` 등 — 도 이름에 든다).
+ * 이어서 속성 상태들로 태그 끝을 찾는다.
+ */
+function scanTag(html: string, nameStart: number, st: HtmlScanStats): HtmlTagEnd & { nameEnd: number } {
+  const n = html.length;
+  let k = nameStart;
+  while (k < n) {
+    const c = html.charCodeAt(k);
+    if (isHtmlSpace(c) || c === 47 || c === 62) break;
+    k++;
+  }
+  st.steps += k - nameStart + 1;
+  return { ...scanTagAttributes(html, k, st), nameEnd: k };
+}
+
+/** html[k] = '<', html[k+1] = '/' 일 때: 이어지는 ASCII 글자 묶음의 끝(e)과, 그것이 name 의 appropriate end tag 인지(뒤가 공백·`/`·`>`). */
+function matchEndTag(html: string, k: number, name: string, st: HtmlScanStats): { e: number; ok: boolean } {
+  let e = k + 2;
+  while (e < html.length && isAsciiLetter(html.charCodeAt(e))) e++;
+  st.steps += e - (k + 2) + 1;
+  if (e - (k + 2) !== name.length || e >= html.length) return { e, ok: false };
+  const d = html.charCodeAt(e);
+  if (!(isHtmlSpace(d) || d === 47 || d === 62)) return { e, ok: false }; // `</script=`·`</script1` 은 닫는 태그가 아니다(P1 :453)
+  for (let m = 0; m < name.length; m++) if ((html.charCodeAt(k + 2 + m) | 0x20) !== name.charCodeAt(m)) return { e, ok: false };
+  return { e, ok: true };
+}
+
+/**
+ * RAWTEXT·RCDATA: from 부터 name 의 appropriate end tag(`</name` 대소문자 무시 + 공백·`/`·`>`) 의 `<` 위치와 이름 끝. 없으면 null.
+ * 안의 따옴표·주석 흉내는 아무 의미가 없다. 앞으로만 훑는다(선형).
+ */
+function findRawTextEnd(html: string, name: string, from: number, st: HtmlScanStats): { lt: number; e: number } | null {
   let pos = from;
   for (;;) {
     const k = html.indexOf('</', pos);
-    st.steps += (k < 0 ? html.length : k + 2) - pos + 1;
-    if (k < 0) return -1;
-    // 이름을 글자 단위로 비교(ASCII 대소문자 무시) — 조각 문자열을 만들지 않는다.
-    let m = 0;
-    while (m < name.length && (html.charCodeAt(k + 2 + m) | 0x20) === name.charCodeAt(m)) m++;
-    st.steps += m + 1;
-    if (m === name.length && !isTagNameChar(html.charCodeAt(k + 2 + m))) return k;
-    pos = k + 2;
+    st.steps += (k < 0 ? html.length : k) - pos + 1;
+    if (k < 0) return null;
+    const m = matchEndTag(html, k, name, st);
+    if (m.ok) return { lt: k, e: m.e };
+    pos = m.e; // 글자 묶음 뒤 글자부터 다시(그 글자가 '<' 일 수 있다)
   }
 }
 
-const isHtmlSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 12 || c === 13;
-
 /**
- * FIX-T18 round 2(Codex review-FIX-T18 놓친 케이스 "속성 안의 `>`"): 태그 이름 뒤 from 부터 태그를 끝내는 `>` 의 위치. 없으면 -1.
- * `=` 바로 뒤(공백 허용)의 따옴표 값 안 `>` 는 태그 끝이 아니다(브라우저와 같음). 닫히지 않은 따옴표는 끝까지 속성 값(-1).
- * 글자마다 한 번만 본다 — 따옴표 값은 indexOf 로 건너뛰고 그 자리부터 이어 간다(선형).
+ * script data(escaped `<!--`·double escaped `<!--<script>` 포함): from 부터 `</script` appropriate end tag 의 `<` 위치와 이름 끝. 없으면 null.
+ * double escaped 상태(주석 흉내 안의 `<script>` 뒤)에서는 `</script>` 가 script 를 끝내지 않는다 — 사양과 같다.
  */
-function findTagEnd(html: string, from: number, st: HtmlScanStats): number {
+function findScriptEnd(html: string, from: number, st: HtmlScanStats): { lt: number; e: number } | null {
   const n = html.length;
+  let state = 0; // 0 script data, 1 escaped, 2 double escaped
+  let dashes = 0; // escaped·double escaped 의 dash / dash dash 상태(0·1·2)
   let k = from;
   while (k < n) {
     const c = html.charCodeAt(k);
     st.steps++;
-    if (c === 62) return k; // '>'
-    if (c === 61) {
-      // '=' 뒤 공백을 건너뛰고 따옴표로 시작하면 짝 따옴표까지 한 번에
-      k++;
-      while (k < n && isHtmlSpace(html.charCodeAt(k))) {
+    if (state === 0) {
+      if (c !== 60 /* < */) {
         k++;
-        st.steps++;
+        continue;
       }
-      const q = html.charCodeAt(k);
-      if (q === 34 || q === 39) {
-        const close = html.indexOf(q === 34 ? '"' : "'", k + 1);
-        st.steps += (close < 0 ? n : close) - k + 1;
-        if (close < 0) return -1;
-        k = close + 1;
-      }
+      const c1 = html.charCodeAt(k + 1);
+      if (c1 === 47) {
+        const m = matchEndTag(html, k, 'script', st);
+        if (m.ok) return { lt: k, e: m.e };
+        k = m.e; // 글자 묶음은 script 글자, 그 뒤 글자는 script data 에서 다시 읽음
+      } else if (c1 === 33 && html.charCodeAt(k + 2) === 45 && html.charCodeAt(k + 3) === 45) {
+        state = 1; // <!-- → script data escaped dash dash
+        dashes = 2;
+        k += 4;
+      } else k++;
       continue;
     }
-    k++;
+    if (c === 45 /* - */) {
+      if (dashes < 2) dashes++;
+      k++;
+      continue;
+    }
+    if (c === 62 /* > */) {
+      if (dashes === 2) state = 0; // `-->` → script data
+      dashes = 0;
+      k++;
+      continue;
+    }
+    dashes = 0;
+    if (c !== 60) {
+      k++;
+      continue;
+    }
+    const c1 = html.charCodeAt(k + 1);
+    if (state === 1) {
+      if (c1 === 47) {
+        const m = matchEndTag(html, k, 'script', st);
+        if (m.ok) return { lt: k, e: m.e };
+        k = m.e;
+      } else if (isAsciiLetter(c1)) {
+        // script data double escape start: 글자 묶음이 script 이고 뒤가 공백·`/`·`>` 면 double escaped
+        let e = k + 1;
+        while (e < n && isAsciiLetter(html.charCodeAt(e))) e++;
+        st.steps += e - (k + 1);
+        const d = html.charCodeAt(e);
+        if (e < n && (isHtmlSpace(d) || d === 47 || d === 62) && e - (k + 1) === 6 && html.slice(k + 1, e).toLowerCase() === 'script') {
+          state = 2;
+          k = e + 1;
+        } else k = e;
+      } else k++;
+    } else {
+      // double escaped: `</script` + 공백·`/`·`>` 면 escaped 로 돌아감
+      if (c1 === 47) {
+        const m = matchEndTag(html, k, 'script', st);
+        if (m.ok) {
+          state = 1;
+          k = m.e + 1;
+        } else k = m.e;
+      } else k++;
+    }
   }
-  return -1;
+  return null;
+}
+
+/**
+ * 주석(`<!--` 뒤, from = `<!--` 다음 위치): 끝난 뒤 위치. EOF 면 n(나머지는 주석).
+ * comment start/start dash 의 `<!-->`·`<!--->`, comment end 의 `-->`(앞 대시 여럿 허용), comment end bang 의 `--!>` — 사양과 같다.
+ * `<!-- -- -->` 처럼 안의 `--` 는 주석을 끝내지 않는다.
+ */
+function scanComment(html: string, from: number, st: HtmlScanStats): number {
+  const n = html.length;
+  if (html.charCodeAt(from) === 62) return from + 1; // <!-->
+  if (html.charCodeAt(from) === 45 && html.charCodeAt(from + 1) === 62) return from + 2; // <!--->
+  let pos = from;
+  for (;;) {
+    const k = html.indexOf('--', pos);
+    st.steps += (k < 0 ? n : k) - pos + 1;
+    if (k < 0) return n;
+    let e = k + 2;
+    while (e < n && html.charCodeAt(e) === 45) e++;
+    st.steps += e - (k + 2) + 1;
+    if (html.charCodeAt(e) === 62) return e + 1;
+    if (html.charCodeAt(e) === 33 && html.charCodeAt(e + 1) === 62) return e + 2;
+    pos = e;
+  }
+}
+
+/** bogus comment(`<!DOCTYPE …>`·`<![CDATA[…]]>`·`<?…>`·`</ …>`·`<!x>`): 첫 `>` 다음 위치. EOF 면 n. */
+function scanBogusComment(html: string, from: number, st: HtmlScanStats): number {
+  const k = html.indexOf('>', from);
+  st.steps += (k < 0 ? html.length : k) - from + 1;
+  return k < 0 ? html.length : k + 1;
 }
 
 /**
  * HTML → 텍스트(스크립트·스타일 제거, 블록 요소는 줄바꿈). 실행·외부 요청 없음. 결과는 소재 원문에 넣는 **파생 값**이고 원본 HTML 은
  * source_version_originals 에 그대로 남는다(FIX-T18 round 1 P0 :293).
  *
- * FIX-T18 round 1(Codex review-T18 P0 :248): 정규식 대신 한 번 훑는 토큰 순회(선형 시간). 모든 탐색(indexOf)은 현재 위치에서 앞으로만 가고,
- * 찾은 곳까지 위치를 옮기거나(소비) 찾지 못하면 그 자리에서 끝낸다 — 같은 구간을 다시 훑지 않는다.
- * 닫히지 않은 주석·script/style/noscript/template/title 은 나머지를 버리고(브라우저와 같음), `>` 없는 태그 시작도 나머지를 버린다.
- *
- * FIX-T18 round 2: (P2 :366) script/style/noscript/template/title 은 `<script/>` 처럼 `/` 로 끝나도 자체 종료가 아니다(HTML 은 void 요소가 아니면
- * `/` 를 무시) — 언제나 짝 닫는 태그까지(없으면 끝까지) 버린다. 속성 따옴표 값 안의 `>` 는 태그 끝이 아니다.
- * 탐색 위치는 언제나 앞으로만 간다 — `stats.steps`(살펴본 글자 수)는 입력 길이의 상수 배 이하다(시험이 확인).
+ * FIX-T18 round 1(Codex review-T18 P0 :248): 정규식 대신 한 번 훑는 순회(선형 시간).
+ * FIX-T18 round 3(Codex review-FIX2-T18): 위 WHATWG 상태 기계. 모든 탐색은 현재 위치에서 앞으로만 간다. 예외는 닫히지 않은
+ * title·iframe·noembed·noframes 를 일반 요소로 다시 읽는 경우인데, 요소 이름마다 "이 위치 뒤에는 닫는 태그가 없음" 을 기억해 같은 이름으로
+ * 두 번 끝까지 훑지 않는다(이름 4개 → 글자마다 최대 5번) — `stats.steps`(살펴본 글자 수)는 입력 길이의 상수 배 이하다(시험이 확인).
  */
 export function htmlToText(html: string, stats?: HtmlScanStats): { text: string; title: string | null } {
   if (html.length > HTML_TO_TEXT_MAX_INPUT) throw new ImportInvalidError('HTML 이 너무 큽니다');
@@ -375,15 +576,30 @@ export function htmlToText(html: string, stats?: HtmlScanStats): { text: string;
   let h1: string[] | null = null;
   let h1Open = false;
   let h1Len = 0;
-  const emit = (s: string) => {
+  const emitRaw = (s: string) => {
+    if (s === '') return;
     out.push(s);
     if (h1Open && h1Len < 2000) {
       h1!.push(s);
       h1Len += s.length;
     }
   };
+  /** 데이터·RCDATA 글자 조각: 문자 참조를 조각 안에서만 푼다(태그를 건너 이어 붙이지 않음). */
+  const emitText = (s: string) => emitRaw(decodeEntities(s));
+  /** 닫히지 않은 RAWTEXT·RCDATA 요소: 이 위치 이후에는 그 이름의 닫는 태그가 없다(다시 끝까지 훑지 않으려고). */
+  const noEndFrom = new Map<string, number>();
+  const rawTextEnd = (name: string, from: number) => {
+    const known = noEndFrom.get(name);
+    if (known !== undefined && from >= known) return null;
+    const r = findRawTextEnd(html, name, from, st);
+    if (!r) noEndFrom.set(name, from);
+    return r;
+  };
+  /** 닫는 태그 이름 뒤(e)부터 태그 끝 — EOF 면 -1. */
+  const finishEndTag = (e: number) => scanTagAttributes(html, e, st).end;
+
   const n = html.length;
-  // pending: 아직 내보내지 않은 글자 구간의 시작. 태그가 아닌 '<' 는 글자 구간에 그대로 남긴다(조각을 만들지 않음).
+  // pending: 아직 내보내지 않은 데이터 글자 구간의 시작. 태그가 아닌 '<' 는 글자 구간에 그대로 남긴다.
   let pending = 0;
   let i = 0;
   while (i < n) {
@@ -392,44 +608,56 @@ export function htmlToText(html: string, stats?: HtmlScanStats): { text: string;
     st.steps += (lt < 0 ? n : lt) - i + 1;
     if (lt < 0) break;
     const c1 = html.charCodeAt(lt + 1);
-    const closing = c1 === 47; // '/'
-    const markup = c1 === 33 || c1 === 63; // '<!…>'(주석·DOCTYPE), '<?xml …?>'
+    // ---- tag open
+    if (c1 === 33 /* ! */) {
+      // markup declaration open: `<!--` 주석, 그 밖(DOCTYPE·[CDATA[·`<!x>`)은 HTML 문서에서 bogus comment 처럼 첫 `>` 까지
+      emitText(html.slice(pending, lt));
+      const isComment = html.charCodeAt(lt + 2) === 45 && html.charCodeAt(lt + 3) === 45;
+      pending = i = isComment ? scanComment(html, lt + 4, st) : scanBogusComment(html, lt + 2, st);
+      continue;
+    }
+    if (c1 === 63 /* ? */) {
+      emitText(html.slice(pending, lt));
+      pending = i = scanBogusComment(html, lt + 2, st);
+      continue;
+    }
+    const closing = c1 === 47;
+    if (closing) {
+      // end tag open
+      if (lt + 2 >= n) {
+        // `</` + EOF → 글자 `</`(pending 부터 끝까지 그대로 남김)
+        break;
+      }
+      const c2 = html.charCodeAt(lt + 2);
+      if (c2 === 62) {
+        emitText(html.slice(pending, lt)); // `</>` → 아무것도 아님
+        pending = i = lt + 3;
+        continue;
+      }
+      if (!isAsciiLetter(c2)) {
+        emitText(html.slice(pending, lt)); // `</ x>`·`</1>` → bogus comment
+        pending = i = scanBogusComment(html, lt + 2, st);
+        continue;
+      }
+    } else if (!isAsciiLetter(c1)) {
+      i = lt + 1; // 태그가 아닌 '<'(예: "a < b", "<3") 는 글자
+      continue;
+    }
+    // ---- tag name + attributes
+    emitText(html.slice(pending, lt));
     const nameStart = closing ? lt + 2 : lt + 1;
-    if (!markup && !isAsciiLetter(html.charCodeAt(nameStart))) {
-      i = lt + 1; // 태그가 아닌 '<'(예: "a < b") 는 글자 구간에 그대로 남긴다
-      continue;
-    }
-    if (c1 === 33 && html.startsWith('<!--', lt)) {
-      if (lt > pending) emit(html.slice(pending, lt));
-      const end = html.indexOf('-->', lt + 4);
-      st.steps += (end < 0 ? n : end + 3) - (lt + 4) + 1;
-      pending = i = end < 0 ? n : end + 3; // 닫히지 않은 주석: 나머지는 주석
-      if (end >= 0) out.push(' ');
-      continue;
-    }
-    if (lt > pending) emit(html.slice(pending, lt));
-    // 이름을 먼저 읽는다(글자 단위, 최대 11자) — 그 뒤부터 태그 끝을 찾는다.
-    let j = nameStart;
-    while (j < n && j - nameStart <= 10 && isTagNameChar(html.charCodeAt(j))) j++;
-    st.steps += j - nameStart + 1;
-    let gt: number;
-    if (markup) {
-      gt = html.indexOf('>', nameStart);
-      st.steps += (gt < 0 ? n : gt) - nameStart + 1;
-    } else {
-      gt = findTagEnd(html, j, st);
-    }
-    if (gt < 0) {
-      pending = n; // '>' 없는 태그 시작(또는 닫히지 않은 따옴표 값): 나머지는 태그(버림) — 끝까지 훑었으므로 다시 훑을 일이 없다
+    const tag = scanTag(html, nameStart, st);
+    if (tag.end < 0) {
+      pending = n; // eof-in-tag: 태그는 버린다(사양)
       break;
     }
-    pending = i = gt + 1;
-    if (markup) continue;
-    if (j - nameStart > 10) continue; // 아는 이름(최대 8자)보다 긴 이름 — 지우기만
-    const name = html.slice(nameStart, j).toLowerCase();
+    pending = i = tag.end;
+    if (tag.nameEnd - nameStart > HTML_MAX_KNOWN_NAME) continue; // 모르는 긴 이름 — 지우기만
+    const name = html.slice(nameStart, tag.nameEnd).toLowerCase();
     if (closing) {
       if (name === 'h1') h1Open = false;
-      if (HTML_BLOCK_TAGS.has(name)) out.push('\n');
+      if (name === 'br') out.push('\n'); // `</br>` 은 `<br>` 로 다룬다(사양)
+      else if (HTML_BLOCK_TAGS.has(name)) out.push('\n');
       continue;
     }
     if (name === 'br') {
@@ -441,30 +669,55 @@ export function htmlToText(html: string, stats?: HtmlScanStats): { text: string;
       h1Open = true;
       continue;
     }
-    // FIX-T18 round 2(P2 :366): 끝의 '/' 와 상관없이 raw text 요소 — 짝 닫는 태그까지(없으면 끝까지) 버린다.
-    if (HTML_RAW_TEXT_TAGS.has(name)) {
-      const end = findClosingTag(html, name, i, st);
-      if (end < 0) {
-        pending = n; // 닫히지 않은 script 등: 나머지는 그 요소의 내용(버림)
+    // 끝의 '/'(자체 종료 표시)는 void 가 아닌 요소에서 무시된다 — `<script/>` 도 script data 로 들어간다(FIX-T18 round 2 P2 :366).
+    if (name === 'script') {
+      const r = findScriptEnd(html, i, st);
+      if (!r) {
+        pending = n; // 닫히지 않은 script: 나머지는 script 내용(버림) — 브라우저와 같음
         break;
       }
-      if (name === 'title' && titleRaw === null) titleRaw = html.slice(i, Math.min(end, i + 1000));
-      out.push(' ');
-      const gt2 = findTagEnd(html, end + 2 + name.length, st);
-      pending = i = gt2 < 0 ? n : gt2 + 1;
+      const end = finishEndTag(r.e);
+      pending = i = end < 0 ? n : end;
       continue;
     }
+    if (name === 'plaintext') {
+      emitRaw(html.slice(i)); // PLAINTEXT: 나머지는 모두 글자 그대로
+      pending = n;
+      break;
+    }
+    const rawKind =
+      name === 'title' || name === 'textarea' ? 'rcdata' : HTML_RAWTEXT_DROP.has(name) || name === 'xmp' ? 'rawtext' : null;
+    if (rawKind === null) continue; // noscript·template 를 포함한 일반 요소: 안의 글자는 데이터로 계속 읽는다
+    const r = rawTextEnd(name, i);
+    if (!r) {
+      if (name === 'textarea') emitText(html.slice(i)); // RCDATA 끝까지 = 보이는 글자
+      else if (name === 'xmp') emitRaw(html.slice(i));
+      else if (HTML_RAWTEXT_DROP_TO_EOF.has(name)) {
+        /* style: 끝까지 버림(브라우저와 같음) */
+      } else continue; // title·iframe·noembed·noframes: 사양과 달리 일반 요소로 다시 읽어 글자를 남긴다(pending = i 그대로)
+      pending = n;
+      break;
+    }
+    const content = html.slice(i, r.lt);
+    if (name === 'title') {
+      if (titleRaw === null) titleRaw = content.slice(0, 1000);
+    } else if (name === 'textarea') emitText(content);
+    else if (name === 'xmp') emitRaw(content);
+    const end = finishEndTag(r.e);
+    pending = i = end < 0 ? n : end;
   }
   if (stats) stats.steps += st.steps;
-  if (pending < n) emit(html.slice(pending));
-  const oneLine = (s: string) => decodeEntities(s).replace(/\s+/g, ' ').trim();
-  const text = decodeEntities(out.join(''))
+  if (pending < n) emitText(html.slice(pending));
+  // h1 조각은 이미 문자 참조를 푼 글자, title 은 RCDATA 원문(아래에서 한 번 푼다) — 두 번 풀지 않는다.
+  const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const text = out
+    .join('')
     .split('\n')
     .map((l) => l.replace(/[ \t\f\v\r]+/g, ' ').trim())
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  const title = (h1 && oneLine(h1.join(''))) || (titleRaw !== null && oneLine(titleRaw)) || null;
+  const title = (h1 && oneLine(h1.join(''))) || (titleRaw !== null && oneLine(decodeEntities(titleRaw))) || null;
   return { text, title: title || null };
 }
 

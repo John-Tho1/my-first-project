@@ -707,6 +707,27 @@ describe('FIX-T18 round 2 — 0039 이전 가져오기의 원본 표시·보충(
     expect([...(await listBackfillableImportItemIds(db, ownerA, ledger3))]).toEqual([byExt(third.items, 'path:보충/c.html').id]);
     const reA = await commit(third.import_id, { backfill_ids: [byExt(third.items, 'path:보충/a.md').id] });
     expect((await reA.json()).error).toBe('import_invalid_selection');
+    // FIX-T18 round 3(Codex review-FIX2-T18 놓친 케이스): 반복 폼 값은 모두 읽는다 — c(후보)와 a(후보 아님)를 함께 보내면 400, 아무것도 채우지 않음.
+    const originalsMid = await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.ownerId, ownerA));
+    const twoVals = await form(third.import_id, [
+      ['backfill', byExt(third.items, 'path:보충/c.html').id],
+      ['backfill', byExt(third.items, 'path:보충/a.md').id],
+    ]);
+    expect(twoVals.status).toBe(303); // 폼 실패는 화면으로 되돌림(?error=)
+    expect(twoVals.headers.get('location')).toContain('error=import_invalid_selection');
+    // 다른 실행의 항목 ID(첫 실행의 a 원장 항목), 다른 owner 실행의 항목 ID → 400, 아무것도 채우지 않음
+    const otherRun = await commit(third.import_id, { backfill_ids: [ia!.id] });
+    expect(otherRun.status).toBe(400);
+    as(B);
+    const runB = await previewOk(zip(), tokenB, 'drive_export');
+    as(A);
+    const otherOwner = await commit(third.import_id, { backfill_ids: [byExt(runB.items, 'path:보충/c.html').id] });
+    expect(otherOwner.status).toBe(400);
+    expect(await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.ownerId, ownerA))).toBe(originalsMid);
+    expect((await db.select().from(schema.importRuns).where(eq(schema.importRuns.id, third.import_id)))[0]!.status).toBe('preview');
+    as(B);
+    await cancelPOST(jsonPost(`/api/imports/${runB.import_id}/cancel`, {}, cookieHeader(tokenB)), ctx(runB.import_id));
+    as(A);
     // 새 항목·새 버전에는 backfill 을 쓸 수 없다(동일 항목 전용)
     const mixed = await previewOk(buildTestZip([{ path: '보충/새.md', data: '# 새\n\n새 항목' }]), tokenA, 'drive_export');
     const onNew = await commit(mixed.import_id, { backfill_ids: [mixed.items[0]!.id] });

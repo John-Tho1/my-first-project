@@ -170,7 +170,8 @@ describe('FIX-T18 round 1 — HTML 선형 처리(P0 :248)', () => {
     expect(htmlToText('<script/>alert(1)</script><p>본문</p>').text).toBe('본문');
     expect(htmlToText('<style/>p{color:red}</style><p>본문</p>').text).toBe('본문');
     expect(htmlToText('<SCRIPT />x()</Script><p>본문</p>').text).toBe('본문');
-    expect(htmlToText('<noscript/>n</noscript>본문').text).toBe('본문');
+    // FIX-T18 round 3: noscript 는 scripting 꺼짐 기준 일반 요소(사양) — 안의 글자를 남긴다(round 2 의 '본문' 은 RAWTEXT 로 본 잘못된 결과).
+    expect(htmlToText('<noscript/>n</noscript>본문').text).toBe('n본문');
     expect(htmlToText('<p>앞</p><script/>닫히지 않음 <p>뒤</p>').text).toBe('앞');
     const t = htmlToText('<title/>탭 제목</title><p>본문</p>');
     expect(t).toEqual({ title: '탭 제목', text: '본문' });

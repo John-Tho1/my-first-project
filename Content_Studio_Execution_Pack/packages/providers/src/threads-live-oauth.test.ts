@@ -430,8 +430,10 @@ describe('오류 분류 순서(FIX1-LIVET1 P0) — 상태 먼저, 4xx 안에서�
     ['400 + 문자열 코드 "1" + 시크릿 문구', ['exchange', 400, { error_type: 'OAuthException', code: '1', error_message: 'Error validating client secret' }], 'provider_error', { reason: 'server_error', ambiguous: true }],
     ['400 + 코드 2 (읽기 단계 — ambiguous 아님)', ['account', 400, g('Error validating client secret', 2)], 'provider_error', { reason: 'server_error', ambiguous: false }],
     // 문구는 코드·하위 코드가 모두 없을 때만(또는 확정 범용 코드 100 을 더 구체적인 확정으로 좁힐 때만)
-    ['400 + 코드 없음 + 시크릿 문구 → invalid_client', ['exchange', 400, { error_type: 'OAuthException', error_message: 'Error validating client secret' }], 'invalid_client', {}],
-    ['400 + 코드 없음 + redirect_uri 문구 → redirect_mismatch', ['exchange', 400, { error_type: 'OAuthException', error_message: 'redirect_uri is not identical' }], 'redirect_mismatch', {}],
+    // FIX3-LIVET1(Codex review-FIX2-LIVET1 P0 :212): 아래 두 줄은 FIX2 까지 invalid_client·redirect_mismatch 를 기대했다(버그를 담은 기대) —
+    // 문구만으로는 확정하지 않으므로 더 엄격한 결과(결과 불명)로 뒤집었다. 식별자 OAuthException 은 확정 식별자가 아니다.
+    ['400 + 코드 없음 + OAuthException + 시크릿 문구 → 결과 불명(FIX3 뒤집음)', ['exchange', 400, { error_type: 'OAuthException', error_message: 'Error validating client secret' }], 'provider_error', { reason: 'oauth_exception', ambiguous: true }],
+    ['400 + 코드 없음 + OAuthException + redirect_uri 문구 → 결과 불명(FIX3 뒤집음)', ['exchange', 400, { error_type: 'OAuthException', error_message: 'redirect_uri is not identical' }], 'provider_error', { reason: 'oauth_exception', ambiguous: true }],
     ['400 + 하위 코드만 + 시크릿 문구 → 문구 안 봄(결과 불명)', ['exchange', 400, { error: { message: 'Error validating client secret', type: 'OAuthException', error_subcode: 1349 } }], 'provider_error', { reason: 'oauth_exception', ambiguous: true, providerSubcode: 1349 }],
     ['400 + 모르는 코드 + 시크릿 문구 → 문구 안 봄(결과 불명)', ['exchange', 400, g('Error validating client secret', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: true, providerCode: 999 }],
     ['400 + 코드 100 + 시크릿 문구 → invalid_client(확정 범용 코드만 좁힘)', ['exchange', 400, g('Error validating client secret', 100)], 'invalid_client', {}],
@@ -470,6 +472,90 @@ describe('오류 분류 순서(FIX1-LIVET1 P0) — 상태 먼저, 4xx 안에서�
     expect(e.code).toBe('invalid_token');
     expect(e.detail).toMatchObject({ step: 'long_lived', shortTokenIssued: true });
     expect(inspect(e, { depth: Infinity })).not.toContain(SHORT);
+  });
+});
+
+// FIX3-LIVET1(Codex review-FIX2-LIVET1 P0 :212·놓친 케이스): 숫자 코드 없는 문자열 오류 식별자는 문구보다 먼저 — 문구는 확정 결과만 좁힌다
+describe('문자열 오류 식별자 우선(FIX3-LIVET1 P0)', () => {
+  const o = (error: string, error_description?: string) => ({ error, ...(error_description !== undefined ? { error_description } : {}) });
+  const SECRET_MSG = 'Temporary error validating client secret.';
+  const REDIRECT_MSG = 'Please retry. redirect_uri could not be verified';
+  type Row = [string, Parameters<typeof mapThreadsError>, OAuthProviderErrorCode, Record<string, unknown>];
+  const UNKNOWN_W = { reason: 'oauth_exception', ambiguous: true };
+  const SERVER_W = { reason: 'server_error', ambiguous: true };
+  const rows: Row[] = [
+    // Codex 재현 입력 그대로
+    ['Codex 재현: temporarily_unavailable + "Temporary error validating client secret."', ['exchange', 400, o('temporarily_unavailable', SECRET_MSG)], 'provider_error', SERVER_W],
+    ['Codex 재현: server_error + redirect_uri 문구', ['exchange', 400, o('server_error', REDIRECT_MSG)], 'provider_error', SERVER_W],
+    ['slow_down + 시크릿 문구 → 제한(쓰기 단계 결과 불명)', ['exchange', 400, o('slow_down', SECRET_MSG), { retryAfter: '5' }], 'provider_error', { reason: 'rate_limited', ambiguous: true, retryAfterSec: 5 }],
+    ['대문자·공백 " Temporarily_Unavailable " → 일시', ['long_lived', 400, o(' Temporarily_Unavailable ', 'Invalid client_id')], 'provider_error', SERVER_W],
+    ['Graph 형식 type=temporarily_unavailable(코드 없음) + 시크릿 문구', ['exchange', 400, { error: { message: SECRET_MSG, type: 'temporarily_unavailable' } }], 'provider_error', SERVER_W],
+    ['Threads 형식 error_type=server_error + redirect_uri 문구', ['exchange', 400, { error_type: 'server_error', error_message: REDIRECT_MSG }], 'provider_error', SERVER_W],
+    ['일시 식별자 + 확정 코드 190 → 일시가 이긴다', ['refresh', 400, { error: { message: 'x', type: 'temporarily_unavailable', code: 190 } }], 'provider_error', SERVER_W],
+    ['읽기 단계 server_error → server_error, ambiguous 아님', ['account', 400, o('server_error', SECRET_MSG)], 'provider_error', { reason: 'server_error', ambiguous: false }],
+    ['읽기 단계 slow_down → rate_limited, ambiguous 없음', ['account', 400, o('slow_down')], 'provider_error', { reason: 'rate_limited' }],
+    // 모르는 식별자 → 문구로 확정하지 않는다
+    ['모르는 식별자 + 시크릿 문구 → 결과 불명', ['exchange', 400, o('some_new_error', 'Error validating client secret')], 'provider_error', UNKNOWN_W],
+    ['모르는 식별자 + redirect_uri 문구 → 결과 불명', ['exchange', 400, o('weird', 'redirect_uri mismatch')], 'provider_error', UNKNOWN_W],
+    ['OAuthException(코드 없음) + 시크릿 문구(장기 교환) → 결과 불명', ['long_lived', 400, { error: { message: 'Error validating client secret', type: 'OAuthException' } }], 'provider_error', UNKNOWN_W],
+    ['식별자 없음 + 문구만(Graph) → 결과 불명', ['exchange', 400, { error: { message: 'Error validating client secret' } }], 'provider_error', UNKNOWN_W],
+    ['빈 문자열 식별자 + 시크릿 문구 → 결과 불명', ['exchange', 400, o('', 'Error validating client secret')], 'provider_error', UNKNOWN_W],
+    ['읽기 단계 모르는 식별자 + 시크릿 문구 → invalid_request(문구로 invalid_client 안 함)', ['account', 400, o('weird', 'Error validating client secret')], 'invalid_request', {}],
+    // 확정 식별자 → 확정(범용만 문구로 좁힘)
+    ['invalid_grant(교환)', ['exchange', 400, o('invalid_grant', 'code already used')], 'invalid_grant', {}],
+    ['invalid_grant + redirect_uri 문구(교환) → redirect_mismatch', ['exchange', 400, o('invalid_grant', 'redirect_uri does not match')], 'redirect_mismatch', {}],
+    ['invalid_grant(갱신) → invalid_token', ['refresh', 400, o('invalid_grant')], 'invalid_token', {}],
+    ['invalid_request + redirect_uri 문구(교환) → redirect_mismatch', ['exchange', 400, o('invalid_request', 'Invalid redirect_uri')], 'redirect_mismatch', {}],
+    ['invalid_request + 시크릿 문구 → invalid_client', ['exchange', 400, o('invalid_request', 'Missing client_secret')], 'invalid_client', {}],
+    ['invalid_request 문구 없음 → invalid_request', ['long_lived', 400, o('invalid_request')], 'invalid_request', {}],
+    ['invalid_client', ['exchange', 401, o('invalid_client', 'redirect_uri ok')], 'invalid_client', {}],
+    ['unauthorized_client', ['exchange', 400, o('unauthorized_client')], 'invalid_client', {}],
+    ['unsupported_grant_type + redirect_uri 문구 → invalid_request(좁히지 않음)', ['exchange', 400, o('unsupported_grant_type', 'redirect_uri')], 'invalid_request', {}],
+    ['invalid_scope', ['exchange', 400, o('invalid_scope')], 'scope_not_allowed', {}],
+    ['access_denied', ['exchange', 400, o('access_denied')], 'scope_not_allowed', {}],
+    ['invalid_token(읽기)', ['account', 401, o('invalid_token', 'client secret')], 'invalid_token', {}],
+    ['redirect_uri_mismatch(교환)', ['exchange', 400, o('redirect_uri_mismatch')], 'redirect_mismatch', {}],
+    // 하위 코드만 있으면 확정 식별자여도 확정하지 않는다
+    ['invalid_grant + 하위 코드만 → 결과 불명', ['exchange', 400, { error: { message: 'x', type: 'invalid_grant', error_subcode: 1349 } }], 'provider_error', UNKNOWN_W],
+    // 형식 깨진 코드 → "코드 없음"이 아니라 알 수 없음
+    ['코드 "1.0" + invalid_client 식별자 → 결과 불명', ['exchange', 400, { error_type: 'invalid_client', code: '1.0', error_message: 'Error validating client secret' }], 'provider_error', UNKNOWN_W],
+    ['코드 "abc" + OAuthException + redirect 문구 → 결과 불명', ['exchange', 400, { error: { message: 'redirect_uri', type: 'OAuthException', code: 'abc' } }], 'provider_error', UNKNOWN_W],
+    ['코드 200.5(소수) → scope_not_allowed 아님, 결과 불명', ['exchange', 400, { error: { message: 'x', type: 'OAuthException', code: 200.5 } }], 'provider_error', UNKNOWN_W],
+    ['코드 -1 → 결과 불명', ['exchange', 400, { error: { message: 'x', type: 'OAuthException', code: -1 } }], 'provider_error', UNKNOWN_W],
+    ['하위 코드 "x" + 확정 코드 190 → 결과 불명', ['long_lived', 400, { error: { message: 'x', type: 'OAuthException', code: 190, error_subcode: 'x' } }], 'provider_error', UNKNOWN_W],
+    ['형식 깨진 코드 + is_transient=true → 일시', ['exchange', 400, { error: { message: 'x', type: 'OAuthException', code: '1e3', is_transient: true } }], 'provider_error', SERVER_W],
+    // FIX3(Q10): 숫자 제한 코드도 쓰기 단계면 결과 불명
+    ['코드 341(쓰기) → rate_limited + ambiguous', ['exchange', 400, { error: { message: 'x', type: 'OAuthException', code: 341 } }], 'provider_error', { reason: 'rate_limited', ambiguous: true }],
+  ];
+  it.each(rows)('%s', (_label, args, code, detail) => {
+    const e = mapThreadsError(...args);
+    expect(e.code).toBe(code);
+    expect(e.detail).toMatchObject(detail);
+    if (!('ambiguous' in detail) && args[0] !== 'account' && code === 'provider_error') expect(e.detail?.ambiguous).toBeUndefined();
+    expect(JSON.stringify(e.detail)).not.toMatch(/secret|client_id|redirect_uri|temporarily|slow_down|verified/i);
+  });
+  it('일시 식별자 × 문구 표 — 어떤 문구든 쓰기 단계 3곳 모두 확정 거절이 되지 않는다', () => {
+    const ids = ['temporarily_unavailable', 'server_error', 'service_unavailable', 'internal_error', 'internal_server_error', 'timeout', 'request_timeout', 'slow_down', 'rate_limited', 'rate_limit_exceeded', 'too_many_requests'];
+    const msgs = ['', SECRET_MSG, REDIRECT_MSG, 'Invalid client_id', 'Invalid OAuth access token', 'Matching code was not found or was already used', 'invalid_grant'];
+    for (const step of ['exchange', 'long_lived', 'refresh'] as const) {
+      for (const id of ids) {
+        for (const m of msgs) {
+          for (const body of [o(id, m), { error: { message: m, type: id } }, { error_type: id, error_message: m }]) {
+            const e = mapThreadsError(step, 400, body);
+            expect(e.code, `${step} ${id} "${m}"`).toBe('provider_error');
+            expect(e.detail?.ambiguous, `${step} ${id} "${m}"`).toBe(true);
+            expect(['server_error', 'rate_limited']).toContain(e.detail?.reason);
+          }
+        }
+      }
+    }
+  });
+  it('공급자 경유: 코드 교환 400 { error: temporarily_unavailable, error_description: 시크릿 문구 } → ambiguous, 장기 교환 안 부름', async () => {
+    const { fetch, seen } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: () => jsonRes(400, o('temporarily_unavailable', SECRET_MSG)) });
+    const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail).toMatchObject({ reason: 'server_error', step: 'exchange', ambiguous: true, httpStatus: 400 });
+    expect(seen).toHaveLength(1);
   });
 });
 

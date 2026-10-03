@@ -423,3 +423,12 @@
 - 상태: **잠정**. 아래 "User decision required" 항목은 실계정 연결 전 사용자 확인이 필요하다(D24 와 같은 원칙). 특히 공개 미디어 URL 방식은 개인 첨부를 외부에서 접근 가능하게 만드는 결정이라 사용자 승인 전에는 모의 구현만 둔다.
 
 ## Proposed D29 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D30 — 사용자 결정 (2026-10-03 아침): D29 공개 미디어 URL·D26/D27·D23·D28·실계정 준비·T17 보류·M5 착수
+- Decision ID / date: D30 / 2026-10-03 (Europe/Moscow), 사용자 확정.
+1. **D29(a) 공개 미디어 URL 방식: ① 채택** — 이 앱이 짧은 수명의 서명 URL 로 미디어를 직접 제공한다. 결과: 실제 Instagram 게시에는 앱이 인터넷에서 HTTPS 로 접근 가능해야 하므로 운영 배포(T21, 별도 승인)가 선행 조건이다. 로컬(localhost)에서는 실제 Instagram 이 파일을 가져갈 수 없다. 구현 원칙(실계정 작업 때): 서명·만료(분 단위)·1회성 또는 짧은 재사용, 경로에 asset ID·checksum 노출 금지, 접근 로그 기록, 원격이 가져간 뒤 철회, 승인된 checksum 과 같은 바이트만 제공. 그 전까지는 모의 구현(MockPublicMediaUrlProvider) 유지. D29 의 나머지(b~) 수치·이름은 잠정 유지.
+2. **D26(Threads)·D27(YouTube): 잠정값 그대로 진행** — 실계정 연결 시 공식 문서로 재확인하는 원칙(각 D 의 When to revisit)은 그대로.
+3. **D23 남은 항목: Codex 권고대로 옮긴다** — 공개 `/api/health` 의 `jobs`(상태별 수·attention_plans)·`uploads`·`db.captures` 를 로그인 뒤(GET /api/ops/summary, owner 범위)로 옮기고 공개 health 는 생존·준비 상태만.
+4. **D28: 현재 방식 유지** — 인계·판정 사본은 docs/handoffs/ 에 추적, docs 전용 커밋으로만.
+5. **실계정 연결 준비물: 사용자 "준비됨"** — 실제 외부 연결·호출·게시는 정확한 범위(첫 채널·첫 시험의 원고·공개 범위·호출 종류·자격 증명 위치)를 사용자가 승인한 뒤에만(AGENTS.md "Before real external connections … present exact scope for explicit approval"). 앱 ID·비밀 값은 사용자가 `.env.local` 에 직접 넣고, 대화·저장소·로그에는 남기지 않는다.
+6. **T17 추가 채널: 보류. M5 모의 작업 착수** — T18(Notion·Drive 선택 가져오기, 파일·모의), T19(허용 소스 수집, 모의 수집기·기본 OFF). T21(운영 배포)은 별도 승인.

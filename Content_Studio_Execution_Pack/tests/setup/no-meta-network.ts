@@ -10,10 +10,12 @@
  *  3) node:http·node:https 의 request·get
  *  4) node:net 의 connect·createConnection, node:tls 의 connect(호스트·servername), net.Socket.prototype.connect(모든 TCP·TLS 연결의 마지막 관문 —
  *     http.Agent·ClientRequest 직접 생성도 여기로 온다)
- *  5) node:dns 의 lookup·resolve·resolve4·resolve6·resolveAny·resolveCname 과 dns.promises 의 같은 함수
+ *  5) node:dns 의 lookup 과 resolve* 전부(resolve·resolve4·resolve6·resolveAny·resolveCname·resolveTxt·resolveMx·resolveSrv·resolveNs … 이 Node 에 있는 것),
+ *     dns.promises 의 같은 함수, 그리고 FIX2-LIVET1(Codex review-FIX-LIVET1 P2 :169) **new dns.Resolver()·new dns.promises.Resolver() 의 인스턴스
+ *     메서드**(Resolver.prototype 의 resolve* — 하위 클래스 포함). reverse·lookupService 는 IP 를 받으므로 판별하지 않는다.
  *  CJS 내보내기를 바꾼 뒤 syncBuiltinESMExports() 로 ESM 이름 가져오기(import { request } from 'node:https')에도 반영한다.
  * 막지 못하는 것(남은 위험): 자식 프로세스·worker_threads(이 setup 이 돌지 않음), 시험 안에서 vi.stubGlobal('fetch', …)로 바꾼 fetch(fixture —
- * 실제 전송은 2)~4)가 여전히 막는다), 이미 해석한 IP 로의 직접 연결(호스트 이름이 없어 판별 불가), 네이티브 애드온·process.binding.
+ * 실제 전송은 2)~4)가 여전히 막는다), 이미 해석한 IP 로의 직접 연결·dns.reverse/lookupService(호스트 이름이 없어 판별 불가), 네이티브 애드온·process.binding.
  * 오류 메시지·기록에는 호스트 이름과 경로 종류만 남긴다(질의 문자열의 시크릿·토큰 없음).
  */
 import { afterAll } from 'vitest';
@@ -32,6 +34,8 @@ export interface GuardState {
   original: typeof fetch;
   /** 설치한 dispatcher 감싸개(afterAll 에서 그대로인지 확인) */
   dispatcher: unknown;
+  /** FIX2-LIVET1: Resolver.prototype(콜백·promises)까지 감쌌는지 */
+  dnsResolverGuarded?: boolean;
 }
 
 const g = globalThis as typeof globalThis & { __csMetaNetworkGuard?: GuardState };
@@ -164,23 +168,45 @@ if (!g.__csMetaNetworkGuard) {
     return socketConnect.apply(this, args);
   } as typeof net.Socket.prototype.connect;
 
-  // 5) dns
+  // 5) dns — FIX2-LIVET1(Codex review-FIX-LIVET1 P2 :169): 모듈 함수(콜백·promises)는 기본 Resolver 에 묶인 사본이라
+  // Resolver.prototype 을 바꿔도 반영되지 않는다 → 둘 다 바꾼다. 이름 목록을 고정하지 않고 lookup + resolve* 전부(resolveTxt·resolveMx·resolveSrv·
+  // resolveNs·resolveSoa·resolveCaa·resolveNaptr·resolvePtr·resolveTlsa 등, 이 Node 에 있는 것)를 감싼다.
+  // reverse·lookupService 는 IP 를 받는다(호스트 이름이 없어 판별 불가 — 남은 위험, IP 직접 연결과 같은 부류).
   const dns = require('node:dns') as typeof import('node:dns');
-  const DNS_FNS = ['lookup', 'resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCname'] as const;
-  for (const fn of DNS_FNS) {
-    const orig = (dns as unknown as Record<string, (...a: unknown[]) => unknown>)[fn]!;
-    (dns as unknown as Record<string, unknown>)[fn] = function guardedDns(this: unknown, ...args: unknown[]) {
+  const isDnsName = (k: string) => k === 'lookup' || /^resolve/.test(k);
+  const wrapCallbackDns = (target: Record<string, unknown>, fn: string, via: string) => {
+    const orig = target[fn] as (...a: unknown[]) => unknown;
+    target[fn] = function guardedDns(this: unknown, ...args: unknown[]) {
       const host = isBlockedHost(args[0]);
-      if (host) throw refuse(host, `dns.${fn}`);
+      if (host) throw refuse(host, via);
       return orig.apply(this, args);
     };
-    const porig = (dns.promises as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[fn]!;
-    (dns.promises as unknown as Record<string, unknown>)[fn] = function guardedDnsPromise(this: unknown, ...args: unknown[]) {
+  };
+  const wrapPromiseDns = (target: Record<string, unknown>, fn: string, via: string) => {
+    const orig = target[fn] as (...a: unknown[]) => Promise<unknown>;
+    target[fn] = function guardedDnsPromise(this: unknown, ...args: unknown[]) {
       const host = isBlockedHost(args[0]);
-      if (host) return Promise.reject(refuse(host, `dns.promises.${fn}`));
-      return porig.apply(this, args);
+      if (host) return Promise.reject(refuse(host, via));
+      return orig.apply(this, args);
     };
+  };
+  const dnsMod = dns as unknown as Record<string, unknown>;
+  const dnsPromises = dns.promises as unknown as Record<string, unknown>;
+  for (const fn of Object.keys(dnsMod)) if (isDnsName(fn) && typeof dnsMod[fn] === 'function') wrapCallbackDns(dnsMod, fn, `dns.${fn}`);
+  for (const fn of Object.keys(dnsPromises)) if (isDnsName(fn) && typeof dnsPromises[fn] === 'function') wrapPromiseDns(dnsPromises, fn, `dns.promises.${fn}`);
+  // new dns.Resolver() · new dns.promises.Resolver() 의 인스턴스 메서드(하위 클래스 포함 — 프로토타입 사슬)
+  for (const [proto, wrap, via] of [
+    [dns.Resolver.prototype, wrapCallbackDns, 'dns.Resolver'],
+    [dns.promises.Resolver.prototype, wrapPromiseDns, 'dns.promises.Resolver'],
+  ] as const) {
+    const p = proto as unknown as Record<string, unknown>;
+    for (const fn of Object.getOwnPropertyNames(p)) {
+      if (!/^resolve/.test(fn)) continue;
+      const d = Object.getOwnPropertyDescriptor(p, fn);
+      if (d && typeof d.value === 'function') wrap(p, fn, `${via}.${fn}`);
+    }
   }
+  state.dnsResolverGuarded = true;
   syncBuiltinESMExports();
 }
 

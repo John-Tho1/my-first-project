@@ -423,6 +423,23 @@ describe('코드 교환 실패 — 오류 매핑·결과 불명(ambiguous)', () 
     expect(rej.sanitizedDetails).not.toHaveProperty('short_token_issued');
     expect(await credRow(account.id)).toBeNull();
   });
+  // FIX2-LIVET1(Codex review-FIX-LIVET1 P0 :138·놓친 케이스): 400 + 일시 코드 1/2 + 시크릿·redirect 문구 → 문구가 일시 코드를 덮지 않는다
+  it.each([
+    ['코드 2 + "Temporary error validating client secret"', 2, 'Temporary error validating client secret'],
+    ['코드 1 + redirect_uri 문구', 1, 'Error validating verification code. Please make sure your redirect_uri is identical'],
+  ] as const)('FIX2-LIVET1(P0): 코드 교환 400 + %s → invalid_client·redirect_mismatch 가 아니라 outcome unknown, 감사 outcome_ambiguous=yes', async (_label, code, message) => {
+    const { account } = await createLive();
+    liveEnv();
+    useFixture({ [`POST ${THREADS_TOKEN_URL}`]: () => jsonRes(400, { error: { message, type: 'OAuthException', code } }) });
+    const r = await callback({ code: `FAKE_code_LIVET1_400_${code}_cccccccccc`, state: (await startLive(account.id)).state });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'oauth_exchange_failed', reason: 'provider_error', outcome: 'unknown' });
+    expect(calls).toHaveLength(1);
+    const rej = (await auditFor(account.id)).filter((e) => e.action === 'oauth.callback_rejected').at(-1)!;
+    expect(rej.sanitizedDetails).toMatchObject({ provider_error: 'provider_error', provider_reason: 'server_error', provider_step: 'exchange', outcome_ambiguous: 'yes' });
+    expect(JSON.stringify(rej)).not.toMatch(/validating|redirect_uri is/);
+    expect(await credRow(account.id)).toBeNull();
+  });
 });
 
 describe('모의 경로는 그대로', () => {

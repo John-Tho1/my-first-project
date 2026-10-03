@@ -142,14 +142,23 @@ describe('코드 교환 → 장기 토큰', () => {
     expect(e.detail).toMatchObject({ reason: 'oauth_exception', step: 'exchange', httpStatus: 400, providerCode: 400 });
     expect(seen).toHaveLength(1);
   });
-  it('앱 시크릿 거부 → invalid_client(메시지 원문은 결과에 없다)', async () => {
+  it('앱 시크릿 거부(코드 101) → invalid_client(메시지 원문은 결과에 없다)', async () => {
     const { fetch } = fixtureFetch({
-      [K('POST', THREADS_TOKEN_URL)]: () => jsonRes(400, { error: { message: 'Error validating client secret.', type: 'OAuthException', code: 1, fbtrace_id: 'FAKE' } }),
+      [K('POST', THREADS_TOKEN_URL)]: () => jsonRes(400, { error: { message: 'Error validating client secret.', type: 'OAuthException', code: 101, fbtrace_id: 'FAKE' } }),
     });
     const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
     expect(e.code).toBe('invalid_client');
     expect(JSON.stringify(e.detail)).not.toContain('validating');
     expect(e.message).toBe('oauth provider error: invalid_client');
+  });
+  it('FIX2-LIVET1(P0): 400 + 일시 코드 1·2 + 시크릿·redirect 문구 → invalid_client·redirect_mismatch 가 아니라 결과 불명(ambiguous)', async () => {
+    for (const [message, code] of [['Error validating client secret.', 1], ['Temporary error validating client secret', 2], ['redirect_uri is not identical', 1], ['redirect_uri mismatch', 2]] as const) {
+      const { fetch, seen } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: () => jsonRes(400, { error: { message, type: 'OAuthException', code } }) });
+      const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+      expect(e.code, message).toBe('provider_error');
+      expect(e.detail).toEqual({ reason: 'server_error', step: 'exchange', httpStatus: 400, providerCode: code, ambiguous: true });
+      expect(seen).toHaveLength(1);
+    }
   });
   it('redirect_uri 불일치 오류 → redirect_mismatch, 등록값과 다른 redirect 는 보내기 전에 거부', async () => {
     const { fetch } = fixtureFetch({
@@ -256,6 +265,8 @@ describe('오류 매핑 표', () => {
     [['account', 400, { error: { message: 'x', type: 'OAuthException', code: 32 } }], 'provider_error', { reason: 'rate_limited' }],
     [['account', 400, { error: { message: 'x', type: 'OAuthException', code: 613 } }], 'provider_error', { reason: 'rate_limited' }],
     [['account', 429, null, '30'], 'provider_error', { reason: 'rate_limited', retryAfterSec: 30 }],
+    [['account', 400, { error: { message: 'x', type: 'OAuthException', code: 341 } }], 'provider_error', { reason: 'rate_limited' }],
+    [['account', 400, { error: { message: 'x', type: 'OAuthException', code: 80014 } }], 'provider_error', { reason: 'rate_limited' }],
     [['account', 500, null], 'provider_error', { reason: 'server_error', ambiguous: false }],
     [['exchange', 502, null], 'provider_error', { reason: 'server_error', ambiguous: true }],
     [['refresh', 400, { error: { message: 'x', type: 'OAuthException', code: 2 } }], 'provider_error', { reason: 'server_error', ambiguous: true }],
@@ -406,16 +417,38 @@ describe('오류 분류 순서(FIX1-LIVET1 P0) — 상태 먼저, 4xx 안에서�
     ['400 + 코드 10, 문구에 client secret', ['exchange', 400, g('client secret permission', 10)], 'scope_not_allowed', {}],
     ['400 + 코드 4, 문구에 client secret', ['exchange', 400, g('client secret rate', 4)], 'provider_error', { reason: 'rate_limited' }],
     // 4xx 문구는 최후 수단
-    ['400 + 코드 1 "Error validating client secret."', ['exchange', 400, g('Error validating client secret.', 1)], 'invalid_client', { providerCode: 1 }],
+    // FIX2-LIVET1(Codex review-FIX-LIVET1 P0 :138): 일시 코드는 문구보다 먼저 — 문구가 일시 코드를 확정 실패로 바꾸지 않는다
+    ['400 + 코드 1 "Error validating client secret."(FIX2 재현)', ['exchange', 400, g('Error validating client secret.', 1)], 'provider_error', { reason: 'server_error', ambiguous: true, providerCode: 1 }],
+    ['400 + 코드 2 "Temporary error validating client secret"(Codex 재현)', ['exchange', 400, g('Temporary error validating client secret', 2)], 'provider_error', { reason: 'server_error', ambiguous: true, providerCode: 2 }],
+    ['400 + 코드 1 redirect_uri 문구', ['exchange', 400, g('redirect_uri is not identical', 1)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['400 + 코드 2 invalid client_id 문구(장기 교환)', ['long_lived', 400, g('Invalid client_id', 2)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['403 + 코드 4 + 시크릿 문구 → 제한', ['exchange', 403, g('Error validating client secret', 4)], 'provider_error', { reason: 'rate_limited' }],
+    ['400 + 코드 341 + redirect_uri 문구 → 제한', ['exchange', 400, g('redirect_uri', 341)], 'provider_error', { reason: 'rate_limited' }],
+    ['400 + 코드 80002(BUC) + client_id 문구 → 제한', ['exchange', 400, g('Invalid client_id', 80002)], 'provider_error', { reason: 'rate_limited' }],
+    ['400 + 모르는 코드 + is_transient=true + 시크릿 문구', ['exchange', 400, g('Error validating client secret', 999, { is_transient: true })], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['400 + 코드 190 + is_transient=true(일시가 이긴다)', ['refresh', 400, g('Invalid OAuth access token', 190, { is_transient: true })], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['400 + 문자열 코드 "1" + 시크릿 문구', ['exchange', 400, { error_type: 'OAuthException', code: '1', error_message: 'Error validating client secret' }], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['400 + 코드 2 (읽기 단계 — ambiguous 아님)', ['account', 400, g('Error validating client secret', 2)], 'provider_error', { reason: 'server_error', ambiguous: false }],
+    // 문구는 코드·하위 코드가 모두 없을 때만(또는 확정 범용 코드 100 을 더 구체적인 확정으로 좁힐 때만)
+    ['400 + 코드 없음 + 시크릿 문구 → invalid_client', ['exchange', 400, { error_type: 'OAuthException', error_message: 'Error validating client secret' }], 'invalid_client', {}],
+    ['400 + 코드 없음 + redirect_uri 문구 → redirect_mismatch', ['exchange', 400, { error_type: 'OAuthException', error_message: 'redirect_uri is not identical' }], 'redirect_mismatch', {}],
+    ['400 + 하위 코드만 + 시크릿 문구 → 문구 안 봄(결과 불명)', ['exchange', 400, { error: { message: 'Error validating client secret', type: 'OAuthException', error_subcode: 1349 } }], 'provider_error', { reason: 'oauth_exception', ambiguous: true, providerSubcode: 1349 }],
+    ['400 + 모르는 코드 + 시크릿 문구 → 문구 안 봄(결과 불명)', ['exchange', 400, g('Error validating client secret', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: true, providerCode: 999 }],
+    ['400 + 코드 100 + 시크릿 문구 → invalid_client(확정 범용 코드만 좁힘)', ['exchange', 400, g('Error validating client secret', 100)], 'invalid_client', {}],
     ['400 + 코드 1 그 밖 문구', ['exchange', 400, g('An unknown error occurred', 1)], 'provider_error', { reason: 'server_error', ambiguous: true }],
     ['400 + 코드 100 redirect_uri', ['exchange', 400, g('redirect_uri is not identical', 100)], 'redirect_mismatch', {}],
     // 코드 교환: 알려진 코드만 invalid_grant
     ['exchange 400 코드 400', ['exchange', 400, t('Matching code was not found or was already used', 400)], 'invalid_grant', {}],
     ['exchange 400 코드 100', ['exchange', 400, g('Invalid verification code format', 100)], 'invalid_grant', {}],
     ['exchange 400 문자열 invalid_grant', ['exchange', 400, { error: 'invalid_grant' }], 'invalid_grant', {}],
-    ['exchange 401 형식 본문·모르는 코드', ['exchange', 401, g('x', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: false, httpStatus: 401, providerCode: 999 }],
-    ['exchange 405 형식 본문·코드 없음', ['exchange', 405, { error_type: 'OAuthException', error_message: 'x' }], 'provider_error', { reason: 'oauth_exception', ambiguous: false, httpStatus: 405 }],
-    ['exchange 404 형식 본문', ['exchange', 404, g('Unknown path', 803)], 'provider_error', { reason: 'oauth_exception', ambiguous: false }],
+    // FIX2-LIVET1(Codex review-FIX-LIVET1 Q7): 확정 거절로 검증된 코드만 확정 — 모르는 코드·분류 안 되는 본문은 쓰기 단계면 결과 불명
+    ['exchange 401 형식 본문·모르는 코드', ['exchange', 401, g('x', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: true, httpStatus: 401, providerCode: 999 }],
+    ['exchange 405 형식 본문·코드 없음', ['exchange', 405, { error_type: 'OAuthException', error_message: 'x' }], 'provider_error', { reason: 'oauth_exception', ambiguous: true, httpStatus: 405 }],
+    ['exchange 404 형식 본문', ['exchange', 404, g('Unknown path', 803)], 'provider_error', { reason: 'oauth_exception', ambiguous: true }],
+    ['long_lived 400 모르는 코드', ['long_lived', 400, g('x', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: true }],
+    ['refresh 400 코드 100(24시간 안 갱신 — 확정)', ['refresh', 400, g('Token too new', 100)], 'invalid_request', {}],
+    ['account 400 모르는 코드(읽기 — 확정 거절)', ['account', 400, g('x', 999)], 'invalid_request', {}],
+    ['account 401 모르는 코드(읽기)', ['account', 401, g('x', 999)], 'invalid_token', {}],
   ];
   it.each(rows)('%s', (_label, args, code, detail) => {
     const e = mapThreadsError(...args);
@@ -437,6 +470,49 @@ describe('오류 분류 순서(FIX1-LIVET1 P0) — 상태 먼저, 4xx 안에서�
     expect(e.code).toBe('invalid_token');
     expect(e.detail).toMatchObject({ step: 'long_lived', shortTokenIssued: true });
     expect(inspect(e, { depth: Infinity })).not.toContain(SHORT);
+  });
+});
+
+// FIX2-LIVET1(Codex review-FIX-LIVET1 P2 :127): 제한 정보(Retry-After·BUC 사용량 헤더의 회복 시간)는 429 밖의 제한 코드에서도 숫자로만 남는다
+describe('제한 응답의 다시 시도 시간(FIX2-LIVET1 P2)', () => {
+  const lim = (code: number) => ({ error: { message: 'Application request limit reached', type: 'OAuthException', code } });
+  type Row = [string, Parameters<typeof mapThreadsError>, number | undefined];
+  const buc = (m: unknown) => JSON.stringify({ '1234': [{ type: 'threads', call_count: 100, total_cputime: 5, total_time: 5, estimated_time_to_regain_access: m }] });
+  const rows: Row[] = [
+    ['400 + 코드 4 + Retry-After 120(Codex 재현)', ['exchange', 400, lim(4), { retryAfter: '120' }], 120],
+    ['403 + 코드 17 + Retry-After 문자열 인자', ['account', 403, lim(17), '45'], 45],
+    ['400 + 코드 613 + BUC 5분', ['refresh', 400, lim(613), { businessUseCaseUsage: buc(5) }], 300],
+    ['400 + 코드 32 + Retry-After 60 · BUC 3분 → 긴 쪽', ['account', 400, lim(32), { retryAfter: '60', businessUseCaseUsage: buc(3) }], 180],
+    ['429 + BUC 2분(Retry-After 없이)', ['account', 429, null, { businessUseCaseUsage: buc(2) }], 120],
+    ['429 + Retry-After 0', ['account', 429, null, '0'], 0],
+    ['400 + 코드 4 + Retry-After 음수 → 없음', ['account', 400, lim(4), { retryAfter: '-5' }], undefined],
+    ['400 + 코드 4 + Retry-After 소수 → 없음', ['account', 400, lim(4), { retryAfter: '1.5' }], undefined],
+    ['400 + 코드 4 + Retry-After HTTP-date → 없음(읽지 않음)', ['account', 400, lim(4), { retryAfter: 'Wed, 21 Oct 2026 07:28:00 GMT' }], undefined],
+    ['400 + 코드 4 + Retry-After 너무 큼 → 없음', ['account', 400, lim(4), { retryAfter: '10000000' }], undefined],
+    ['400 + 코드 4 + BUC 깨진 JSON → 없음', ['account', 400, lim(4), { businessUseCaseUsage: '{not json' }], undefined],
+    ['400 + 코드 4 + BUC 음수·문자 → 없음', ['account', 400, lim(4), { businessUseCaseUsage: JSON.stringify({ a: [{ estimated_time_to_regain_access: -1 }, { estimated_time_to_regain_access: '9' }] }) }], undefined],
+    ['400 + 코드 4 + 힌트 없음', ['account', 400, lim(4), null], undefined],
+  ];
+  it.each(rows)('%s', (_label, args, sec) => {
+    const e = mapThreadsError(...args);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail?.reason).toBe('rate_limited');
+    if (sec === undefined) expect(e.detail).not.toHaveProperty('retryAfterSec');
+    else expect(e.detail?.retryAfterSec).toBe(sec);
+    // 원 헤더 값(날짜·JSON·사용량 수치)은 결과에 없다 — 숫자 필드만
+    expect(JSON.stringify(e.detail)).not.toMatch(/GMT|call_count|total_cputime|not json|threads"/);
+  });
+  it('제한이 아닌 오류(확정·5xx)에는 retryAfterSec 를 붙이지 않는다', () => {
+    expect(mapThreadsError('account', 400, { error: { message: 'x', type: 'OAuthException', code: 190 } }, { retryAfter: '30' }).detail).not.toHaveProperty('retryAfterSec');
+    expect(mapThreadsError('account', 503, null, { retryAfter: '30' }).detail).not.toHaveProperty('retryAfterSec');
+  });
+  it('공급자 경유: 400 + 코드 4 + Retry-After·BUC 헤더 → retryAfterSec 만 남는다(헤더 원문 없음)', async () => {
+    const { fetch } = fixtureFetch({
+      [K('GET', THREADS_ME_URL)]: () => jsonRes(400, lim(4), { 'retry-after': '90', 'x-business-use-case-usage': buc(1), 'x-app-usage': '{"call_count":100}' }),
+    });
+    const e = await provider(fetch).accountInfo({ accessToken: LONG, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail).toEqual({ reason: 'rate_limited', step: 'account', httpStatus: 400, providerCode: 4, retryAfterSec: 90 });
   });
 });
 

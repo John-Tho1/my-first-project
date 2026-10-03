@@ -5,6 +5,7 @@
  */
 import dns from 'node:dns';
 import http from 'node:http';
+import http2 from 'node:http2';
 import https, { request as httpsRequestNamed } from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -135,6 +136,55 @@ describe('Meta 호스트 차단 — 경로별', () => {
     expect(guard().via.slice(-5)).toEqual(['dns.lookup', 'dns.resolve4', 'dns.resolve', 'dns.promises.lookup', 'dns.promises.resolve6']);
   });
 
+  // FIX2-LIVET1(Codex review-FIX-LIVET1 P2 :169): Resolver 인스턴스 메서드는 모듈 함수와 별개 — 프로토타입까지 감쌌는지.
+  // 막히지 않아도 질의가 밖으로 나가지 않게 서버를 닫힌 로컬 포트(127.0.0.1:9)로 둔다.
+  it('node:dns Resolver 인스턴스(콜백·promises, 하위 클래스)와 resolveTxt·resolveMx 등 나머지 조회 함수', async () => {
+    const r = new dns.Resolver({ timeout: 50, tries: 1 });
+    r.setServers(['127.0.0.1:9']);
+    expect(() => r.resolve4('graph.threads.net', () => undefined)).toThrow(BLOCKED);
+    expect(() => r.resolveTxt('GRAPH.THREADS.COM.', () => undefined)).toThrow(BLOCKED);
+    expect(() => r.resolve('www.facebook.com', 'A', () => undefined)).toThrow(BLOCKED);
+    const pr = new dns.promises.Resolver({ timeout: 50, tries: 1 });
+    pr.setServers(['127.0.0.1:9']);
+    await expect(pr.resolve4('graph.threads.net')).rejects.toThrow(BLOCKED);
+    await expect(pr.resolveTxt('threads.net')).rejects.toThrow(BLOCKED);
+    await expect(pr.resolveAny('i.instagram.com')).rejects.toThrow(BLOCKED);
+    class SubResolver extends dns.promises.Resolver {}
+    const sub = new SubResolver({ timeout: 50, tries: 1 });
+    sub.setServers(['127.0.0.1:9']);
+    await expect(sub.resolveSrv('_x._tcp.graph.threads.net')).rejects.toThrow(BLOCKED);
+    expect(() => dns.resolveTxt('graph.threads.net', () => undefined)).toThrow(BLOCKED);
+    expect(() => dns.resolveMx('facebook.com', () => undefined)).toThrow(BLOCKED);
+    await expect(dns.promises.resolveNs('threads.com')).rejects.toThrow(BLOCKED);
+    expect(guard().via.slice(-10)).toEqual([
+      'dns.Resolver.resolve4',
+      'dns.Resolver.resolveTxt',
+      'dns.Resolver.resolve',
+      'dns.promises.Resolver.resolve4',
+      'dns.promises.Resolver.resolveTxt',
+      'dns.promises.Resolver.resolveAny',
+      'dns.promises.Resolver.resolveSrv',
+      'dns.resolveTxt',
+      'dns.resolveMx',
+      'dns.promises.resolveNs',
+    ]);
+  });
+
+  it('Resolver 인스턴스: 허용 이름(.invalid)은 가드를 지나 원래 조회 함수로 간다(닫힌 로컬 서버 → 연결 거부, 기록 없음)', async () => {
+    const before = guard().attempts.length;
+    const pr = new dns.promises.Resolver({ timeout: 50, tries: 1 });
+    pr.setServers(['127.0.0.1:9']);
+    const msg = await pr.resolve4('allowed.guard-test.invalid').then(() => 'resolved', (e: Error) => e.message);
+    expect(msg).not.toMatch(BLOCKED);
+    expect(guard().attempts.length).toBe(before);
+  });
+
+  it('node:http2 connect 는 tls 연결 단계에서 막힌다(별도 http2 패치 불필요)', async () => {
+    const msg = await blockedSyncOrEvent(() => http2.connect('https://graph.threads.net'));
+    expect(msg).toMatch(BLOCKED);
+    expect(guard().via.at(-1)).toBe('tls.connect');
+  });
+
   it('비슷하지만 다른 호스트(notthreads.net 류)는 막지 않는다 — 판정만(실제 요청 없음)', () => {
     const before = guard().attempts.length;
     // 판정은 연결 전이므로 로컬 주소로 보내되 servername 만 비슷한 이름으로: 막히면 안 된다
@@ -145,7 +195,7 @@ describe('Meta 호스트 차단 — 경로별', () => {
   });
 
   it('기록을 비운다(의도한 시도)', () => {
-    expect(guard().attempts.length).toBeGreaterThanOrEqual(20);
+    expect(guard().attempts.length).toBeGreaterThanOrEqual(35);
     guard().attempts.length = 0;
     guard().via.length = 0;
   });

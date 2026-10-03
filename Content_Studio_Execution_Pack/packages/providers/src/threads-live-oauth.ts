@@ -52,68 +52,144 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 /** 쓰기(코드 소비·토큰 발급)가 일어날 수 있는 단계 — 전송 실패·5xx·2xx 형식 오류면 결과 불명(ambiguous) */
 const WRITE_STEPS: ReadonlySet<Step> = new Set(['exchange', 'long_lived', 'refresh']);
 
-/** Meta 오류 본문의 두 형태: { error: { message, type, code, error_subcode } } · { error_type, code, error_message } (Threads OAuth 문서 예시) */
+/** Meta 오류 본문의 두 형태: { error: { message, type, code, error_subcode, is_transient } } · { error_type, code, error_message } (Threads OAuth 문서 예시) */
 interface ParsedProviderError {
   code: number | null;
   subcode: number | null;
   type: string | null;
+  /** Graph 오류 객체의 is_transient(불리언일 때만) — true 면 일시 오류 */
+  transient: boolean | null;
   /** 분류에만 쓰고 어디에도 저장하지 않는다 */
   message: string;
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : typeof v === 'string' && /^\d{1,9}$/.test(v) ? Number(v) : null);
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
 
 export function parseThreadsErrorBody(body: unknown): ParsedProviderError | null {
   if (!body || typeof body !== 'object') return null;
   const b = body as Record<string, unknown>;
   if (b.error && typeof b.error === 'object') {
     const e = b.error as Record<string, unknown>;
-    return { code: num(e.code), subcode: num(e.error_subcode), type: str(e.type) || null, message: str(e.message) };
+    return { code: num(e.code), subcode: num(e.error_subcode), type: str(e.type) || null, transient: bool(e.is_transient), message: str(e.message) };
   }
   if ('error_type' in b || 'error_message' in b) {
-    return { code: num(b.code), subcode: num(b.error_subcode), type: str(b.error_type) || null, message: str(b.error_message) };
+    return { code: num(b.code), subcode: num(b.error_subcode), type: str(b.error_type) || null, transient: bool(b.is_transient), message: str(b.error_message) };
   }
-  if (typeof b.error === 'string') return { code: null, subcode: null, type: b.error, message: str(b.error_description) };
+  if (typeof b.error === 'string') return { code: null, subcode: null, type: b.error, transient: null, message: str(b.error_description) };
   return null;
 }
 
-const RATE_LIMIT_CODES = new Set([4, 17, 32, 613]);
-const TRANSIENT_CODES = new Set([1, 2]);
-/** 코드 교환에서 "code 무효·이미 사용"으로 아는 공급자 코드(문서 예시 400, Graph 매개변수 오류 100) */
-const INVALID_GRANT_CODES = new Set([100, 400]);
+/**
+ * FIX2-LIVET1(Codex review-FIX-LIVET1 P0 :138): 일시(transient) 코드 표 — **문구보다 먼저** 보고, 문구가 절대 덮어쓰지 않는다.
+ * Meta Graph API 오류 코드 관례(Graph API "Handling Errors"·"Rate Limiting" 문서): 1 API Unknown(재시도), 2 API Service(일시),
+ * 4 앱 호출 제한, 17 사용자 호출 제한, 32 페이지 호출 제한, 341 앱 한도 도달, 613 호출 빈도 초과, 80000~80014 비즈니스 사용 사례(BUC) 제한.
+ * Threads 문서에 같은 표가 따로 있는지는 이번 라운드에서 다시 확인하지 않았다(핸드오프 위험 항목) — 표에 넣는 쪽이 보수적이다(결과 불명 보존).
+ */
+export const THREADS_TRANSIENT_CODES: ReadonlyMap<number, 'rate_limited' | 'server_error'> = new Map<number, 'rate_limited' | 'server_error'>([
+  [1, 'server_error'],
+  [2, 'server_error'],
+  [4, 'rate_limited'],
+  [17, 'rate_limited'],
+  [32, 'rate_limited'],
+  [341, 'rate_limited'],
+  [613, 'rate_limited'],
+  ...Array.from({ length: 15 }, (_, i): [number, 'rate_limited'] => [80000 + i, 'rate_limited']),
+]);
+
+/** 확정(definite) 코드 표 — 공급자가 처리하지 않고 거절했다고 아는 코드. 여기에 없는 코드는 "알 수 없음"(쓰기 단계면 결과 불명). */
+function definiteByCode(step: Step, code: number, subcode: number | null): OAuthProviderErrorCode | null {
+  if (code === 101) return 'invalid_client';
+  if (code === 190) {
+    if (subcode === 463) return 'token_expired';
+    if (subcode === 458 || subcode === 460) return 'token_revoked';
+    return 'invalid_token';
+  }
+  if (code === 10 || (code >= 200 && code < 300)) return 'scope_not_allowed';
+  // 코드 교환: 문서 예시 400("Matching code was not found or was already used"), Graph 매개변수 오류 100 → code 무효
+  if (step === 'exchange' && (code === 400 || code === 100)) return 'invalid_grant';
+  // 그 밖 단계의 100(매개변수 오류 — 예: 발급 24시간 안 갱신) → 요청 거절
+  if (code === 100) return 'invalid_request';
+  return null;
+}
+
 const CLIENT_MESSAGE = /client[_ ]?secret|app(lication)? secret|invalid client|client[_ ]?id|invalid app(lication)? id|validating application/i;
 const REDIRECT_MESSAGE = /redirect[_ ]?uri/i;
 
+/** 문구 보정 — (a) 코드·하위 코드가 모두 없을 때, (b) 확정 범용 코드 100(매개변수 오류)을 더 구체적인 **확정** 오류로 좁힐 때만. 일시 코드에는 쓰지 않는다. */
+function refineByMessage(step: Step, message: string): OAuthProviderErrorCode | null {
+  const redirect = REDIRECT_MESSAGE.test(message);
+  if (redirect && step === 'exchange') return 'redirect_mismatch';
+  if (!redirect && CLIENT_MESSAGE.test(message)) return 'invalid_client';
+  return null;
+}
+
+/** 제한 응답 힌트(헤더) — 숫자만 뽑는다. 원 헤더 값은 어디에도 남기지 않는다. */
+export interface ThreadsRateLimitHints {
+  /** Retry-After(초 단위 정수만 — HTTP-date 는 읽지 않는다) */
+  retryAfter?: string | null;
+  /** X-Business-Use-Case-Usage(JSON) — 항목들의 estimated_time_to_regain_access(분) 최댓값 */
+  businessUseCaseUsage?: string | null;
+}
+
+const MAX_RETRY_AFTER_SEC = 999_999;
+
+/** 제한 힌트 → 초(0 이상 정수) 또는 undefined. 이상한 값(음수·소수·문자·너무 큼·JSON 오류)은 버린다. 둘 다 있으면 긴 쪽. */
+export function parseRetryAfterSec(hints: ThreadsRateLimitHints | string | null | undefined): number | undefined {
+  const h: ThreadsRateLimitHints = typeof hints === 'string' ? { retryAfter: hints } : (hints ?? {});
+  let best: number | undefined;
+  const ra = h.retryAfter?.trim();
+  if (ra && /^\d{1,6}$/.test(ra)) best = Number(ra);
+  const buc = h.businessUseCaseUsage;
+  if (buc && buc.length <= 8192) {
+    try {
+      const parsed = JSON.parse(buc) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const list of Object.values(parsed as Record<string, unknown>)) {
+          if (!Array.isArray(list)) continue;
+          for (const item of list) {
+            const m = item && typeof item === 'object' ? (item as Record<string, unknown>).estimated_time_to_regain_access : undefined;
+            if (typeof m === 'number' && Number.isInteger(m) && m > 0 && m * 60 <= MAX_RETRY_AFTER_SEC) best = Math.max(best ?? 0, m * 60);
+          }
+        }
+      }
+    } catch {
+      // 형식 오류 — 버린다
+    }
+  }
+  return best;
+}
+
 /**
  * 공급자 오류 → 기존 T13 코드(OAuthProviderErrorCode) + 숫자·열거 부가 정보. 메시지 원문은 분류에만 쓰고 결과에 넣지 않는다.
- * FIX1-LIVET1(Codex review-LIVET1 P0 :104·Q2): **전송·HTTP 상태를 먼저** 본다 — 본문의 코드·문구는 그 뒤, 4xx 안에서만.
- *  1) 429 → provider_error(rate_limited, retryAfterSec) — 공급자가 처리하지 않고 거절
- *  2) 5xx → provider_error(server_error, 쓰기 단계면 ambiguous) — 본문이 "client secret"·"expired"·코드 101/190 이어도 결과 불명
+ * 우선순위(엄격, 위가 이긴다) — FIX1-LIVET1(전송·상태 먼저) + FIX2-LIVET1(Codex review-FIX-LIVET1 P0 :138 일시 코드가 문구보다 먼저):
+ *  1) 429 → provider_error(rate_limited, retryAfterSec)
+ *  2) 5xx → provider_error(server_error, 쓰기 단계면 ambiguous) — 본문이 무엇이든
  *  3) 408 → provider_error(timeout, 쓰기 단계면 ambiguous)
  *  4) 4xx 가 아닌 상태(2xx·1xx·3xx)의 오류 본문 → provider_error(malformed_response, 쓰기 단계면 ambiguous)
- *  5) 4xx 인데 Meta 오류 본문 형식이 아님(HTML·빈 본문) → 쓰기 단계면 provider_error(http_error, ambiguous),
- *     아니면 401 → invalid_token, 그 밖 → invalid_request
- *  6) 4xx + 형식 맞는 오류 본문 — 코드·하위 코드: 4/17/32/613 → rate_limited, 101 → invalid_client,
- *     190 → invalid_token(463 = token_expired, 458·460 = token_revoked), 10·200~299 → scope_not_allowed
- *  7) (최후 수단, 4xx 안에서만) 메시지: redirect_uri 언급 → 코드 교환이면 redirect_mismatch, 앱 ID·시크릿 언급 → invalid_client
- *  8) 코드 1/2(일시) → provider_error(server_error, 쓰기 단계면 ambiguous)
- *  9) 코드 교환: 알려진 코드(400·100, 또는 OAuth 문자열 오류 invalid_grant)만 invalid_grant — 그 밖(401·404·405·알 수 없는 코드)은
- *     provider_error(oauth_exception, ambiguous=false — 공급자가 4xx 로 거절했다. 원인은 providerCode·httpStatus 로 남는다)
- * 10) 그 밖 단계: 401 → invalid_token, 그 밖 4xx → invalid_request
+ *  5) 4xx 인데 Meta 오류 본문 형식이 아님 → 쓰기 단계면 provider_error(http_error, ambiguous), 아니면 401 → invalid_token, 그 밖 → invalid_request
+ *  6) 4xx + 일시 표(THREADS_TRANSIENT_CODES) 또는 is_transient=true → 제한이면 provider_error(rate_limited, retryAfterSec),
+ *     그 밖 provider_error(server_error, 쓰기 단계면 ambiguous). **문구는 보지 않는다**(예: 코드 2 + "validating client secret" 도 결과 불명).
+ *  7) 4xx + 확정 표(definiteByCode) → 그 코드. 범용 매개변수 오류 100 만 문구로 더 구체적인 확정 오류(redirect_mismatch·invalid_client)로 좁힌다.
+ *  8) 4xx + 코드·하위 코드가 모두 없음 → 그때만 문구(redirect_uri → redirect_mismatch(교환), 앱 ID·시크릿 → invalid_client),
+ *     문자열 오류 invalid_grant(교환) → invalid_grant
+ *  9) 나머지(알 수 없는 코드, 또는 코드 없이 분류 안 되는 본문) → 쓰기 단계면 provider_error(oauth_exception, ambiguous=true —
+ *     Codex review-FIX-LIVET1 Q7: 확정 거절로 검증된 응답만 확정), 읽기 단계면 401 → invalid_token, 그 밖 → invalid_request
  */
-export function mapThreadsError(step: Step, httpStatus: number, body: unknown, retryAfterHeader: string | null = null): OAuthProviderError {
+export function mapThreadsError(step: Step, httpStatus: number, body: unknown, hints: ThreadsRateLimitHints | string | null = null): OAuthProviderError {
   const write = WRITE_STEPS.has(step);
   const p = parseThreadsErrorBody(body);
   const base: OAuthProviderErrorDetail = { reason: p ? 'oauth_exception' : 'http_error', step, httpStatus };
   if (p?.code !== null && p?.code !== undefined) base.providerCode = p.code;
   if (p?.subcode !== null && p?.subcode !== undefined) base.providerSubcode = p.subcode;
   const err = (code: OAuthProviderErrorCode, extra: Partial<OAuthProviderErrorDetail> = {}) => new OAuthProviderError(code, { ...base, ...extra });
-  // 1)~4) 전송·상태 먼저(본문과 관계없이)
-  if (httpStatus === 429) {
-    const ra = retryAfterHeader && /^\d{1,6}$/.test(retryAfterHeader.trim()) ? Number(retryAfterHeader.trim()) : undefined;
+  const rateLimited = () => {
+    const ra = parseRetryAfterSec(hints);
     return err('provider_error', { reason: 'rate_limited', ...(ra !== undefined ? { retryAfterSec: ra } : {}) });
-  }
+  };
+  // 1)~4) 전송·상태 먼저(본문과 관계없이)
+  if (httpStatus === 429) return rateLimited();
   if (httpStatus >= 500) return err('provider_error', { reason: 'server_error', ambiguous: write });
   if (httpStatus === 408) return err('provider_error', { reason: 'timeout', ambiguous: write });
   if (httpStatus < 400) return err('provider_error', { reason: 'malformed_response', ambiguous: write });
@@ -122,30 +198,24 @@ export function mapThreadsError(step: Step, httpStatus: number, body: unknown, r
     if (write) return err('provider_error', { reason: 'http_error', ambiguous: true });
     return err(httpStatus === 401 ? 'invalid_token' : 'invalid_request');
   }
-  // 6) 4xx, 코드·하위 코드
-  const code = p.code;
-  if (code !== null && RATE_LIMIT_CODES.has(code)) return err('provider_error', { reason: 'rate_limited' });
-  if (code === 101) return err('invalid_client');
-  if (code === 190) {
-    if (p.subcode === 463) return err('token_expired');
-    if (p.subcode === 458 || p.subcode === 460) return err('token_revoked');
-    return err('invalid_token');
+  // 6) 일시 — 문구보다 먼저, 문구로 바꾸지 않는다
+  const transient = p.code !== null ? THREADS_TRANSIENT_CODES.get(p.code) : undefined;
+  if (transient === 'rate_limited') return rateLimited();
+  if (transient === 'server_error' || p.transient === true) return err('provider_error', { reason: 'server_error', ambiguous: write });
+  // 7) 확정 코드(100 만 문구로 좁힘 — 확정 → 더 구체적인 확정)
+  if (p.code !== null) {
+    const definite = definiteByCode(step, p.code, p.subcode);
+    if (definite) return err(p.code === 100 ? (refineByMessage(step, p.message) ?? definite) : definite);
   }
-  if (code === 10 || (code !== null && code >= 200 && code < 300)) return err('scope_not_allowed');
-  // 7) 최후 수단: 메시지(4xx 안에서만)
-  const redirectMessage = REDIRECT_MESSAGE.test(p.message);
-  if (redirectMessage && step === 'exchange') return err('redirect_mismatch');
-  if (!redirectMessage && CLIENT_MESSAGE.test(p.message)) return err('invalid_client');
-  // 8) 일시 코드
-  if (code !== null && TRANSIENT_CODES.has(code)) return err('provider_error', { reason: 'server_error', ambiguous: write });
-  // 9) 코드 교환
-  if (step === 'exchange') {
-    if ((code !== null && INVALID_GRANT_CODES.has(code)) || p.type === 'invalid_grant') return err('invalid_grant');
-    return err('provider_error', { ambiguous: false });
+  // 8) 코드·하위 코드가 모두 없을 때만 문구
+  if (p.code === null && p.subcode === null) {
+    const byMessage = refineByMessage(step, p.message);
+    if (byMessage) return err(byMessage);
+    if (step === 'exchange' && p.type === 'invalid_grant') return err('invalid_grant');
   }
-  // 10)
-  if (httpStatus === 401) return err('invalid_token');
-  return err('invalid_request');
+  // 9) 알 수 없음
+  if (write) return err('provider_error', { ambiguous: true });
+  return err(httpStatus === 401 ? 'invalid_token' : 'invalid_request');
 }
 
 const isAbort = (e: unknown): boolean =>
@@ -315,7 +385,8 @@ export class LiveThreadsOAuthProvider implements OAuthProvider {
     // 2xx 인데 오류 본문(성공 필드 없음)인 경우도 공급자 오류로 본다
     const hasSuccessField = !!body && typeof body === 'object' && ('access_token' in body || 'id' in body);
     if (!res.ok || (parseThreadsErrorBody(body) !== null && !hasSuccessField)) {
-      throw mapThreadsError(step, res.status, body, res.headers.get('retry-after'));
+      // FIX2-LIVET1(P2 :127): 제한 힌트는 429 밖(코드 4·17·…)에서도 쓴다 — 숫자만 뽑고 원 헤더 값은 버린다
+      throw mapThreadsError(step, res.status, body, { retryAfter: res.headers.get('retry-after'), businessUseCaseUsage: res.headers.get('x-business-use-case-usage') });
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new OAuthProviderError('provider_error', { reason: 'malformed_response', step, httpStatus: res.status, ambiguous: ambiguousOnTransport });

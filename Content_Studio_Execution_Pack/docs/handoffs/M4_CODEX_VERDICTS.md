@@ -99,3 +99,7 @@ CHANGES_REQUESTED
 - [P0] packages/providers/src/instagram-mock.ts:257 — 실제 읽은 이미지의 checksum을 승인된 checksum과 비교하지 않고 게시한다
 - [P0] packages/providers/src/instagram-mock.ts:225 — 적용된 쓰기 5xx 장애가 부작용 없음으로 분류되어 게시를 다시 요청한다
 - [P1] packages/providers/src/instagram-mock.ts:908 — 캐러셀 부모 생성 응답을 잃으면 이미 사용된 자식으로 부모를 다시 생성하려 한다
+
+## FIX-T16 (165f0df, T16 round 1) — CHANGES_REQUESTED (P0 1·P1 1)
+- [P0] packages/providers/src/instagram-mock.ts:612 — 적용된 쓰기의 sideEffect unknown 을 429 분류에서 여전히 부작용 없음으로 처리한다
+- [P1] packages/providers/src/instagram-mock.ts:877 — 부모 요청 표식이 없는 기존 작업을 부모 요청 전으로 오판한다

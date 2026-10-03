@@ -168,3 +168,56 @@
 3. checksum 확인을 매 submit(재개 포함)마다 전 이미지에 대해 하는 것과, 이미 만든 자식 컨테이너가 있는 재개에서도 파일이 바뀌면 FAILED 로 닫는 것이 적절한가(게시 단계가 있으면 확인만)?
 4. `instagramUncheckedInTx` 가 계정 상태만 다시 보고 asset 상태(삭제·미검증)는 트랜잭션 안에서 다시 보지 않는다 — 보내기 직전 검사로 충분한가?
 5. MIME 불일치 판정(둘 중 하나라도 허용 밖이면 not_allowed + mismatch)이 승인 전 거절 사유로 적절한가, 아니면 mismatch 만으로 충분한가?
+
+## FIX round 2 (Codex review-FIX-T16)
+- Orchestrator: HEAD_SHA 914ac36 (code only, D28) — reran lint·typecheck·build·unit 825·integration 628·drill:mock 0·real-DB drill:restore PASS.
+- BASE_SHA: `627c3a5` · HEAD_SHA: TBD(오케스트레이터가 커밋 뒤 기록 — 이 절은 커밋 전에 작성)
+- 범위: 모의만(네트워크·실제 Instagram 호출 없음). 새 마이그레이션 없음(0037 그대로), 새 의존성 없음.
+
+### 변경 파일
+- `packages/providers/src/instagram-mock.ts` — 오류 분류(부작용 우선), submit 의 부모 찾기 조건, 기록한 컨테이너의 게시 먼저 찾기, reconcile 의 부모 찾기 조건, 머리 주석
+- `packages/providers/src/instagram-mock.test.ts` — 단위 15건 추가
+- `packages/domain/src/instagram.ts` — JPEG SOF 성분 수·길이 대조
+- `packages/domain/src/instagram.test.ts` — 단위 1건 추가
+- `tests/integration/instagram.test.ts` — 통합 5건 추가
+
+### 지적 → 변경 → 시험
+1. **[P0] instagram-mock.ts:612 — 적용된 쓰기의 sideEffect unknown 을 429 분기가 "부작용 없음"으로 처리**
+   - 변경: `classifyInstagramError` 가 **쓰기 호출(createImageContainer·createCarouselContainer·publish)에서 `e.sideEffect === 'unknown'` 이면 종류 분기보다 먼저** ambiguous/`transient_unknown_side_effect` 로 보낸다(error_code: 5xx → `server_error_side_effect_unknown`, 시간 초과 → `timeout`, 그 밖 → `<code>_side_effect_unknown`, 예: `rate_limited_side_effect_unknown`). 429·400·401·403·404 의 기존 분류(재시도·영구·재연결)는 부작용 없음이 증명된 오류(명시 none·생략 = 시뮬레이터가 받아들이기 전 거절, applied 아님)에만 남는다. 읽기 호출은 부작용이 없으므로 그대로. 쓰기 5xx 는 FIX1 대로 표시와 무관하게 ambiguous.
+   - 시뮬레이터 계약: applied 장애는 `fail()` 이 항상 sideEffect unknown(FIX1), applied + none 주입은 거부(FIX1) — 그대로.
+   - 시험(단위): 분류 표(쓰기 3 × 오류 종류 7 × unknown → 모두 ambiguous, none 429 → Retry-After 재시도, 읽기 429 unknown → 재시도) · 시뮬레이터 applied 429/400/401/403 게시 → ambiguous·미디어 1 · 게시 applied 429 → ambiguous → 조회 found → 재시도 게시 0(게시 1) · 게시 applied 429 뒤 조회 없이 재시도 → 게시 1 · 컨테이너 생성 applied 429 → not_found → 새 컨테이너 게시 1 · 캐러셀 부모 생성 applied 429 → 표식으로 찾아 부모 1·게시 1 · **적용 안 된 429** → rejected/transient_no_side_effect(retry_after 5) → 같은 컨테이너로 게시(컨테이너 1·미디어 1).
+   - 시험(통합): 게시 applied 429 → RECONCILING(RETRY_WAIT 아님, publication 0) → CONFIRMED(게시 호출 1·미디어 1·의도 1) · 컨테이너 생성 applied 429 → RECONCILING → CONFIRMED(컨테이너 2·미디어 1, 기록 = 게시한 컨테이너). 적용 안 된 429 는 기존 `instagram_rate_limited` 통합 시험(RETRY_WAIT → 같은 컨테이너 CONFIRMED)이 그대로 통과.
+2. **[P1] instagram-mock.ts:877 — 표식 없는 기존(FIX1 이전) 작업을 "부모 요청 전"으로 오판**
+   - 변경(submit): 캐러셀에서 부모 ID 가 없을 때 **표식이 있거나, 이번 submit 이 자식을 하나도 새로 만들지 않았으면(모든 자식이 이미 기록돼 있었으면)** `findCarouselByChildren` 으로 먼저 찾는다. 찾으면 기록하고 그 부모로 진행, null(자식 모두 알고 아직 어느 부모에도 안 쓰임 — 없음 확실)일 때만 표식을 남기고 생성, 찾기 실패(시간 초과·인증·5xx·원격 기록 유실·자식이 다른 부모에 쓰임) → ambiguous(`parent_lookup_<code>`) — 생성하지 않는다. 이번 submit 이 자식을 새로 만든 경우는 그 자식 목록 전체로 만든 부모가 있을 수 없어 찾기를 건너뛴다(새 작업의 호출 수 그대로).
+   - 변경(reconcile): 부모 ID 가 없을 때 **표식이 있거나 캐러셀 자식이 모두 기록돼 있으면** 찾는다(표식 부재를 미요청의 증거로 쓰지 않음). 표식 있고 자식 불완전 → unknown(기존). 표식 없고 자식 불완전 → 부모를 요청했을 수 없음(자식은 다음 원격 호출 전에 기록) → 기존 자식 판정.
+   - 시험(단위, FIX1 이전 모양 = 표식을 쓰지 않는 단계 창구로 만든 `자식만 기록·표식 없음`): 원격 부모 있음 → 조회가 찾아 기록(resumable container_not_published) → 같은 부모로 게시(부모 생성 1·게시 1) · 조회 없이 바로 재시도해도 부모 1·invalid_children 없음 · 원격 부모 없음 → 조회 resumable(carousel_parent_not_created) → 부모 1번(이때는 표식 먼저) · 찾기 실패(timeout → 조회 unknown `parent_lookup_timeout`, 401 → submit ambiguous, 5xx → submit ambiguous, 원격 재시작 → unknown·ambiguous) → 새 부모 0·게시 0.
+   - 시험(통합, 다음 한 번의 submit 만 DB 에 표식을 남기지 않게 감싼 실제 runJobsTick): 원격 부모 있음 → RECONCILING(단계 `ig_container:1,2` 만) → CONFIRMED(부모 생성 1·게시 1, 미디어의 컨테이너 = 그 부모) · 원격 부모 없음 → CONFIRMED(부모 1, 단계 끝 모양 `…ig_parent_request:0, ig_container:0, ig_publish:0`) · 부모 찾기가 계속 시간 초과 → **UNKNOWN**(새 부모 0·게시 0·publication 0). 수정 전 코드라면 첫·셋째는 부모 재생성 → invalid_children(FAILED)로 기대와 달라질 것으로 판단(수정 전 코드로 실제 실행해 확인하지는 않음).
+3. **리뷰 "놓친 케이스" 중 싼 것**
+   - 게시 성공 → 게시 단계 기록 실패 → 파일 변경·삭제: submit 이 **게시할 컨테이너(post 0)가 기록돼 있으면 파일 검사 전에** `findPublishedByContainer` 로 게시 여부를 찾는다 — 있으면 `ig_publish` 기록 + accepted, 찾기 실패 → ambiguous(`find_<code>`), 없음 → 기존 흐름. 단위: 바뀐 파일로 재시도 → accepted(게시 1, 단계 container·publish), 사라진 파일로 조회 → found, 찾기 5xx + 사라진 파일 → ambiguous(FAILED 아님).
+   - 부모 요청 표식 저장 직후 중단(부모 요청 전): 단위 — 중단 → 조회 resumable(찾기 null) → 재시도가 같은 표식으로 부모 1번·게시.
+   - 부모 조회의 인증 오류·시간 초과: 위 P1 시험에 포함.
+   - JPEG SOF 길이 ≥ 11 이지만 성분 수와 불일치: `imageDimensions` 가 `nf ≥ 1 && len = 8 + 3·nf` 가 아니면 null. 단위: nf 2(길이 17), nf 0, 길이 14 → null, 원본 → 그대로.
+   - 파일 전체 읽기 예외·짧은 반환: `verifiedImageFiles` 직접 단위 — 예외 → `asset_read_failed:1`, 짧은 반환 → `asset_read_failed:1`, 크기 0·없음 → `asset_unavailable:1`.
+   - 하지 않음(범위·비용): `approveItems` 실행 중 계정·asset 경합 재현, `ig_parent_request` 를 담은 묶음의 내보내기·복원 추가 시험(기존 복원 시험은 표식 없는 묶음), 원격 private 결과의 DB 저장·화면 표시, 실제 페이지의 표식 노출 확인.
+
+### 명령과 결과 (로컬 Windows 10, Node 24.21.0, `source tools/env.sh` + `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함)
+- `corepack pnpm exec vitest run --project unit packages/providers/src/instagram-mock.test.ts packages/domain/src/instagram.test.ts` → pass 2 files / 62 tests
+- `corepack pnpm lint` → pass(exit 0)
+- `corepack pnpm typecheck` → pass(exit 0)
+- `corepack pnpm build` → pass(exit 0, 개발 서버 꺼진 상태)
+- `corepack pnpm test` → pass 42 files / 825 tests(+16)
+- `corepack pnpm test:integration`(단독) → pass 32 files / 628 tests(+5), 366.7 s
+- `corepack pnpm drill:mock` → exit 0, `불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK), T16 Instagram 모의 불변식 통과(MOCK)`, Instagram fetch 0. Instagram 표는 FIX round 1 과 같은 18행·같은 값(이번에 drill 행은 추가하지 않음).
+- 실행하지 않음: 개발 서버·브라우저 smoke, `pnpm db:migrate`(`./data` 를 열지 않음, 마이그레이션 변경 없음), `drill:restore`, 실제 PostgreSQL 동시성, Codex 재검증.
+
+### 남은 위험
+- 분류는 시뮬레이터 오류의 `sideEffect` 표시에 기댄다. 시뮬레이터가 받아들이기 전 던지는 오류(인증·규격·예산 429)는 표시를 생략(= none)한다 — live 어댑터에서는 원격 응답만으로 "받아들이기 전 거절"을 증명할 수 있는 오류만 none 으로 매겨야 한다(공식 계약 확인 전에는 쓰기 4xx/429 도 unknown 으로 두는 편이 안전).
+- 부작용 unknown 인 401 은 이제 BLOCKED 가 아니라 RECONCILING 으로 간다 — 조회도 같은 토큰을 쓰므로 토큰이 정말 무효면 UNKNOWN 으로 끝난다(재연결 안내 대신 확인 불가 표시). 이중 게시 방지를 우선한 선택.
+- FIX1 이전 작업 판정은 "자식이 모두 이미 기록됨"을 부모 요청 가능성의 조건으로 쓴다. 이번 submit 에서 자식을 새로 만든 경우 찾기를 건너뛴다 — 부모는 기록한 자식 전체로만 만들기 때문(모의 계약). 실제 API 에서 같은 자식으로 다른 부모 조합이 가능하면 다시 봐야 한다.
+- `findCarouselByChildren`·`findPublishedByContainer` 는 모의 가정(live 전 실제 API 확인). 기록한 컨테이너가 있는 재개는 이제 매 submit 마다 `findPublishedByContainer` 1회를 더 부른다(읽기).
+- 통합의 FIX1 이전 모양은 submit 을 감싸 표식만 빼서 만든다 — 실제 이전 버전 바이너리로 만든 DB 는 아니다.
+
+### Codex 에게 질문
+1. 쓰기 호출에서 sideEffect unknown 을 종류 분기보다 먼저 ambiguous 로 보내고, 생략(none)은 "받아들이기 전 거절"로 남긴 경계가 맞는가 — 아니면 쓰기 429/4xx 는 표시가 생략돼도 기본 unknown 으로 보고 명시 none 만 재시도해야 하는가(그 경우 시뮬레이터 자체 거절에 none 을 명시하는 변경 필요)?
+2. FIX1 이전 작업 판정 조건(표식 없음 + 이번 submit 에서 새 자식 없음 → 찾기 먼저, 찾기 실패 → ambiguous/unknown, null → 생성)에 표식 부재를 미요청으로 오판하는 남은 경로가 있는가? 특히 reconcile 의 "표식 없음 + 자식 불완전 → 자식 판정"이 안전한가?
+3. 기록한 게시 컨테이너가 있을 때 파일 검사 전에 `findPublishedByContainer` 를 먼저 부르는 순서(찾기 실패 → ambiguous)가 "원격 사실을 파일 문제로 덮지 않는다"는 요구와 A08 을 함께 만족하는가 — 게시되지 않은 것이 확인된 뒤 파일이 바뀌었으면 FAILED 로 닫는 것은 그대로 적절한가?

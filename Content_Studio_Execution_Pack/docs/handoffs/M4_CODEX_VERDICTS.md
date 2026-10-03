@@ -71,3 +71,7 @@ CHANGES_REQUESTED
 
 ## FIX2-T14 (746aa3a, T14 round 2) — **PASS** (지적 없음) → T14 종결(모의 범위)
 ## (참고) FIX-T15 PASS → T15 종결(모의 범위)
+
+## FIX6-T13 (2a974d5, T13 round 6) — CHANGES_REQUESTED (P1 1·P2 1)
+- [P1] packages/db/src/oauth.ts:1791 — worker가 오래된 조회 결과로 새로 연결된 자격 증명까지 해제할 수 있다
+- [P2] packages/db/src/oauth.ts:1779 — 해독 불가능한 오래된 행들이 재개 후보 한도를 계속 차지한다

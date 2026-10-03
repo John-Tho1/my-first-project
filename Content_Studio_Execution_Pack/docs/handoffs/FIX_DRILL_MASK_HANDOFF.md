@@ -6,3 +6,9 @@
 - 시험: tests/integration/youtube.test.ts "업로드 세션이 있는 owner 의 복원 훈련 PASS — 이미 가린 세션 값을 다시 가리지 않는다" — runRestoreDrill mismatches [] + 복원 대상 재내보내기의 가린 값 = 원래 묶음의 가린 값. 수정을 빼면 remote_steps 불일치로 실패함을 확인.
 - 명령(Windows 10, Node 24.21.0): lint·typecheck·build PASS, unit 39 files/745, integration 31 files/570, drill:mock 위반 0, db:migrate, 실제 로컬 DB drill:restore PASS.
 - Codex 에게: (1) 원본 remote_id 가 우연히 'mock-redacted:' 로 시작하는 경우(현재 CHECK 는 'mock%' 이고 모의 세션 URI 는 mock://… 라 불가)를 막아야 하나? (2) 가린 세션 행이 복원된 뒤 조회가 unknown 으로 끝나는지(FIX-T14 규칙) 외에 확인할 경로가 있나?
+
+# FIX round 2 (Codex review-FIX-drill-mask P2)
+- HEAD_SHA: 75dd988 (bundle-tables.ts), 회귀 테스트는 2fed5b4 의 tests/integration/youtube.test.ts "가림 예외는 정확한 표식만".
+- 변경: 다시 가리지 않는 예외를 `remote_id !~ '^mock-redacted:session:[0-9a-f]{16}$'` 로 좁힘 — 형식이 다른 mock-redacted 값도 가린다.
+- 시험: 트리거를 잠시 끄고 upload_session remote_id 를 'mock-redacted:session:NOT-HEX-…' 로 바꾼 뒤 내보내기 → ZIP 에 원문 없음, 값은 정확한 표식 형식. 이전 조건(not like 'mock-redacted:%')에서 실패 확인.
+- 명령: lint·typecheck·build·unit 759·integration 589·drill:mock 0·실제 DB drill:restore PASS.

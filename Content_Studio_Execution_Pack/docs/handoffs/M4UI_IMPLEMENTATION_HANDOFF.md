@@ -105,3 +105,10 @@
 3. `UPLOADED_PRIVATE` 를 계속 `not_applied` 로 두는 근거(D27 `youtubeResultOf`: private+publishAt → SCHEDULED_REMOTE)가 실제 어댑터 단계에서도 유지된다고 봐도 되나, 아니면 결과 행에 원격 publishAt 을 기록하는 후속이 필요한가?
 4. 연결 해제 미완료 문구의 "작업 처리기가 이어서 마무리" 약속이 FIX6 재개 조건(revoking·암호문·`revoke_*`·60초 경과·지금 키로 열림·공급자 있음)과 어긋나는 경우가 있나(예: `revoke_current_seal_failed` 이후 키는 열리는데 계속 봉인 실패)?
 5. `superseded` 를 `?revoke=superseded` 경고로 분리한 것이 맞는가, 아니면 "해제 끝남"(revoked=1)으로 두는 편이 정확한가?
+
+# FIX round 2 (Codex review-FIX-M4UI P2) — 오케스트레이터 직접
+- HEAD_SHA: cd0a2aa (apps/web/lib/revoke-view.ts + test).
+- 지적: 해제 미완료 안내가 원인 해소 여부와 무관하게 "이어서 마무리" 를 약속함(봉인 실패 지속·unknown 에도).
+- 변경: 안내를 "원인이 해결되고 재개 조건이 갖춰지면 작업 처리기가 같은 해제 작업을 다시 시도합니다(…). 해제가 끝날 때까지 이 계정의 배포 실행은 차단됩니다." 로 — 재시도와 완료를 구분.
+- 시험: revoke-view.test.ts 가 조건부 문구 포함·"마무리합니다/마무리하며/자동으로 완료" 없음 확인.
+- 명령: lint·typecheck·build·unit 759·integration 595·drill:mock 0·실제 DB drill:restore PASS.

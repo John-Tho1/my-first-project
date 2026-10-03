@@ -75,3 +75,8 @@ CHANGES_REQUESTED
 ## FIX6-T13 (2a974d5, T13 round 6) — CHANGES_REQUESTED (P1 1·P2 1)
 - [P1] packages/db/src/oauth.ts:1791 — worker가 오래된 조회 결과로 새로 연결된 자격 증명까지 해제할 수 있다
 - [P2] packages/db/src/oauth.ts:1779 — 해독 불가능한 오래된 행들이 재개 후보 한도를 계속 차지한다
+
+## FIX2-drill-mask (75dd988) — **PASS** → 업로드 세션 URI 가림 종결
+
+## FIX-M4UI (2fed5b4, 화면 기능 round 1) — CHANGES_REQUESTED (P2 1)
+- [P2] apps/web/lib/revoke-view.ts:14 — 해제 미완료 안내가 오류 해소 여부와 무관하게 자동 완료를 약속함

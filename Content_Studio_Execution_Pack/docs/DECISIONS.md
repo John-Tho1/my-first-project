@@ -417,3 +417,9 @@
 - 할당량 단위는 기록된 단계로 계산한다(어댑터 훅 rateUnitsRemaining): 영상이 있거나 살아 있을 수 있는 세션이면 0, 세션 없음·만료·오류면 1. 만료 세션은 창 안 사용량으로 남고 새 세션 비용을 상쇄하지 않는다. 사전 검사 뒤 세션이 만료돼 새 세션이 필요해지면 그 시도는 부수 효과 없이 끝나고(upload_session_requires_quota_check) 다음 시도가 할당량을 다시 검사한다.
 - 모의 시뮬레이터의 queryOffset 만료 주입은 완료된 세션에는 적용하지 않는다.
 - 남은 위험: yield 마다 전송 의도 1건(2GB 를 웹 tick 으로만 올리면 최대 256건), inline 모드는 웹 요청이 와야 진행.
+
+## D29 — T16 Instagram(모의만): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+- Decision ID / date: D29 / 2026-10-03. 코드 620ed86. 출처: docs/handoffs/T16_IMPLEMENTATION_HANDOFF.md "Proposed D29".
+- 상태: **잠정**. 아래 "User decision required" 항목은 실계정 연결 전 사용자 확인이 필요하다(D24 와 같은 원칙). 특히 공개 미디어 URL 방식은 개인 첨부를 외부에서 접근 가능하게 만드는 결정이라 사용자 승인 전에는 모의 구현만 둔다.
+
+## Proposed D29 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)

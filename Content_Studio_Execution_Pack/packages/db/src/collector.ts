@@ -560,7 +560,9 @@ export async function runDueCollectorSources(
   // 기한이 지난 소스가 매 tick 빠졌다). 기한 = last_run_at + 주기(daily 24h·weekly 7d), 처음(null)은 즉시. 기한이 오래된 순 → id.
   // 간격은 domain scheduleIntervalMs 와 같은 값(시험이 둘을 대조) — isScheduleDue 로 한 번 더 확인한다.
   const nowIso = now.toISOString();
-  const dueAt = sql`(${collectorSources.lastRunAt} + case ${collectorSources.schedule} when 'daily' then interval '24 hours' when 'weekly' then interval '7 days' end)`;
+  const dueAt = sql`(${collectorSources.lastRunAt} + case ${collectorSources.schedule} when 'daily' then interval '24 hours' when 'weekly' then interval '168 hours' end)`;
+  // Codex review-FIX-T19 P2 :563 — '7 days' 는 timestamptz 에서 세션 시간대의 달력 일로 더해져 서머타임 전환 주에 168시간과 달라진다.
+  // domain scheduleIntervalMs(고정 밀리초)와 같게 시간 단위로만 더한다.
   const cands = await db
     .select()
     .from(collectorSources)

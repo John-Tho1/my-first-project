@@ -724,6 +724,40 @@ describe('FIX-T19 round 1 (Codex review-T19)', () => {
   });
 });
 
+describe('Codex review-FIX-T19 P2 :563 — 주간 기한은 고정 168시간(서머타임과 무관)', () => {
+  it('세션 시간대 America/New_York, 2026-03-08 서머타임 시작을 끼는 주: SQL 이 1시간 일찍 고른 주간 소스가 한도(1)를 차지해 기한이 지난 daily 소스를 밀어내지 않는다', async () => {
+    vi.stubEnv('COLLECTOR_SCHEDULER', 'on');
+    const lastRunAt = new Date('2026-03-07T12:00:00.000Z');
+    const now = new Date(lastRunAt.getTime() + 167.5 * 3600_000); // 168시간 전 — 주간 소스는 아직 기한 전
+    const dailyLast = new Date(now.getTime() - 24 * 3600_000 - 10 * 60_000); // daily 기한 = now - 10분 (> 주간 소스의 '7 days' 기한 167h)
+    const [weekly] = await db
+      .insert(schema.collectorSources)
+      .values({ ownerId: ownerB, kind: 'rss', url: 'https://dst-weekly.mock.example/feed.xml', normalizedUrl: 'https://dst-weekly.mock.example/feed.xml', host: 'dst-weekly.mock.example', enabled: true, schedule: 'weekly', lastRunAt })
+      .returning();
+    await db.update(schema.collectorSources).set({ enabled: false, schedule: 'off' }).where(and(eq(schema.collectorSources.ownerId, ownerB), sql`${schema.collectorSources.id} <> ${weekly!.id}`));
+    const [daily] = await db
+      .insert(schema.collectorSources)
+      .values({ ownerId: ownerB, kind: 'rss', url: MOCK_FEEDS.overseasSales, normalizedUrl: MOCK_FEEDS.overseasSales, host: 'overseas-sales.mock.example', enabled: true, schedule: 'daily', lastRunAt: dailyLast })
+      .onConflictDoUpdate({ target: [schema.collectorSources.ownerId, schema.collectorSources.normalizedUrl], set: { enabled: true, schedule: 'daily', lastRunAt: dailyLast } })
+      .returning();
+    const runsOf = (id: string) => n(schema.collectorRuns, and(eq(schema.collectorRuns.sourceId, id), eq(schema.collectorRuns.trigger, 'scheduled')));
+    const dailyBefore = await runsOf(daily!.id);
+    await db.execute(sql`set time zone 'America/New_York'`);
+    try {
+      // '7 days' 였다면 뉴욕 달력 7일 = 167시간이라 주간 소스가 SQL 상 먼저 기한 → 한도 1 을 차지하고 JS 재확인에서 빠져 daily 가 실행되지 않았다.
+      await runDueCollectorSources(db, loadConfig(), mockCollectorForTest(), now, 1);
+      expect(await runsOf(weekly!.id)).toBe(0);
+      expect(await runsOf(daily!.id)).toBe(dailyBefore + 1);
+      // 168시간이 되면 주간 소스도 실행
+      await runDueCollectorSources(db, loadConfig(), mockCollectorForTest(), new Date(lastRunAt.getTime() + 168 * 3600_000), 1);
+      expect(await runsOf(weekly!.id)).toBe(1);
+    } finally {
+      await db.execute(sql`set time zone 'UTC'`);
+      await db.update(schema.collectorSources).set({ enabled: false, schedule: 'off' }).where(eq(schema.collectorSources.ownerId, ownerB));
+    }
+  });
+});
+
 describe('내보내기·복원(수집 표 포함)', () => {
   it('복원 훈련 PASS — 소스·실행·항목·닫기 행이 같은 ID 로, 소스는 꺼진 채(enabled=false)로 복원', async () => {
     // 켜진 소스가 하나 이상 있어야 "꺼진 채 복원" 규칙이 실제로 적용된다

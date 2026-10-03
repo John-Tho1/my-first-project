@@ -548,6 +548,14 @@ function decodeUtf8(bytes: Uint8Array): string {
  * 문자열 구간 [start, end) 에 해당하는 원본 바이트를 잘라 준다(복사본). s 는 bytes 를 손실 없이(fatal, ignoreBOM) 디코딩한 값이어야 한다.
  * 구간은 앞에서 뒤로 차례로 요청된다고 가정하고 위치를 이어서 센다(전체 선형). 뒤로 돌아가면 처음부터 다시 센다.
  */
+/**
+ * Codex review-FIX-T19 P2 :560 — Buffer.prototype.slice 는 같은 메모리를 공유하는 view 를 돌려준다(Uint8Array.prototype.slice 는 복사).
+ * 원본 바이트는 입력 버퍼와 분리돼야 하므로, 입력이 Buffer 여도 항상 새 메모리로 복사한다.
+ */
+export function copyBytes(bytes: Uint8Array, start = 0, end = bytes.byteLength): Uint8Array {
+  return Uint8Array.prototype.slice.call(bytes, start, end) as Uint8Array;
+}
+
 function byteSlicer(s: string, bytes: Uint8Array) {
   let charPos = 0;
   let bytePos = 0;
@@ -559,7 +567,7 @@ function byteSlicer(s: string, bytes: Uint8Array) {
     bytePos += Buffer.byteLength(s.slice(charPos, start), 'utf8');
     charPos = start;
     const len = Buffer.byteLength(s.slice(start, end), 'utf8');
-    return bytes.slice(bytePos, bytePos + len);
+    return copyBytes(bytes, bytePos, bytePos + len);
   };
 }
 
@@ -695,7 +703,7 @@ export function parsePage(bytes: Uint8Array, pageUrl: string): ParsedFeed {
         publishedText: null,
         publishedAt: null,
         text: text.trim(),
-        rawBytes: bytes.slice(),
+        rawBytes: copyBytes(bytes),
         rawFormat: 'html',
         linkRelative: false,
       },

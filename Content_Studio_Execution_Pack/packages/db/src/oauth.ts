@@ -27,8 +27,12 @@ import {
   CredentialRefreshFailedError,
   credentialHealth,
   hashOAuthState,
+  isRevokeUnsupported,
+  isUnboundLiveExternalId,
   isUuid,
   isWellFormedOAuthState,
+  LIVE_THREADS_PUBLISH_MARKER,
+  UNBOUND_LIVE_EXTERNAL_PREFIX,
   newCodeVerifier,
   newOAuthState,
   NotFoundError,
@@ -210,8 +214,58 @@ export function accountHealthView(account: AccountRow, cred: OAuthCredentialRow 
     /** FIX3·FIX4-T13: 정리 대기 종류(refresh_unknown·verify_current·cleanup_revoke 중 가장 앞의 것)와 건수만 — 봉인·행 ID 는 내보내지 않는다 */
     pending_reconcile: pending?.kind ?? null,
     pending_count: pending?.count ?? 0,
-    notice: mock ? 'MOCK — 모의 연결입니다. 실제 Threads 계정 연결이 아니며 실제 게시에 쓰이지 않습니다.' : null,
+    notice: mock
+      ? 'MOCK — 모의 연결입니다. 실제 Threads 계정 연결이 아니며 실제 게시에 쓰이지 않습니다.'
+      : `실제 계정 — 연결·프로필 조회만(D31). 실제 게시는 하지 않습니다(${LIVE_THREADS_PUBLISH_MARKER}).`,
+    /** LIVE-T1: 실제 계정이 아직 Threads 프로필 ID 에 묶이지 않음(첫 연결 전) */
+    live_unbound: !mock && isUnboundLiveExternalId(account.externalAccountId),
   };
+}
+
+/**
+ * LIVE-T1(D31 2단계 준비): 실제 Threads 계정 행(연결 전)을 만든다 — owner 범위, 외부 호출 없음. 이미 "연결 전" 실제 Threads 행이 있으면 그 행을 돌려준다(멱등).
+ * external_account_id = 'pending:<uuid>'(첫 실제 연결 callback 이 프로필 ID 로 묶는다), state = 'disconnected'(accountReady=false — 배포 계획에 고를 수 없다;
+ * 실제 게시는 D31 범위 밖). 연결 정보·토큰은 만들지 않는다.
+ */
+export async function createLiveThreadsAccount(db: Db, ownerId: string, now: Date = new Date()): Promise<{ account: AccountRow; created: boolean }> {
+  return db.transaction(async (tx) => {
+    const existing = await tx
+      .select()
+      .from(channelAccounts)
+      .where(and(eq(channelAccounts.ownerId, ownerId), eq(channelAccounts.platform, 'threads'), eq(channelAccounts.kind, 'live')))
+      .orderBy(asc(channelAccounts.createdAt), asc(channelAccounts.id));
+    const unbound = existing.find((a) => isUnboundLiveExternalId(a.externalAccountId));
+    if (unbound) return { account: unbound, created: false };
+    const [row] = await tx
+      .insert(channelAccounts)
+      .values({
+        ownerId,
+        platform: 'threads',
+        kind: 'live',
+        externalAccountId: `${UNBOUND_LIVE_EXTERNAL_PREFIX}${randomUUID()}`,
+        displayName: '실제 Threads 계정(연결 전)',
+        state: 'disconnected',
+        capabilitySnapshot: { mock: false, external_writes: false, publish: 'out_of_scope_D31', note: '실제 계정 — 연결·프로필 조회만(D31), 게시 안 함' },
+        createdAt: now,
+      })
+      .returning();
+    await recordAudit(tx, {
+      ownerId,
+      action: 'channel_account.live_created',
+      entity: 'channel_account',
+      entityId: row!.id,
+      details: { platform: 'threads', kind: 'live', approval: 'D31', publish: 'out_of_scope' },
+      at: now,
+    });
+    return { account: row!, created: true };
+  });
+}
+
+/** LIVE-T1: 같은 owner 의 다른 Threads 계정이 이미 그 프로필에 묶여 있음 — 저장하지 않는다 */
+export class OAuthAccountDuplicateError extends AppError {
+  constructor() {
+    super('conflict', 'oauth_account_duplicate', '이 Threads 계정은 이미 다른 배포 계정 행에 연결되어 있습니다. 연결 정보를 저장하지 않았습니다.');
+  }
 }
 export type AccountHealthView = ReturnType<typeof accountHealthView>;
 
@@ -321,7 +375,8 @@ export async function startOAuthConnect(
       action: 'oauth.connect_start',
       entity: 'channel_account',
       entityId: account.id,
-      details: { provider: provider.id, mock: provider.mock, scopes: scopes.join(','), pkce: 'S256' },
+      // LIVE-T1: 실제 Threads 는 PKCE 미지원(문서) — challenge 를 보내지 않으므로 'none'(verifier 는 틀 공통으로 봉인해 둔다)
+      details: { provider: provider.id, mock: provider.mock, scopes: scopes.join(','), pkce: provider.pkce === false ? 'none' : 'S256' },
       at: now,
     });
   });
@@ -395,16 +450,20 @@ async function lockAccountCredential(tx: DbOrTx, ownerId: string, accountId: str
 const sameLiveGeneration = (cred: OAuthCredentialRow | null, generation: number): cred is OAuthCredentialRow =>
   !!cred && cred.tokenGeneration === generation && !cred.revokedAt && cred.status !== 'revoking' && cred.encryptedToken !== null;
 
-type RemoteRevoke = 'ok' | 'ok_already_revoked' | 'failed' | 'unknown';
+type RemoteRevoke = 'ok' | 'ok_already_revoked' | 'failed' | 'unknown' | 'unsupported';
 
 /**
  * 공급자에서 토큰을 철회한다(정리용 — 실패해도 던지지 않는다).
  * FIX3-T13: token_revoked·invalid_token(공급자가 모르는 토큰 — 쓸 수 없음) = 이미 철회됨. provider_error(일시·원인 불명) = unknown(철회됐는지 모름).
  * 그 밖의 공급자 거부 = failed(철회되지 않음). failed·unknown 은 정리 대기(cleanup_revoke)로 남겨 다음 확인·tick 이 다시 철회한다.
+ * LIVE-T1(D31): 공급자에 철회 API 가 없으면(실제 Threads) unsupported — 다시 시도해도 바뀌지 않으므로 정리 대기로 남기지 않는다(실패 아님).
+ * 로컬 삭제(암호문 삭제·revoked_at·승인 철회)는 T13 규칙 그대로 하고, 감사에 remote_revoke=unsupported 를 남긴다. 토큰은 공급자 쪽에서
+ * 만료(장기 토큰 60일)될 때까지 유효할 수 있다 — 사용자가 Threads 앱 설정에서 앱 권한을 지우면 무효가 된다(README·핸드오프).
  */
 async function revokeAtProvider(provider: OAuthProvider, tokens: StoredOAuthTokens, now: Date): Promise<{ result: RemoteRevoke; code: string | null }> {
   try {
-    await provider.revoke({ tokens, now });
+    const r = await provider.revoke({ tokens, now });
+    if (isRevokeUnsupported(r)) return { result: 'unsupported', code: null };
     return { result: 'ok', code: null };
   } catch (e) {
     const code = e instanceof OAuthProviderError ? e.code : 'provider_error';
@@ -512,8 +571,14 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
     tokens = await provider.exchangeCode({ code: input.query.code!, codeVerifier: verifier, redirectUri: row.redirectUri, now });
   } catch (e) {
     const code = e instanceof OAuthProviderError ? e.code : 'provider_error';
-    await rejectCallback(db, ownerId, account.id, 'exchange_failed', now, { provider_error: code });
-    throw new OAuthFlowError('oauth_exchange_failed', { reason: code });
+    // LIVE-T1(D31): 실제 공급자의 부가 정보(숫자·열거만). ambiguous = 코드가 소비됐거나 토큰이 발급됐을 수 있지만 받지 못함 —
+    // 손에 든 토큰이 없으므로 저장·정리 대기(봉인할 값 없음)·철회(Threads 는 철회 API 없음) 모두 할 수 없다. state 는 이미 사용 처리됐다(다시 연결).
+    const d = e instanceof OAuthProviderError ? e.detail : null;
+    await rejectCallback(db, ownerId, account.id, 'exchange_failed', now, {
+      provider_error: code,
+      ...(d ? { provider_reason: d.reason, provider_step: d.step ?? null, outcome_ambiguous: d.ambiguous ? 'yes' : 'no' } : {}),
+    });
+    throw new OAuthFlowError('oauth_exchange_failed', { reason: code, ...(d?.ambiguous ? { outcome: 'unknown' } : {}) });
   }
   // 여기부터 공급자에 유효한 토큰이 있다 — 저장하지 못하면 철회한다.
   const issued: StoredOAuthTokens = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, accessExpiresAt: tokens.accessExpiresAt ? tokens.accessExpiresAt.toISOString() : null };
@@ -537,7 +602,13 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
     await discard('account_info_failed', { provider_error: code });
     throw new OAuthFlowError('oauth_exchange_failed', { reason: code });
   }
-  if (info.externalAccountId !== account.externalAccountId) {
+  // LIVE-T1(D31): 연결 전 실제 계정(pending:)은 첫 연결에서 공급자 프로필 ID 로 묶는다(저장 트랜잭션 안에서 다시 확인). 그 밖에는 T13 그대로 — 다르면 거부.
+  const bindLive = account.kind === 'live' && isUnboundLiveExternalId(account.externalAccountId);
+  if (bindLive && (!info.externalAccountId || isUnboundLiveExternalId(info.externalAccountId) || info.externalAccountId.startsWith('mock:'))) {
+    await discard('account_mismatch');
+    throw new OAuthAccountMismatchError();
+  }
+  if (!bindLive && info.externalAccountId !== account.externalAccountId) {
     await discard('account_mismatch');
     throw new OAuthAccountMismatchError();
   }
@@ -553,6 +624,26 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
       // FIX2-T13(Codex P1 :439): 이 연결 요청을 만든 뒤 연결 해제가 시작됐다면(해제 세대가 바뀜 — 그 뒤 다시 연결됐어도) 저장하지 않는다.
       // 해제 세대는 다시 연결로 초기화되지 않으므로 시각 비교 없이 판정한다.
       if ((existing?.revocationEpoch ?? 0) !== row.revocationEpoch) throw new OAuthFlowError('oauth_state_invalid', { reason: 'revoked_after_request' });
+      // LIVE-T1(D31): 잠금 아래에서 계정 정체를 다시 본다. 아직 연결 전(pending:)이면 프로필 ID 로 묶고, 그 사이 묶였으면 같은 ID 일 때만.
+      let accountBound = false;
+      if (isUnboundLiveExternalId(acc.externalAccountId)) {
+        if (acc.kind !== 'live') throw new OAuthAccountMismatchError();
+        const dup = await tx
+          .select({ id: channelAccounts.id })
+          .from(channelAccounts)
+          .where(and(eq(channelAccounts.ownerId, ownerId), eq(channelAccounts.platform, acc.platform), eq(channelAccounts.externalAccountId, info.externalAccountId)))
+          .limit(1);
+        if (dup.length) throw new OAuthAccountDuplicateError();
+        await tx
+          .update(channelAccounts)
+          .set({ externalAccountId: info.externalAccountId, displayName: info.displayName.slice(0, 200) })
+          .where(and(eq(channelAccounts.id, acc.id), eq(channelAccounts.ownerId, ownerId)));
+        acc.externalAccountId = info.externalAccountId;
+        acc.displayName = info.displayName.slice(0, 200);
+        accountBound = true;
+      } else if (acc.externalAccountId !== info.externalAccountId) {
+        throw new OAuthAccountMismatchError();
+      }
       const generation = (existing?.tokenGeneration ?? 0) + 1;
       const values = {
         encryptedToken: sealed.ciphertext,
@@ -590,6 +681,7 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
           provider: provider.id,
           mock: provider.mock,
           reconnect: existing !== null,
+          account_bound: accountBound,
           token_generation: generation,
           revocation_epoch: row.revocationEpoch,
           scopes: tokens.scopes.join(','),
@@ -2026,6 +2118,9 @@ export async function refreshExpiringCredentials(
   }
   const conds = [
     eq(oauthCredentials.status, 'active'),
+    // LIVE-T1(D31): 실제 연결 정보의 자동 갱신(th_refresh_token — 실제 Threads 호출)은 D31 승인 범위(연결·프로필 조회) 밖이라 worker 가 하지 않는다.
+    // 모의 연결 정보만 자동 갱신한다. 실제 토큰은 만료(60일) 전 사용자가 다시 연결하거나, 별도 승인 뒤 이 조건을 푼다.
+    eq(oauthCredentials.isMock, true),
     isNull(oauthCredentials.revokedAt),
     notExists(db.select({ one: sql`1` }).from(oauthPendingTokens).where(eq(oauthPendingTokens.channelAccountId, oauthCredentials.channelAccountId))),
     gt(oauthCredentials.expiresAt, now),

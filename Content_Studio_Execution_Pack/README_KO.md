@@ -467,6 +467,24 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 개발용 시나리오(Instagram 모의 항목에만): `instagram_success`·`instagram_container_slow`·`instagram_publish_timeout_sent`·`instagram_publish_timeout_not_sent`·`instagram_rate_limited`·`instagram_token_invalid`·`instagram_permission_denied`·`instagram_invalid_spec_remote`·`instagram_container_error`. payload·hash 는 바꾸지 않는다.
 - `pnpm drill:mock` 은 YouTube 표 다음에 Instagram 모의 표(단일·캐러셀·컨테이너 지연·게시 응답 유실·401·원격 규격 거부·컨테이너 오류·429·승인 전 규격 거절·로컬 제한·재시작 UNKNOWN — 게시 1회·받은 이미지 = 승인 파일·살아 있는 공개 URL 0·DB 에 공개 URL 0)를 찍는다.
 
+### Threads 실제 연결(D31 2단계 준비)
+결정 D31(docs/DECISIONS.md). **1단계(LIVE-T1)는 코드와 기록된 응답(fixture) 시험만 — 이 저장소의 어떤 코드·시험도 실제 Threads·Meta 로 요청하지 않았다.** 시험은 `tests/setup/no-meta-network.ts` 가드가 `*.threads.com`·`*.threads.net`·`*.facebook.com`·`*.instagram.com` 요청을 보내기 전에 막고, 시도가 있으면 그 시험 파일을 실패시킨다. 2단계(실제 연결 1회)는 사용자가 아래 순서로 직접 한다.
+- **범위 안(D31)**: 테스트 Threads 계정 1개를 실제 OAuth 로 연결 — 인증 창(`threads.com/oauth/authorize`) → 코드 교환(`POST graph.threads.com/oauth/access_token`) → 장기 토큰 교환(`GET graph.threads.net/access_token`, `th_exchange_token`) → 프로필 조회(`GET graph.threads.net/v1.0/me?fields=id,username`). 요청 권한은 `threads_basic,threads_content_publish` 만(답글·통계 요청 안 함). 장기 토큰은 T13 규칙대로 서버에서 봉인 저장.
+- **범위 밖(별도 승인)**: 실제 게시(컨테이너·`threads_publish` — 화면·`/ops` 에 `LIVE_THREADS_PUBLISH(D31 범위 밖)` 표시, `PUBLISH_MODE=disabled` 유지), 다른 계정·채널, 운영 배포, 터널 등 앱을 외부에 노출하는 일. **자동 갱신(`th_refresh_token`)도 worker 가 하지 않는다**(실제 연결 정보는 자동 갱신 대상에서 빠짐 — 설정 화면에 "지금 갱신" 버튼도 없다). 실제 계정 행은 `state=disconnected` 로 남아 배포 계획에 고를 수 없다.
+- 환경 변수(값은 사용자가 `.env.local` 에 직접 — 대화·저장소·로그에 값 없음): `OAUTH_MODE=live` · `THREADS_APP_ID`(앱 대시보드의 Threads 앱 ID, 숫자) · `THREADS_APP_SECRET` · `OAUTH_REDIRECT_URI`(예: `http://localhost:3000/api/oauth/callback` — 앱 대시보드의 "유효한 OAuth 리디렉션 URI" 와 글자까지 같아야 함) · `OAUTH_LIVE_APPROVAL_REF=D31` · `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(T13). `PUBLISH_MODE` 는 넣지 않거나 `disabled`.
+- 준비 상태: 위 이름이 하나라도 빠지면 설정 → 배포 계정 연결에 `실제 Threads 연결 준비 안 됨: <이름들>`(값 없음)이 보이고 연결 버튼 대신 같은 이름 목록이 나온다. 모두 갖춰지면 `실제 Threads 연결 준비됨`.
+- 2단계 순서(사용자):
+  1. Meta 앱 대시보드에서 Threads 사용 사례·테스트 사용자(테스트 Threads 계정)·유효한 OAuth 리디렉션 URI 를 확인한다. Meta 가 `http://localhost` 를 거부하면 멈추고 알려 준다(HTTPS 로컬 주소 방법은 다시 정한다 — 외부 노출은 별도 승인).
+  2. `.env.local` 에 위 변수를 넣고 dev 서버를 다시 시작한다.
+  3. 설정 → 배포 계정 연결 → **실제 Threads 계정 추가(연결 전 행 — 외부 호출 없음)**.
+  4. 그 행의 **실제 연결(Threads 인증 창)** → Threads 에 테스트 계정으로 로그인·동의 → 앱으로 돌아오면 `실제 Threads 계정을 연결했습니다`. 행 이름이 `@<username>` 으로 바뀌고 상태 `연결됨`, 만료(약 60일)가 보인다.
+  5. (선택) **연결 확인(프로필 조회)** — `/me` 한 번.
+  6. 끝나면 결과(성공·오류 코드만)를 Claude 에 알린다. 토큰·코드·시크릿은 붙여 넣지 않는다.
+- 연결 해제: Threads 에는 토큰 철회 API 가 공식 문서에 없다 → `연결 해제`는 **이 앱의 연결 정보만** 지우고(T13 규칙 — 암호문 삭제·승인 철회) 응답·감사에 `remote_revoke=unsupported` 를 남긴다. Threads 쪽 권한까지 없애려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 지운다(메뉴 이름은 앱 버전에 따라 다를 수 있음). 그러지 않으면 장기 토큰은 만료(60일)까지 Threads 쪽에서 유효하다.
+- 보호: PKCE 는 Threads 문서에 없어 보내지 않는다 — state(서버에 SHA-256 만, 로그인 세션·계정에 묶임, 1회용, 10분) + redirect URI 정확 일치 + 서버만 아는 앱 시크릿으로 막는다. 앱 시크릿·토큰은 공식 문서대로 질의 문자열에 들어가는 요청이 있으므로 URL 을 기록하지 않고, 공급자 오류는 코드와 숫자(HTTP 상태·Meta 오류 코드)만 남긴다(원 오류·메시지 원문 버림). 리다이렉트를 따르지 않고(시크릿이 다른 호스트로 가지 않게) 10초 시간 제한.
+- 오류: 코드 교환 중 끊김·시간 초과·5xx 는 **결과 불명**(코드가 소비됐을 수 있음) — 다시 보내지 않고 400 `oauth_exchange_failed`(`outcome: unknown`), 감사 `outcome_ambiguous=yes`. 손에 받은 토큰이 없으므로 저장·정리 대기·철회할 것이 없다 — 설정에서 다시 연결한다. 이미 쓴 코드 → `invalid_grant`, 앱 ID·시크릿 거부 → `invalid_client`, 190 → `invalid_token`(463 만료 · 458/460 철회), 10·200번대 → `scope_not_allowed`, 429·4/17/32/613 → 요청 제한(`provider_error`).
+- API: `POST /api/channel-accounts`(본문 `platform=threads`, `kind=live` — 연결 전 실제 Threads 행, 같은 출처·로그인, 멱등). 첫 실제 연결이 `pending:<uuid>` 를 프로필 ID 로 묶는다. 같은 owner 의 다른 행이 이미 그 프로필에 묶여 있으면 409 `oauth_account_duplicate`, 묶인 행에 다른 Threads 계정이 돌아오면 409 `oauth_account_mismatch`(저장 안 함).
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

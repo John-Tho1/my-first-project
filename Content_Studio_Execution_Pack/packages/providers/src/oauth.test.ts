@@ -143,23 +143,28 @@ describe('resolveOAuthProvider', () => {
     // T16: Instagram 은 Meta 형 모의 공급자가 생겼다 — 지원하지 않는 채널 예시는 블로그(같은 단언)
     expect(() => resolveOAuthProvider({ kind: 'mock', platform: 'blog' }, config, {}, REDIRECT)).toThrow(OAuthNotSupportedError);
   });
-  it('실제 계정은 조건이 모두 있어도 거부(LIVE_OAUTH_ADAPTER(T14 미구현)) — 비밀 값은 메시지에 없다', () => {
+  // LIVE-T1(D31): 조건이 모두 있으면 실제 Threads 공급자가 선택된다(그 행렬은 threads-live-oauth.test.ts). 여기서는 T13 의 거부 경로가 그대로인지만.
+  it('실제 계정: 조건이 빠지면 거부(빠진 이름만) — 비밀 값은 메시지에 없다. 조건이 모두 있으면 실제 공급자(네트워크 없음)', () => {
     const live = loadConfig({
       OAUTH_MODE: 'live',
-      THREADS_APP_ID: 'placeholder-app-id',
-      OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
+      THREADS_APP_ID: '000000000000001',
+      OAUTH_REDIRECT_URI: REDIRECT,
       OAUTH_LIVE_APPROVAL_REF: 'D99',
-      PUBLISH_MODE: 'enabled',
     });
     const env = { THREADS_APP_SECRET: 'placeholder-secret-value', SECRETS_MASTER_KEY: Buffer.alloc(32, 7).toString('base64'), SECRETS_KEY_VERSION: '1' };
     try {
-      resolveOAuthProvider({ kind: 'live', platform: 'threads' }, live, env, REDIRECT);
+      resolveOAuthProvider({ kind: 'live', platform: 'threads' }, live, { ...env, THREADS_APP_SECRET: '' }, REDIRECT);
       expect.unreachable();
     } catch (e) {
       expect(e).toBeInstanceOf(LiveOAuthNotConfiguredError);
-      expect((e as LiveOAuthNotConfiguredError).missing).toEqual(['LIVE_OAUTH_ADAPTER(T14 미구현)']);
+      expect((e as LiveOAuthNotConfiguredError).missing).toEqual(['THREADS_APP_SECRET']);
       expect((e as Error).message).not.toContain('placeholder-secret-value');
+      expect((e as Error).message).not.toContain('LIVE_OAUTH_ADAPTER');
     }
+    const p = resolveOAuthProvider({ kind: 'live', platform: 'threads' }, live, env, REDIRECT);
+    expect(p.mock).toBe(false);
+    expect(p.id).toBe('threads');
+    expect(JSON.stringify(p)).not.toContain('placeholder-secret-value');
     expect(() => resolveOAuthProvider({ kind: 'live', platform: 'threads' }, config, {}, REDIRECT)).toThrow(LiveOAuthNotConfiguredError);
   });
 });

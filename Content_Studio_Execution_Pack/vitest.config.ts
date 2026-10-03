@@ -14,6 +14,8 @@ export default defineConfig({
       COLLECTOR_MODE: 'disabled',
       WORKER_MODE: 'inline',
     },
+    // LIVE-T1(D31): 실제 Threads·Meta 호스트로의 fetch 를 막고, 시도가 있으면 그 시험 파일을 실패시킨다(fixture fetch 만 허용).
+    setupFiles: ['./tests/setup/no-meta-network.ts'],
     projects: [
       {
         extends: true,

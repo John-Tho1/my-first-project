@@ -8,8 +8,12 @@ import {
   INSTAGRAM_NOT_REQUESTED_BY_DEFAULT,
   INSTAGRAM_REQUIRED_SCOPES,
   isPlainRedirectUri,
+  isUnboundLiveExternalId,
   isWellFormedOAuthState,
+  LIVE_THREADS_PUBLISH_MARKER,
   liveOAuthReadiness,
+  livePublishReadiness,
+  UNBOUND_LIVE_EXTERNAL_PREFIX,
   newCodeVerifier,
   newOAuthState,
   OAUTH_EXPIRING_SOON_MS,
@@ -95,32 +99,48 @@ describe('credentialHealth', () => {
   });
 });
 
-describe('live 준비 상태 — T13 에는 live 어댑터가 없어 항상 준비 안 됨', () => {
-  it('기본 설정: 빠진 조건 이름만(값 없음)', () => {
+// LIVE-T1(D31): T13 의 "항상 준비 안 됨(LIVE_OAUTH_ADAPTER(T14 미구현))" → 실제 Threads 연결은 조건이 모두 갖춰지면 준비됨.
+// PUBLISH_MODE 는 연결 준비에서 빠지고(D31 은 disabled 로 연결만 승인), 게시 준비(livePublishReadiness)는 항상 준비 안 됨.
+describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 나눠 본다', () => {
+  const FULL = {
+    OAUTH_MODE: 'live',
+    THREADS_APP_ID: 'placeholder-app-id',
+    OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
+    OAUTH_LIVE_APPROVAL_REF: 'D31',
+  } as const;
+  it('기본 설정: 빠진 조건 이름만(값 없음), 게시 관련 이름은 연결 준비에 없다', () => {
     const r = liveOAuthReadiness(loadConfig({}), { threadsAppSecretPresent: false, masterKeyConfigured: false });
     expect(r.ready).toBe(false);
-    expect(r.missing).toEqual([
-      'OAUTH_MODE=live',
-      'THREADS_APP_ID',
-      'THREADS_APP_SECRET',
-      'OAUTH_REDIRECT_URI',
-      'SECRETS_MASTER_KEY',
-      'OAUTH_LIVE_APPROVAL_REF',
-      'PUBLISH_MODE=enabled',
-      'LIVE_OAUTH_ADAPTER(T14 미구현)',
-    ]);
+    expect(r.missing).toEqual(['OAUTH_MODE=live', 'THREADS_APP_ID', 'THREADS_APP_SECRET', 'OAUTH_REDIRECT_URI', 'SECRETS_MASTER_KEY', 'OAUTH_LIVE_APPROVAL_REF']);
+    expect(r.missing.join(',')).not.toContain('LIVE_OAUTH_ADAPTER');
   });
-  it('모든 조건이 있어도 ready=false, LIVE_OAUTH_ADAPTER 만 남는다', () => {
-    const config = loadConfig({
-      OAUTH_MODE: 'live',
-      THREADS_APP_ID: 'placeholder-app-id',
-      OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
-      OAUTH_LIVE_APPROVAL_REF: 'D99',
-      PUBLISH_MODE: 'enabled',
-    });
+  it('모든 조건(PUBLISH_MODE=disabled 그대로) → ready=true, 빠진 이름 없음, 값은 결과에 없다', () => {
+    const config = loadConfig({ ...FULL });
+    expect(config.PUBLISH_MODE).toBe('disabled');
     const r = liveOAuthReadiness(config, { threadsAppSecretPresent: true, masterKeyConfigured: true });
-    expect(r).toEqual({ ready: false, missing: ['LIVE_OAUTH_ADAPTER(T14 미구현)'] });
+    expect(r).toEqual({ ready: true, missing: [] });
     expect(JSON.stringify(r)).not.toContain('placeholder-app-id');
+  });
+  it.each([
+    ['OAUTH_MODE', { OAUTH_MODE: 'mock' }, {}, 'OAUTH_MODE=live'],
+    ['THREADS_APP_ID', { THREADS_APP_ID: undefined }, {}, 'THREADS_APP_ID'],
+    ['THREADS_APP_SECRET', {}, { threadsAppSecretPresent: false }, 'THREADS_APP_SECRET'],
+    ['OAUTH_REDIRECT_URI', { OAUTH_REDIRECT_URI: undefined }, {}, 'OAUTH_REDIRECT_URI'],
+    ['SECRETS_MASTER_KEY', {}, { masterKeyConfigured: false }, 'SECRETS_MASTER_KEY'],
+    ['OAUTH_LIVE_APPROVAL_REF', { OAUTH_LIVE_APPROVAL_REF: undefined }, {}, 'OAUTH_LIVE_APPROVAL_REF'],
+  ] as const)('%s 하나만 빠짐 → ready=false, 그 이름 하나만', (_n, cfg, sec, name) => {
+    const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecretPresent: true, masterKeyConfigured: true, ...sec });
+    expect(r).toEqual({ ready: false, missing: [name] });
+  });
+  it('게시 준비: PUBLISH_MODE 와 관계없이 항상 준비 안 됨 + LIVE_THREADS_PUBLISH(D31 범위 밖)', () => {
+    expect(livePublishReadiness(loadConfig({}))).toEqual({ ready: false, missing: ['PUBLISH_MODE=enabled', LIVE_THREADS_PUBLISH_MARKER] });
+    expect(livePublishReadiness(loadConfig({ PUBLISH_MODE: 'enabled' }))).toEqual({ ready: false, missing: [LIVE_THREADS_PUBLISH_MARKER] });
+    expect(LIVE_THREADS_PUBLISH_MARKER).toBe('LIVE_THREADS_PUBLISH(D31 범위 밖)');
+  });
+  it('연결 전 실제 계정 ID 접두(pending:)는 mock: 과 겹치지 않는다', () => {
+    expect(isUnboundLiveExternalId(`${UNBOUND_LIVE_EXTERNAL_PREFIX}x`)).toBe(true);
+    expect(isUnboundLiveExternalId('1234567')).toBe(false);
+    expect(UNBOUND_LIVE_EXTERNAL_PREFIX.startsWith('mock:')).toBe(false);
   });
 });
 

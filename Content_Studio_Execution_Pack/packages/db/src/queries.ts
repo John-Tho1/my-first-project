@@ -233,6 +233,8 @@ export interface AuditInput {
     | 'transcript.to_capture'
     // T10 배포 계획·승인·실행
     | 'channel_account.state'
+    // LIVE-T1(D31): 실제 Threads 계정 행(연결 전) 생성 — 외부 호출 없음
+    | 'channel_account.live_created'
     | 'plan.create'
     | 'plan.execute'
     | 'approval.grant'

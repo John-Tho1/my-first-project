@@ -269,8 +269,8 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <p className="note">AI live 준비 안 됨: {live.missing.length ? live.missing.join(', ') : '없음'}</p>
         <p className="note">음성 전사 live 준비 안 됨: {sttLive.missing.length ? sttLive.missing.join(', ') : '없음'}</p>
         <p className="note">
-          계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 계정 연결 준비 안 됨:{' '}
-          {oauth.live.missing.join(', ')}
+          계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 Threads 연결 준비 안 됨:{' '}
+          {oauth.live.missing.length ? oauth.live.missing.join(', ') : '없음(준비됨 — 연결·프로필 조회만, D31)'} · 실제 게시 준비 안 됨: {oauth.livePublish.missing.join(', ')}
         </p>
       </section>
 

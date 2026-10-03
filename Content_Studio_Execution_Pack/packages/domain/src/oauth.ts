@@ -2,6 +2,8 @@
  * T13(결정 D24): 계정 연결(OAuth) 공통 틀 — 공급자 인터페이스, state·PKCE, scope, 연결 상태(health) 판정, live 준비 상태.
  *
  * - T13 은 모의 공급자(Threads 형태, 프로세스 안, 네트워크 없음)만 있다. 실제 Meta OAuth 왕복·토큰 발급은 하지 않는다.
+ *   LIVE-T1(D31): 실제 Threads 연결 공급자(@cs/providers LiveThreadsOAuthProvider)가 생겼다 — 준비 상태(liveOAuthReadiness)가 모두 갖춰진
+ *   실제(live) Threads 계정만. 실제 게시는 범위 밖(livePublishReadiness — LIVE_THREADS_PUBLISH(D31 범위 밖)).
  * - state: 32바이트 난수(base64url). 서버에는 SHA-256 만 저장, 한 번만 쓰임, owner + 로그인 세션 + 계정에 묶임, TTL 10분.
  * - PKCE: S256(verifier 32바이트 난수 base64url → SHA-256 → base64url). verifier 는 서버에 암호화해 둔다(브라우저로 나가지 않음).
  * - scope: 게시에 필요한 최소(Threads 기본 + 게시). reply·insights 는 기본으로 요청하지 않는다(docs/03). 실제 이름은 T14 에서 공식 문서로 재확인.
@@ -98,13 +100,30 @@ export interface OAuthProvider {
   readonly id: OAuthProviderId;
   readonly platform: Channel;
   readonly mock: boolean;
+  /**
+   * LIVE-T1(D31): 공급자가 PKCE(code_challenge)를 받는가. 생략 = true(모의 공급자 — S256).
+   * 실제 Threads 는 공식 문서에 PKCE 가 없어 false — state(세션 결합·1회용) + redirect URI 정확 일치 + 서버 쪽 client_secret 으로 막는다.
+   * false 여도 연결 요청 행에는 verifier 를 봉인해 둔다(틀 공통) — 다만 authorize URL 에 challenge 를 싣지 않는다.
+   */
+  readonly pkce?: boolean;
   requiredScopes(): readonly string[];
   buildAuthorizeUrl(req: OAuthAuthorizeRequest): string;
   exchangeCode(input: { code: string; codeVerifier: string; redirectUri: string; now: Date }): Promise<OAuthTokenSet>;
   refresh(input: { tokens: StoredOAuthTokens; now: Date }): Promise<OAuthTokenSet>;
-  revoke(input: { tokens: StoredOAuthTokens; now: Date }): Promise<void>;
+  /**
+   * 공급자 철회. void = 철회됨. LIVE-T1(D31): 공급자에 토큰 철회 API 가 없으면 { remoteRevoke: 'unsupported' } 를 돌려준다(네트워크 호출 없음) —
+   * 호출자는 T13 의 로컬 삭제 규칙(암호문 삭제·revoked_at·승인 철회)을 그대로 적용하고 원격 철회는 "지원 안 함"으로 기록한다.
+   */
+  revoke(input: { tokens: StoredOAuthTokens; now: Date }): Promise<void | OAuthRevokeOutcome>;
   accountInfo(input: { accessToken: string; now: Date }): Promise<OAuthAccountInfo>;
 }
+
+/** LIVE-T1(D31): 원격 철회를 지원하지 않는 공급자의 revoke 결과 */
+export interface OAuthRevokeOutcome {
+  remoteRevoke: 'unsupported';
+}
+export const isRevokeUnsupported = (v: unknown): v is OAuthRevokeOutcome =>
+  !!v && typeof v === 'object' && (v as { remoteRevoke?: unknown }).remoteRevoke === 'unsupported';
 
 export type OAuthProviderErrorCode =
   | 'invalid_grant'
@@ -117,15 +136,34 @@ export type OAuthProviderErrorCode =
   | 'token_revoked'
   | 'scope_not_allowed'
   | 'invalid_request'
+  /** LIVE-T1: 앱 ID·앱 시크릿이 공급자에서 거부됨(설정 문제 — 다시 시도해도 같다) */
+  | 'invalid_client'
+  /** 일시·원인 불명(네트워크·시간 초과·요청 제한·5xx·형식 오류 포함). T13 규칙: 철회 결과로는 unknown, 갱신 실패여도 상태는 active 유지. */
   | 'provider_error';
 
-/** 공급자 오류 — 코드만 담는다(토큰·code 값 없음). */
+/**
+ * LIVE-T1(D31): 공급자 오류의 부가 정보 — **숫자·열거 값만**(공급자 메시지 원문·URL·토큰·시크릿 없음). 감사에 그대로 남겨도 된다.
+ * ambiguous = 요청이 공급자에 닿아 쓰기(코드 소비·토큰 발급)가 일어났을 수 있지만 결과를 모른다(네트워크 끊김·시간 초과·5xx·2xx 형식 오류).
+ */
+export interface OAuthProviderErrorDetail {
+  reason: 'network' | 'timeout' | 'rate_limited' | 'server_error' | 'oauth_exception' | 'http_error' | 'malformed_response' | 'host_not_allowed' | 'local_check';
+  step?: 'authorize' | 'exchange' | 'long_lived' | 'refresh' | 'account';
+  httpStatus?: number;
+  providerCode?: number;
+  providerSubcode?: number;
+  ambiguous?: boolean;
+  retryAfterSec?: number;
+}
+
+/** 공급자 오류 — 코드만 담는다(토큰·code 값 없음). LIVE-T1: 부가 정보(detail)도 숫자·열거 값만. cause 는 붙이지 않는다(원 오류에 URL·시크릿이 있을 수 있음). */
 export class OAuthProviderError extends Error {
   readonly code: OAuthProviderErrorCode;
-  constructor(code: OAuthProviderErrorCode) {
+  readonly detail: OAuthProviderErrorDetail | null;
+  constructor(code: OAuthProviderErrorCode, detail?: OAuthProviderErrorDetail) {
     super(`oauth provider error: ${code}`);
     this.name = 'OAuthProviderError';
     this.code = code;
+    this.detail = detail ?? null;
   }
 }
 
@@ -200,7 +238,7 @@ export class LiveOAuthNotConfiguredError extends GuardError {
   constructor(missing: string[] = []) {
     super(
       'LIVE_OAUTH_NOT_CONFIGURED',
-      `실제 계정 연결(OAuth)이 구현·승인되어 있지 않습니다. 외부로 아무것도 보내지 않았습니다.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
+      `실제 계정 연결(OAuth)이 준비·승인되어 있지 않습니다. 외부로 아무것도 보내지 않았습니다.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
     );
     this.missing = missing;
   }
@@ -340,16 +378,22 @@ export function credentialHealth(input: CredentialHealthInput): CredentialHealth
 // ---- live 준비 상태 ----
 
 export interface LiveOAuthReadiness {
-  ready: false;
+  /** 실제 계정 **연결**(OAuth 왕복·프로필 조회)을 시작할 수 있는가 — 게시와는 별개(livePublishReadiness) */
+  ready: boolean;
   missing: string[];
 }
 
+/** LIVE-T1(D31): 실제 게시는 승인 범위 밖 — 이 표식은 3단계 승인 전까지 항상 남는다. */
+export const LIVE_THREADS_PUBLISH_MARKER = 'LIVE_THREADS_PUBLISH(D31 범위 밖)';
+
 /**
- * 실제 계정 연결의 전제 조건(이름만, 값 없음). 모두 갖춰져도 T13 에는 live OAuth 어댑터가 없어 ready 는 항상 false 이고
- * 'LIVE_OAUTH_ADAPTER(T14 미구현)' 가 남는다(LLM·STT 와 같은 방식).
+ * 실제 Threads 계정 **연결**의 전제 조건(이름만, 값 없음). LIVE-T1(D31): 모두 갖춰지면 ready=true(실제 Threads OAuth 공급자 선택 가능).
+ * 조건: OAUTH_MODE=live · THREADS_APP_ID · THREADS_APP_SECRET(존재만) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path) · SECRETS_MASTER_KEY ·
+ * OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다(게시 준비는 livePublishReadiness).
+ * T13 의 'LIVE_OAUTH_ADAPTER(T14 미구현)' 표식은 Threads 연결에서는 사라졌다(다른 채널의 실제 연결은 resolveOAuthProvider 가 따로 거부).
  */
 export function liveOAuthReadiness(
-  config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI' | 'PUBLISH_MODE'>,
+  config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
   secrets: { threadsAppSecretPresent: boolean; masterKeyConfigured: boolean },
 ): LiveOAuthReadiness {
   const missing: string[] = [];
@@ -357,12 +401,29 @@ export function liveOAuthReadiness(
   if (!config.THREADS_APP_ID) missing.push('THREADS_APP_ID');
   if (!secrets.threadsAppSecretPresent) missing.push('THREADS_APP_SECRET');
   if (!config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI');
+  else if (!isPlainRedirectUri(config.OAUTH_REDIRECT_URI)) missing.push('OAUTH_REDIRECT_URI(형식)');
   if (!secrets.masterKeyConfigured) missing.push('SECRETS_MASTER_KEY');
   if (!config.OAUTH_LIVE_APPROVAL_REF) missing.push('OAUTH_LIVE_APPROVAL_REF');
+  return { ready: missing.length === 0, missing };
+}
+
+/**
+ * LIVE-T1(D31): 실제 게시 준비 상태 — D31 승인 범위 밖이므로 항상 ready=false, LIVE_THREADS_PUBLISH(D31 범위 밖) 가 남는다.
+ * (게시 경로 자체도 PUBLISH_MODE·어댑터 선택(LiveChannelNotConfiguredError)·live 계정 state 로 막혀 있다 — 이 함수는 화면 표시용 이름 목록.)
+ */
+export function livePublishReadiness(config: Pick<AppConfig, 'PUBLISH_MODE'>): { ready: false; missing: string[] } {
+  const missing: string[] = [];
   if (config.PUBLISH_MODE !== 'enabled') missing.push('PUBLISH_MODE=enabled');
-  missing.push('LIVE_OAUTH_ADAPTER(T14 미구현)');
+  missing.push(LIVE_THREADS_PUBLISH_MARKER);
   return { ready: false, missing };
 }
+
+/**
+ * LIVE-T1(D31): 실제(live) 계정 행을 만들 때 외부 계정 ID 를 아직 모르면 이 접두 + UUID 로 둔다("연결 전"). 첫 실제 연결 callback 이
+ * 공급자 프로필의 ID 로 한 번만 바꾼다(묶기). 'mock:' 접두가 아니므로 DB CHECK(kind=mock ⇔ mock: 접두)와 맞는다.
+ */
+export const UNBOUND_LIVE_EXTERNAL_PREFIX = 'pending:';
+export const isUnboundLiveExternalId = (v: string): boolean => v.startsWith(UNBOUND_LIVE_EXTERNAL_PREFIX);
 
 /** 환경에 비밀이 "있는지"만 본다(값을 읽어 돌려주지 않음). */
 export function envPresent(env: Record<string, string | undefined>, name: string): boolean {

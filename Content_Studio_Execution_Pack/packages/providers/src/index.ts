@@ -8,6 +8,7 @@ export * from './channel-adapter';
 export * from './collector';
 export * from './llm';
 export * from './oauth';
+export * from './threads-live-oauth';
 export * from './publisher';
 export * from './storage';
 export * from './stt';

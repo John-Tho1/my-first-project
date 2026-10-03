@@ -14,7 +14,8 @@ type Ctx = { params: Promise<{ id: string }> };
  * POST /api/channel-accounts/{id}/connect — 계정 연결 시작(T13, D24). 같은 출처·로그인 필요. 다른 owner 의 계정은 404.
  * → 200 { account_id, authorize_url, expires_at, provider, mock, scopes } (폼은 303 으로 authorize_url).
  * authorize_url 에는 OAuth 규약상 state·PKCE challenge 가 들어간다(verifier 는 서버에 봉인, state 는 서버에 hash 만).
- * T13 은 Threads 모의 계정만(모의 공급자, 네트워크 없음). 실제 계정은 503 LIVE_OAUTH_NOT_CONFIGURED. 마스터 키가 없으면 503 secrets_not_configured.
+ * 모의 계정은 모의 공급자(네트워크 없음). LIVE-T1(D31): 실제 Threads 계정은 준비 상태가 모두 갖춰졌을 때만 threads.com 인증 창 주소(이 요청 자체는
+ * 외부 호출 없음 — 주소만 만든다), 아니면 503 live_oauth_not_configured(빠진 이름만). 마스터 키가 없으면 503 secrets_not_configured.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
   const html = wantsHtml(request);
@@ -40,7 +41,9 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
       provider: r.provider,
       mock: r.mock,
       scopes: r.scopes,
-      notice: r.mock ? 'MOCK — 모의 연결입니다. 실제 Threads 로 아무것도 보내지 않습니다.' : null,
+      notice: r.mock
+        ? 'MOCK — 모의 연결입니다. 실제 Threads 로 아무것도 보내지 않습니다.'
+        : '실제 Threads 인증 창으로 이동합니다(연결·프로필 조회만 — D31). 게시는 하지 않습니다.',
     });
   } catch (e) {
     if (html) return accountFormFailure(e);

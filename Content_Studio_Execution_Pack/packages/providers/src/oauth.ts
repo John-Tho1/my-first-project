@@ -8,8 +8,8 @@
  *   서버를 다시 시작하면 모의 토큰은 "알 수 없음"(invalid_token)이 된다 — 그 경우 화면은 다시 연결을 안내한다.
  *   M4-DEV1: 단, 모의 모드(OAUTH_MODE=mock)에서는 프로세스가 처음 연결 경로를 쓸 때 DB 의 쓸 수 있는 모의 연결 정보로 이 메모리를 한 번 다시 채운다
  *   (ensureMockOAuthRehydrated) — 재시작 뒤에도 모의 연결이 유지된다. 채널 시뮬레이터의 원격 기록은 다시 채우지 않는다(재시작 → UNKNOWN 유지).
- * - resolveOAuthProvider: 계정 kind 로 공급자를 고른다. 모의 계정 + threads → 모의 공급자. 실제(live) 계정은 liveOAuthReadiness 가
- *   항상 거부한다(T13 에는 live 어댑터가 없다 — LiveOAuthNotConfiguredError, 외부 호출 0).
+ * - resolveOAuthProvider: 계정 kind 로 공급자를 고른다. 모의 계정 + threads → 모의 공급자. 실제(live) Threads 계정은 LIVE-T1(D31)부터
+ *   liveOAuthReadiness 가 모두 갖춰졌을 때만 LiveThreadsOAuthProvider(threads-live-oauth.ts), 아니면 LiveOAuthNotConfiguredError(외부 호출 0).
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
@@ -32,6 +32,7 @@ import {
   type OAuthTokenSet,
   type StoredOAuthTokens,
 } from '@cs/domain';
+import { LiveThreadsOAuthProvider } from './threads-live-oauth';
 
 export const MOCK_THREADS_CLIENT_ID = 'mock-threads-client';
 /** 모의 공급자의 "동의 화면" 경로(앱 안). 실제 공급자라면 외부 주소다. */
@@ -655,14 +656,18 @@ export interface OAuthAccountRef {
 
 /**
  * 계정에 맞는 공급자. 모의 계정 + threads → 모의 공급자(네트워크 없음). 모의 계정의 다른 채널 → OAuthNotSupportedError(400).
- * 실제 계정 → liveOAuthReadiness 로 빠진 조건을 모아 LiveOAuthNotConfiguredError(503) — 조건이 모두 있어도 T13 에는 live 어댑터가 없어 항상 거부.
+ * 모의 계정은 OAUTH_MODE 와 관계없이 언제나 모의 공급자다(실제 자격 증명을 쓰지 않는다).
+ * 실제(live) 계정 → LIVE-T1(D31): Threads 이고 liveOAuthReadiness 가 모두 갖춰지면 LiveThreadsOAuthProvider(앱 시크릿은 여기서만 env 에서 읽어
+ * 공급자 비공개 필드로 넘긴다). 준비 안 됨 → LiveOAuthNotConfiguredError(503, 빠진 이름만). Threads 밖의 실제 계정 → 같은 오류 + 'LIVE_OAUTH_ADAPTER(<채널> 범위 밖)'.
+ * opts.fetch: 시험용 주입(fixture). 없으면 호출 시점의 globalThis.fetch.
  */
 export function resolveOAuthProvider(
   account: OAuthAccountRef,
-  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'PUBLISH_MODE'>,
+  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF'>,
   env: Record<string, string | undefined>,
   registeredRedirectUri: string,
   store?: MockOAuthStore,
+  opts: { fetch?: (input: string, init?: RequestInit) => Promise<Response> } = {},
 ): OAuthProvider {
   if (account.kind === 'mock') {
     if (account.platform === 'threads') return new MockThreadsOAuthProvider({ registeredRedirectUri, appBaseUrl: config.APP_BASE_URL, store });
@@ -672,9 +677,25 @@ export function resolveOAuthProvider(
     if (account.platform === 'instagram') return new MockInstagramOAuthProvider({ registeredRedirectUri, appBaseUrl: config.APP_BASE_URL, store });
     throw new OAuthNotSupportedError();
   }
+  if (account.kind !== 'live') throw new OAuthNotSupportedError();
   const readiness = liveOAuthReadiness(config, {
     threadsAppSecretPresent: envPresent(env, 'THREADS_APP_SECRET'),
     masterKeyConfigured: readSecretKeyring(env).ok,
   });
-  throw new LiveOAuthNotConfiguredError(readiness.missing);
+  const missing = [...readiness.missing];
+  if (account.platform !== 'threads') missing.push(`LIVE_OAUTH_ADAPTER(${account.platform} 범위 밖)`);
+  // 등록 redirect URI(callback 정확 일치 대상)는 설정값과 같아야 한다 — 다르면 이름만 알린다
+  else if (config.OAUTH_REDIRECT_URI && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
+  if (missing.length) throw new LiveOAuthNotConfiguredError(missing);
+  try {
+    return new LiveThreadsOAuthProvider({
+      appId: config.THREADS_APP_ID!,
+      appSecret: env.THREADS_APP_SECRET!.trim(),
+      registeredRedirectUri,
+      fetch: opts.fetch,
+    });
+  } catch {
+    // 앱 ID 형식(숫자)·시크릿 형식 문제 — 값 없이 이름만
+    throw new LiveOAuthNotConfiguredError(['THREADS_APP_ID·THREADS_APP_SECRET(형식)']);
+  }
 }

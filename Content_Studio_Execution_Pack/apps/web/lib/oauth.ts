@@ -7,6 +7,7 @@ import {
   AppError,
   envPresent,
   liveOAuthReadiness,
+  livePublishReadiness,
   oauthRedirectUri,
   readSecretKeyring,
   requireSecretKeyring,
@@ -102,20 +103,26 @@ export function mockThreadsProvider(config: AppConfig): MockThreadsOAuthProvider
   return new MockThreadsOAuthProvider({ registeredRedirectUri: oauthRedirectUri(config), appBaseUrl: config.APP_BASE_URL });
 }
 
-/** 화면 표시: 키 설정 여부·live 준비 상태(이름만, 값 없음) */
+/**
+ * 화면 표시: 키 설정 여부·live 준비 상태(이름만, 값 없음).
+ * LIVE-T1(D31): live = 실제 Threads **연결** 준비(ready 면 실제 연결 버튼 활성), livePublish = 실제 게시 준비(항상 준비 안 됨 — LIVE_THREADS_PUBLISH(D31 범위 밖)).
+ */
 export function oauthReadinessView(config: AppConfig, env: Record<string, string | undefined> = process.env) {
   const secrets = secretsReadiness(env);
   return {
     secrets,
     live: liveOAuthReadiness(config, { threadsAppSecretPresent: envPresent(env, 'THREADS_APP_SECRET'), masterKeyConfigured: readSecretKeyring(env).ok }),
+    livePublish: livePublishReadiness(config),
     redirectUri: oauthRedirectUri(config),
   };
 }
 
 export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   secrets_not_configured: '서버 비밀 암호화 키(SECRETS_MASTER_KEY·SECRETS_KEY_VERSION)가 설정되지 않아 계정을 연결할 수 없습니다. 다른 기능은 그대로 쓸 수 있습니다.',
-  oauth_not_supported: 'Threads·YouTube·Instagram 모의 계정만 연결할 수 있습니다.',
-  live_oauth_not_configured: '실제 계정 연결은 아직 준비되지 않았습니다(T14, 별도 승인 후). 외부로 아무것도 보내지 않았습니다.',
+  oauth_not_supported: 'Threads·YouTube·Instagram 모의 계정과 실제 Threads 계정만 연결할 수 있습니다.',
+  live_oauth_not_configured: '실제 계정 연결 준비가 끝나지 않았습니다(설정 화면의 "준비 안 됨" 이름을 확인하세요). 외부로 아무것도 보내지 않았습니다.',
+  oauth_account_duplicate: '이 Threads 계정은 이미 다른 배포 계정 행에 연결되어 있어 저장하지 않았습니다.',
+  bad_request: '요청 형식이 올바르지 않습니다.',
   oauth_state_invalid: '연결 요청을 확인할 수 없습니다. 다시 연결하세요.',
   oauth_state_expired: '연결 요청 시간이 지났습니다(10분). 다시 연결하세요.',
   oauth_state_used: '이미 처리한 연결 요청입니다. 다시 연결하세요.',

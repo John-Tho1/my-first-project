@@ -48,7 +48,13 @@ export default async function SettingsPage({
   const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
   // M4UI FIX1: 연결 해제 결과는 revokeNotice — 끝나지 않은 해제(revoke=incomplete&revoke_code=허용 코드)는 경고로, "해제했습니다"라고 하지 않는다
   const revokeMsg = revokeNotice({ revoked: str(q.revoked), revoke: str(q.revoke), code: str(q.revoke_code) });
-  const accountDone = q.connected ? '계정을 연결했습니다(MOCK).' : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : revokeMsg && !revokeMsg.warn ? revokeMsg.text : undefined;
+  const accountDone = q.connected === 'live'
+    ? '실제 Threads 계정을 연결했습니다(연결·프로필 조회만 — 실제 게시는 하지 않습니다, D31).'
+    : q.connected
+      ? '계정을 연결했습니다(MOCK).'
+      : q.live_account
+        ? '실제 Threads 계정 행을 만들었습니다(연결 전). 준비 상태가 모두 갖춰지면 "실제 연결"을 누르세요.'
+        : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : revokeMsg && !revokeMsg.warn ? revokeMsg.text : undefined;
   const accountWarn = revokeMsg?.warn ? revokeMsg.text : undefined;
 
   return (
@@ -130,6 +136,10 @@ export default async function SettingsPage({
           기준이며 1시간짜리 access token 은 보내기 전에 자동 갱신합니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을 복원하면 연결했던 계정은 &quot;다시
           연결 필요&quot;가 됩니다.
         </p>
+        <p className="note">
+          실제 Threads 계정(D31): 연결(인증 창 → 코드 교환 → 장기 토큰)과 프로필 조회만 합니다. 실제 게시·자동 갱신은 하지 않습니다. Threads 에는 토큰 철회 API 가 없어
+          &quot;연결 해제&quot;는 이 앱의 연결 정보만 지웁니다 — Threads 쪽 권한까지 지우려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 삭제하세요(메뉴 이름은 Threads 앱 버전에 따라 다를 수 있음).
+        </p>
         <p className="meta">
           <span className={oauth.secrets.configured ? 'tag' : 'tag warn'}>
             서버 암호화 키: {oauth.secrets.configured ? `설정됨(키 버전 ${oauth.secrets.currentVersion}${oauth.secrets.hasPrevious ? ', 이전 키 있음' : ''})` : '설정 안 됨'}
@@ -141,9 +151,26 @@ export default async function SettingsPage({
             계정 연결 불가: {oauth.secrets.problems.join(', ')} — .env.local 에 SECRETS_MASTER_KEY·SECRETS_KEY_VERSION 을 넣고 서버를 다시 시작하세요(다른 기능은 그대로).
           </p>
         ) : null}
+        {oauth.live.ready ? (
+          <p className="meta">
+            <span className="tag warn">실제 Threads 연결 준비됨</span>
+            <span>(연결·프로필 조회만 — D31. 요청 권한 threads_basic, threads_content_publish)</span>
+          </p>
+        ) : (
+          <p className="notice" role="note">
+            실제 Threads 연결 준비 안 됨: {oauth.live.missing.join(', ')}
+          </p>
+        )}
         <p className="notice" role="note">
-          실제 계정 연결 준비 안 됨: {oauth.live.missing.join(', ')}
+          실제 게시 준비 안 됨: {oauth.livePublish.missing.join(', ')}
         </p>
+        <form className="form inline" method="post" action="/api/channel-accounts">
+          <input type="hidden" name="platform" value="threads" />
+          <input type="hidden" name="kind" value="live" />
+          <button type="submit" className="link-button">
+            실제 Threads 계정 추가(연결 전 행 — 외부 호출 없음)
+          </button>
+        </form>
         {accounts.length ? (
           <div className="table-scroll">
             <table className="compare">
@@ -160,11 +187,15 @@ export default async function SettingsPage({
               <tbody>
                 {accounts.map((a) => {
                   const connectable = a.mock && (a.platform === 'threads' || a.platform === 'youtube' || a.platform === 'instagram');
+                  // LIVE-T1(D31): 실제 Threads 계정 — 준비 상태가 모두 갖춰졌을 때만 실제 연결(아니면 빠진 이름만 보인다)
+                  const liveThreads = !a.mock && a.platform === 'threads';
                   const hasCredential = a.connected_at !== null && a.revoked_at === null;
                   return (
                     <tr key={a.account_id}>
                       <td>
-                        {a.mock ? <span className="tag warn">MOCK</span> : null} {a.display_name} · {CHANNEL_LABEL[a.platform as Channel] ?? a.platform}
+                        {a.mock ? <span className="tag warn">MOCK</span> : <span className="tag warn">실제 계정</span>} {a.display_name} ·{' '}
+                        {CHANNEL_LABEL[a.platform as Channel] ?? a.platform}
+                        {!a.mock ? ' · 게시 안 함(D31 범위 밖)' : ''}
                       </td>
                       <td>
                         <span className={a.usable_for_execution ? 'tag' : 'tag warn'}>{a.status_label}</span>
@@ -187,24 +218,36 @@ export default async function SettingsPage({
                               {a.connected_at ? '다시 연결(모의)' : '연결(모의)'}
                             </button>
                           </form>
+                        ) : liveThreads ? (
+                          oauth.live.ready && oauth.secrets.configured ? (
+                            <form method="post" action={`/api/channel-accounts/${a.account_id}/connect`}>
+                              <button type="submit" className="link-button">
+                                {a.connected_at ? '다시 연결(실제 Threads)' : '실제 연결(Threads 인증 창)'}
+                              </button>
+                            </form>
+                          ) : (
+                            <span className="muted-text">실제 연결 준비 안 됨: {oauth.live.missing.join(', ')}</span>
+                          )
                         ) : (
-                          <span className="muted-text">연결 미지원(Threads·YouTube·Instagram 모의만)</span>
+                          <span className="muted-text">연결 미지원(Threads·YouTube·Instagram 모의, 실제 Threads 만)</span>
                         )}
                         {hasCredential ? (
                           <>
-                            <form method="post" action={`/api/channel-accounts/${a.account_id}/refresh`}>
-                              <button type="submit" className="link-button">
-                                지금 갱신
-                              </button>
-                            </form>
+                            {a.mock ? (
+                              <form method="post" action={`/api/channel-accounts/${a.account_id}/refresh`}>
+                                <button type="submit" className="link-button">
+                                  지금 갱신
+                                </button>
+                              </form>
+                            ) : null}
                             <form method="post" action={`/api/channel-accounts/${a.account_id}/check`}>
                               <button type="submit" className="link-button">
-                                연결 확인
+                                {a.mock ? '연결 확인' : '연결 확인(프로필 조회)'}
                               </button>
                             </form>
                             <form method="post" action={`/api/channel-accounts/${a.account_id}/revoke`}>
                               <button type="submit" className="link-button">
-                                연결 해제
+                                {a.mock ? '연결 해제' : '연결 해제(로컬 삭제 — Threads 철회 API 없음)'}
                               </button>
                             </form>
                           </>

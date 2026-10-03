@@ -384,7 +384,9 @@ describe('state·redirect·PKCE·거부', () => {
   });
 
   // T16: Instagram 모의 연결이 생겨 "지원하지 않는 채널" 예시를 블로그로 바꿨다(같은 단언 — 400 oauth_not_supported).
-  it('지원하지 않는 채널(모의 blog) → 400 oauth_not_supported, 실제 계정 → 503 live_oauth_not_configured(조건을 모두 넣어도)', async () => {
+  // LIVE-T1(D31): 실제 Threads 계정은 조건이 모두 있으면 연결할 수 있게 됐다(그 흐름은 live-threads-oauth.test.ts). 여기서는 조건 하나(앱 시크릿)가
+  // 빠졌을 때의 503 거부(빠진 이름만, 연결 요청 행 없음)를 본다 — T13 의 "조건을 모두 넣어도 거부(LIVE_OAUTH_ADAPTER)" 단언은 의도한 동작 변경으로 바꿨다.
+  it('지원하지 않는 채널(모의 blog) → 400 oauth_not_supported, 실제 계정 → 준비 조건이 빠지면 503 live_oauth_not_configured', async () => {
     const ig = await connect(acc[ownerA]!.blog);
     expect(ig.status).toBe(400);
     expect((await ig.json()).error).toBe('oauth_not_supported');
@@ -394,7 +396,7 @@ describe('state·redirect·PKCE·거부', () => {
       .returning();
     vi.stubEnv('OAUTH_MODE', 'live');
     vi.stubEnv('THREADS_APP_ID', 'placeholder-app-id');
-    vi.stubEnv('THREADS_APP_SECRET', 'placeholder-secret');
+    vi.stubEnv('THREADS_APP_SECRET', '');
     vi.stubEnv('OAUTH_REDIRECT_URI', `${BASE}/api/oauth/callback`);
     vi.stubEnv('OAUTH_LIVE_APPROVAL_REF', 'D99');
     try {
@@ -402,8 +404,9 @@ describe('state·redirect·PKCE·거부', () => {
       expect(r.status).toBe(503);
       const body = await r.json();
       expect(body.error).toBe('live_oauth_not_configured');
-      expect(body.message).toContain('LIVE_OAUTH_ADAPTER(T14 미구현)');
-      expect(JSON.stringify(body)).not.toContain('placeholder-secret');
+      expect(body.message).toContain('THREADS_APP_SECRET');
+      expect(body.message).not.toContain('LIVE_OAUTH_ADAPTER');
+      expect(JSON.stringify(body)).not.toContain('placeholder-app-id');
       expect(await db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, live!.id))).toHaveLength(0);
       // live 계정은 연결 정보가 없으므로 다시 연결 필요(실행 불가)
       expect((await (await health(live!.id)).json()).account).toMatchObject({ status: 'needs_reconnect', usable_for_execution: false });

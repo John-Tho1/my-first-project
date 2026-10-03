@@ -36,7 +36,8 @@ export const GET = oauthEndpoint(async (request: Request): Promise<Response> => 
       providerFor: deps.providerFor,
       keyring: deps.keyring,
     });
-    if (html) return seeOther('/settings?connected=1#accounts');
+    // LIVE-T1: 실제 계정 연결은 다른 문구(게시는 범위 밖) — query 에는 고정 값만
+    if (html) return seeOther(`/settings?connected=${account.mock ? '1' : 'live'}#accounts`);
     return json({ account });
   } catch (e) {
     if (html) return accountFormFailure(e);

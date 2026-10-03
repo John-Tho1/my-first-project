@@ -251,3 +251,68 @@ WebFetch 로 받은 본문(마크다운 변환)에 "Updated" 날짜가 보이지
 ## Codex 에게 묻는 것(FIX round 2)
 1. 우선순위 "전송·상태 → 일시 코드/is_transient → 확정 코드(100 만 문구로 좁힘) → 코드·하위 코드 없을 때만 문구 → 나머지는 쓰기 단계 UNKNOWN" 이 불변식에 맞는가? 특히 (a) 코드 100 의 문구 좁히기(확정 → 확정)를 허용한 것, (b) 하위 코드만 있고 코드가 없는 본문에서도 문구를 보지 않게 한 것, (c) 일시 표에 341·80000~80014(BUC)를 넣은 것이 과하거나 부족한가?
 2. 제한 정보를 기존 `retryAfterSec`(초, domain `retryDelay` 와 같은 단위)에 Retry-After 정수 초와 `X-Business-Use-Case-Usage.estimated_time_to_regain_access`(분) 중 긴 쪽으로 싣는 것이 충분한가 — HTTP-date Retry-After 를 버리는 것과 X-App-Usage 를 읽지 않는 것이 실제 소비 경로(현재 OAuth 경로는 갱신이 막혀 있어 소비자가 거의 없음)에 위험을 만드는가?
+
+---
+
+# FIX round 3 (Codex review-FIX2-LIVET1)
+- Orchestrator: HEAD_SHA 9273517 (code only, D28) — reran lint·typecheck·build·integration 702·drill:mock 0·real-DB drill:restore PASS; unit 1073/1074 (the 1 failure is the unrelated T18 HTML timing test in packages/domain/src/imports-fix1.test.ts, to be fixed in T18 FIX2).
+
+- 대상 판정: `.handoffs/review-FIX2-LIVET1.md`(CHANGES_REQUESTED — P0 1) on `e51ae72`
+- BASE_SHA: `35c59d4185e4dc01b39a9f61bb164105c35dcce2`(현재 HEAD, docs 전용 커밋) · HEAD_SHA: TBD(커밋 안 함 — 오케스트레이터가 커밋 후 기록)
+- 범위: D31 1단계 그대로 — Threads·Meta 로 실제 요청 0, fixture 만, 실제 자격 증명·`.env.local`·`./data` 손대지 않음, 실제 게시·실제 갱신 없음. 새 의존성 없음.
+
+## 지적 → 변경 → 시험
+
+### [P0] threads-live-oauth.ts:212 — 숫자 코드 없는 문자열 오류 식별자를 문구가 확정 실패로 덮어씀
+- 재현(수정 전 정적 추적, 새 시험이 고정): `mapThreadsError('exchange', 400, { error: 'temporarily_unavailable', error_description: 'Temporary error validating client secret.' })` → `invalid_client`(ambiguous 없음). `{ error: 'server_error', error_description: '… redirect_uri …' }` → `redirect_mismatch`. 원인: 8단계(코드·하위 코드 없음)에서 식별자보다 `refineByMessage` 가 먼저 돌았다.
+- 변경(`packages/providers/src/threads-live-oauth.ts`):
+  1) **문자열 일시 표 `THREADS_TRANSIENT_IDENTIFIERS`**(export, 소문자·trim 비교): temporarily_unavailable·server_error·service_unavailable·internal_error·internal_server_error·timeout·request_timeout → server_error, slow_down·rate_limited·rate_limit_exceeded·too_many_requests → rate_limited. OAuth2 `error` 문자열, Graph `error.type`, Threads `error_type` 어느 자리에 와도 같다. 숫자 일시 표·`is_transient` 와 함께 **6단계(문구 전)** 에서 본다 — 확정 코드(예: 190)와 충돌해도 일시가 이긴다.
+  2) **확정 식별자 표 `definiteByIdentifier`**(숫자 코드·하위 코드 모두 없을 때만): invalid_grant → 교환 invalid_grant / 그 밖 단계 invalid_token, invalid_request → invalid_request, invalid_client·unauthorized_client → invalid_client, unsupported_grant_type·unsupported_response_type → invalid_request, invalid_scope·access_denied·insufficient_scope → scope_not_allowed, invalid_token → invalid_token, redirect_uri_mismatch → 교환 redirect_mismatch. 범용 식별자(invalid_request, 교환의 invalid_grant)만 문구로 더 구체적인 확정(redirect_mismatch·invalid_client)으로 좁힌다.
+  3) **문구만으로는 확정 결과를 만들지 않는다**: 기존 8단계 "코드 없으면 문구" 분기를 없앴다. 문구는 이제 (a) 확정 코드 100, (b) 확정 범용 식별자를 좁힐 때만 쓴다. 식별자가 없거나 모르는 식별자(OAuthException·GraphMethodException 포함)면 9단계(쓰기 단계 oauth_exception + ambiguous=true, 읽기 단계 401 → invalid_token / 그 밖 invalid_request).
+  4) 놓친 케이스 "잘못된 형식의 코드가 코드 없음으로 바뀜": `parseThreadsErrorBody` 가 `malformedCode` 를 기록(code·error_subcode 필드가 있는데 0 이상 정수로 안 읽힘 — "1.0"·"abc"·""·1.5·-1·200.5). 형식 깨진 코드는 확정 코드·확정 식별자로 가지 않고 9단계(알 수 없음). `num()` 이 이제 0 이상 안전 정수만 받는다(수정 전에는 200.5 가 `200~299 → scope_not_allowed` 범위 비교에 걸릴 수 있었다). 일시 신호(is_transient 등)는 형식 깨진 코드보다 먼저.
+  5) Codex 답 Q10(제한 표의 "보수적" 주석이 부정확 — rate_limited 에 ambiguous 없음): 4xx 본문의 제한 신호(숫자 제한 코드 4·17·32·341·613·80000~80014, 문자열 slow_down 등)는 **쓰기 단계면 `ambiguous: true`** 를 단다. 읽기 단계·HTTP 429 자체는 기존대로(ambiguous 필드 없음). 주석 수정.
+  - 우선순위 주석(1~9단계) 갱신.
+- 기대값을 뒤집은 기존 시험(약화 아님 — 버그를 담은 기대를 더 엄격하게): 「오류 분류 순서」 표의 `400 + 코드 없음 + (error_type OAuthException) + 시크릿 문구 → invalid_client`, `… + redirect_uri 문구 → redirect_mismatch` 2행 → 이제 `provider_error(oauth_exception, ambiguous: true)`. 그 밖 기존 기대는 그대로 통과.
+- 시험:
+  - 단위 `packages/providers/src/threads-live-oauth.test.ts` 새 describe 「문자열 오류 식별자 우선(FIX3-LIVET1 P0)」 — 표 36행 + 2건(+38):
+    - Codex 재현 2건(temporarily_unavailable + "Temporary error validating client secret." / server_error + redirect_uri 문구 → 교환 server_error ambiguous), slow_down + 시크릿 → rate_limited ambiguous + retryAfterSec, 대소문자·공백 식별자, Graph `type`·Threads `error_type` 자리의 일시 식별자, 일시 식별자 + 확정 코드 190 → 일시, 읽기 단계(server_error ambiguous=false, slow_down ambiguous 없음).
+    - 모르는 식별자·OAuthException(코드 없음)·식별자 없음·빈 식별자 + 시크릿/redirect 문구 → 쓰기 단계 결과 불명, 읽기 단계 invalid_request(invalid_client 아님).
+    - 확정 식별자 13행(invalid_grant 교환/갱신, invalid_grant·invalid_request + redirect → redirect_mismatch, invalid_request + client_secret → invalid_client, invalid_client(문구 무시), unauthorized_client, unsupported_grant_type(좁히지 않음), invalid_scope, access_denied, invalid_token, redirect_uri_mismatch), invalid_grant + 하위 코드만 → 결과 불명.
+    - 형식 깨진 코드 6행("1.0"+invalid_client, "abc", 200.5, -1, 하위 코드 "x" + 190, "1e3" + is_transient → 일시), 코드 341 쓰기 단계 → rate_limited + ambiguous.
+    - 모든 행: detail 에 문구·식별자 원문 없음, ambiguous 를 기대하지 않는 쓰기 단계 provider_error 행은 ambiguous 필드 없음.
+    - **식별자 × 문구 표**: 일시 식별자 11 × 문구 7(빈 문구·시크릿·redirect·client_id·access token·already used·"invalid_grant") × 본문 형태 3(OAuth2·Graph·Threads) × 쓰기 단계 3 = 693 조합 모두 provider_error + ambiguous=true.
+    - 공급자 경유 1건: 코드 교환 400 `{ error: temporarily_unavailable, error_description: 시크릿 문구 }` → server_error·ambiguous·httpStatus 400, 장기 교환 안 부름.
+  - 통합 `tests/integration/live-threads-oauth.test.ts` +3(it.each): callback 코드 교환 400 + {temporarily_unavailable + "Temporary error validating client secret."(Codex 재현), server_error + redirect_uri 문구, error_type OAuthException(코드 없음) + 시크릿 문구} → 400 `oauth_exchange_failed` + `reason: provider_error` + **`outcome: unknown`**, 감사 `outcome_ambiguous=yes`·`provider_step=exchange`, 감사에 문구·식별자 원문 없음, 연결 정보 없음, fixture 호출 1회.
+
+### 놓친 케이스(review 목록) 처리
+- 반영: 숫자 코드 없는 server_error·temporarily_unavailable + client secret·redirect_uri 문구(단위·통합), 식별자와 설명 문구 충돌(표·조합 시험), 잘못된 형식 코드가 "코드 없음"으로 바뀌는 경우(`malformedCode`).
+- 미반영(남은 위험): 여러 BUC 항목 최댓값·8 KiB 경계·시간 상한 경계·힌트 버려졌을 때 소비자의 실제 재시도 시각(현재 OAuth 경로는 갱신이 막혀 자동 재시도 소비자 없음), `node:dns/promises` 이름 가져오기·가드 설치 전 확보한 Resolver 메서드 참조·사용자 정의 dispatcher, 다른 state 로 같은 code 순차·동시 제출(code 지문 원자 예약), 두 pending 행 동시 묶기·동시 계정 생성 409 변환, pending 있는 실제 계정 갱신 거부 뒤 독립 정리 완료.
+
+## 바뀐 파일(FIX round 3)
+- `packages/providers/src/threads-live-oauth.ts` — `THREADS_TRANSIENT_IDENTIFIERS`·`definiteByIdentifier`, 문구 단독 확정 분기 제거, `malformedCode`·정수 전용 `num()`, 쓰기 단계 제한 신호 ambiguous, 주석
+- 시험: `packages/providers/src/threads-live-oauth.test.ts`(+38, 2행 기대 뒤집음), `tests/integration/live-threads-oauth.test.ts`(+3)
+- 문서: 이 인계 문서(추가만)
+- 손대지 않음: T18 인계·DECISIONS·M4_CODEX_VERDICTS·M4_STATUS·다른 인계, `.env.local`, `./data`. (작업 트리의 `docs/handoffs/M4_CODEX_VERDICTS.md` 변경은 이 라운드가 만든 것이 아니다.)
+
+## 실행한 명령(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project unit packages/providers/src/threads-live-oauth.test.ts` | PASS — 1 file, 164 tests |
+| `corepack pnpm lint` | PASS |
+| `corepack pnpm typecheck` | PASS |
+| `corepack pnpm build` | PASS(exit 0) |
+| `corepack pnpm test` (unit, 1회차 — build 직후) | FAIL 1 — `packages/domain/src/imports-fix1.test.ts` T18 HTML 선형 시간 시험(203ms, 상한 200ms — 이 라운드와 무관한 시간 측정) |
+| `corepack pnpm test` (unit, 2회차 — 변경 없이 재실행) | PASS — 47 files, 1074 tests |
+| `corepack pnpm test:integration` (단독, unit 과 동시 실행 안 함) | PASS — 35 files, 702 tests |
+| `corepack pnpm drill:mock` | PASS — exit 0, "불변식 위반 0건"(M3·T14·T15·T16), Instagram fetch 호출 0 |
+
+## 남은 위험(FIX round 3 기준)
+1. 문자열 일시·확정 식별자 표는 RFC 6749·6750·8628 과 흔한 표기 기준 — Threads 가 이런 OAuth2 형태 본문을 실제로 보내는지 미확인(Codex 도 미확인으로 기록). 표에 없는 식별자는 쓰기 단계에서 UNKNOWN(보수적).
+2. 문구 단독 확정 제거로, 코드·식별자 없이 문구만 있는 실제 "시크릿 오류"·"redirect 불일치"도 교환 단계에서 `outcome: unknown` 으로 보인다 — 설정 문제를 사용자가 바로 알기 어려워질 수 있다(재연결 시 같은 결과 반복). 실제 응답 확인 후 확정 코드(101 등)로 보정.
+3. 쓰기 단계 제한 신호가 이제 ambiguous — 4xx 제한 거절이 실제로는 미처리여도 UNKNOWN 으로 남아 대사(reconcile) 대상이 늘 수 있다. HTTP 429 자체는 바꾸지 않았다(아래 질문 2).
+4. T18 HTML 선형 시간 시험(200ms 절대 상한)은 build 직후 부하에서 한 번 실패 — 이 라운드와 무관하지만 흔들릴 수 있다.
+5. HEAD 미정 — 커밋 후 SHA 기록 필요. 그 밖 FIX round 2 남은 위험 4~6 그대로.
+
+## Codex 에게 묻는 것(FIX round 3)
+1. "일시 신호(숫자·문자열·is_transient) → 형식 깨진 코드는 알 수 없음 → 숫자 확정 코드 → (코드·하위 코드 없을 때) 확정 식별자 → 나머지 UNKNOWN, 문구는 확정 범용 결과(코드 100·invalid_request·교환 invalid_grant)를 좁힐 때만" 이 P0 를 닫는가? 특히 (a) 식별자도 코드도 없는 문구 단독 본문까지 UNKNOWN 으로 바꾼 것이 과한가, (b) access_denied·insufficient_scope 를 scope_not_allowed 로, 교환 밖 invalid_grant 를 invalid_token 으로 둔 확정 매핑이 적절한가?
+2. 4xx 본문의 제한 신호를 쓰기 단계에서 ambiguous=true 로 바꾸면서 HTTP 429 자체는 ambiguous 를 달지 않았다. 429 도 쓰기 단계에서 UNKNOWN 으로 남겨야 하는가, 아니면 "요청 제한 응답은 미처리"로 보는 현재 비대칭이 받아들일 만한가?

@@ -142,3 +142,8 @@ CHANGES_REQUESTED
 
 ## FIX2-LIVET1 (e51ae72, LIVE-T1 round 2) — CHANGES_REQUESTED (P0 1)
 - [P0] packages/providers/src/threads-live-oauth.ts:212 — 숫자 코드가 없는 일시 오류는 여전히 메시지 때문에 확정 실패로 바뀐다
+
+## FIX-T18 (6e7ff92, T18 round 1) — CHANGES_REQUESTED (P0 1·P1 1·P2 1)
+- [P0] packages/domain/src/imports.ts:499 — 겹치는 ZIP 항목으로 같은 압축 데이터를 반복 해제하면 현재 예산으로 CPU 사용량을 제한할 수 없습니다
+- [P1] apps/web/app/captures/[id]/page.tsx:123 — 원본이 없는 기존 가져오기에도 다운로드 링크가 표시되며, 동일 파일 재가져오기로도 원본을 복구할 수 없습니다
+- [P2] packages/domain/src/imports.ts:366 — `<script/>`·`<style/>`를 자체 종료 태그로 취급하여 코드가 소재 본문에 남습니다

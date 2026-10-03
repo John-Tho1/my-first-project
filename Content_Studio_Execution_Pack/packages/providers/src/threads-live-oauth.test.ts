@@ -18,6 +18,7 @@ import { MockThreadsOAuthProvider, resolveOAuthProvider } from './oauth';
 import {
   LiveThreadsOAuthProvider,
   mapThreadsError,
+  normalizeThreadsErrorBody,
   THREADS_AUTHORIZE_URL,
   THREADS_LONG_LIVED_URL,
   THREADS_ME_URL,
@@ -556,6 +557,212 @@ describe('문자열 오류 식별자 우선(FIX3-LIVET1 P0)', () => {
     expect(e.code).toBe('provider_error');
     expect(e.detail).toMatchObject({ reason: 'server_error', step: 'exchange', ambiguous: true, httpStatus: 400 });
     expect(seen).toHaveLength(1);
+  });
+});
+
+// FIX4-LIVET1(Codex review-FIX3-LIVET1 P0 :89 — 구조적): 하나의 정규화 + 하나의 우선순위. 어떤 본문 형태든 신호를 버리지 않는다.
+describe('정규화 일원화(FIX4-LIVET1 P0)', () => {
+  type Row = [string, Parameters<typeof mapThreadsError>, OAuthProviderErrorCode, Record<string, unknown>];
+  const UNKNOWN_W = { reason: 'oauth_exception', ambiguous: true };
+  const SERVER_W = { reason: 'server_error', ambiguous: true };
+  const SECRET_MSG = 'Error validating client secret';
+  const rows: Row[] = [
+    // Codex 재현 입력 그대로
+    ['Codex 재현: { error: invalid_client, code: 2, is_transient: true } → 결과 불명(일시)', ['exchange', 400, { error: 'invalid_client', code: 2, is_transient: true }], 'provider_error', { ...SERVER_W, providerCode: 2 }],
+    ['Codex 재현: { error: invalid_client, code: "abc" } → 결과 불명(형식 깨진 코드)', ['exchange', 400, { error: 'invalid_client', code: 'abc' }], 'provider_error', UNKNOWN_W],
+    // 문자열 error + 다른 신호 하나씩
+    ['문자열 error + is_transient=true 만', ['long_lived', 400, { error: 'invalid_client', is_transient: true }], 'provider_error', SERVER_W],
+    ['문자열 error + 숫자 일시 코드 1(문자열 "1")', ['refresh', 400, { error: 'invalid_grant', code: '1' }], 'provider_error', SERVER_W],
+    ['문자열 error + 제한 코드 4 → rate_limited(쓰기 단계 결과 불명)', ['exchange', 400, { error: 'invalid_grant', code: 4 }, { retryAfter: '7' }], 'provider_error', { reason: 'rate_limited', ambiguous: true, retryAfterSec: 7 }],
+    ['문자열 error + 형식 깨진 error_subcode', ['exchange', 400, { error: 'invalid_client', error_subcode: 'x' }], 'provider_error', UNKNOWN_W],
+    ['문자열 error + 하위 코드만(정수)', ['exchange', 400, { error: 'invalid_client', error_subcode: 1349 }], 'provider_error', { ...UNKNOWN_W, providerSubcode: 1349 }],
+    ['문자열 error + is_transient="true"(불리언 아님) → 형식 깨짐', ['exchange', 400, { error: 'invalid_client', is_transient: 'true' }], 'provider_error', UNKNOWN_W],
+    ['문자열 error + 모르는 숫자 코드', ['exchange', 400, { error: 'invalid_client', code: 999 }], 'provider_error', { ...UNKNOWN_W, providerCode: 999 }],
+    ['문자열 error + 일치하는 확정 코드 101 → invalid_client', ['exchange', 400, { error: 'invalid_client', code: 101 }], 'invalid_client', { providerCode: 101 }],
+    ['문자열 error + is_transient=false + 확정 → 확정(false 는 막지 않음)', ['exchange', 400, { error: 'invalid_client', is_transient: false }], 'invalid_client', {}],
+    // error · error_type · error_message 가 서로 다른 분류(놓친 케이스)
+    ['error=invalid_client + error_type=invalid_scope → 충돌, 결과 불명', ['exchange', 400, { error: 'invalid_client', error_type: 'invalid_scope', error_message: SECRET_MSG }], 'provider_error', UNKNOWN_W],
+    ['error=invalid_grant + error_type=server_error → 일시', ['exchange', 400, { error: 'invalid_grant', error_type: 'server_error', error_message: 'code already used' }], 'provider_error', SERVER_W],
+    ['error=invalid_client + error_type=모르는 식별자 → 결과 불명', ['exchange', 400, { error: 'invalid_client', error_type: 'brand_new_error' }], 'provider_error', UNKNOWN_W],
+    ['error=invalid_client + error_type=OAuthException(범용 이름) → invalid_client', ['exchange', 400, { error: 'invalid_client', error_type: 'OAuthException' }], 'invalid_client', {}],
+    ['확정 코드 101 + 확정 식별자 invalid_scope → 충돌, 결과 불명', ['exchange', 400, { error: { type: 'invalid_scope', code: 101, message: 'x' } }], 'provider_error', UNKNOWN_W],
+    ['코드 100(교환 invalid_grant) + invalid_request 식별자 → 충돌, 결과 불명', ['exchange', 400, { error: 'invalid_request', code: 100 }], 'provider_error', UNKNOWN_W],
+    ['코드 100 + invalid_request(교환 밖, 범용끼리 일치) + 시크릿 문구 → invalid_client(좁힘)', ['long_lived', 400, { error: 'invalid_request', code: 100, error_description: SECRET_MSG }], 'invalid_client', {}],
+    ['범용 invalid_request + 서로 다른 쪽으로 좁히는 문구 둘 → 좁히지 않음', ['exchange', 400, { error: 'invalid_request', error_description: SECRET_MSG, error_message: 'redirect_uri mismatch' }], 'invalid_request', {}],
+    // 최상위 + 중첩 error 객체 혼합(두 자리 모두 읽는다)
+    ['중첩 error{ code: 101 } + 최상위 is_transient=true → 일시', ['exchange', 400, { error: { message: 'x', type: 'OAuthException', code: 101 }, is_transient: true }], 'provider_error', SERVER_W],
+    ['중첩 error{ code: 101 } + 최상위 code 2 → 일시', ['exchange', 400, { error: { message: 'x', code: 101 }, code: 2 }], 'provider_error', SERVER_W],
+    ['중첩 error{ code: 190 } + 최상위 code "abc" → 형식 깨짐', ['long_lived', 400, { error: { message: 'x', code: 190 }, code: 'abc' }], 'provider_error', UNKNOWN_W],
+    ['중첩 error{ code: 101 } + 최상위 code 190 → 충돌, 결과 불명(providerCode 없음)', ['exchange', 400, { error: { message: 'x', code: 101 }, code: 190 }], 'provider_error', UNKNOWN_W],
+    ['중첩 error{ type: invalid_client } + 최상위 error_type=temporarily_unavailable → 일시', ['exchange', 400, { error: { type: 'invalid_client' }, error_type: 'temporarily_unavailable' }], 'provider_error', SERVER_W],
+    ['중첩 error.error 문자열 + 중첩 error_code 일시 2', ['exchange', 400, { error: { error: 'invalid_client', error_code: 2 } }], 'provider_error', SERVER_W],
+    ['error 가 숫자(문자열·객체 아님) → 형식 깨짐', ['exchange', 400, { error: 5 }], 'provider_error', UNKNOWN_W],
+    ['error_type 이 숫자 → 형식 깨짐', ['exchange', 400, { error_type: 7, code: 101 }], 'provider_error', UNKNOWN_W],
+    ['최상위 code 만(2) — 인식되는 본문, 일시', ['exchange', 400, { code: 2 }], 'provider_error', SERVER_W],
+    ['중첩 error_user_msg 만 시크릿 문구 + 코드 100 → invalid_client(중첩 문구도 읽음)', ['long_lived', 400, { error: { code: 100, error_user_msg: SECRET_MSG } }], 'invalid_client', {}],
+    // HTTP 429 × 본문(놓친 케이스·Codex Q13): 쓰기 단계는 결과 불명, 읽기 단계는 ambiguous 없음
+    ['exchange 429 + server_error 본문 → rate_limited + ambiguous', ['exchange', 429, { error: 'server_error' }, '12'], 'provider_error', { reason: 'rate_limited', ambiguous: true, retryAfterSec: 12 }],
+    ['long_lived 429 + is_transient 본문 → rate_limited + ambiguous', ['long_lived', 429, { error: { code: 2, is_transient: true } }], 'provider_error', { reason: 'rate_limited', ambiguous: true }],
+    ['refresh 429 + 확정 invalid_client 본문 → 상태가 이긴다, ambiguous', ['refresh', 429, { error: 'invalid_client' }], 'provider_error', { reason: 'rate_limited', ambiguous: true }],
+    ['account 429 → rate_limited, ambiguous 없음', ['account', 429, { error: 'server_error' }], 'provider_error', { reason: 'rate_limited' }],
+  ];
+  it.each(rows)('%s', (_label, args, code, detail) => {
+    const e = mapThreadsError(...args);
+    expect(e.code).toBe(code);
+    expect(e.detail).toMatchObject(detail);
+    if (code !== 'provider_error') expect(e.detail?.ambiguous).toBeUndefined();
+    if (args[0] === 'account') expect(e.detail?.ambiguous).not.toBe(true);
+    // 충돌·형식 깨진 코드에는 대표 코드를 지어내지 않는다
+    const n = normalizeThreadsErrorBody(args[2]);
+    if (n && n.codes.length !== 1) expect(e.detail?.providerCode).toBeUndefined();
+    expect(JSON.stringify(e.detail)).not.toMatch(/secret|client_id|redirect_uri|temporarily|invalid_client|invalid_scope|brand_new/i);
+  });
+
+  it('정규화: 모든 자리·모든 필드를 합친다(한 형태가 있다고 다른 신호를 버리지 않음)', () => {
+    expect(normalizeThreadsErrorBody({ error: 'invalid_client', code: 2, is_transient: true, error_description: 'd' })).toEqual({
+      identifiers: ['invalid_client'], codes: [2], numericCode: 2, subcodes: [], subcode: null, malformedCode: false, isTransientFlag: true, messages: ['d'],
+    });
+    expect(normalizeThreadsErrorBody({ error: { message: 'm', type: 'OAuthException', code: 190, error_subcode: '463', is_transient: false, error_user_msg: 'u' }, error_type: ' Server_Error ', code: 'abc', error_message: 't' })).toEqual({
+      identifiers: ['server_error', 'oauthexception'], codes: [190], numericCode: 190, subcodes: [463], subcode: 463, malformedCode: true, isTransientFlag: false, messages: ['t', 'm', 'u'],
+    });
+    expect(normalizeThreadsErrorBody({ foo: 1 })).toBeNull();
+    expect(normalizeThreadsErrorBody({ type: 'x', message: 'y' })).toBeNull();
+    expect(normalizeThreadsErrorBody([{ error: 'x' }])).toBeNull();
+    expect(normalizeThreadsErrorBody({ error: null, code: null })).toBeNull();
+  });
+
+  /**
+   * 생성 조합 행렬 — 본문 형태 5(평면·중첩 객체·OAuth2 문자열·혼합 2종) × 신호 부분집합(12 신호 → 4095) × 단계 4.
+   * 불변식: 쓰기 단계에서 일시·형식 깨짐·모르는 신호가 하나라도 있으면 ambiguous=true. 확정은 있는 모든 확정 신호가 한 결과로 일치할 때만.
+   * 기대값은 구현과 독립된 단순 판정(oracle)으로 계산한다.
+   */
+  describe('생성 조합 행렬 — 형태 × 신호', () => {
+    type Kind = 'code' | 'id' | 'flag' | 'sub' | 'msg';
+    type Cls = 'transient' | 'malformed' | 'unknown' | 'neutral' | 'msg' | { definite: OAuthProviderErrorCode };
+    interface Sig {
+      name: string;
+      kind: Kind;
+      value: unknown;
+      cls: Cls;
+    }
+    const SIGNALS: Sig[] = [
+      { name: 'T_CODE', kind: 'code', value: 2, cls: 'transient' },
+      { name: 'T_ID', kind: 'id', value: 'temporarily_unavailable', cls: 'transient' },
+      { name: 'T_FLAG', kind: 'flag', value: true, cls: 'transient' },
+      { name: 'F_FLAG', kind: 'flag', value: false, cls: 'neutral' },
+      { name: 'MAL_CODE', kind: 'code', value: 'abc', cls: 'malformed' },
+      { name: 'MAL_SUB', kind: 'sub', value: '1.5', cls: 'malformed' },
+      { name: 'DEF_CODE', kind: 'code', value: 101, cls: { definite: 'invalid_client' } },
+      { name: 'DEF_ID', kind: 'id', value: 'invalid_client', cls: { definite: 'invalid_client' } },
+      { name: 'DEF_ID_OTHER', kind: 'id', value: 'invalid_scope', cls: { definite: 'scope_not_allowed' } },
+      { name: 'UNK_CODE', kind: 'code', value: 999, cls: 'unknown' },
+      { name: 'UNK_ID', kind: 'id', value: 'brand_new_error', cls: 'unknown' },
+      { name: 'MSG', kind: 'msg', value: 'Temporary error validating client secret; redirect_uri', cls: 'msg' },
+    ];
+    type Loc = 'top' | 'nested';
+    type Shape = 'flat' | 'nested' | 'oauth2' | 'mixed_a' | 'mixed_b';
+    const KEYS: Record<Loc, Record<Kind, string[]>> = {
+      top: { code: ['code', 'error_code'], id: ['error_type', 'type'], flag: ['is_transient'], sub: ['error_subcode'], msg: ['error_message', 'message'] },
+      nested: { code: ['code', 'error_code'], id: ['type', 'error_type'], flag: ['is_transient'], sub: ['error_subcode'], msg: ['message', 'error_user_msg'] },
+    };
+    /** 신호를 형태에 맞는 자리에 놓는다. 자리가 모자라면 null(그 조합은 그 형태로 만들 수 없음). */
+    function build(shape: Shape, sigs: Sig[]): Record<string, unknown> | null {
+      const top: Record<string, unknown> = {};
+      const nested: Record<string, unknown> = {};
+      for (const [i, s] of sigs.entries()) {
+        const order: Loc[] =
+          shape === 'flat' || shape === 'oauth2' ? ['top'] : shape === 'nested' ? ['nested'] : (i % 2 === 0) === (shape === 'mixed_a') ? ['top', 'nested'] : ['nested', 'top'];
+        let placed = false;
+        for (const loc of order) {
+          const target = loc === 'top' ? top : nested;
+          const keys =
+            shape === 'oauth2' && s.kind === 'id' ? ['error', ...KEYS.top.id] : shape === 'oauth2' && s.kind === 'msg' ? ['error_description', ...KEYS.top.msg] : KEYS[loc][s.kind];
+          const k = keys.find((key) => !(key in target));
+          if (k) {
+            target[k] = s.value;
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) return null;
+      }
+      // OAuth2 형태는 문자열 error 가 있어야 한다 — 식별자 신호가 없으면 범용 이름을 넣는다
+      if (shape === 'oauth2' && !('error' in top)) top.error = 'OAuthException';
+      if (shape === 'nested' || ((shape === 'mixed_a' || shape === 'mixed_b') && Object.keys(nested).length)) top.error = nested;
+      // 인식 근거가 없는 최상위(type·message 만)면 이 행렬의 대상이 아니다
+      if (!['error', 'error_type', 'error_message', 'error_code', 'error_subcode', 'is_transient', 'code', 'error_description'].some((k) => k in top)) return null;
+      return top;
+    }
+    type Expect = { kind: 'transient' } | { kind: 'unknown' } | { kind: 'definite'; code: OAuthProviderErrorCode };
+    function oracle(sigs: Sig[]): Expect {
+      if (sigs.some((s) => s.cls === 'transient')) return { kind: 'transient' };
+      if (sigs.some((s) => s.cls === 'malformed' || s.cls === 'unknown')) return { kind: 'unknown' };
+      const defs = new Set(sigs.flatMap((s) => (typeof s.cls === 'object' ? [s.cls.definite] : [])));
+      if (defs.size !== 1) return { kind: 'unknown' }; // 확정 신호 없음 또는 불일치
+      return { kind: 'definite', code: [...defs][0]! };
+    }
+    it('모든 조합에서 불변식을 지킨다', () => {
+      const shapes: Shape[] = ['flat', 'nested', 'oauth2', 'mixed_a', 'mixed_b'];
+      const steps = ['exchange', 'long_lived', 'refresh', 'account'] as const;
+      let checked = 0;
+      let definiteSeen = 0;
+      let ambiguousSeen = 0;
+      const failures: string[] = [];
+      const perShape = new Map<Shape, number>();
+      for (let mask = 1; mask < 1 << SIGNALS.length; mask++) {
+        const sigs = SIGNALS.filter((_, i) => mask & (1 << i));
+        const exp = oracle(sigs);
+        for (const shape of shapes) {
+          const body = build(shape, sigs);
+          if (!body) continue;
+          perShape.set(shape, (perShape.get(shape) ?? 0) + 1);
+          for (const step of steps) {
+            const e = mapThreadsError(step, 400, body);
+            const write = step !== 'account';
+            const d = e.detail;
+            checked++;
+            let ok: boolean;
+            if (exp.kind === 'definite') {
+              definiteSeen++;
+              ok = e.code === exp.code && d?.ambiguous === undefined;
+            } else if (exp.kind === 'transient') {
+              ok = e.code === 'provider_error' && d?.reason === 'server_error' && d?.ambiguous === write;
+            } else if (write) {
+              ok = e.code === 'provider_error' && d?.reason === 'oauth_exception' && d?.ambiguous === true;
+            } else {
+              ok = e.code === 'invalid_request';
+            }
+            // 불변식 자체(위 기대와 별도로 한 번 더): 쓰기 단계 + 일시·형식 깨짐·모르는·불일치 신호 → ambiguous=true
+            if (write && exp.kind !== 'definite') {
+              ambiguousSeen++;
+              if (d?.ambiguous !== true) ok = false;
+            }
+            if (!ok && failures.length < 20) failures.push(`${step} ${shape} [${sigs.map((x) => x.name).join(',')}] ${JSON.stringify(body)} → ${e.code} ${JSON.stringify(d)}`);
+          }
+        }
+      }
+      expect(failures).toEqual([]);
+      // 행렬이 실제로 넓게 돌았는지(형태마다 수백 조합, 확정·결과 불명 양쪽 모두)
+      for (const shape of shapes) expect(perShape.get(shape) ?? 0, shape).toBeGreaterThan(200);
+      expect(definiteSeen).toBeGreaterThan(50);
+      expect(ambiguousSeen).toBeGreaterThan(10_000);
+      expect(checked).toBeGreaterThan(30_000);
+    }, 60_000);
+  });
+
+  it('공급자 경유: 장기 교환 400 { error: invalid_client, code: 2, is_transient: true } → 결과 불명 + shortTokenIssued(단기 토큰 잔존 가능)', async () => {
+    const { fetch, seen } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: EXCHANGE_OK, [K('GET', THREADS_LONG_LIVED_URL)]: () => jsonRes(400, { error: 'invalid_client', code: 2, is_transient: true }) });
+    const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail).toMatchObject({ reason: 'server_error', step: 'long_lived', ambiguous: true, shortTokenIssued: true, httpStatus: 400 });
+    expect(seen).toHaveLength(2);
+    expect(inspect(e, { depth: Infinity })).not.toContain(SHORT);
+  });
+  it('공급자 경유: 장기 교환 400 문자열 오류 { error: invalid_client, code: "abc" } → 결과 불명 + shortTokenIssued', async () => {
+    const { fetch } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: EXCHANGE_OK, [K('GET', THREADS_LONG_LIVED_URL)]: () => jsonRes(400, { error: 'invalid_client', code: 'abc' }) });
+    const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail).toMatchObject({ reason: 'oauth_exception', step: 'long_lived', ambiguous: true, shortTokenIssued: true });
   });
 });
 

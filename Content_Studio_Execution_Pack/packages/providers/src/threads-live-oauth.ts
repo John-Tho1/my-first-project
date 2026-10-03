@@ -52,42 +52,95 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 /** 쓰기(코드 소비·토큰 발급)가 일어날 수 있는 단계 — 전송 실패·5xx·2xx 형식 오류면 결과 불명(ambiguous) */
 const WRITE_STEPS: ReadonlySet<Step> = new Set(['exchange', 'long_lived', 'refresh']);
 
-/** Meta 오류 본문의 두 형태: { error: { message, type, code, error_subcode, is_transient } } · { error_type, code, error_message } (Threads OAuth 문서 예시) */
-interface ParsedProviderError {
-  code: number | null;
+/**
+ * FIX4-LIVET1(Codex review-FIX3-LIVET1 P0 :89 — 구조적): 본문 형태별 분기(Graph 객체 · Threads error_type · OAuth2 문자열)를 없애고
+ * **하나의 정규화**로 모은다. 알려진 모든 자리(최상위 + 중첩 error 객체)의 알려진 모든 필드를 읽어 한 기록에 **합친다** —
+ * 한 자리·형태가 있다고 다른 자리의 신호를 버리지 않는다(예: { error: 'invalid_client', code: 2, is_transient: true } 의 code·is_transient).
+ */
+export interface NormalizedThreadsError {
+  /** 문자열 식별자(trim·소문자, 빈 값 제외, 중복 제거) — 최상위 error(문자열)·error_type·type, 중첩 error.error(문자열)·error.error_type·error.type */
+  identifiers: string[];
+  /** 0 이상 정수로 읽힌 code·error_code 값(최상위·중첩, 중복 제거) */
+  codes: number[];
+  /** codes 가 정확히 1개일 때 그 값(부가 정보 providerCode), 아니면 null */
+  numericCode: number | null;
+  /** 0 이상 정수로 읽힌 error_subcode 값(최상위·중첩, 중복 제거) */
+  subcodes: number[];
+  /** subcodes 가 정확히 1개일 때 그 값, 아니면 null */
   subcode: number | null;
-  type: string | null;
-  /** Graph 오류 객체의 is_transient(불리언일 때만) — true 면 일시 오류 */
-  transient: boolean | null;
   /**
-   * FIX3-LIVET1(Codex review-FIX2-LIVET1 놓친 케이스): code·error_subcode 필드가 **있는데** 0 이상 정수로 읽히지 않음(예: "1.0"·"abc"·1.5·-1·"").
-   * "코드 없음"으로 바꾸지 않는다 — 알 수 없는 코드로 본다(쓰기 단계면 결과 불명).
+   * 있는데 형식이 깨진 신호(FIX3 의 "알 수 없는 코드" 를 모든 자리로 넓힘): code·error_code·error_subcode 가 0 이상 정수로 안 읽힘
+   * ("1.0"·"abc"·""·1.5·-1), is_transient 가 불리언이 아님, 식별자 자리(error·error_type·type)에 문자열이 아닌 값(error 는 객체 허용).
+   * "코드 없음"으로 바꾸지 않는다 — 알 수 없음(쓰기 단계면 결과 불명).
    */
   malformedCode: boolean;
-  /** 분류에만 쓰고 어디에도 저장하지 않는다 */
-  message: string;
+  /** is_transient — 하나라도 true → true, 있는 것이 모두 false → false, 없음 → null */
+  isTransientFlag: boolean | null;
+  /** 이미 확정된 범용 결과를 좁힐 때만 쓰고 어디에도 저장하지 않는다 — error_description·error_message·message·error_user_msg·error_user_title(최상위·중첩) */
+  messages: string[];
 }
 
 /** 0 이상 정수만(숫자 또는 1~9자리 숫자 문자열). 소수·음수·지수·공백은 null — 범위 비교(200~299 등)가 소수에 걸리지 않게 */
 const num = (v: unknown): number | null =>
   typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : typeof v === 'string' && /^\d{1,9}$/.test(v) ? Number(v) : null;
 const present = (v: unknown): boolean => v !== undefined && v !== null;
-const malformed = (...vs: unknown[]): boolean => vs.some((v) => present(v) && num(v) === null);
-const str = (v: unknown): string => (typeof v === 'string' ? v : '');
-const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-export function parseThreadsErrorBody(body: unknown): ParsedProviderError | null {
-  if (!body || typeof body !== 'object') return null;
-  const b = body as Record<string, unknown>;
-  if (b.error && typeof b.error === 'object') {
-    const e = b.error as Record<string, unknown>;
-    return { code: num(e.code), subcode: num(e.error_subcode), type: str(e.type) || null, transient: bool(e.is_transient), malformedCode: malformed(e.code, e.error_subcode), message: str(e.message) };
+const ID_KEYS = ['error', 'error_type', 'type'] as const;
+const CODE_KEYS = ['code', 'error_code'] as const;
+const MESSAGE_KEYS = ['error_description', 'error_message', 'message', 'error_user_msg', 'error_user_title'] as const;
+/** 최상위에 이 중 하나라도(null 아님) 있으면 공급자 오류 본문으로 본다. type·message 단독은 너무 흔한 이름이라 인식 근거로 쓰지 않는다(인식된 본문에서는 읽는다). */
+const RECOGNIZED_TOP_KEYS = ['error', 'error_type', 'error_message', 'error_description', 'error_code', 'error_subcode', 'error_user_msg', 'error_user_title', 'is_transient', 'code'] as const;
+
+export function normalizeThreadsErrorBody(body: unknown): NormalizedThreadsError | null {
+  if (!isPlainObject(body)) return null;
+  const top = body;
+  if (!RECOGNIZED_TOP_KEYS.some((k) => present(top[k]))) return null;
+  const nested = isPlainObject(top.error) ? top.error : null;
+  const ids = new Set<string>();
+  const codes = new Set<number>();
+  const subcodes = new Set<number>();
+  const messages: string[] = [];
+  let malformedCode = false;
+  let anyTrue = false;
+  let anyFalse = false;
+  for (const src of nested ? [top, nested] : [top]) {
+    for (const k of ID_KEYS) {
+      const v = src[k];
+      if (!present(v) || (src === top && k === 'error' && v === nested)) continue;
+      if (typeof v === 'string') {
+        const id = v.trim().toLowerCase();
+        if (id) ids.add(id);
+      } else malformedCode = true;
+    }
+    for (const k of [...CODE_KEYS, 'error_subcode'] as const) {
+      const v = src[k];
+      if (!present(v)) continue;
+      const n = num(v);
+      if (n === null) malformedCode = true;
+      else (k === 'error_subcode' ? subcodes : codes).add(n);
+    }
+    const t = src.is_transient;
+    if (t === true) anyTrue = true;
+    else if (t === false) anyFalse = true;
+    else if (present(t)) malformedCode = true;
+    for (const k of MESSAGE_KEYS) {
+      const v = src[k];
+      if (typeof v === 'string' && v) messages.push(v);
+    }
   }
-  if ('error_type' in b || 'error_message' in b) {
-    return { code: num(b.code), subcode: num(b.error_subcode), type: str(b.error_type) || null, transient: bool(b.is_transient), malformedCode: malformed(b.code, b.error_subcode), message: str(b.error_message) };
-  }
-  if (typeof b.error === 'string') return { code: null, subcode: null, type: b.error || null, transient: null, malformedCode: false, message: str(b.error_description) };
-  return null;
+  const codeList = [...codes];
+  const subList = [...subcodes];
+  return {
+    identifiers: [...ids],
+    codes: codeList,
+    numericCode: codeList.length === 1 ? codeList[0]! : null,
+    subcodes: subList,
+    subcode: subList.length === 1 ? subList[0]! : null,
+    malformedCode,
+    isTransientFlag: anyTrue ? true : anyFalse ? false : null,
+    messages,
+  };
 }
 
 /**
@@ -127,7 +180,7 @@ function definiteByCode(step: Step, code: number, subcode: number | null): OAuth
 
 /**
  * FIX3-LIVET1(Codex review-FIX2-LIVET1 P0 :212): 문자열 오류 식별자(OAuth2 { error, error_description } 의 error, 또는 Graph·Threads 본문의 type·error_type).
- * 소문자로 비교한다. 숫자 코드가 없을 때 **문구보다 먼저** 이 표로 분류한다.
+ * 소문자로 비교한다. **문구보다 먼저** 이 표로 분류한다(FIX4-LIVET1: 숫자 코드가 함께 있어도 — 어느 자리에 있든 일시 신호 하나면 일시).
  * 일시 표: RFC 6749 §4.1.2.1·§5.2(server_error·temporarily_unavailable), RFC 8628 §3.5(slow_down), 그 밖 흔한 일시 표기.
  * 쓰기 단계면 모두 ambiguous=true(결과 불명). 이 표에 없는 식별자(예: OAuthException·GraphMethodException)는 "알 수 없음".
  */
@@ -225,34 +278,88 @@ export function parseRetryAfterSec(hints: ThreadsRateLimitHints | string | null 
 }
 
 /**
+ * FIX4-LIVET1: 정규화된 기록 → 판정(하나의 우선순위 함수). 4xx 의 형식 맞는 본문에만 쓴다(상태 판정은 mapThreadsError 가 먼저).
+ * Meta 가 쓰는 범용 예외 분류 이름 — 확정도 일시도 아니고 다른 신호를 막지도 않는다(예: { error: { type: 'OAuthException', code: 190 } } → 190 으로 판정).
+ */
+const NEUTRAL_IDENTIFIERS: ReadonlySet<string> = new Set(['oauthexception', 'graphmethodexception', 'facebookapiexception']);
+
+export type ThreadsOAuthErrorVerdict =
+  | { kind: 'transient'; reason: 'rate_limited' | 'server_error' }
+  | { kind: 'definite'; code: OAuthProviderErrorCode }
+  | { kind: 'unknown'; why: 'malformed' | 'subcode_conflict' | 'subcode_only' | 'unknown_code' | 'unknown_identifier' | 'conflict' | 'no_signal' };
+
+/**
+ * 우선순위(위가 이긴다):
+ *  a) 일시 신호가 **하나라도** — 숫자 일시 코드(THREADS_TRANSIENT_CODES) · 일시 식별자(THREADS_TRANSIENT_IDENTIFIERS) · is_transient=true
+ *     → transient(제한 신호가 하나라도 있으면 rate_limited, 아니면 server_error). 확정 코드·식별자·문구와 충돌해도 일시가 이긴다.
+ *  b) 형식 깨진 신호(malformedCode) → unknown
+ *  c) 하위 코드가 여럿(서로 다름) → unknown · 숫자 코드 없이 하위 코드만 → unknown
+ *  d) 숫자 코드가 하나라도 확정 표(definiteByCode)에 없음 → unknown
+ *  e) 범용 예외 이름(NEUTRAL_IDENTIFIERS) 밖의 식별자가 하나라도 확정 표(definiteByIdentifier)에 없음 → unknown
+ *  f) 확정 결과(코드·식별자 모두)가 **하나로 일치**해야 definite — 둘 이상이면 conflict(unknown), 하나도 없으면 no_signal(unknown)
+ *  g) 문구는 f) 의 결과가 범용(코드 100·invalid_request·교환 invalid_grant — 참여한 모든 출처가 범용)일 때만 더 구체적인 확정으로 좁힌다.
+ *     문구들이 서로 다른 쪽으로 좁히면 좁히지 않는다. 문구만으로는 아무것도 만들지 않는다.
+ */
+export function classifyThreadsOAuthError(step: Step, n: NormalizedThreadsError): ThreadsOAuthErrorVerdict {
+  const unknown = (why: Extract<ThreadsOAuthErrorVerdict, { kind: 'unknown' }>['why']): ThreadsOAuthErrorVerdict => ({ kind: 'unknown', why });
+  const transient = [
+    ...n.codes.map((c) => THREADS_TRANSIENT_CODES.get(c)),
+    ...n.identifiers.map((id) => THREADS_TRANSIENT_IDENTIFIERS.get(id)),
+  ].filter((r): r is 'rate_limited' | 'server_error' => r !== undefined);
+  if (transient.length || n.isTransientFlag === true) return { kind: 'transient', reason: transient.includes('rate_limited') ? 'rate_limited' : 'server_error' };
+  if (n.malformedCode) return unknown('malformed');
+  if (n.subcodes.length > 1) return unknown('subcode_conflict');
+  if (!n.codes.length && n.subcodes.length) return unknown('subcode_only');
+  const outcomes = new Set<OAuthProviderErrorCode>();
+  let refinable = true;
+  for (const c of n.codes) {
+    const d = definiteByCode(step, c, n.subcode);
+    if (!d) return unknown('unknown_code');
+    outcomes.add(d);
+    if (c !== 100) refinable = false;
+  }
+  for (const id of n.identifiers) {
+    if (NEUTRAL_IDENTIFIERS.has(id)) continue;
+    const d = definiteByIdentifier(step, id);
+    if (!d) return unknown('unknown_identifier');
+    outcomes.add(d.code);
+    if (!d.refinable) refinable = false;
+  }
+  if (!outcomes.size) return unknown('no_signal');
+  if (outcomes.size > 1) return unknown('conflict');
+  const definite = [...outcomes][0]!;
+  if (refinable) {
+    const narrowed = new Set(n.messages.map((m) => refineByMessage(step, m)).filter((r): r is OAuthProviderErrorCode => r !== null));
+    if (narrowed.size === 1) return { kind: 'definite', code: [...narrowed][0]! };
+  }
+  return { kind: 'definite', code: definite };
+}
+
+/**
  * 공급자 오류 → 기존 T13 코드(OAuthProviderErrorCode) + 숫자·열거 부가 정보. 메시지 원문은 분류에만 쓰고 결과에 넣지 않는다.
- * 우선순위(엄격, 위가 이긴다) — FIX1-LIVET1(전송·상태 먼저) + FIX2-LIVET1(Codex review-FIX-LIVET1 P0 :138 일시 코드가 문구보다 먼저):
- *  1) 429 → provider_error(rate_limited, retryAfterSec)
+ * FIX4-LIVET1(Codex review-FIX3-LIVET1 P0 :89): 본문은 normalizeThreadsErrorBody 하나로 읽고 classifyThreadsOAuthError 하나로 판정한다.
+ * 우선순위(엄격, 위가 이긴다):
+ *  1) 429 → provider_error(rate_limited, retryAfterSec), **쓰기 단계면 ambiguous=true**(FIX4 — Codex Q13: 429 가 토큰 발급 전에만 온다는 보장 없음)
  *  2) 5xx → provider_error(server_error, 쓰기 단계면 ambiguous) — 본문이 무엇이든
  *  3) 408 → provider_error(timeout, 쓰기 단계면 ambiguous)
  *  4) 4xx 가 아닌 상태(2xx·1xx·3xx)의 오류 본문 → provider_error(malformed_response, 쓰기 단계면 ambiguous)
- *  5) 4xx 인데 Meta 오류 본문 형식이 아님 → 쓰기 단계면 provider_error(http_error, ambiguous), 아니면 401 → invalid_token, 그 밖 → invalid_request
- *  6) 4xx + 일시 신호 — 숫자 일시 표(THREADS_TRANSIENT_CODES) · 문자열 일시 표(THREADS_TRANSIENT_IDENTIFIERS) · is_transient=true 중 **하나라도**
- *     → 제한이면 provider_error(rate_limited, retryAfterSec), 그 밖 provider_error(server_error). 둘 다 쓰기 단계면 ambiguous=true.
- *     **문구는 보지 않는다**(예: 코드 2 또는 error=temporarily_unavailable + "validating client secret" 도 결과 불명). 확정 코드와 충돌해도 일시가 이긴다.
- *  7) 4xx + 형식이 깨진 code·error_subcode(있는데 정수로 안 읽힘) → 9)(알 수 없음). "코드 없음"으로 보지 않는다.
- *  8) 4xx + 숫자 코드 있음 → 확정 표(definiteByCode)면 그 코드(범용 100 만 문구로 좁힘), 아니면 9). 식별자(OAuthException 등)는 코드를 바꾸지 않는다.
- *     4xx + 숫자 코드·하위 코드 모두 없음 → 확정 식별자 표(definiteByIdentifier)면 그 코드(invalid_request·invalid_grant 만 문구로 좁힘), 아니면 9).
- *     FIX3-LIVET1(Codex review-FIX2-LIVET1 P0 :212): **문구만으로는 확정 결과를 만들지 않는다**(식별자가 없거나 모르는 식별자여도).
- *  9) 나머지(알 수 없는 코드·식별자, 형식 깨진 코드, 분류 안 되는 본문) → 쓰기 단계면 provider_error(oauth_exception, ambiguous=true —
- *     Codex review-FIX-LIVET1 Q7: 확정 거절로 검증된 응답만 확정), 읽기 단계면 401 → invalid_token, 그 밖 → invalid_request
+ *  5) 4xx 인데 공급자 오류 본문이 아님 → 쓰기 단계면 provider_error(http_error, ambiguous), 아니면 401 → invalid_token, 그 밖 → invalid_request
+ *  6) 4xx + classifyThreadsOAuthError:
+ *     transient → rate_limited(retryAfterSec) 또는 server_error, 쓰기 단계면 둘 다 ambiguous=true
+ *     definite  → 그 코드
+ *     unknown   → 쓰기 단계면 provider_error(oauth_exception, ambiguous=true), 읽기 단계면 401 → invalid_token, 그 밖 → invalid_request
  */
 export function mapThreadsError(step: Step, httpStatus: number, body: unknown, hints: ThreadsRateLimitHints | string | null = null): OAuthProviderError {
   const write = WRITE_STEPS.has(step);
-  const p = parseThreadsErrorBody(body);
-  const base: OAuthProviderErrorDetail = { reason: p ? 'oauth_exception' : 'http_error', step, httpStatus };
-  if (p?.code !== null && p?.code !== undefined) base.providerCode = p.code;
-  if (p?.subcode !== null && p?.subcode !== undefined) base.providerSubcode = p.subcode;
+  const n = normalizeThreadsErrorBody(body);
+  const base: OAuthProviderErrorDetail = { reason: n ? 'oauth_exception' : 'http_error', step, httpStatus };
+  if (n && n.numericCode !== null) base.providerCode = n.numericCode;
+  if (n && n.subcode !== null) base.providerSubcode = n.subcode;
   const err = (code: OAuthProviderErrorCode, extra: Partial<OAuthProviderErrorDetail> = {}) => new OAuthProviderError(code, { ...base, ...extra });
-  /** ambiguousOnWrite: 4xx 본문의 제한 신호(코드·식별자)는 쓰기 단계면 결과 불명으로 둔다(FIX3-LIVET1 Q10). HTTP 429 자체는 기존대로. */
-  const rateLimited = (ambiguousOnWrite = false) => {
+  /** 제한 응답(429 · 4xx 본문의 제한 신호) — 쓰기 단계면 결과 불명. 읽기 단계는 부작용이 없어 ambiguous 를 달지 않는다. */
+  const rateLimited = () => {
     const ra = parseRetryAfterSec(hints);
-    return err('provider_error', { reason: 'rate_limited', ...(ambiguousOnWrite && write ? { ambiguous: true } : {}), ...(ra !== undefined ? { retryAfterSec: ra } : {}) });
+    return err('provider_error', { reason: 'rate_limited', ...(write ? { ambiguous: true } : {}), ...(ra !== undefined ? { retryAfterSec: ra } : {}) });
   };
   // 1)~4) 전송·상태 먼저(본문과 관계없이)
   if (httpStatus === 429) return rateLimited();
@@ -260,29 +367,14 @@ export function mapThreadsError(step: Step, httpStatus: number, body: unknown, h
   if (httpStatus === 408) return err('provider_error', { reason: 'timeout', ambiguous: write });
   if (httpStatus < 400) return err('provider_error', { reason: 'malformed_response', ambiguous: write });
   // 5) 4xx, 형식 모름
-  if (!p) {
+  if (!n) {
     if (write) return err('provider_error', { reason: 'http_error', ambiguous: true });
     return err(httpStatus === 401 ? 'invalid_token' : 'invalid_request');
   }
-  // 6) 일시(숫자 코드·문자열 식별자·is_transient) — 문구보다 먼저, 문구로 바꾸지 않는다
-  const id = p.type ? p.type.trim().toLowerCase() : null;
-  const byCode = p.code !== null ? THREADS_TRANSIENT_CODES.get(p.code) : undefined;
-  const byId = id ? THREADS_TRANSIENT_IDENTIFIERS.get(id) : undefined;
-  if (byCode === 'rate_limited' || (byCode === undefined && byId === 'rate_limited')) return rateLimited(true);
-  if (byCode || byId || p.transient === true) return err('provider_error', { reason: 'server_error', ambiguous: write });
-  // 7) 형식 깨진 코드 → 알 수 없음(코드 없음으로 보지 않는다)
-  if (!p.malformedCode) {
-    if (p.code !== null) {
-      // 8a) 확정 코드(100 만 문구로 좁힘 — 확정 → 더 구체적인 확정)
-      const definite = definiteByCode(step, p.code, p.subcode);
-      if (definite) return err(p.code === 100 ? (refineByMessage(step, p.message) ?? definite) : definite);
-    } else if (p.subcode === null && id) {
-      // 8b) 코드 없음 + 확정 식별자(범용 invalid_request·invalid_grant 만 문구로 좁힘). 문구만으로는 확정하지 않는다.
-      const definite = definiteByIdentifier(step, id);
-      if (definite) return err(definite.refinable ? (refineByMessage(step, p.message) ?? definite.code) : definite.code);
-    }
-  }
-  // 9) 알 수 없음
+  // 6) 하나의 판정
+  const v = classifyThreadsOAuthError(step, n);
+  if (v.kind === 'transient') return v.reason === 'rate_limited' ? rateLimited() : err('provider_error', { reason: 'server_error', ambiguous: write });
+  if (v.kind === 'definite') return err(v.code);
   if (write) return err('provider_error', { ambiguous: true });
   return err(httpStatus === 401 ? 'invalid_token' : 'invalid_request');
 }
@@ -453,7 +545,7 @@ export class LiveThreadsOAuthProvider implements OAuthProvider {
     }
     // 2xx 인데 오류 본문(성공 필드 없음)인 경우도 공급자 오류로 본다
     const hasSuccessField = !!body && typeof body === 'object' && ('access_token' in body || 'id' in body);
-    if (!res.ok || (parseThreadsErrorBody(body) !== null && !hasSuccessField)) {
+    if (!res.ok || (normalizeThreadsErrorBody(body) !== null && !hasSuccessField)) {
       // FIX2-LIVET1(P2 :127): 제한 힌트는 429 밖(코드 4·17·…)에서도 쓴다 — 숫자만 뽑고 원 헤더 값은 버린다
       throw mapThreadsError(step, res.status, body, { retryAfter: res.headers.get('retry-after'), businessUseCaseUsage: res.headers.get('x-business-use-case-usage') });
     }

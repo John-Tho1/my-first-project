@@ -458,6 +458,38 @@ describe('코드 교환 실패 — 오류 매핑·결과 불명(ambiguous)', () 
     expect(JSON.stringify(rej)).not.toMatch(/validating|redirect_uri could|temporarily_unavailable/);
     expect(await credRow(account.id)).toBeNull();
   });
+  // FIX4-LIVET1(Codex review-FIX3-LIVET1 P0 :89): 문자열 error 와 함께 온 일시 코드·is_transient·형식 깨진 코드, 충돌 식별자, 쓰기 단계 429 → 결과 불명
+  it.each([
+    ['Codex 재현 { error: invalid_client, code: 2, is_transient: true }', 400, { error: 'invalid_client', code: 2, is_transient: true }],
+    ['Codex 재현 { error: invalid_client, code: "abc" }', 400, { error: 'invalid_client', code: 'abc', error_description: 'Error validating client secret' }],
+    ['error=invalid_client + error_type=invalid_scope(충돌)', 400, { error: 'invalid_client', error_type: 'invalid_scope', error_message: 'Error validating client secret' }],
+    ['429 + error=invalid_client', 429, { error: 'invalid_client' }],
+  ] as const)('FIX4-LIVET1(P0): 코드 교환 %s → outcome unknown, 감사 outcome_ambiguous=yes, 연결 정보 없음', async (label, status, body) => {
+    const { account } = await createLive();
+    liveEnv();
+    useFixture({ [`POST ${THREADS_TOKEN_URL}`]: () => jsonRes(status, body) });
+    const r = await callback({ code: `FAKE_code_LIVET1_FIX4_${label.length}_cccccccccc`, state: (await startLive(account.id)).state });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'oauth_exchange_failed', reason: 'provider_error', outcome: 'unknown' });
+    expect(calls).toHaveLength(1);
+    const rej = (await auditFor(account.id)).filter((e) => e.action === 'oauth.callback_rejected').at(-1)!;
+    expect(rej.sanitizedDetails).toMatchObject({ provider_error: 'provider_error', provider_step: 'exchange', outcome_ambiguous: 'yes' });
+    expect(JSON.stringify(rej)).not.toMatch(/validating|invalid_client|invalid_scope/);
+    expect(await credRow(account.id)).toBeNull();
+  });
+  it('FIX4-LIVET1(놓친 케이스): 장기 교환 400 문자열 오류 { error: invalid_client, is_transient: true } → outcome unknown + 단기 토큰 잔존 가능 기록', async () => {
+    const { account } = await createLive();
+    liveEnv();
+    useFixture({ [`POST ${THREADS_TOKEN_URL}`]: EXCHANGE_OK, [`GET ${THREADS_LONG_LIVED_URL}`]: () => jsonRes(400, { error: 'invalid_client', is_transient: true }) });
+    const r = await callback({ code: 'FAKE_code_LIVET1_FIX4_long_cccccccccc', state: (await startLive(account.id)).state });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'oauth_exchange_failed', outcome: 'unknown' });
+    expect(calls).toHaveLength(2);
+    const rej = (await auditFor(account.id)).filter((e) => e.action === 'oauth.callback_rejected').at(-1)!;
+    expect(rej.sanitizedDetails).toMatchObject({ provider_step: 'long_lived', outcome_ambiguous: 'yes', short_token_issued: 'yes', short_token_remote_state: 'may_be_valid' });
+    expect(JSON.stringify(rej)).not.toContain(SHORT);
+    expect(await credRow(account.id)).toBeNull();
+  });
 });
 
 describe('모의 경로는 그대로', () => {

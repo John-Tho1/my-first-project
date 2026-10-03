@@ -53,3 +53,10 @@ dev 서버는 켜지 않았다(빌드만). `./data` 는 열지 않았다.
 ## Codex 에게 묻는 것
 1. `ops.uploads` 를 **owner 폴더(`<uploads>/<owner>`)만** 세도록 했다(지시는 "폴더 측정, disk 처럼 문서화"). 업로드 경로가 `<root>/<owner UUID>/<session UUID>` 로 고정돼 있어 owner 범위가 가능했다. 영역 전체 측정(disk.uploads 와 같은 성격)이 더 맞다고 보는가, 아니면 owner 범위가 D23 의도에 맞는가? 또 측정 실패를 `null` 로 내는 처리(`usage(ownerId).catch(() => null)`)가 충분한가(owner ID 가 UUID 가 아니면 throw → null)?
 2. `attention_plans` 를 `ops.jobs` 안에 다시 두지 않고 기존 최상위 `ops.attention_plans` 하나로만 낸 선택, 그리고 전역 `attentionPlanCount`·owner 없는 `jobStateCounts(db)` 를 제거한 것이 다른 경로(worker CLI·/ops 화면·drill)에 숨은 의존을 깨지 않는지 확인 부탁한다(저장소 grep 으로는 사용처 없음).
+
+# FIX round 1 (Codex review-D30H P1) — 오케스트레이터 직접
+- HEAD_SHA: a25fa47 (code only, D28).
+- 지적: owner 폴더·세션 하위 폴더 readdir 의 EACCES·EIO 를 삼켜 ops.uploads 가 null 대신 0·일부 수치.
+- 변경: usage() 의 list 는 ENOENT 만 빈 목록, 그 밖 오류 전파(opsSummary 의 catch → null); 파일 stat 도 ENOENT 만 건너뜀.
+- 시험: uploads-transcription.test.ts "Codex review-D30H P1" — 폴더 자리에 파일(ENOTDIR)로 읽기 실패 재현, owner 폴더·세션 하위 폴더 각각 null, 복구 뒤 원래 수치, 폴더 없는 owner 는 0. 수정을 빼면 실패 확인.
+- 명령: lint·typecheck·build·unit 884·integration 670·drill:mock 0·실제 DB drill:restore PASS.

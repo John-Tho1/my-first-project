@@ -62,3 +62,56 @@
 4. 원장을 EXPORTED·RESTORED 로 둔 결정(D32 e)과 복원 PARENTS(대상 소재·출처·버전이 없으면 dependency 충돌) — 복원된 preview 실행이 남는 것, add_missing 에서 부분 unique 충돌이 생길 때의 동작이 받아들일 만한가?
 5. 미리보기·확정 API 의 선택 해석(폴더 합집합, 빈 선택 400, 다른 실행 ID 400, 충돌은 version_ids 만)과 폼(같은 이름 여러 값)이 우회 없이 같은 규칙인가?
 6. 원장·감사 기록에 개인 원문이 새는 경로가 있는가? (원장에는 경로·제목·생성 표시·checksum 이 있고 본문은 없음, audit 은 건수만, 소재 상세는 원래 경로를 보인다.)
+
+## FIX round 1 (Codex review-T18)
+- Orchestrator: HEAD_SHA 6e7ff92 (code only, D28) — reran lint·typecheck·build·unit 1036·integration 699·drill:mock 0·db:migrate 0039·real-DB drill:restore PASS.
+- 입력: `.handoffs/review-T18.md`(CHANGES_REQUESTED, 1427118 대상). BASE_SHA: 8bd31388e355cc723d8810e4096f639b09756b55 · HEAD_SHA: TBD(커밋 안 한 작업 트리 — 오케스트레이터가 커밋).
+- 범위: 파일·모의만. 네트워크·자격 증명·live 커넥터 0, 새 의존성 0, migration 0039(`0039_t18_fix1_originals`), `./data` 열지 않음, dev 서버 꺼짐.
+- 건드리지 않음: `docs/DECISIONS.md`, `M4_CODEX_VERDICTS.md`(작업 중 다른 쪽에서 수정된 상태 — 이 작업의 변경 아님), `M4_STATUS.md`, `LIVET1_IMPLEMENTATION_HANDOFF.md`, 다른 handoff.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+|---|---|---|
+| [P0] domain imports.ts:293 HTML 원본이 추출 텍스트로 대체됨(원본 바이트 미보존) | 새 표 `source_version_originals`(0039): 출처 버전마다 하나(unique), `content_base64`(원본 바이트 그대로 — 문자열 디코딩을 거치지 않아 BOM·CRLF 가 드라이버/JSON 에서 바뀌지 않음), `byte_size`, `sha256`, `format`, owner. DB CHECK: 길이(decode)=byte_size, sha256(decode)=sha256. 트리거: INSERT 때 sha256 = 출처 버전 raw_hash 이고 owner = 출처 owner, UPDATE·DELETE 금지(`append_only_immutable`). 파서는 `original`(UTF-8 fatal + ignoreBOM 디코딩, 변환 없음)을 함께 돌려주고 확정 때 버전과 같은 트랜잭션에 넣는다. 소재 원문은 파생 값 그대로(.html 은 추출 텍스트). 내보내기·복원: EXPORTED/RESTORED 표, `TABLE_INTRODUCED_IN` 0039(이전 묶음은 빈 표), 행 스키마, 묶음 무결성(버전 존재·버전당 하나·sha256=raw_hash=sha256(바이트)·크기), 복원 PARENTS(source_versions), 보존 정리 보호 표. 받기: `GET /api/imports/originals/{출처 버전 ID}`(owner 조건, text/plain + attachment + nosniff + sandbox CSP, `x-content-sha256`), 소재 상세에 "원본 파일 그대로 받기" 링크 | 단위: HTML(링크·표·BOM·CRLF) original 이 바이트 동일·sha256=checksum, md BOM 은 original 에만. 통합: HTML 확정 → 소재 원문에 href·script 없음, 원본 행 바이트 동일·sha256=raw_hash, 받기 경로 바이트 동일·헤더, 다른 owner 404, UPDATE·DELETE 거부, raw_hash 불일치·owner 불일치 INSERT 를 트리거가 거부(오류 메시지로 트리거 확인), md(BOM·CRLF) 바이트 동일. 복원 훈련: `source_version_originals` ids same·행 수 일치 |
+| [P0] imports.ts:328 중첩 ZIP 이 누적 해제량·전체 항목 수 상한 우회 | 바깥·안쪽이 함께 쓰는 예산 하나: 중앙 목록 **레코드 수(디렉터리 포함)** 를 전역 5,000 에 합산, 실제로 푸는 바이트(중첩 컨테이너 + 텍스트) 합계 128MiB 를 **풀기 전에** 선언 크기로 검사, 중첩 ZIP 16개 상한, 깊이 1(두 겹째 ZIP 은 첨부·풀지 않음). 텍스트 64MiB 상한은 그대로 | 단위: 안쪽 ZIP 17개 → 거부(16개는 받음), 9MiB 첨부만 든 안쪽 ZIP 15개(올린 파일 < 5MB) → ImportTooLargeError(14개는 받음), 디렉터리 3,000개짜리 안쪽 ZIP 2개 → 거부, 바깥 디렉터리 5,001개 → 거부, 두 겹째 ZIP 은 첨부 |
+| [P0] imports.ts:248 HTML 제거 정규식 ReDoS | `htmlToText` 를 한 번 훑는 토큰 순회로 교체(indexOf 는 현재 위치에서 앞으로만, 찾은 곳까지 소비하거나 못 찾으면 끝냄 — 같은 구간 재탐색 없음). 닫히지 않은 주석·script/style/noscript/template/title 과 `>` 없는 태그 시작은 나머지를 버림(브라우저와 같음), 태그가 아닌 `<` 는 글자. 닫는 태그 이름 비교는 글자 단위. title·h1 추출 정규식(경계 반복)도 제거. 입력 상한 2MiB(`HTML_TO_TEXT_MAX_INPUT`, 넘으면 ImportInvalidError) + `parseImportFile` 도 2MiB 초과는 too_large | 단위: 적대 입력 10종(닫히지 않은 `<script>`·`<style x>`·주석 반복, `<a` 반복, `<`·`</` 반복, `<title>`+`</titl` 반복, `<script>`+`</scrip` 반복, `<h1>`+짧은 태그 반복, 엔티티 흉내) 2MB 각각 **CPU 시간 < 200ms**(3회 중 최소) + 선형성(2MB 1회 < 512KB 4회 × 2.5 + 32ms). 참고: 고치기 전 정규식은 `<script>` 반복 32KB 41ms → 64KB 130ms → 128KB 482ms(제곱, 이 PC). 닫히지 않은 태그·주석·대소문자·self-closing script·h1/title 제목 |
+| [P1] db/imports.ts:244 다른 실행의 동시 확정이 직렬화되지 않음 | 확정 트랜잭션에서 실행을 차지한 직후 `pg_advisory_xact_lock(hashtext('cs.import:<owner>:<공급자>'))` → 그 뒤에 출처를 다시 읽어 판정(잠금 뒤 문장은 먼저 커밋된 출처를 봄). 새 출처 INSERT 는 savepoint(`tx.transaction`) 안 — `sources_owner_import_external_uq` 위반이면 그 INSERT 만 되돌리고 다시 읽어 동일 → `skipped_identical`, 다르면 `skipped_conflict`(사용자가 새 버전을 고르지 않았으므로 덮어쓰지 않음). 다른 제약 위반은 그대로 throw | 통합: 같은 새 항목을 가진 두 실행을 `Promise.all` 로 확정 → 둘 다 200, 출처 1·소재 1, 결과 imported 1 + skipped_identical 1, 원장 target 일관. 시험 전용 훅 `beforeSourceInsert`(같은 트랜잭션, savepoint 밖에서 같은 외부 ID 출처+버전을 먼저 넣음) → 동일 내용이면 skipped_identical, 다른 내용이면 skipped_conflict, 500 없음, 소재·이력 0 증가 |
+| [P1] apps/web/lib/imports.ts:122 실제 선택 0개로 확정·ZIP 삭제 | `effectiveImportChoice`(domain): 원장 판정 기준 new 는 item_ids·폴더, conflict 는 version_ids 일 때만 쓰기. `commitImportRun` 이 상태 변경·원본 재읽기 **전에** 유효 선택이 0개면 400 `import_nothing_selected`(실행 preview 유지, 라우트가 ZIP 을 지우지 않음). version_ids 가 충돌 항목이 아니면 400 `import_invalid_selection`(폼 문구 추가). 폼·JSON 같은 경로 | 통합: 없는 폴더 → 400·preview·ZIP 남음·쓰기 0, 새 항목에 version_ids → 400 invalid_selection, 동일 항목만 → 400, 반복 `folder` 폼 → 두 폴더만 imported 2·skipped_unselected 1, 반복 `version` 폼(충돌 아님) → 303 `?error=import_invalid_selection`. 기존 "충돌만 선택 → skipped_conflict" 시험은 바뀐 규칙에 맞춰 "충돌만 선택 → 400, 새 항목과 함께 선택 → 충돌은 skipped_conflict·새 항목 imported·기존 소재 그대로" 로 바꿈(단언을 줄이지 않고 두 경로 모두 확인) |
+| [P2] imports.ts:339 unsigned ZIP 크기를 signed integer 에 저장 | 0039 에서 `import_items.byte_size` → bigint. 파서는 원장에 넣기 전 0 ≤ size ≤ 0xffffffff·safe integer 확인(벗어나면 ZipFormatError) | 단위: 선언 크기 2^31−1·2^31·0xfffffffe 첨부 → byteSize 그대로. 통합: 2^31−1·2^31 첨부가 든 ZIP 미리보기 200, 원장 byte_size 그대로 |
+
+### 놓친 케이스(리뷰 파일)에서 함께 처리한 것
+- 정상 데이터 디스크립터(bit 3) ZIP 읽기(local 크기·CRC 0) — 시험 도우미에 `dataDescriptor` 추가, 단위 시험.
+- local/central 불일치(이름·압축 방식·암호화 플래그) → 거부. 시험 도우미 `localName`, 단위 시험.
+- 지원하지 않는 압축 방식은 첨부·디렉터리·too_large 항목(풀지 않는 항목)에서도 거부 — `rawMethod`, 단위 시험.
+- 닫히지 않은 태그·주석 반복, 원본 링크·표 보존과 복원, 없는 폴더·새 항목의 version_ids·반복 folder/version 폼, byte_size 2^31−1/2^31 경계.
+- 처리하지 않음: `add_missing` 의 외부 ID 같고 출처 UUID 다른 충돌 집계, 확정·취소 뒤 ZIP 삭제 실패 재정리, 실제 Notion·Drive ZIP 파일명 인코딩(아래 위험).
+
+### 변경 파일
+- 수정: `packages/domain/src/imports.ts`, `packages/db/src/imports.ts`, `packages/db/src/schema.ts`, `packages/db/drizzle/meta/_journal.json`, `packages/db/src/{bundle-tables,restore}.ts`, `packages/domain/src/{bundle,ops}.ts`, `packages/domain/src/{bundle,writing}.test.ts`(BundleTables 리터럴에 빈 표), `apps/web/lib/imports.ts`(오류 문구), `apps/web/app/captures/[id]/page.tsx`(원본 받기 링크), `tests/helpers/import-zip.ts`, `tests/integration/imports.test.ts`, `README_KO.md`(가져오기 절 두 문장).
+- 새 파일: `packages/db/drizzle/0039_t18_fix1_originals.sql`(drizzle-kit 출력 + 머리말 2줄 + 손으로 더한 트리거 함수 1·트리거 2), `packages/db/drizzle/meta/0039_snapshot.json`, `apps/web/app/api/imports/originals/[versionId]/route.ts`, `packages/domain/src/imports-fix1.test.ts`.
+
+### 명령과 결과(로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `drizzle-kit generate --name t18_fix1_originals` → 0039.
+- `corepack pnpm lint`: pass(중간에 no-useless-assignment 2건을 고친 뒤).
+- `corepack pnpm typecheck`: pass.
+- `corepack pnpm build`: pass(`/api/imports/originals/[versionId]` 포함).
+- `corepack pnpm test`(unit): pass — 47 files, 1036 tests(새 `packages/domain/src/imports-fix1.test.ts` 26). 첫 전체 실행에서 HTML 시간 시험이 병렬 부하로 벽시계 200ms 를 넘어 실패 → 시간 측정을 이 워커 프로세스의 CPU 시간(3회 중 최소)으로 바꾸고 `<` 만 반복 경로를 빠르게 고친 뒤 pass(상한 200ms 는 그대로).
+- `corepack pnpm test:integration`(혼자): pass — 35 files, 699 tests, 508s(`tests/integration/imports.test.ts` 24, 새 9 포함).
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건".
+- 실제 로컬 DB `db:migrate`·`drill:restore`: not_run(`./data` 를 열지 말라는 지시 — 오케스트레이터 단계).
+
+### 남은 위험
+- 동시 확정 시험은 PGlite 단일 연결이라 두 트랜잭션이 실제로 엇갈리지 않는다(PGlite 가 트랜잭션을 줄 세움). advisory lock 이 별도 연결에서 직렬화하는지는 DB_DRIVER=postgres 가 없어 관찰하지 못했다 — unique 위반 복구 경로는 훅으로만 확인.
+- 잠금은 owner·공급자 단위(외부 ID 단위 아님) — 같은 owner 의 같은 공급자 확정은 모두 직렬화된다(개인 앱이라 받아들임, 교착 없음).
+- 원본은 base64 text(최대 2MiB → 약 2.7MiB/행)로 DB·묶음에 들어간다 — 가져오기 1회 최대 1,000 항목이면 묶음이 커질 수 있다. 원본은 DB 에 있고 파일 저장소(assets)를 쓰지 않는다.
+- 0039 이전에 확정한 가져오기(1427118 로 만든 로컬 데이터)는 원본 행이 없다 — 받기 링크가 404, 복원·무결성은 통과(원본은 선택적). 다시 가져오면 동일 판정이라 채워지지 않는다.
+- HTML 처리 시간 시험은 CPU 시간 기준이다(Windows 눈금 약 15.6ms). 벽시계는 병렬 부하에 따라 더 길 수 있다. `<` 만 2MB 는 CPU 약 30~90ms.
+- `htmlToText` 는 속성 값 안의 `>` 를 태그 끝으로 본다(이전 정규식과 같음) — 추출 텍스트가 조금 달라질 수 있으나 원본은 보존된다.
+- 화면은 build·typecheck 만 — 브라우저로 보지 않음.
+
+### Codex 에게 질문
+1. 원본을 `source_version_originals.content_base64`(DB CHECK + INSERT 트리거 raw_hash·owner 일치 + 추가 전용)로 둔 방식이 "원본 보존" 불변식과 내보내기·복원(무결성 검사 포함)에 충분한가? 0039 이전 가져오기에 원본이 없는 것을 어떻게 다뤄야 하는가?
+2. owner·공급자 단위 `pg_advisory_xact_lock` + 잠금 뒤 재조회 + savepoint unique 복구가 PostgreSQL READ COMMITTED 다중 연결에서 중복 출처·500 을 막는가? 같은 기존 출처에 같은 버전을 동시에 추가하는 경우(versioned)도 이 잠금으로 충분한가?
+3. 중첩 예산(레코드 수 디렉터리 포함 5,000 · 실제 푸는 바이트 128MiB · 안쪽 ZIP 16개 · 깊이 1)과 local/central 일치 검사에 남은 우회가 있는가? 특히 같은 local header 를 여러 중앙 레코드가 가리키는 겹침(overlapping entries)은 아직 검사하지 않는다.
+4. `htmlToText` 토큰 순회에 선형이 아닌 경로가 남았는가(decodeEntities·줄 정리 정규식 포함)? CPU 시간 기준 200ms 시험이 회귀 방지로 충분한가?
+5. "유효 선택 0개 → 400" 을 미리보기 판정 기준으로 둔 것(확정 때 재판정으로 결과가 모두 skipped 가 될 수는 있음)과 version_ids 를 충돌 항목으로만 제한한 것이 받아들일 만한가?

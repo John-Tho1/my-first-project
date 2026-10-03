@@ -139,3 +139,6 @@ CHANGES_REQUESTED
 - [P1] `packages/db/src/imports.ts:244` — 서로 다른 실행의 동시 확정에서 출처 재판정과 삽입이 직렬화되지 않는다
 - [P1] `apps/web/lib/imports.ts:122` — 실제 선택 항목이 없어도 미리보기를 확정하고 ZIP을 삭제한다
 - [P2] `packages/domain/src/imports.ts:339` — ZIP의 unsigned 크기를 DB의 signed `integer`에 그대로 저장한다
+
+## FIX2-LIVET1 (e51ae72, LIVE-T1 round 2) — CHANGES_REQUESTED (P0 1)
+- [P0] packages/providers/src/threads-live-oauth.ts:212 — 숫자 코드가 없는 일시 오류는 여전히 메시지 때문에 확정 실패로 바뀐다

@@ -5,6 +5,8 @@ import {
   codeChallengeS256,
   credentialHealth,
   hashOAuthState,
+  INSTAGRAM_NOT_REQUESTED_BY_DEFAULT,
+  INSTAGRAM_REQUIRED_SCOPES,
   isPlainRedirectUri,
   isWellFormedOAuthState,
   liveOAuthReadiness,
@@ -47,7 +49,13 @@ describe('scope', () => {
   it('Threads 는 기본 + 게시만 요청, 답글·통계는 기본 요청 목록에 없다', () => {
     expect([...requiredScopesForPlatform('threads')]).toEqual(['threads_basic', 'threads_content_publish']);
     for (const s of THREADS_NOT_REQUESTED_BY_DEFAULT) expect(THREADS_REQUIRED_SCOPES as readonly string[]).not.toContain(s);
-    expect(requiredScopesForPlatform('instagram')).toEqual([]);
+    // T16: Instagram 은 모의 자리 표시 scope(기본 + 게시)가 생겼다 — 연결 공급자가 없는 채널은 블로그(같은 단언)
+    expect(requiredScopesForPlatform('blog')).toEqual([]);
+  });
+  it('T16 Instagram: 자리 표시 scope(기본 + 콘텐츠 게시)만, 댓글·메시지·통계는 기본 요청 목록에 없다 — 이름은 모두 (mock) 표시', () => {
+    expect([...requiredScopesForPlatform('instagram')]).toEqual(['instagram_basic(mock)', 'instagram_content_publish(mock)']);
+    for (const s of INSTAGRAM_NOT_REQUESTED_BY_DEFAULT) expect(INSTAGRAM_REQUIRED_SCOPES as readonly string[]).not.toContain(s);
+    for (const s of [...INSTAGRAM_REQUIRED_SCOPES, ...INSTAGRAM_NOT_REQUESTED_BY_DEFAULT]) expect(s.endsWith('(mock)')).toBe(true);
   });
 });
 

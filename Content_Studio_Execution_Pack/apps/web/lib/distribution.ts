@@ -8,6 +8,7 @@ import {
   CREDENTIAL_STATUS_LABEL,
   formatMsk,
   formatMskInline,
+  instagramSpecProblemLabel,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
   scenarioApplies,
@@ -62,6 +63,8 @@ export const PROBLEM_LABEL: Record<string, string> = {
 
 export function problemLabel(p: string): string {
   if (p.startsWith('blocked:')) return `검토 차단: ${p.slice('blocked:'.length)}`;
+  // T16(D29 제안): Instagram 잠정 규격(승인 전 검사)
+  if (p.startsWith('media_spec:')) return `Instagram 규격(잠정): ${instagramSpecProblemLabel(p)}`;
   return PROBLEM_LABEL[p] ?? p;
 }
 
@@ -102,7 +105,7 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
   item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
   scenario_not_applicable:
-    '이 항목의 모의 어댑터(일반 모의·Threads 모의·YouTube 모의)에 맞지 않는 시나리오입니다. threads_* 는 모의 연결한 Threads 계정, youtube_* 는 모의 연결한 YouTube 계정 항목에만 쓸 수 있습니다.',
+    '이 항목의 모의 어댑터(일반 모의·Threads 모의·YouTube 모의·Instagram 모의)에 맞지 않는 시나리오입니다. threads_* 는 모의 연결한 Threads 계정, youtube_* 는 모의 연결한 YouTube 계정, instagram_* 는 모의 연결한 Instagram 계정 항목에만 쓸 수 있습니다.',
   // T15(D27): YouTube 모의 연결 계정의 목적·공개 범위·예약 공개 규칙
   requested_result_not_supported: '모의 연결한 YouTube 계정은 비공개 업로드 또는 공개 게시 계획만 만들 수 있습니다(결과는 MOCK).',
   visibility_mismatch: '요청 결과와 공개 범위가 맞지 않습니다(비공개 업로드 = private, 공개 게시 = public·unlisted 또는 private + 예약 공개).',
@@ -111,6 +114,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   publish_at_requires_private: '예약 공개는 private 영상에만 정할 수 있습니다.',
   publish_at_before_send: '예약 공개 시각은 업로드 시작 시각보다 뒤여야 합니다.',
   requested_result_required: '실제 계정은 비공개 업로드 또는 공개 게시를 골라야 합니다(이 단계에서는 실제 게시하지 않음).',
+  // T16(D29 제안): Instagram 모의 연결 계정
+  instagram_visibility_public_only: '모의 연결한 Instagram 계정은 공개 범위 공개(public)만 고를 수 있습니다(Instagram 게시물은 비공개·예약 결과가 없음 — 결과는 MOCK).',
   server: '서버 오류가 발생했습니다.',
 };
 
@@ -197,7 +202,15 @@ export function resultChoicesFor(acc: { kind: string; platform: string; credenti
 /** 계정 선택 목록의 한 줄(MOCK · 고를 수 있는 요청 결과). */
 export function planAccountLabel(acc: { displayName: string; kind: string; platform: string; credentialState: string }): string {
   const choices = resultChoicesFor(acc);
-  const res = choices.length === 1 && choices[0] === 'mock_publish' ? 'MOCK 실행만' : choices.length ? '모의 연결 — 비공개 업로드·공개 게시·예약 공개' : '';
+  const instagramLinked = acc.kind === 'mock' && adapterIdFor({ kind: 'mock', platform: acc.platform, credential_state: acc.credentialState }) === 'mock_instagram';
+  // T16(D29 제안): 모의 연결 Instagram 은 MOCK 실행만 + 공개 범위 public 만
+  const res = instagramLinked
+    ? '모의 연결 — MOCK 실행만(공개 범위 public 만)'
+    : choices.length === 1 && choices[0] === 'mock_publish'
+      ? 'MOCK 실행만'
+      : choices.length
+        ? '모의 연결 — 비공개 업로드·공개 게시·예약 공개'
+        : '';
   return `${acc.displayName}${acc.kind === 'mock' ? ' (MOCK)' : ''}${res ? ` · ${res}` : ''}`;
 }
 
@@ -379,6 +392,16 @@ export const MOCK_SCENARIO_LABEL: Record<(typeof MOCK_SCENARIO_VALUES)[number], 
   youtube_public_unverified_forced_private: 'YouTube 모의: 미검증 프로젝트 — public 요청도 비공개로 강제',
   youtube_scheduled_private: 'YouTube 모의: 검증된 프로젝트 + 예약 공개(payload 의 publish_at) → 원격 예약',
   youtube_project_verified: 'YouTube 모의(시험·개발 전용): 검증된 프로젝트 — public 요청이면 공개 결과',
+  // T16(D29 제안): Instagram 모의 어댑터(모의 연결 계정 — 미디어 컨테이너 → 게시)
+  instagram_success: 'Instagram 모의: 이미지(또는 캐러셀) 컨테이너 → 게시 성공',
+  instagram_container_slow: 'Instagram 모의: 컨테이너 처리 지연 → 원격 처리 중 → 같은 컨테이너로 게시',
+  instagram_publish_timeout_sent: 'Instagram 모의: 게시 응답 유실(원격은 게시함) — 조회로 확인, 다시 게시 안 함',
+  instagram_publish_timeout_not_sent: 'Instagram 모의: 게시 시간 초과(원격 게시 안 됨) — 조회 뒤 같은 컨테이너로 게시',
+  instagram_rate_limited: 'Instagram 모의: 게시 요청 제한(429, Retry-After 5초) 한 번',
+  instagram_token_invalid: 'Instagram 모의: 토큰 거절(401) — 계정 다시 연결 필요',
+  instagram_permission_denied: 'Instagram 모의: 권한 없음(403) — 재시도 안 함',
+  instagram_invalid_spec_remote: 'Instagram 모의: 원격이 이미지 규격 거부(400) — 재시도 안 함',
+  instagram_container_error: 'Instagram 모의: 컨테이너 처리 오류(ERROR) — 재시도 안 함',
 };
 
 export const MOCK_SCENARIO_OPTIONS = MOCK_SCENARIO_VALUES.map((v) => ({ value: v, label: `${v} — ${MOCK_SCENARIO_LABEL[v]}` }));
@@ -411,6 +434,29 @@ export function youtubeProgressLine(p: { received: number | null; total: number 
   const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
   const extra = p.sessions > 1 ? ` · 새 세션 ${p.sessions - 1}회(만료)` : '';
   return `업로드 ${pct}% (${mb(received)}/${mb(total)} MB) · 세션 재개 ${p.resumes}회${extra}`;
+}
+
+/**
+ * T16(D29 제안): Instagram 단계 한 줄 — `게시할 컨테이너 · 준비됨 · mockig_ct_…` / `캐러셀 이미지 2/3 · 컨테이너 생성됨 · …` / `게시됨(MOCK) · mockig_m_…`.
+ * 모의 ID 만(공개 미디어 URL 은 단계에 없다). "게시 완료"라고 하지 않는다.
+ */
+export const INSTAGRAM_STEP_LABEL: Record<string, string> = {
+  'ig_container:created': '컨테이너 생성됨(처리 중)',
+  'ig_container:finished': '컨테이너 준비됨',
+  'ig_container:error': '컨테이너 오류',
+  'ig_publish:published': '게시됨(MOCK)',
+};
+export function instagramStepLine(step: { kind: string; status: string; postIndex: number; remoteId: string }, images: number): string {
+  const label = INSTAGRAM_STEP_LABEL[`${step.kind}:${step.status}`] ?? `${step.kind} ${step.status}`;
+  const where =
+    step.kind === 'ig_publish' ? '게시' : step.postIndex === 0 ? (images > 1 ? '캐러셀(부모) 컨테이너' : '이미지 컨테이너') : `캐러셀 이미지 ${step.postIndex}/${images}`;
+  return `${where} · ${label} · ${step.remoteId}`;
+}
+/** T16: 컨테이너 진행 요약 — `컨테이너 2/4 준비 · 게시 대기`. 캐러셀은 자식 n + 부모 1. */
+export function instagramProgressLine(p: { images: number; finished: number; created: number; published: boolean }): string {
+  const total = p.images > 1 ? p.images + 1 : 1;
+  if (p.published) return `게시됨(MOCK) · 컨테이너 ${total}/${total}`;
+  return `컨테이너 ${p.finished}/${total} 준비${p.created > p.finished ? ` · 처리 중 ${p.created - p.finished}` : ''} · 게시 대기`;
 }
 
 /** T15: YouTube 단계 상태 문구(모의 ID 만 — 세션 URI 는 `세션 있음`). */
@@ -537,6 +583,7 @@ export function itemHeadline(x: ItemHeadlineInput): string {
     case 'SENDING':
       return '전송 중(MOCK)';
     case 'REMOTE_PROCESSING':
+      if (x.channel === 'instagram') return 'Instagram 컨테이너 처리 중 — 확인 대기(MOCK)';
       return x.channel === 'youtube' ? '비공개 업로드 처리 중 — 확인 대기' : '원격 처리 중 — 확인 대기';
     case 'RETRY_WAIT':
       if (job && isRateLimitWait(job)) return `${x.channel === 'youtube' ? '할당량 소진' : '요청 제한'} — ${mskHourMinute(job.nextRunAt)} 이후 재시도`;
@@ -571,6 +618,8 @@ export function itemHeadline(x: ItemHeadlineInput): string {
         }
         if (kind === 'PUBLISHED') return `공개 게시 확인(MOCK)${tail}`;
       }
+      // T16: Instagram 은 게시 결과만(비공개·예약 없음) — 모의 게시 확인, 실제 발행 아님
+      if (x.channel === 'instagram' && kind === 'PUBLISHED') return 'MOCK 게시 확인(Instagram 모의 — 실제 발행 아님)';
       if (kind === 'UPLOADED_PRIVATE') return x.channel === 'youtube' ? '비공개 업로드 완료, 공개 전환 확인 필요' : 'MOCK 비공개 결과 확인';
       if (kind === 'SCHEDULED_REMOTE') return 'MOCK 원격 예약 확인';
       if (kind === 'PUBLISHED') return 'MOCK 공개 결과 확인';
@@ -756,7 +805,7 @@ export interface StepsPanelInput {
 
 export interface StepsPanelView {
   /** 보일 단계 패널(없으면 null) */
-  panel: 'threads' | 'youtube' | null;
+  panel: 'threads' | 'youtube' | 'instagram' | null;
   /** 패널을 고른 어댑터(기록을 읽을 수 없으면 null) */
   adapter: AdapterId | null;
   /** intent = 전송 의도에 기록된 어댑터, current = 아직 보낸 적 없어 현재 선택, none = 계정 없음 */
@@ -765,7 +814,7 @@ export interface StepsPanelView {
   note: string | null;
 }
 
-const PLATFORM_STEP_NAME: Record<'threads' | 'youtube', string> = { threads: 'Threads 단계', youtube: 'YouTube 업로드 단계' };
+const PLATFORM_STEP_NAME: Record<'threads' | 'youtube' | 'instagram', string> = { threads: 'Threads 단계', youtube: 'YouTube 업로드 단계', instagram: 'Instagram 단계' };
 
 /**
  * M4 화면 FIX(S1, D26 후속 규칙): 단계 패널의 어댑터는 **가장 최근 전송 의도에 기록된 어댑터**(recordedAdapterIdOf — adapter_id 없음·null 이면
@@ -776,7 +825,8 @@ export function stepsPanelView(x: StepsPanelInput): StepsPanelView {
   const hasSteps = (kinds: readonly string[]) => x.remoteStepKinds.some((k) => kinds.includes(k));
   const threadsSteps = hasSteps(['container', 'publish']);
   const youtubeSteps = hasSteps(['upload_session', 'video']);
-  const platformPanel = x.platform === 'threads' || x.platform === 'youtube' ? x.platform : null;
+  const instagramSteps = hasSteps(['ig_container', 'ig_publish']);
+  const platformPanel = x.platform === 'threads' || x.platform === 'youtube' || x.platform === 'instagram' ? x.platform : null;
   let adapter: AdapterId | null;
   let source: StepsPanelView['source'];
   if (x.latestIntent) {
@@ -787,7 +837,13 @@ export function stepsPanelView(x: StepsPanelInput): StepsPanelView {
     source = x.currentAdapter ? 'current' : 'none';
   }
   const panel: StepsPanelView['panel'] =
-    adapter === 'mock_threads' || threadsSteps ? 'threads' : adapter === 'mock_youtube' || youtubeSteps ? 'youtube' : null;
+    adapter === 'mock_threads' || threadsSteps
+      ? 'threads'
+      : adapter === 'mock_youtube' || youtubeSteps
+        ? 'youtube'
+        : adapter === 'mock_instagram' || instagramSteps
+          ? 'instagram'
+          : null;
   if (panel) return { panel, adapter, source, note: null };
   if (source === 'intent' && platformPanel) {
     const name = PLATFORM_STEP_NAME[platformPanel];

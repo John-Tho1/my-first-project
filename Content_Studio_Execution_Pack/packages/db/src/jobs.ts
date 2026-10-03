@@ -58,7 +58,6 @@ import {
   type ChannelAdapterRegistry,
   type JobEvent,
   type JobState,
-  type MediaPort,
   type MediaReader,
   type MockScenarioSetting,
   type PublishSnapshot,
@@ -83,11 +82,12 @@ import {
 } from './approval-invalidation';
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
+import { mediaPortFor } from './media-spec';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
 import { accountRateSnapshot, listRemoteSteps, publishedStepCount, remoteStepsPort, type RateInflightJob } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
-import { assets, channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
+import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
 export type SendIntentRow = typeof sendIntents.$inferSelect;
 export type PublicationRow = typeof publications.$inferSelect;
@@ -135,45 +135,6 @@ export interface JobRunOptions {
    * phase = 'before_snapshot'(잠금 직후·읽기 전) | 'after_usage'(창 안 사용량을 읽은 직후). 다른 작업의 커밋이 끼어드는 순서를 강제하는 데만 쓴다.
    */
   rateCheckHook?: (tx: DbOrTx, at: { phase: 'before_snapshot' | 'after_usage'; jobId: string; accountId: string }) => Promise<void>;
-}
-
-/**
- * T15(D27): 작업 처리기 쪽 미디어 창구 — 승인 스냅샷의 첨부(id·checksum·mime)와 같은 owner 의 **VERIFIED·지워지지 않은** asset 만 연다.
- * 읽기는 짧은 조회 하나(잠금 없음) + 저장소 범위 읽기(호출마다 [start, end) 만).
- */
-export function mediaPortFor(db: DbOrTx, ownerId: string, reader: MediaReader | undefined): MediaPort {
-  return {
-    open: async (want) => {
-      if (!reader) return { ok: false, code: 'media_reader_unavailable' };
-      if (!isUuid(want.id)) return { ok: false, code: 'media_not_found' };
-      const rows = await db
-        .select({ key: assets.key, mime: assets.mime, bytes: assets.bytes, checksum: assets.checksum, state: assets.verificationState, deletedAt: assets.deletedAt })
-        .from(assets)
-        .where(and(eq(assets.id, want.id), eq(assets.ownerId, ownerId)))
-        .limit(1);
-      const a = rows[0];
-      if (!a) return { ok: false, code: 'media_not_found' };
-      if (a.deletedAt) return { ok: false, code: 'media_deleted' };
-      if (a.state !== 'VERIFIED') return { ok: false, code: 'media_not_verified' };
-      if (a.checksum !== want.checksum || a.mime !== want.mime) return { ok: false, code: 'media_changed' };
-      const key = a.key;
-      const size = Number(a.bytes);
-      return {
-        ok: true,
-        file: {
-          bytes: size,
-          mime: a.mime,
-          checksum: a.checksum,
-          read: async (start: number, end: number) => {
-            if (!(start >= 0 && end > start && end <= size)) throw new RangeError('media read out of range');
-            const out = await reader.readRange(key, start, end);
-            if (out.byteLength !== end - start) throw new Error('media short read');
-            return out;
-          },
-        },
-      };
-    },
-  };
 }
 
 export function newWorkerId(prefix: string): string {

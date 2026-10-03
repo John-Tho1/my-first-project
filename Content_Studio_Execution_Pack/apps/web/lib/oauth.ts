@@ -13,7 +13,7 @@ import {
   secretsReadiness,
   type AppConfig,
 } from '@cs/domain';
-import { MockGoogleOAuthProvider, MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
+import { MockGoogleOAuthProvider, MockInstagramOAuthProvider, MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
 import { errorResponse, seeOther } from './api';
 
 export interface OAuthDeps {
@@ -50,6 +50,11 @@ export function mockGoogleProvider(config: AppConfig): MockGoogleOAuthProvider {
   return new MockGoogleOAuthProvider({ registeredRedirectUri: oauthRedirectUri(config), appBaseUrl: config.APP_BASE_URL });
 }
 
+/** T16(D29 제안): Instagram(Meta 형) 모의 "동의 화면" 경로가 쓰는 공급자(등록 redirect URI = 설정값) */
+export function mockInstagramProvider(config: AppConfig): MockInstagramOAuthProvider {
+  return new MockInstagramOAuthProvider({ registeredRedirectUri: oauthRedirectUri(config), appBaseUrl: config.APP_BASE_URL });
+}
+
 /** 모의 "동의 화면" 경로가 쓰는 공급자(등록 redirect URI = 설정값) */
 export function mockThreadsProvider(config: AppConfig): MockThreadsOAuthProvider {
   return new MockThreadsOAuthProvider({ registeredRedirectUri: oauthRedirectUri(config), appBaseUrl: config.APP_BASE_URL });
@@ -67,7 +72,7 @@ export function oauthReadinessView(config: AppConfig, env: Record<string, string
 
 export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   secrets_not_configured: '서버 비밀 암호화 키(SECRETS_MASTER_KEY·SECRETS_KEY_VERSION)가 설정되지 않아 계정을 연결할 수 없습니다. 다른 기능은 그대로 쓸 수 있습니다.',
-  oauth_not_supported: 'Threads·YouTube 모의 계정만 연결할 수 있습니다.',
+  oauth_not_supported: 'Threads·YouTube·Instagram 모의 계정만 연결할 수 있습니다.',
   live_oauth_not_configured: '실제 계정 연결은 아직 준비되지 않았습니다(T14, 별도 승인 후). 외부로 아무것도 보내지 않았습니다.',
   oauth_state_invalid: '연결 요청을 확인할 수 없습니다. 다시 연결하세요.',
   oauth_state_expired: '연결 요청 시간이 지났습니다(10분). 다시 연결하세요.',

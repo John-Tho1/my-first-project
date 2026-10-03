@@ -364,7 +364,7 @@ export interface AdapterAccount {
 }
 
 /** T14(D26)·T15(D27): 어댑터 식별자. */
-export const ADAPTER_IDS = ['mock_generic', 'mock_threads', 'mock_youtube'] as const;
+export const ADAPTER_IDS = ['mock_generic', 'mock_threads', 'mock_youtube', 'mock_instagram'] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
 
 /**
@@ -372,12 +372,15 @@ export type AdapterId = (typeof ADAPTER_IDS)[number];
  * → Threads 모의 어댑터(mock_threads, 컨테이너 → 게시 2단계, T13 연결 정보 사용). 연결한 적 없는 모의 계정(M3 seed 계정)
  * → 일반 모의 어댑터(mock_generic, M3 동작 그대로). live 계정 → null(어댑터 없음 — LiveChannelNotConfiguredError).
  * T15(D27): 모의 계정 + platform='youtube' + 연결 정보를 쓴 적 있음 → YouTube 모의 어댑터(mock_youtube, 재개 업로드, Google 형 모의 OAuth 연결 정보 사용).
+ * T16(D29 제안): 모의 계정 + platform='instagram' + 연결 정보를 쓴 적 있음 → Instagram 모의 어댑터(mock_instagram, 미디어 컨테이너 → 게시,
+ * Meta 형 모의 OAuth 연결 정보 사용). 연결한 적 없는 seed Instagram 계정은 그대로 mock_generic(M3 동작).
  */
 export function adapterIdFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): AdapterId | null {
   if (account.kind !== 'mock') return null;
   const linked = account.credential_state !== undefined && account.credential_state !== 'none';
   if (account.platform === 'threads' && linked) return 'mock_threads';
   if (account.platform === 'youtube' && linked) return 'mock_youtube';
+  if (account.platform === 'instagram' && linked) return 'mock_instagram';
   return 'mock_generic';
 }
 
@@ -399,8 +402,11 @@ export function recordedAdapterIdOf(sanitizedDetails: Record<string, unknown> | 
  * T15(D27): YouTube 재개 업로드 — upload_session(세션 URI, post_index = 세션 순번, 받은 바이트 수는 단조 증가) · video(영상 ID, post_index 0).
  * 종류별 상태: container created|finished|error · publish published · upload_session created(진행 중)|finished(다 보냄)|expired|error ·
  * video uploaded|processed|error.
+ * T16(D29 제안): Instagram 미디어 게시 — ig_container(post_index 0 = 게시할 컨테이너(단일 이미지 또는 캐러셀 부모), 1..n = 캐러셀 자식 이미지,
+ * created|finished|error) · ig_publish(post_index 0, 게시된 미디어 ID, published). Threads 의 container·publish 와 종류를 나눈 이유: 캐러셀 부모·자식
+ * 순번 규칙이 다르고, 요청 제한 단위(rateStepKinds)·화면 패널·내보내기에서 플랫폼을 단계 종류만으로 구분할 수 있게.
  */
-export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video'] as const;
+export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish'] as const;
 export type RemoteStepKind = (typeof REMOTE_STEP_KINDS)[number];
 export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed'] as const;
 export type RemoteStepStatus = (typeof REMOTE_STEP_STATUSES)[number];
@@ -410,6 +416,8 @@ export const REMOTE_STEP_KIND_STATUSES: Readonly<Record<RemoteStepKind, readonly
   publish: ['published'],
   upload_session: ['created', 'finished', 'expired', 'error'],
   video: ['uploaded', 'processed', 'error'],
+  ig_container: ['created', 'finished', 'error'],
+  ig_publish: ['published'],
 };
 
 export interface RemoteStep {
@@ -557,6 +565,16 @@ export const MOCK_SCENARIO_VALUES = [
   'youtube_public_unverified_forced_private',
   'youtube_scheduled_private',
   'youtube_project_verified',
+  // T16(D29 제안): Instagram 모의 어댑터(mock_instagram) 전용 — 시뮬레이터 동작만 정한다(payload·hash 는 그대로).
+  'instagram_success',
+  'instagram_container_slow',
+  'instagram_publish_timeout_sent',
+  'instagram_publish_timeout_not_sent',
+  'instagram_rate_limited',
+  'instagram_token_invalid',
+  'instagram_permission_denied',
+  'instagram_invalid_spec_remote',
+  'instagram_container_error',
 ] as const;
 export type MockScenarioValue = (typeof MOCK_SCENARIO_VALUES)[number];
 /** T14: Threads 모의 어댑터에만 쓰는 시나리오. 'success' 는 두 어댑터 모두에 쓸 수 있다(Threads 에서는 threads_success). */
@@ -565,12 +583,16 @@ export const isThreadsMockScenario = (s: string): boolean => s.startsWith('threa
 /** T15: YouTube 모의 어댑터에만 쓰는 시나리오. */
 export const YOUTUBE_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.startsWith('youtube_')) as readonly MockScenarioValue[];
 export const isYouTubeMockScenario = (s: string): boolean => s.startsWith('youtube_');
+/** T16: Instagram 모의 어댑터에만 쓰는 시나리오. */
+export const INSTAGRAM_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.startsWith('instagram_')) as readonly MockScenarioValue[];
+export const isInstagramMockScenario = (s: string): boolean => s.startsWith('instagram_');
 /** 어댑터에 맞는 시나리오인가(API 가 다르면 400 scenario_not_applicable). */
 export function scenarioApplies(adapter: AdapterId, scenario: string): boolean {
   if (scenario === 'success') return true;
   if (adapter === 'mock_threads') return isThreadsMockScenario(scenario);
   if (adapter === 'mock_youtube') return isYouTubeMockScenario(scenario);
-  return !isThreadsMockScenario(scenario) && !isYouTubeMockScenario(scenario);
+  if (adapter === 'mock_instagram') return isInstagramMockScenario(scenario);
+  return !isThreadsMockScenario(scenario) && !isYouTubeMockScenario(scenario) && !isInstagramMockScenario(scenario);
 }
 export const MOCK_SCENARIO_MAX_DELAY_MS = 5000;
 
@@ -797,7 +819,9 @@ export class ScenarioNotApplicableError extends AppError {
         ? '이 항목은 Threads 모의 연결 계정이라 threads_* 시나리오(또는 success)만 정할 수 있습니다'
         : adapter === 'mock_youtube'
           ? '이 항목은 YouTube 모의 연결 계정이라 youtube_* 시나리오(또는 success)만 정할 수 있습니다'
-          : 'threads_*·youtube_* 시나리오는 모의 연결(OAuth)한 Threads·YouTube 계정 항목에만 정할 수 있습니다',
+          : adapter === 'mock_instagram'
+            ? '이 항목은 Instagram 모의 연결 계정이라 instagram_* 시나리오(또는 success)만 정할 수 있습니다'
+            : 'threads_*·youtube_*·instagram_* 시나리오는 모의 연결(OAuth)한 Threads·YouTube·Instagram 계정 항목에만 정할 수 있습니다',
       { adapter },
     );
   }

@@ -30,3 +30,4 @@ export * from './retention';
 export * from './oauth';
 export * from './secrets-cli';
 export * from './remote-steps';
+export * from './media-spec';

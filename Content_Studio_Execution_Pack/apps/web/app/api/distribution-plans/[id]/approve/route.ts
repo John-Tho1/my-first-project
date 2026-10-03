@@ -3,7 +3,7 @@ import { AppError, approveSchema, assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
 import { distributeFormFailure, formToApprove, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
-import { getConfig } from '../../../../../lib/server';
+import { getConfig, getStorage } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
 export const dynamic = 'force-dynamic';
@@ -31,7 +31,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     if (!Array.isArray(raw.item_ids) || raw.item_ids.length === 0) throw new AppError('bad_request', 'no_items', '승인할 항목을 하나 이상 고르세요');
     const parsed = approveSchema.safeParse(raw);
     if (!parsed.success) throw validationError(parsed.error);
-    const r = await approveItems(owner.db, owner.ownerId, id.toLowerCase(), parsed.data);
+    // T16(D29 제안): Instagram 모의 연결 항목은 승인 전에 잠정 규격을 파일 앞부분으로 검사한다(저장소 범위 읽기 창구).
+    const r = await approveItems(owner.db, owner.ownerId, id.toLowerCase(), parsed.data, undefined, { media: getStorage() });
     if (html) return seeOther(`/distribute/${r.plan.id}?approved=${r.approvals.length}`);
     return json({ plan: planView(r.plan), approvals: r.approvals.map(approvalView), mode: 'MOCK' });
   } catch (e) {

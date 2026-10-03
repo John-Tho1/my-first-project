@@ -5,6 +5,7 @@
  */
 import { formatDrillTable, runDrill } from './drill-matrix';
 import { formatThreadsDrillTable, runThreadsDrill } from './drill-threads';
+import { formatInstagramDrillTable, runInstagramDrill } from './drill-instagram';
 import { formatYouTubeDrillTable, runYouTubeDrill } from './drill-youtube';
 
 const started = Date.now();
@@ -24,10 +25,15 @@ const y = await runYouTubeDrill();
 console.log('\nT15 YouTube 모의 훈련(MOCK — 모의 Google OAuth·모의 YouTube, 합성 영상, 실제 발행 실적 아님, 외부 호출 없음)\n');
 console.log(formatYouTubeDrillTable(y));
 console.log(`YouTube fetch 호출 ${y.fetch_calls}`);
-const violations = [...r.violations, ...t.violations, ...y.violations];
+// T16(D29 제안): Instagram 모의(Meta 형 모의 OAuth 연결 계정 — 이미지·캐러셀 컨테이너 → 게시, 모의 공개 미디어 URL) 표.
+const g = await runInstagramDrill();
+console.log('\nT16 Instagram 모의 훈련(MOCK — 모의 Meta OAuth·모의 Instagram·모의 공개 URL, 합성 이미지, 실제 발행 실적 아님, 외부 호출 없음)\n');
+console.log(formatInstagramDrillTable(g));
+console.log(`Instagram fetch 호출 ${g.fetch_calls}`);
+const violations = [...r.violations, ...t.violations, ...y.violations, ...g.violations];
 if (violations.length) {
   console.error(`\n불변식 위반 ${violations.length}건:`);
   for (const v of violations) console.error(`- ${v}`);
   process.exit(1);
 }
-console.log('불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK)');
+console.log('불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK), T16 Instagram 모의 불변식 통과(MOCK)');

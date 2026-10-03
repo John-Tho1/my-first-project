@@ -73,7 +73,7 @@ flowchart TD
 ## 채널별 실행 원칙
 - Threads: 공식 API로 텍스트 게시부터. 실제 계정 권한·테스터/앱 공개 조건은 M0/M4에서 확인.
 - YouTube: 완성된 영상의 재개 가능한 업로드. 최초 통합 검증은 승인된 비공개 영상 1건. 미검증 API 프로젝트의 공개 제한을 숨기지 않는다.
-- Instagram: 프로 계정·권한·미디어 규격 확인 후. 본문만으로 이미지/영상 게시물을 완성했다고 표시하지 않는다.
+- Instagram: 프로 계정·권한·미디어 규격 확인 후. 본문만으로 이미지/영상 게시물을 완성했다고 표시하지 않는다. (T16: 이미지·캐러셀 **모의** 어댑터만 — 잠정 규격, 공개 미디어 URL 방식은 사용자 결정 대기)
 - LinkedIn: 선택 기능. 필명 정체성·계정 정책·권한 적합성 확인 전 연결하지 않는다.
 - 미지원/미승인 채널: 원고·미디어·제목·설명·체크리스트를 담은 ZIP 내보내기. “파일 준비 완료”와 “게시 완료”는 별개다.
 채널 상태는 지원됨/구현됨/인증됨/실계정 검증됨을 따로 기록한다. 구체 제약은 docs/03_DISTRIBUTION.md 참고.
@@ -448,6 +448,20 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 개발용 시나리오(YouTube 모의 항목에만): `youtube_success_private`·`youtube_processing_slow`·`youtube_network_drop`·`youtube_response_lost_after_complete`·`youtube_session_expired_before_complete`·`youtube_quota_exceeded`·`youtube_token_invalid`·`youtube_rejected`·`youtube_public_unverified_forced_private`·`youtube_scheduled_private`·`youtube_project_verified`(시험·개발 전용 — 검증된 프로젝트 흉내). payload·hash 는 바꾸지 않는다.
 - `pnpm drill:mock` 은 Threads 표 다음에 YouTube 모의 표(영상 1개·유효 세션 재사용·보낸 바이트 < 2×·미검증 프로젝트 PUBLISHED 없음·처리 전 publication 없음)를 찍는다.
 
+### Instagram 이미지·캐러셀 (M4, T16 — 모의)
+**모의 어댑터만** — 실제 Instagram/Meta 호출·앱 등록·실계정·실제 공개 URL 없음. 결과는 모두 MOCK 이며 실제 발행 실적이 아니다. 규격·한도·scope 이름은 **잠정값**(공식 자료 재확인 전 — docs/03 "[공식자료·부분 확인]"), 결정은 docs/handoffs/T16_IMPLEMENTATION_HANDOFF.md 의 "Proposed D29"(사용자 확인 전).
+- 연결: 설정 → 배포 계정 연결에서 Instagram 모의 계정 `연결(모의)` → 앱 안의 **Meta 형 모의 동의 화면**(`/api/oauth/mock-instagram/authorize`, authorization code + PKCE S256 + state) → T13 callback. scope 는 **자리 표시 이름 `instagram_basic(mock)`·`instagram_content_publish(mock)`**(댓글·메시지·통계는 요청하지 않음 — 공식 이름은 live 전 재확인). 토큰 `mockig_at_…`(60일, refresh token 없음 — 만료 전 같은 토큰으로 갱신). 모의 사용자는 비즈니스·크리에이터(professional) 계정으로 **가정**한다. 토큰은 T13 과 같이 봉인 저장, 응답·로그·내보내기에 없다.
+- 어댑터 선택(`adapterIdFor`): 모의 + Instagram + 연결한 적 있음 → **Instagram 모의 어댑터**(`mock_instagram`). seed Instagram 계정(연결 없음)은 M3 일반 어댑터 그대로(규격 검사·공개 범위 규칙 없음 — M3 시험·훈련 불변).
+- 계획: 연결한 Instagram 모의 계정은 `mock_publish` 만(결과 PUBLISHED, MOCK — Instagram 에는 비공개·원격 예약 결과가 없다), 공개 범위는 **public 만**(생략 시 public, private·unlisted → 400 `instagram_visibility_public_only`). 앱 쪽 실행 예약(`schedule`)은 그대로 쓸 수 있다(원격 예약이 아님). 범위: 이미지 1장 또는 **캐러셀 2~10장**(영상·Reels·스토리·썸네일 첨부는 범위 밖).
+- 잠정 규격(`INSTAGRAM_PROVISIONAL_MEDIA_SPEC`, 확인일 없음): JPEG 만 · 8MiB 이하 · 가로세로 4:5~1.91:1 · 가로 320px 이상 · 캡션 2,200자 · 해시태그 30개 · 언급 20개. **승인 전**에 파일 앞부분(헤더)만 읽어 검사하고(계획 화면 problems·승인 409 `snapshot_stale` 의 `media_spec:…`), **보내기 직전**에 어댑터가 같은 검사를 다시 한다(원격 호출 0 으로 FAILED, 재시도 없음). 모의 원격도 받은 이미지를 다시 검사해 400 `invalid_image_spec` 으로 거부할 수 있다(FAILED).
+- 공개 미디어 URL: 실제 Instagram 은 공개 URL 에서 이미지를 가져간다. 이 앱에는 **인터페이스(`PublicMediaUrlProvider`)와 모의 구현만** 있다 — `mock://public-media/<불투명 값>`(실제 호스팅 없음, URL 에 파일 내용·asset ID·checksum 없음), 같은 프로세스의 모의 원격만 저장소 창구로 읽고, 컨테이너를 만든 직후 철회한다. URL 은 단계 기록·작업 이력·감사·로그·내보내기에 남기지 않는다. **실제 방식(이 앱의 짧은 서명 URL / 제3자 호스팅 / 수동 게시)은 live 전 사용자 결정**(누가 언제까지 파일을 볼 수 있는가 — 개인정보 영향).
+- 게시: 이미지 컨테이너(`ig_container` post 0) → FINISHED 까지 조회 → 게시(`ig_publish`). 캐러셀은 자식 컨테이너(post 1..n) → 부모 컨테이너(post 0) → 게시 1번. 각 원격 참조는 **다음 원격 호출 전에** `remote_steps` 에 기록(migration 0036 — 종류 `ig_container`·`ig_publish`, 모의 ID CHECK 그대로). 처리 지연 → `REMOTE_PROCESSING` → 같은 컨테이너로 이어 게시. 게시 응답 유실 → `RECONCILING` → 조회가 컨테이너로 미디어를 찾아 CONFIRMED(A08 — 두 번째 게시 없음). 원격이 기록을 잃음(재시작)·만료 컨테이너 → 확인 불가 3회 뒤 `UNKNOWN`(맹목 재게시 없음). 401 → BLOCKED(`계정 다시 연결 필요`), 403·400 → FAILED, 429 → Retry-After 뒤 같은 컨테이너로. 결과 `mock:instagram:mockig_m_…`·`mock://instagram/p/…`, `PUBLISHED/public`, MOCK.
+- 요청 제한(잠정): 계정당 24시간 게시 25개(`ig_publish` 기록으로 셈 — 캐러셀도 1개). 넘으면 전송 의도 없이 `RETRY_WAIT`(`요청 제한 — HH:mm MSK 이후 재시도`).
+- 화면 `/distribute/[id]`: Instagram 단계(MOCK) — `이미지 1개 · 컨테이너 1/1 준비 · 게시 대기` / 캐러셀 `컨테이너 n/m 준비`, 단계 줄(`캐러셀 이미지 2/3 · 컨테이너 준비됨 · mockig_ct_…`), 모의 링크, `MOCK 게시 확인(Instagram 모의 — 실제 발행 아님)`. `/distribute/new` 는 모의 연결 Instagram 계정에 `MOCK 실행만(공개 범위 public 만)`·잠정 규격 안내를 보이고 공개 범위 기본값을 public 으로 둔다.
+- 복원: `ig_container`·`ig_publish` 단계는 읽기 전용 이력으로 함께 복원되고, 복원한 작업의 조회는 not_found 를 믿지 않는다(unknown — T14 규칙 그대로).
+- 개발용 시나리오(Instagram 모의 항목에만): `instagram_success`·`instagram_container_slow`·`instagram_publish_timeout_sent`·`instagram_publish_timeout_not_sent`·`instagram_rate_limited`·`instagram_token_invalid`·`instagram_permission_denied`·`instagram_invalid_spec_remote`·`instagram_container_error`. payload·hash 는 바꾸지 않는다.
+- `pnpm drill:mock` 은 YouTube 표 다음에 Instagram 모의 표(단일·캐러셀·컨테이너 지연·게시 응답 유실·401·원격 규격 거부·컨테이너 오류·429·승인 전 규격 거절·로컬 제한·재시작 UNKNOWN — 게시 1회·받은 이미지 = 승인 파일·살아 있는 공개 URL 0·DB 에 공개 URL 0)를 찍는다.
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |
@@ -460,7 +474,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
-| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표 + T16 Instagram 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
 | `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(연결 정보·진행 중 연결 요청·정리 대기 봉인별 다시 봉인 대상·현재 키·그 사이 바뀌어 건너뜀·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰·DB 오류 메시지 본문은 출력하지 않음(오류는 허용된 종류 이름·모양이 맞는 코드만) | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금·DB 닫기 실패면 안내 후 exit 1 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |

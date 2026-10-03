@@ -12,6 +12,8 @@ import {
   DISTRIBUTE_ERROR_TEXT,
   formToApprove,
   formToPlanCreate,
+  instagramProgressLine,
+  instagramStepLine,
   itemHeadline,
   jobStatusText,
   mockScenarioOptionsFor,
@@ -19,6 +21,7 @@ import {
   planFormDefaults,
   planFormEcho,
   planResultSelect,
+  problemLabel,
   reconciledNotice,
   REQUESTED_RESULT_LABEL,
   RESULT_CHOICE_LABEL,
@@ -576,5 +579,36 @@ describe('M4 화면 FIX(S5, D27) — 요청한 예약 공개 시각과 원격 �
 
   it('잘못된 시각: 시각 미확인', () => {
     expect(publishAtView({ publishAt: 'nope', resultKind: null, isMock: true })!.text).toContain('시각 미확인');
+  });
+});
+
+describe('T16(D29 제안) Instagram 모의 화면 문구', () => {
+  it('단계 패널: 기록된 어댑터·단계 종류로 instagram 패널, 일반 모의로 처리된 Instagram 항목은 안내 한 줄', () => {
+    expect(stepsPanelView({ currentAdapter: 'mock_instagram', platform: 'instagram', remoteStepKinds: [], latestIntent: null }).panel).toBe('instagram');
+    expect(stepsPanelView({ currentAdapter: 'mock_generic', platform: 'instagram', remoteStepKinds: ['ig_container'], latestIntent: { sanitizedDetails: {} } }).panel).toBe('instagram');
+    const v = stepsPanelView({ currentAdapter: 'mock_instagram', platform: 'instagram', remoteStepKinds: [], latestIntent: { sanitizedDetails: { adapter_id: 'mock_generic' } } });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — Instagram 단계 기록 없음(MOCK)');
+  });
+  it('단계 한 줄·진행: 캐러셀 자식/부모/게시를 구분, 모의 ID 만, "게시 완료" 없음', () => {
+    expect(instagramStepLine({ kind: 'ig_container', status: 'finished', postIndex: 2, remoteId: 'mockig_ct_x' }, 3)).toBe('캐러셀 이미지 2/3 · 컨테이너 준비됨 · mockig_ct_x');
+    expect(instagramStepLine({ kind: 'ig_container', status: 'created', postIndex: 0, remoteId: 'mockig_ct_p' }, 3)).toBe('캐러셀(부모) 컨테이너 · 컨테이너 생성됨(처리 중) · mockig_ct_p');
+    expect(instagramStepLine({ kind: 'ig_container', status: 'finished', postIndex: 0, remoteId: 'mockig_ct_s' }, 1)).toBe('이미지 컨테이너 · 컨테이너 준비됨 · mockig_ct_s');
+    expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'mockig_m_1' }, 1)).toBe('게시 · 게시됨(MOCK) · mockig_m_1');
+    expect(instagramProgressLine({ images: 3, finished: 2, created: 3, published: false })).toBe('컨테이너 2/4 준비 · 처리 중 1 · 게시 대기');
+    expect(instagramProgressLine({ images: 1, finished: 1, created: 1, published: true })).toBe('게시됨(MOCK) · 컨테이너 1/1');
+    expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'm' }, 1)).not.toContain('게시 완료');
+  });
+  it('항목 문구: 처리 중·게시 확인(MOCK, 실제 발행 아님), 규격 문제·공개 범위 오류·계정 줄', () => {
+    expect(itemHeadline({ status: 'REMOTE_PROCESSING', channel: 'instagram', job: null, pub: null, blockReason: null })).toBe('Instagram 컨테이너 처리 중 — 확인 대기(MOCK)');
+    const h = itemHeadline({ status: 'CONFIRMED', channel: 'instagram', job: null, pub: { permalink: 'mock://instagram/p/x', resultKind: 'PUBLISHED', isMock: true }, blockReason: null });
+    expect(h).toBe('MOCK 게시 확인(Instagram 모의 — 실제 발행 아님)');
+    expect(h).not.toContain('게시 완료');
+    expect(problemLabel('media_spec:aspect_out_of_range:1').startsWith('Instagram 규격(잠정): 가로세로 비율')).toBe(true);
+    expect(DISTRIBUTE_ERROR_TEXT.instagram_visibility_public_only).toMatch(/public/);
+    expect(planAccountLabel({ displayName: 'IG', kind: 'mock', platform: 'instagram', credentialState: 'linked' })).toBe('IG (MOCK) · 모의 연결 — MOCK 실행만(공개 범위 public 만)');
+    expect(planAccountLabel({ displayName: 'IG', kind: 'mock', platform: 'instagram', credentialState: 'none' })).toBe('IG (MOCK) · MOCK 실행만');
+    expect(resultChoicesFor({ kind: 'mock', platform: 'instagram', credentialState: 'linked' })).toEqual(['mock_publish']);
+    expect(mockScenarioOptionsFor('mock_instagram').every((o) => o.value === 'success' || o.value.startsWith('instagram_'))).toBe(true);
+    expect(mockScenarioOptionsFor('mock_generic').some((o) => o.value.startsWith('instagram_'))).toBe(false);
   });
 });

@@ -22,3 +22,4 @@ export * from './jobs';
 export * from './ops';
 export * from './secrets';
 export * from './oauth';
+export * from './instagram';

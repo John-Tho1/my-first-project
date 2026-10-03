@@ -8,6 +8,8 @@ import {
   bannersFromState,
   blockInfoOf,
   DISTRIBUTE_ERROR_TEXT,
+  instagramProgressLine,
+  instagramStepLine,
   ITEM_STATUS_LABEL,
   itemHeadline,
   jobStatusText,
@@ -27,7 +29,7 @@ import {
   youtubeProgressLine,
   youtubeSessionNote,
 } from '../../../lib/distribution';
-import { getAppDb, getConfig } from '../../../lib/server';
+import { getAppDb, getConfig, getStorage } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
 
@@ -112,14 +114,68 @@ function StepsPanel({ x }: { x: PlanItemDetail }) {
   if (v.note) {
     return (
       <>
-        <h4>{v.panel === 'threads' ? 'Threads 단계' : 'YouTube 업로드'}(MOCK)</h4>
+        <h4>{v.panel === 'threads' ? 'Threads 단계' : v.panel === 'instagram' ? 'Instagram 단계' : 'YouTube 업로드'}(MOCK)</h4>
         <p className="empty-text">
           <span className="tag warn">MOCK</span> {v.note}
         </p>
       </>
     );
   }
+  if (v.panel === 'instagram') return <InstagramSteps x={x} />;
   return v.panel === 'threads' ? <ThreadsSteps x={x} /> : <YouTubeSteps x={x} />;
+}
+
+/**
+ * T16(D29 제안): Instagram 모의 단계(컨테이너 n/m 준비 · 게시 · 모의 링크)와 T13 연결 상태 한 줄. 공개 미디어 URL 은 단계·화면에 없다
+ * (모의 원격이 컨테이너를 만들 때만 쓰고 바로 철회). 컨테이너·미디어 ID 는 모의 ID(mockig_…)만.
+ */
+function InstagramSteps({ x }: { x: PlanItemDetail }) {
+  const images = x.payload.assets.filter((a) => a.role === 'image').length;
+  const latest = x.jobs.at(-1) ?? null;
+  const steps = latest ? x.remoteSteps.filter((r) => r.jobId === latest.id) : [];
+  const containers = steps.filter((r) => r.kind === 'ig_container');
+  const published = steps.some((r) => r.kind === 'ig_publish');
+  const pub = latest ? (x.publications.find((p) => p.jobId === latest.id) ?? null) : null;
+  return (
+    <>
+      <h4>Instagram 단계(MOCK — 모의 Instagram, 모의 ID)</h4>
+      {x.connection ? (
+        <p className="meta" role="status">
+          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
+        </p>
+      ) : null}
+      <p className="status-line" role="status">
+        {images > 1 ? `캐러셀 이미지 ${images}개` : '이미지 1개'} ·{' '}
+        {instagramProgressLine({
+          images,
+          finished: containers.filter((r) => r.status === 'finished').length,
+          created: containers.length,
+          published,
+        })}
+      </p>
+      {steps.length ? (
+        <ol className="list">
+          {[...steps]
+            .sort((a, b) => a.stepIndex - b.stepIndex)
+            .map((st) => (
+              <li key={st.id} className="hash">
+                {instagramStepLine({ kind: st.kind, status: st.status, postIndex: st.postIndex, remoteId: st.remoteId }, images)}
+              </li>
+            ))}
+        </ol>
+      ) : (
+        <p className="empty-text">
+          아직 원격 단계 없음({images > 1 ? '캐러셀: 이미지 컨테이너 → 부모 컨테이너 → 게시' : '이미지 컨테이너 → 게시'} 순서로 진행, 보내기 직전에 이미지 규격(잠정)을 다시 확인)
+        </p>
+      )}
+      {pub?.permalink ? <p className="note">모의 링크: {pub.permalink} (실제 Instagram 주소가 아님)</p> : null}
+      <p className="note">
+        컨테이너·미디어 ID 는 모의 ID 입니다(mockig_…). 이미지는 모의 공개 URL(mock://public-media/…)로만 모의 원격에 전달되고 바로 철회됩니다 — 실제로 공개된
+        파일은 없습니다. 실제 Instagram 으로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.
+      </p>
+    </>
+  );
 }
 
 /** T14: Threads 모의 단계(게시물 n/m · 컨테이너 생성됨/게시됨/오류 · 모의 ID)와 T13 연결 상태 한 줄. */
@@ -437,7 +493,8 @@ export default async function PlanPage({
   const { id } = await params;
   const q = await searchParams;
   const { db } = await getAppDb(getConfig());
-  const d = await getPlanDetail(db, session.ownerId, id.toLowerCase());
+  // T16(D29 제안): Instagram 모의 연결 항목의 잠정 규격 문제를 승인 전에 보인다(저장소 범위 읽기 창구).
+  const d = await getPlanDetail(db, session.ownerId, id.toLowerCase(), undefined, { media: getStorage() });
   if (!d) notFound();
   const approvable = d.items.filter((x) => x.item.status === 'PLANNED' && !x.activeApproval && x.problems.length === 0);
   const executable = d.items.some((x) => x.item.status === 'PLANNED' && x.activeApproval);

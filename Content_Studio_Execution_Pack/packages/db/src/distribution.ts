@@ -47,6 +47,7 @@ import {
   type ApproveInput,
   type CanonicalPayload,
   type Channel,
+  type MediaReader,
   type PlanCreateInput,
   type RequestedResult,
   type SnapshotAsset,
@@ -90,6 +91,7 @@ import {
   variants,
   variantVersions,
 } from './schema';
+import { instagramSpecProblemsForItems } from './media-spec';
 import { variantReviewBlockers } from './variants';
 import { getCurrentBrandProfile } from './writing';
 
@@ -402,7 +404,13 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
         if (!it.requested_result || it.requested_result === 'mock_publish') throw new AppError('bad_request', 'requested_result_required', '실제 계정은 upload_private 또는 public_publish 를 지정해야 합니다');
         requested = it.requested_result;
       }
-      const visibility: Visibility = it.visibility ?? 'private';
+      // T16(D29 제안): 모의 연결(Meta 형 OAuth)한 Instagram 계정 — 요청 결과는 위의 모의 규칙대로 mock_publish 만(결과 PUBLISHED, MOCK).
+      // Instagram 게시물은 비공개·원격 예약 결과가 없다(계정 공개 범위를 따름) → 공개 범위는 public 만(생략 시 public). 승인 스냅샷이 실제와 다른 범위를 말하지 않게.
+      const instagramLinked = adapterIdFor({ kind: acc.kind === 'mock' ? 'mock' : 'live', platform: acc.platform, credential_state: acc.credentialState }) === 'mock_instagram';
+      const visibility: Visibility = it.visibility ?? (instagramLinked ? 'public' : 'private');
+      if (instagramLinked && visibility !== 'public') {
+        throw new AppError('bad_request', 'instagram_visibility_public_only', '모의 연결한 Instagram 계정은 공개 범위 public 만 정할 수 있습니다(Instagram 게시물은 비공개·예약 결과가 없음 — 결과는 MOCK)');
+      }
       if (requested === 'upload_private' && visibility !== 'private') throw new AppError('bad_request', 'visibility_mismatch', '비공개 업로드는 공개 범위가 private 이어야 합니다');
       const scheduledAtUtc = it.schedule ? scheduleFromMsk(it.schedule.date, it.schedule.time, now) : null;
       // T15(D27): YouTube 원격 예약 공개(publishAt) — 처음부터 명확히 승인한 공개 계획(public_publish)의 private 영상에만, 미래 시각만(A13).
@@ -529,7 +537,11 @@ export interface PlanDetail {
   items: PlanItemDetail[];
 }
 
-export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string, now: Date = new Date()): Promise<PlanDetail | null> {
+/**
+ * T16(D29 제안): opts.media = 저장소 범위 읽기 창구 — Instagram 모의 연결 항목(PLANNED)의 잠정 규격 문제(media_spec:…)를 승인 전에 problems 에 함께 보인다.
+ * 없으면 그 항목은 media_spec:unchecked(승인도 같은 규칙으로 막힌다).
+ */
+export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string, now: Date = new Date(), opts: { media?: MediaReader } = {}): Promise<PlanDetail | null> {
   const plan = await getPlanRow(db, ownerId, planId);
   if (!plan) return null;
   const items = await db
@@ -561,6 +573,12 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
     : [];
   const scenarios = await mockScenariosForItems(db, ownerId, ids);
   const allSteps = await listRemoteStepsForItems(db, ownerId, ids);
+  const specProblems = await instagramSpecProblemsForItems(
+    db,
+    ownerId,
+    items.filter((i) => i.status === 'PLANNED').map((i) => i.id),
+    opts.media,
+  );
   const out: PlanItemDetail[] = [];
   for (const item of items) {
     const mineJobs = allJobs.filter((j) => j.itemId === item.id);
@@ -598,7 +616,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       jobs: mineJobs,
       publications: allPubs.filter((p) => p.itemId === item.id),
       events,
-      problems: item.status === 'PLANNED' ? await snapshotProblems(db, ownerId, item, now) : [],
+      problems: item.status === 'PLANNED' ? [...new Set([...(await snapshotProblems(db, ownerId, item, now)), ...(specProblems.get(item.id) ?? [])])] : [],
       mockScenario: scenarios.get(item.id) ?? null,
       remoteSteps: allSteps.filter((r) => r.itemId === item.id),
       connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
@@ -665,8 +683,14 @@ export interface ApproveResult {
  * purpose = requested_result(400) · 활성 승인 없음(409 already_approved) · 스냅샷 = 지금의 실제 행(409 snapshot_stale — 감사 approval.refused 만 남기고
  * 항목은 PLANNED 그대로, 새 계획 필요). 통과하면 승인 행 + 파생본 review → approved + 계획 상태.
  */
-export async function approveItems(db: Db, ownerId: string, planId: string, input: ApproveInput, now: Date = new Date()): Promise<ApproveResult> {
+/**
+ * T16(D29 제안): opts.media = 저장소 범위 읽기 창구. Instagram 모의 연결 항목은 승인 전에 잠정 규격(형식·크기·비율·가로·캡션)을 검사하고
+ * 문제가 있으면 다른 스냅샷 문제와 같이 거절한다(409 snapshot_stale, reasons 에 media_spec:…). 파일은 트랜잭션 **밖**에서 앞부분만 읽는다
+ * (항목 payload 는 불변). 창구가 없으면 media_spec:unchecked 로 거절(fail closed). 다른 채널·seed 계정은 영향 없음.
+ */
+export async function approveItems(db: Db, ownerId: string, planId: string, input: ApproveInput, now: Date = new Date(), opts: { media?: MediaReader } = {}): Promise<ApproveResult> {
   if (!isUuid(planId)) throw new NotFoundError(PLAN_NOT_FOUND);
+  const specProblems = await instagramSpecProblemsForItems(db, ownerId, [...new Set(input.item_ids)], opts.media);
   const out = await db.transaction(async (tx) => {
     const plan = await getPlanRow(tx, ownerId, planId);
     if (!plan) throw new NotFoundError(PLAN_NOT_FOUND);
@@ -701,7 +725,7 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
     if (active.size) throw new AppError('conflict', 'already_approved', '이미 승인한 항목이 있습니다', { item_ids: [...active.keys()] });
     const refused: Array<{ item_id: string; reasons: string[] }> = [];
     for (const item of items) {
-      const problems = await snapshotProblems(tx, ownerId, item, now);
+      const problems = [...new Set([...(await snapshotProblems(tx, ownerId, item, now)), ...(specProblems.get(item.id) ?? [])])];
       if (problems.length) refused.push({ item_id: item.id, reasons: problems });
     }
     if (refused.length) {

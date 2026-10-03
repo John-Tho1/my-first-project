@@ -14,9 +14,10 @@ import { AppError, GuardError } from './errors';
 import type { Channel } from './channel';
 
 /** T15(D27): mock_google = Google(YouTube) 형 모의 공급자(프로세스 안, 네트워크 없음). 실제 Google 공급자는 없다. */
-export const OAUTH_PROVIDER_IDS = ['mock_threads', 'threads', 'mock_google'] as const;
+/** T16(D29 제안): mock_instagram = Instagram(Meta 형, Instagram 로그인 흉내) 모의 공급자(프로세스 안, 네트워크 없음). 실제 Meta 공급자는 없다. */
+export const OAUTH_PROVIDER_IDS = ['mock_threads', 'threads', 'mock_google', 'mock_instagram'] as const;
 /** 모의 공급자 ID(연결 정보 is_mock = true — DB CHECK 와 같아야 한다). */
-export const MOCK_OAUTH_PROVIDER_IDS = ['mock_threads', 'mock_google'] as const;
+export const MOCK_OAUTH_PROVIDER_IDS = ['mock_threads', 'mock_google', 'mock_instagram'] as const;
 export type OAuthProviderId = (typeof OAUTH_PROVIDER_IDS)[number];
 
 /** T13 잠정 scope(D24 — T14 에서 공식 문서로 재확인). 게시에 필요한 최소만. */
@@ -32,10 +33,20 @@ export const YOUTUBE_REQUIRED_SCOPES = ['youtube.upload(mock)'] as const;
 /** 기본 연결에서 요청하지 않는 scope(모의 자리 표시 — 전체 관리·분석). */
 export const YOUTUBE_NOT_REQUESTED_BY_DEFAULT = ['youtube.manage(mock)', 'youtube.analytics(mock)'] as const;
 
-/** 채널별 필요한 최소 scope(Threads·YouTube — 다른 채널은 연결 공급자가 없어 빈 목록). */
+/**
+ * T16(D29 제안): Instagram 게시에 필요한 최소 scope — **모의 자리 표시 이름**("(mock) — 공식 이름 live 전 재확인"). 실제 Meta 권한 이름이 아니다.
+ * Instagram 로그인(비즈니스·크리에이터 계정) 기준의 기본 + 콘텐츠 게시만 요청하고, 댓글·메시지·통계는 기본으로 요청하지 않는다(docs/03 — 최소 권한,
+ * Instagram 로그인과 Facebook 로그인의 계정·권한 조건을 섞지 않는다).
+ */
+export const INSTAGRAM_REQUIRED_SCOPES = ['instagram_basic(mock)', 'instagram_content_publish(mock)'] as const;
+/** 기본 연결에서 요청하지 않는 scope(모의 자리 표시 — 댓글·메시지·통계). */
+export const INSTAGRAM_NOT_REQUESTED_BY_DEFAULT = ['instagram_manage_comments(mock)', 'instagram_manage_messages(mock)', 'instagram_manage_insights(mock)'] as const;
+
+/** 채널별 필요한 최소 scope(Threads·YouTube·Instagram — 블로그는 연결 공급자가 없어 빈 목록). */
 export function requiredScopesForPlatform(platform: string): readonly string[] {
   if (platform === 'threads') return THREADS_REQUIRED_SCOPES;
   if (platform === 'youtube') return YOUTUBE_REQUIRED_SCOPES;
+  if (platform === 'instagram') return INSTAGRAM_REQUIRED_SCOPES;
   return [];
 }
 
@@ -147,7 +158,7 @@ export class OAuthFlowError extends AppError {
 
 export class OAuthNotSupportedError extends AppError {
   constructor() {
-    super('bad_request', 'oauth_not_supported', 'Threads·YouTube 모의 계정만 연결할 수 있습니다(다른 채널·실제 계정 연결은 이후 작업).');
+    super('bad_request', 'oauth_not_supported', 'Threads·YouTube·Instagram 모의 계정만 연결할 수 있습니다(다른 채널·실제 계정 연결은 이후 작업).');
   }
 }
 

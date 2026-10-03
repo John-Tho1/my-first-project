@@ -129,7 +129,8 @@ describe('resolveOAuthProvider', () => {
     const p = resolveOAuthProvider({ kind: 'mock', platform: 'threads' }, config, {}, REDIRECT);
     expect(p.mock).toBe(true);
     expect(p.id).toBe('mock_threads');
-    expect(() => resolveOAuthProvider({ kind: 'mock', platform: 'instagram' }, config, {}, REDIRECT)).toThrow(OAuthNotSupportedError);
+    // T16: Instagram 은 Meta 형 모의 공급자가 생겼다 — 지원하지 않는 채널 예시는 블로그(같은 단언)
+    expect(() => resolveOAuthProvider({ kind: 'mock', platform: 'blog' }, config, {}, REDIRECT)).toThrow(OAuthNotSupportedError);
   });
   it('실제 계정은 조건이 모두 있어도 거부(LIVE_OAUTH_ADAPTER(T14 미구현)) — 비밀 값은 메시지에 없다', () => {
     const live = loadConfig({

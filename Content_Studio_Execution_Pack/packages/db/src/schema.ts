@@ -1403,7 +1403,7 @@ export const mockScenarios = pgTable(
     unique('mock_scenarios_item_uq').on(t.distributionItemId),
     check(
       'mock_scenarios_scenario_chk',
-      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported', 'threads_success', 'threads_container_slow', 'threads_publish_timeout_sent', 'threads_publish_timeout_not_sent', 'threads_thread_partial', 'threads_rate_limited', 'threads_token_invalid', 'threads_text_too_long', 'youtube_success_private', 'youtube_processing_slow', 'youtube_network_drop', 'youtube_response_lost_after_complete', 'youtube_session_expired_before_complete', 'youtube_quota_exceeded', 'youtube_token_invalid', 'youtube_rejected', 'youtube_public_unverified_forced_private', 'youtube_scheduled_private', 'youtube_project_verified')`,
+      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported', 'threads_success', 'threads_container_slow', 'threads_publish_timeout_sent', 'threads_publish_timeout_not_sent', 'threads_thread_partial', 'threads_rate_limited', 'threads_token_invalid', 'threads_text_too_long', 'youtube_success_private', 'youtube_processing_slow', 'youtube_network_drop', 'youtube_response_lost_after_complete', 'youtube_session_expired_before_complete', 'youtube_quota_exceeded', 'youtube_token_invalid', 'youtube_rejected', 'youtube_public_unverified_forced_private', 'youtube_scheduled_private', 'youtube_project_verified', 'instagram_success', 'instagram_container_slow', 'instagram_publish_timeout_sent', 'instagram_publish_timeout_not_sent', 'instagram_rate_limited', 'instagram_token_invalid', 'instagram_permission_denied', 'instagram_invalid_spec_remote', 'instagram_container_error')`,
     ),
     check('mock_scenarios_delay_chk', sql`${t.delayMs} between 0 and 5000`),
     foreignKey({
@@ -1427,6 +1427,8 @@ export const mockScenarios = pgTable(
  * T15(D27, migration 0032): YouTube 재개 업로드 단계 — upload_session(세션 URI, post_index = 세션 순번, created|finished|expired|error)·
  * video(영상 ID, uploaded|processed|error). received_bytes(원격이 확인한 받은 바이트)는 트리거로 **앞으로만**, total_bytes 는 처음 값 그대로,
  * resume_count(같은 세션을 다음 시도가 이어 받은 횟수)도 앞으로만. 세션 URI 는 내보내기 묶음에서 가린다(bundle-tables selectExpr).
+ * T16(D29 제안, migration 0036): Instagram 미디어 게시 단계 — ig_container(post_index 0 = 게시할 컨테이너, 1..n = 캐러셀 자식, created|finished|error)·
+ * ig_publish(post_index 0, published). 트리거 규칙은 0032 그대로(종류에 매이지 않음). 공개 미디어 URL 은 이 표에 넣지 않는다.
  */
 export const remoteSteps = pgTable(
   'remote_steps',
@@ -1458,11 +1460,11 @@ export const remoteSteps = pgTable(
     unique('remote_steps_job_post_kind_uq').on(t.jobId, t.postIndex, t.kind),
     unique('remote_steps_remote_id_uq').on(t.remoteId),
     index('remote_steps_item_idx').on(t.itemId),
-    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video')`),
+    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish')`),
     check('remote_steps_status_chk', sql`${t.status} in ('created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed')`),
     check(
       'remote_steps_kind_status_chk',
-      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error'))`,
+      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published')`,
     ),
     check('remote_steps_bytes_chk', sql`(${t.receivedBytes} is null or ${t.receivedBytes} >= 0) and (${t.totalBytes} is null or ${t.totalBytes} > 0) and (${t.receivedBytes} is null or ${t.totalBytes} is null or ${t.receivedBytes} <= ${t.totalBytes})`),
     check('remote_steps_resume_count_chk', sql`${t.resumeCount} >= 0`),
@@ -1488,7 +1490,7 @@ export const remoteSteps = pgTable(
  * 계정 연결 정보(oauth_credentials). 계정마다 한 행. 토큰 평문은 저장하지 않는다 — encrypted_token 은 AES-256-GCM 봉인
  * (`csk1:` 형식, @cs/domain secrets.ts, AAD = owner + 계정 + 용도), key_version 은 봉인한 키 버전.
  * 연결 해제(revoke)는 암호문·키 버전을 지우고 revoked_at·status='revoked' 를 남긴다(행은 남김 — 감사·상태 표시).
- * is_mock = (provider ∈ 모의 공급자 mock_threads·mock_google — T15), 그리고 트리거가 계정 kind 와 맞는지 확인한다 — 모의 토큰은 실제 계정에 붙을 수 없다.
+ * is_mock = (provider ∈ 모의 공급자 mock_threads·mock_google — T15·mock_instagram — T16), 그리고 트리거가 계정 kind 와 맞는지 확인한다 — 모의 토큰은 실제 계정에 붙을 수 없다.
  * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES). 복원한 계정은 "다시 연결 필요".
  */
 export const oauthCredentials = pgTable(
@@ -1541,8 +1543,8 @@ export const oauthCredentials = pgTable(
   },
   (t) => [
     unique('oauth_credentials_account_uq').on(t.channelAccountId),
-    check('oauth_credentials_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google')`),
-    check('oauth_credentials_mock_chk', sql`${t.isMock} = (${t.provider} in ('mock_threads', 'mock_google'))`),
+    check('oauth_credentials_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google', 'mock_instagram')`),
+    check('oauth_credentials_mock_chk', sql`${t.isMock} = (${t.provider} in ('mock_threads', 'mock_google', 'mock_instagram'))`),
     // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
     check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
     check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
@@ -1639,7 +1641,7 @@ export const oauthStates = pgTable(
   },
   (t) => [
     unique('oauth_states_hash_uq').on(t.stateHash),
-    check('oauth_states_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google')`),
+    check('oauth_states_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google', 'mock_instagram')`),
     check('oauth_states_sealed_chk', sql`${t.encryptedVerifier} like 'csk1:%'`),
     index('oauth_states_owner_expires_idx').on(t.ownerId, t.expiresAt),
     foreignKey({

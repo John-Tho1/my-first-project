@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getContentRow, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
-import { CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
+import { adapterIdFor, CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
   DISTRIBUTE_ERROR_TEXT,
@@ -130,7 +130,11 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                     ))}
                   </select>
                   <label htmlFor={`vis-${v.id}`}>공개 범위</label>
-                  <select id={`vis-${v.id}`} name={`visibility_${v.id}`} defaultValue={prev.visibility[v.id] ?? 'private'}>
+                  <select
+                    id={`vis-${v.id}`}
+                    name={`visibility_${v.id}`}
+                    defaultValue={prev.visibility[v.id] ?? (accs.some((a) => adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram') ? 'public' : 'private')}
+                  >
                     {VISIBILITIES.map((x) => (
                       <option key={x} value={x}>
                         {VISIBILITY_LABEL[x]}
@@ -141,6 +145,12 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                   <input id={`date-${v.id}`} type="date" name={`date_${v.id}`} defaultValue={prev.date[v.id] ?? ''} />
                   <label htmlFor={`time-${v.id}`}>실행 예약 시각(모스크바, HH:mm, 선택)</label>
                   <input id={`time-${v.id}`} type="text" name={`time_${v.id}`} placeholder="예: 12:00" defaultValue={prev.time[v.id] ?? ''} pattern="[0-2][0-9]:[0-5][0-9]" maxLength={5} />
+                  {v.channel === 'instagram' && accs.some((a) => adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram') ? (
+                    <p className="note">
+                      <span className="tag warn">MOCK</span> 모의 연결 Instagram 계정: 결과는 MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다(비공개·예약 결과 없음). 이미지는 잠정
+                      규격(JPEG·8MiB 이하·가로세로 4:5~1.91:1·가로 320px 이상, 캐러셀 2~10장)을 승인 전에 검사합니다 — 공식 규격 재확인 전 값.
+                    </p>
+                  ) : null}
                   <ResultFields vid={v.id} sel={planResultSelect(accs)} prev={prev} />
                 </>
               )}

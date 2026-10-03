@@ -383,8 +383,9 @@ describe('state·redirect·PKCE·거부', () => {
     expect((await r.json()).account).toMatchObject({ status: 'needs_reconnect', reason: 'scope_missing', missing_scopes: ['threads_content_publish'], usable_for_execution: false });
   });
 
-  it('지원하지 않는 채널(모의 instagram) → 400 oauth_not_supported, 실제 계정 → 503 live_oauth_not_configured(조건을 모두 넣어도)', async () => {
-    const ig = await connect(acc[ownerA]!.instagram);
+  // T16: Instagram 모의 연결이 생겨 "지원하지 않는 채널" 예시를 블로그로 바꿨다(같은 단언 — 400 oauth_not_supported).
+  it('지원하지 않는 채널(모의 blog) → 400 oauth_not_supported, 실제 계정 → 503 live_oauth_not_configured(조건을 모두 넣어도)', async () => {
+    const ig = await connect(acc[ownerA]!.blog);
     expect(ig.status).toBe(400);
     expect((await ig.json()).error).toBe('oauth_not_supported');
     const [live] = await db

@@ -13,6 +13,8 @@ export * from './storage';
 export * from './stt';
 export * from './threads-mock';
 export * from './youtube-mock';
+export * from './instagram-mock';
+export * from './public-media';
 
 export interface Providers {
   llm: LlmProvider;

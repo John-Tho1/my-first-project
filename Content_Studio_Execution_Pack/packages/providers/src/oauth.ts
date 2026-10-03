@@ -13,6 +13,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   codeChallengeS256,
   envPresent,
+  INSTAGRAM_NOT_REQUESTED_BY_DEFAULT,
+  INSTAGRAM_REQUIRED_SCOPES,
   liveOAuthReadiness,
   LiveOAuthNotConfiguredError,
   OAuthNotSupportedError,
@@ -54,7 +56,7 @@ interface MockToken {
   expiresAt: number;
   revoked: boolean;
   /** T15: 발급한 모의 공급자(없으면 mock_threads — T13 행 호환) */
-  provider?: 'mock_threads' | 'mock_google';
+  provider?: 'mock_threads' | 'mock_google' | 'mock_instagram';
   /** T15: access | refresh(Google 형만 refresh token 이 있다) */
   kind?: 'access' | 'refresh';
   /** T15: 같은 동의(grant)에서 나온 토큰 묶음 — Google 형 철회는 묶음 전체를 무효로 한다 */
@@ -382,6 +384,143 @@ export class MockGoogleOAuthProvider implements OAuthProvider {
   }
 }
 
+// ---- T16(D29 제안): Instagram(Meta 형) 모의 OAuth 공급자 ----
+
+export const MOCK_INSTAGRAM_CLIENT_ID = 'mock-instagram-client';
+export const MOCK_INSTAGRAM_AUTHORIZE_PATH = '/api/oauth/mock-instagram/authorize';
+/** 모의 장기 토큰 60일(Meta 형 — 실제 수명·갱신 규칙은 live 전에 공식 문서로 확인). */
+export const MOCK_INSTAGRAM_TOKEN_TTL_MS = 60 * 24 * 3600_000;
+const MOCK_INSTAGRAM_ALLOWED_SCOPES = new Set<string>([...INSTAGRAM_REQUIRED_SCOPES, ...INSTAGRAM_NOT_REQUESTED_BY_DEFAULT]);
+
+/**
+ * Instagram(Meta 형) 모의 OAuth 공급자 — **프로세스 안**(HTTP·DNS 없음). Threads 모의와 같은 모양: authorization code + PKCE S256 + state,
+ * refresh token 없이 장기 access token(`mockig_at_…`, 60일)을 만료 전에 같은 토큰으로 갱신(이전 토큰 무효), 철회는 그 토큰.
+ * scope 는 자리 표시 이름(`instagram_basic(mock)`·`instagram_content_publish(mock)` — "(mock) — 공식 이름 live 전 재확인")만.
+ * 모의 사용자는 **비즈니스·크리에이터(professional) 계정이라고 가정**한다(실제 계정 종류 확인은 live 전 사용자 결정·공식 재확인).
+ * 다른 모의 공급자(Threads·Google)가 발급한 토큰은 모른다(invalid_token). 상태는 T13 과 같은 MockOAuthStore.
+ */
+export class MockInstagramOAuthProvider implements OAuthProvider {
+  readonly id = 'mock_instagram' as const;
+  readonly platform = 'instagram' as const;
+  readonly mock = true;
+  readonly registeredRedirectUri: string;
+  private readonly appBaseUrl: string;
+  private readonly store: MockOAuthStore;
+
+  constructor(opts: { registeredRedirectUri: string; appBaseUrl: string; store?: MockOAuthStore }) {
+    this.registeredRedirectUri = opts.registeredRedirectUri;
+    this.appBaseUrl = opts.appBaseUrl;
+    this.store = opts.store ?? mockOAuthStore();
+  }
+
+  requiredScopes(): readonly string[] {
+    return INSTAGRAM_REQUIRED_SCOPES;
+  }
+
+  buildAuthorizeUrl(req: OAuthAuthorizeRequest): string {
+    const u = new URL(MOCK_INSTAGRAM_AUTHORIZE_PATH, this.appBaseUrl);
+    u.searchParams.set('client_id', MOCK_INSTAGRAM_CLIENT_ID);
+    u.searchParams.set('redirect_uri', req.redirectUri);
+    u.searchParams.set('response_type', 'code');
+    u.searchParams.set('scope', req.scopes.join(','));
+    u.searchParams.set('state', req.state);
+    u.searchParams.set('code_challenge', req.codeChallenge);
+    u.searchParams.set('code_challenge_method', 'S256');
+    if (req.loginHint) u.searchParams.set('login_hint', req.loginHint);
+    return u.toString();
+  }
+
+  /** 모의 동의 화면(공급자 쪽): 등록 redirect URI 정확 일치·S256 만·허용 scope 만. */
+  authorize(p: MockAuthorizeParams, now: Date): MockAuthorizeResult {
+    if (p.client_id !== MOCK_INSTAGRAM_CLIENT_ID) return { ok: false, error: 'invalid_client' };
+    if (!p.redirect_uri || p.redirect_uri !== this.registeredRedirectUri) return { ok: false, error: 'redirect_mismatch' };
+    if (p.response_type !== 'code' || !p.state || !p.code_challenge || p.code_challenge_method !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(p.code_challenge)) {
+      return { ok: false, error: 'invalid_request' };
+    }
+    const requested = (p.scope ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (requested.length === 0 || requested.some((x) => !MOCK_INSTAGRAM_ALLOWED_SCOPES.has(x))) return { ok: false, error: 'scope_not_allowed' };
+    const back = new URL(p.redirect_uri);
+    if (p.mock_deny === '1') {
+      back.searchParams.set('error', 'access_denied');
+      back.searchParams.set('state', p.state);
+      return { ok: true, redirect: back.toString() };
+    }
+    const grant = p.mock_grant ? new Set(p.mock_grant.split(',').map((x) => x.trim())) : null;
+    const scopes = grant ? requested.filter((x) => grant.has(x)) : requested;
+    const user = (p.mock_user || p.login_hint || '').slice(0, 200);
+    if (!user) return { ok: false, error: 'invalid_request' };
+    const code = `mockig_code_${randomBytes(24).toString('base64url')}`;
+    this.store.codes.set(h(code), {
+      challenge: p.code_challenge,
+      redirectUri: p.redirect_uri,
+      scopes,
+      user,
+      displayName: 'MOCK Instagram 비즈니스 계정',
+      expiresAt: now.getTime() + MOCK_CODE_TTL_MS,
+      used: false,
+    });
+    back.searchParams.set('code', code);
+    back.searchParams.set('state', p.state);
+    return { ok: true, redirect: back.toString() };
+  }
+
+  private takeFail(op: 'exchange' | 'refresh' | 'revoke' | 'account'): void {
+    const f = this.store.failNext;
+    if (f && f.op === op) {
+      this.store.failNext = null;
+      throw new OAuthProviderError(f.code);
+    }
+  }
+
+  private issue(user: string, displayName: string, scopes: string[], now: Date): OAuthTokenSet {
+    const accessToken = `mockig_at_${randomBytes(32).toString('base64url')}`;
+    const expiresAt = now.getTime() + MOCK_INSTAGRAM_TOKEN_TTL_MS;
+    this.store.tokens.set(h(accessToken), { user, displayName, scopes: [...scopes], expiresAt, revoked: false, provider: 'mock_instagram', kind: 'access' });
+    return { accessToken, refreshToken: null, expiresAt: new Date(expiresAt), scopes: [...scopes] };
+  }
+
+  async exchangeCode(input: { code: string; codeVerifier: string; redirectUri: string; now: Date }): Promise<OAuthTokenSet> {
+    this.takeFail('exchange');
+    const c = this.store.codes.get(h(input.code));
+    if (!c || !input.code.startsWith('mockig_code_')) throw new OAuthProviderError('invalid_grant');
+    if (c.used) throw new OAuthProviderError('code_reused');
+    c.used = true;
+    if (c.expiresAt <= input.now.getTime()) throw new OAuthProviderError('code_expired');
+    if (input.redirectUri !== c.redirectUri) throw new OAuthProviderError('redirect_mismatch');
+    if (codeChallengeS256(input.codeVerifier) !== c.challenge) throw new OAuthProviderError('pkce_mismatch');
+    return this.issue(c.user, c.displayName, c.scopes, input.now);
+  }
+
+  private live(token: string, now: Date): MockToken {
+    const t = this.store.tokens.get(h(token));
+    if (!t || t.provider !== 'mock_instagram') throw new OAuthProviderError('invalid_token');
+    if (t.revoked) throw new OAuthProviderError('token_revoked');
+    if (t.expiresAt <= now.getTime()) throw new OAuthProviderError('token_expired');
+    return t;
+  }
+
+  /** Meta 형: refresh token 없이 만료 전의 장기 토큰으로 새 토큰(이전 토큰 무효 — 모의 가정, live 전 재확인). */
+  async refresh(input: { tokens: StoredOAuthTokens; now: Date }): Promise<OAuthTokenSet> {
+    this.takeFail('refresh');
+    const t = this.live(input.tokens.accessToken, input.now);
+    t.revoked = true;
+    return this.issue(t.user, t.displayName, t.scopes, input.now);
+  }
+
+  async revoke(input: { tokens: StoredOAuthTokens; now: Date }): Promise<void> {
+    this.takeFail('revoke');
+    const t = this.store.tokens.get(h(input.tokens.accessToken));
+    if (!t || t.provider !== 'mock_instagram') throw new OAuthProviderError('invalid_token');
+    t.revoked = true;
+  }
+
+  async accountInfo(input: { accessToken: string; now: Date }): Promise<OAuthAccountInfo> {
+    this.takeFail('account');
+    const t = this.live(input.accessToken, input.now);
+    return { externalAccountId: t.user, displayName: t.displayName };
+  }
+}
+
 /** 공급자 선택에 필요한 계정 필드 */
 export interface OAuthAccountRef {
   kind: string;
@@ -403,6 +542,8 @@ export function resolveOAuthProvider(
     if (account.platform === 'threads') return new MockThreadsOAuthProvider({ registeredRedirectUri, appBaseUrl: config.APP_BASE_URL, store });
     // T15(D27): YouTube 모의 계정 → Google 형 모의 공급자(네트워크 없음)
     if (account.platform === 'youtube') return new MockGoogleOAuthProvider({ registeredRedirectUri, appBaseUrl: config.APP_BASE_URL, store });
+    // T16(D29 제안): Instagram 모의 계정 → Meta 형 모의 공급자(네트워크 없음)
+    if (account.platform === 'instagram') return new MockInstagramOAuthProvider({ registeredRedirectUri, appBaseUrl: config.APP_BASE_URL, store });
     throw new OAuthNotSupportedError();
   }
   const readiness = liveOAuthReadiness(config, {

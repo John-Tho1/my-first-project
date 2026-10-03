@@ -571,7 +571,8 @@ export const ROW_SCHEMAS = {
     intent_id: uuid,
     item_id: uuid,
     step_index: int.min(0),
-    kind: z.enum(['container', 'publish', 'upload_session', 'video']),
+    // T16(D29 제안): Instagram 미디어 컨테이너·게시 단계
+    kind: z.enum(['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish']),
     post_index: int.min(0),
     remote_id: z.string().regex(/^mock/),
     status: z.enum(['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed']),

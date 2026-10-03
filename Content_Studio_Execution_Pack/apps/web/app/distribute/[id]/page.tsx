@@ -251,7 +251,13 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
   });
   // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
-  const publishAt = publishAtView({ publishAt: providerMetadataOf(p).publish_at ?? null, resultKind: latestPub?.resultKind ?? null, isMock: latestPub?.isMock ?? x.account?.kind === 'mock' });
+  // M4UI FIX1: PUBLISHED 는 기록 시각(created_at)이 예약 시각 전일 때만 "적용하지 않음" — 그 밖은 중립 문구
+  const publishAt = publishAtView({
+    publishAt: providerMetadataOf(p).publish_at ?? null,
+    resultKind: latestPub?.resultKind ?? null,
+    isMock: latestPub?.isMock ?? x.account?.kind === 'mock',
+    recordedAt: latestPub?.createdAt ?? null,
+  });
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>

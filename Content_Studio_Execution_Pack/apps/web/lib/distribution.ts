@@ -148,9 +148,11 @@ export function formToPlanCreate(f: Record<string, string>) {
     const time = (f[`time_${vid}`] ?? '').trim();
     // M4UI(G2): 요청 결과(result_<vid>)와 예약 공개(publish_date_·publish_time_<vid>, 모스크바). 서버(createPlan)가 계정·공개 범위와의 조합을 판정한다.
     const choice = f[`result_${vid}`] ?? '';
-    const pDate = (f[`publish_date_${vid}`] ?? '').trim();
-    const pTime = (f[`publish_time_${vid}`] ?? '').trim();
     const scheduledPublish = choice === 'scheduled_publish';
+    // M4UI FIX1(Codex review-M4UI P1 :161): 예약 공개 날짜·시각은 "예약 공개"를 고른 경우에만 읽는다. 다른 선택(공개 게시·비공개 업로드·계정 기본값)에
+    // 남아 있는 값은 버린다 — 그래야 "공개 게시"(public_publish, publish_at 없음)와 "예약 공개"(public_publish + private + publish_at)가 요청에서 구별된다.
+    const pDate = scheduledPublish ? (f[`publish_date_${vid}`] ?? '').trim() : '';
+    const pTime = scheduledPublish ? (f[`publish_time_${vid}`] ?? '').trim() : '';
     items.push({
       variant_id: vid,
       channel_account_id: f[`account_${vid}`] ?? '',
@@ -158,8 +160,8 @@ export function formToPlanCreate(f: Record<string, string>) {
       requested_result: scheduledPublish ? 'public_publish' : choice || undefined,
       visibility: f[`visibility_${vid}`] || undefined,
       schedule: date || time ? { date, time } : undefined,
-      // 예약 공개를 골랐으면 날짜·시각이 비어도 넘겨 서버가 invalid_schedule 로 거부한다. 다른 결과에 넣은 예약 공개 시각도 숨기지 않고 넘긴다(서버가 거부).
-      publish_at: scheduledPublish || pDate || pTime ? { date: pDate, time: pTime } : undefined,
+      // 예약 공개를 골랐으면 날짜·시각이 비어도 넘겨 서버가 invalid_schedule 로 거부한다. 다른 선택이면 publish_at 을 보내지 않는다.
+      publish_at: scheduledPublish ? { date: pDate, time: pTime } : undefined,
     });
   }
   return { items, target_summary: f.target_summary || undefined };
@@ -831,31 +833,54 @@ export function youtubeSessionNote(x: { hasSession: boolean }): string {
   return x.hasSession ? `세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음). ${YOUTUBE_MOCK_DISCLAIMER}` : YOUTUBE_MOCK_DISCLAIMER;
 }
 
-export type PublishAtState = 'requested' | 'applied' | 'not_applied';
+/** unconfirmed = 원격 결과는 있지만 그 기록만으로는 예약 적용 여부를 가릴 수 없음(M4UI FIX1). */
+export type PublishAtState = 'requested' | 'applied' | 'not_applied' | 'unconfirmed';
 
 export interface PublishAtView {
   state: PublishAtState;
   text: string;
-  /** 원격이 적용하지 않음 — 경고 표시. */
+  /** 원격이 적용하지 않음(기록이 그렇게 보여 줌) — 경고 표시. */
   warn: boolean;
 }
 
 /**
- * M4 화면 FIX(S5, D27): 요청한 예약 공개 시각(승인 스냅샷 provider_metadata.publish_at)과 원격이 보고한 결과를 구분한다.
+ * M4 화면 FIX(S5, D27) + M4UI FIX1(Codex review-FIX-M4screen2 P1 :860): 요청한 예약 공개 시각(승인 스냅샷 provider_metadata.publish_at)과
+ * 원격이 보고한 결과(publications.result_kind·created_at)를 구분한다. "적용하지 않음"은 기록이 그렇게 보여 줄 때만 말한다.
  * - 결과 전: 요청한 시각(요청만, 원격 결과 전).
  * - SCHEDULED_REMOTE: 원격이 예약을 보고함 → 적용.
- * - 그 밖의 결과(UPLOADED_PRIVATE·PUBLISHED 등): 원격이 적용하지 않음. UPLOADED_PRIVATE 는 미검증 프로젝트가 비공개로 강제하고 publishAt 을 버린 경우.
+ * - UPLOADED_PRIVATE: 원격이 publishAt 없이 비공개로 보고함(D27 — private + publishAt 이면 SCHEDULED_REMOTE) → 적용하지 않음(미검증 프로젝트의 비공개 강제 등).
+ * - PUBLISHED: 예약 시각 **전에** 기록된 공개 결과면 예약이 적용되지 않은 것(경고). 예약 시각 이후 기록이거나 기록 시각을 모르면
+ *   정상 예약 뒤 공개와 구분할 수 없으므로 중립 문구(예약 적용 여부는 원격 기록으로 확인 필요).
+ * - 그 밖(MANUAL_REPORTED 등): 중립 문구.
  * publish_at 이 없으면 null(표시 없음). 결과 종류는 원격이 보고한 값만 쓴다(요청값으로 추정하지 않음).
  */
-export function publishAtView(x: { publishAt: string | null | undefined; resultKind: string | null | undefined; isMock: boolean }): PublishAtView | null {
+export function publishAtView(x: {
+  publishAt: string | null | undefined;
+  resultKind: string | null | undefined;
+  isMock: boolean;
+  /** 원격 결과를 기록한 시각(publications.created_at). 없으면 PUBLISHED 는 중립 문구. */
+  recordedAt?: Date | string | null;
+}): PublishAtView | null {
   if (!x.publishAt) return null;
-  const at = Number.isFinite(Date.parse(x.publishAt)) ? formatMsk(x.publishAt) : '시각 미확인';
+  const atMs = Date.parse(x.publishAt);
+  const at = Number.isFinite(atMs) ? formatMsk(x.publishAt) : '시각 미확인';
   const mock = x.isMock ? ', MOCK' : '';
   if (!x.resultKind) return { state: 'requested', text: `요청한 예약 공개 시각: ${at} — 원격 결과 전(요청만)`, warn: false };
   if (x.resultKind === 'SCHEDULED_REMOTE') return { state: 'applied', text: `예약 공개(원격 publishAt 적용): ${at}${x.isMock ? ' (MOCK)' : ''}`, warn: false };
-  const why =
-    x.resultKind === 'UPLOADED_PRIVATE'
-      ? `미검증 프로젝트 등으로 비공개로 강제${mock}`
-      : `원격 결과: ${RESULT_KIND_LABEL[x.resultKind] ?? x.resultKind}${mock}`;
-  return { state: 'not_applied', text: `요청한 예약 공개 시각: ${at} — 원격이 적용하지 않음(${why})`, warn: true };
+  if (x.resultKind === 'UPLOADED_PRIVATE') {
+    return { state: 'not_applied', text: `요청한 예약 공개 시각: ${at} — 원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, 원격 publishAt 없음${mock})`, warn: true };
+  }
+  const label = RESULT_KIND_LABEL[x.resultKind] ?? x.resultKind;
+  if (x.resultKind === 'PUBLISHED') {
+    const recMs = x.recordedAt instanceof Date ? x.recordedAt.getTime() : typeof x.recordedAt === 'string' ? Date.parse(x.recordedAt) : NaN;
+    if (Number.isFinite(atMs) && Number.isFinite(recMs) && recMs < atMs) {
+      return {
+        state: 'not_applied',
+        text: `요청한 예약 공개 시각: ${at} — 예약 시각 전(${formatMskInline(new Date(recMs))} 기록)에 원격이 공개로 보고함, 예약이 적용되지 않음(원격 결과: ${label}${mock})`,
+        warn: true,
+      };
+    }
+    return { state: 'unconfirmed', text: `요청한 예약 공개 시각: ${at} — 원격 결과: 공개됨(예약 적용 여부는 원격 기록으로 확인 필요${mock})`, warn: false };
+  }
+  return { state: 'unconfirmed', text: `요청한 예약 공개 시각: ${at} — 원격 결과: ${label}(예약 적용 여부는 원격 기록으로 확인 필요${mock})`, warn: false };
 }

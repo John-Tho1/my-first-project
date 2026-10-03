@@ -48,9 +48,9 @@ function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; 
       </p>
       {sel.scheduledAllowed ? (
         <>
-          <label htmlFor={`pdate-${vid}`}>예약 공개 날짜(모스크바, 예약 공개일 때만)</label>
+          <label htmlFor={`pdate-${vid}`}>예약 공개 날짜(모스크바, 예약 공개일 때만 — 다른 요청 결과면 보내지 않음)</label>
           <input id={`pdate-${vid}`} type="date" name={`publish_date_${vid}`} defaultValue={prev.publishDate[vid] ?? ''} />
-          <label htmlFor={`ptime-${vid}`}>예약 공개 시각(모스크바, HH:mm, 예약 공개일 때만)</label>
+          <label htmlFor={`ptime-${vid}`}>예약 공개 시각(모스크바, HH:mm, 예약 공개일 때만 — 다른 요청 결과면 보내지 않음)</label>
           <input
             id={`ptime-${vid}`}
             type="text"

@@ -5,6 +5,7 @@ import { budgetPolicy, CHANNEL_LABEL, formatMsk, fromMicro, liveLlmReadiness, st
 import { getSession } from '../../lib/auth';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
+import { revokeNotice } from '../../lib/revoke-view';
 import { getAppDb, getConfig } from '../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -45,7 +46,10 @@ export default async function SettingsPage({
   const accounts = await listAccountHealth(db, session.ownerId);
   const oauth = oauthReadinessView(config);
   const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
-  const accountDone = q.connected ? '계정을 연결했습니다(MOCK).' : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : q.revoked ? '연결을 해제했습니다. 다시 연결하기 전까지 이 계정으로는 배포하지 않습니다.' : undefined;
+  // M4UI FIX1: 연결 해제 결과는 revokeNotice — 끝나지 않은 해제(revoke=incomplete&revoke_code=허용 코드)는 경고로, "해제했습니다"라고 하지 않는다
+  const revokeMsg = revokeNotice({ revoked: str(q.revoked), revoke: str(q.revoke), code: str(q.revoke_code) });
+  const accountDone = q.connected ? '계정을 연결했습니다(MOCK).' : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : revokeMsg && !revokeMsg.warn ? revokeMsg.text : undefined;
+  const accountWarn = revokeMsg?.warn ? revokeMsg.text : undefined;
 
   return (
     <main className="container">
@@ -107,6 +111,11 @@ export default async function SettingsPage({
         {accountDone ? (
           <p className="saved" role="status">
             {accountDone}
+          </p>
+        ) : null}
+        {accountWarn ? (
+          <p className="notice" role="alert">
+            {accountWarn}
           </p>
         ) : null}
         {accountErr ? (

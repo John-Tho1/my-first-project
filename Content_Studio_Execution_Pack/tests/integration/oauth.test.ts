@@ -49,7 +49,8 @@ import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/rou
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
 import { GET as opsSummaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { oauthDeps } from '../../apps/web/lib/oauth';
-import { BASE, cookieHeader, jsonPost, login } from './helpers';
+import { revokeNotice } from '../../apps/web/lib/revoke-view';
+import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 const B = 'oauth-other@example.local';
@@ -452,6 +453,40 @@ describe('마스터 키 없음', () => {
     key1();
     const again = await revoke(accountId);
     expect(await again.json()).toMatchObject({ outcome: 'revoked', remote_revoke: 'ok', incomplete_code: null });
+    expect((await credRow(accountId))!.encryptedToken).toBeNull();
+  });
+
+  it('M4UI FIX1: HTML 연결 해제 폼 — incomplete 는 ?revoke=incomplete&revoke_code=<허용 코드>(경고 문구), 끝나면 ?revoked=1', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    useKeys({});
+    const htmlRevoke = () =>
+      revokePOST(
+        new Request(`${BASE}/api/channel-accounts/${accountId}/revoke`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html,application/xhtml+xml', ...ORIGIN_HEADERS, ...cookieHeader(tokenA) },
+          body: '',
+        }),
+        ctx(accountId),
+      ).then((r) => record('revoke-html', r));
+    const r1 = await htmlRevoke();
+    expect(r1.status).toBe(303);
+    const loc1 = r1.headers.get('location')!;
+    expect(loc1).toBe('/settings?revoke=incomplete&revoke_code=revoke_current_no_key#accounts');
+    const q1 = new URL(loc1, BASE).searchParams;
+    expect(q1.get('revoked')).toBeNull();
+    const n1 = revokeNotice({ revoked: q1.get('revoked') ?? undefined, revoke: q1.get('revoke') ?? undefined, code: q1.get('revoke_code') ?? undefined })!;
+    expect(n1.warn).toBe(true);
+    expect(n1.text).toContain('연결 해제가 끝나지 않았습니다');
+    expect(n1.text).toContain('키를 설정하면');
+    // 여전히 해제 중(차단) — 암호문 그대로
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoking', revokedAt: null, lastErrorCode: 'revoke_current_no_key' });
+    // 키를 맞추고 다시 누르면 끝남 → ?revoked=1
+    key1();
+    const r2 = await htmlRevoke();
+    expect(r2.status).toBe(303);
+    expect(r2.headers.get('location')).toBe('/settings?revoked=1#accounts');
+    expect(revokeNotice({ revoked: '1' })!.warn).toBe(false);
     expect((await credRow(accountId))!.encryptedToken).toBeNull();
   });
 });

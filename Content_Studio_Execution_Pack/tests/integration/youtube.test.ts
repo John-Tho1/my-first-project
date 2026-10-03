@@ -884,6 +884,24 @@ describe('비밀 — 토큰·세션 URI 는 어디에도 나가지 않는다', (
     expect(r.result).toBe('pass');
     expect(reExported).toEqual(masked.map((x) => String(x.remote_id)).sort());
   }, 120_000);
+
+  it('가림 예외는 정확한 표식만 — "mock-redacted:" 로 시작해도 형식이 다르면 내보낼 때 가린다(Codex FIX-drill-mask P2)', async () => {
+    const [row] = await db.select().from(schema.remoteSteps).where(eq(schema.remoteSteps.kind, 'upload_session')).limit(1);
+    expect(row).toBeTruthy();
+    const odd = 'mock-redacted:session:NOT-HEX-' + randomUUID();
+    await db.execute(sql`alter table remote_steps disable trigger user`);
+    try {
+      await db.execute(sql`update remote_steps set remote_id = ${odd} where id = ${row!.id}`);
+      const ex = await exportOwner(db, storage, owner, { outDir: path.join(tmp, 'exports-odd'), record: false });
+      const raw = readFileSync(ex.zipPath);
+      expect(raw.includes(Buffer.from(odd))).toBe(false);
+      const got = (await parseBundleZip(raw)).tables.remote_steps.find((r) => r.id === row!.id);
+      expect(String(got!.remote_id)).toMatch(/^mock-redacted:session:[0-9a-f]{16}$/);
+    } finally {
+      await db.execute(sql`update remote_steps set remote_id = ${row!.remoteId} where id = ${row!.id}`);
+      await db.execute(sql`alter table remote_steps enable trigger user`);
+    }
+  }, 120_000);
 });
 
 describe('drill:mock 의 YouTube 행(같은 표)', () => {

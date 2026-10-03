@@ -448,7 +448,17 @@ export const approveSchema = z
   })
   .superRefine((v, ctx) => {
     if (new Set(v.item_ids).size !== v.item_ids.length) ctx.addIssue({ code: 'custom', message: '같은 항목을 두 번 고를 수 없습니다', path: ['item_ids'] });
-    const per = new Map(Object.entries(v.purposes ?? {}).map(([k, p]) => [k.toLowerCase(), p]));
+    const per = new Map<string, string>();
+    for (const [k, p] of Object.entries(v.purposes ?? {})) {
+      // M4UI FIX1(Codex review-M4UI 놓친 케이스): 대소문자만 다른 같은 항목 키에 서로 다른 목적 → 거부(삽입 순서로 마지막 값이 이기지 않게)
+      const key = k.toLowerCase();
+      const prev = per.get(key);
+      if (prev !== undefined && prev !== p) {
+        ctx.addIssue({ code: 'custom', message: '같은 항목의 승인 목적(purposes)이 서로 다릅니다', path: ['purposes'] });
+        return;
+      }
+      per.set(key, p);
+    }
     for (const id of v.item_ids) {
       const p = per.get(id);
       if (p === undefined && v.purpose === undefined) {

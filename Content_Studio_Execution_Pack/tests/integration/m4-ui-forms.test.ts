@@ -211,6 +211,108 @@ describe('G2 — 계획 만들기 폼: 요청 결과·예약 공개', () => {
     }
   });
 
+  // M4UI FIX1(Codex review-M4UI P1 :161): 예약 공개 날짜·시각을 넣은 뒤 다른 요청 결과로 바꾸면 남은 값은 요청에 실리지 않는다
+  it('FIX1: 남은 예약 공개 날짜·시각 + 공개 게시(public) → 즉시 공개 계획(publish_at 없음); 공개 게시(private) → visibility_mismatch(예약 공개로 바뀌지 않음); 비공개 업로드·계정 기본값 → publish_at 없음', async () => {
+    const leftover = (vid: string) => ({ [`publish_date_${vid}`]: FUTURE_DAY, [`publish_time_${vid}`]: '09:30' });
+    for (const [choice, vis, expected] of [
+      ['public_publish', 'public', 'public_publish'],
+      ['public_publish', 'unlisted', 'public_publish'],
+      ['upload_private', 'private', 'upload_private'],
+      ['', 'private', 'upload_private'],
+    ] as const) {
+      const y = await youtubeVariant();
+      const res = await plansPOST(
+        form('/api/distribution-plans', {
+          content_id: y.contentId,
+          [`use_${y.variantId}`]: 'on',
+          [`account_${y.variantId}`]: ytAccount,
+          [`visibility_${y.variantId}`]: vis,
+          [`result_${y.variantId}`]: choice,
+          ...leftover(y.variantId),
+        }),
+      );
+      const w = where(res);
+      expect(w.params.get('error'), `${choice}/${vis}`).toBeNull();
+      const [item] = await itemsOfPlan(w.path.split('/').at(-1)!);
+      expect(item!.requestedResult).toBe(expected);
+      expect(item!.visibility).toBe(vis);
+      expect(item!.scheduledAtUtc).toBeNull();
+      expect(providerMetadataOf(item!.payloadJson as unknown as CanonicalPayload).publish_at, `${choice}/${vis}`).toBeUndefined();
+      expect(await approvalsOf(item!.id)).toHaveLength(0);
+    }
+    // 공개 게시 + private + 남은 날짜·시각: 예전에는 예약 공개와 같은 요청이 됐다 — 이제 publish_at 이 없어 서버가 거부(계획 없음)
+    const y = await youtubeVariant();
+    const before = (await db.select().from(schema.distributionItems)).length;
+    const res = await plansPOST(
+      form('/api/distribution-plans', {
+        content_id: y.contentId,
+        [`use_${y.variantId}`]: 'on',
+        [`account_${y.variantId}`]: ytAccount,
+        [`visibility_${y.variantId}`]: 'private',
+        [`result_${y.variantId}`]: 'public_publish',
+        ...leftover(y.variantId),
+      }),
+    );
+    expect(where(res).params.get('error')).toBe('visibility_mismatch');
+    expect((await db.select().from(schema.distributionItems)).length).toBe(before);
+    // Threads seed(MOCK 실행만)에 남은 예약 공개 값 → 버리고 MOCK 실행 계획
+    const t = await threadsVariant();
+    const tr = await plansPOST(
+      form('/api/distribution-plans', { content_id: t.contentId, [`use_${t.variantId}`]: 'on', [`account_${t.variantId}`]: thrSeedAccount, [`visibility_${t.variantId}`]: 'private', ...leftover(t.variantId) }),
+    );
+    const tw = where(tr);
+    expect(tw.params.get('error')).toBeNull();
+    const [ti] = await itemsOfPlan(tw.path.split('/').at(-1)!);
+    expect(ti!.requestedResult).toBe('mock_publish');
+    expect(providerMetadataOf(ti!.payloadJson as unknown as CanonicalPayload).publish_at).toBeUndefined();
+  });
+
+  it('FIX1: 서버는 JSON API 로 들어온 예약 공개 시각도 그대로 판정 — 비공개 업로드 + publish_at, Threads + publish_at, public + publish_at 거부', async () => {
+    const y = await youtubeVariant();
+    const t = await threadsVariant();
+    const before = (await db.select().from(schema.distributionItems)).length;
+    const pa = { date: FUTURE_DAY, time: '09:30' };
+    for (const [content, item, code] of [
+      [y.contentId, { variant_id: y.variantId, channel_account_id: ytAccount, requested_result: 'upload_private', visibility: 'private', publish_at: pa }, 'publish_at_requires_public_publish'],
+      [y.contentId, { variant_id: y.variantId, channel_account_id: ytAccount, requested_result: 'public_publish', visibility: 'public', publish_at: pa }, 'publish_at_requires_private'],
+      [t.contentId, { variant_id: t.variantId, channel_account_id: thrSeedAccount, visibility: 'private', publish_at: pa }, 'publish_at_not_supported'],
+    ] as const) {
+      const res = await plansPOST(post('/api/distribution-plans', { content_id: content, items: [item] }));
+      expect(res.status, code).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe(code);
+    }
+    expect((await db.select().from(schema.distributionItems)).length).toBe(before);
+  });
+
+  it('FIX1(놓친 케이스): 예약 공개 시각 = 실행 예약 시각·더 이름 → publish_at_before_send, MSK 자정 → 전날 21:00Z, 없는 날짜·24:00 → invalid_schedule', async () => {
+    const y = await youtubeVariant();
+    const base = {
+      content_id: y.contentId,
+      [`use_${y.variantId}`]: 'on',
+      [`account_${y.variantId}`]: ytAccount,
+      [`visibility_${y.variantId}`]: 'private',
+      [`result_${y.variantId}`]: 'scheduled_publish',
+    };
+    const before = (await db.select().from(schema.distributionItems)).length;
+    for (const [fields, code] of [
+      [{ [`date_${y.variantId}`]: FUTURE_DAY, [`time_${y.variantId}`]: '09:30', [`publish_date_${y.variantId}`]: FUTURE_DAY, [`publish_time_${y.variantId}`]: '09:30' }, 'publish_at_before_send'],
+      [{ [`date_${y.variantId}`]: FUTURE_DAY, [`time_${y.variantId}`]: '10:00', [`publish_date_${y.variantId}`]: FUTURE_DAY, [`publish_time_${y.variantId}`]: '09:30' }, 'publish_at_before_send'],
+      [{ [`publish_date_${y.variantId}`]: '2030-02-30', [`publish_time_${y.variantId}`]: '09:30' }, 'invalid_schedule'],
+      [{ [`publish_date_${y.variantId}`]: FUTURE_DAY, [`publish_time_${y.variantId}`]: '24:00' }, 'invalid_schedule'],
+    ] as const) {
+      const w = where(await plansPOST(form('/api/distribution-plans', { ...base, ...fields })));
+      expect(w.path).toBe('/distribute/new');
+      expect(w.params.get('error'), JSON.stringify(fields)).toBe(code);
+    }
+    expect((await db.select().from(schema.distributionItems)).length).toBe(before);
+    // MSK 00:30 → UTC 전날 21:30
+    const w = where(await plansPOST(form('/api/distribution-plans', { ...base, [`publish_date_${y.variantId}`]: FUTURE_DAY, [`publish_time_${y.variantId}`]: '00:30' })));
+    expect(w.params.get('error')).toBeNull();
+    const [item] = await itemsOfPlan(w.path.split('/').at(-1)!);
+    const prev = new Date(Date.parse(`${FUTURE_DAY}T00:00:00.000Z`) - 86_400_000).toISOString().slice(0, 10);
+    expect(providerMetadataOf(item!.payloadJson as unknown as CanonicalPayload).publish_at).toBe(`${prev}T21:30:00.000Z`);
+  });
+
   it('잘못된 조합은 서버가 거부 → 같은 화면 + 한국어 오류 코드, 입력값(요청 결과·예약 공개)은 되살림, 계획은 만들어지지 않음', async () => {
     const y = await youtubeVariant();
     const t = await threadsVariant();
@@ -226,11 +328,6 @@ describe('G2 — 계획 만들기 폼: 요청 결과·예약 공개', () => {
         name: '예약 공개 시각이 과거',
         fields: { [`visibility_${y.variantId}`]: 'private', [`result_${y.variantId}`]: 'scheduled_publish', [`publish_date_${y.variantId}`]: '2020-01-01', [`publish_time_${y.variantId}`]: '09:30' },
         code: 'schedule_in_past',
-      },
-      {
-        name: '비공개 업로드 + 예약 공개 시각',
-        fields: { [`visibility_${y.variantId}`]: 'private', [`result_${y.variantId}`]: 'upload_private', [`publish_date_${y.variantId}`]: FUTURE_DAY, [`publish_time_${y.variantId}`]: '09:30' },
-        code: 'publish_at_requires_public_publish',
       },
       { name: '비공개 업로드 + public', fields: { [`visibility_${y.variantId}`]: 'public', [`result_${y.variantId}`]: 'upload_private' }, code: 'visibility_mismatch' },
       { name: '공개 게시 + private(예약 공개 없음)', fields: { [`visibility_${y.variantId}`]: 'private', [`result_${y.variantId}`]: 'public_publish' }, code: 'visibility_mismatch' },
@@ -250,7 +347,7 @@ describe('G2 — 계획 만들기 폼: 요청 결과·예약 공개', () => {
     for (const [fields, code] of [
       [{ [`result_${t.variantId}`]: 'upload_private' }, 'mock_only'],
       [{ [`result_${t.variantId}`]: 'scheduled_publish', [`publish_date_${t.variantId}`]: FUTURE_DAY, [`publish_time_${t.variantId}`]: '09:30' }, 'mock_only'],
-      [{ [`publish_date_${t.variantId}`]: FUTURE_DAY, [`publish_time_${t.variantId}`]: '09:30' }, 'publish_at_not_supported'],
+      // M4UI FIX1: 예약 공개를 고르지 않고 남긴 날짜·시각은 폼이 버린다 → 위 FIX1 시험(MOCK 실행 계획). 서버 판정(publish_at_not_supported)은 JSON 시험으로.
     ] as const) {
       const res = await plansPOST(
         form('/api/distribution-plans', { content_id: t.contentId, [`use_${t.variantId}`]: 'on', [`account_${t.variantId}`]: thrSeedAccount, [`visibility_${t.variantId}`]: 'private', ...fields }),

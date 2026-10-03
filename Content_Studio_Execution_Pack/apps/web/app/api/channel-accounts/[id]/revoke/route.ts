@@ -2,6 +2,7 @@ import { revokeCredential } from '@cs/db';
 import { assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { accountFormFailure, oauthDeps } from '../../../../../lib/oauth';
+import { revokeRedirectPath } from '../../../../../lib/revoke-view';
 import { getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
@@ -24,7 +25,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const owner = await requireOwner(request);
     const deps = oauthDeps(config);
     const r = await revokeCredential(owner.db, { ownerId: owner.ownerId, accountId: id, providerFor: deps.providerFor, keyring: deps.keyring });
-    if (html) return seeOther('/settings?revoked=1#accounts');
+    // M4UI FIX1: 끝나지 않은 해제(incomplete)·다른 연결에 밀린 해제(superseded)는 "해제했습니다"로 보내지 않는다(코드는 허용 목록만)
+    if (html) return seeOther(revokeRedirectPath(r.outcome, r.incompleteCode));
     return json({ account: r.health, outcome: r.outcome, remote_revoke: r.remoteRevoke, revoked_approvals: r.revokedApprovals, incomplete_code: r.incompleteCode });
   } catch (e) {
     if (html) return accountFormFailure(e);

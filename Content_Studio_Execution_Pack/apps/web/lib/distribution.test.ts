@@ -233,9 +233,31 @@ describe('M4UI(G1·G2) — 승인 폼 항목별 목적, 계획 폼 요청 결과
     expect(item({ [`result_${V}`]: 'scheduled_publish' }).publish_at).toEqual({ date: '', time: '' });
     expect(item({ [`result_${V}`]: '' })).toMatchObject({ requested_result: undefined, publish_at: undefined });
     expect(item({})).toMatchObject({ requested_result: undefined, publish_at: undefined });
-    expect(item({ [`result_${V}`]: 'upload_private', [`publish_date_${V}`]: '2030-01-02' })).toMatchObject({ requested_result: 'upload_private', publish_at: { date: '2030-01-02', time: '' } });
+    // M4UI FIX1(Codex review-M4UI P1 :161): 예약 공개가 아닌 선택에 남아 있는 예약 공개 날짜·시각은 버린다(publish_at 없음)
+    expect(item({ [`result_${V}`]: 'upload_private', [`publish_date_${V}`]: '2030-01-02' })).toMatchObject({ requested_result: 'upload_private', publish_at: undefined });
     // 모르는 값은 그대로 넘겨 스키마가 거부
     expect(item({ [`result_${V}`]: 'go_live' }).requested_result).toBe('go_live');
+  });
+  it('M4UI FIX1: 공개 게시 + 남은 예약 공개 날짜·시각 → publish_at 없음(즉시 공개 계획), 예약 공개 → publish_at, 두 선택이 요청에서 구별됨', () => {
+    const leftover = { [`use_${V}`]: 'on', [`account_${V}`]: I1, [`publish_date_${V}`]: '2030-01-02', [`publish_time_${V}`]: '09:30' };
+    const pub = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'public', [`result_${V}`]: 'public_publish' }).items[0]!;
+    expect(pub).toMatchObject({ requested_result: 'public_publish', visibility: 'public' });
+    expect(pub.publish_at).toBeUndefined();
+    // 같은 입력(private + 날짜·시각)에서 공개 게시와 예약 공개가 서로 다른 요청이 된다
+    const pubPrivate = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'private', [`result_${V}`]: 'public_publish' }).items[0]!;
+    const sched = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'private', [`result_${V}`]: 'scheduled_publish' }).items[0]!;
+    expect(pubPrivate.publish_at).toBeUndefined();
+    expect(sched).toMatchObject({ requested_result: 'public_publish', visibility: 'private', publish_at: { date: '2030-01-02', time: '09:30' } });
+    expect(JSON.stringify(pubPrivate)).not.toBe(JSON.stringify(sched));
+    // 계정 기본값(빈 값)·MOCK 실행에 남은 값도 버린다. 실행 예약(date_·time_)은 그대로
+    expect(formToPlanCreate({ ...leftover, [`result_${V}`]: '' }).items[0]!.publish_at).toBeUndefined();
+    expect(formToPlanCreate({ ...leftover, [`result_${V}`]: 'mock_publish', [`date_${V}`]: '2030-01-01', [`time_${V}`]: '08:00' }).items[0]).toMatchObject({
+      requested_result: 'mock_publish',
+      publish_at: undefined,
+      schedule: { date: '2030-01-01', time: '08:00' },
+    });
+    // 예약 공개 날짜·시각 앞뒤 공백은 잘라 넘긴다
+    expect(formToPlanCreate({ ...leftover, [`publish_time_${V}`]: ' 09:30 ', [`result_${V}`]: 'scheduled_publish' }).items[0]!.publish_at).toEqual({ date: '2030-01-02', time: '09:30' });
   });
   it('resultChoicesFor·planResultSelect·planAccountLabel: D27 — 모의 연결 YouTube 만 비공개 업로드·공개 게시·예약 공개, seed·Threads 는 MOCK 실행만', () => {
     const ytLinked = { kind: 'mock', platform: 'youtube', credentialState: 'linked', displayName: 'YT' };
@@ -500,15 +522,56 @@ describe('M4 화면 FIX(S5, D27) — 요청한 예약 공개 시각과 원격 �
     expect(v.warn).toBe(true);
     expect(v.text).toContain('요청한 예약 공개 시각');
     expect(v.text).toContain('2026-10-04 10:00');
-    expect(v.text).toContain('원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, MOCK)');
+    expect(v.text).toContain('원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, 원격 publishAt 없음, MOCK)');
     expect(v.text).not.toContain('원격 publishAt 적용');
   });
 
-  it('PUBLISHED 등 다른 결과: 원격이 적용하지 않음 + 원격 결과 종류', () => {
-    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: false })!;
-    expect(v.state).toBe('not_applied');
-    expect(v.text).toContain('원격이 적용하지 않음(원격 결과: 게시)');
+  // M4UI FIX1(Codex review-FIX-M4screen2 P1 :860): PUBLISHED 만으로 "적용하지 않음"이라고 단정하지 않는다
+  it('PUBLISHED, 예약 시각 이후 기록(정상 예약 뒤 공개일 수 있음): 중립 문구, 경고 아님, "적용하지 않음" 없음', () => {
+    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: false, recordedAt: new Date('2026-10-04T07:05:00.000Z') })!;
+    expect(v.state).toBe('unconfirmed');
+    expect(v.warn).toBe(false);
+    expect(v.text).toBe('요청한 예약 공개 시각: 2026-10-04 10:00 (MSK) — 원격 결과: 공개됨(예약 적용 여부는 원격 기록으로 확인 필요)');
+    expect(v.text).not.toContain('적용하지 않음');
     expect(v.text).not.toContain('MOCK');
+    // 예약 시각과 같은 순간에 기록 → 이전이 아니므로 중립
+    expect(publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt: publishAt })!.state).toBe('unconfirmed');
+  });
+
+  it('PUBLISHED, 기록 시각 없음·잘못됨: 중립 문구(MOCK 이면 MOCK)', () => {
+    for (const recordedAt of [undefined, null, 'nope']) {
+      const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt })!;
+      expect(v.state).toBe('unconfirmed');
+      expect(v.warn).toBe(false);
+      expect(v.text).toContain('원격 결과: 공개됨(예약 적용 여부는 원격 기록으로 확인 필요, MOCK)');
+    }
+  });
+
+  it('PUBLISHED, 예약 시각 전에 기록(원격이 예약 전에 공개로 보고): 적용하지 않음 + 경고 + 기록 시각', () => {
+    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt: '2026-10-03T12:00:00.000Z' })!;
+    expect(v.state).toBe('not_applied');
+    expect(v.warn).toBe(true);
+    expect(v.text).toContain('예약 시각 전(2026-10-03 15:00 MSK 기록)에 원격이 공개로 보고함');
+    expect(v.text).toContain('예약이 적용되지 않음(원격 결과: 게시, MOCK)');
+  });
+
+  it('PUBLISHED, 요청 시각이 잘못됨: 비교할 수 없으므로 중립', () => {
+    expect(publishAtView({ publishAt: 'nope', resultKind: 'PUBLISHED', isMock: false, recordedAt: '2020-01-01T00:00:00Z' })!.state).toBe('unconfirmed');
+  });
+
+  it('MANUAL_REPORTED·모르는 결과: 중립 문구(적용·미적용 단정 없음)', () => {
+    const m = publishAtView({ publishAt, resultKind: 'MANUAL_REPORTED', isMock: false, recordedAt: '2026-10-03T12:00:00.000Z' })!;
+    expect(m.state).toBe('unconfirmed');
+    expect(m.text).toContain('원격 결과: 수동 기록(예약 적용 여부는 원격 기록으로 확인 필요)');
+    const u = publishAtView({ publishAt, resultKind: 'SOMETHING', isMock: false })!;
+    expect(u.state).toBe('unconfirmed');
+    expect(u.text).toContain('원격 결과: SOMETHING(');
+  });
+
+  it('UPLOADED_PRIVATE·SCHEDULED_REMOTE 는 기록 시각과 무관(예약 시각 이후 기록이어도 같은 판정)', () => {
+    const late = '2026-10-05T00:00:00.000Z';
+    expect(publishAtView({ publishAt, resultKind: 'UPLOADED_PRIVATE', isMock: true, recordedAt: late })!.state).toBe('not_applied');
+    expect(publishAtView({ publishAt, resultKind: 'SCHEDULED_REMOTE', isMock: true, recordedAt: late })!.state).toBe('applied');
   });
 
   it('잘못된 시각: 시각 미확인', () => {

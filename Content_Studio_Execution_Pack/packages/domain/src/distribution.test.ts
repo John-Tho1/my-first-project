@@ -211,6 +211,19 @@ describe('입력 스키마', () => {
     // 목적이 아무것도 없으면 정해지지 않음
     expect(approvalPurposeFor({}, U1)).toBeUndefined();
   });
+  it('M4UI FIX1 approveSchema.purposes: 대소문자만 다른 같은 항목 키에 다른 목적 → 거부(순서 무관), 같은 목적이면 통과', () => {
+    const UA = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const base = { item_ids: [UA, U2], expected_hashes: { [UA]: H, [U2]: H }, confirm: true };
+    expect(UA.toUpperCase()).not.toBe(UA);
+    const a = { [UA]: 'upload_private', [UA.toUpperCase()]: 'public_publish', [U2]: 'mock_publish' };
+    const b = { [UA.toUpperCase()]: 'public_publish', [UA]: 'upload_private', [U2]: 'mock_publish' };
+    expect(approveSchema.safeParse({ ...base, purposes: a }).success).toBe(false);
+    expect(approveSchema.safeParse({ ...base, purposes: b }).success).toBe(false);
+    // 고르지 않은 항목이라도 키 충돌은 거부(승인 입력이 모호하지 않게)
+    expect(approveSchema.safeParse({ item_ids: [U2], expected_hashes: { [U2]: H }, confirm: true, purposes: a }).success).toBe(false);
+    const same = approveSchema.parse({ ...base, purposes: { [UA]: 'upload_private', [UA.toUpperCase()]: 'upload_private', [U2]: 'mock_publish' } });
+    expect(approvalPurposeFor(same, UA)).toBe('upload_private');
+  });
   it('executeSchema: command_key 8~64 [A-Za-z0-9_-]', () => {
     expect(executeSchema.safeParse({ command_key: 'abcd1234' }).success).toBe(true);
     expect(executeSchema.safeParse({ command_key: 'short' }).success).toBe(false);

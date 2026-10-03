@@ -115,3 +115,27 @@
 1. 피드 항목 원본을 "응답 바이트에서 자른 구간"으로 정의했다(BOM 은 항목 밖이라 항목 원본에 없음, 페이지 원본에는 있음). `byteSlicer`(fatal·ignoreBOM 디코딩 → 문자열 위치 ↔ 바이트 위치)가 서로게이트 쌍·4바이트 문자·CRLF 에서 항상 정확한가? 이 정의가 docs 의 "원본 바이트 그대로 보존" 과 맞는가?
 2. 0042 의 앞 검사(위반 행 있으면 RAISE, 데이터 변경 없음)와 새 CHECK 식이 0041 의 모든 정상 상태(preview 의 outcome null, not_selected·skipped_duplicate·failed_changed, accepted)를 그대로 허용하고 위반만 막는가? 묶음 검사에 넣은 "새 항목만 outcome" 이 기존 `collected_items_outcome_chk` 와 정확히 같은 규칙인가?
 3. 상대 링크에만 허용 목록을 다시 적용하고 절대 링크는 내부 주소만 막는 경계가 A05 에 충분한가? 받아들이기에서 링크 불일치를 failed_changed 로 보는 것(새 미리보기 요구)이 Codex 제안과 맞는가, 아니면 링크 정책 실패를 별도 outcome(policy_blocked)으로 구분해야 하는가?
+
+---
+
+## FIX round 2 (Codex review-FIX-T19, P2 2)
+
+### 고친 것
+- **[P2] collector.ts:560 Buffer 공유**: 새 `copyBytes`(= `Uint8Array.prototype.slice.call`) — Node `Buffer.prototype.slice` 는 같은 메모리를 보는 view 를 돌려주므로 `bytes.slice` 대신 이것을 씀. `byteSlicer`(피드 항목 원본)와 `parsePage` 의 `rawBytes` 둘 다. 새 단위 `packages/domain/src/collector-fix2.test.ts` 3개(copyBytes 메모리 비공유, parsePage(Buffer)·parseFeed(Buffer) 뒤 입력 `fill(0)` 해도 원본 그대로). 옛 `bytes.slice` 로 되돌리면 2개 실패함을 확인.
+- **[P2] db collector.ts:563 주간 간격**: SQL 기한 식을 `interval '24 hours'`·`interval '168 hours'`(고정 시간)로. 세션 시간대가 America/New_York 일 때 PGlite 에서 `'2026-03-07T12:00Z' + interval '7 days'` = 03-14 08:00Z(167시간), `+ '168 hours'` = 09:00Z 확인.
+- 통합 시험(collector.test.ts 'Codex review-FIX-T19 P2 :563'): 세션 시간대 New_York, 서머타임 시작을 끼는 주간 소스(lastRunAt+167.5h, 아직 기한 전)와 10분 전에 기한이 된 daily 소스, 한도 max=1. '7 days' 였다면 SQL 이 주간 소스를 먼저 골라 한도를 차지하고 JS `isScheduleDue` 재확인에서 빠져 daily 가 굶는다 — 이 시험은 daily 1회 실행·주간 0회, 168h 에 주간 1회를 단언. '7 days' 로 되돌리면 실패(expected +0 to be 1)함을 확인. (처음 쓴 시험은 JS 재확인 때문에 '7 days' 에서도 통과해 회귀를 못 잡았으므로 다시 설계함.)
+
+### 변경 파일
+`packages/domain/src/collector.ts`, 새 `packages/domain/src/collector-fix2.test.ts`, `packages/db/src/collector.ts`, `tests/integration/collector.test.ts`.
+
+### 명령과 결과
+- 개발 중 단독: `vitest run --project integration tests/integration/collector.test.ts` → 28 passed. `'7 days'` 로 임시 되돌림 → 1 failed(위 단언), 원복 후 cmp 확인.
+- 전체 검사: `.handoffs/run-checks.sh FIX2-T19` — 결과는 아래 줄에 기록.
+- 전체 검사(로컬 Windows 10, Node 24.21.0, 순차, dev 서버 꺼짐): lint 0, typecheck 0, build 0, unit pass(54 files, 1269 tests), integration pass(36 files, 738 tests), drill:mock pass("불변식 위반 0건"), db:migrate 0, drill:restore PASS.
+
+### 리뷰 대상
+- BASE: 66e1257 (FIX round 1) / HEAD: f07153c (FIX round 2 코드 커밋)
+
+### 남은 위험
+- round 1 의 남은 위험 그대로(UTF-8 만, 0042 앞 검사 멈춤, 절대 링크 정책, 동시성 경쟁 미처리, 화면 브라우저 미확인).
+- SQL 간격과 domain `scheduleIntervalMs` 는 여전히 따로 적혀 있다 — 이번 시험이 168h 경계·DST 를 묶는다.

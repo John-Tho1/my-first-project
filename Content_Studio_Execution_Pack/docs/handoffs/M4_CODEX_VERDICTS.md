@@ -170,3 +170,7 @@ CHANGES_REQUESTED
 
 ## FIX4-T18 (e6f643b, T18 round 4) — **PASS** → T18 Notion·Drive 선택 가져오기(파일·모의) 종결
 - T18: 1427118 → FIX1 6e7ff92 → FIX2 e294aca → FIX3 d9e482d → **FIX4 e6f643b PASS**.
+
+## FIX-T19 (66e1257, T19 round 1) — CHANGES_REQUESTED (P2 2, P0·P1 없음)
+- [P2] packages/domain/src/collector.ts:560 — `Buffer` 입력에서는 원본 바이트가 복사되지 않고 입력 버퍼와 공유된다
+- [P2] packages/db/src/collector.ts:563 — 주간 SQL 기한의 `interval '7 days'`가 고정 168시간 규칙과 DST에서 달라진다

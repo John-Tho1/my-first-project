@@ -91,7 +91,7 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 ## 2026-10-03 아침 — 밤사이 진행 (Codex 한도 복귀 후 00:55 ~)
 - Codex 대기열 → 상주 실행기(`.handoffs/run-codex-daemon.sh`, 대기열 파일에 줄을 추가하면 자동 검토).
 - **종결(Codex PASS)**: T13(FIX8 c82c721) · T14(FIX2 746aa3a) · T15(FIX1 cc26535) · 화면(S1–S5, G1·G2, 해제 안내 cd0a2aa) · 업로드 세션 가림(75dd988).
-- **T16 Instagram(모의)**: 구현 620ed86(D29 잠정) → FIX1 165f0df(체크섬 대조·쓰기 5xx ambiguous·캐러셀 부모 요청 표식 0037) → FIX2 914ac36(sideEffect unknown 전 상태 코드 조회·표식 없는 옛 작업 부모 조회) — Codex 재검증 중.
+- **T16 Instagram(모의)**: 구현 620ed86(D29 잠정) → FIX1 165f0df(체크섬 대조·쓰기 5xx ambiguous·캐러셀 부모 요청 표식 0037) → FIX2 914ac36(sideEffect unknown 전 상태 코드 조회·표식 없는 옛 작업 부모 조회) — **Codex PASS(07:33) → 종결**.
 - 마지막 검사(914ac36): lint·typecheck·build·unit 825·integration 628·drill:mock(M3·Threads·YouTube·Instagram) 0건·db:migrate(0037)·실제 로컬 DB drill:restore PASS. migration 0030~0037 로컬 적용.
 - 외부 호출·새 의존성·비밀·실제 게시 0. 모의 연결용 로컬 시험 마스터 키는 `.env.local`(git 무시)에만.
 

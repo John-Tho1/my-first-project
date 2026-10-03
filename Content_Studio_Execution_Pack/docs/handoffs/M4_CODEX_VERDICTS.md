@@ -103,3 +103,6 @@ CHANGES_REQUESTED
 ## FIX-T16 (165f0df, T16 round 1) — CHANGES_REQUESTED (P0 1·P1 1)
 - [P0] packages/providers/src/instagram-mock.ts:612 — 적용된 쓰기의 sideEffect unknown 을 429 분류에서 여전히 부작용 없음으로 처리한다
 - [P1] packages/providers/src/instagram-mock.ts:877 — 부모 요청 표식이 없는 기존 작업을 부모 요청 전으로 오판한다
+
+## FIX2-T16 (914ac36, T16 round 2) — **PASS** → T16 종결(모의 범위)
+- T16: 620ed86 → FIX1 165f0df → **FIX2 914ac36 PASS**. M4 의 T13~T16 모의 범위 모두 Codex 종결.

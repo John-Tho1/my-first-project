@@ -16,7 +16,7 @@
  *   token_generation +1(키 교체는 그대로). 공급자 호출 뒤 되쓰기는 읽었던 세대일 때만 — 아니면 결과를 버리고, 새로 받은 토큰은 공급자에서 철회.
  */
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, like, lt, lte, notExists, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, lte, notExists, or, sql } from 'drizzle-orm';
 import {
   AppError,
   codeChallengeS256,
@@ -364,6 +364,8 @@ export const oauthTestHooks: {
   beforeStaleBump?: () => Promise<void>;
   /** FIX6-T13: 연결 해제 마무리 트랜잭션 안, 감사 기록 뒤(커밋 전) — 던지면 마무리 전체가 되돌려진다(시험 전용 — 트랜잭션 안에서 불린다) */
   insideRevokeFinish?: () => Promise<void>;
+  /** FIX7-T13: worker 가 미완료 해제를 훑고 메모리 확인을 마친 뒤·재개 호출 직전(훑은 뒤 해제 완료·다시 연결 교차 재현) */
+  beforeRevokeResume?: (c: { ownerId: string; accountId: string }) => Promise<void>;
 } = {};
 
 interface Locked {
@@ -563,6 +565,8 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
         lastErrorCode: null,
         revokedAt: null,
         revokeOpId: null,
+        revokeResumeAt: null,
+        revokeResumeAttempts: 0,
         updatedAt: now,
       };
       if (existing) {
@@ -1448,9 +1452,7 @@ export interface RevokeResult {
 }
 
 export type RevokeIncompleteCode = 'revoke_current_no_key' | 'revoke_current_unreadable' | 'revoke_provider_unavailable' | 'revoke_current_seal_failed';
-/** FIX6-T13: worker 가 이어서 해제할 수 있는 미완료 해제의 표시(oauth_credentials.last_error_code 접두어) */
-const REVOKE_INCOMPLETE_PREFIX = 'revoke_';
-/** FIX6-T13: 미완료 해제를 worker 가 다시 잇기 전 기다리는 시간(진행 중인 해제와 겹치지 않게) */
+/** FIX6-T13: 미완료 해제를 worker 가 다시 잇기 전 기다리는 시간(진행 중인 해제와 겹치지 않게). FIX7-T13: 해제 1단계가 revoke_resume_at 을 이만큼 뒤로 정한다. */
 export const REVOKE_RESUME_AFTER_MS = 60_000;
 
 /**
@@ -1469,6 +1471,28 @@ export async function revokeCredential(
   db: Db,
   input: { ownerId: string; accountId: string; providerFor: ProviderFor; keyring: KeyringSource; now?: Date },
 ): Promise<RevokeResult> {
+  const r = await revokeCredentialOp(db, input, null);
+  // 사용자 요청(expect 없음)은 판정 전 건너뛰기가 없다
+  if (r === 'skipped_changed') throw new CredentialNotFoundError();
+  return r;
+}
+
+/**
+ * FIX7-T13(Codex review-FIX6-T13 P1 :1791): worker 가 훑어 본 미완료 해제 하나를 **그 작업 그대로** 잇는다. 첫 잠금 트랜잭션 안에서 연결 정보가
+ * 아직 revoking 이고 해제 작업 ID·토큰 세대·해제 세대가 훑을 때와 같은지 확인하고, 다르면(그 사이 해제가 끝났거나 다시 연결됐거나 새 해제가 시작됨)
+ * 공급자 호출·로컬 변경 없이 'skipped_changed' — 새 해제 작업을 만들지 않는다.
+ */
+export interface RevokeResumeExpectation {
+  opId: string;
+  generation: number;
+  epoch: number;
+}
+
+async function revokeCredentialOp(
+  db: Db,
+  input: { ownerId: string; accountId: string; providerFor: ProviderFor; keyring: KeyringSource; now?: Date },
+  expect: RevokeResumeExpectation | null,
+): Promise<RevokeResult | 'skipped_changed'> {
   const now = input.now ?? new Date();
   const account = await ownedAccount(db, input.ownerId, input.accountId);
   let provider: OAuthProvider | null = null;
@@ -1479,17 +1503,44 @@ export async function revokeCredential(
   }
   const marked = await db.transaction(async (tx) => {
     const { account: acc, cred } = await lockAccountCredential(tx, input.ownerId, account.id);
+    if (expect) {
+      // FIX7-T13: worker 재개 — 훑을 때 본 그 해제 작업이 아직 그대로일 때만(무엇도 쓰기 전에 판정)
+      const same =
+        !!cred &&
+        !cred.revokedAt &&
+        cred.status === 'revoking' &&
+        cred.revokeOpId === expect.opId &&
+        cred.tokenGeneration === expect.generation &&
+        cred.revocationEpoch === expect.epoch;
+      if (!same) return { changed: true as const };
+    }
     if (!cred) throw new CredentialNotFoundError();
     if (cred.revokedAt) return { done: accountHealthView(acc, cred, await pendingInfoOf(tx, input.ownerId, acc.id), now) };
     let opId = cred.revokeOpId;
     let epoch = cred.revocationEpoch;
     const joined = cred.status === 'revoking' && opId !== null;
+    // FIX7-T13(Codex review-FIX6-T13 P2 :1779·Q2): 진행 중 표시 — worker 는 revoke_resume_at 이 지난 revoking 행만 잇는다. 이 해제가 끝나기 전에
+    // 프로세스가 멈추거나 마무리가 되돌려져도(1단계는 커밋됨) 이 시각 뒤 worker 가 같은 작업으로 잇는다. 합류할 때마다 시도 수 +1(지수 backoff).
     if (!joined) {
       opId = randomUUID();
       epoch = cred.revocationEpoch + 1;
       await tx
         .update(oauthCredentials)
-        .set({ status: 'revoking', revokeOpId: opId, revocationEpoch: epoch, updatedAt: now })
+        .set({
+          status: 'revoking',
+          revokeOpId: opId,
+          revocationEpoch: epoch,
+          revokeResumeAt: new Date(now.getTime() + REVOKE_RESUME_AFTER_MS),
+          revokeResumeAttempts: 1,
+          updatedAt: now,
+        })
+        .where(eq(oauthCredentials.id, cred.id));
+    } else {
+      const attempts = cred.revokeResumeAttempts + 1;
+      const next = new Date(now.getTime() + Math.max(REVOKE_RESUME_AFTER_MS, pendingBackoffMs(attempts)));
+      await tx
+        .update(oauthCredentials)
+        .set({ revokeResumeAt: cred.revokeResumeAt ? laterOf(cred.revokeResumeAt, next) : next, revokeResumeAttempts: attempts })
         .where(eq(oauthCredentials.id, cred.id));
     }
     await tx
@@ -1530,6 +1581,7 @@ export async function revokeCredential(
     const hadCiphertext = cred.encryptedToken !== null && cred.keyVersion !== null;
     return { generation: cred.tokenGeneration, tokens, hadCiphertext, pendings, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
   });
+  if ('changed' in marked) return 'skipped_changed';
   if ('done' in marked && marked.done) return { health: marked.done, outcome: 'already_revoked', remoteRevoke: 'already_revoked', revokedApprovals: 0, incompleteCode: null };
   if ('done' in marked) throw new CredentialNotFoundError();
   await oauthTestHooks.afterRevokeMarked?.();
@@ -1646,6 +1698,8 @@ export async function revokeCredential(
           revokedAt: now,
           status: 'revoked',
           lastErrorCode: remoteCode,
+          revokeResumeAt: null,
+          revokeResumeAttempts: 0,
           updatedAt: now,
         })
         .where(and(eq(oauthCredentials.id, cred!.id), eq(oauthCredentials.tokenGeneration, marked.generation), eq(oauthCredentials.revokeOpId, marked.opId)))
@@ -1721,7 +1775,7 @@ export async function revokeCredential(
 export async function refreshExpiringCredentials(
   db: Db,
   input: { providerFor: ProviderFor; keyring: KeyringSource; now?: Date; ownerId?: string; limit?: number },
-): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number; revokeResumed: number; revokeWaiting: number }> {
+): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number; revokeResumed: number; revokeWaiting: number; revokeSkippedChanged: number }> {
   const now = input.now ?? new Date();
   // FIX3-T13: 정리 대기가 있는 계정을 먼저 정리한다(만료·상태와 무관 — 해제된 계정·연결 정보 행이 없는 계정 포함).
   // FIX4-T13(Codex review-FIX3-T13 P2 :1293): 다음 시도 시각(next_attempt_at)이 지난 행이 있는 계정만, 가장 이른 시각 순으로 고른다.
@@ -1758,27 +1812,54 @@ export async function refreshExpiringCredentials(
     if (r === 'still_pending') pendingRemaining++;
     else pendingResolved++;
   }
-  // FIX6-T13(Codex review-FIX5-T13 P1 :1541): 미완료 해제(revoking + 암호문 그대로 + last_error_code 'revoke_*')를 잇는다. 지금 키로 암호문을 열 수 있고
-  // 공급자가 있을 때만 같은 해제 작업에 합류한다(revokeCredential) — 아직 열 수 없으면 아무것도 쓰지 않고 넘긴다(감사·시도 기록 없음, 차단 유지).
-  // 진행 중인 해제와 겹치지 않게 마지막 갱신 뒤 REVOKE_RESUME_AFTER_MS 가 지난 행만.
+  // FIX6-T13(Codex review-FIX5-T13 P1 :1541): 미완료 해제(revoking + 암호문 그대로)를 잇는다. 지금 키로 암호문을 열 수 있고 공급자가 있을 때만
+  // 같은 해제 작업에 합류한다 — 아직 열 수 없으면 감사·비밀 쓰기 없이 다음 시도 시각만 미룬다.
+  // FIX7-T13(Codex review-FIX6-T13):
+  // - P2 :1779 — 후보는 revoke_resume_at(없으면 updated_at + REVOKE_RESUME_AFTER_MS)이 지난 행만, 그 시각 순. 열 수 없거나 공급자가 없어 넘긴 행은
+  //   revoke_resume_attempts +1 · revoke_resume_at = now + backoff 로 미뤄 뒤 행이 차례를 받는다(정리 대기와 같은 지수 backoff).
+  // - Q2 — last_error_code 'revoke_*' 표시를 더는 요구하지 않는다: 1단계 직후 멈춤·마무리 롤백으로 표시 없이 남은 revoking 행도 1단계가 정한
+  //   revoke_resume_at 뒤에 잇는다.
+  // - P1 :1791 — 재개는 훑을 때 본 해제 작업(작업 ID·토큰 세대·해제 세대)에 묶인다. 그 사이 해제가 끝나고 다시 연결됐거나 새 해제가 시작됐으면
+  //   revokeCredentialOp 가 첫 잠금 안에서 확인하고 아무것도 하지 않는다(skipped_changed — 새 연결의 토큰을 철회하지 않는다).
+  const resumeDue = sql<Date>`coalesce(${oauthCredentials.revokeResumeAt}, ${oauthCredentials.updatedAt} + make_interval(secs => ${REVOKE_RESUME_AFTER_MS / 1000}))`;
   const revokeConds = [
     eq(oauthCredentials.status, 'revoking'),
     isNull(oauthCredentials.revokedAt),
     isNotNull(oauthCredentials.revokeOpId),
     isNotNull(oauthCredentials.encryptedToken),
     isNotNull(oauthCredentials.keyVersion),
-    like(oauthCredentials.lastErrorCode, `${REVOKE_INCOMPLETE_PREFIX}%`),
-    lte(oauthCredentials.updatedAt, new Date(now.getTime() - REVOKE_RESUME_AFTER_MS)),
+    sql`${resumeDue} <= ${now}`,
   ];
   if (input.ownerId) revokeConds.push(eq(oauthCredentials.ownerId, input.ownerId));
   const stuckRevokes = await db
     .select()
     .from(oauthCredentials)
     .where(and(...revokeConds))
-    .orderBy(asc(oauthCredentials.updatedAt), asc(oauthCredentials.id))
+    .orderBy(resumeDue, asc(oauthCredentials.id))
     .limit(input.limit ?? 20);
   let revokeResumed = 0;
   let revokeWaiting = 0;
+  let revokeSkippedChanged = 0;
+  // 훑을 때 본 그 작업이 아직 그대로이고 아직 기한이 지난 상태일 때만 미룬다(다른 호출이 정한 더 늦은 예약·새 연결은 건드리지 않음). updated_at·감사 없음.
+  const deferResume = async (c: OAuthCredentialRow) => {
+    const attempts = c.revokeResumeAttempts + 1;
+    await db
+      .update(oauthCredentials)
+      .set({ revokeResumeAttempts: attempts, revokeResumeAt: new Date(now.getTime() + Math.max(REVOKE_RESUME_AFTER_MS, pendingBackoffMs(attempts))) })
+      .where(
+        and(
+          eq(oauthCredentials.id, c.id),
+          eq(oauthCredentials.status, 'revoking'),
+          isNull(oauthCredentials.revokedAt),
+          eq(oauthCredentials.revokeOpId, c.revokeOpId!),
+          eq(oauthCredentials.tokenGeneration, c.tokenGeneration),
+          eq(oauthCredentials.revocationEpoch, c.revocationEpoch),
+          eq(oauthCredentials.revokeResumeAttempts, c.revokeResumeAttempts),
+          sql`${resumeDue} <= ${now}`,
+        ),
+      )
+      .catch(() => undefined);
+  };
   for (const c of stuckRevokes) {
     try {
       const ring = input.keyring();
@@ -1786,11 +1867,22 @@ export async function refreshExpiringCredentials(
       input.providerFor(await ownedAccount(db, c.ownerId, c.channelAccountId));
     } catch {
       revokeWaiting++;
+      await deferResume(c);
       continue;
     }
-    const r = await revokeCredential(db, { ownerId: c.ownerId, accountId: c.channelAccountId, providerFor: input.providerFor, keyring: input.keyring, now }).catch(() => null);
-    if (r && (r.outcome === 'revoked' || r.outcome === 'completed_by_other' || r.outcome === 'already_revoked')) revokeResumed++;
-    else revokeWaiting++;
+    await oauthTestHooks.beforeRevokeResume?.({ ownerId: c.ownerId, accountId: c.channelAccountId });
+    const r = await revokeCredentialOp(
+      db,
+      { ownerId: c.ownerId, accountId: c.channelAccountId, providerFor: input.providerFor, keyring: input.keyring, now },
+      { opId: c.revokeOpId!, generation: c.tokenGeneration, epoch: c.revocationEpoch },
+    ).catch(() => null);
+    if (r === 'skipped_changed') revokeSkippedChanged++;
+    else if (r && (r.outcome === 'revoked' || r.outcome === 'completed_by_other' || r.outcome === 'already_revoked')) revokeResumed++;
+    else {
+      revokeWaiting++;
+      // 예외로 끝남 — 1단계가 커밋됐으면 이미 미뤄졌다(아래는 1단계 전 실패일 때만 적용됨)
+      if (!r) await deferResume(c);
+    }
   }
   const conds = [
     eq(oauthCredentials.status, 'active'),
@@ -1816,7 +1908,7 @@ export async function refreshExpiringCredentials(
       failed++;
     }
   }
-  return { refreshed, failed, pendingResolved, pendingRemaining, revokeResumed, revokeWaiting };
+  return { refreshed, failed, pendingResolved, pendingRemaining, revokeResumed, revokeWaiting, revokeSkippedChanged };
 }
 
 // ---- 키 교체 ----

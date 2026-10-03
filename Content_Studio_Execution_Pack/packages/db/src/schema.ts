@@ -1516,6 +1516,14 @@ export const oauthCredentials = pgTable(
     /** FIX2-T13: 진행 중이거나 마지막으로 끝난 연결 해제 작업 ID. 다시 연결하면 null — 해제 요청이 자기 작업이 아직 현재인지 판정한다. */
     revokeOpId: uuid('revoke_op_id'),
     /**
+     * FIX7-T13(Codex review-FIX6-T13 P2 :1779, 0035): 끝나지 않은 해제(revoking)를 worker 가 다시 이어 볼 시각·횟수 — 정리 대기의
+     * next_attempt_at·attempts 와 같은 다음 시도 시각/지수 backoff. 해제 1단계가 지금 + REVOKE_RESUME_AFTER_MS 이후로 미루고(진행 중 표시 —
+     * 프로세스가 그 뒤 멈추면 worker 가 이어 받는다), worker 가 열 수 없어 넘긴 행도 미룬다(감사·비밀 쓰기 없음). 해제가 끝나거나 다시 연결하면 비운다.
+     * null 이면 updated_at + REVOKE_RESUME_AFTER_MS 로 본다(이 열 전의 행).
+     */
+    revokeResumeAt: ts('revoke_resume_at'),
+    revokeResumeAttempts: integer('revoke_resume_attempts').notNull().default(0),
+    /**
      * FIX3-T13 의 정리 대기 열(pending_*)은 FIX4-T13(0033)에서 별도 표 oauth_pending_tokens 로 옮겼다 — 계정마다 여러 건,
      * 연결 정보 행이 없어도(첫 연결) 기록할 수 있다.
      */
@@ -1538,6 +1546,7 @@ export const oauthCredentials = pgTable(
     // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
     check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
     check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
+    check('oauth_credentials_revoke_resume_attempts_chk', sql`${t.revokeResumeAttempts} >= 0`),
     check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
     check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
     check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),

@@ -96,6 +96,9 @@ export function imageDimensions(head: Uint8Array): ImageDimensions | null {
       if (JPEG_SOF.has(m)) {
         // FIX-T16: SOF 머리 길이는 최소 11(정밀도 1 + 높이 2 + 너비 2 + 성분 수 1 + 성분 1개 3 + 길이 2) — 짧거나 잘린 머리는 읽지 않는다.
         if (len < 11 || i + len > b.length) return null;
+        // FIX-T16 round 2: 성분 수(nf ≥ 1)와 머리 길이가 맞아야 한다(len = 8 + 3·nf) — 어긋난 머리는 추측하지 않는다.
+        const nf = b[i + 7]!;
+        if (nf < 1 || len !== 8 + 3 * nf) return null;
         const height = u16be(b, i + 3);
         const width = u16be(b, i + 5);
         return width > 0 && height > 0 ? { format: 'jpeg', width, height } : null;

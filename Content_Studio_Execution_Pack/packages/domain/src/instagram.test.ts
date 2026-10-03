@@ -61,6 +61,22 @@ describe('imageDimensions(헤더만)', () => {
     expect(imageDimensions(syntheticJpeg(0, 100))).toBeNull();
     expect(imageDimensions(new Uint8Array(0))).toBeNull();
   });
+  it('FIX-T16 round 2: SOF 길이 ≥ 11 이지만 성분 수와 길이가 어긋나면(len ≠ 8 + 3·nf) 또는 성분 0 이면 null', () => {
+    const j = syntheticJpeg(1080, 1080);
+    const sofAt = 20; // head 20 바이트 뒤 FF C0, 길이 0x0011, 정밀도, 높이, 너비, nf(=3)
+    expect(j[sofAt + 1]).toBe(0xc0);
+    const nfAt = sofAt + 2 + 7;
+    const twoComponents = Uint8Array.from(j);
+    twoComponents[nfAt] = 2; // 길이 17 은 nf 3 에만 맞다
+    expect(imageDimensions(twoComponents)).toBeNull();
+    const zero = Uint8Array.from(j);
+    zero[nfAt] = 0;
+    expect(imageDimensions(zero)).toBeNull();
+    const lenOff = Uint8Array.from(j);
+    lenOff[sofAt + 3] = 0x0e; // 길이 14(≥ 11) — nf 3 이면 17 이어야
+    expect(imageDimensions(lenOff)).toBeNull();
+    expect(imageDimensions(j)).toEqual({ format: 'jpeg', width: 1080, height: 1080 });
+  });
 });
 
 describe('캡션(잠정 한도)', () => {

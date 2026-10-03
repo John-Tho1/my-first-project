@@ -651,6 +651,118 @@ describe('FIX-T16(Codex review-T16)', () => {
     expect(await pubsOf(p.itemId)).toHaveLength(0);
   });
 
+  // ---- FIX round 2(Codex review-FIX-T16) ----
+
+  it('[R2-P0] 게시 applied 429(원격은 게시) → RETRY_WAIT 아님, RECONCILING → 조회로 CONFIRMED(게시 호출 1·미디어 1·의도 1)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id);
+    api.injectFault({ op: 'publish', kind: 'rate_limited', applied: true, retryAfterSec: 5, userId: acc.external });
+    await execute(p.planId);
+    const publishes = api.calls.publish;
+    await tick();
+    expect(await jobOf(p.itemId)).toMatchObject({ state: 'RECONCILING' });
+    expect(await pubsOf(p.itemId)).toHaveLength(0);
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.calls.publish - publishes).toBe(1);
+    expect(api.mediaOf(acc.external)).toHaveLength(1);
+    expect(await intentsOf((await jobOf(p.itemId)).id)).toHaveLength(1);
+  });
+
+  it('[R2-P0] 컨테이너 생성 applied 429(원격은 만듦, 기록 없음) → RECONCILING → 조회 not_found → 새 컨테이너로 게시 1번', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id);
+    api.injectFault({ op: 'createImageContainer', kind: 'rate_limited', applied: true, userId: acc.external });
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.containerIds(acc.external)).toHaveLength(2);
+    const media = api.mediaOf(acc.external);
+    expect(media).toHaveLength(1);
+    expect((await stepsOf(p.itemId)).filter((s) => s.kind === 'ig_container').map((s) => s.remoteId)).toEqual([media[0]!.containerId]);
+  });
+
+  /** 다음 한 번의 submit 을 FIX1 이전 버전처럼 — 부모 요청 표식(ig_parent_request)을 DB 에 남기지 않는다(그 외 단계는 실제 DB 창구 그대로). */
+  function nextSubmitAsPreFix1(): void {
+    const original = ig.submit.bind(ig);
+    vi.spyOn(ig, 'submit').mockImplementationOnce(async (prepared, c) => {
+      const steps = c.steps!;
+      return original(prepared, {
+        ...c,
+        steps: {
+          list: () => steps.list(),
+          record: async (st) => {
+            if (st.kind !== 'ig_parent_request') return steps.record(st);
+            const now = new Date().toISOString();
+            return { kind: st.kind, post_index: st.post_index, remote_id: st.remote_id, status: st.status, received_bytes: null, total_bytes: null, resume_count: 0, step_index: -1, created_at: now, updated_at: now };
+          },
+        },
+      });
+    });
+  }
+  const carouselParents = (external: string) => api.containerIds(external).filter((id) => api.containerOf(id)!.type === 'CAROUSEL');
+
+  it('[R2-P1] FIX1 이전 작업(자식만 기록·표식 없음), 원격 부모 있음 → 조회가 자식으로 부모를 찾아 기록 → CONFIRMED(부모 1·게시 1)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+    ]);
+    api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true, userId: acc.external });
+    nextSubmitAsPreFix1();
+    const created = api.calls.createCarouselContainer;
+    const publishes = api.calls.publish;
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect((await stepsOf(p.itemId)).map((s) => `${s.kind}:${s.postIndex}`)).toEqual(['ig_container:1', 'ig_container:2']);
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.calls.createCarouselContainer - created).toBe(1);
+    expect(carouselParents(acc.external)).toHaveLength(1);
+    expect(api.calls.publish - publishes).toBe(1);
+    expect(api.mediaOf(acc.external)).toHaveLength(1);
+    expect(api.mediaOf(acc.external)[0]!.containerId).toBe(carouselParents(acc.external)[0]);
+  });
+
+  it('[R2-P1] FIX1 이전 작업, 원격 부모 없음 → 찾기 null → 부모 1번 생성 → CONFIRMED(새로 만들 때는 표식 먼저)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+    ]);
+    api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: false, userId: acc.external });
+    nextSubmitAsPreFix1();
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect(carouselParents(acc.external)).toHaveLength(0);
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(carouselParents(acc.external)).toHaveLength(1);
+    expect(api.mediaOf(acc.external)).toHaveLength(1);
+    expect((await stepsOf(p.itemId)).map((s) => `${s.kind}:${s.postIndex}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_parent_request:0', 'ig_container:0', 'ig_publish:0']);
+  });
+
+  it('[R2-P1] FIX1 이전 작업, 부모 찾기가 계속 실패(시간 초과) → UNKNOWN, 새 부모·게시 0', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+    ]);
+    api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true, userId: acc.external });
+    for (let i = 0; i < 40; i++) api.injectFault({ op: 'findCarouselByChildren', kind: 'timeout', userId: acc.external });
+    nextSubmitAsPreFix1();
+    const created = api.calls.createCarouselContainer;
+    const publishes = api.calls.publish;
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect(await drainUntil(p.itemId, DONE)).toBe('UNKNOWN');
+    expect(api.calls.createCarouselContainer - created).toBe(1);
+    expect(carouselParents(acc.external)).toHaveLength(1);
+    expect(api.calls.publish - publishes).toBe(0);
+    expect(await pubsOf(p.itemId)).toHaveLength(0);
+  });
+
   it('승인 트랜잭션: 밖 검사 뒤 지금은 Instagram 모의 연결인데 검사하지 않은 항목·hash → media_spec:unchecked(fail closed), seed 계정은 영향 없음', async () => {
     const acc = await linkedAccount();
     const p = await planFor(acc.id, [[1080, 1080]], { approve: false });

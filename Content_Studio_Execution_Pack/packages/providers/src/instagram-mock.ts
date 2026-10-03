@@ -22,6 +22,9 @@
  * - FIX-T16(P0): 쓰기(컨테이너·부모·게시)의 5xx·시간 초과는 모두 결과 불명(ambiguous → 조회). 다시 보내기는 조회가 "안 됨"을 확인한 뒤에만(A08).
  * - FIX-T16(P1): 캐러셀 부모를 만들기 **전에** ig_parent_request 단계(요청 표식)를 남긴다. 부모 ID 를 잃으면(응답 유실·기록 실패) 조회·재시도가
  *   기록한 자식으로 부모를 찾아 기록하고, 찾지 못한 게 확실할 때만 다시 만든다. 찾기 실패(원격 기록 없음 등) → unknown. 쓰인 자식으로 두 번째 부모를 만들지 않는다.
+ * - FIX-T16 round 2: (P0) 쓰기 오류의 부작용이 unknown 이면(applied·시간 초과) 429·4xx 를 포함해 종류와 무관하게 결과 불명 → 조회.
+ *   (P1) 표식 부재 ≠ 부모 미요청 — 자식이 모두 이미 기록된 캐러셀은 표식이 없어도(FIX1 이전 작업) 부모를 먼저 찾는다(찾기 실패 → unknown/ambiguous).
+ *   게시할 컨테이너가 기록돼 있으면 파일 검사 전에 그 컨테이너의 게시 여부를 먼저 찾는다(게시 성공 → 게시 단계 기록 실패 복구).
  * - 단일 이미지: [공개 URL 발급 → 컨테이너(post_index 0) → URL 철회 → 단계 기록 → FINISHED 까지 조회 → 게시 → 게시 단계 기록].
  *   캐러셀(이미지 2~10): 자식 컨테이너(post_index 1..n, is_carousel_item)마다 같은 순서 → 자식이 모두 FINISHED → 부모 컨테이너(post_index 0) → 게시.
  *   **원격 참조는 다음 원격 호출 전에 기록**(ctx.steps). 재개·재확인은 기록을 먼저 읽고, 있는 컨테이너는 다시 만들지 않으며 게시된 것은 다시 게시하지 않는다(A08).
@@ -596,6 +599,12 @@ export async function verifiedImageFiles(
 /** 시뮬레이터 오류 → 어댑터 결과(docs/03 분류). 토큰·URL 은 넣지 않는다. */
 export function classifyInstagramError(e: unknown, op: InstagramOp): AdapterResult {
   if (!(e instanceof InstagramMockApiError)) return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'adapter_error' };
+  // FIX-T16 round 2(P0): 쓰기 호출에서 부작용이 unknown 인 오류(applied 장애·명시 unknown·시간 초과)는 **종류와 무관하게** 결과 불명 → 조회(A08).
+  // 429·400·401·403·404 분기보다 먼저 본다 — 아래 분기의 "재시도·영구 거절"은 부작용 없음(원격이 받아들이기 전 거절)이 증명된 오류에만 적용된다.
+  if (WRITE_OPS.includes(op) && e.sideEffect === 'unknown') {
+    const code = e.kind === 'timeout' ? 'timeout' : e.kind === 'server_error' ? 'server_error_side_effect_unknown' : `${e.code}_side_effect_unknown`;
+    return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: code };
+  }
   switch (e.kind) {
     case 'auth_invalid_token':
       return { status: 'rejected', retry_class: 'auth', error_code: 'auth_invalid_token' };
@@ -833,6 +842,21 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
       // 이미 게시됨 — 다시 게시하지 않고 링크만 확인한다(파일 검사보다 먼저: 게시 뒤 파일이 바뀌어도 원격 사실을 FAILED 로 덮지 않는다).
       return this.acceptedFor(published.remote_id, token, userId, ctx, requestId);
     }
+    const recordedTarget = find('ig_container', 0);
+    if (recordedTarget && recordedTarget.status !== 'error') {
+      // FIX-T16 round 2: 게시는 됐는데 게시 단계 기록만 잃었을 수 있다(게시 성공 → 기록 실패). 파일 검사보다 **먼저** 기록한 컨테이너로
+      // 게시된 미디어를 찾는다(읽기) — 찾으면 기록하고 accepted, 찾기 실패 → 결과 불명(파일 문제로 원격 사실을 FAILED 로 덮지 않는다).
+      let m: { id: string } | null;
+      try {
+        m = this.api.findPublishedByContainer({ creationId: recordedTarget.remote_id, userId, accessToken: token, now: ctx.now });
+      } catch (e) {
+        return res({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: `find_${e instanceof InstagramMockApiError ? e.code : 'adapter_error'}` });
+      }
+      if (m) {
+        await steps.record({ kind: 'ig_publish', post_index: 0, remote_id: m.id, status: 'published' });
+        return this.acceptedFor(m.id, token, userId, ctx, requestId);
+      }
+    }
     // 보내기 직전 규격 재검사(원격 호출 0): 승인한 파일(VERIFIED·같은 checksum 메타데이터)을 열어 형식·크기·비율·가로·캡션. 어긋나면 FAILED(재시도 없음).
     const inspected = await instagramMediaFacts(ctx.media, assetsOf(snap), this.spec);
     const problems = [...inspected.problems, ...instagramSpecProblems({ caption, media: inspected.facts }, this.spec)];
@@ -845,6 +869,8 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
 
     const carousel = images.length > 1;
     let firstCreate = true;
+    /** 이번 submit 이 자식을 하나라도 새로 만들었나(그렇다면 이 자식 목록 전체로 만든 부모는 있을 수 없다) */
+    let createdChild = false;
     let target = find('ig_container', 0);
     if (target && target.status === 'error') return res({ status: 'rejected', retry_class: 'permanent', error_code: 'container_error' });
     if (!target && carousel) {
@@ -864,6 +890,7 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
           } finally {
             firstCreate = false;
           }
+          createdChild = true;
           // 다음 원격 호출 전에 참조를 남긴다(짧은 트랜잭션).
           child = await steps.record({ kind: 'ig_container', post_index: k, remote_id: created.id, status: created.status === 'FINISHED' ? 'finished' : 'created' });
         }
@@ -874,7 +901,9 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
       recorded = await steps.list();
       target = find('ig_container', 0);
       const marker = find('ig_parent_request', 0);
-      if (!target && marker) {
+      if (!target && (marker || !createdChild)) {
+        // FIX-T16 round 2(P1): 표식 부재를 "부모 미요청"의 증거로 쓰지 않는다 — FIX1 이전 버전이 남긴 작업(자식만 기록·표식 없음)은 부모를 요청했을 수 있다.
+        // 자식을 이번 submit 에서 하나도 새로 만들지 않았으면(모두 이미 기록돼 있었으면) 표식 유무와 관계없이 먼저 찾는다.
         // FIX-T16(P1): 이전 시도가 부모를 요청했다 — 응답(또는 기록)을 잃었을 수 있다. 기록한 자식으로 부모를 찾아 기록하고, 없음이 확실할 때만 새로 만든다.
         // 찾기 실패(원격 기록 없음·자식이 다른 부모에 쓰임·읽기 오류)는 결과 불명 → 조회(쓰인 자식으로 두 번째 부모를 만들지 않는다).
         const looked = this.lookupParent(token, userId, childIds, ctx);
@@ -994,11 +1023,13 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
     };
     let target = find('ig_container', 0);
     const marker = find('ig_parent_request', 0);
-    if (!target && marker) {
+    const kids = recorded.filter((s) => s.kind === 'ig_container' && s.post_index > 0).sort((a, b) => a.post_index - b.post_index);
+    const imageCount = instagramImagesOf(snap).length;
+    // FIX-T16 round 2(P1): 표식이 없어도 캐러셀 자식이 모두 기록돼 있으면 부모를 요청했을 수 있다(FIX1 이전 버전의 작업) — 표식 유무와 관계없이 찾는다.
+    if (!target && (marker || (imageCount > 1 && kids.length === imageCount))) {
       // FIX-T16(P1): 부모 생성을 요청했는데 부모 ID 가 없다(응답 유실·기록 실패). 자식이 준비됐다는 것만으로 "부모 없음"을 확정하지 않는다 —
       // 기록한 자식(전부, 순서대로)으로 부모를 찾아 기록한다. 찾기 실패 → unknown. 없음이 확실(null) → 아래 자식 판정(resumable 가능).
-      const kids = recorded.filter((s) => s.kind === 'ig_container' && s.post_index > 0).sort((a, b) => a.post_index - b.post_index);
-      if (kids.length !== instagramImagesOf(snap).length) return { status: 'unknown', published_parts: 0, error_code: 'carousel_children_incomplete' };
+      if (kids.length !== imageCount) return { status: 'unknown', published_parts: 0, error_code: 'carousel_children_incomplete' };
       const looked = this.lookupParent(
         token,
         userId,

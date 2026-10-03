@@ -747,13 +747,38 @@ export interface MockCredentialSnapshot {
 }
 
 /**
+ * FIX2-M4DEV1(Codex review-FIX-M4DEV1 P1 :778): 정리 대기 행 하나가 현재 토큰 C(세대 `generation`)를 무효로 만들었을 수 있는가 — true 면 C 를 다시 등록하지 않는다.
+ * - refresh_unknown: base_generation 이 없거나(callback — C 가 그 뒤 무엇인지 모름) C 의 세대 이상이면 true. 같은 세대면 그 갱신이 C 로 새 토큰을 받았다 —
+ *   모의 공급자(Threads·Instagram 형 이전 토큰 무효, Google 형 grant 회전)에서 C 는 이미 무효다. 세대가 그 뒤로 넘어갔으면 C 는 그 갱신이 받은 토큰이거나
+ *   더 나중에 발급된 토큰이다(그 사이 C 를 무효로 만드는 갱신·해제는 새 세대·error·해제 상태·새 정리 대기 행을 남긴다).
+ * - verify_current: base_generation 이 없거나 C 의 세대 이상이면 true(C 의 유효성을 아직 확인하지 못함). 세대가 지난 행은 정리가 확인 없이 지우는 낡은 행.
+ * - cleanup_revoke: 봉인을 열어 P 가 C 와 토큰(access·refresh)을 하나라도 공유하면 true, 열 수 없거나 내용이 없으면 true(판정 불가 — 등록 안 함).
+ *   P ≠ C 이면 false — P 철회는 P(Google 형은 P 의 grant)만 무효로 하고 C 와 grant 를 공유하지 않는다(모의 발급마다 새 grant).
+ * - 그 밖의 종류: true.
+ */
+function pendingMayInvalidateCurrent(p: OAuthPendingRow, generation: number, current: StoredOAuthTokens, ring: SecretKeyring, ownerId: string, accountId: string): boolean {
+  if (p.kind === 'refresh_unknown' || p.kind === 'verify_current') return p.baseGeneration === null || p.baseGeneration >= generation;
+  if (p.kind !== 'cleanup_revoke') return true;
+  if (!p.sealedToken || p.keyVersion === null) return true;
+  let pending: StoredOAuthTokens;
+  try {
+    pending = decodeTokens(openSecret(ring, p.sealedToken, p.keyVersion, pendingAad(ownerId, accountId)));
+  } catch {
+    return true;
+  }
+  const mine = new Set([current.accessToken, current.refreshToken].filter((t): t is string => !!t));
+  return [pending.accessToken, pending.refreshToken].some((t) => !!t && mine.has(t));
+}
+
+/**
  * M4-DEV1(개발 품질): 개발 서버 재시작 뒤 모의 연결이 끊기지 않도록, 모의 공급자 메모리를 다시 채울 연결 정보를 읽는다(**읽기 전용**).
  * 대상: 해제되지 않은(revoked_at null·status active) 모의 공급자 행(is_mock·provider ∈ mock_*), 계정 kind = mock, 연결 상태가 쓸 수 있음
  * (connected·expiring_soon).
- * FIX1-M4DEV1(Codex review-M4DEV1 P1 :781): 정리 대기(oauth_pending_tokens — refresh_unknown·cleanup_revoke·verify_current)가 한 건이라도 있는 계정은
- * **통째로 제외**한다. 그런 계정의 DB 현재 토큰은 공급자 쪽에서 이미 회전·철회로 무효가 됐을 수 있어(갱신 뒤 저장 결과 불명), 유효로 다시 등록하면
- * 정리 대기 해소(verify_current·refresh_unknown 판정)가 잘못된 "유효" 근거를 보게 된다. 제외된 계정은 모의 공급자에서 "알 수 없는 토큰"으로 남고,
- * 계정 실행 차단(health = 정리 대기)도 그대로다 — 다시 연결이 필요하면 화면이 안내한다. 정리 대기 토큰 자체도 읽지 않는다.
+ * FIX1-M4DEV1(Codex review-M4DEV1 P1 :781) → FIX2-M4DEV1(Codex review-FIX-M4DEV1 P1 :778): 정리 대기(oauth_pending_tokens) 중 **현재 토큰(C)을
+ * 무효로 만들 수 있는 행**이 하나라도 있는 계정만 제외한다(pendingMayInvalidateCurrent). 그런 C 는 공급자 쪽에서 이미 회전·철회로 무효가 됐을 수 있어
+ * 유효로 다시 등록하면 정리 판정이 잘못된 "유효" 근거를 보게 된다 — 제외된 C 는 "알 수 없는 토큰"으로 남고, 정리 판정이 C 를 확인하면 무효(error)로
+ * 끝난다(실행 차단 유지, 다시 연결 안내). C 와 무관한 cleanup_revoke(다른 토큰 P 의 철회 의무 — 모의 공급자는 발급마다 별도 grant 라 P 철회가 C 에
+ * 닿지 않음)만 있는 계정은 C 를 등록한다 — 재시작 뒤 첫 확인이 P 정리를 마치면 C 가 그대로 쓰인다(다시 연결 없음). 정리 대기 토큰 P 자체는 등록하지 않는다.
  * 봉인을 열 수 없는 행은 건너뛴다 — 상태를 쓰지 않으므로 기존 오류·차단 처리(readForUse·readAccessTokenForSend 의 decrypt_<문제>)가 그대로다.
  * 모든 owner 의 행을 읽는다(프로세스 하나의 모의 공급자 상태). 반환값은 개수와 토큰 — 호출자는 토큰을 모의 공급자 메모리에만 넘긴다.
  */
@@ -775,15 +800,20 @@ export async function loadMockCredentialsForRehydration(
         isNull(oauthCredentials.revokedAt),
         isNotNull(oauthCredentials.encryptedToken),
         eq(channelAccounts.kind, 'mock'),
-        // FIX1-M4DEV1: 정리 대기가 있는 계정은 다시 채우지 않는다(위 설명)
-        notExists(
-          db
-            .select({ one: sql`1` })
-            .from(oauthPendingTokens)
-            .where(and(eq(oauthPendingTokens.ownerId, oauthCredentials.ownerId), eq(oauthPendingTokens.channelAccountId, oauthCredentials.channelAccountId))),
-        ),
       ),
     );
+  // FIX2-M4DEV1: 정리 대기는 계정 단위로 읽어 행마다 "현재 토큰을 무효로 만들 수 있는가"를 판정한다(pendingMayInvalidateCurrent).
+  const pendingByKey = new Map<string, OAuthPendingRow[]>();
+  if (rows.length) {
+    const pend = await db
+      .select()
+      .from(oauthPendingTokens)
+      .where(inArray(oauthPendingTokens.channelAccountId, [...new Set(rows.map((r) => r.account.id))]));
+    for (const p of pend) {
+      const k = `${p.ownerId}:${p.channelAccountId}`;
+      pendingByKey.set(k, [...(pendingByKey.get(k) ?? []), p]);
+    }
+  }
   const entries: MockCredentialSnapshot[] = [];
   let skipped = 0;
   for (const { cred, account } of rows) {
@@ -801,6 +831,12 @@ export async function loadMockCredentialsForRehydration(
       tokens = decodeTokens(openSecret(input.keyring, cred.encryptedToken, cred.keyVersion, tokenAad(cred.ownerId, account.id)));
     } catch (e) {
       if (!(e instanceof SecretDecryptError)) throw e;
+      skipped++;
+      continue;
+    }
+    // FIX2-M4DEV1: 현재 토큰을 무효로 만들 수 있는 정리 대기가 한 건이라도 있으면 이 계정은 등록하지 않는다(판정 불가도 등록 안 함)
+    const pend = pendingByKey.get(`${cred.ownerId}:${account.id}`) ?? [];
+    if (pend.some((p) => pendingMayInvalidateCurrent(p, cred.tokenGeneration, tokens, input.keyring, cred.ownerId, account.id))) {
       skipped++;
       continue;
     }

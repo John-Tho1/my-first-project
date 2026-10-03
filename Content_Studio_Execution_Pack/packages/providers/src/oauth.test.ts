@@ -250,6 +250,33 @@ describe('M4-DEV1: 재시작 뒤 모의 공급자 메모리 다시 채우기', (
     expect(store.tokens.size).toBe(0);
   });
 
+  it('FIX2-M4DEV1: Google 형 토큰 쌍 중 한쪽만 이미 알려졌거나 철회됐으면 다른 쪽도 등록하지 않는다(묶음을 새로 만들어 되살리지 않음)', async () => {
+    const store = new MockOAuthStore();
+    const g = new MockGoogleOAuthProvider({ registeredRedirectUri: REDIRECT, appBaseUrl: 'http://localhost:3000', store });
+    const pair = (a: string, r: string): MockRehydrateEntry => ({
+      provider: 'mock_google',
+      externalAccountId: 'mock:youtube:pair',
+      accessToken: `mockyt_at_${a.repeat(43)}`,
+      refreshToken: `mockyt_rt_${r.repeat(43)}`,
+      expiresAt: later,
+      accessExpiresAt: later,
+      scopes: ['youtube.upload(mock)'],
+    });
+    // 철회된 묶음(access·refresh 둘 다 철회) — access 만 같은 새 항목: refresh 를 새로 등록하지 않는다
+    const e1 = pair('e', 'f');
+    expect(store.registerRehydrated(e1)).toBe('registered');
+    await g.revoke({ tokens: { accessToken: e1.accessToken, refreshToken: e1.refreshToken }, now: NOW });
+    const accessOnlyKnown = pair('e', 'g');
+    expect(store.registerRehydrated(accessOnlyKnown)).toBe('already_known');
+    expect(await errCode(g.refresh({ tokens: { accessToken: accessOnlyKnown.accessToken, refreshToken: accessOnlyKnown.refreshToken }, now: NOW }))).toBe('invalid_grant');
+    // refresh 만 알려진(철회된) 항목: access 를 새로 등록하지 않는다
+    const refreshOnlyKnown = pair('h', 'f');
+    expect(store.registerRehydrated(refreshOnlyKnown)).toBe('already_known');
+    expect(await errCode(g.accountInfo({ accessToken: refreshOnlyKnown.accessToken, now: NOW }))).toBe('invalid_token');
+    expect(await errCode(g.accountInfo({ accessToken: e1.accessToken, now: NOW }))).toBe('token_revoked');
+    expect(store.tokens.size).toBe(2);
+  });
+
   it('FIX1-M4DEV1: 내용이 잘못된 항목은 이미 아는 토큰이 아니라 건너뜀으로 센다, 실패 결과만 연결 정보 작업을 막는다', async () => {
     const store = new MockOAuthStore();
     const load = vi.fn(async () => ({ entries: [thr(), thr({ accessToken: 'garbage' })], skipped: 0 }));

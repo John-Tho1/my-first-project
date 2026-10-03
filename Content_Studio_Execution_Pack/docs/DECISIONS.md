@@ -447,3 +447,9 @@
 - 상태: **잠정**. 실제 Notion·Drive 연결(OAuth·API)은 하지 않으며 별도 승인 대상.
 
 ## Proposed D32 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D33 — T19 허용 소스 수집·재추천(모의 수집기): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+- Decision ID / date: D33 / 2026-10-03. 코드 4a2e02f. 출처: docs/handoffs/T19_IMPLEMENTATION_HANDOFF.md "Proposed D33".
+- 상태: **잠정**. 실제 웹 수집(실제 HTTP 요청)은 없으며 별도 승인 대상.
+
+## Proposed D33 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)

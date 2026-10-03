@@ -4,7 +4,7 @@
  * 외부 호출 없음: 전사기는 MockTranscriber(결정적), live 는 어댑터가 없어 항상 거부.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -545,6 +545,46 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
     as(A);
     expect((await sessionDELETE(bare(`/api/uploads/sessions/${s.session.id}`, tokenA, 'DELETE'), ctx(s.session.id))).status).toBe(200);
     expect(await usageOf(tokenA)).toEqual(aBefore);
+  });
+
+  it('Codex review-D30H P1: 폴더 읽기 실패(없음이 아닌 오류)는 0·일부 수치가 아니라 ops.uploads null — owner 폴더·세션 하위 폴더 각각', async () => {
+    const uploadsOf = async (token: string) => {
+      const res = await summaryGET(get('/api/ops/summary', token), undefined);
+      expect(res.status).toBe(200);
+      return (await res.json()).ops.uploads as { sessions: number; files: number; bytes: number } | null;
+    };
+    // 세션 하위 폴더: 폴더가 있어야 할 자리에 파일 → readdir ENOTDIR(ENOENT 아님)
+    as(A);
+    const before = await uploadsOf(tokenA);
+    expect(before).not.toBeNull();
+    mkdirSync(path.join(uploadsRoot(), ownerA), { recursive: true });
+    const bogusSession = path.join(uploadsRoot(), ownerA, randomUUID());
+    writeFileSync(bogusSession, 'not a directory');
+    try {
+      expect(await uploadsOf(tokenA)).toBeNull();
+    } finally {
+      rmSync(bogusSession, { force: true });
+    }
+    expect(await uploadsOf(tokenA)).toEqual(before);
+    // owner 폴더 자체: owner 폴더 자리에 파일
+    as(B);
+    const ownerB = (await db.select({ id: schema.users.id }).from(schema.users).where(eq(schema.users.allowedIdentity, B)))[0]!.id;
+    const ownerDir = path.join(uploadsRoot(), ownerB);
+    const backup = ownerDir + '.bak-' + randomUUID();
+    const hadDir = existsSync(ownerDir);
+    if (hadDir) renameSync(ownerDir, backup);
+    writeFileSync(ownerDir, 'not a directory');
+    try {
+      expect(await uploadsOf(tokenB)).toBeNull();
+    } finally {
+      rmSync(ownerDir, { force: true });
+      if (hadDir) renameSync(backup, ownerDir);
+    }
+    expect(await uploadsOf(tokenB)).not.toBeNull();
+    // 폴더가 아예 없는 owner(ENOENT)는 0 — 정상
+    const fresh = await uploadStoreFor(loadConfig()).usage(randomUUID());
+    expect(fresh).toEqual({ sessions: 0, files: 0, bytes: 0 });
+    as(A);
   });
 });
 

@@ -126,7 +126,13 @@ export class UploadStore {
     let sessions = 0;
     let files = 0;
     let bytes = 0;
-    const list = (p: string) => readdir(/*turbopackIgnore: true*/ p).catch(() => [] as string[]);
+    // Codex review-D30H P1: 폴더가 없으면(ENOENT) 빈 것으로 보고, 권한·I/O·형식 오류는 그대로 던진다 — 호출자(GET /api/ops/summary)가 null 로 바꾼다(0·일부 수치를 정상처럼 내지 않게).
+    const isEnoent = (e: unknown) => (e as NodeJS.ErrnoException | null)?.code === 'ENOENT';
+    const list = (p: string) =>
+      readdir(/*turbopackIgnore: true*/ p).catch((e: unknown) => {
+        if (isEnoent(e)) return [] as string[];
+        throw e;
+      });
     if (ownerId !== undefined && !isUuid(ownerId)) throw new Error('업로드 경로 식별자가 올바르지 않습니다');
     const owners = ownerId !== undefined ? [ownerId] : await list(this.root);
     for (const o of owners) {
@@ -139,8 +145,8 @@ export class UploadStore {
               files++;
               bytes += st.size;
             }
-          } catch {
-            // 사이에 지워진 파일
+          } catch (e) {
+            if (!isEnoent(e)) throw e; // 사이에 지워진 파일만 건너뛴다
           }
         }
       }

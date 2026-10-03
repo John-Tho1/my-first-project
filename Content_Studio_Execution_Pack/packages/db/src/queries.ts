@@ -263,7 +263,11 @@ export interface AuditInput {
     | 'oauth.cleanup_revoke_unknown'
     | 'oauth.checked'
     | 'oauth.revoked'
-    | 'oauth.key_rotated';
+    | 'oauth.key_rotated'
+    // T18(D32 제안): 가져오기 원장(건수만 — 파일 이름·경로·본문 없음)
+    | 'import.preview'
+    | 'import.commit'
+    | 'import.cancel';
   entity: string;
   entityId?: string | null;
   versionOrHash?: string | null;

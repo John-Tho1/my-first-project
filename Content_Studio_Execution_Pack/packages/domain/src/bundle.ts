@@ -68,6 +68,9 @@ export const EXPORTED_TABLES = [
   // T14(0031, 결정 D26): 원격 단계 참조(Threads 컨테이너·게시 ID, 모의). FIX-T14(Codex review-T14 P1): 작업·전송 의도와 함께 읽기 전용 이력으로 복원한다
   // (게시된 부분의 근거·재확인용 참조 보존). 업로드 세션 URI 는 묶음에서 가린 값 그대로 들어간다.
   'remote_steps',
+  // T18(0038, D32 제안): 가져오기 원장 — 가져온 소재의 출처 이력. 소재·출처·출처 버전보다 뒤(대상 참조). 변환 없이 그대로 복원한다.
+  'import_runs',
+  'import_items',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -99,6 +102,8 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   publications: '0017_t11_jobs',
   mock_scenarios: '0018_t12_mock_scenarios',
   remote_steps: '0031_t14_threads_steps',
+  import_runs: '0038_t18_imports',
+  import_items: '0038_t18_imports',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -582,6 +587,42 @@ export const ROW_SCHEMAS = {
     resume_count: int.min(0).default(0),
     created_at: ts,
     updated_at: ts,
+  }),
+  // T18(0038, D32 제안): 가져오기 원장. 본문·자격 증명 없음.
+  import_runs: z.strictObject({
+    id: uuid,
+    source_kind: z.enum(['notion_export', 'drive_export', 'mock_connector']),
+    file_name: nstr,
+    file_checksum: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    file_bytes: int.min(0).nullable(),
+    status: z.enum(['preview', 'committed', 'failed', 'canceled']),
+    counts: z.record(z.string(), z.number()),
+    result: z.record(z.string(), z.number()).nullable(),
+    created_at: ts,
+    committed_at: ts.nullable(),
+    canceled_at: ts.nullable(),
+  }),
+  import_items: z.strictObject({
+    id: uuid,
+    run_id: uuid,
+    external_id: str,
+    external_path: str,
+    folder: str,
+    title: nstr,
+    format: z.enum(['md', 'txt', 'html', 'csv', 'other']),
+    content_checksum: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    byte_size: int.min(0),
+    external_created_text: nstr,
+    decision: z.enum(['new', 'identical', 'conflict', 'skipped']),
+    skip_reason: nstr,
+    matched_source_id: uuid.nullable(),
+    outcome: z
+      .enum(['imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed'])
+      .nullable(),
+    target_capture_id: uuid.nullable(),
+    target_source_id: uuid.nullable(),
+    target_source_version_id: uuid.nullable(),
+    created_at: ts,
   }),
   audit_events: z.strictObject({
     id: uuid,
@@ -1276,6 +1317,22 @@ export function checkIntegrity(t: BundleTables): void {
     need('content_captures', 'capture_id', r.capture_id, 'captures');
   }
   checkDistributionIntegrity(t, need, problems);
+  // T18(D32 제안): 가져오기 원장 — 항목은 실행·대상(소재·출처·출처 버전)을 가리키고, 대상 소재는 그 출처에 속하며 출처 버전도 그 출처의 것.
+  const captureSource = new Map(t.captures.map((c) => [c.id, c.source_id]));
+  const versionSource = new Map(t.source_versions.map((v) => [v.id, v.source_id]));
+  for (const i of t.import_items) {
+    need('import_items', 'run_id', i.run_id, 'import_runs');
+    need('import_items', 'target_capture_id', i.target_capture_id, 'captures');
+    need('import_items', 'target_source_id', i.target_source_id, 'sources');
+    need('import_items', 'target_source_version_id', i.target_source_version_id, 'source_versions');
+    need('import_items', 'matched_source_id', i.matched_source_id, 'sources');
+    if (i.target_capture_id !== null && captureSource.has(i.target_capture_id) && captureSource.get(i.target_capture_id) !== i.target_source_id) {
+      problems.push('import_items.target_capture_id → 같은 출처의 소재');
+    }
+    if (i.target_source_version_id !== null && versionSource.has(i.target_source_version_id) && versionSource.get(i.target_source_version_id) !== i.target_source_id) {
+      problems.push('import_items.target_source_version_id → 같은 출처의 버전');
+    }
+  }
   if (problems.length) {
     throw new BundleError('integrity', '묶음 안의 관계(ID 참조)가 맞지 않습니다', { problems: [...new Set(problems)].slice(0, 20) });
   }

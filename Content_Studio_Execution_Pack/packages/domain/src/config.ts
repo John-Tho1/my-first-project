@@ -36,6 +36,8 @@ const LABELS: Record<string, string> = {
   STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
   EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
   RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
+  IMPORT_LOCAL_DIR: 'IMPORT_LOCAL_DIR(가져오기 파일 경로)',
+  IMPORT_CONNECTOR_MODE: 'IMPORT_CONNECTOR_MODE(가져오기 커넥터 모드)',
   JOB_SUBMIT_TIMEOUT_MS: 'JOB_SUBMIT_TIMEOUT_MS(배포 전송 시간 제한, ms)',
   WORKER_UI_TICK_TIMEOUT_MS: 'WORKER_UI_TICK_TIMEOUT_MS(화면 "작업 처리 실행" 전송 시간 제한, ms)',
   BACKUP_MAX_AGE_HOURS: 'BACKUP_MAX_AGE_HOURS(백업 경고 기준 시간)',
@@ -117,6 +119,13 @@ export const configSchema = z.object({
   EXPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/exports')),
   /** T05: 복원 미리보기에 올린 ZIP(<restore_id>.zip)을 두는 곳. */
   RESTORE_LOCAL_DIR: opt(z.string().min(1).default('./data/restores')),
+  /** T18(D32 제안): 가져오기 미리보기에 올린 ZIP(<import_id>.zip)을 확정·취소 전까지 두는 곳(gitignore 된 data/ 아래). */
+  IMPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/imports')),
+  /**
+   * T18(D32 제안): 앞으로의 Notion·Drive 직접 연결(커넥터) 자리. disabled(기본) = 꺼짐, mock = 프로세스 안 모의 자료만(외부 호출 0).
+   * live 값은 없다 — 실제 커넥터·자격 증명은 별도 승인 전까지 만들지 않는다(다른 앱의 Notion·Drive 연결은 이 앱의 자격 증명이 아니다).
+   */
+  IMPORT_CONNECTOR_MODE: opt(z.enum(['disabled', 'mock']).default('disabled')),
   /**
    * T11(D18): 배포 작업의 어댑터 submit 시간 제한(ms). 넘으면 결과 불명(ambiguous) → RECONCILING(재전송하지 않고 조회).
    * 1초 ~ 10분, 기본 30초. lease 는 heartbeat 로 연장된다.

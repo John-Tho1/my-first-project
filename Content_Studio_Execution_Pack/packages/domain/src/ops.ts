@@ -50,6 +50,9 @@ export const RETENTION_PROTECTED_TABLES = [
   'publications',
   'mock_scenarios',
   'remote_steps',
+  // T18(D32 제안): 가져오기 원장 — 가져온 소재의 출처 이력
+  'import_runs',
+  'import_items',
   'audit_events',
   'export_runs',
   'restore_runs',

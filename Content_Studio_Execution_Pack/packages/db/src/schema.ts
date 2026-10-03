@@ -88,6 +88,10 @@ export const sources = pgTable(
     uniqueIndex('sources_owner_normalized_url_uq')
       .on(t.ownerId, t.normalizedUrl)
       .where(sql`${t.normalizedUrl} is not null`),
+    // T18(D32 제안): 가져온 외부 항목은 owner·공급자·외부 ID 마다 출처 하나 — 다시 가져오면 같은 출처에 버전이 쌓인다(새 출처 중복 없음).
+    uniqueIndex('sources_owner_import_external_uq')
+      .on(t.ownerId, t.externalProvider, t.externalId)
+      .where(sql`${t.externalProvider} in ('notion_export', 'drive_export', 'mock_connector') and ${t.externalId} is not null`),
   ],
 );
 
@@ -1649,6 +1653,113 @@ export const oauthStates = pgTable(
       name: 'oauth_states_account_same_owner_fk',
       columns: [t.channelAccountId, t.ownerId],
       foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * T18(제안 결정 D32) 가져오기 실행 기록(import ledger). 사용자가 올린 Notion·Drive 내보내기 ZIP(또는 모의 커넥터)을
+ * 미리보기(preview) → 선택 확정(committed) | 취소(canceled) | 실패(failed) 로 기록한다. 외부 원본은 읽기만 하고 바꾸지 않는다.
+ * file_checksum 은 올린 ZIP 의 sha256(모의 커넥터는 null). 자격 증명·토큰은 이 표에 없다(어떤 열에도 넣지 않는다).
+ * counts: 미리보기 판정 건수(new·identical·conflict·skipped·attachments·total). result: 확정 결과 건수.
+ * export/restore 에 포함한다(D32 제안 — 가져온 소재의 출처 이력이므로 사용자 자료와 함께 옮긴다).
+ */
+export const importRuns = pgTable(
+  'import_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sourceKind: text('source_kind').notNull(),
+    fileName: text('file_name'),
+    fileChecksum: text('file_checksum'),
+    fileBytes: bigint('file_bytes', { mode: 'number' }),
+    status: text('status').notNull().default('preview'),
+    counts: jsonb('counts').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result').$type<Record<string, number>>(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    committedAt: ts('committed_at'),
+    canceledAt: ts('canceled_at'),
+  },
+  (t) => [
+    unique('import_runs_id_owner_uq').on(t.id, t.ownerId),
+    check('import_runs_source_kind_chk', sql`${t.sourceKind} in ('notion_export', 'drive_export', 'mock_connector')`),
+    check('import_runs_status_chk', sql`${t.status} in ('preview', 'committed', 'failed', 'canceled')`),
+    check(
+      'import_runs_checksum_chk',
+      sql`(${t.sourceKind} = 'mock_connector' and ${t.fileChecksum} is null) or (${t.sourceKind} <> 'mock_connector' and ${t.fileChecksum} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check('import_runs_committed_chk', sql`(${t.status} = 'committed') = (${t.committedAt} is not null)`),
+    index('import_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * T18 가져오기 항목(import ledger 의 줄). 실행마다 외부 항목 하나(external_id: Notion 페이지 ID 또는 내보내기 안 경로).
+ * decision(미리보기 판정): new | identical(같은 외부 ID·같은 checksum 이 이미 있음) | conflict(같은 외부 ID, 내용 다름 — 덮어쓰지 않음) | skipped(지원 안 함).
+ * outcome(확정 결과, 미리보기 중 null): imported | versioned(사용자가 고른 충돌 → 기존 출처에 새 버전) | skipped_* | failed_changed.
+ * target_*: 확정으로 만든 소재·출처·출처 버전(같은 owner — 복합 FK). 본문은 이 표에 없다(소재 원문에만).
+ */
+export const importItems = pgTable(
+  'import_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    externalId: text('external_id').notNull(),
+    externalPath: text('external_path').notNull(),
+    folder: text('folder').notNull().default(''),
+    title: text('title'),
+    format: text('format').notNull(),
+    contentChecksum: text('content_checksum'),
+    byteSize: integer('byte_size').notNull(),
+    externalCreatedText: text('external_created_text'),
+    decision: text('decision').notNull(),
+    skipReason: text('skip_reason'),
+    matchedSourceId: uuid('matched_source_id'),
+    outcome: text('outcome'),
+    targetCaptureId: uuid('target_capture_id'),
+    targetSourceId: uuid('target_source_id'),
+    targetSourceVersionId: uuid('target_source_version_id').references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('import_items_run_external_uq').on(t.runId, t.externalId),
+    check('import_items_format_chk', sql`${t.format} in ('md', 'txt', 'html', 'csv', 'other')`),
+    check('import_items_decision_chk', sql`${t.decision} in ('new', 'identical', 'conflict', 'skipped')`),
+    check(
+      'import_items_outcome_chk',
+      sql`${t.outcome} is null or ${t.outcome} in ('imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed')`,
+    ),
+    check('import_items_checksum_chk', sql`${t.contentChecksum} is null or ${t.contentChecksum} ~ '^[0-9a-f]{64}$'`),
+    check('import_items_skip_chk', sql`(${t.decision} = 'skipped') = (${t.skipReason} is not null)`),
+    check(
+      'import_items_target_chk',
+      sql`(${t.outcome} in ('imported', 'versioned')) = (${t.targetCaptureId} is not null and ${t.targetSourceId} is not null and ${t.targetSourceVersionId} is not null)`,
+    ),
+    index('import_items_owner_capture_idx').on(t.ownerId, t.targetCaptureId),
+    foreignKey({
+      name: 'import_items_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [importRuns.id, importRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_capture_same_owner_fk',
+      columns: [t.targetCaptureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_source_same_owner_fk',
+      columns: [t.targetSourceId, t.ownerId],
+      foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_matched_source_same_owner_fk',
+      columns: [t.matchedSourceId, t.ownerId],
+      foreignColumns: [sources.id, sources.ownerId],
     }).onDelete('restrict'),
   ],
 );

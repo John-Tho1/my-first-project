@@ -228,6 +228,14 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'intent_id', table: 'send_intents', owned: true },
     { col: 'item_id', table: 'distribution_items', owned: true },
   ],
+  // T18(D32 제안): 가져오기 원장 항목은 그 실행이 이번에 들어갔거나 같을 때만(기존 실행에 항목을 덧붙이지 않는다), 대상(소재·출처·버전)이 있을 때만.
+  import_items: [
+    { col: 'run_id', table: 'import_runs', owned: true },
+    { col: 'target_capture_id', table: 'captures' },
+    { col: 'target_source_id', table: 'sources' },
+    { col: 'target_source_version_id', table: 'source_versions' },
+    { col: 'matched_source_id', table: 'sources' },
+  ],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

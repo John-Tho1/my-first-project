@@ -16,6 +16,7 @@ export * from './threads-mock';
 export * from './youtube-mock';
 export * from './instagram-mock';
 export * from './public-media';
+export * from './import-connector';
 
 export interface Providers {
   llm: LlmProvider;

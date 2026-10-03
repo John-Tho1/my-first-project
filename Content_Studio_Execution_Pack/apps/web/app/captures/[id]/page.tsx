@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { computeDuplicates, getCaptureDetail, getCapturesByIds, listCaptureDerivations } from '@cs/db';
-import { formatMsk, formatMskInline, ideaSeedFromCapture, isFetchableUrl, MAX_IDEA, MAX_TITLE, MAX_USER_NOTE } from '@cs/domain';
+import { computeDuplicates, getCaptureDetail, getCapturesByIds, getImportOriginForCapture, listCaptureDerivations } from '@cs/db';
+import { formatMsk, formatMskInline, ideaSeedFromCapture, IMPORT_KIND_LABEL, isFetchableUrl, MAX_IDEA, MAX_TITLE, MAX_USER_NOTE, type ImportSourceKind } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../../lib/labels';
@@ -48,6 +48,8 @@ export default async function CaptureDetailPage({
   const { capture: c, source, revisions, extractions } = detail;
   const dups = await computeDuplicates(db, session.ownerId, c, source);
   const derived = await listCaptureDerivations(db, session.ownerId, c.id);
+  // T18: 가져온 사본이면 원본 종류·원래 경로(읽기만 — 원본은 바뀌지 않음)
+  const importOrigin = await getImportOriginForCapture(db, session.ownerId, c.id);
   const related = await getCapturesByIds(db, session.ownerId, [
     ...dups.exact.map((d) => d.id),
     ...dups.similar.map((d) => d.id),
@@ -112,6 +114,14 @@ export default async function CaptureDetailPage({
           <span>수정 {c.revision}</span>
         </p>
         {c.userNote ? <p className="note">메모: {c.userNote}</p> : null}
+        {importOrigin ? (
+          <p className="note">
+            가져온 사본: {IMPORT_KIND_LABEL[importOrigin.sourceKind as ImportSourceKind] ?? importOrigin.sourceKind}
+            {importOrigin.outcome === 'versioned' ? '(새 버전)' : ''} · 원래 경로 <span className="hash">{importOrigin.externalPath}</span>
+            {importOrigin.externalCreatedText ? ` · 원본 생성 표시 ${importOrigin.externalCreatedText}` : ''} ·{' '}
+            <Link href={`/imports/${importOrigin.runId}`}>가져오기 기록</Link> (원본 파일은 바뀌지 않았습니다)
+          </p>
+        ) : null}
         {sourceUrl ? (
           <p className="note">
             출처 URL:{' '}

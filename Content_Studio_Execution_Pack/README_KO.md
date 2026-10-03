@@ -485,6 +485,17 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 오류: 코드 교환 중 끊김·시간 초과·5xx 는 **결과 불명**(코드가 소비됐을 수 있음) — 다시 보내지 않고 400 `oauth_exchange_failed`(`outcome: unknown`), 감사 `outcome_ambiguous=yes`. 손에 받은 토큰이 없으므로 저장·정리 대기·철회할 것이 없다 — 설정에서 다시 연결한다. 이미 쓴 코드 → `invalid_grant`, 앱 ID·시크릿 거부 → `invalid_client`, 190 → `invalid_token`(463 만료 · 458/460 철회), 10·200번대 → `scope_not_allowed`, 429·4/17/32/613 → 요청 제한(`provider_error`).
 - API: `POST /api/channel-accounts`(본문 `platform=threads`, `kind=live` — 연결 전 실제 Threads 행, 같은 출처·로그인, 멱등). 첫 실제 연결이 `pending:<uuid>` 를 프로필 ID 로 묶는다. 같은 owner 의 다른 행이 이미 그 프로필에 묶여 있으면 409 `oauth_account_duplicate`, 묶인 행에 다른 Threads 계정이 돌아오면 409 `oauth_account_mismatch`(저장 안 함).
 
+### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
+**Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.
+- 화면: 상단 메뉴 `가져오기`(`/imports`) → ZIP 올리기(최대 50MB, 원본 종류 자동 판별 | Notion | Drive) → **미리보기**(`/imports/<id>`) → 항목·폴더 선택 → `선택한 항목 가져오기` | `이 미리보기 취소`. 실행 기록은 `/imports` 아래 표.
+- 받는 파일: Notion "Markdown & CSV" 내보내기 ZIP(파일 이름 끝 32자리 페이지 ID 를 외부 ID 로), Drive 폴더 "다운로드" ZIP(경로를 외부 ID 로). 안쪽 ZIP(Part-1.zip 등)은 **한 겹만** 연다. 가져오는 것은 텍스트 `.md`·`.markdown`·`.txt`·`.html`·`.htm`·`.csv` 뿐 — 이미지·첨부·`.docx` 등은 **목록에만**(건너뜀, 풀지 않음). `.md`·`.txt`·`.csv` 는 원문 그대로, `.html` 은 텍스트만 소재 원문이 된다. 제목은 첫 `# 제목`(HTML 은 h1·title) 또는 파일 이름, 원본의 `Created: …` 같은 생성 표시는 해석하지 않고 그대로 보인다.
+- 안전: 위험한 경로(`..`·절대 경로·역슬래시·드라이브 문자)가 하나라도 있으면 **ZIP 전체를 거부**(파일을 디스크에 풀지 않음), 암호화·ZIP64·분할 ZIP 거부, 압축은 저장·deflate 만. 상한: 항목 5,000개 · 텍스트 파일 하나 2MB · 풀린 텍스트 합계 64MB · 가져올 항목 1,000개 · 소재 원문 20,000자(넘으면 그 항목만 건너뜀). deflate 는 목록의 크기까지만 풀고 CRC-32 를 확인한다.
+- 미리보기는 소재·출처를 만들지 않는다(원장 `import_runs`·`import_items` 만 — 본문 없음). 판정: **새 항목** / **이미 가져옴(동일)** = 같은 외부 ID·같은 원본 sha256 이 어떤 버전에 있음 → 다시 가져오지 않음 / **충돌** = 같은 외부 ID, 내용 다름 → **덮어쓰지 않는다**(기본 건너뜀, `새 버전으로 추가`를 직접 체크할 때만 기존 출처에 출처 버전 + 새 소재) / **건너뜀** = 지원하지 않음.
+- 확정은 미리보기를 믿지 않는다: 보관한 ZIP 을 다시 읽어 sha256 이 다르면 409 `import_file_changed`, 항목 checksum 이 달라졌으면 그 항목 `failed_changed`. 만든 소재는 입력 종류 `파일`, 원문 불변(T03 규칙 그대로), 출처(`sources.kind`=`notion_export`|`drive_export`, 외부 ID)·출처 버전(`raw_hash` = 원본 파일 sha256, `extraction_state`=`imported`)과 연결되고, 소재 상세에 "가져온 사본 · 원래 경로" 가 보인다. 기존 소재의 원문·제목·메모는 바꾸지 않는다. 확정·취소 뒤 보관 ZIP(`IMPORT_LOCAL_DIR`, 기본 `./data/imports`)은 지운다.
+- API: `POST /api/imports/preview`(multipart `file`+`source_kind` | `application/zip` 본문 + `?kind=` | JSON `{source:'mock_connector'}`), `GET /api/imports`, `GET /api/imports/{id}`, `POST /api/imports/{id}/commit`(JSON `{item_ids, folders, version_ids}` 또는 폼 `item`·`folder`·`version` 여러 개 — 아무것도 고르지 않으면 400), `POST /api/imports/{id}/cancel`. 모두 로그인·같은 출처 확인·owner 범위(다른 owner → 404).
+- 커넥터: `ImportConnector`(listScope·fetchItem) 인터페이스와 **모의 구현만**. `IMPORT_CONNECTOR_MODE=disabled`(기본 — 화면 "준비 중(모의)", API 503 `import_connector_disabled`) | `mock`(합성 예시 3건, 외부 호출 0). live 값은 설정에서 거부된다.
+- 내보내기·복원: `import_runs`·`import_items` 는 묶음에 들어가고 그대로 복원된다(가져온 소재의 출처 이력). 복원한 환경에는 보관 ZIP 이 없으므로 복원된 "미리보기" 실행은 확정할 수 없다(409 `import_file_missing` — 취소만).
+
 ### 검증 명령
 | 명령 | 내용 | 기대 |
 | --- | --- | --- |

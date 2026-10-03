@@ -23,6 +23,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <Link href="/distribute">배포함</Link>
           <Link href="/search">검색</Link>
           <Link href="/brand">브랜드</Link>
+          <Link href="/imports">가져오기</Link>
           <Link href="/ops">운영</Link>
           <Link href="/settings">설정</Link>
         </nav>

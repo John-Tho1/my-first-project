@@ -108,3 +108,63 @@
 4. 공개 URL 을 "생성 직후 철회"하는 수명 규칙과, URL 을 어디에도 기록하지 않는 것(결과 불명 뒤 조회는 컨테이너 ID 만 씀)이 A08·개인정보 규칙에 충분한가? 철회 실패(프로세스 종료)로 남는 모의 URL 은 10분 만료에만 기댄다.
 5. 승인 전 검사를 트랜잭션 밖에서(파일 헤더 읽기) 한 뒤 트랜잭션 안의 거절 목록에 합치는 순서가 안전한가? 항목 payload 불변·계정 변경은 `snapshotProblems` 가 따로 잡는다는 전제.
 6. Instagram 계정의 공개 범위를 public 만 허용하고 결과를 `PUBLISHED/public` 으로 기록하는 것(계정이 비공개 계정이어도)이 "원격이 보고한 공개 범위만 기록" 원칙(A12 계열)과 충돌하지 않는가 — 모의에서 계정 공개 여부를 조회해 기록해야 하는가?
+
+## FIX round 1 (Codex review-T16)
+- Orchestrator: HEAD_SHA 165f0df (code only, D28) — reran lint·typecheck·build·unit 809·integration 623·drill:mock 0·db:migrate 0037·real-DB drill:restore PASS.
+- 판정 원본: 로컬 `.handoffs/review-T16.md`(CHANGES_REQUESTED, 리뷰 대상 620ed86 — P0 2건·P1 1건 + 질문 답·놓친 케이스). 범위: 모의 어댑터·모의 시뮬레이터·모의 공개 URL 만, 외부 호출 0, 새 의존성 0, 실계정·비밀 0.
+- BASE_SHA: 49e624c · HEAD_SHA: TBD(오케스트레이터 커밋 — 이 파일은 커밋하지 않음)
+- migration: **0037_t16_fix1_ig_parent_request**(drizzle-kit 출력 그대로 + 머리 주석 — remote_steps kind/kind_status CHECK 에 `ig_parent_request`(created 만) 추가. 트리거·`remote_id LIKE 'mock%'` 그대로).
+
+### 지적 → 변경 → 시험
+1. **[P0] instagram-mock.ts:257 — 실제로 읽은 이미지 바이트를 승인 checksum 과 비교하지 않음**
+   - 변경: 어댑터 `submit` 이 규격 재검사 뒤, **컨테이너를 하나도 만들기 전에** 이미지마다 파일 전체를 읽어 sha256 을 계산하고 승인 스냅샷 checksum 과 비교한다(`verifiedImageFiles`). 하나라도 다르면 `rejected / permanent / asset_checksum_mismatch:<order>`(원격 호출 0·공개 URL 발급 0), 읽기 실패·길이 다름은 `asset_read_failed:<order>`. 같으면 **확인한 바이트의 메모리 사본**을 파일 창구로 만들어 공개 URL 창구(`publicMedia.issue`)에 넘긴다 — 확인 뒤 저장소 파일이 바뀌어도 원격이 받는 바이트는 승인한 것(TOCTOU 차단). 이미 `ig_publish` 가 기록된 작업은 파일 검사보다 먼저 링크 확인으로 간다(게시 뒤 파일이 바뀌어도 원격 사실을 FAILED 로 덮지 않음).
+   - 시험: 단위(`instagram-mock.test.ts` FIX-T16 절) — **실제 `mediaPortFor` 처럼 메타데이터만 비교하는 창구**(`metaOnlyMedia` — 기존 `memMedia` 는 바이트를 해시해 차이를 가렸다)로 단일 이미지 바이트 변경 → `asset_checksum_mismatch:1`·원격 호출 합계 0·URL 0·단계 0; 캐러셀 3장 중 2번째만 변경 → `asset_checksum_mismatch:2`·자식 컨테이너 0; 확인 직후 저장소 변경 → 원격이 받은 sha256 = 승인 checksum; 게시 뒤 파일 변경 → 재확인은 accepted 그대로·게시 1. 통합(`instagram.test.ts`) — **실제 `mediaPortFor` + LocalStorageAdapter** 에서 승인 뒤 저장소 바이트만 같은 길이로 바꿈(DB checksum 그대로) → FAILED `asset_checksum_mismatch:1`·컨테이너·URL 0·1시간 뒤에도 의도 1; 캐러셀 2번째 → `asset_checksum_mismatch:2`·컨테이너 0. drill 행 추가.
+2. **[P0] instagram-mock.ts:225 — 적용된 쓰기 5xx 를 "부작용 없음"으로 분류해 다시 요청**
+   - 변경: (a) 분류 — 쓰기(`createImageContainer`·`createCarouselContainer`·`publish`)의 5xx 는 부작용 표시(생략·none·unknown)와 **무관하게** `ambiguous / transient_unknown_side_effect / server_error_side_effect_unknown` → 조회(A08). 응답만으로 "적용 안 됨"을 증명할 수 없으므로 직접 재시도하지 않는다 — 조회가 not_found·resumable 을 확인한 뒤에만 다음 시도. 읽기 5xx 는 그대로 재시도(`transient_no_side_effect`). (b) 시뮬레이터 — applied 장애는 오류에 `sideEffect: 'unknown'` 을 싣고, `applied: true` + `sideEffect: 'none'` 모순은 `injectFault`·호출별 fault 모두 거부(throw).
+   - 시험: 단위 — 분류 표(쓰기 3종 × 부작용 표시 3종 → ambiguous, 읽기 4종 → 재시도), 모순 주입 거부·applied 5xx 의 sideEffect unknown; 게시 5xx(적용됨) → ambiguous → 조회 found·게시 호출 1·미디어 1, 그 뒤 재시도도 게시 0; 게시 5xx(적용 안 됨) → 조회 resumable → 같은 컨테이너로 게시(컨테이너 1); 컨테이너 생성 5xx(적용됨, 기록 없음) → 조회 not_found → 새 컨테이너로 게시 1번(고아 컨테이너는 게시되지 않음, 철회 안 된 URL 0). 통합 — 게시 5xx 적용 → RECONCILING(publication 0) → CONFIRMED·게시 호출 1·의도 1; 컨테이너 생성 5xx 적용 → RECONCILING → CONFIRMED(원격 컨테이너 2·기록된 컨테이너 = 게시된 컨테이너). drill 행 2개 추가.
+3. **[P1] instagram-mock.ts:908 — 캐러셀 부모 생성 응답을 잃으면 이미 쓰인 자식으로 부모를 다시 만듦**
+   - 변경: 새 단계 종류 `ig_parent_request`(post_index 0, status created, remote_id `mockig_req_<uuid>` — 원격 ID 가 아닌 이 앱의 모의 상관 값, migration 0037). 부모 생성 **원격 호출 전에** 표식을 기록한다(재시도는 같은 표식 — remote_id 불변). 시뮬레이터에 읽기 조회 `findCarouselByChildren(children)`(같은 자식 목록의 부모 → {id,status}, 없음 확실 → null, 자식을 모르거나 자식이 다른 부모에 쓰였으면 not_found 오류 — **모의 가정**, 실제 API 에 같은 조회가 있는지 live 전 확인). 표식이 있고 부모 ID 가 없으면: submit·reconcile 모두 **기록한 자식(전부·순서대로)으로 부모를 찾아** `ig_container:0` 으로 기록 → 기존 판정(FINISHED 미게시 → resumable·같은 부모로 게시, PUBLISHED → 미디어 찾아 found). null(부모 없음 확실) → 기존 자식 판정(resumable `carousel_parent_not_created`) → 다음 시도가 부모 생성. 찾기 실패 → reconcile `unknown`(`parent_lookup_<code>`), submit `ambiguous`(새 부모를 만들지 않음). 표식이 없으면 부모를 요청한 적 없음(표식이 원격 호출보다 먼저) → 기존 판정. 자식 수 ≠ 승인 이미지 수인데 표식만 있으면 unknown.
+   - 시험: 단위 — 부모 생성 timeout(적용됨) → 단계 `ig_container:1,2 + ig_parent_request:0` → 조회가 부모를 찾아 기록 → resumable → 같은 부모로 게시(부모 생성 1·게시 1·이미지 순서 = 승인); 조회 없이 바로 재시도해도 찾기 → 두 번째 부모 0(`invalid_children` 없음); timeout(적용 안 됨) → 찾기 null → resumable(부모부터) → 부모 생성 2회 호출·원격 컨테이너 3·표식 1; 부모 생성 직후 `ig_container:0` 기록 실패(DB 예외) → submit 예외 → 조회가 부모를 찾아 기록 → 게시 1; 부모 유실 뒤 원격 재시작 → 조회 `unknown(parent_lookup_container_not_found)`·재시도 ambiguous·부모 생성 0·게시 0. 통합 — 부모 응답 유실 → RECONCILING(단계 `ig_container:1,2 + ig_parent_request:0`) → CONFIRMED(부모 생성 1·원격 컨테이너 3·미디어 1·sha256 순서 = 승인), 0037 CHECK(표식 상태 finished 로 바꾸기 거부); 부모 유실 뒤 원격 재시작 → UNKNOWN(부모 생성·게시 0·publication 0). 캐러셀 성공 경로의 단계 순서 기대값에 `ig_parent_request:0` 이 들어갔다(단위·통합 — 기대를 늘린 것, 약화 아님). drill 행 추가.
+4. **놓친 케이스 중 저렴한 것**
+   - **MIME 메타데이터 ↔ 실제 헤더 불일치**: `instagramMediaFacts` 가 헤더로 읽은 형식이 기록 MIME 과 다르면 `media_spec:mime_mismatch:<order>`(승인 전·보내기 직전 모두). 형식 허용 판단은 둘 중 하나라도 허용 밖이면 허용 밖(PNG 를 image/jpeg 로 기록 → mismatch + not_allowed; JPEG 를 image/png 로 기록 → mismatch + not_allowed). 화면 문구 추가. 시험: 도메인 단위(PNG·WebP 를 image/jpeg 로), 통합 기존 PNG 시험에 mismatch 기대 추가.
+   - **잘못된 JPEG SOF 길이**: SOF 길이 < 11 이거나 머리가 잘렸으면 `imageDimensions` → null(크기를 추측하지 않음 → dimensions_unreadable). 도메인 단위 시험.
+   - **승인 전 검사 ↔ 트랜잭션 사이 계정 연결 변경**(Codex Q5): `instagramSpecCheckForItems` 가 문제 목록과 함께 **검사한 것**(`항목 ID:payload hash`)을 돌려주고, `approveItems` 트랜잭션은 계정(FOR SHARE) 잠금 뒤 `instagramUncheckedInTx` 로 지금 계정 상태가 mock_instagram 인데 그 항목·hash 를 검사하지 않았으면 `media_spec:unchecked`(fail closed). seed 계정(연결 없음)은 영향 없음. 시험: 통합(검사 안 함 → unchecked, 같은 hash 검사함 → 없음, 다른 hash → unchecked, seed 계정 → 없음). asset 상태 변경(삭제·미검증)은 보내기 직전 `mediaPortFor`(VERIFIED·삭제 안 됨) + 이번 checksum 확인이 막는다(승인 트랜잭션 안 재검사는 하지 않음).
+   - **URL 철회 검증이 TTL 에 가려짐**: 공개 URL 창구에 `unrevokedCount()`(철회하지 않은 발급 기록 수 — TTL 무관). drill 의 행별·끝 검사와 통합 비밀 시험이 `activeCount` 대신(또는 함께) 이것을 본다(drill 은 tick 뒤 시계를 20분 옮겨 10분 URL 의 철회 누락을 놓쳤다).
+   - **Q6 공개 범위**: 시뮬레이터 `getMedia` 가 게시 때 계정 공개 범위(`visibility`, 모의 기본 public — `setAccountVisibility` 로 시험이 바꿈)를 돌려주고, 어댑터 accepted·조회 found 가 그 값을 `remote_visibility` 로 기록(고정 public 아님). 단위: private 계정 → accepted·found 모두 `private`. 계획 규칙(public 만 요청)은 그대로.
+   - **화면 공개 범위 기본값**: 계획 화면이 `accs.some(...)` 대신 **처음 선택되는 계정**(이전 입력 계정 또는 첫 계정)으로 기본값을 정한다(`defaultVisibilityFor`). 서버 규칙(생략 → 계정별)은 그대로. 표시 전용 — 화면 시험 없음(계정을 바꾸면 서버가 다시 판정).
+   - 화면 단계 문구: `캐러셀(부모) 생성 요청 · 요청 표식(원격 ID 아님 — 응답을 잃으면 자식으로 부모를 찾음) · mockig_req_…`(web 단위 시험).
+
+### 명령과 결과 (로컬 Windows 10, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함)
+- `corepack pnpm exec drizzle-kit generate --name t16_fix1_ig_parent_request`(packages/db) → 0037 생성(스키마 diff 그대로 + 머리 주석)
+- `pnpm lint` → pass(exit 0)
+- `pnpm typecheck` → pass
+- `pnpm build` → pass(개발 서버 꺼진 상태)
+- `pnpm test` → pass 42 files / 809 tests
+- `pnpm test:integration`(단독) → pass 32 files / 623 tests, 414.2 s (instagram.test.ts 23건 — FIX 7건 추가)
+- `pnpm drill:mock` → exit 0, `불변식 위반 0건 — M3 게이트 통과(MOCK), T14 Threads 모의 불변식 통과(MOCK), T15 YouTube 모의 불변식 통과(MOCK), T16 Instagram 모의 불변식 통과(MOCK)`, Instagram fetch 0, Instagram 행 14 → 18
+- 실행하지 않음: 개발 서버·브라우저 smoke(화면 기본값 변경은 수동 확인 안 함), 실제 PostgreSQL 동시성, `pnpm db:migrate`(파일 DB — `./data` 를 열지 않음; 0037 은 통합·drill 의 메모리 DB 적용으로만 확인), `drill:restore`, Codex 재검증.
+
+### drill:mock Instagram 표(추가 행)
+| 시나리오(Instagram 모의) | 이미지 | 최종 job 상태 | 항목 상태 | intent 수 | 컨테이너 | 게시 | publication(MOCK) | 재게시 |
+|---|---|---|---|---|---|---|---|---|
+| 저장소 바이트 변경(캐러셀 2번째, 같은 길이) → checksum 불일치 FAILED | 3 | FAILED | FAILED | 1 | 0 | 0 | 없음 | 없음 |
+| 게시 5xx(원격은 게시함) → 조회로 확인 | 1 | CONFIRMED | CONFIRMED | 1 | 1 | 1 | MOCK PUBLISHED/public | 없음 |
+| 컨테이너 생성 5xx(원격은 만듦·기록 없음) → 조회 not_found → 새 컨테이너 | 1 | CONFIRMED | CONFIRMED | 2 | 1 | 1 | MOCK PUBLISHED/public | 없음 |
+| 캐러셀 부모 생성 응답 유실 → 요청 표식으로 부모 찾아 게시 | 3 | CONFIRMED | CONFIRMED | 2 | 4 | 1 | MOCK PUBLISHED/public | 없음 |
+(기존 14행은 위 표와 같은 값 그대로. 캐러셀 행의 컨테이너 수는 ig_container 만 센다 — 표식 ig_parent_request 는 세지 않음.)
+
+### 남은 위험
+- `findCarouselByChildren` 은 **모의 가정**이다. 실제 Instagram 에 "자식 → 부모 컨테이너" 조회가 없으면 live 어댑터는 표식이 있고 부모 ID 가 없을 때 항상 unknown 이 된다(안전 쪽 — 이중 게시 없음, 대신 수동 확인 필요).
+- checksum 확인은 이미지 전체를 메모리에 올린다(최대 10장 × 8MiB 잠정 = 80MiB/작업). 모의 범위에서는 문제 없지만 live·동시 작업에서는 스트리밍 해시 + 서명 URL 로 바꿔야 할 수 있다.
+- 쓰기 5xx 를 모두 결과 불명으로 보내 조회 왕복이 늘었다(적용 안 된 5xx 도 조회 1회 뒤 재시도 — 시도 수 1 증가). 의도된 비용.
+- 게시 5xx 적용 뒤 조회가 `findPublishedByContainer` 에 기대는 것은 기존과 같다(원격 재시작이면 unknown).
+- 컨테이너 생성 5xx 적용(기록 없음)은 여전히 고아 컨테이너를 남긴다(게시되지 않음 — 이중 게시 없음). 단일 이미지 컨테이너 생성 전에는 표식을 두지 않았다(고아 컨테이너는 게시 위험이 없으므로).
+- 계획 화면 공개 범위 기본값은 처음 선택된 계정 기준일 뿐, 사용자가 계정을 바꾸면 기본값이 따라오지 않는다(JS 없음). 서버가 instagram_visibility_public_only 로 막는다.
+- 0037 은 기존 묶음(0036 이전 단계 종류)과 호환(허용값 추가만). 0037 이전 앱으로 `ig_parent_request` 를 담은 묶음을 복원하면 zod enum 에서 거부된다(앞 방향 호환 없음 — 기존 규칙과 같음).
+
+### Codex 에게 질문
+1. 쓰기 5xx 를 부작용 표시와 무관하게 모두 결과 불명(조회)으로 바꾼 것이 docs/03 "부작용 없음이 확실할 때만 재시도"와 맞는가 — 아니면 원격이 명시한 not-applied(예: 특정 오류 코드)를 직접 재시도 가능한 예외로 남겨야 하는가?
+2. 캐러셀 부모 표식(`ig_parent_request`, 원격 호출 전 기록)과 자식 목록 조회의 조합이 A08 을 만족하는가? 표식 없음 = "요청한 적 없음"으로 보는 전제(표식 기록이 원격 호출보다 먼저, 기록 실패면 호출하지 않음)에 빈틈이 있는가?
+3. checksum 확인을 매 submit(재개 포함)마다 전 이미지에 대해 하는 것과, 이미 만든 자식 컨테이너가 있는 재개에서도 파일이 바뀌면 FAILED 로 닫는 것이 적절한가(게시 단계가 있으면 확인만)?
+4. `instagramUncheckedInTx` 가 계정 상태만 다시 보고 asset 상태(삭제·미검증)는 트랜잭션 안에서 다시 보지 않는다 — 보내기 직전 검사로 충분한가?
+5. MIME 불일치 판정(둘 중 하나라도 허용 밖이면 not_allowed + mismatch)이 승인 전 거절 사유로 적절한가, 아니면 mismatch 만으로 충분한가?

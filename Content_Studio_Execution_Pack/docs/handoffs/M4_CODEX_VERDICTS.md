@@ -94,3 +94,8 @@ CHANGES_REQUESTED
 - T15: 427dc71 → **FIX1 cc26535 PASS**
 - 화면: S1–S3 f2bb3b9 PASS · G1·G2 fa37b1a → 2fed5b4 → **cd0a2aa PASS** (S4·S5 8d2cc64 의 지적은 2fed5b4 에서 반영)
 - 업로드 세션 가림: 0c86db2 → **75dd988 PASS**
+
+## T16 (620ed86, Instagram — 모의) — CHANGES_REQUESTED (P0 2·P1 1)
+- [P0] packages/providers/src/instagram-mock.ts:257 — 실제 읽은 이미지의 checksum을 승인된 checksum과 비교하지 않고 게시한다
+- [P0] packages/providers/src/instagram-mock.ts:225 — 적용된 쓰기 5xx 장애가 부작용 없음으로 분류되어 게시를 다시 요청한다
+- [P1] packages/providers/src/instagram-mock.ts:908 — 캐러셀 부모 생성 응답을 잃으면 이미 사용된 자식으로 부모를 다시 생성하려 한다

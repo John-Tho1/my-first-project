@@ -65,3 +65,53 @@
 4. 판정 규칙: "받아들인 적 있는 키" 만 중복으로 보고 버린 미리보기는 다시 new 로 보이는 것, existing_capture 를 받아들인 적 없는 키에만 적용하는 것, updated 를 새 소재로 만드는 것이 docs/01 "출처·날짜가 다른 관찰은 자동 삭제하지 않음"·원문 불변과 맞는가?
 5. 내보내기·복원: 복원 때 `collector_sources.enabled=false` override + add_missing 비교에서 운영 열 제외(enabled·last_run_at·last_status·updated_at)가 다른 표의 규칙(D17~D19, channel_accounts)과 일관적인가? 원본 조각을 `source_version_originals`(format 'txt' 에 XML 조각) 로 재사용한 것이 T18 의 의미(가져온 파일 원본)와 섞여 문제를 만드는가?
 6. 주기 실행: COLLECTOR_SCHEDULER=on 이어도 미리보기만 만들고 web inline tick(요청 처리 중)에서도 돈다 — inline 모드에서 web 요청 지연·모의 외 경로가 생길 여지는 없는가? "자동 수락 없음" 이 서버 쪽에서 충분히 강제되는가(받아들이기는 사용자 요청 경로 하나뿐)?
+
+---
+
+## FIX round 1 (Codex review-T19)
+- Orchestrator: HEAD_SHA 66e1257 (code only, D28) — reran lint·typecheck·build·unit 1266·integration 737·drill:mock 0·db:migrate 0042·real-DB drill:restore PASS.
+- 대상 판정: `.handoffs/review-T19.md`(CHANGES_REQUESTED, BASE 1808c65 → HEAD 4a2e02f).
+- BASE_SHA: 9aaeda2 · HEAD_SHA: TBD(커밋 안 한 작업 트리 — 오케스트레이터가 커밋)
+- Implementer: Claude Code. 네트워크 0·live fetcher 없음·수집 기본 꺼짐 그대로. 새 의존성 0. migration 0042. `./data` 열지 않음, dev 서버 꺼짐.
+- 건드리지 않음: `docs/DECISIONS.md`, `docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md`, `M4_CODEX_VERDICTS.md`(작업 전부터 작업 트리에서 수정된 상태 — 이 작업 변경 아님), `M4_STATUS.md`, 다른 handoff.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+|---|---|---|
+| [P0] `domain/collector.ts:605` BOM 있는 HTML 원본 바이트가 디코딩·재인코딩돼 보존되지 않음 | `FeedItem.raw: string` 을 없애고 `rawBytes: Uint8Array`(응답 바이트)로 바꿈. 페이지 = 응답 바이트 전체 복사본(BOM·CRLF·charset 선언 무관). 피드 = 응답을 `TextDecoder(fatal, ignoreBOM:true)` 로 디코딩해 문자열 위치와 바이트 위치를 1:1 로 맞춘 뒤 `<item>`/`<entry>` 구간을 **원본 바이트에서** 자름(`byteSlicer` — 앞에서 뒤로 이어 세는 선형). 텍스트 추출은 따로(BOM 제거 후 htmlToText). `toCandidate` 의 `raw_sha256`·`byte_size` 는 그 바이트로 계산, `createCollectedCapture` 는 그 바이트를 그대로 base64 로 `source_version_originals` 에 저장(0039 CHECK·트리거가 sha256 = raw_hash 재확인). 실제 UTF-8 아닌 바이트(windows-1251 등)는 텍스트를 만들 수 없어 예전처럼 `feed_not_utf8`(실행 failed·쓰기 0) | 단위: 피드 BOM+CRLF+한글·이모지 — 항목 바이트 = 응답 구간 `Buffer.compare` 0, sha256·크기 일치, CRLF 유지; 페이지 BOM+CRLF+`<meta charset="windows-1251">` — 원본 = 응답 전체, sha256·크기, 텍스트·제목에 BOM 없음, 원본은 복사본; cp1251 바이트 → feed_not_utf8. 통합: BOM 페이지 수집→수락 → DB 원본 base64 디코딩 = 응답 바이트(BOM 3바이트 포함), `format html`·`byte_size`·`sha256`·`source_versions.raw_hash`·원장 `byte_size` 일치, **내려받기 `/api/imports/originals/<버전>` 응답 바이트 = 응답 바이트**·`x-content-sha256`; BOM+CRLF 피드 수락 → 원본 = 응답의 `<item>` 구간; cp1251 페이지 실행 failed/feed_not_utf8·쓰기 0 |
+| [P1] `0041:31` accepted CHECK 가 NULL outcome + 채워진 연결 필드를 허용 | 새 migration **0042**(`0042_t19_fix1_collected_accepted.sql`, drizzle-kit 생성 + 머리말·앞 검사): CHECK 를 NULL 에 안전한 식으로 — `((outcome is not distinct from 'accepted') = (capture_id is not null)) and (… = (source_version_id is not null)) and (… = (accepted_at is not null))`(어느 항도 NULL 이 되지 않음). 앞 검사 `DO $$ … RAISE EXCEPTION` — 새 규칙을 어기는 기존 행이 있으면 **데이터를 바꾸지 않고** 멈춤(앱 경로는 이런 행을 만들지 않음 — 있으면 사람이 확인). `schema.ts` 같은 식. 묶음 검사(`bundle.ts checkIntegrity`)에도 같은 규칙 + "새 항목만 outcome" 추가(복원 전에 거부) | 통합(직접 SQL): 받아들인 행을 복사한 INSERT 5종(outcome null+연결, null+시각만, not_selected+연결, accepted+시각 없음, accepted+소재 없음) → 모두 `collected_items_accepted_chk` 위반, `UPDATE … set outcome = null` 위반, 정상 형태(null·연결 없음) INSERT 는 통과(지움), 원래 행 그대로. 단위: 묶음 integrity 7종 |
+| [P1] `db/collector.ts:552` 기한 판정 전 50개 제한 → 기한 지난 daily 소스 굶음 | 기한을 SQL 에서 먼저 판정: `enabled and schedule in ('daily','weekly') and (last_run_at is null or last_run_at + case schedule when 'daily' then 24h when 'weekly' then 7d end <= now)`, 정렬 = 기한(`last_run_at + 주기`) 오래된 순(처음은 맨 앞) → id, `LIMIT max`(50 고정 제거). `isScheduleDue` 로 한 번 더 확인 | 통합: 다른 owner 에 기한 전 weekly 55개(이틀 전 실행) + 25시간 전 daily 1 + 24h−1초 경계 1 → tick(max 3)에 daily 만 실행(preview), weekly 55·경계 0; 1초 뒤 tick 에 경계 소스 실행(>= 24h 경계 = domain 규칙과 같음). 끝나면 B 소스 끔 |
+| [P1] `db/collector.ts:396` 다시 읽을 때 바뀐 상대 링크 해석 결과를 검사 안 함 | (1) `parseFeed` 가 링크가 원문에서 상대였는지(`linkRelative` — `/x`·`x`·`//host/x`) 표시. (2) 새 순수 함수 `applyLinkPolicy(cands, allowlist)`: 상대 링크를 최종 URL(redirect 뒤) 기준으로 푼 결과에 `checkCollectorUrl(link, owner 허용 목록)` — 통과 못 하면 `blockedLink`(미리보기 skipped/blocked_link). 실행·다시 읽기 모두 `fetchCandidates` 에서 적용. 절대 링크는 예전대로 내부 주소만 막음(다른 사이트 글 링크는 조회하지 않는 출처 표시용). (3) 받아들이기: 다시 읽은 항목의 `link`·`link_normalized` 가 원장과 다르거나 `blockedLink` 면 `failed_changed`(원본 조각·checksum 이 같아도) | 단위: `/posts/1` 통과, `//evil…/x` 차단, 절대 다른 사이트 링크 통과, 판정 reason, 허용 목록 밖 호스트 차단. 통합: 같은 호스트 redirect `/old/feed.xml` → `/new/feed.xml` 로만 바뀐 같은 `<item>`(`<link>post/1</link>`) 수락 → failed_changed(raw_sha256·checksum 은 원장과 같음)·쓰기 0; `//evil.mock.example/x` → blocked_link, 고르면 400, 그 주소 미요청 |
+| [P2] `domain/collector.ts:318` 엔티티·속성 사전이 Object.prototype 을 상속 | 기본 엔티티 표를 `Map` 으로(`PREDEFINED.get`). 속성 사전은 `Object.create(null)` + 중복 검사 `Object.hasOwn` | 단위: `&toString; &valueOf; &__proto__; &constructor; &hasOwnProperty; &isPrototypeOf; &propertyIsEnumerable;` 가 decode·parseXml 모두 글자 그대로(함수 문자열·`[object` 없음), 속성 `toString`·`constructor`·`__proto__`·`hasOwnProperty`·`valueOf` 를 일반 키로 저장(프로토타입 null), 진짜 중복만 거부, `attrs.type` 상속값 없음 |
+
+### 놓친 케이스 중 함께 처리(값싼 것)
+- **파싱 실패 경로 계측**: `parseXml` 이 `finally` 에서 steps 를 더함(예전에는 정상 반환 때만) — 시험 주석과 구현이 이제 일치. 단위: 거부된 입력도 steps ≥ 1000.
+- **Atom 기본 text·XHTML**: type 없음 = text(RFC 4287, 예전에는 HTML 로 해석), `html`/`text/html` = HTML, `xhtml` = 안쪽 XHTML 조각(원문 구간)에서 htmlToText(script 제외). 제목도 같은 규칙. 단위 1.
+- **수락 후 화면 문구**: `/collect/runs/[id]` 상단 안내가 상태별(preview: 고르라는 안내, accepted: "결과" 열 안내, 그 밖: 소재 없음). build·typecheck 만(브라우저 확인 안 함).
+- 모의 어댑터 fixture 가 `Uint8Array` 본문을 받음(BOM·비 UTF-8 바이트 시험용, 그대로 복사해 돌려줌).
+
+### 변경 파일
+`packages/domain/src/collector.ts`, `packages/domain/src/collector.test.ts`, `packages/domain/src/bundle.ts`(CRLF 유지), `packages/domain/src/bundle.test.ts`, `packages/db/src/collector.ts`, `packages/db/src/schema.ts`(CRLF 유지), 새 `packages/db/drizzle/0042_t19_fix1_collected_accepted.sql` + `meta/0042_snapshot.json` + `meta/_journal.json`, `packages/providers/src/collector-mock.ts`, `apps/web/app/collect/runs/[id]/page.tsx`, `tests/integration/collector.test.ts`.
+
+### 명령과 결과 (로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `drizzle-kit generate --name t19_fix1_collected_accepted`(packages/db): 0042 생성(DROP/ADD CONSTRAINT 2문), 머리말 2줄 + 앞 검사 DO 블록만 덧붙임.
+- `corepack pnpm lint`: pass(첫 실행 1 오류 — 새 단위 시험 정규식에 BOM 글자가 그대로 들어감(no-irregular-whitespace) → `charCodeAt(0) !== 0xfeff` 비교로 고침).
+- `corepack pnpm typecheck`: pass.
+- `corepack pnpm test`(unit): pass — 53 files, 1266 tests(새: collector.test.ts FIX 8, bundle.test.ts FIX 1). 개발 중 1 실패: Atom xhtml 제목이 null — 바깥 `<title>` 태그까지 htmlToText 에 넘겨 HTML title 로 해석됨 → 안쪽 XHTML 조각만 넘기도록 코드 수정.
+- `corepack pnpm build`: pass.
+- 개발 중 단독: `vitest run --project integration tests/integration/collector.test.ts` → 27 passed(새 6). 0042 적용 확인 = NULL outcome INSERT 가 CHECK 로 거부됨(0041 식이면 통과했을 행).
+- `corepack pnpm test:integration`(혼자 실행): pass — "Test Files 36 passed (36)", "Tests 737 passed (737)", 525s, exit 0(T19 때 731 + 새 6). 로그는 세션 scratchpad(저장소 밖).
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건"(M3·T14·T15·T16 모의 불변식, Instagram fetch 0).
+
+### 남은 위험
+- 페이지 원본은 바이트 그대로지만 **텍스트는 UTF-8 만** — 실제 windows-1251·EUC-KR 등으로 인코딩된 페이지는 `feed_not_utf8` 로 실패한다(charset 선언을 따라 디코딩하지 않음 — 새 의존성 없이 하려면 TextDecoder 의 레이블 지원으로 가능하나 이번 범위 밖). 피드 항목 원본도 UTF-8 응답에서만 만들어진다.
+- 0042 앞 검사는 위반 행이 있으면 마이그레이션을 멈춘다(자동 정리 없음). 현재 앱 경로·복원 경로로는 그런 행이 생기지 않는다(복원은 묶음 검사가 먼저 거부).
+- 상대 링크만 허용 목록을 다시 본다 — 절대 링크(다른 사이트 글)는 내부 주소만 막는다(링크는 조회하지 않고 출처 표시용). 실제 수집기가 링크를 따라가 본문을 가져오게 되면 같은 정책을 그 요청에도 적용해야 한다.
+- 주기 실행 SQL 의 간격(24h·7d)은 domain `scheduleIntervalMs` 와 별도로 적혀 있다 — 통합 시험의 24h 경계와 `isScheduleDue` 재확인으로 묶었다. 기한 식은 인덱스를 쓰지 않는다(owner 당 50·전체 소스 수가 작다는 가정).
+- `XmlScanStats.steps` 는 여전히 엔티티 이름 탐색(최대 11자)·`xmlText`·`htmlToText` 비용을 세지 않는다(Codex 답 2) — 각각 상수·선형이지만 계측값은 실제 비용보다 작다.
+- 놓친 케이스 중 **처리 안 함**: 실제 PostgreSQL 에서 두 실행 동시 수락·수락/버리기 경쟁, 소스 49개에서 두 등록 동시 요청(상한 경쟁 — count 뒤 insert 라 51개가 될 수 있음), collector 출처 식별자 DB unique, `existing_capture` 를 "선택 가능한 후보"로 보여 줄지(D33 사용자 결정 3), inline tick 지연. 화면은 브라우저로 보지 않았다.
+
+### Codex 에게 질문
+1. 피드 항목 원본을 "응답 바이트에서 자른 구간"으로 정의했다(BOM 은 항목 밖이라 항목 원본에 없음, 페이지 원본에는 있음). `byteSlicer`(fatal·ignoreBOM 디코딩 → 문자열 위치 ↔ 바이트 위치)가 서로게이트 쌍·4바이트 문자·CRLF 에서 항상 정확한가? 이 정의가 docs 의 "원본 바이트 그대로 보존" 과 맞는가?
+2. 0042 의 앞 검사(위반 행 있으면 RAISE, 데이터 변경 없음)와 새 CHECK 식이 0041 의 모든 정상 상태(preview 의 outcome null, not_selected·skipped_duplicate·failed_changed, accepted)를 그대로 허용하고 위반만 막는가? 묶음 검사에 넣은 "새 항목만 outcome" 이 기존 `collected_items_outcome_chk` 와 정확히 같은 규칙인가?
+3. 상대 링크에만 허용 목록을 다시 적용하고 절대 링크는 내부 주소만 막는 경계가 A05 에 충분한가? 받아들이기에서 링크 불일치를 failed_changed 로 보는 것(새 미리보기 요구)이 Codex 제안과 맞는가, 아니면 링크 정책 실패를 별도 outcome(policy_blocked)으로 구분해야 하는가?

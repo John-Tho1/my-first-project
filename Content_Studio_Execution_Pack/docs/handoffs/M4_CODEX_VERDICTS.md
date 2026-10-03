@@ -167,3 +167,6 @@ CHANGES_REQUESTED
 - [P1] `packages/db/src/collector.ts:552` — 기한 검사 전에 50개로 제한하여 실행할 daily 소스가 계속 제외될 수 있다
 - [P1] `packages/db/src/collector.ts:396` — 재수집으로 바뀐 상대 링크의 해석 결과를 검사하지 않는다
 - [P2] `packages/domain/src/collector.ts:318` — 기본 엔티티 검사에 Object
+
+## FIX4-T18 (e6f643b, T18 round 4) — **PASS** → T18 Notion·Drive 선택 가져오기(파일·모의) 종결
+- T18: 1427118 → FIX1 6e7ff92 → FIX2 e294aca → FIX3 d9e482d → **FIX4 e6f643b PASS**.

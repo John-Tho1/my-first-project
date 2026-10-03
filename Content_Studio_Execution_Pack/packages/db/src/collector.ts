@@ -101,17 +101,21 @@ export async function createCollectorSource(db: Db, ownerId: string, input: Crea
   const check = checkCollectorUrl(input.url);
   if (!check.ok) throw new CollectorUrlBlockedError(check.reason);
   const { canonical, normalized } = normalizeUrl(check.url.href);
-  const count = await db.select({ n: sql<number>`count(*)::int` }).from(collectorSources).where(eq(collectorSources.ownerId, ownerId));
-  if ((count[0]?.n ?? 0) >= COLLECTOR_MAX_SOURCES) throw new AppError('conflict', 'collector_too_many_sources', `수집 소스는 ${COLLECTOR_MAX_SOURCES}개까지입니다`);
-  const rows = await db
-    .insert(collectorSources)
-    .values({ ownerId, kind: input.kind, url: canonical, normalizedUrl: normalized, host: check.host, label: input.label, createdAt: now, updatedAt: now })
-    .onConflictDoNothing()
-    .returning();
-  const row = rows[0];
-  if (!row) throw new CollectorSourceExistsError();
-  await recordAudit(db, { ownerId, action: 'collector.source.create', entity: 'collector_source', entityId: row.id, details: { kind: row.kind, host: row.host } });
-  return row;
+  // 개수 확인과 추가를 owner 단위 잠금(받아들이기와 같은 advisory 키) 안에서 한다 — 예전에는 count 뒤 insert 라 동시 등록 두 건이 함께 상한을 넘을 수 있었다.
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs.collector:${ownerId}`}))`);
+    const count = await tx.select({ n: sql<number>`count(*)::int` }).from(collectorSources).where(eq(collectorSources.ownerId, ownerId));
+    if ((count[0]?.n ?? 0) >= COLLECTOR_MAX_SOURCES) throw new AppError('conflict', 'collector_too_many_sources', `수집 소스는 ${COLLECTOR_MAX_SOURCES}개까지입니다`);
+    const rows = await tx
+      .insert(collectorSources)
+      .values({ ownerId, kind: input.kind, url: canonical, normalizedUrl: normalized, host: check.host, label: input.label, createdAt: now, updatedAt: now })
+      .onConflictDoNothing()
+      .returning();
+    const row = rows[0];
+    if (!row) throw new CollectorSourceExistsError();
+    await recordAudit(tx, { ownerId, action: 'collector.source.create', entity: 'collector_source', entityId: row.id, details: { kind: row.kind, host: row.host } });
+    return row;
+  });
 }
 
 export async function listCollectorSources(db: DbOrTx, ownerId: string): Promise<CollectorSourceRow[]> {

@@ -9,7 +9,7 @@ import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, count, eq, sql, type SQL } from 'drizzle-orm';
 import type { PgTable } from 'drizzle-orm/pg-core';
-import { closeDb, getDb, runDueCollectorSources, runRestoreDrill, schema, seed, type Db } from '@cs/db';
+import { closeDb, COLLECTOR_MAX_SOURCES, createCollectorSource, getDb, runDueCollectorSources, runRestoreDrill, schema, seed, type Db } from '@cs/db';
 import { contentHash, loadConfig, sha256Bytes } from '@cs/domain';
 import { DisabledPublisher, LocalStorageAdapter, MOCK_FEEDS, mockCollectorForTest, OVERSEAS_SALES_RSS } from '@cs/providers';
 import { runWorkerTick } from '@cs/worker';
@@ -754,6 +754,34 @@ describe('Codex review-FIX-T19 P2 :563 — 주간 기한은 고정 168시간(서
     } finally {
       await db.execute(sql`set time zone 'UTC'`);
       await db.update(schema.collectorSources).set({ enabled: false, schedule: 'off' }).where(eq(schema.collectorSources.ownerId, ownerB));
+    }
+  });
+});
+
+describe('T19 남은 위험 — 소스 상한 동시 등록', () => {
+  it('상한 하나 전에서 동시에 두 소스를 등록하면 하나만 들어가고 다른 하나는 collector_too_many_sources', async () => {
+    // 다른 시험이 ownerB 에 소스를 직접 넣으므로(상한 무시) 이 시험만의 owner 를 쓴다.
+    const [u] = await db.insert(schema.users).values({ allowedIdentity: 'collector-cap@example.local' }).returning();
+    const ownerC = u!.id;
+    const countC = () => n(schema.collectorSources, eq(schema.collectorSources.ownerId, ownerC));
+    try {
+      await db.insert(schema.collectorSources).values(
+        Array.from({ length: COLLECTOR_MAX_SOURCES - 1 }, (_, i) => ({ ownerId: ownerC, kind: 'rss' as const, url: `https://cap-fill.mock.example/${i}.xml`, normalizedUrl: `https://cap-fill.mock.example/${i}.xml`, host: 'cap-fill.mock.example' })),
+      );
+      expect(await countC()).toBe(COLLECTOR_MAX_SOURCES - 1);
+      const results = await Promise.allSettled([
+        createCollectorSource(db, ownerC, { kind: 'rss', url: 'https://cap-race-1.mock.example/feed.xml', label: null }),
+        createCollectorSource(db, ownerC, { kind: 'rss', url: 'https://cap-race-2.mock.example/feed.xml', label: null }),
+      ]);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0]!.reason as { code?: string }).code).toBe('collector_too_many_sources');
+      expect(await countC()).toBe(COLLECTOR_MAX_SOURCES);
+    } finally {
+      await db.delete(schema.auditEvents).where(eq(schema.auditEvents.ownerId, ownerC));
+      await db.delete(schema.collectorSources).where(eq(schema.collectorSources.ownerId, ownerC));
+      await db.delete(schema.users).where(eq(schema.users.id, ownerC));
     }
   });
 });

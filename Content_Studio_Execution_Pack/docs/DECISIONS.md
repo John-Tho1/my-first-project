@@ -432,3 +432,12 @@
 4. **D28: 현재 방식 유지** — 인계·판정 사본은 docs/handoffs/ 에 추적, docs 전용 커밋으로만.
 5. **실계정 연결 준비물: 사용자 "준비됨"** — 실제 외부 연결·호출·게시는 정확한 범위(첫 채널·첫 시험의 원고·공개 범위·호출 종류·자격 증명 위치)를 사용자가 승인한 뒤에만(AGENTS.md "Before real external connections … present exact scope for explicit approval"). 앱 ID·비밀 값은 사용자가 `.env.local` 에 직접 넣고, 대화·저장소·로그에는 남기지 않는다.
 6. **T17 추가 채널: 보류. M5 모의 작업 착수** — T18(Notion·Drive 선택 가져오기, 파일·모의), T19(허용 소스 수집, 모의 수집기·기본 OFF). T21(운영 배포)은 별도 승인.
+
+## D31 — 실계정 연결 범위 승인: Threads, 2단계(OAuth 연결·프로필 조회)까지
+- Decision ID / date: D31 / 2026-10-03, 사용자 승인("Threads로 하는데 동의 2단계까지만 진행").
+- 승인 범위(정확히):
+  1. 1단계 — Threads 실제 OAuth·연결 확인 어댑터 코드 작성. 시험은 기록된 응답(fixture)으로만, 네트워크 호출 없음.
+  2. 2단계 — 사용자 테스트 Threads 계정 1개를 실제 OAuth 로 연결: 인증 창(threads.com/oauth/authorize) → 코드 교환(POST graph.threads.com/oauth/access_token) → 필요하면 장기 토큰 교환 → 프로필 조회(/me, 필드 id·username) 1회. 요청 scope 는 `threads_basic,threads_content_publish` 만(reply·insights 요청 안 함). 토큰은 T13 규칙대로 서버 암호화 저장.
+- **승인 범위 밖(별도 승인 필요)**: 실제 게시(3단계, 컨테이너 생성·threads_publish), 다른 계정·채널, 운영 배포, 터널 등 앱을 외부에 노출하는 일.
+- 설정: `OAUTH_MODE=live`, `OAUTH_LIVE_APPROVAL_REF=D31`, `PUBLISH_MODE` 는 **disabled 유지**(게시 불가). 앱 ID·시크릿·redirect URI 는 사용자가 `.env.local` 에 직접 넣는다(대화·저장소·로그에 값 없음).
+- redirect URI: 앱 대시보드의 유효한 OAuth 리디렉션 URI 와 정확히 일치해야 함(공식 문서 2026-08-12 판 확인). 로컬 기본값 `http://localhost:3000/api/oauth/callback`. Meta 가 http 를 거부하면 HTTPS 로컬 주소가 필요 — 그때 방법을 다시 정한다(외부 노출 방식은 별도 승인).

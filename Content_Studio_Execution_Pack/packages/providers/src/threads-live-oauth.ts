@@ -20,6 +20,9 @@
  */
 import {
   isPlainRedirectUri,
+  isValidThreadsAppId,
+  isValidThreadsAppSecret,
+  LiveRefreshOutOfScopeError,
   OAuthProviderError,
   THREADS_REQUIRED_SCOPES,
   type OAuthAccountInfo,
@@ -77,44 +80,70 @@ export function parseThreadsErrorBody(body: unknown): ParsedProviderError | null
 
 const RATE_LIMIT_CODES = new Set([4, 17, 32, 613]);
 const TRANSIENT_CODES = new Set([1, 2]);
+/** 코드 교환에서 "code 무효·이미 사용"으로 아는 공급자 코드(문서 예시 400, Graph 매개변수 오류 100) */
+const INVALID_GRANT_CODES = new Set([100, 400]);
 const CLIENT_MESSAGE = /client[_ ]?secret|app(lication)? secret|invalid client|client[_ ]?id|invalid app(lication)? id|validating application/i;
 const REDIRECT_MESSAGE = /redirect[_ ]?uri/i;
 
 /**
  * 공급자 오류 → 기존 T13 코드(OAuthProviderErrorCode) + 숫자·열거 부가 정보. 메시지 원문은 분류에만 쓰고 결과에 넣지 않는다.
- * - 429·코드 4/17/32/613 → provider_error(rate_limited, retryAfterSec)
- * - 앱 ID·시크릿 거부(메시지 또는 코드 101) → invalid_client
- * - 190 → invalid_token(하위 463 = token_expired, 458·460 = token_revoked)
- * - 10·200~299 → scope_not_allowed
- * - 5xx·코드 1/2 → provider_error(server_error, 쓰기 단계면 ambiguous)
- * - 코드 교환 단계의 그 밖 4xx(문서 예: code 400 "Matching code was not found or was already used") → invalid_grant
- *   (redirect_uri 언급 → redirect_mismatch). 그 밖 4xx → invalid_request.
+ * FIX1-LIVET1(Codex review-LIVET1 P0 :104·Q2): **전송·HTTP 상태를 먼저** 본다 — 본문의 코드·문구는 그 뒤, 4xx 안에서만.
+ *  1) 429 → provider_error(rate_limited, retryAfterSec) — 공급자가 처리하지 않고 거절
+ *  2) 5xx → provider_error(server_error, 쓰기 단계면 ambiguous) — 본문이 "client secret"·"expired"·코드 101/190 이어도 결과 불명
+ *  3) 408 → provider_error(timeout, 쓰기 단계면 ambiguous)
+ *  4) 4xx 가 아닌 상태(2xx·1xx·3xx)의 오류 본문 → provider_error(malformed_response, 쓰기 단계면 ambiguous)
+ *  5) 4xx 인데 Meta 오류 본문 형식이 아님(HTML·빈 본문) → 쓰기 단계면 provider_error(http_error, ambiguous),
+ *     아니면 401 → invalid_token, 그 밖 → invalid_request
+ *  6) 4xx + 형식 맞는 오류 본문 — 코드·하위 코드: 4/17/32/613 → rate_limited, 101 → invalid_client,
+ *     190 → invalid_token(463 = token_expired, 458·460 = token_revoked), 10·200~299 → scope_not_allowed
+ *  7) (최후 수단, 4xx 안에서만) 메시지: redirect_uri 언급 → 코드 교환이면 redirect_mismatch, 앱 ID·시크릿 언급 → invalid_client
+ *  8) 코드 1/2(일시) → provider_error(server_error, 쓰기 단계면 ambiguous)
+ *  9) 코드 교환: 알려진 코드(400·100, 또는 OAuth 문자열 오류 invalid_grant)만 invalid_grant — 그 밖(401·404·405·알 수 없는 코드)은
+ *     provider_error(oauth_exception, ambiguous=false — 공급자가 4xx 로 거절했다. 원인은 providerCode·httpStatus 로 남는다)
+ * 10) 그 밖 단계: 401 → invalid_token, 그 밖 4xx → invalid_request
  */
 export function mapThreadsError(step: Step, httpStatus: number, body: unknown, retryAfterHeader: string | null = null): OAuthProviderError {
+  const write = WRITE_STEPS.has(step);
   const p = parseThreadsErrorBody(body);
   const base: OAuthProviderErrorDetail = { reason: p ? 'oauth_exception' : 'http_error', step, httpStatus };
   if (p?.code !== null && p?.code !== undefined) base.providerCode = p.code;
   if (p?.subcode !== null && p?.subcode !== undefined) base.providerSubcode = p.subcode;
   const err = (code: OAuthProviderErrorCode, extra: Partial<OAuthProviderErrorDetail> = {}) => new OAuthProviderError(code, { ...base, ...extra });
-  const code = p?.code ?? null;
-  if (httpStatus === 429 || (code !== null && RATE_LIMIT_CODES.has(code))) {
+  // 1)~4) 전송·상태 먼저(본문과 관계없이)
+  if (httpStatus === 429) {
     const ra = retryAfterHeader && /^\d{1,6}$/.test(retryAfterHeader.trim()) ? Number(retryAfterHeader.trim()) : undefined;
     return err('provider_error', { reason: 'rate_limited', ...(ra !== undefined ? { retryAfterSec: ra } : {}) });
   }
-  if (code === 101 || (p && CLIENT_MESSAGE.test(p.message) && !REDIRECT_MESSAGE.test(p.message))) return err('invalid_client');
+  if (httpStatus >= 500) return err('provider_error', { reason: 'server_error', ambiguous: write });
+  if (httpStatus === 408) return err('provider_error', { reason: 'timeout', ambiguous: write });
+  if (httpStatus < 400) return err('provider_error', { reason: 'malformed_response', ambiguous: write });
+  // 5) 4xx, 형식 모름
+  if (!p) {
+    if (write) return err('provider_error', { reason: 'http_error', ambiguous: true });
+    return err(httpStatus === 401 ? 'invalid_token' : 'invalid_request');
+  }
+  // 6) 4xx, 코드·하위 코드
+  const code = p.code;
+  if (code !== null && RATE_LIMIT_CODES.has(code)) return err('provider_error', { reason: 'rate_limited' });
+  if (code === 101) return err('invalid_client');
   if (code === 190) {
-    if (p?.subcode === 463) return err('token_expired');
-    if (p?.subcode === 458 || p?.subcode === 460) return err('token_revoked');
+    if (p.subcode === 463) return err('token_expired');
+    if (p.subcode === 458 || p.subcode === 460) return err('token_revoked');
     return err('invalid_token');
   }
   if (code === 10 || (code !== null && code >= 200 && code < 300)) return err('scope_not_allowed');
-  if (httpStatus >= 500 || (code !== null && TRANSIENT_CODES.has(code))) {
-    return err('provider_error', { reason: 'server_error', ambiguous: WRITE_STEPS.has(step) });
-  }
+  // 7) 최후 수단: 메시지(4xx 안에서만)
+  const redirectMessage = REDIRECT_MESSAGE.test(p.message);
+  if (redirectMessage && step === 'exchange') return err('redirect_mismatch');
+  if (!redirectMessage && CLIENT_MESSAGE.test(p.message)) return err('invalid_client');
+  // 8) 일시 코드
+  if (code !== null && TRANSIENT_CODES.has(code)) return err('provider_error', { reason: 'server_error', ambiguous: write });
+  // 9) 코드 교환
   if (step === 'exchange') {
-    if (p && REDIRECT_MESSAGE.test(p.message)) return err('redirect_mismatch');
-    return err('invalid_grant');
+    if ((code !== null && INVALID_GRANT_CODES.has(code)) || p.type === 'invalid_grant') return err('invalid_grant');
+    return err('provider_error', { ambiguous: false });
   }
+  // 10)
   if (httpStatus === 401) return err('invalid_token');
   return err('invalid_request');
 }
@@ -134,16 +163,23 @@ export class LiveThreadsOAuthProvider implements OAuthProvider {
   readonly #appSecret: string;
   readonly #fetch: FetchLike | null;
   readonly #timeoutMs: number;
+  readonly #refreshEnabled: boolean;
 
-  constructor(opts: { appId: string; appSecret: string; registeredRedirectUri: string; fetch?: FetchLike; timeoutMs?: number }) {
-    if (!/^\d{1,30}$/.test(opts.appId)) throw new OAuthProviderError('invalid_client', { reason: 'local_check' });
-    if (!opts.appSecret || /\s/.test(opts.appSecret)) throw new OAuthProviderError('invalid_client', { reason: 'local_check' });
+  /**
+   * refreshEnabled: FIX1-LIVET1(Codex review-LIVET1 P1) — 실제 갱신(th_refresh_token)은 D31 범위 밖이라 기본 false(refresh 는 외부 호출 없이
+   * LiveRefreshOutOfScopeError). resolveOAuthProvider 는 이 값을 넘기지 않는다(설정·환경으로 켤 수 없음). fixture 시험만 true 로 요청 모양을 확인한다.
+   */
+  constructor(opts: { appId: string; appSecret: string; registeredRedirectUri: string; fetch?: FetchLike; timeoutMs?: number; refreshEnabled?: boolean }) {
+    // FIX1-LIVET1(P2): 형식 검증은 준비 판정(liveOAuthReadiness)과 같은 함수. 시크릿은 앞뒤 공백을 뗀 값이어야 한다(resolveOAuthProvider 가 뗀다).
+    if (!isValidThreadsAppId(opts.appId)) throw new OAuthProviderError('invalid_client', { reason: 'local_check' });
+    if (!isValidThreadsAppSecret(opts.appSecret) || opts.appSecret !== opts.appSecret.trim()) throw new OAuthProviderError('invalid_client', { reason: 'local_check' });
     if (!isPlainRedirectUri(opts.registeredRedirectUri)) throw new OAuthProviderError('redirect_mismatch', { reason: 'local_check' });
     this.appId = opts.appId;
     this.#appSecret = opts.appSecret;
     this.registeredRedirectUri = opts.registeredRedirectUri;
     this.#fetch = opts.fetch ?? null;
     this.#timeoutMs = opts.timeoutMs ?? LIVE_THREADS_HTTP_TIMEOUT_MS;
+    this.#refreshEnabled = opts.refreshEnabled === true;
   }
 
   requiredScopes(): readonly string[] {
@@ -191,12 +227,23 @@ export class LiveThreadsOAuthProvider implements OAuthProvider {
     u.searchParams.set('grant_type', 'th_exchange_token');
     u.searchParams.set('client_secret', this.#appSecret);
     u.searchParams.set('access_token', shortToken);
-    const long = await this.#call('long_lived', u, { method: 'GET', headers: { accept: 'application/json' } });
-    return this.#tokenSet(long, 'long_lived', input.now);
+    try {
+      const long = await this.#call('long_lived', u, { method: 'GET', headers: { accept: 'application/json' } });
+      return this.#tokenSet(long, 'long_lived', input.now);
+    } catch (e) {
+      // FIX1-LIVET1(Codex review-LIVET1 Q3): 단기 토큰은 이미 발급됐다 — 공급자에 유효하게 남아 있을 수 있다(철회 API 없음)는 표시를 단다
+      if (e instanceof OAuthProviderError && e.detail) throw new OAuthProviderError(e.code, { ...e.detail, shortTokenIssued: true });
+      throw new OAuthProviderError('provider_error', { reason: 'local_check', step: 'long_lived', ambiguous: true, shortTokenIssued: true });
+    }
   }
 
-  /** 장기 토큰 갱신(refresh token 없음 — 장기 토큰 자체로). 발급 24시간 안의 갱신은 공급자가 거부할 수 있다(invalid_request — 상태는 active 유지). */
+  /**
+   * 장기 토큰 갱신(refresh token 없음 — 장기 토큰 자체로). 발급 24시간 안의 갱신은 공급자가 거부할 수 있다(invalid_request — 상태는 active 유지).
+   * FIX1-LIVET1(P1): D31 범위 밖 — refreshEnabled 가 아니면 외부 호출 없이 LiveRefreshOutOfScopeError(LIVE_THREADS_REFRESH(D31 범위 밖)).
+   * (서버 공통 갱신 진입점 refreshCredential 이 실제 계정을 먼저 거부하므로 이 검사는 두 번째 방어선이다.)
+   */
   async refresh(input: { tokens: StoredOAuthTokens; now: Date }): Promise<OAuthTokenSet> {
+    if (!this.#refreshEnabled) throw new LiveRefreshOutOfScopeError();
     const u = new URL(THREADS_REFRESH_URL);
     u.searchParams.set('grant_type', 'th_refresh_token');
     u.searchParams.set('access_token', this.#token(input.tokens.accessToken, 'refresh'));

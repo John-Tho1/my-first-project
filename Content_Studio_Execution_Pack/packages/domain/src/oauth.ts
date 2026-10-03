@@ -13,6 +13,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { AppConfig } from './config';
 import { AppError, GuardError } from './errors';
+import { readSecretKeyring } from './secrets';
 import type { Channel } from './channel';
 
 /** T15(D27): mock_google = Google(YouTube) 형 모의 공급자(프로세스 안, 네트워크 없음). 실제 Google 공급자는 없다. */
@@ -153,6 +154,11 @@ export interface OAuthProviderErrorDetail {
   providerSubcode?: number;
   ambiguous?: boolean;
   retryAfterSec?: number;
+  /**
+   * FIX1-LIVET1(Codex review-LIVET1 Q3): 단기 토큰은 이미 받았는데 그 뒤(장기 교환)에서 실패 — 공급자에 단기 토큰이 유효하게 남아 있을 수 있다
+   * (철회 API 없음 → 철회하지 못함). "토큰 발급 없음"으로 기록하지 않게 표시한다.
+   */
+  shortTokenIssued?: boolean;
 }
 
 /** 공급자 오류 — 코드만 담는다(토큰·code 값 없음). LIVE-T1: 부가 정보(detail)도 숫자·열거 값만. cause 는 붙이지 않는다(원 오류에 URL·시크릿이 있을 수 있음). */
@@ -241,6 +247,24 @@ export class LiveOAuthNotConfiguredError extends GuardError {
       `실제 계정 연결(OAuth)이 준비·승인되어 있지 않습니다. 외부로 아무것도 보내지 않았습니다.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
     );
     this.missing = missing;
+  }
+}
+
+/** FIX1-LIVET1(Codex review-LIVET1 P1): 실제 연결 정보 갱신(th_refresh_token)은 D31 승인 범위 밖 — 별도 승인 전까지 이 표식이 남는다. */
+export const LIVE_THREADS_REFRESH_MARKER = 'LIVE_THREADS_REFRESH(D31 범위 밖)';
+
+/**
+ * FIX1-LIVET1(Codex review-LIVET1 P1): 실제(live) 계정의 연결 정보 갱신 요청 — 서버 공통 갱신 진입점(refreshCredential)과 실제 공급자 refresh 가
+ * 외부 호출 없이 거부한다(409). 연결 정보·상태는 바꾸지 않는다. 수동 API·작업 처리기·worker 어느 경로든 같다.
+ */
+export class LiveRefreshOutOfScopeError extends AppError {
+  constructor() {
+    super(
+      'conflict',
+      'live_refresh_out_of_scope',
+      '실제 계정의 연결 정보 갱신은 아직 승인 범위 밖이라 하지 않았습니다(' + LIVE_THREADS_REFRESH_MARKER + '). 외부로 아무것도 보내지 않았고 연결 정보는 그대로입니다. 만료 전에 다시 연결하세요.',
+      { marker: LIVE_THREADS_REFRESH_MARKER },
+    );
   }
 }
 
@@ -387,24 +411,52 @@ export interface LiveOAuthReadiness {
 export const LIVE_THREADS_PUBLISH_MARKER = 'LIVE_THREADS_PUBLISH(D31 범위 밖)';
 
 /**
+ * FIX1-LIVET1(Codex review-LIVET1 P2): Threads 앱 ID·시크릿 형식 — 준비 판정(liveOAuthReadiness)과 실제 공급자 생성자(LiveThreadsOAuthProvider)가
+ * **같은 함수**를 쓴다(화면의 "준비됨"과 실제 공급자 선택이 어긋나지 않게).
+ * 앱 ID: 숫자 1~30자리. 시크릿: 앞뒤 공백을 뗀 값이 공백 없는 1~512자(서버는 뗀 값을 쓴다).
+ */
+export const isValidThreadsAppId = (v: string | null | undefined): boolean => typeof v === 'string' && /^\d{1,30}$/.test(v);
+export const isValidThreadsAppSecret = (v: string | null | undefined): boolean => typeof v === 'string' && /^\S{1,512}$/.test(v.trim());
+export type ThreadsAppSecretState = 'missing' | 'invalid' | 'ok';
+/** 환경의 THREADS_APP_SECRET 상태(값은 돌려주지 않는다) */
+export function threadsAppSecretState(env: Record<string, string | undefined>): ThreadsAppSecretState {
+  if (!envPresent(env, 'THREADS_APP_SECRET')) return 'missing';
+  return isValidThreadsAppSecret(env.THREADS_APP_SECRET) ? 'ok' : 'invalid';
+}
+
+/**
  * 실제 Threads 계정 **연결**의 전제 조건(이름만, 값 없음). LIVE-T1(D31): 모두 갖춰지면 ready=true(실제 Threads OAuth 공급자 선택 가능).
- * 조건: OAUTH_MODE=live · THREADS_APP_ID · THREADS_APP_SECRET(존재만) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path) · SECRETS_MASTER_KEY ·
- * OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다(게시 준비는 livePublishReadiness).
- * T13 의 'LIVE_OAUTH_ADAPTER(T14 미구현)' 표식은 Threads 연결에서는 사라졌다(다른 채널의 실제 연결은 resolveOAuthProvider 가 따로 거부).
+ * 조건: OAUTH_MODE=live · THREADS_APP_ID(존재·형식) · THREADS_APP_SECRET(존재·형식) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path,
+ * 등록 redirect 와 일치) · SECRETS_MASTER_KEY · OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다.
+ * FIX1-LIVET1(P2): 공급자 선택(resolveOAuthProvider)은 이 함수의 missing 을 그대로 쓴다 — ready === (실제 공급자 선택 성공)(Threads 계정 기준).
+ * registeredRedirectUri: callback 이 정확 일치로 비교할 등록 redirect URI(주면 OAUTH_REDIRECT_URI 와 같아야 한다).
  */
 export function liveOAuthReadiness(
   config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
-  secrets: { threadsAppSecretPresent: boolean; masterKeyConfigured: boolean },
+  secrets: { threadsAppSecret: ThreadsAppSecretState; masterKeyConfigured: boolean },
+  registeredRedirectUri?: string,
 ): LiveOAuthReadiness {
   const missing: string[] = [];
   if (config.OAUTH_MODE !== 'live') missing.push('OAUTH_MODE=live');
   if (!config.THREADS_APP_ID) missing.push('THREADS_APP_ID');
-  if (!secrets.threadsAppSecretPresent) missing.push('THREADS_APP_SECRET');
+  else if (!isValidThreadsAppId(config.THREADS_APP_ID)) missing.push('THREADS_APP_ID(형식)');
+  if (secrets.threadsAppSecret === 'missing') missing.push('THREADS_APP_SECRET');
+  else if (secrets.threadsAppSecret === 'invalid') missing.push('THREADS_APP_SECRET(형식)');
   if (!config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI');
   else if (!isPlainRedirectUri(config.OAUTH_REDIRECT_URI)) missing.push('OAUTH_REDIRECT_URI(형식)');
+  else if (registeredRedirectUri !== undefined && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
   if (!secrets.masterKeyConfigured) missing.push('SECRETS_MASTER_KEY');
   if (!config.OAUTH_LIVE_APPROVAL_REF) missing.push('OAUTH_LIVE_APPROVAL_REF');
   return { ready: missing.length === 0, missing };
+}
+
+/** 환경에서 비밀 상태를 읽어(값 없이) liveOAuthReadiness 를 부른다 — 화면 표시(web)와 공급자 선택(providers)이 같이 쓴다. */
+export function liveOAuthReadinessFromEnv(
+  config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
+  env: Record<string, string | undefined>,
+  registeredRedirectUri?: string,
+): LiveOAuthReadiness {
+  return liveOAuthReadiness(config, { threadsAppSecret: threadsAppSecretState(env), masterKeyConfigured: readSecretKeyring(env).ok }, registeredRedirectUri);
 }
 
 /**

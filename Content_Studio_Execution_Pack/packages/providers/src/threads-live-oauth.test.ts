@@ -4,7 +4,16 @@
  */
 import { inspect } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadConfig, LiveOAuthNotConfiguredError, OAuthNotSupportedError, OAuthProviderError, type OAuthProviderErrorCode } from '@cs/domain';
+import {
+  LIVE_THREADS_REFRESH_MARKER,
+  liveOAuthReadinessFromEnv,
+  LiveOAuthNotConfiguredError,
+  LiveRefreshOutOfScopeError,
+  loadConfig,
+  OAuthNotSupportedError,
+  OAuthProviderError,
+  type OAuthProviderErrorCode,
+} from '@cs/domain';
 import { MockThreadsOAuthProvider, resolveOAuthProvider } from './oauth';
 import {
   LiveThreadsOAuthProvider,
@@ -62,8 +71,8 @@ const ME_OK = () => jsonRes(200, { id: '1234567', username: 'threadsapitestuser'
 
 const K = (method: string, url: string) => `${method} ${url}`;
 
-function provider(fetch: (i: string, o?: RequestInit) => Promise<Response>, timeoutMs?: number) {
-  return new LiveThreadsOAuthProvider({ appId: APP_ID, appSecret: SECRET, registeredRedirectUri: REDIRECT, fetch, timeoutMs });
+function provider(fetch: (i: string, o?: RequestInit) => Promise<Response>, timeoutMs?: number, refreshEnabled?: boolean) {
+  return new LiveThreadsOAuthProvider({ appId: APP_ID, appSecret: SECRET, registeredRedirectUri: REDIRECT, fetch, timeoutMs, refreshEnabled });
 }
 
 afterEach(() => {
@@ -184,6 +193,7 @@ describe('코드 교환 → 장기 토큰', () => {
       expect(e.code).toBe('provider_error');
       expect(e.detail.ambiguous).toBe(true);
       expect(e.detail.step).toBe('long_lived');
+      expect(e.detail.shortTokenIssued).toBe(true); // FIX1-LIVET1: 단기 토큰은 이미 발급됨
     }
   });
 });
@@ -191,7 +201,7 @@ describe('코드 교환 → 장기 토큰', () => {
 describe('갱신·프로필·철회', () => {
   it('refresh: GET graph.threads.net/refresh_access_token(th_refresh_token) → 새 장기 토큰(60일)', async () => {
     const { fetch, seen } = fixtureFetch({ [K('GET', THREADS_REFRESH_URL)]: () => jsonRes(200, { access_token: LONG2, token_type: 'bearer', expires_in: 5184000 }) });
-    const t = await provider(fetch).refresh({ tokens: { accessToken: LONG, refreshToken: null }, now: NOW });
+    const t = await provider(fetch, undefined, true).refresh({ tokens: { accessToken: LONG, refreshToken: null }, now: NOW });
     expect(t.accessToken).toBe(LONG2);
     expect(t.expiresAt.getTime()).toBe(NOW.getTime() + 5184000 * 1000);
     expect(Object.fromEntries(seen[0]!.url.searchParams)).toEqual({ grant_type: 'th_refresh_token', access_token: LONG });
@@ -206,7 +216,7 @@ describe('갱신·프로필·철회', () => {
     ];
     for (const [res, code, reason] of cases) {
       const { fetch } = fixtureFetch({ [K('GET', THREADS_REFRESH_URL)]: () => res.clone() });
-      const e = await provider(fetch).refresh({ tokens: { accessToken: LONG, refreshToken: null }, now: NOW }).catch((x) => x);
+      const e = await provider(fetch, undefined, true).refresh({ tokens: { accessToken: LONG, refreshToken: null }, now: NOW }).catch((x) => x);
       expect(e.code, `${code}`).toBe(code);
       expect(e.detail.reason).toBe(reason);
     }
@@ -268,7 +278,7 @@ describe('비밀 위생 — 시크릿·토큰·code 가 로그·오류·직렬�
     const errors: unknown[] = [];
     const run = async (routes: Record<string, Reply | Reply[]>, fn: (p: LiveThreadsOAuthProvider) => Promise<unknown>) => {
       const { fetch } = fixtureFetch(routes);
-      const p = provider(fetch);
+      const p = provider(fetch, undefined, true); // refresh 오류 경로도 비밀 위생을 본다(fixture 만)
       try {
         await fn(p);
       } catch (e) {
@@ -366,6 +376,130 @@ describe('공급자 선택(준비 상태 행렬) — 실제 공급자는 모든 
     }
     expect(resolveOAuthProvider({ kind: 'mock', platform: 'threads' }, loadConfig({ ...FULL }), ENV, REDIRECT)).toBeInstanceOf(MockThreadsOAuthProvider);
     expect(() => resolveOAuthProvider({ kind: 'mock', platform: 'blog' }, loadConfig({ ...FULL }), ENV, REDIRECT)).toThrow(OAuthNotSupportedError);
+  });
+});
+
+// FIX1-LIVET1(Codex review-LIVET1 P0 :104·Q2·놓친 케이스): 전송·상태가 본문 문구·코드보다 먼저 — 5xx 는 본문이 무엇이든 결과 불명(쓰기 단계)
+describe('오류 분류 순서(FIX1-LIVET1 P0) — 상태 먼저, 4xx 안에서만 코드·문구', () => {
+  const g = (message: string, code: number, extra: Record<string, unknown> = {}) => ({ error: { message, type: 'OAuthException', code, ...extra } });
+  const t = (message: string, code: number) => ({ error_type: 'OAuthException', code, error_message: message });
+  type Row = [string, Parameters<typeof mapThreadsError>, OAuthProviderErrorCode, Record<string, unknown>];
+  const rows: Row[] = [
+    // 5xx + 인증·시크릿·만료처럼 보이는 본문 → 모두 server_error, 쓰기 단계면 ambiguous
+    ['503 + 코드 1 "validating client secret"(Codex 재현)', ['exchange', 503, g('Temporary error validating client secret', 1)], 'provider_error', { reason: 'server_error', ambiguous: true, httpStatus: 503, providerCode: 1 }],
+    ['500 + 코드 101(invalid client_id)', ['exchange', 500, g('Invalid client_id', 101)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['502 + 코드 190/463(expired)', ['long_lived', 502, g('Session has expired', 190, { error_subcode: 463 })], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['504 + 코드 10(permission)', ['exchange', 504, g('Permission denied', 10)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['500 + 코드 400 "already used"', ['exchange', 500, t('Matching code was not found or was already used', 400)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['503 + redirect_uri 문구', ['exchange', 503, g('redirect_uri mismatch', 100)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['500 + 코드 4(rate limit)', ['refresh', 500, g('Application request limit reached', 4)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['500 + invalid token(읽기 단계 — ambiguous 아님)', ['account', 500, g('Invalid OAuth access token', 190)], 'provider_error', { reason: 'server_error', ambiguous: false }],
+    // 408·2xx 오류 본문·4xx 비형식(쓰기 단계)
+    ['408 + client secret 문구', ['exchange', 408, g('Error validating client secret', 1)], 'provider_error', { reason: 'timeout', ambiguous: true }],
+    ['200 오류 본문(코드 101)', ['exchange', 200, g('Invalid client_id', 101)], 'provider_error', { reason: 'malformed_response', ambiguous: true }],
+    ['200 오류 본문(읽기)', ['account', 200, g('x', 190)], 'provider_error', { reason: 'malformed_response', ambiguous: false }],
+    ['exchange 401 비형식', ['exchange', 401, null], 'provider_error', { reason: 'http_error', ambiguous: true }],
+    ['exchange 404 HTML', ['exchange', 404, null], 'provider_error', { reason: 'http_error', ambiguous: true }],
+    ['long_lived 400 비형식', ['long_lived', 400, { foo: 1 }], 'provider_error', { reason: 'http_error', ambiguous: true }],
+    // 4xx + 형식 맞는 본문: 코드가 문구보다 먼저
+    ['400 + 코드 190, 문구에 client_id', ['account', 400, g('Invalid token for client_id 1', 190)], 'invalid_token', {}],
+    ['400 + 코드 10, 문구에 client secret', ['exchange', 400, g('client secret permission', 10)], 'scope_not_allowed', {}],
+    ['400 + 코드 4, 문구에 client secret', ['exchange', 400, g('client secret rate', 4)], 'provider_error', { reason: 'rate_limited' }],
+    // 4xx 문구는 최후 수단
+    ['400 + 코드 1 "Error validating client secret."', ['exchange', 400, g('Error validating client secret.', 1)], 'invalid_client', { providerCode: 1 }],
+    ['400 + 코드 1 그 밖 문구', ['exchange', 400, g('An unknown error occurred', 1)], 'provider_error', { reason: 'server_error', ambiguous: true }],
+    ['400 + 코드 100 redirect_uri', ['exchange', 400, g('redirect_uri is not identical', 100)], 'redirect_mismatch', {}],
+    // 코드 교환: 알려진 코드만 invalid_grant
+    ['exchange 400 코드 400', ['exchange', 400, t('Matching code was not found or was already used', 400)], 'invalid_grant', {}],
+    ['exchange 400 코드 100', ['exchange', 400, g('Invalid verification code format', 100)], 'invalid_grant', {}],
+    ['exchange 400 문자열 invalid_grant', ['exchange', 400, { error: 'invalid_grant' }], 'invalid_grant', {}],
+    ['exchange 401 형식 본문·모르는 코드', ['exchange', 401, g('x', 999)], 'provider_error', { reason: 'oauth_exception', ambiguous: false, httpStatus: 401, providerCode: 999 }],
+    ['exchange 405 형식 본문·코드 없음', ['exchange', 405, { error_type: 'OAuthException', error_message: 'x' }], 'provider_error', { reason: 'oauth_exception', ambiguous: false, httpStatus: 405 }],
+    ['exchange 404 형식 본문', ['exchange', 404, g('Unknown path', 803)], 'provider_error', { reason: 'oauth_exception', ambiguous: false }],
+  ];
+  it.each(rows)('%s', (_label, args, code, detail) => {
+    const e = mapThreadsError(...args);
+    expect(e.code).toBe(code);
+    expect(e.detail).toMatchObject(detail);
+    expect(JSON.stringify(e.detail)).not.toMatch(/secret|client_id|expired|already used/i);
+  });
+  it('공급자 경유: 코드 교환 503 + "validating client secret" → provider_error(ambiguous), 장기 교환 안 부름', async () => {
+    const { fetch, seen } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: () => jsonRes(503, { error: { message: 'Temporary error validating client secret', type: 'OAuthException', code: 1 } }) });
+    const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('provider_error');
+    expect(e.detail).toMatchObject({ reason: 'server_error', step: 'exchange', ambiguous: true });
+    expect(e.detail.shortTokenIssued).toBeUndefined();
+    expect(seen).toHaveLength(1);
+  });
+  it('공급자 경유: 단기 토큰 발급 뒤 장기 교환 4xx(확정 거절)여도 shortTokenIssued=true — "발급 없음"이 아니다', async () => {
+    const { fetch } = fixtureFetch({ [K('POST', THREADS_TOKEN_URL)]: EXCHANGE_OK, [K('GET', THREADS_LONG_LIVED_URL)]: () => jsonRes(400, { error: { message: 'x', type: 'OAuthException', code: 190 } }) });
+    const e = await provider(fetch).exchangeCode({ code: CODE, codeVerifier: 'v'.repeat(43), redirectUri: REDIRECT, now: NOW }).catch((x) => x);
+    expect(e.code).toBe('invalid_token');
+    expect(e.detail).toMatchObject({ step: 'long_lived', shortTokenIssued: true });
+    expect(inspect(e, { depth: Infinity })).not.toContain(SHORT);
+  });
+});
+
+// FIX1-LIVET1(Codex review-LIVET1 P1 :199): 실제 갱신은 D31 범위 밖 — 공급자 기본값은 외부 호출 없이 거부
+describe('실제 갱신 차단(FIX1-LIVET1 P1) — 공급자 두 번째 방어선', () => {
+  it('기본(resolveOAuthProvider 가 만드는 공급자 포함): refresh → LiveRefreshOutOfScopeError(409, LIVE_THREADS_REFRESH(D31 범위 밖)), fetch 0회', async () => {
+    const { fetch } = fixtureFetch({ [K('GET', THREADS_REFRESH_URL)]: () => jsonRes(200, { access_token: LONG2, expires_in: 5184000 }) });
+    for (const p of [
+      provider(fetch),
+      resolveOAuthProvider({ kind: 'live', platform: 'threads' }, loadConfig({ OAUTH_MODE: 'live', THREADS_APP_ID: APP_ID, OAUTH_REDIRECT_URI: REDIRECT, OAUTH_LIVE_APPROVAL_REF: 'D31' }), { THREADS_APP_SECRET: SECRET, SECRETS_MASTER_KEY: Buffer.alloc(32, 7).toString('base64'), SECRETS_KEY_VERSION: '1' }, REDIRECT, undefined, { fetch }),
+    ]) {
+      const e = await p.refresh({ tokens: { accessToken: LONG, refreshToken: null }, now: NOW }).catch((x) => x);
+      expect(e).toBeInstanceOf(LiveRefreshOutOfScopeError);
+      expect(e.code).toBe('live_refresh_out_of_scope');
+      expect(e.kind).toBe('conflict');
+      expect(e.message).toContain(LIVE_THREADS_REFRESH_MARKER);
+      expect(inspect(e, { depth: Infinity })).not.toContain(LONG);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+    expect(LIVE_THREADS_REFRESH_MARKER).toBe('LIVE_THREADS_REFRESH(D31 범위 밖)');
+  });
+});
+
+// FIX1-LIVET1(Codex review-LIVET1 P2 :401): 화면 준비 판정 === 실제 공급자 선택 성공(같은 검증 함수)
+describe('준비 판정 ↔ 공급자 선택 일치 행렬(FIX1-LIVET1 P2)', () => {
+  const KEY = Buffer.alloc(32, 7).toString('base64');
+  const CFG = { OAUTH_MODE: 'live', THREADS_APP_ID: APP_ID, OAUTH_REDIRECT_URI: REDIRECT, OAUTH_LIVE_APPROVAL_REF: 'D31' };
+  const ENV = { THREADS_APP_SECRET: SECRET, SECRETS_MASTER_KEY: KEY, SECRETS_KEY_VERSION: '1' };
+  type Case = [string, Record<string, string | undefined>, Record<string, string | undefined>, string, string[]];
+  const cases: Case[] = [
+    ['모두 갖춤', {}, {}, REDIRECT, []],
+    ['시크릿 앞뒤 공백(뗀 값 사용)', {}, { THREADS_APP_SECRET: `  ${SECRET}  ` }, REDIRECT, []],
+    ['OAUTH_MODE=mock', { OAUTH_MODE: 'mock' }, {}, REDIRECT, ['OAUTH_MODE=live']],
+    ['앱 ID 없음', { THREADS_APP_ID: undefined }, {}, REDIRECT, ['THREADS_APP_ID']],
+    ['앱 ID 숫자 아님(placeholder-app-id — Codex 재현)', { THREADS_APP_ID: 'placeholder-app-id' }, {}, REDIRECT, ['THREADS_APP_ID(형식)']],
+    ['앱 ID 31자리', { THREADS_APP_ID: '1'.repeat(31) }, {}, REDIRECT, ['THREADS_APP_ID(형식)']],
+    ['시크릿 없음', {}, { THREADS_APP_SECRET: undefined }, REDIRECT, ['THREADS_APP_SECRET']],
+    ['시크릿 공백뿐', {}, { THREADS_APP_SECRET: '   ' }, REDIRECT, ['THREADS_APP_SECRET']],
+    ['시크릿 중간 공백', {}, { THREADS_APP_SECRET: 'FAKE secret' }, REDIRECT, ['THREADS_APP_SECRET(형식)']],
+    ['시크릿 513자', {}, { THREADS_APP_SECRET: 'x'.repeat(513) }, REDIRECT, ['THREADS_APP_SECRET(형식)']],
+    ['redirect 없음', { OAUTH_REDIRECT_URI: undefined }, {}, REDIRECT, ['OAUTH_REDIRECT_URI']],
+    ['등록 redirect 불일치', {}, {}, 'http://localhost:3001/api/oauth/callback', ['OAUTH_REDIRECT_URI(불일치)']],
+    ['마스터 키 없음', {}, { SECRETS_MASTER_KEY: undefined }, REDIRECT, ['SECRETS_MASTER_KEY']],
+    ['승인 기록 없음', { OAUTH_LIVE_APPROVAL_REF: undefined }, {}, REDIRECT, ['OAUTH_LIVE_APPROVAL_REF']],
+    ['여러 개', { THREADS_APP_ID: 'abc', OAUTH_LIVE_APPROVAL_REF: undefined }, { THREADS_APP_SECRET: 'a b' }, REDIRECT, ['THREADS_APP_ID(형식)', 'THREADS_APP_SECRET(형식)', 'OAUTH_LIVE_APPROVAL_REF']],
+  ];
+  it.each(cases)('%s', (_label, cfg, env, registered, expected) => {
+    const config = loadConfig({ ...CFG, ...cfg } as Record<string, string | undefined>);
+    const fullEnv = { ...ENV, ...env };
+    const readiness = liveOAuthReadinessFromEnv(config, fullEnv, registered);
+    let resolved = false;
+    let missing: string[] = [];
+    try {
+      resolveOAuthProvider({ kind: 'live', platform: 'threads' }, config, fullEnv, registered);
+      resolved = true;
+    } catch (e) {
+      expect(e).toBeInstanceOf(LiveOAuthNotConfiguredError);
+      missing = (e as LiveOAuthNotConfiguredError).missing;
+    }
+    expect(readiness.ready).toBe(resolved);
+    expect(readiness.missing).toEqual(expected);
+    expect(missing).toEqual(expected);
+    expect(JSON.stringify(readiness)).not.toContain(SECRET);
   });
 });
 

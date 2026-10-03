@@ -255,6 +255,7 @@ export interface AuditInput {
     | 'oauth.connected'
     | 'oauth.refreshed'
     | 'oauth.refresh_failed'
+    | 'oauth.refresh_refused'
     | 'oauth.refresh_discarded'
     | 'oauth.pending_reconciled'
     | 'oauth.pending_record_failed'

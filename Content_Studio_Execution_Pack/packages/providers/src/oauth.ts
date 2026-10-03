@@ -14,14 +14,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import {
   codeChallengeS256,
-  envPresent,
   INSTAGRAM_NOT_REQUESTED_BY_DEFAULT,
   INSTAGRAM_REQUIRED_SCOPES,
-  liveOAuthReadiness,
+  liveOAuthReadinessFromEnv,
   LiveOAuthNotConfiguredError,
   OAuthNotSupportedError,
   OAuthProviderError,
-  readSecretKeyring,
   THREADS_REQUIRED_SCOPES,
   YOUTUBE_NOT_REQUESTED_BY_DEFAULT,
   YOUTUBE_REQUIRED_SCOPES,
@@ -678,14 +676,11 @@ export function resolveOAuthProvider(
     throw new OAuthNotSupportedError();
   }
   if (account.kind !== 'live') throw new OAuthNotSupportedError();
-  const readiness = liveOAuthReadiness(config, {
-    threadsAppSecretPresent: envPresent(env, 'THREADS_APP_SECRET'),
-    masterKeyConfigured: readSecretKeyring(env).ok,
-  });
+  // FIX1-LIVET1(Codex review-LIVET1 P2 :401): 준비 판정(화면)과 같은 함수 — 앱 ID·시크릿 형식, redirect 형식·등록값 일치까지 여기서 본다.
+  // Threads 계정이면 readiness.ready === (실제 공급자 선택 성공)이다(시험: 준비 상태 행렬).
+  const readiness = liveOAuthReadinessFromEnv(config, env, registeredRedirectUri);
   const missing = [...readiness.missing];
   if (account.platform !== 'threads') missing.push(`LIVE_OAUTH_ADAPTER(${account.platform} 범위 밖)`);
-  // 등록 redirect URI(callback 정확 일치 대상)는 설정값과 같아야 한다 — 다르면 이름만 알린다
-  else if (config.OAUTH_REDIRECT_URI && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
   if (missing.length) throw new LiveOAuthNotConfiguredError(missing);
   try {
     return new LiveThreadsOAuthProvider({
@@ -695,7 +690,7 @@ export function resolveOAuthProvider(
       fetch: opts.fetch,
     });
   } catch {
-    // 앱 ID 형식(숫자)·시크릿 형식 문제 — 값 없이 이름만
+    // 준비 판정과 생성자가 같은 검증 함수를 쓰므로 여기 오지 않는다(방어선) — 값 없이 이름만
     throw new LiveOAuthNotConfiguredError(['THREADS_APP_ID·THREADS_APP_SECRET(형식)']);
   }
 }

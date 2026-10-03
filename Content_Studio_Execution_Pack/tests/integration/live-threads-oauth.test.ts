@@ -28,9 +28,10 @@ import { GET as accountsGET, POST as accountsPOST } from '../../apps/web/app/api
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
 import { POST as checkPOST } from '../../apps/web/app/api/channel-accounts/[id]/check/route';
 import { POST as revokePOST } from '../../apps/web/app/api/channel-accounts/[id]/revoke/route';
+import { POST as refreshPOST } from '../../apps/web/app/api/channel-accounts/[id]/refresh/route';
 import { GET as callbackGET } from '../../apps/web/app/api/oauth/callback/route';
 import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
-import { oauthDeps } from '../../apps/web/lib/oauth';
+import { jobCredentials, oauthDeps, oauthReadinessView } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
 const A = 'owner@example.local';
@@ -187,6 +188,9 @@ describe('준비 상태 행렬(route) — 하나라도 빠지면 503(이름만),
     ['THREADS_APP_SECRET', { THREADS_APP_SECRET: '' }],
     ['OAUTH_REDIRECT_URI', { OAUTH_REDIRECT_URI: '' }],
     ['OAUTH_LIVE_APPROVAL_REF', { OAUTH_LIVE_APPROVAL_REF: '' }],
+    // FIX1-LIVET1(Codex review-LIVET1 P2): 형식 오류도 화면(준비 안 됨)과 route(503)가 같은 이름
+    ['THREADS_APP_ID(형식)', { THREADS_APP_ID: 'placeholder-app-id' }],
+    ['THREADS_APP_SECRET(형식)', { THREADS_APP_SECRET: 'FAKE secret with space' }],
   ] as const)('%s 빠짐', async (name, over) => {
     const f = useFixture({});
     const { account } = await createLive();
@@ -197,6 +201,9 @@ describe('준비 상태 행렬(route) — 하나라도 빠지면 503(이름만),
     expect(body.error).toBe('live_oauth_not_configured');
     expect(body.message).toContain(name);
     expect(JSON.stringify(body)).not.toContain(SECRET);
+    const view = oauthReadinessView(loadConfig(process.env));
+    expect(view.live.ready).toBe(false);
+    expect(view.live.missing).toContain(name);
     expect(await db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, account.id))).toHaveLength(0);
     expect(f).not.toHaveBeenCalled();
   });
@@ -278,6 +285,33 @@ describe('실제 연결 전체 흐름(fixture) — 묶기·봉인 저장·프로
     expect((await chk.json()).account.status).toBe('connected');
     expect(calls.length).toBe(before + 1);
     expect(calls.at(-1)!.url.pathname).toBe('/v1.0/me');
+
+    // FIX1-LIVET1(Codex review-LIVET1 P1·Q4): 수동 갱신 API·작업 처리기 갱신 경로 모두 실제 계정은 거부 — 외부 호출 0, 연결 정보 그대로
+    const credBefore = (await credRow(account.id))!;
+    const callsBefore = calls.length;
+    const rf = await rec(await refreshPOST(post(`/api/channel-accounts/${account.id}/refresh`), ctx(account.id)));
+    expect(rf.status).toBe(409);
+    const rfb = await rf.json();
+    expect(rfb.error).toBe('live_refresh_out_of_scope');
+    expect(rfb.message).toContain('LIVE_THREADS_REFRESH(D31 범위 밖)');
+    const rfHtml = await refreshPOST(new Request(`${BASE}/api/channel-accounts/${account.id}/refresh`, { method: 'POST', headers: { accept: 'text/html', origin: BASE, ...cookieHeader(tokenA) } }), ctx(account.id));
+    expect(rfHtml.status).toBe(303);
+    expect(rfHtml.headers.get('location')).toContain('account_error=live_refresh_out_of_scope');
+    await expect(jobCredentials(loadConfig(process.env), db).refresh!(ownerA, account.id, new Date())).rejects.toMatchObject({ code: 'live_refresh_out_of_scope' });
+    expect(f.mock.calls.length).toBe(callsBefore);
+    expect(calls.length).toBe(callsBefore);
+    const credAfter = (await credRow(account.id))!;
+    expect({ s: credAfter.status, g: credAfter.tokenGeneration, t: credAfter.encryptedToken, e: credAfter.expiresAt?.getTime(), err: credAfter.lastErrorCode }).toEqual({
+      s: credBefore.status,
+      g: credBefore.tokenGeneration,
+      t: credBefore.encryptedToken,
+      e: credBefore.expiresAt?.getTime(),
+      err: credBefore.lastErrorCode,
+    });
+    const refused = (await auditFor(account.id)).filter((e) => e.action === 'oauth.refresh_refused');
+    expect(refused.length).toBe(3);
+    expect(refused[0]!.sanitizedDetails).toMatchObject({ reason: 'live_refresh_out_of_scope', kind: 'live' });
+    expect((await auditFor(account.id)).some((e) => e.action === 'oauth.refresh_failed')).toBe(false);
 
     // 연결 해제 — Threads 철회 API 없음: 네트워크 0, remote_revoke=unsupported, 로컬 삭제(T13 규칙)
     const rv = await rec(await revokePOST(post(`/api/channel-accounts/${account.id}/revoke`), ctx(account.id)));
@@ -371,6 +405,23 @@ describe('코드 교환 실패 — 오류 매핑·결과 불명(ambiguous)', () 
     expect(await r.json()).toMatchObject({ error: 'oauth_exchange_failed', outcome: 'unknown' });
     expect(await credRow(account.id)).toBeNull();
     expect(await db.select().from(schema.oauthPendingTokens).where(eq(schema.oauthPendingTokens.channelAccountId, account.id))).toHaveLength(0);
+    // FIX1-LIVET1(Codex review-LIVET1 Q3): 단기 토큰은 발급됐다 — "발급 없음"이 아니라 원격에 유효할 수 있음·철회 불가로 기록
+    const rej = (await auditFor(account.id)).filter((e) => e.action === 'oauth.callback_rejected').at(-1)!;
+    expect(rej.sanitizedDetails).toMatchObject({ provider_step: 'long_lived', outcome_ambiguous: 'yes', short_token_issued: 'yes', short_token_remote_state: 'may_be_valid', short_token_revoke: 'not_possible' });
+    expect(JSON.stringify(rej)).not.toContain(SHORT);
+  });
+  it('FIX1-LIVET1(P0): 코드 교환 503 + "validating client secret" 본문 → invalid_client 가 아니라 outcome unknown(ambiguous)', async () => {
+    const { account } = await createLive();
+    liveEnv();
+    useFixture({ [`POST ${THREADS_TOKEN_URL}`]: () => jsonRes(503, { error: { message: 'Temporary error validating client secret', type: 'OAuthException', code: 1 } }) });
+    const r = await callback({ code: 'FAKE_code_LIVET1_503_cccccccccccc', state: (await startLive(account.id)).state });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'oauth_exchange_failed', reason: 'provider_error', outcome: 'unknown' });
+    expect(calls).toHaveLength(1);
+    const rej = (await auditFor(account.id)).filter((e) => e.action === 'oauth.callback_rejected').at(-1)!;
+    expect(rej.sanitizedDetails).toMatchObject({ provider_error: 'provider_error', provider_reason: 'server_error', provider_step: 'exchange', outcome_ambiguous: 'yes' });
+    expect(rej.sanitizedDetails).not.toHaveProperty('short_token_issued');
+    expect(await credRow(account.id)).toBeNull();
   });
 });
 

@@ -11,7 +11,10 @@ import {
   isUnboundLiveExternalId,
   isWellFormedOAuthState,
   LIVE_THREADS_PUBLISH_MARKER,
+  isValidThreadsAppId,
+  isValidThreadsAppSecret,
   liveOAuthReadiness,
+  threadsAppSecretState,
   livePublishReadiness,
   UNBOUND_LIVE_EXTERNAL_PREFIX,
   newCodeVerifier,
@@ -104,12 +107,13 @@ describe('credentialHealth', () => {
 describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 나눠 본다', () => {
   const FULL = {
     OAUTH_MODE: 'live',
-    THREADS_APP_ID: 'placeholder-app-id',
+    // FIX1-LIVET1(Codex review-LIVET1 P2): 숫자 아닌 앱 ID 는 이제 준비 안 됨(THREADS_APP_ID(형식)) — 공급자 생성자와 같은 검증
+    THREADS_APP_ID: '000000000000001',
     OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
     OAUTH_LIVE_APPROVAL_REF: 'D31',
   } as const;
   it('기본 설정: 빠진 조건 이름만(값 없음), 게시 관련 이름은 연결 준비에 없다', () => {
-    const r = liveOAuthReadiness(loadConfig({}), { threadsAppSecretPresent: false, masterKeyConfigured: false });
+    const r = liveOAuthReadiness(loadConfig({}), { threadsAppSecret: 'missing', masterKeyConfigured: false });
     expect(r.ready).toBe(false);
     expect(r.missing).toEqual(['OAUTH_MODE=live', 'THREADS_APP_ID', 'THREADS_APP_SECRET', 'OAUTH_REDIRECT_URI', 'SECRETS_MASTER_KEY', 'OAUTH_LIVE_APPROVAL_REF']);
     expect(r.missing.join(',')).not.toContain('LIVE_OAUTH_ADAPTER');
@@ -117,20 +121,30 @@ describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 �
   it('모든 조건(PUBLISH_MODE=disabled 그대로) → ready=true, 빠진 이름 없음, 값은 결과에 없다', () => {
     const config = loadConfig({ ...FULL });
     expect(config.PUBLISH_MODE).toBe('disabled');
-    const r = liveOAuthReadiness(config, { threadsAppSecretPresent: true, masterKeyConfigured: true });
+    const r = liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true });
     expect(r).toEqual({ ready: true, missing: [] });
-    expect(JSON.stringify(r)).not.toContain('placeholder-app-id');
+    expect(JSON.stringify(r)).not.toContain('000000000000001');
   });
   it.each([
     ['OAUTH_MODE', { OAUTH_MODE: 'mock' }, {}, 'OAUTH_MODE=live'],
     ['THREADS_APP_ID', { THREADS_APP_ID: undefined }, {}, 'THREADS_APP_ID'],
-    ['THREADS_APP_SECRET', {}, { threadsAppSecretPresent: false }, 'THREADS_APP_SECRET'],
+    ['THREADS_APP_SECRET', {}, { threadsAppSecret: 'missing' }, 'THREADS_APP_SECRET'],
+    ['THREADS_APP_ID(형식)', { THREADS_APP_ID: 'placeholder-app-id' }, {}, 'THREADS_APP_ID(형식)'],
+    ['THREADS_APP_SECRET(형식)', {}, { threadsAppSecret: 'invalid' }, 'THREADS_APP_SECRET(형식)'],
     ['OAUTH_REDIRECT_URI', { OAUTH_REDIRECT_URI: undefined }, {}, 'OAUTH_REDIRECT_URI'],
     ['SECRETS_MASTER_KEY', {}, { masterKeyConfigured: false }, 'SECRETS_MASTER_KEY'],
     ['OAUTH_LIVE_APPROVAL_REF', { OAUTH_LIVE_APPROVAL_REF: undefined }, {}, 'OAUTH_LIVE_APPROVAL_REF'],
   ] as const)('%s 하나만 빠짐 → ready=false, 그 이름 하나만', (_n, cfg, sec, name) => {
-    const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecretPresent: true, masterKeyConfigured: true, ...sec });
+    const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecret: 'ok', masterKeyConfigured: true, ...sec });
     expect(r).toEqual({ ready: false, missing: [name] });
+  });
+  it('FIX1-LIVET1: 등록 redirect URI 를 주면 설정값과 정확히 같아야 한다(불일치 → OAUTH_REDIRECT_URI(불일치)), 형식 검증 함수', () => {
+    const config = loadConfig({ ...FULL });
+    expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI).ready).toBe(true);
+    expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, 'https://studio.example.test/api/oauth/callback/')).toEqual({ ready: false, missing: ['OAUTH_REDIRECT_URI(불일치)'] });
+    expect([isValidThreadsAppId('123'), isValidThreadsAppId('12a'), isValidThreadsAppId(''), isValidThreadsAppId('1'.repeat(31))]).toEqual([true, false, false, false]);
+    expect([isValidThreadsAppSecret(' abc '), isValidThreadsAppSecret('a b'), isValidThreadsAppSecret('  '), isValidThreadsAppSecret(undefined)]).toEqual([true, false, false, false]);
+    expect([threadsAppSecretState({}), threadsAppSecretState({ THREADS_APP_SECRET: ' ' }), threadsAppSecretState({ THREADS_APP_SECRET: 'a b' }), threadsAppSecretState({ THREADS_APP_SECRET: 'ab' })]).toEqual(['missing', 'missing', 'invalid', 'ok']);
   });
   it('게시 준비: PUBLISH_MODE 와 관계없이 항상 준비 안 됨 + LIVE_THREADS_PUBLISH(D31 범위 밖)', () => {
     expect(livePublishReadiness(loadConfig({}))).toEqual({ ready: false, missing: ['PUBLISH_MODE=enabled', LIVE_THREADS_PUBLISH_MARKER] });

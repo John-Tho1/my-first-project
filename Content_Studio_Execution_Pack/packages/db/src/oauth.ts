@@ -25,6 +25,7 @@ import {
   CredentialBusyError,
   CredentialNotFoundError,
   CredentialRefreshFailedError,
+  LiveRefreshOutOfScopeError,
   credentialHealth,
   hashOAuthState,
   isRevokeUnsupported,
@@ -577,6 +578,9 @@ export async function completeOAuthCallback(db: Db, input: CallbackInput): Promi
     await rejectCallback(db, ownerId, account.id, 'exchange_failed', now, {
       provider_error: code,
       ...(d ? { provider_reason: d.reason, provider_step: d.step ?? null, outcome_ambiguous: d.ambiguous ? 'yes' : 'no' } : {}),
+      // FIX1-LIVET1(Codex review-LIVET1 Q3): 장기 교환 실패 = 단기 토큰은 발급됐다 — "발급 없음"이 아니다. 공급자에 유효하게 남아 있을 수 있고
+      // 손에 없으므로(공급자 메모리에서 버림) 철회하지 못했다(Threads 철회 API 도 없음).
+      ...(d?.shortTokenIssued ? { short_token_issued: 'yes', short_token_remote_state: 'may_be_valid', short_token_revoke: 'not_possible' } : {}),
     });
     throw new OAuthFlowError('oauth_exchange_failed', { reason: code, ...(d?.ambiguous ? { outcome: 'unknown' } : {}) });
   }
@@ -963,6 +967,21 @@ export async function refreshCredential(
 ): Promise<AccountHealthView> {
   const now = input.now ?? new Date();
   const trigger = input.trigger ?? 'manual';
+  // FIX1-LIVET1(Codex review-LIVET1 P1 :199·Q4): 서버 공통 갱신 진입점 — 실제(live) 계정의 연결 정보 갱신(th_refresh_token)은 D31 범위 밖.
+  // 수동 API(POST …/refresh)·작업 처리기(jobCredentials.refresh)·worker(refreshExpiringCredentials) 어느 경로든 여기서 공급자를 만들거나
+  // 부르기 전에 거부한다 — 외부 호출 0, 연결 정보·상태·정리 대기 그대로. 모의 계정은 T13 그대로.
+  const target = await ownedAccount(db, input.ownerId, input.accountId);
+  if (target.kind !== 'mock') {
+    await recordAudit(db, {
+      ownerId: input.ownerId,
+      action: 'oauth.refresh_refused',
+      entity: 'channel_account',
+      entityId: target.id,
+      details: { reason: 'live_refresh_out_of_scope', kind: target.kind, platform: target.platform, trigger },
+      at: now,
+    });
+    throw new LiveRefreshOutOfScopeError();
+  }
   // FIX3-T13: 정리 대기가 있으면 먼저 정리한다 — 하나라도 남으면 갱신하지 않는다(발급을 더 늘리지 않음).
   if ((await reconcilePendingCredential(db, { ...input, now, ignoreBackoff: trigger !== 'auto' })) === 'still_pending') throw new CredentialRefreshFailedError('pending_reconcile');
   const s = await readForUse(db, input.ownerId, input.accountId, input.providerFor, input.keyring, now);

@@ -53,6 +53,8 @@ export const RETENTION_PROTECTED_TABLES = [
   // T18(D32 제안): 가져오기 원장 — 가져온 소재의 출처 이력
   'import_runs',
   'import_items',
+  // FIX-T18 round 1(0039): 가져온 원본 그대로 — 원본 보존(AGENTS)
+  'source_version_originals',
   'audit_events',
   'export_runs',
   'restore_runs',

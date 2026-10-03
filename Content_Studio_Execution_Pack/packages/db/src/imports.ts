@@ -7,17 +7,23 @@
  * - 기존 소재의 원문·제목·메모를 바꾸지 않는다. 같은 외부 항목을 다시 가져오면 동일(checksum 같음)은 건너뛰고(멱등),
  *   내용이 다르면 충돌 — 사용자가 그 항목을 "새 버전"으로 고른 때만 기존 출처에 source_version + 새 소재(그 출처에 연결)를 만든다. 덮어쓰기 없음.
  * - 모든 조회·변경은 owner 조건을 건다(A01). 원장에는 본문·자격 증명을 넣지 않는다.
+ * - FIX-T18 round 1(Codex review-T18):
+ *   (P0 :293) 확정한 항목의 원본 파일은 바이트 그대로 source_version_originals 에 남는다(출처 버전마다 하나, sha256 = raw_hash). 소재 원문은 파생 값(.html 은 추출 텍스트).
+ *   (P1 :244) 확정 트랜잭션은 owner·공급자 단위 advisory lock 을 잡은 뒤 출처를 다시 읽어 판정한다 — 다른 실행의 동시 확정과 직렬화.
+ *            그래도 부분 unique(sources_owner_import_external_uq) 에 걸리면(잠금 밖의 쓰기) savepoint 로 되돌리고 다시 읽어 동일·충돌로 판정한다(500 아님).
+ *   (P1 web :122) 원장 기준으로 실제 쓰기를 일으키는 선택이 하나도 없으면 상태를 바꾸기 전에 400 import_nothing_selected. version_ids 는 충돌 항목만.
  */
 import { randomUUID } from 'node:crypto';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   AppError,
   BadRequestError,
   contentHash,
   decideImportItem,
-  inSelectedFolder,
+  effectiveImportChoice,
   isUuid,
   NotFoundError,
+  originalBytes,
   type ExistingImportSource,
   type ImportOutcome,
   type ImportSelection,
@@ -26,7 +32,7 @@ import {
 } from '@cs/domain';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
-import { captureRevisions, captures, importItems, importRuns, sources, sourceVersions } from './schema';
+import { captureRevisions, captures, importItems, importRuns, sources, sourceVersionOriginals, sourceVersions } from './schema';
 
 export type ImportRunRow = typeof importRuns.$inferSelect;
 export type ImportItemRow = typeof importItems.$inferSelect;
@@ -208,6 +214,32 @@ export async function cancelImportRun(db: Db, ownerId: string, id: string, now: 
 
 export type ImportCommitResult = Record<ImportOutcome, number> & { total: number };
 
+/** 시험 전용 훅(운영 경로는 넘기지 않는다). */
+export interface CommitImportHooks {
+  /**
+   * 새 출처 INSERT 직전(같은 트랜잭션, savepoint 밖). 다른 연결의 동시 확정이 같은 외부 항목의 출처를 먼저 커밋한 상황을
+   * 흉내 내어 부분 unique 충돌 → 재판정 경로를 시험한다.
+   */
+  beforeSourceInsert?: (tx: DbOrTx, externalId: string) => Promise<void>;
+}
+
+const IMPORT_SOURCE_UNIQUE = 'sources_owner_import_external_uq';
+
+/** PostgreSQL unique 위반(23505)의 제약 이름(드라이버·drizzle 오류의 cause 를 따라간다). */
+function uniqueViolationConstraint(e: unknown): string | null {
+  let cur: unknown = e;
+  for (let i = 0; i < 5 && cur; i++) {
+    const c = cur as { code?: unknown; constraint?: unknown; cause?: unknown; message?: unknown };
+    if (c.code === '23505') {
+      if (typeof c.constraint === 'string') return c.constraint;
+      if (typeof c.message === 'string' && c.message.includes(IMPORT_SOURCE_UNIQUE)) return IMPORT_SOURCE_UNIQUE;
+      return '';
+    }
+    cur = c.cause;
+  }
+  return null;
+}
+
 /**
  * 선택 확정. loadItems 는 원본을 다시 읽어 항목(본문 포함)을 돌려준다(ZIP: 저장한 파일 + checksum 확인, 모의: 커넥터 재조회).
  * 선택: selection.itemIds ∪ (selection.folders 안의 항목). 충돌 항목은 selection.versionIds 에 있을 때만 새 버전.
@@ -219,15 +251,26 @@ export async function commitImportRun(
   selection: ImportSelection,
   loadItems: (run: ImportRunRow) => Promise<readonly ParsedImportItem[]>,
   now: Date = new Date(),
+  hooks: CommitImportHooks = {},
 ): Promise<{ run: ImportRunRow; items: ImportItemRow[]; result: ImportCommitResult }> {
   const run = await getImportRun(db, ownerId, runId.toLowerCase());
   if (!run) throw new NotFoundError('가져오기를 찾을 수 없습니다');
   if (run.status === 'committed') throw new ImportAlreadyCommittedError();
   if (run.status !== 'preview') throw new ImportNotCommittableError(run.status);
   const ledger = await listImportItems(db, ownerId, run.id);
-  const ledgerIds = new Set(ledger.map((i) => i.id));
+  const ledgerById = new Map(ledger.map((i) => [i.id, i]));
   for (const id of [...selection.itemIds, ...selection.versionIds]) {
-    if (!ledgerIds.has(id)) throw new BadRequestError('이 가져오기에 없는 항목을 골랐습니다');
+    if (!ledgerById.has(id)) throw new BadRequestError('이 가져오기에 없는 항목을 골랐습니다');
+  }
+  // FIX-T18 round 1(Codex review-T18 P1 web :122): "새 버전" 은 충돌 항목만 고를 수 있다.
+  for (const id of selection.versionIds) {
+    if (ledgerById.get(id)!.decision !== 'conflict') {
+      throw new AppError('bad_request', 'import_invalid_selection', '"새 버전으로 추가" 는 충돌 항목만 고를 수 있습니다');
+    }
+  }
+  // 원장 기준으로 실제 쓰기를 일으키는 선택이 하나도 없으면(없는 폴더·동일·건너뜀만 고름) 상태를 바꾸지 않고 거부한다 — 실행은 미리보기로 남고 ZIP 도 남는다.
+  if (!ledger.some((i) => effectiveImportChoice(i, selection) !== null)) {
+    throw new AppError('bad_request', 'import_nothing_selected', '가져올 항목을 하나 이상 고르세요(새 항목 또는 "새 버전으로 추가" 를 고른 충돌 항목)');
   }
   const parsed = new Map((await loadItems(run)).map((p) => [p.externalId, p]));
 
@@ -241,6 +284,8 @@ export async function commitImportRun(
     if (!claimed) throw new ImportAlreadyCommittedError();
 
     const provider = run.sourceKind as ImportSourceKind;
+    // FIX-T18 round 1(P1 :244): 같은 owner·공급자의 확정을 직렬화한다. 잠금 뒤의 조회는 먼저 커밋된 다른 실행의 출처를 본다(READ COMMITTED 의 문장 스냅샷).
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs.import:${ownerId}:${provider}`}))`);
     const existing = await findExistingImportSources(tx, ownerId, provider, ledger.map((i) => i.externalId));
     const counts = {
       total: ledger.length,
@@ -254,14 +299,15 @@ export async function commitImportRun(
     } satisfies ImportCommitResult;
 
     for (const item of ledger) {
-      const selected = selection.itemIds.has(item.id) || (item.decision === 'new' && inSelectedFolder(item.folder, selection.folders));
-      const versionChosen = selection.versionIds.has(item.id);
+      const choice = effectiveImportChoice(item, selection);
+      const selected = selection.itemIds.has(item.id) || choice === 'import';
+      const versionChosen = choice === 'version';
       let outcome: ImportOutcome;
       let target: { captureId: string; sourceId: string; sourceVersionId: string } | null = null;
       const p = parsed.get(item.externalId);
       if (item.decision === 'skipped') {
         outcome = 'skipped_unsupported';
-      } else if (!p || p.contentChecksum !== item.contentChecksum || p.body === null) {
+      } else if (!p || p.contentChecksum !== item.contentChecksum || p.body === null || p.original === null) {
         outcome = 'failed_changed';
       } else {
         const cur = decideImportItem(p, existing.get(item.externalId));
@@ -270,28 +316,50 @@ export async function commitImportRun(
         else if (cur === 'new') outcome = selected ? 'imported' : 'skipped_unselected';
         else outcome = versionChosen ? 'versioned' : selected ? 'skipped_conflict' : 'skipped_unselected';
 
-        if (outcome === 'imported' || outcome === 'versioned') {
-          let sourceId: string;
-          if (outcome === 'imported') {
-            const [src] = await tx
-              .insert(sources)
-              .values({
-                ownerId,
-                kind: provider,
-                externalProvider: provider,
-                externalId: item.externalId,
-                checkedAt: now,
-                contentHash: p.contentChecksum,
-              })
-              .returning();
+        let sourceId: string | null = null;
+        if (outcome === 'imported') {
+          await hooks.beforeSourceInsert?.(tx, item.externalId);
+          try {
+            // savepoint: unique 충돌이면 이 INSERT 만 되돌리고 트랜잭션은 이어 간다.
+            const [src] = await tx.transaction(async (sp) =>
+              sp
+                .insert(sources)
+                .values({
+                  ownerId,
+                  kind: provider,
+                  externalProvider: provider,
+                  externalId: item.externalId,
+                  checkedAt: now,
+                  contentHash: p.contentChecksum,
+                })
+                .returning(),
+            );
             sourceId = src!.id;
-          } else {
-            sourceId = existing.get(item.externalId)!.sourceId;
+          } catch (e) {
+            if (uniqueViolationConstraint(e) !== IMPORT_SOURCE_UNIQUE) throw e;
+            // 다른 쓰기가 같은 외부 항목의 출처를 먼저 만들었다 — 다시 읽어 판정(동일 → 건너뜀, 다르면 충돌 — 사용자가 고르지 않았으므로 덮어쓰지 않음).
+            const again = (await findExistingImportSources(tx, ownerId, provider, [item.externalId])).get(item.externalId);
+            if (again) existing.set(item.externalId, again);
+            outcome = decideImportItem(p, again) === 'identical' ? 'skipped_identical' : 'skipped_conflict';
           }
+        } else if (outcome === 'versioned') {
+          sourceId = existing.get(item.externalId)!.sourceId;
+        }
+        if ((outcome === 'imported' || outcome === 'versioned') && sourceId !== null) {
           const [ver] = await tx
             .insert(sourceVersions)
             .values({ sourceId, rawHash: p.contentChecksum, fetchedAt: now, excerpt: null, extractionState: 'imported' })
             .returning();
+          // FIX-T18 round 1(P0 :293): 원본 파일 그대로(바이트 = UTF-8(original), base64 로 보관, sha256 = raw_hash — DB CHECK·트리거가 다시 확인).
+          const raw = originalBytes(p.original);
+          await tx.insert(sourceVersionOriginals).values({
+            sourceVersionId: ver!.id,
+            ownerId,
+            format: p.format,
+            byteSize: raw.byteLength,
+            sha256: p.contentChecksum!,
+            contentBase64: Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('base64'),
+          });
           const [cap] = await tx
             .insert(captures)
             .values({
@@ -359,12 +427,36 @@ export async function commitImportRun(
   return { ...result, items: await listImportItems(db, ownerId, run.id) };
 }
 
+/** FIX-T18 round 1: 가져온 원본(출처 버전 하나). owner 조건 — 다른 owner 의 버전이면 null. */
+export async function getSourceVersionOriginal(
+  db: DbOrTx,
+  ownerId: string,
+  sourceVersionId: string,
+): Promise<typeof sourceVersionOriginals.$inferSelect | null> {
+  if (!isUuid(sourceVersionId)) return null;
+  const rows = await db
+    .select()
+    .from(sourceVersionOriginals)
+    .where(and(eq(sourceVersionOriginals.sourceVersionId, sourceVersionId), eq(sourceVersionOriginals.ownerId, ownerId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 /** 소재 상세 표시용: 이 소재를 만든 가져오기(있으면). */
 export async function getImportOriginForCapture(
   db: DbOrTx,
   ownerId: string,
   captureId: string,
-): Promise<{ runId: string; sourceKind: string; externalPath: string; externalCreatedText: string | null; outcome: string; committedAt: Date | null } | null> {
+): Promise<{
+  runId: string;
+  sourceKind: string;
+  externalPath: string;
+  externalCreatedText: string | null;
+  outcome: string;
+  committedAt: Date | null;
+  sourceVersionId: string | null;
+  format: string;
+} | null> {
   if (!isUuid(captureId)) return null;
   const rows = await db
     .select({
@@ -374,6 +466,8 @@ export async function getImportOriginForCapture(
       externalCreatedText: importItems.externalCreatedText,
       outcome: importItems.outcome,
       committedAt: importRuns.committedAt,
+      sourceVersionId: importItems.targetSourceVersionId,
+      format: importItems.format,
     })
     .from(importItems)
     .innerJoin(importRuns, and(eq(importRuns.id, importItems.runId), eq(importRuns.ownerId, importItems.ownerId)))

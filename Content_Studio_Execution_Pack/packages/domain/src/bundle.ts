@@ -71,6 +71,8 @@ export const EXPORTED_TABLES = [
   // T18(0038, D32 제안): 가져오기 원장 — 가져온 소재의 출처 이력. 소재·출처·출처 버전보다 뒤(대상 참조). 변환 없이 그대로 복원한다.
   'import_runs',
   'import_items',
+  // FIX-T18 round 1(0039, Codex review-T18 P0): 가져온 텍스트 파일의 원본 그대로(출처 버전마다 하나). 출처 버전보다 뒤. 변환 없이 복원한다.
+  'source_version_originals',
   'audit_events',
 ] as const;
 export type ExportedTable = (typeof EXPORTED_TABLES)[number];
@@ -104,6 +106,7 @@ export const TABLE_INTRODUCED_IN: Partial<Record<ExportedTable, string>> = {
   remote_steps: '0031_t14_threads_steps',
   import_runs: '0038_t18_imports',
   import_items: '0038_t18_imports',
+  source_version_originals: '0039_t18_fix1_originals',
 };
 
 export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
@@ -622,6 +625,16 @@ export const ROW_SCHEMAS = {
     target_capture_id: uuid.nullable(),
     target_source_id: uuid.nullable(),
     target_source_version_id: uuid.nullable(),
+    created_at: ts,
+  }),
+  // FIX-T18 round 1(0039): 원본 바이트 그대로(base64). 관계·sha256·크기는 checkIntegrity 에서 다시 확인한다.
+  source_version_originals: z.strictObject({
+    id: uuid,
+    source_version_id: uuid,
+    format: z.enum(['md', 'txt', 'html', 'csv']),
+    byte_size: int.min(0).max(2 * 1024 * 1024),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    content_base64: z.string().regex(/^[A-Za-z0-9+/]*={0,2}$/),
     created_at: ts,
   }),
   audit_events: z.strictObject({
@@ -1332,6 +1345,17 @@ export function checkIntegrity(t: BundleTables): void {
     if (i.target_source_version_id !== null && versionSource.has(i.target_source_version_id) && versionSource.get(i.target_source_version_id) !== i.target_source_id) {
       problems.push('import_items.target_source_version_id → 같은 출처의 버전');
     }
+  }
+  // FIX-T18 round 1(0039): 원본은 출처 버전 하나에 하나, sha256 = 그 버전의 raw_hash = sha256(base64 디코딩 바이트), byte_size = 그 길이.
+  const versionHash = new Map(t.source_versions.map((v) => [v.id, v.raw_hash]));
+  const seenOriginalVersions = new Set<string>();
+  for (const o of t.source_version_originals) {
+    need('source_version_originals', 'source_version_id', o.source_version_id, 'source_versions');
+    if (seenOriginalVersions.has(o.source_version_id)) problems.push('source_version_originals.source_version_id → 버전마다 원본 하나');
+    seenOriginalVersions.add(o.source_version_id);
+    if (versionHash.has(o.source_version_id) && versionHash.get(o.source_version_id) !== o.sha256) problems.push('source_version_originals.sha256 → 출처 버전 raw_hash');
+    const bytes = new Uint8Array(Buffer.from(o.content_base64, 'base64'));
+    if (bytes.byteLength !== o.byte_size || sha256Hex(bytes) !== o.sha256) problems.push('source_version_originals.content_base64 → sha256·크기');
   }
   if (problems.length) {
     throw new BundleError('integrity', '묶음 안의 관계(ID 참조)가 맞지 않습니다', { problems: [...new Set(problems)].slice(0, 20) });

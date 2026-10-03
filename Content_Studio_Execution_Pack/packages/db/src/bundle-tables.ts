@@ -48,6 +48,7 @@ export const BUNDLE_TABLES: Record<ExportedTable, PgTable> = {
   remote_steps: schema.remoteSteps,
   import_runs: schema.importRuns,
   import_items: schema.importItems,
+  source_version_originals: schema.sourceVersionOriginals,
   audit_events: schema.auditEvents,
 };
 

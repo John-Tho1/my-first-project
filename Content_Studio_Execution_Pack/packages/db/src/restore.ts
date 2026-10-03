@@ -236,6 +236,8 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'target_source_version_id', table: 'source_versions' },
     { col: 'matched_source_id', table: 'sources' },
   ],
+  // FIX-T18 round 1(0039): 원본은 그 출처 버전이 있을 때만(버전 행·sha256 일치는 DB 트리거가 다시 확인).
+  source_version_originals: [{ col: 'source_version_id', table: 'source_versions' }],
 };
 
 type Avail = 'inserted' | 'same' | 'different';

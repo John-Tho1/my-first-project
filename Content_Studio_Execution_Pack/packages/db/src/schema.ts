@@ -1715,7 +1715,8 @@ export const importItems = pgTable(
     title: text('title'),
     format: text('format').notNull(),
     contentChecksum: text('content_checksum'),
-    byteSize: integer('byte_size').notNull(),
+    /** FIX-T18 round 1(Codex review-T18 P2, 0039): ZIP 크기 필드는 unsigned 32bit 라 integer 를 넘을 수 있다 → bigint. */
+    byteSize: bigint('byte_size', { mode: 'number' }).notNull(),
     externalCreatedText: text('external_created_text'),
     decision: text('decision').notNull(),
     skipReason: text('skip_reason'),
@@ -1761,5 +1762,37 @@ export const importItems = pgTable(
       columns: [t.matchedSourceId, t.ownerId],
       foreignColumns: [sources.id, sources.ownerId],
     }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * FIX-T18 round 1(Codex review-T18 P0 :293, AGENTS "원본·버전 이력 보존", 0039): 가져온 텍스트 파일의 **원본 그대로**(출처 버전마다 하나).
+ * content_base64 는 원본 파일 바이트의 base64(변환 없음 — BOM·CRLF·NUL 도 그대로). 문자열 디코딩을 거치지 않으므로 드라이버·JSON 묶음이
+ * 앞의 BOM 등을 바꿀 수 없다. DB CHECK: 길이(decode) = byte_size, sha256(decode) = sha256.
+ * 트리거: sha256 = 그 출처 버전의 raw_hash(INSERT), 수정·삭제 금지(append_only_immutable). 소재 원문(captures.raw_text)은 이 값에서 만든 파생 값이다
+ * (.html 은 추출 텍스트). 내보내기·복원에 포함(변환 없이).
+ */
+export const sourceVersionOriginals = pgTable(
+  'source_version_originals',
+  {
+    id: id(),
+    sourceVersionId: uuid('source_version_id')
+      .notNull()
+      .unique('source_version_originals_version_uq')
+      .references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    format: text('format').notNull(),
+    byteSize: integer('byte_size').notNull(),
+    sha256: text('sha256').notNull(),
+    contentBase64: text('content_base64').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    check('source_version_originals_format_chk', sql`${t.format} in ('md', 'txt', 'html', 'csv')`),
+    check('source_version_originals_size_chk', sql`${t.byteSize} >= 0 and ${t.byteSize} <= 2097152 and octet_length(decode(${t.contentBase64}, 'base64')) = ${t.byteSize}`),
+    check('source_version_originals_sha_chk', sql`${t.sha256} ~ '^[0-9a-f]{64}$' and encode(sha256(decode(${t.contentBase64}, 'base64')), 'hex') = ${t.sha256}`),
+    index('source_version_originals_owner_idx').on(t.ownerId),
   ],
 );

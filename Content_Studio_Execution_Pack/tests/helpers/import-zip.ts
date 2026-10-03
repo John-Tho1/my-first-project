@@ -13,6 +13,12 @@ export interface TestZipEntry {
   declaredSize?: number;
   /** 암호화 플래그(시험용) */
   encrypted?: boolean;
+  /** FIX-T18 round 1: 데이터 디스크립터(bit 3) — local header 의 CRC·크기는 0, 본문 뒤에 디스크립터(서명 포함 16바이트) */
+  dataDescriptor?: boolean;
+  /** FIX-T18 round 1: local header 에만 다른 이름(local/central 불일치 시험용) */
+  localName?: string;
+  /** FIX-T18 round 1: 압축 방식 값을 그대로 적는다(지원하지 않는 방식 시험용, 본문은 저장 그대로) */
+  rawMethod?: number;
 }
 
 export function buildTestZip(entries: readonly TestZipEntry[]): Buffer {
@@ -21,22 +27,33 @@ export function buildTestZip(entries: readonly TestZipEntry[]): Buffer {
   let offset = 0;
   for (const e of entries) {
     const raw = typeof e.data === 'string' ? Buffer.from(e.data, 'utf8') : Buffer.from(e.data);
-    const method = e.method ?? 8;
+    const method = e.rawMethod ?? e.method ?? 8;
     const body = method === 8 ? deflateRawSync(raw) : raw;
     const name = Buffer.from(e.path, 'utf8');
+    const lname = Buffer.from(e.localName ?? e.path, 'utf8');
     const crc = crc32(raw) >>> 0;
     const size = e.declaredSize ?? raw.length;
-    const flags = 0x0800 | (e.encrypted ? 1 : 0);
+    const flags = 0x0800 | (e.encrypted ? 1 : 0) | (e.dataDescriptor ? 0x0008 : 0);
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0);
     lh.writeUInt16LE(20, 4);
     lh.writeUInt16LE(flags, 6);
     lh.writeUInt16LE(method, 8);
-    lh.writeUInt32LE(crc, 14);
-    lh.writeUInt32LE(body.length, 18);
-    lh.writeUInt32LE(size, 22);
-    lh.writeUInt16LE(name.length, 26);
-    locals.push(lh, name, body);
+    lh.writeUInt32LE(e.dataDescriptor ? 0 : crc, 14);
+    lh.writeUInt32LE(e.dataDescriptor ? 0 : body.length, 18);
+    lh.writeUInt32LE(e.dataDescriptor ? 0 : size, 22);
+    lh.writeUInt16LE(lname.length, 26);
+    locals.push(lh, lname, body);
+    let dd = 0;
+    if (e.dataDescriptor) {
+      const d = Buffer.alloc(16);
+      d.writeUInt32LE(0x08074b50, 0);
+      d.writeUInt32LE(crc, 4);
+      d.writeUInt32LE(body.length, 8);
+      d.writeUInt32LE(size, 12);
+      locals.push(d);
+      dd = 16;
+    }
     const ch = Buffer.alloc(46);
     ch.writeUInt32LE(0x02014b50, 0);
     ch.writeUInt16LE(20, 4);
@@ -49,7 +66,7 @@ export function buildTestZip(entries: readonly TestZipEntry[]): Buffer {
     ch.writeUInt16LE(name.length, 28);
     ch.writeUInt32LE(offset, 42);
     centrals.push(ch, name);
-    offset += 30 + name.length + body.length;
+    offset += 30 + lname.length + body.length + dd;
   }
   const cd = Buffer.concat(centrals);
   const eocd = Buffer.alloc(22);

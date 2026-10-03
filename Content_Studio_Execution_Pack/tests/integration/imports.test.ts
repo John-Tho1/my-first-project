@@ -9,12 +9,13 @@ import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, count, eq, type SQL } from 'drizzle-orm';
 import type { PgTable } from 'drizzle-orm/pg-core';
-import { closeDb, getDb, runRestoreDrill, schema, seed, type Db } from '@cs/db';
-import { loadConfig } from '@cs/domain';
+import { closeDb, commitImportRun, getDb, runRestoreDrill, schema, seed, type Db } from '@cs/db';
+import { loadConfig, parseImportArchive, sha256Bytes } from '@cs/domain';
 import { DisabledPublisher, LocalStorageAdapter, mockImportConnectorForTest } from '@cs/providers';
 import { POST as cancelPOST } from '../../apps/web/app/api/imports/[id]/cancel/route';
 import { POST as commitPOST } from '../../apps/web/app/api/imports/[id]/commit/route';
 import { GET as importGET } from '../../apps/web/app/api/imports/[id]/route';
+import { GET as originalGET } from '../../apps/web/app/api/imports/originals/[versionId]/route';
 import { POST as previewPOST } from '../../apps/web/app/api/imports/preview/route';
 import { GET as importsGET } from '../../apps/web/app/api/imports/route';
 import { buildTestZip, NOTION_IDS, notionExport } from '../helpers/import-zip';
@@ -232,11 +233,30 @@ describe('선택 확정·재가져오기·충돌', () => {
     expect(p1.decision).toBe('conflict');
     const [orig] = await db.select().from(schema.captures).where(eq(schema.captures.id, page1Capture));
     const before = await writeCounts(ownerA);
-    const out = await (await commit(run.import_id, { item_ids: [p1.id] })).json();
+    // FIX-T18 round 1(P1 web :122): 충돌 항목만 고르고 "새 버전" 을 고르지 않으면 실제로 쓸 것이 없다 → 400, 실행은 미리보기로 남는다.
+    const none = await commit(run.import_id, { item_ids: [p1.id] });
+    expect(none.status).toBe(400);
+    expect((await none.json()).error).toBe('import_nothing_selected');
+    expect((await db.select().from(schema.importRuns).where(eq(schema.importRuns.id, run.import_id)))[0]!.status).toBe('preview');
+    expect(existsSync(path.join(tmp, 'imports', `${run.import_id}.zip`))).toBe(true);
+    // 새 항목과 함께 고르면 충돌 항목은 skipped_conflict(덮어쓰기·새 버전 없음)
+    const mixed = await previewOk(
+      buildTestZip([
+        { path: `X/현지 파트너 첫 미팅 ${NOTION_IDS.page1}.md`, data: '# 현지 파트너 첫 미팅\n\n외부에서 고친 내용(합성).\n' },
+        { path: `X/새 페이지 ${'5'.repeat(32)}.md`, data: '# 새 페이지\n\n새 본문(합성).\n' },
+      ]),
+      tokenA,
+      'notion_export',
+    );
+    const mp1 = byExt(mixed.items, `notion:${NOTION_IDS.page1}`);
+    expect(mp1.decision).toBe('conflict');
+    const out = await (await commit(mixed.import_id, { item_ids: mixed.items.map((i) => i.id) })).json();
     expect(byExt(out.items, `notion:${NOTION_IDS.page1}`)).toMatchObject({ outcome: 'skipped_conflict', target_capture_id: null });
-    expect(await writeCounts(ownerA)).toEqual(before);
+    expect(byExt(out.items, `notion:${'5'.repeat(32)}`).outcome).toBe('imported');
+    expect((await writeCounts(ownerA)).captures).toBe(before.captures + 1);
     const [after] = await db.select().from(schema.captures).where(eq(schema.captures.id, page1Capture));
     expect(after).toEqual(orig);
+    expect((await db.select().from(schema.sources).where(and(eq(schema.sources.ownerId, ownerA), eq(schema.sources.externalId, `notion:${NOTION_IDS.page1}`))))).toHaveLength(1);
   });
 
   it('충돌을 "새 버전"으로 명시 선택 → 같은 출처에 source_version 추가 + 새 소재, 기존 소재·출처 행은 그대로', async () => {
@@ -383,6 +403,200 @@ describe('모의 커넥터(IMPORT_CONNECTOR_MODE)', () => {
   });
 });
 
+describe('FIX-T18 round 1 — 원본 그대로 보존(P0 :293)', () => {
+  const html =
+    '﻿<html><head><title>근거 문서</title><script>track()</script></head><body><h1>근거 문서</h1><p>출처: <a href="https://example.com/source?id=1">근거</a></p><table><tr><td>항목</td><td>값</td></tr></table></body></html>\r\n';
+
+  const byTrigger = (e: unknown) => /source_version_originals_match/.test(String((e as { cause?: { message?: string } }).cause?.message ?? (e as Error).message));
+
+  it('HTML 항목: 소재 원문은 추출 텍스트(파생), 원본은 바이트 그대로 + checksum = raw_hash, 원본 받기 경로로 같은 바이트, 다른 owner 404, DB 가 수정·불일치를 막는다', async () => {
+    const htmlBytes = new TextEncoder().encode(html);
+    const run = await previewOk(buildTestZip([{ path: '근거/근거 문서.html', data: htmlBytes }]), tokenA, 'drive_export');
+    const out = await (await commit(run.import_id, { folders: ['근거'] })).json();
+    const item = out.items[0] as ItemView;
+    expect(item.outcome).toBe('imported');
+    const [cap] = await db.select().from(schema.captures).where(eq(schema.captures.id, item.target_capture_id!));
+    expect(cap!.rawText).toContain('근거');
+    expect(cap!.rawText).not.toContain('href');
+    expect(cap!.rawText).not.toContain('track()');
+    const [orig] = await db.select().from(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, item.target_source_version_id!));
+    const [ver] = await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.id, item.target_source_version_id!));
+    expect(orig).toMatchObject({ ownerId: ownerA, format: 'html', byteSize: htmlBytes.byteLength, sha256: ver!.rawHash });
+    expect(Buffer.from(orig!.contentBase64, 'base64').equals(Buffer.from(htmlBytes))).toBe(true); // 바이트 그대로(BOM·CRLF 포함)
+    expect(sha256Bytes(Buffer.from(orig!.contentBase64, 'base64'))).toBe(item.content_checksum);
+
+    const res = await originalGET(new Request(`${BASE}/api/imports/originals/${item.target_source_version_id}`, { headers: cookieHeader(tokenA) }), {
+      params: Promise.resolve({ versionId: item.target_source_version_id! }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/plain; charset=utf-8');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('x-content-sha256')).toBe(ver!.rawHash);
+    expect(Buffer.from(await res.arrayBuffer()).equals(Buffer.from(htmlBytes))).toBe(true);
+
+    as(B);
+    const other = await originalGET(new Request(`${BASE}/api/imports/originals/${item.target_source_version_id}`, { headers: cookieHeader(tokenB) }), {
+      params: Promise.resolve({ versionId: item.target_source_version_id! }),
+    });
+    expect(other.status).toBe(404);
+    as(A);
+
+    // 원본은 추가 전용 — 수정·삭제 금지, 버전 raw_hash 와 다른 원본은 들어가지 않는다
+    await expect(
+      db.update(schema.sourceVersionOriginals).set({ contentBase64: 'eA==' }).where(eq(schema.sourceVersionOriginals.id, orig!.id)),
+    ).rejects.toThrow();
+    await expect(db.delete(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.id, orig!.id))).rejects.toThrow();
+    const [v2] = await db.insert(schema.sourceVersions).values({ sourceId: ver!.sourceId, rawHash: sha256Bytes(new TextEncoder().encode('다른 내용')), extractionState: 'imported' }).returning();
+    await expect(
+      // 내용·크기·sha256 은 서로 맞지만(CHECK 통과) 출처 버전 raw_hash 와 다름 → 트리거가 거부
+      db.insert(schema.sourceVersionOriginals).values({ sourceVersionId: v2!.id, ownerId: ownerA, format: 'txt', byteSize: 1, sha256: sha256Bytes(new TextEncoder().encode('y')), contentBase64: Buffer.from('y').toString('base64') }),
+    ).rejects.toSatisfy(byTrigger);
+    // 다른 owner 로 적은 원본도 거부(출처 owner 와 다름)
+    await expect(
+      db.insert(schema.sourceVersionOriginals).values({ sourceVersionId: v2!.id, ownerId: ownerB, format: 'txt', byteSize: new TextEncoder().encode('다른 내용').byteLength, sha256: v2!.rawHash!, contentBase64: Buffer.from('다른 내용').toString('base64') }),
+    ).rejects.toSatisfy(byTrigger);
+  });
+
+  it('md(BOM·CRLF) 도 원본 바이트 그대로 보존 — 소재 원문은 BOM 만 뗀 텍스트', async () => {
+    const md = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('# 원본 md\r\n\r\n줄 끝 CRLF\r\n')]);
+    const run = await previewOk(buildTestZip([{ path: 'md원본/a.md', data: md }]), tokenA, 'drive_export');
+    const out = await (await commit(run.import_id, { folders: ['md원본'] })).json();
+    const vid = out.items[0].target_source_version_id as string;
+    const [orig] = await db.select().from(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, vid));
+    expect(Buffer.from(orig!.contentBase64, 'base64').equals(Buffer.from(md))).toBe(true);
+    const [cap] = await db.select().from(schema.captures).where(eq(schema.captures.id, out.items[0].target_capture_id));
+    expect(cap!.rawText.startsWith('# 원본 md\r\n')).toBe(true);
+  });
+});
+
+describe('FIX-T18 round 1 — 동시 확정 직렬화(P1 :244)', () => {
+  const zipOf = (body: string) => buildTestZip([{ path: '동시/같은 항목.md', data: body }]);
+
+  it('같은 새 외부 항목을 가진 두 실행을 동시에 확정 → 출처 하나, 한쪽 imported·다른 쪽 skipped_identical, 원장 일관', async () => {
+    const z = zipOf('# 같은 항목\n\n동시 확정 본문(합성).\n');
+    const r1 = await previewOk(z, tokenA, 'drive_export');
+    const r2 = await previewOk(z, tokenA, 'drive_export');
+    expect(r1.items[0]!.decision).toBe('new');
+    expect(r2.items[0]!.decision).toBe('new');
+    const [a, b] = await Promise.all([commit(r1.import_id, { folders: [''] }), commit(r2.import_id, { folders: [''] })]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const outs = [await a.json(), await b.json()];
+    expect(outs.map((o) => o.items[0].outcome).sort()).toEqual(['imported', 'skipped_identical']);
+    const srcs = await db
+      .select()
+      .from(schema.sources)
+      .where(and(eq(schema.sources.ownerId, ownerA), eq(schema.sources.externalProvider, 'drive_export'), eq(schema.sources.externalId, 'path:동시/같은 항목.md')));
+    expect(srcs).toHaveLength(1);
+    const caps = await db.select().from(schema.captures).where(eq(schema.captures.sourceId, srcs[0]!.id));
+    expect(caps).toHaveLength(1);
+    const imported = outs.find((o) => o.items[0].outcome === 'imported')!;
+    expect(imported.items[0].target_source_id).toBe(srcs[0]!.id);
+    expect(outs.find((o) => o.items[0].outcome === 'skipped_identical')!.items[0].target_source_id).toBeNull();
+  });
+
+  it('잠금 밖의 쓰기가 같은 외부 항목의 출처를 먼저 만든 경우(훅) → unique 위반을 500 이 아닌 동일·충돌 판정으로', async () => {
+    for (const [body, other, expected] of [
+      ['# 훅 동일\n\n본문 A\n', '# 훅 동일\n\n본문 A\n', 'skipped_identical'],
+      ['# 훅 충돌\n\n본문 B\n', '# 훅 충돌\n\n다른 사람이 먼저 넣은 다른 내용\n', 'skipped_conflict'],
+    ] as const) {
+      const path1 = `훅/${expected}.md`;
+      const z = buildTestZip([{ path: path1, data: body }]);
+      const run = await previewOk(z, tokenA, 'drive_export');
+      const before = await writeCounts(ownerA);
+      const out = await commitImportRun(
+        db,
+        ownerA,
+        run.import_id,
+        { itemIds: new Set(), folders: [''], versionIds: new Set() },
+        async () => parseImportArchive('drive_export', z).items,
+        new Date(),
+        {
+          beforeSourceInsert: async (tx, externalId) => {
+            const [s] = await tx
+              .insert(schema.sources)
+              .values({ ownerId: ownerA, kind: 'drive_export', externalProvider: 'drive_export', externalId, contentHash: sha256Bytes(new TextEncoder().encode(other)) })
+              .returning();
+            await tx.insert(schema.sourceVersions).values({ sourceId: s!.id, rawHash: sha256Bytes(new TextEncoder().encode(other)), extractionState: 'imported' });
+          },
+        },
+      );
+      expect(out.items[0]!.outcome).toBe(expected);
+      expect(out.result[expected]).toBe(1);
+      expect(out.items[0]!.targetSourceId).toBeNull();
+      // 훅이 넣은 출처 1 + 버전 1 만 늘고, 소재·이력은 그대로
+      expect(await writeCounts(ownerA)).toEqual({ ...before, sources: before.sources + 1, source_versions: before.source_versions + 1 });
+    }
+  });
+});
+
+describe('FIX-T18 round 1 — 실제 선택이 없으면 확정하지 않음(P1 web :122)', () => {
+  it('없는 폴더·동일 항목만·새 항목에 version_ids → 400, 실행은 preview, ZIP 은 남음. 반복 folder 폼 제출은 두 폴더 모두', async () => {
+    const z = buildTestZip([
+      { path: '선택A/a.md', data: '# a\n\n선택 본문 a' },
+      { path: '선택B/b.md', data: '# b\n\n선택 본문 b' },
+      { path: '선택C/c.md', data: '# c\n\n선택 본문 c' },
+    ]);
+    const run = await previewOk(z, tokenA, 'drive_export');
+    const before = await writeCounts(ownerA);
+    const noFolder = await commit(run.import_id, { folders: ['없는 폴더'] });
+    expect(noFolder.status).toBe(400);
+    expect((await noFolder.json()).error).toBe('import_nothing_selected');
+    const versionOnNew = await commit(run.import_id, { version_ids: [run.items[0]!.id] });
+    expect(versionOnNew.status).toBe(400);
+    expect((await versionOnNew.json()).error).toBe('import_invalid_selection');
+    expect(await writeCounts(ownerA)).toEqual(before);
+    expect((await db.select().from(schema.importRuns).where(eq(schema.importRuns.id, run.import_id)))[0]!.status).toBe('preview');
+    expect(existsSync(path.join(tmp, 'imports', `${run.import_id}.zip`))).toBe(true);
+
+    // 폼: folder 를 두 번 → 두 폴더의 새 항목 모두(C 는 고르지 않음)
+    const body = new URLSearchParams();
+    body.append('folder', '선택A');
+    body.append('folder', '선택B');
+    const res = await commitPOST(
+      new Request(`${BASE}/api/imports/${run.import_id}/commit`, {
+        method: 'POST',
+        headers: { accept: 'text/html', 'content-type': 'application/x-www-form-urlencoded', origin: BASE, ...cookieHeader(tokenA) },
+        body: body.toString(),
+      }),
+      ctx(run.import_id),
+    );
+    expect(res.status).toBe(303);
+    const [row] = await db.select().from(schema.importRuns).where(eq(schema.importRuns.id, run.import_id));
+    expect(row!.result).toMatchObject({ imported: 2, skipped_unselected: 1 });
+
+    // 같은 ZIP 다시: 동일 항목만 고름 → 400(쓸 것이 없음)
+    const again = await previewOk(z, tokenA, 'drive_export');
+    const ids = again.items.filter((i) => i.decision === 'identical').map((i) => i.id);
+    expect(ids).toHaveLength(2);
+    const onlyIdentical = await commit(again.import_id, { item_ids: ids });
+    expect(onlyIdentical.status).toBe(400);
+    expect((await onlyIdentical.json()).error).toBe('import_nothing_selected');
+    // 폼: 반복 version 값(충돌 아님) → 400 으로 폼 오류 리다이렉트
+    const vform = new URLSearchParams();
+    for (const id of ids) vform.append('version', id);
+    const vres = await commitPOST(
+      new Request(`${BASE}/api/imports/${again.import_id}/commit`, {
+        method: 'POST',
+        headers: { accept: 'text/html', 'content-type': 'application/x-www-form-urlencoded', origin: BASE, ...cookieHeader(tokenA) },
+        body: vform.toString(),
+      }),
+      ctx(again.import_id),
+    );
+    expect(vres.status).toBe(303);
+    expect(vres.headers.get('location')).toBe(`/imports/${again.import_id}?error=import_invalid_selection`);
+  });
+});
+
+describe('FIX-T18 round 1 — 크기 경계(P2 :339)', () => {
+  it.each([[2 ** 31 - 1], [2 ** 31]])('선언 크기 %d 인 첨부가 든 ZIP → 미리보기 200, 원장 byte_size 그대로', async (size) => {
+    const run = await previewOk(buildTestZip([{ path: `경계/v${size}.mp4`, data: 'x', method: 0, declaredSize: size }, { path: '경계/m.md', data: '# m\n\n본문' }]), tokenA, 'drive_export');
+    const big = run.items.find((i) => i.external_path.endsWith('.mp4'))!;
+    const [row] = await db.select().from(schema.importItems).where(eq(schema.importItems.id, big.id));
+    expect(row!.byteSize).toBe(size);
+    expect(row!.skipReason).toBe('unsupported_type');
+  });
+});
+
 describe('내보내기·복원(원장 포함)', () => {
   it('복원 훈련: import_runs·import_items 를 포함해 빈 DB 복원 → PASS(원장 행·대상 ID 그대로)', async () => {
     const storage = new LocalStorageAdapter(path.join(tmp, 'assets'));
@@ -395,5 +609,10 @@ describe('내보내기·복원(원장 포함)', () => {
     expect(runs).toMatchObject({ ids: 'same' });
     expect(items.expected_rows).toBeGreaterThan(10);
     expect(items.actual_rows).toBe(items.expected_rows);
+    // FIX-T18 round 1(P0 :293): 가져온 원본 그대로도 묶음에 들어가 같은 ID·같은 내용으로 복원된다
+    const originals = r.tables.find((t) => t.table === 'source_version_originals')!;
+    expect(originals.expected_rows).toBeGreaterThanOrEqual(10);
+    expect(originals).toMatchObject({ ids: 'same' });
+    expect(originals.actual_rows).toBe(originals.expected_rows);
   }, 120_000);
 });

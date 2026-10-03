@@ -33,8 +33,17 @@ export const IMPORT_MAX_TOTAL_TEXT_BYTES = 64 * 1024 * 1024;
 export const IMPORT_MAX_NESTED_DEPTH = 1;
 /** 중첩 ZIP 하나의 풀린 크기 상한(= 올릴 수 있는 ZIP 크기). */
 const MAX_NESTED_ZIP_BYTES = IMPORT_MAX_ZIP_BYTES;
+/**
+ * FIX-T18 round 1(Codex review-T18 P0 :328): 묶음 전체(바깥 + 모든 중첩 ZIP)에서 실제로 푸는 바이트 합 상한(128 MiB).
+ * 중첩 ZIP 컨테이너를 푸는 바이트와 텍스트 항목을 푸는 바이트를 모두 센다(풀기 **전에** 선언 크기로 검사 — 넘으면 묶음 전체 거부).
+ */
+export const IMPORT_MAX_TOTAL_INFLATED_BYTES = 128 * 1024 * 1024;
+/** FIX-T18 round 1: 바깥 ZIP 안에서 풀 수 있는 중첩 ZIP 개수 상한(넘으면 묶음 전체 거부). */
+export const IMPORT_MAX_NESTED_ARCHIVES = 16;
 /** 가져올 수 있는(텍스트) 항목 수 상한 — 미리보기 한 번에 이 수를 넘으면 거부(나눠서 올리기). */
 export const IMPORT_MAX_ITEMS = 1000;
+/** FIX-T18 round 1(P2 :339): 원장 크기 값의 상한 — ZIP 의 크기 필드는 unsigned 32bit 이다(원장 byte_size 는 0039 에서 bigint). */
+export const IMPORT_MAX_DECLARED_BYTES = 0xffffffff;
 
 export type ImportFormat = 'md' | 'txt' | 'html' | 'csv' | 'other';
 export type ImportSkipReason =
@@ -75,8 +84,14 @@ export interface ParsedImportItem {
   byteSize: number;
   /** 원본에 적힌 생성 시각 문자열(Notion 속성 "Created: …" 등) — 해석하지 않고 그대로(최대 100자) */
   externalCreatedText: string | null;
-  /** 소재 원문으로 넣을 본문(.md·.txt·.csv 는 원문 그대로, .html 은 텍스트만). 건너뛴 항목은 null */
+  /** 소재 원문으로 넣을 본문(.md·.txt·.csv 는 원문 그대로(BOM 만 뗌), .html 은 추출한 텍스트 — 파생 값). 건너뛴 항목은 null */
   body: string | null;
+  /**
+   * FIX-T18 round 1(Codex review-T18 P0 :293, AGENTS "원본 보존"): 원본 파일 바이트를 그대로 디코딩한 문자열(BOM 포함, 변환 없음).
+   * 가져오는 항목은 UTF-8·NUL 없음이 보장되므로 UTF-8 로 다시 인코딩하면 원본 바이트와 정확히 같고 sha256 = contentChecksum.
+   * 확정 때 source_version_originals 에 그대로 보관한다(내보내기·복원 포함). 건너뛴 항목은 null.
+   */
+  original: string | null;
   skipReason: ImportSkipReason | null;
 }
 
@@ -111,8 +126,13 @@ function findEocd(buf: Buffer): number {
   return -1;
 }
 
-/** 중앙 목록을 읽고 경로·형식을 검사한다(내용은 풀지 않는다). */
-function listZip(buf: Buffer): RawEntry[] {
+/**
+ * 중앙 목록을 읽고 경로·형식을 검사한다(내용은 풀지 않는다).
+ * FIX-T18 round 1: records = 중앙 목록 레코드 수(디렉터리 포함) — 전역 항목 수 상한은 이 값으로 센다.
+ * 모든 레코드(디렉터리·첨부 포함)의 압축 방식은 저장(0)·deflate(8)만. local header 의 이름·방식·암호화 플래그는 중앙 목록과 같아야 한다
+ * (데이터 디스크립터 bit 3 이 있으면 local 의 크기·CRC 는 0 일 수 있으므로 중앙 목록 값만 쓴다).
+ */
+function listZip(buf: Buffer): { entries: RawEntry[]; records: number } {
   if (buf.length < 22) throw new ZipFormatError('ZIP 파일이 아닙니다');
   const eocd = findEocd(buf);
   if (eocd < 0) throw new ZipFormatError('ZIP 파일이 아닙니다(끝 레코드 없음)');
@@ -147,6 +167,8 @@ function listZip(buf: Buffer): RawEntry[] {
 
     if (flags & 0x0001) throw new ZipFormatError('암호화된 ZIP 은 지원하지 않습니다');
     if (compSize === 0xffffffff || size === 0xffffffff || localOffset === 0xffffffff) throw new ZipFormatError('ZIP64 는 지원하지 않습니다');
+    // FIX-T18 round 1: 압축 방식은 모든 레코드(디렉터리·첨부·큰 파일 포함)에서 검사한다 — 풀지 않는 항목도 지원하지 않는 방식이면 묶음 거부.
+    if (method !== 0 && method !== 8) throw new ZipFormatError('지원하지 않는 ZIP 압축 방식입니다', { paths: [name.slice(0, 200)] });
     const isDir = name.endsWith('/');
     const checkName = isDir ? name.slice(0, -1) : name;
     // zip-slip: 위험한 경로가 하나라도 있으면 묶음 전체를 거부한다(디렉터리 항목 포함).
@@ -157,13 +179,21 @@ function listZip(buf: Buffer): RawEntry[] {
     if (localOffset + 30 > cdOffset || buf.readUInt32LE(localOffset) !== SIG_LOCAL) {
       throw new ZipFormatError('ZIP 항목 헤더가 손상되었습니다', { paths: [name.slice(0, 200)] });
     }
+    const lFlags = buf.readUInt16LE(localOffset + 6);
+    const lMethod = buf.readUInt16LE(localOffset + 8);
     const lNameLen = buf.readUInt16LE(localOffset + 26);
     const lExtraLen = buf.readUInt16LE(localOffset + 28);
+    if (localOffset + 30 + lNameLen > cdOffset) throw new ZipFormatError('ZIP 항목 헤더가 손상되었습니다', { paths: [name.slice(0, 200)] });
+    const lName = buf.subarray(localOffset + 30, localOffset + 30 + lNameLen).toString('utf8');
+    // FIX-T18 round 1: local/central 불일치(이름·방식·암호화) → 거부. 해석기마다 다른 파일을 보게 만드는 ZIP 을 받지 않는다.
+    if (lName !== name || lMethod !== method || (lFlags & 0x0001) !== (flags & 0x0001)) {
+      throw new ZipFormatError('ZIP 항목 헤더가 목록과 다릅니다', { paths: [name.slice(0, 200)] });
+    }
     const dataStart = localOffset + 30 + lNameLen + lExtraLen;
     if (dataStart + compSize > cdOffset) throw new ZipFormatError('ZIP 항목 크기가 올바르지 않습니다', { paths: [name.slice(0, 200)] });
     out.push({ path: name, method, crc, compSize, size, dataStart });
   }
-  return out;
+  return { entries: out, records: count };
 }
 
 /** 항목 하나를 푼다(선언 크기까지만). 방식·크기·CRC 가 맞지 않으면 ZipFormatError. */
@@ -239,24 +269,122 @@ function decodeEntities(s: string): string {
   });
 }
 
-/** HTML → 텍스트(스크립트·스타일 제거, 블록 요소는 줄바꿈). 실행·외부 요청 없음. */
+/** FIX-T18 round 1: htmlToText 입력 상한(문자 수) — 텍스트 항목 상한과 같다. 넘으면 처리하지 않는다. */
+export const HTML_TO_TEXT_MAX_INPUT = IMPORT_MAX_TEXT_ENTRY_BYTES;
+
+/** 내용을 통째로 건너뛰는 요소(닫는 태그까지). title 은 제목으로만 쓰고 본문에는 넣지 않는다. */
+const HTML_RAW_TEXT_TAGS = new Set(['script', 'style', 'noscript', 'template', 'title']);
+/** 닫는 태그 뒤 줄바꿈 */
+const HTML_BLOCK_TAGS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr', 'blockquote', 'pre', 'section', 'article', 'ul', 'ol', 'table']);
+const isAsciiLetter = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isTagNameChar = (c: number) => isAsciiLetter(c) || (c >= 48 && c <= 57) || c === 45 || c === 58;
+
+/** from 부터 `</name`(대소문자 무시, 뒤가 이름 글자가 아님) 의 위치. 없으면 -1. 앞으로만 훑는다(선형). */
+function findClosingTag(html: string, name: string, from: number): number {
+  let pos = from;
+  for (;;) {
+    const k = html.indexOf('</', pos);
+    if (k < 0) return -1;
+    // 이름을 글자 단위로 비교(ASCII 대소문자 무시) — 조각 문자열을 만들지 않는다.
+    let m = 0;
+    while (m < name.length && (html.charCodeAt(k + 2 + m) | 0x20) === name.charCodeAt(m)) m++;
+    if (m === name.length && !isTagNameChar(html.charCodeAt(k + 2 + m))) return k;
+    pos = k + 2;
+  }
+}
+
+/**
+ * HTML → 텍스트(스크립트·스타일 제거, 블록 요소는 줄바꿈). 실행·외부 요청 없음. 결과는 소재 원문에 넣는 **파생 값**이고 원본 HTML 은
+ * source_version_originals 에 그대로 남는다(FIX-T18 round 1 P0 :293).
+ *
+ * FIX-T18 round 1(Codex review-T18 P0 :248): 정규식 대신 한 번 훑는 토큰 순회(선형 시간). 모든 탐색(indexOf)은 현재 위치에서 앞으로만 가고,
+ * 찾은 곳까지 위치를 옮기거나(소비) 찾지 못하면 그 자리에서 끝낸다 — 같은 구간을 다시 훑지 않는다.
+ * 닫히지 않은 주석·script/style/noscript/template/title 은 나머지를 버리고(브라우저와 같음), `>` 없는 태그 시작도 나머지를 버린다.
+ */
 export function htmlToText(html: string): { text: string; title: string | null } {
-  const titleM = /<title[^>]*>([\s\S]{0,1000}?)<\/title>/i.exec(html);
-  const h1M = /<h1[^>]*>([\s\S]{0,2000}?)<\/h1>/i.exec(html);
-  const stripTags = (s: string) => decodeEntities(s.replace(/<[^>]{0,2000}>/g, '')).replace(/\s+/g, ' ').trim();
-  const body = html
-    .replace(/<(script|style|head|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote|pre|section|article|ul|ol|table)\s*>/gi, '\n')
-    .replace(/<[^>]{0,2000}>/g, '');
-  const text = decodeEntities(body)
+  if (html.length > HTML_TO_TEXT_MAX_INPUT) throw new ImportInvalidError('HTML 이 너무 큽니다');
+  const out: string[] = [];
+  let titleRaw: string | null = null;
+  let h1: string[] | null = null;
+  let h1Open = false;
+  let h1Len = 0;
+  const emit = (s: string) => {
+    out.push(s);
+    if (h1Open && h1Len < 2000) {
+      h1!.push(s);
+      h1Len += s.length;
+    }
+  };
+  const n = html.length;
+  // pending: 아직 내보내지 않은 글자 구간의 시작. 태그가 아닌 '<' 는 글자 구간에 그대로 남긴다(조각을 만들지 않음).
+  let pending = 0;
+  let i = 0;
+  while (i < n) {
+    const lt = html.indexOf('<', i);
+    if (lt < 0) break;
+    const c1 = html.charCodeAt(lt + 1);
+    const closing = c1 === 47; // '/'
+    const markup = c1 === 33 || c1 === 63; // '<!…>'(주석·DOCTYPE), '<?xml …?>'
+    const nameStart = closing ? lt + 2 : lt + 1;
+    if (!markup && !isAsciiLetter(html.charCodeAt(nameStart))) {
+      i = lt + 1; // 태그가 아닌 '<'(예: "a < b") 는 글자 구간에 그대로 남긴다
+      continue;
+    }
+    if (c1 === 33 && html.startsWith('<!--', lt)) {
+      if (lt > pending) emit(html.slice(pending, lt));
+      const end = html.indexOf('-->', lt + 4);
+      pending = i = end < 0 ? n : end + 3; // 닫히지 않은 주석: 나머지는 주석
+      if (end >= 0) out.push(' ');
+      continue;
+    }
+    if (lt > pending) emit(html.slice(pending, lt));
+    const gt = html.indexOf('>', nameStart);
+    if (gt < 0) {
+      pending = n; // '>' 없는 태그 시작: 나머지는 태그(버림) — 뒤에 '>' 가 없으므로 다시 훑을 일이 없다
+      break;
+    }
+    pending = i = gt + 1;
+    if (markup) continue;
+    let j = nameStart;
+    while (j < gt && j - nameStart <= 10 && isTagNameChar(html.charCodeAt(j))) j++;
+    if (j - nameStart > 10) continue; // 아는 이름(최대 8자)보다 긴 이름 — 지우기만
+    const name = html.slice(nameStart, j).toLowerCase();
+    if (closing) {
+      if (name === 'h1') h1Open = false;
+      if (HTML_BLOCK_TAGS.has(name)) out.push('\n');
+      continue;
+    }
+    if (name === 'br') {
+      out.push('\n');
+      continue;
+    }
+    if (name === 'h1' && h1 === null) {
+      h1 = [];
+      h1Open = true;
+      continue;
+    }
+    if (HTML_RAW_TEXT_TAGS.has(name) && html.charCodeAt(gt - 1) !== 47) {
+      const end = findClosingTag(html, name, i);
+      if (end < 0) {
+        pending = n; // 닫히지 않은 script 등: 나머지는 그 요소의 내용(버림)
+        break;
+      }
+      if (name === 'title' && titleRaw === null) titleRaw = html.slice(i, Math.min(end, i + 1000));
+      out.push(' ');
+      const gt2 = html.indexOf('>', end + 2);
+      pending = i = gt2 < 0 ? n : gt2 + 1;
+      continue;
+    }
+  }
+  if (pending < n) emit(html.slice(pending));
+  const oneLine = (s: string) => decodeEntities(s).replace(/\s+/g, ' ').trim();
+  const text = decodeEntities(out.join(''))
     .split('\n')
     .map((l) => l.replace(/[ \t\f\v\r]+/g, ' ').trim())
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  const title = (h1M && stripTags(h1M[1]!)) || (titleM && stripTags(titleM[1]!)) || null;
+  const title = (h1 && oneLine(h1.join(''))) || (titleRaw !== null && oneLine(titleRaw)) || null;
   return { text, title: title || null };
 }
 
@@ -276,16 +404,19 @@ export function parseImportFile(kind: ImportFileKind, innerPath: string, display
     byteSize: bytes.byteLength,
     externalCreatedText: null,
     body: null,
+    original: null,
     skipReason: null,
   };
-  let text: string;
+  if (bytes.byteLength > IMPORT_MAX_TEXT_ENTRY_BYTES) return { ...base, contentChecksum: null, skipReason: 'too_large' };
+  let original: string;
   try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // ignoreBOM: BOM 도 원본의 일부로 남긴다(다시 인코딩하면 원본 바이트와 같다).
+    original = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     return { ...base, skipReason: 'not_utf8' };
   }
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  if (text.includes('\0')) return { ...base, skipReason: 'not_utf8' };
+  if (original.includes('\0')) return { ...base, skipReason: 'not_utf8' };
+  const text = original.charCodeAt(0) === 0xfeff ? original.slice(1) : original;
   let body = text;
   let title = base.title;
   if (format === 'html') {
@@ -297,11 +428,14 @@ export function parseImportFile(kind: ImportFileKind, innerPath: string, display
     if (m && text.slice(0, m.index).trim() === '') title = truncate(m[1]!.trim(), MAX_TITLE);
   }
   const created = CREATED_RE.exec(text.slice(0, 4000));
-  const out: ParsedImportItem = { ...base, title, body, externalCreatedText: created ? created[1]!.trim() : null };
-  if (body.trim() === '') return { ...out, body: null, skipReason: 'empty' };
-  if (body.length > MAX_RAW_TEXT) return { ...out, body: null, skipReason: 'too_long' };
+  const out: ParsedImportItem = { ...base, title, body, original, externalCreatedText: created ? created[1]!.trim() : null };
+  if (body.trim() === '') return { ...out, body: null, original: null, skipReason: 'empty' };
+  if (body.length > MAX_RAW_TEXT) return { ...out, body: null, original: null, skipReason: 'too_long' };
   return out;
 }
+
+/** 원본 문자열(original)을 UTF-8 로 되돌린 바이트 — 가져온 원본 파일과 바이트 단위로 같다. */
+export const originalBytes = (original: string): Uint8Array => new TextEncoder().encode(original);
 
 /**
  * 내보내기 ZIP 을 읽어 항목 목록을 만든다(미리보기·확정 공용 — 같은 바이트면 같은 결과).
@@ -312,19 +446,27 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
   const items: ParsedImportItem[] = [];
   const seenIds = new Set<string>();
   let attachments = 0;
-  let totalText = 0;
-  let entries = 0;
+  // FIX-T18 round 1(Codex review-T18 P0 :328): 바깥·안쪽 ZIP 이 함께 쓰는 하나의 예산. 풀기 전에 선언 크기로 검사한다.
+  const budget = { records: 0, inflated: 0, text: 0, nested: 0 };
+  const spend = (bytes: number) => {
+    budget.inflated += bytes;
+    if (budget.inflated > IMPORT_MAX_TOTAL_INFLATED_BYTES) throw new ImportTooLargeError('풀린 내용이 너무 큽니다(중첩 ZIP 포함 최대 128MB)');
+  };
 
   const walk = (bytes: Uint8Array, prefix: string, depth: number) => {
     const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const list = listZip(buf);
-    entries += list.length;
-    if (entries > IMPORT_MAX_ENTRIES) throw new ImportInvalidError(`ZIP 항목이 너무 많습니다(최대 ${IMPORT_MAX_ENTRIES}개)`);
+    const { entries: list, records } = listZip(buf);
+    // 디렉터리를 포함한 모든 중앙 목록 레코드를 전역으로 센다(중첩 ZIP 안 레코드 포함).
+    budget.records += records;
+    if (budget.records > IMPORT_MAX_ENTRIES) throw new ImportInvalidError(`ZIP 항목이 너무 많습니다(중첩 포함 최대 ${IMPORT_MAX_ENTRIES}개)`);
     for (const e of list) {
       const display = prefix ? `${prefix}!/${e.path}` : e.path;
       const { ext, folder, stem } = splitPath(display);
       if (ext === 'zip' && depth < IMPORT_MAX_NESTED_DEPTH) {
         if (e.size > MAX_NESTED_ZIP_BYTES) throw new ImportTooLargeError('안쪽 ZIP 이 너무 큽니다');
+        budget.nested += 1;
+        if (budget.nested > IMPORT_MAX_NESTED_ARCHIVES) throw new ImportInvalidError(`안쪽 ZIP 이 너무 많습니다(최대 ${IMPORT_MAX_NESTED_ARCHIVES}개)`);
+        spend(e.size);
         walk(extract(buf, e), display, depth + 1);
         continue;
       }
@@ -339,8 +481,11 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
         byteSize: e.size,
         externalCreatedText: null,
         body: null,
+        original: null,
         skipReason: reason,
       });
+      // FIX-T18 round 1(P2 :339): ZIP 크기 필드는 unsigned 32bit — 원장(bigint)에 넣기 전에 범위를 확인한다.
+      if (!Number.isSafeInteger(e.size) || e.size < 0 || e.size > IMPORT_MAX_DECLARED_BYTES) throw new ZipFormatError('ZIP 항목 크기가 올바르지 않습니다');
       let item: ParsedImportItem;
       if (format === 'other') {
         attachments++;
@@ -348,12 +493,13 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
       } else if (e.size > IMPORT_MAX_TEXT_ENTRY_BYTES) {
         item = skipped('too_large');
       } else {
-        totalText += e.size;
-        if (totalText > IMPORT_MAX_TOTAL_TEXT_BYTES) throw new ImportTooLargeError('풀린 텍스트가 너무 큽니다(최대 64MB)');
+        budget.text += e.size;
+        if (budget.text > IMPORT_MAX_TOTAL_TEXT_BYTES) throw new ImportTooLargeError('풀린 텍스트가 너무 큽니다(최대 64MB)');
+        spend(e.size);
         item = parseImportFile(kind, e.path, display, extract(buf, e));
       }
       if (seenIds.has(item.externalId)) {
-        item = { ...item, externalId: `${item.externalId}#${items.length}`, body: null, skipReason: 'duplicate_in_archive' };
+        item = { ...item, externalId: `${item.externalId}#${items.length}`, body: null, original: null, skipReason: 'duplicate_in_archive' };
       }
       seenIds.add(item.externalId);
       items.push(item);
@@ -442,4 +588,14 @@ export interface ImportSelection {
 
 export function inSelectedFolder(folder: string, folders: readonly string[]): boolean {
   return folders.some((f) => f === '' || folder === f || folder.startsWith(`${f}/`));
+}
+
+/** 원장 항목이 이 선택으로 실제로 쓰기를 일으키는지(미리보기 판정 기준). new 는 item_ids·폴더, conflict 는 version_ids 에 있을 때만. */
+export function effectiveImportChoice(
+  item: { id: string; decision: string; folder: string },
+  selection: ImportSelection,
+): 'import' | 'version' | null {
+  if (item.decision === 'new') return selection.itemIds.has(item.id) || inSelectedFolder(item.folder, selection.folders) ? 'import' : null;
+  if (item.decision === 'conflict') return selection.versionIds.has(item.id) ? 'version' : null;
+  return null;
 }

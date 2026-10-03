@@ -64,3 +64,8 @@ BASE cbb8d38, 커밋 안 함(작업 트리 변경). 화면 표시만 — 작업�
   - `test:integration`(단독) pass — 31 파일 / 569 테스트
   - `drill:mock` pass — 불변식 위반 0건, YouTube fetch 호출 0
 - 브라우저 재확인: not_run(dev 서버 내려 둠) — 다음 화면 확인에서 S4(세션 없는 YouTube 항목)·S5(publish_at + UPLOADED_PRIVATE) 육안 확인 필요.
+
+## M4-DEV1 재시작 확인 (0d9911b, 내장 브라우저, 2026-10-03 08:17)
+- dev 서버 새로 시작 뒤 설정 → 배포 계정 연결: Threads·YouTube 연결됨 유지(00:08 연결분).
+- YouTube "연결 확인" → `token_expired`(1시간 access token 만료 — 공급자가 토큰을 알아봄, 예전처럼 unknown token/invalid 아님). "지금 갱신" → "연결 정보를 갱신했습니다", 만료 2027-04-01 08:17 로 갱신 — 다시 연결 없이 성공.
+- 서버 오류 로그 0건.

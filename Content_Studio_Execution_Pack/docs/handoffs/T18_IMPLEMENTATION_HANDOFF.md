@@ -230,3 +230,10 @@
 ### Codex 에게 질문
 1. 상태 기계(`scanTagAttributes`·`matchEndTag`·`findRawTextEnd`·`findScriptEnd`·`scanComment`)가 WHATWG 토크나이저와 어긋나 **글을 잃는** 입력이 남았는가? 특히 script data escaped/double escaped 의 대시·`<` 처리와, 닫는 태그 뒤 속성 상태(`</script x="…`)에서 EOF 까지 버리는 경우를 봐 달라.
 2. 사양과 일부러 다르게 한 두 가지(닫히지 않은 title·iframe·noembed·noframes 를 일반 HTML 로 다시 읽어 글자를 남김 + 이름별 `noEndFrom` 기억으로 선형 유지, noscript·template 를 일반 요소로 봄)가 "원본은 보존, 추출 텍스트는 파생" 원칙에서 받아들일 만한가? eof-in-tag(닫히지 않은 따옴표 값)도 글을 남기는 쪽으로 바꿔야 하는가?
+
+# FIX round 4 (Codex review-FIX3-T18 P2) — 오케스트레이터 직접
+- HEAD_SHA: e6f643b (code only, D28).
+- 지적: `<xmp>A</xmp><p>B</p>`·`<textarea>A</textarea><p>B</p>` 가 `AB` — 닫는 태그를 직접 소비하는 경로가 일반 블록 닫는 태그의 줄바꿈을 거치지 않음.
+- 변경: htmlToText 의 raw-text/RCDATA 닫는 태그 소비 뒤 HTML_BLOCK_TAGS 이면 줄바꿈.
+- 시험: packages/domain/src/imports-fix4.test.ts — xmp·textarea 뒤 문단·글자·다른 xmp/textarea, 대문자·공백 닫는 태그, 앞뒤 문단과 엔티티(10건) + 닫히지 않은 경우 기존 동작(1건). 수정을 빼면 10건 실패 확인.
+- 명령: lint·typecheck·build·unit 1257·integration 731·drill:mock 0·실제 DB drill:restore PASS.

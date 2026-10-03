@@ -160,3 +160,10 @@ CHANGES_REQUESTED
 
 ## FIX3-T18 (d9e482d, T18 round 3 WHATWG 상태 기계) — CHANGES_REQUESTED (P2 1, P0·P1 없음)
 - [P2] packages/domain/src/imports.ts:706 — textarea·xmp 의 닫는 태그를 소비하면서 블록 구분 줄바꿈을 누락한다
+
+## T19 (4a2e02f, 허용 소스 수집·재추천 — 모의) — CHANGES_REQUESTED (P0 1·P1 3·P2 1)
+- [P0] `packages/domain/src/collector.ts:605` — BOM이 있는 HTML의 원본 바이트가 보존되지 않는다
+- [P1] `packages/db/drizzle/0041_t19_collector.sql:31` — accepted CHECK가 NULL outcome에 연결 필드가 채워진 행을 허용한다
+- [P1] `packages/db/src/collector.ts:552` — 기한 검사 전에 50개로 제한하여 실행할 daily 소스가 계속 제외될 수 있다
+- [P1] `packages/db/src/collector.ts:396` — 재수집으로 바뀐 상대 링크의 해석 결과를 검사하지 않는다
+- [P2] `packages/domain/src/collector.ts:318` — 기본 엔티티 검사에 Object

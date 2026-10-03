@@ -101,3 +101,75 @@ WebFetch 로 받은 본문(마크다운 변환)에 "Updated" 날짜가 보이지
 4. 실제 연결 정보의 자동 갱신을 worker 에서 끈 것(D31 승인 목록에 갱신 호출이 없음)과 수동 `POST …/refresh` 를 열어 둔 것 — 수동 경로도 막아야 하는가?
 5. `pending:` 행의 첫 callback 묶기(잠금 아래 재확인·같은 owner 중복 검사)에 경쟁 조건이 남는가? 두 pending 행이 동시에 같은 프로필로 묶이면 unique 제약 위반이 저장 실패 경로(store_failed → discard → 500 대신 409 가 아님)로 갈 수 있다.
 6. 네트워크 가드(setupFiles)가 `vi.stubGlobal('fetch')` 를 쓰는 시험·`undici` 직접 사용·`http(s).request` 를 우회로 남기는가? 가드 범위를 넓혀야 하는가?
+
+
+---
+
+# FIX round 1 (Codex review-LIVET1)
+- Orchestrator: HEAD_SHA 1b01226 (code only, D28) — reran lint·typecheck·build·unit 942·integration 673·drill:mock 0·real-DB drill:restore PASS.
+
+- 판정 원본: `.handoffs/review-LIVET1.md`(CHANGES_REQUESTED, 검토 HEAD `1f16583`)
+- BASE = `55b1b3839dc0a8d4148f72891c563821f4e6e7cb` · HEAD = TBD(커밋 전 — 오케스트레이터가 커밋 후 기록)
+- 범위: D31 1단계 그대로 — Threads·Meta 로의 실제 요청 0(코드·시험 모두 fixture), 실제 자격 증명·`.env.local` 손대지 않음, 게시 코드 없음. 새 의존성 없음.
+
+## 지적 → 변경 → 시험
+
+### [P0] threads-live-oauth.ts:104 — 메시지 분류가 5xx 판정보다 먼저
+- 변경: `mapThreadsError` 를 **전송·HTTP 상태 우선**으로 다시 짰다. 429 → rate_limited, 5xx → server_error(쓰기 단계면 ambiguous — 본문 코드·문구 무시), 408 → timeout(ambiguous), 4xx 가 아닌 상태의 오류 본문(2xx 등) → malformed_response(ambiguous), 4xx 인데 Meta 오류 형식 아님 → 쓰기 단계면 http_error(ambiguous). 형식 맞는 4xx 만 코드·하위 코드(4/17/32/613, 101, 190/463/458/460, 10·200~299)로 분류하고, 메시지는 그 뒤 4xx 안에서만 최후 수단(redirect_uri → 코드 교환이면 redirect_mismatch, 앱 ID·시크릿 → invalid_client). 코드 1/2 → server_error(ambiguous). 코드 교환은 알려진 코드(400·100·문자열 `invalid_grant`)만 invalid_grant, 그 밖(401·404·405·모르는 코드)은 provider_error(oauth_exception, ambiguous=false, providerCode·httpStatus 보존).
+- Codex Q3(놓친 케이스): 장기 교환 단계의 모든 실패에 `detail.shortTokenIssued=true` — callback 감사에 `short_token_issued=yes`, `short_token_remote_state=may_be_valid`, `short_token_revoke=not_possible`(손에 없고 철회 API 도 없음). "발급 없음"으로 기록하지 않는다.
+- 시험: `packages/providers/src/threads-live-oauth.test.ts` 「오류 분류 순서(FIX1-LIVET1 P0)」 표 26행 — 5xx + 코드 1 "validating client secret"(Codex 재현)·101·190/463·10·400 "already used"·redirect 문구·rate 코드, 408, 2xx 오류 본문, exchange 401/404 비형식, long_lived 400 비형식, 4xx 코드 vs 문구 충돌(190+client_id → invalid_token, 10+secret → scope, 4+secret → rate), 4xx 코드 1 + secret 문구(invalid_client) / 그 밖 문구(ambiguous), exchange 401/404/405 형식 본문 → provider_error. 각 행에서 detail 에 원문 문구 없음. 공급자 경유 2건(503 → ambiguous·장기 교환 안 부름 / 장기 교환 4xx → shortTokenIssued). 통합 `tests/integration/live-threads-oauth.test.ts`: 503 + secret 문구 callback → 400 `oauth_exchange_failed` + `outcome: unknown`, 감사 `outcome_ambiguous=yes`; 장기 교환 5xx 감사의 short_token_* 3필드.
+
+### [P1] threads-live-oauth.ts:199 — 실제 갱신이 서버 경계에서 막히지 않음
+- 변경: (1) 서버 공통 갱신 진입점 `refreshCredential`(packages/db/src/oauth.ts)이 **공급자를 만들거나 정리 대기·봉인을 건드리기 전에** 계정 kind 를 보고 실제(live) 계정이면 `LiveRefreshOutOfScopeError`(409 `live_refresh_out_of_scope`, extra.marker `LIVE_THREADS_REFRESH(D31 범위 밖)`)를 던진다 — 외부 호출 0, 연결 정보 상태·세대·봉인·lastErrorCode 그대로, 감사 `oauth.refresh_refused`(reason·kind·platform·trigger). 수동 API(`POST …/refresh`, JSON 409·폼 303 `account_error=live_refresh_out_of_scope`), 작업 처리기(`jobCredentials().refresh`), worker(`refreshExpiringCredentials` — 원래 isMock 조건 + 이 진입점) 모두 이 함수를 지난다. (2) 두 번째 방어선: `LiveThreadsOAuthProvider.refresh` 는 생성자 `refreshEnabled` 가 true 가 아니면 네트워크 없이 같은 오류. `resolveOAuthProvider` 는 이 값을 넘기지 않는다(설정·환경으로 켤 수 없음 — fixture 시험만 true 로 요청 모양 확인). 모의 갱신은 그대로.
+- 시험: 단위 「실제 갱신 차단(FIX1-LIVET1 P1)」 — 직접 만든 공급자·resolveOAuthProvider 가 만든 공급자 모두 refresh → LiveRefreshOutOfScopeError(conflict, 표식), fixture fetch 0회. 통합 전체 흐름 시험 안: API refresh(JSON) 409 + 표식, 폼 303, `jobCredentials().refresh` 거부, fixture 호출 수 불변, 연결 정보 5개 필드 불변, `oauth.refresh_refused` 3건, `oauth.refresh_failed` 0건. worker 자동 갱신은 기존 단언(refreshed 0·failed 0·호출 0) 유지.
+
+### [P2] domain/oauth.ts:401 — 화면 준비 판정과 공급자 설정 검증 불일치
+- 변경: 공유 검증 함수 `isValidThreadsAppId`(숫자 1~30자리)·`isValidThreadsAppSecret`(앞뒤 공백 뗀 값이 공백 없는 1~512자)·`threadsAppSecretState(env)` 를 domain 에 두고, `liveOAuthReadiness(config, { threadsAppSecret: 'missing'|'invalid'|'ok', masterKeyConfigured }, registeredRedirectUri?)` 가 형식(`THREADS_APP_ID(형식)`·`THREADS_APP_SECRET(형식)`)과 등록 redirect 불일치(`OAUTH_REDIRECT_URI(불일치)`)까지 판정한다. `liveOAuthReadinessFromEnv` 를 화면(`oauthReadinessView` — 등록 redirect = `oauthRedirectUri(config)`)과 공급자 선택(`resolveOAuthProvider`)이 같이 쓰고, resolver 는 그 missing 을 그대로 던진다. 공급자 생성자도 같은 검증 함수(생성자 catch 는 이제 닿지 않는 방어선). 이름만, 값 없음.
+- 시험: 단위 「준비 판정 ↔ 공급자 선택 일치 행렬」 15행 — 각 행 `readiness.ready === (resolver 성공)`, `readiness.missing` === resolver 오류 missing === 기대값(placeholder-app-id(Codex 재현)·31자리·시크릿 공백뿐/중간 공백/513자/앞뒤 공백(통과)·redirect 없음/불일치·키·승인·복합). domain 시험: 기존 FULL 의 `placeholder-app-id`(불일치를 고정하던 값) → 숫자 ID, 형식 2행 + 불일치·검증 함수 시험 추가. 통합 준비 행렬 2행 추가(앱 ID·시크릿 형식 → route 503 이름 + `oauthReadinessView().live` 같은 이름·ready=false).
+
+### [P2] tests/setup/no-meta-network.ts:37 — fetch 래퍼만으로는 차단 보장 불가
+- 변경: 가드가 막는 경로(이 시험 프로세스 안): ① 전역 fetch 래퍼 ② Node 내장 undici 전역 dispatcher(`Symbol.for('undici.globalDispatcher.1')` 를 Proxy 로 감쌈 — fetch 의 리다이렉트 각 단계, 가드 설치 전 fetch 참조도 지남. 이 저장소에 undici 패키지는 없음 — 설치되면 같은 전역 dispatcher 사용) ③ `node:http`·`node:https` request·get ④ `node:net` connect·createConnection, `node:tls` connect(host·servername), `net.Socket.prototype.connect`(http.Agent·ClientRequest 직접 생성 포함 모든 TCP·TLS 의 마지막 관문) ⑤ `node:dns` lookup·resolve·resolve4·resolve6·resolveAny·resolveCname + promises. `syncBuiltinESMExports()` 로 ESM 이름 가져오기에도 반영. 호스트 정규화(소문자·[ ] 제거·끝의 점 제거), `*.fbcdn.net` 포함. afterAll 은 시도 기록 외에 전역 dispatcher 가 가드 밖으로 바뀌었는지도 확인한다. 막지 못하는 것: 자식 프로세스·worker_threads, 이미 해석한 IP 로의 직접 연결, 네이티브 애드온 — 가드 머리 주석·README_KO D31 절에 명시.
+- 증명(probe — 실제 Meta 호스트로 나가지 않게 두 단계): (a) 가드 정규식에 임시로 `guard-probe.invalid` 를 넣고 영구 시험의 호스트를 모두 `*.guard-probe.invalid` 로 바꾼 사본을 돌림 → 11/11 통과(모든 경로가 연결·DNS 전에 막힘 — 새는 경로가 있었어도 .invalid 로만 나감). (b) 정규식 원복 뒤, 기록을 비우지 않는 임시 probe(fetch·http.request·https.get·net.connect·tls.connect·dns.lookup 각 1회)를 돌림 → 4개 시험은 통과(각각 throw/reject)하고 **파일은 afterAll 에서 FAIL**("6번 요청 … fetch, http.request, https.get, net.connect, tls.connect, dns.lookup"). 두 임시 파일 모두 삭제, 정규식 원복 확인(`guard-probe` 0건).
+- 영구 시험: `packages/providers/src/no-meta-network.test.ts`(11) — fetch 문자열/URL/Request·대문자·끝의 점·fbcdn·instagram, 로컬(127.0.0.1) 서버의 302 → graph.threads.net 리다이렉트가 `undici.dispatch` 에서 막힘, 가드 설치 전 fetch 참조도 막힘, 허용 호스트(로컬)는 fetch·http.get 통과, http/https request·get(문자열·옵션·host:port·URL·ESM 이름 가져오기), ClientRequest 직접 생성(Agent·createConnection+tls), net/tls/Socket.connect, dns 콜백·promises, 비슷한 이름은 막지 않음. 마지막에 기록을 비운다.
+
+### 그 밖 놓친 케이스(review 목록 중 싼 것)
+- 반영: 5xx + client·token·permission 코드, exchange 401·404·405·408·2xx 오류 본문, 실제 계정 수동 갱신 API, 앱 ID·시크릿 형식의 화면·API 일치, 직접 HTTP(S)·undici·리다이렉트·끝의 점 호스트, 장기 교환 실패 시 단기 토큰 원격 유효 가능성 기록.
+- 미반영(남은 위험으로): 새 state 로 같은 code 재전달·동시 전달 차단(code 지문 원자 예약), 서로 다른 pending 행의 같은 프로필 동시 묶기·계정 생성 API 동시 호출의 고유 제약 → 409 변환, 부분 권한 허용 scope 구분, 프로필 조회·저장 실패 시 원격 철회 미지원 기록의 추가 필드.
+
+## 바뀐 파일
+- `packages/providers/src/threads-live-oauth.ts` — 오류 분류 순서, refreshEnabled 게이트, 공유 형식 검증, 장기 교환 shortTokenIssued
+- `packages/providers/src/oauth.ts` — resolver 가 `liveOAuthReadinessFromEnv` 결과를 그대로 사용
+- `packages/domain/src/oauth.ts` — `shortTokenIssued` detail, `LIVE_THREADS_REFRESH_MARKER`·`LiveRefreshOutOfScopeError`, 공유 검증 함수, readiness 형식·불일치, `liveOAuthReadinessFromEnv`
+- `packages/db/src/oauth.ts` — refreshCredential 실제 계정 거부(감사 `oauth.refresh_refused`), callback 감사 short_token_* 필드
+- `packages/db/src/queries.ts` — 감사 action `oauth.refresh_refused`
+- `apps/web/lib/oauth.ts` — 화면 준비 판정이 공유 함수 사용, 폼 오류 문구 `live_refresh_out_of_scope`
+- `tests/setup/no-meta-network.ts` — 다층 가드
+- 시험: `packages/providers/src/threads-live-oauth.test.ts`, `packages/providers/src/no-meta-network.test.ts`(새 파일), `packages/domain/src/oauth.test.ts`, `tests/integration/live-threads-oauth.test.ts`
+- 문서: `README_KO.md`(D31 절 가드 범위·갱신 거부 문장), 이 인계 문서(추가만)
+- 손대지 않음: DECISIONS·M4_CODEX_VERDICTS·M4_STATUS·다른 인계, `.env.local`, `./data`
+
+## 실행한 명령(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`)
+| 명령 | 결과 |
+|---|---|
+| `corepack pnpm lint` | PASS |
+| `corepack pnpm typecheck` | PASS |
+| `corepack pnpm build` | PASS(exit 0) |
+| `corepack pnpm test` (unit) | PASS — 44 files, 942 tests(이전 43/884) |
+| `corepack pnpm test:integration` (단독, unit 과 동시 실행 안 함) | PASS — 34 files, 673 tests(이전 669) |
+| `corepack pnpm drill:mock` | PASS — exit 0, "불변식 위반 0건"(M3·T14·T15·T16), Instagram fetch 호출 0 |
+| 임시 probe (a) `.invalid` 사본 | 11/11 PASS(차단 확인) → 삭제 |
+| 임시 probe (b) 기록 안 비움 | 의도대로 FAIL(afterAll BLOCKED_EXTERNAL_NETWORK, 6건·6경로) → 삭제 |
+
+(README 수정은 위 명령 뒤의 문서 변경 — 코드 변경 없음.)
+
+## 남은 위험(이번 라운드 기준 갱신)
+1. 위 "미반영" 놓친 케이스(같은 code 재전달·동시 묶기·동시 계정 생성·부분 scope).
+2. 오류 분류는 여전히 Graph 일반 규약 가정 — 4xx 코드 1 + 시크릿 문구를 invalid_client 로 보는 판단은 문구 의존(최후 수단). 2단계 실제 응답으로 보정.
+3. 실제 갱신은 이제 모든 경로에서 막힌다 → 실제 연결은 60일 뒤 다시 연결 필요(설계상 의도, 별도 승인 시 refreshCredential 의 kind 검사와 refreshEnabled 를 함께 풀어야 함).
+4. 네트워크 가드는 시험 프로세스 안만 — 자식 프로세스·worker_threads·IP 직접 연결·네이티브 애드온은 범위 밖. 누군가 `setGlobalDispatcher` 를 부르면 afterAll 이 파일을 실패시키지만 그 사이 요청은 net 층만 막는다.
+5. HEAD 미정 — 커밋 후 SHA 기록 필요.
+
+## Codex 에게 묻는 것(FIX round 1)
+1. 상태 우선 분류에서 **4xx + 형식 맞는 본문 + 코드 1/2** 를 쓰기 단계 ambiguous 로 둔 것(4xx 는 HTTP 상 미처리 거절이지만 Meta 코드 1 은 "알 수 없는 오류")과, exchange 의 모르는 4xx 코드를 ambiguous=false provider_error 로 둔 것이 불변식("불명은 UNKNOWN")에 맞는가?
+2. 실제 갱신 차단을 `refreshCredential` 의 계정 kind 검사(공급자·봉인·정리 대기보다 먼저) + 공급자 `refreshEnabled` 두 겹으로 둔 것이 충분한가? 정리 대기(pending)가 있는 실제 계정도 refresh 요청 시 reconcile 없이 거부되는데, 이것이 정리 지연 위험을 만드는가(정리는 check·worker tick 이 계속 한다)?
+3. 네트워크 가드의 undici 전역 dispatcher Proxy·`net.Socket.prototype.connect` 패치 방식에 우회 경로(예: `http2.connect`, `fetch` 에 `dispatcher` 옵션으로 별도 Agent 전달 — 이 저장소엔 undici 패키지가 없어 Agent 생성 불가)가 남는가? `http2` 도 막아야 하는가?

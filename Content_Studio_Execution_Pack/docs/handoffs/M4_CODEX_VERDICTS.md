@@ -124,3 +124,5 @@ CHANGES_REQUESTED
 - [P1] packages/providers/src/threads-live-oauth.ts:199 — D31에서 제외한 실제 갱신을 서버 실행 경계에서 차단하지 않음
 - [P2] packages/domain/src/oauth.ts:401 — 화면의 연결 준비 판정과 실제 공급자의 설정 검증이 불일치함
 - [P2] tests/setup/no-meta-network.ts:37 — fetch 래퍼만으로는 문서에 명시한 Meta 요청 차단 범위를 보장하지 못함
+
+## FIX-D30H (a25fa47) — **PASS** → 공개 health 정리(D23·D30-3) 종결

@@ -1,7 +1,7 @@
 import { checkCredential } from '@cs/db';
 import { assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
-import { accountFormFailure, ensureMockOAuthReady, oauthDeps } from '../../../../../lib/oauth';
+import { accountFormFailure, requireMockOAuthReady, oauthDeps } from '../../../../../lib/oauth';
 import { getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
@@ -22,7 +22,7 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     assertSameOrigin(request, config);
     const owner = await requireOwner(request);
     // M4-DEV1: 재시작 뒤 첫 사용이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
-    await ensureMockOAuthReady(config, owner.db);
+    await requireMockOAuthReady(config, owner.db); // FIX1-M4DEV1: 다시 채우기 실패면 공급자 호출·상태 변경 없이 503 mock_rehydration_unavailable
     const deps = oauthDeps(config);
     const r = await checkCredential(owner.db, { ownerId: owner.ownerId, accountId: id, providerFor: deps.providerFor, keyring: deps.keyring });
     if (html) return seeOther('/settings?checked=1#accounts');

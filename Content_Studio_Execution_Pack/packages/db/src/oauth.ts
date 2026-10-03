@@ -366,6 +366,8 @@ export const oauthTestHooks: {
   insideRevokeFinish?: () => Promise<void>;
   /** FIX7-T13: worker 가 미완료 해제를 훑고 메모리 확인을 마친 뒤·재개 호출 직전(훑은 뒤 해제 완료·다시 연결 교차 재현) */
   beforeRevokeResume?: (c: { ownerId: string; accountId: string }) => Promise<void>;
+  /** FIX1-M4DEV1: 모의 다시 채우기 읽기(loadMockCredentialsForRehydration) 직전 — 던지면 일시적 DB·읽기 실패 흉내 */
+  beforeMockRehydrationLoad?: () => Promise<void>;
 } = {};
 
 interface Locked {
@@ -747,8 +749,11 @@ export interface MockCredentialSnapshot {
 /**
  * M4-DEV1(개발 품질): 개발 서버 재시작 뒤 모의 연결이 끊기지 않도록, 모의 공급자 메모리를 다시 채울 연결 정보를 읽는다(**읽기 전용**).
  * 대상: 해제되지 않은(revoked_at null·status active) 모의 공급자 행(is_mock·provider ∈ mock_*), 계정 kind = mock, 연결 상태가 쓸 수 있음
- * (connected·expiring_soon — 정리 대기 표시는 판정에서 빼고 본다: 현재 토큰은 공급자에 실제로 있던 토큰이므로 등록하고, 정리 대기 토큰 자체
- * (oauth_pending_tokens)는 읽지도 등록하지도 않는다. 정리 대기 계정의 실행 차단은 health 가 그대로 한다).
+ * (connected·expiring_soon).
+ * FIX1-M4DEV1(Codex review-M4DEV1 P1 :781): 정리 대기(oauth_pending_tokens — refresh_unknown·cleanup_revoke·verify_current)가 한 건이라도 있는 계정은
+ * **통째로 제외**한다. 그런 계정의 DB 현재 토큰은 공급자 쪽에서 이미 회전·철회로 무효가 됐을 수 있어(갱신 뒤 저장 결과 불명), 유효로 다시 등록하면
+ * 정리 대기 해소(verify_current·refresh_unknown 판정)가 잘못된 "유효" 근거를 보게 된다. 제외된 계정은 모의 공급자에서 "알 수 없는 토큰"으로 남고,
+ * 계정 실행 차단(health = 정리 대기)도 그대로다 — 다시 연결이 필요하면 화면이 안내한다. 정리 대기 토큰 자체도 읽지 않는다.
  * 봉인을 열 수 없는 행은 건너뛴다 — 상태를 쓰지 않으므로 기존 오류·차단 처리(readForUse·readAccessTokenForSend 의 decrypt_<문제>)가 그대로다.
  * 모든 owner 의 행을 읽는다(프로세스 하나의 모의 공급자 상태). 반환값은 개수와 토큰 — 호출자는 토큰을 모의 공급자 메모리에만 넘긴다.
  */
@@ -756,6 +761,7 @@ export async function loadMockCredentialsForRehydration(
   db: DbOrTx,
   input: { keyring: SecretKeyring; now?: Date },
 ): Promise<{ entries: MockCredentialSnapshot[]; skipped: number }> {
+  await oauthTestHooks.beforeMockRehydrationLoad?.();
   const now = input.now ?? new Date();
   const rows = await db
     .select({ cred: oauthCredentials, account: channelAccounts })
@@ -769,6 +775,13 @@ export async function loadMockCredentialsForRehydration(
         isNull(oauthCredentials.revokedAt),
         isNotNull(oauthCredentials.encryptedToken),
         eq(channelAccounts.kind, 'mock'),
+        // FIX1-M4DEV1: 정리 대기가 있는 계정은 다시 채우지 않는다(위 설명)
+        notExists(
+          db
+            .select({ one: sql`1` })
+            .from(oauthPendingTokens)
+            .where(and(eq(oauthPendingTokens.ownerId, oauthCredentials.ownerId), eq(oauthPendingTokens.channelAccountId, oauthCredentials.channelAccountId))),
+        ),
       ),
     );
   const entries: MockCredentialSnapshot[] = [];

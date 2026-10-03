@@ -84,19 +84,21 @@ export class MockOAuthStore {
   /**
    * M4-DEV1: DB 에 봉인돼 있던 모의 토큰을 "공급자가 발급해 둔 유효 토큰"으로 다시 등록한다(재시작 전 공급자 상태 복원).
    * 이미 아는 토큰(같은 프로세스에서 발급·철회됨)은 건드리지 않는다(멱등 — 철회 상태를 되살리지 않음). 모의 공급자 ID·토큰 접두가 맞지 않으면 등록하지 않는다.
-   * 반환: 등록했으면 true. 토큰 값은 SHA-256 키로만 남는다(원문 보관·기록 없음).
+   * 반환: 'registered'(등록), 'already_known'(이미 아는 토큰 — 그대로 둠), 'rejected'(모양·공급자·계정이 맞지 않음 — 등록 안 함).
+   * 토큰 값은 SHA-256 키로만 남는다(원문 보관·기록 없음).
    */
-  registerRehydrated(e: MockRehydrateEntry): boolean {
+  registerRehydrated(e: MockRehydrateEntry): 'registered' | 'already_known' | 'rejected' {
     const spec = REHYDRATE_SPEC[e.provider as MockOAuthProviderId];
-    if (!spec) return false;
-    if (!e.accessToken.startsWith(spec.access) || !Number.isFinite(e.expiresAt.getTime())) return false;
-    if (spec.refresh !== null && (!e.refreshToken || !e.refreshToken.startsWith(spec.refresh))) return false;
-    if (spec.refresh === null && e.refreshToken !== null) return false;
+    if (!spec) return 'rejected';
+    if (typeof e.accessToken !== 'string' || !e.accessToken.startsWith(spec.access) || e.accessToken.length <= spec.access.length) return 'rejected';
+    if (!(e.expiresAt instanceof Date) || !Number.isFinite(e.expiresAt.getTime())) return 'rejected';
+    if (spec.refresh !== null && (!e.refreshToken || !e.refreshToken.startsWith(spec.refresh) || e.refreshToken.length <= spec.refresh.length)) return 'rejected';
+    if (spec.refresh === null && e.refreshToken !== null) return 'rejected';
+    const user = typeof e.externalAccountId === 'string' ? e.externalAccountId.slice(0, 200) : '';
+    if (!user) return 'rejected';
     const accessKey = h(e.accessToken);
     const refreshKey = e.refreshToken ? h(e.refreshToken) : null;
-    if (this.tokens.has(accessKey) || (refreshKey && this.tokens.has(refreshKey))) return false;
-    const user = e.externalAccountId.slice(0, 200);
-    if (!user) return false;
+    if (this.tokens.has(accessKey) || (refreshKey && this.tokens.has(refreshKey))) return 'already_known';
     const scopes = [...e.scopes];
     const provider = e.provider as MockOAuthProviderId;
     if (provider === 'mock_google') {
@@ -105,10 +107,10 @@ export class MockOAuthStore {
       const base = { user, displayName: spec.displayName, revoked: false, provider, grant: randomBytes(12).toString('base64url') };
       this.tokens.set(accessKey, { ...base, scopes: [...scopes], expiresAt: accessExp, kind: 'access' });
       this.tokens.set(refreshKey!, { ...base, scopes: [...scopes], expiresAt: e.expiresAt.getTime(), kind: 'refresh' });
-      return true;
+      return 'registered';
     }
     this.tokens.set(accessKey, { user, displayName: spec.displayName, scopes, expiresAt: e.expiresAt.getTime(), revoked: false, provider, kind: 'access' });
-    return true;
+    return 'registered';
   }
 }
 
@@ -180,8 +182,10 @@ export function ensureMockOAuthRehydrated(input: {
           invalid++;
           continue;
         }
-        if (store.registerRehydrated(e)) registered++;
-        else alreadyKnown++;
+        const r = store.registerRehydrated(e);
+        if (r === 'registered') registered++;
+        else if (r === 'already_known') alreadyKnown++;
+        else invalid++;
       }
       return { status: 'done', registered, alreadyKnown, skipped: skipped + invalid };
     } catch {
@@ -191,6 +195,16 @@ export function ensureMockOAuthRehydrated(input: {
   })();
   store.rehydration = run;
   return run;
+}
+
+/**
+ * FIX1-M4DEV1(Codex review-M4DEV1 P1 check/route.ts:25): 이번 요청·tick 에서 모의 연결 정보(공급자 호출·작업 처리·만료 임박 갱신)를 써도 되는가.
+ * 다시 채우기가 실패했으면(`failed`) false — 모의 공급자 메모리가 비어 있어 공급자가 토큰을 "알 수 없음"으로 판정하고, 그 결과가 연결 정보를
+ * error 로 굳히기 때문이다. 이때 호출자는 공급자를 부르지 않고 연결 상태도 바꾸지 않는다(route 503 mock_rehydration_unavailable, worker 는 그 tick 의
+ * 연결 정보 작업을 건너뜀). 표식은 이미 지워져 다음 요청이 다시 읽는다. live 모드·키 없음(null)·완료는 true(기존 처리 그대로).
+ */
+export function mockCredentialWorkAllowed(outcome: MockRehydrateOutcome | null): boolean {
+  return outcome?.status !== 'failed';
 }
 
 /** 시험용: 다시 채우기 표식만 지운다(다음 ensureMockOAuthRehydrated 가 다시 읽는다). 토큰은 그대로. */

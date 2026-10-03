@@ -2,7 +2,8 @@
  * M4-DEV1(개발 품질): 개발 서버 재시작 뒤 모의 OAuth 연결 유지.
  * 모의 공급자(mock_threads·mock_google·mock_instagram)는 발급한 토큰을 프로세스 메모리에만 둔다. 재시작(= 메모리·시뮬레이터 비움) 뒤 처음 연결 경로를
  * 쓸 때 DB 의 쓸 수 있는 모의 연결 정보로 한 번 다시 채워, 다시 연결하지 않아도 새 계획의 전송·갱신이 된다.
- * 다시 채우지 않는 것: 해제·오류·다시 연결 필요·열 수 없는 봉인·정리 대기 토큰·실제(live) 공급자·OAUTH_MODE=live·키 없음.
+ * 다시 채우지 않는 것: 해제·오류·다시 연결 필요·열 수 없는 봉인·정리 대기가 있는 계정(현재 토큰 포함, FIX1)·만료·내용이 잘못된 행·실제(live) 공급자·OAUTH_MODE=live·키 없음.
+ * FIX1-M4DEV1: 다시 채우기가 일시적으로 실패하면 공급자를 부르지 않고 연결 상태를 바꾸지 않는다(route 503 mock_rehydration_unavailable, worker 는 그 tick 의 연결 정보 작업 건너뜀).
  * 채널 시뮬레이터 원격 기록(게시물·영상·컨테이너)은 다시 채우지 않는다 — 재시작 전 결과 불명 작업은 그대로 UNKNOWN(재전송 없음).
  * 마스터 키는 시험이 만든 난수. **네트워크 없음**(fetch 0).
  */
@@ -20,6 +21,7 @@ import {
   getAccountHealth,
   getDb,
   loadMockCredentialsForRehydration,
+  oauthTestHooks,
   runJobsTick,
   schema,
   seed,
@@ -51,7 +53,9 @@ import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[
 import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
 import { PUT as scenarioPUT } from '../../apps/web/app/api/distribution-items/[id]/mock-scenario/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
-import { ensureMockOAuthReady, jobCredentials } from '../../apps/web/lib/oauth';
+import { DISTRIBUTE_ERROR_TEXT, distributeFormFailure } from '../../apps/web/lib/distribution';
+import { ACCOUNT_ERROR_TEXT, accountFormFailure, ensureMockOAuthReady, jobCredentials, mockRehydrationUnavailable } from '../../apps/web/lib/oauth';
+import { runInlineWorker } from '../../apps/web/lib/stt';
 import { syntheticJpeg } from '../../packages/db/scripts/drill-instagram';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
@@ -155,7 +159,7 @@ function syntheticVideo(bytes = 200 * 1024): Uint8Array {
   return out;
 }
 async function mediaVariant(channel: 'youtube' | 'instagram'): Promise<string> {
-  const assetId = channel === 'youtube' ? await verifiedAsset(syntheticVideo(), 'video/mp4') : await verifiedAsset(syntheticJpeg(1080, 1080, ++imageSeed), 'image/jpeg');
+  const assetId = channel === 'youtube' ? await verifiedAsset(syntheticVideo(200 * 1024 + ++imageSeed), 'video/mp4') : await verifiedAsset(syntheticJpeg(1080, 1080, ++imageSeed), 'image/jpeg');
   const { content } = await createContent(db, owner, { title: `DEV1 ${channel}`, body: '해외 영업 첫 분기 회고(합성 미디어)\n대리점과 재고 기준을 먼저 합의한 이야기.' });
   const { variant } = await createVariantDraft(db, owner, content.id, { channel, baseVersion: 1 });
   await setVariantAssets(db, owner, variant.id, { baseVersion: 1, assets: [{ assetId, position: 1, role: channel === 'youtube' ? 'video' : 'image' }] });
@@ -418,8 +422,8 @@ describe('다시 채우지 않는 행·모드', () => {
     expect(inStore(t.scopeless.refresh!)).toBe(false);
     expect(inStore(t.unreadable.access)).toBe(false);
     expect(inStore(pendingToken)).toBe(false);
-    // 정리 대기 계정의 **현재** 토큰은 공급자에 실제로 있던 토큰이라 등록하지만, 계정 실행 차단은 그대로(health = 정리 대기 오류)
-    expect(inStore(t.pending.access)).toBe(true);
+    // FIX1-M4DEV1(Codex review-M4DEV1 P1 :781): 정리 대기 계정은 **현재** 토큰도 등록하지 않는다(회전으로 이미 무효였을 수 있음) — 계정 실행 차단도 그대로
+    expect(inStore(t.pending.access)).toBe(false);
     const ph = await getAccountHealth(db, owner, pending.id);
     expect(ph.status).toBe('error');
     expect(ph.usable_for_execution).toBe(false);
@@ -498,6 +502,240 @@ describe('다시 채우지 않는 행·모드', () => {
     restart();
     await ensureMockOAuthReady(config, db);
     expect(inStore(fake)).toBe(false);
+  });
+});
+
+describe('FIX1-M4DEV1: 다시 채우기가 일시적으로 실패하면 공급자를 부르지 않고 연결 상태를 바꾸지 않는다(Codex review-M4DEV1 P1 check/route.ts:25)', () => {
+  const failLoad = () => {
+    oauthTestHooks.beforeMockRehydrationLoad = async () => {
+      throw new Error('FIX1-M4DEV1 시험: 일시적 DB 읽기 실패');
+    };
+  };
+  const recoverLoad = () => {
+    delete oauthTestHooks.beforeMockRehydrationLoad;
+  };
+  const allCreds = () => db.select().from(schema.oauthCredentials).orderBy(asc(schema.oauthCredentials.id));
+  const allPending = () => db.select().from(schema.oauthPendingTokens).orderBy(asc(schema.oauthPendingTokens.id));
+  const expectUnavailable = async (res: Response) => {
+    expect(res.status, await res.clone().text()).toBe(503);
+    expect(((await res.json()) as { error: string }).error).toBe('mock_rehydration_unavailable');
+  };
+
+  it('check·refresh·revoke·worker tick route·inline worker: 503(또는 연결 정보 작업 건너뜀) — 연결 정보 행·정리 대기·작업 그대로, 다음 요청(회복 뒤)은 성공', async () => {
+    const thr = await linkedAccount('threads');
+    const yt = await linkedAccount('youtube');
+    const tThr = await tokensOf(thr.id);
+    const item = await planAndExecute(thr.id, await textVariant('threads', '실패 주입 — 재시작 직후 DB 읽기만 잠깐 실패.'));
+    const job0 = await jobOf(item);
+    restart();
+    failLoad();
+    try {
+      const creds0 = await allCreds();
+      const pending0 = await allPending();
+      for (const a of [thr, yt]) {
+        await expectUnavailable(await rec(await checkPOST(post(`/api/channel-accounts/${a.id}/check`), ctx(a.id))));
+        await expectUnavailable(await rec(await refreshPOST(post(`/api/channel-accounts/${a.id}/refresh`), ctx(a.id))));
+        await expectUnavailable(await rec(await revokePOST(post(`/api/channel-accounts/${a.id}/revoke`), ctx(a.id))));
+      }
+      await expectUnavailable(await tickRoute());
+      // inline worker: 이번 tick 은 배포 작업·만료 임박 갱신을 건너뛴다(던지지 않음 — 업로드 만료·전사는 그대로)
+      const inline = await runInlineWorker({ ...config, WORKER_MODE: 'inline' }, db);
+      expect(inline).not.toBeNull();
+      expect(inline!.jobs).toBeNull();
+      expect(inline!.credentials).toBeNull();
+      // 공급자를 부르지 않았다: 모의 공급자 메모리는 비어 있고 표식도 없다(다음 요청이 다시 읽는다)
+      expect(mockOAuthStore().tokens.size).toBe(0);
+      expect(mockOAuthStore().rehydration).toBeNull();
+      // 연결 정보 행·정리 대기·작업 상태 그대로(error 로 굳지 않음)
+      expect(await allCreds()).toEqual(creds0);
+      expect(await allPending()).toEqual(pending0);
+      const job1 = await jobOf(item);
+      expect({ state: job1.state, attempt: job1.attempt, nextRunAt: job1.nextRunAt }).toEqual({ state: job0.state, attempt: job0.attempt, nextRunAt: job0.nextRunAt });
+      expect(await intentsOf(job0.id)).toHaveLength(0);
+      for (const a of [thr, yt]) expect((await getAccountHealth(db, owner, a.id)).status).toBe('connected');
+    } finally {
+      recoverLoad();
+    }
+    // 회복 뒤 첫 요청이 다시 읽어 성공 — 연결 확인 connected, 작업 처리 CONFIRMED
+    const ck = await rec(await checkPOST(post(`/api/channel-accounts/${thr.id}/check`), ctx(thr.id)));
+    expect(ck.status, await ck.clone().text()).toBe(200);
+    expect(((await ck.json()) as { account: { status: string } }).account.status).toBe('connected');
+    expect(await mockOAuthStore().rehydration).toMatchObject({ status: 'done' });
+    expect(inStore(tThr.access)).toBe(true);
+    expect((await tickRoute()).status).toBe(200);
+    expect((await jobOf(item)).state).toBe('CONFIRMED');
+    expect((await credOf(yt.id)).status).toBe('active');
+  });
+
+  it('callback: 실패하면 503(연결 요청 state 를 쓰지 않음) → 회복 뒤 같은 callback 이 성공', async () => {
+    const [row] = await db
+      .insert(schema.channelAccounts)
+      .values({ ownerId: owner, platform: 'threads', kind: 'mock', externalAccountId: `mock:threads:${randomUUID()}`, displayName: 'MOCK threads DEV1 cb', state: 'mock_ready' })
+      .returning();
+    const c = await rec(await connectPOST(post(`/api/channel-accounts/${row!.id}/connect`), ctx(row!.id)));
+    expect(c.status).toBe(200);
+    const { authorize_url } = (await c.json()) as { authorize_url: string };
+    const a = await rec(await threadsAuthorizeGET(new Request(authorize_url, { headers: { accept: 'application/json', ...cookieHeader(token) } })));
+    expect(a.status).toBe(303);
+    const cbUrl = a.headers.get('location')!;
+    resetMockOAuthRehydration(); // 표식만 지움(발급한 code 는 그대로) — 다음 경로가 다시 읽게
+    failLoad();
+    try {
+      const cb = await rec(await callbackGET(new Request(cbUrl, { headers: { accept: 'application/json', ...cookieHeader(token) } })));
+      await expectUnavailable(cb);
+      expect(await db.select().from(schema.oauthCredentials).where(eq(schema.oauthCredentials.channelAccountId, row!.id))).toHaveLength(0);
+    } finally {
+      recoverLoad();
+    }
+    const cb2 = await rec(await callbackGET(new Request(cbUrl, { headers: { accept: 'application/json', ...cookieHeader(token) } })));
+    expect(cb2.status, await cb2.clone().text()).toBe(200);
+    expect((await credOf(row!.id)).status).toBe('active');
+  });
+
+  it('화면 폼: 설정(계정)·배포 화면 모두 일시 오류 문구로 돌아간다(live_blocked·server 로 뭉개지 않음)', () => {
+    const acc = accountFormFailure(mockRehydrationUnavailable());
+    expect(acc.headers.get('location')).toContain('account_error=mock_rehydration_unavailable');
+    expect(ACCOUNT_ERROR_TEXT.mock_rehydration_unavailable).toMatch(/[가-힣]/u);
+    const dist = distributeFormFailure(mockRehydrationUnavailable(), post('/api/worker/tick'), '/distribute');
+    expect(dist.headers.get('location')).toBe('/distribute?error=mock_rehydration_unavailable');
+    expect(DISTRIBUTE_ERROR_TEXT.mock_rehydration_unavailable).toMatch(/[가-힣]/u);
+  });
+});
+
+describe('FIX1-M4DEV1: 정리 대기 계정은 다시 채우지 않는다(Codex review-M4DEV1 P1 db/oauth.ts:781)', () => {
+  /** 공급자 갱신으로 현재 토큰 A 는 무효가 되고 B 가 발급됐지만 저장 결과 불명 — DB 에는 A(active) + 정리 대기 */
+  async function withPending(kind: 'refresh_unknown' | 'verify_current' | 'cleanup_revoke') {
+    const acc = await linkedAccount('threads');
+    const a = await tokensOf(acc.id);
+    const cred = await credOf(acc.id);
+    let sealed: { ciphertext: string; keyVersion: number } | null = null;
+    if (kind !== 'verify_current') {
+      const b = `mockthr_at_${randomBytes(32).toString('base64url')}`;
+      knownTokens.add(b);
+      sealed = sealSecret(requireSecretKeyring(process.env), JSON.stringify({ v: 1, access_token: b, refresh_token: null }), {
+        ownerId: owner,
+        channelAccountId: acc.id,
+        purpose: 'oauth_pending_token',
+      });
+    }
+    await db.insert(schema.oauthPendingTokens).values({
+      ownerId: owner,
+      channelAccountId: acc.id,
+      kind,
+      sealedToken: sealed?.ciphertext ?? null,
+      keyVersion: sealed?.keyVersion ?? null,
+      baseGeneration: kind === 'cleanup_revoke' ? null : cred.tokenGeneration,
+      source: 'dev1_fix1_test',
+      nextAttemptAt: new Date(Date.now() + 3600_000),
+    });
+    return { acc, a };
+  }
+
+  it('refresh_unknown·verify_current·cleanup_revoke 계정: 재시작 뒤 현재 토큰도 등록하지 않고 계정은 계속 차단, 이전 토큰으로 성공하는 공급자 호출 없음', async () => {
+    const cases = [await withPending('refresh_unknown'), await withPending('verify_current'), await withPending('cleanup_revoke')];
+    const clean = await linkedAccount('threads');
+    const tClean = await tokensOf(clean.id);
+    restart();
+    const { entries } = await loadMockCredentialsForRehydration(db, { keyring: requireSecretKeyring(process.env) });
+    for (const c of cases) expect(entries.some((e) => e.accessToken === c.a.access)).toBe(false);
+    expect(entries.some((e) => e.accessToken === tClean.access)).toBe(true);
+    expect(await ensureMockOAuthReady(config, db)).toMatchObject({ status: 'done' });
+    expect(inStore(tClean.access)).toBe(true);
+    for (const c of cases) {
+      expect(inStore(c.a.access)).toBe(false);
+      expect(mockOAuthTokenCheck()(c.a.access, c.acc.external, new Date())).toBe(false);
+      const h = await getAccountHealth(db, owner, c.acc.id);
+      expect(h.usable_for_execution).toBe(false);
+      expect(h.pending_reconcile).not.toBeNull();
+    }
+    // 연결 확인(정리 대기 처리 포함)도 옛 토큰을 유효로 보지 않는다.
+    // refresh_unknown·verify_current: 정리 판정이 현재 토큰을 공급자에서 확인 → 알 수 없음 → 오류(실행 불가, 다시 연결 안내).
+    for (const c of cases.slice(0, 2)) {
+      const r = await rec(await checkPOST(post(`/api/channel-accounts/${c.acc.id}/check`), ctx(c.acc.id)));
+      const body = (await r.clone().json()) as { account?: { status: string } };
+      expect(body.account?.status).not.toBe('connected');
+      expect((await getAccountHealth(db, owner, c.acc.id)).usable_for_execution).toBe(false);
+      expect(mockOAuthTokenCheck()(c.a.access, c.acc.external, new Date())).toBe(false);
+    }
+    // cleanup_revoke: 기존 T13 규칙대로 첫 확인은 정리(남은 토큰 철회)로 갈음해 정리 대기만 걷힌다 — 현재 토큰은 등록하지 않았으므로
+    // 다음 확인(일반 공급자 확인)이 알 수 없는 토큰 → 오류(실행 불가). 옛 토큰으로 성공한 공급자 호출은 없다.
+    const cr = cases[2]!;
+    expect((await rec(await checkPOST(post(`/api/channel-accounts/${cr.acc.id}/check`), ctx(cr.acc.id)))).status).toBe(200);
+    expect(await db.select().from(schema.oauthPendingTokens).where(eq(schema.oauthPendingTokens.channelAccountId, cr.acc.id))).toHaveLength(0);
+    const r2 = await rec(await checkPOST(post(`/api/channel-accounts/${cr.acc.id}/check`), ctx(cr.acc.id)));
+    expect(((await r2.json()) as { account: { status: string; usable_for_execution: boolean } }).account).toMatchObject({ status: 'error', usable_for_execution: false });
+    expect((await credOf(cr.acc.id)).lastErrorCode).toBe('invalid_token');
+    expect(mockOAuthTokenCheck()(cr.a.access, cr.acc.external, new Date())).toBe(false);
+  });
+});
+
+describe('FIX1-M4DEV1: 놓친 경우(Codex 목록)', () => {
+  it('만료된 연결 정보·알 수 없는 키 버전·복호화는 되지만 내용이 잘못된 행은 등록하지 않고(행 그대로) 나머지는 등록한다', async () => {
+    const good = await linkedAccount('instagram');
+    const expired = await linkedAccount('threads');
+    const badVer = await linkedAccount('threads');
+    const garbage = await linkedAccount('threads');
+    const t = { good: await tokensOf(good.id), expired: await tokensOf(expired.id), badVer: await tokensOf(badVer.id), garbage: await tokensOf(garbage.id) };
+    await db.update(schema.oauthCredentials).set({ expiresAt: new Date(Date.now() - 60_000) }).where(eq(schema.oauthCredentials.channelAccountId, expired.id));
+    await db.update(schema.oauthCredentials).set({ keyVersion: 99 }).where(eq(schema.oauthCredentials.channelAccountId, badVer.id));
+    const resealed = sealSecret(requireSecretKeyring(process.env), JSON.stringify({ v: 1, access_token: 'not-a-mock-token', refresh_token: null }), {
+      ownerId: owner,
+      channelAccountId: garbage.id,
+      purpose: 'oauth_token',
+    });
+    await db.update(schema.oauthCredentials).set({ encryptedToken: resealed.ciphertext, keyVersion: resealed.keyVersion }).where(eq(schema.oauthCredentials.channelAccountId, garbage.id));
+    const rowsBefore = await db.select().from(schema.oauthCredentials).orderBy(asc(schema.oauthCredentials.id));
+    restart();
+    const out = await ensureMockOAuthReady(config, db);
+    expect(out).toMatchObject({ status: 'done' });
+    expect((out as { skipped: number }).skipped).toBeGreaterThanOrEqual(3);
+    expect(inStore(t.good.access)).toBe(true);
+    expect(inStore(t.expired.access)).toBe(false);
+    expect(inStore(t.badVer.access)).toBe(false);
+    expect(inStore(t.garbage.access)).toBe(false);
+    expect(mockOAuthStore().tokens.has(sha('not-a-mock-token'))).toBe(false);
+    expect(await db.select().from(schema.oauthCredentials).orderBy(asc(schema.oauthCredentials.id))).toEqual(rowsBefore);
+  });
+
+  it('Google 형 access 는 만료·refresh 는 유효: 재시작 뒤 첫 사용이 작업 처리여도 보내기 전 갱신 → 비공개 업로드 CONFIRMED', async () => {
+    const yt = await linkedAccount('youtube');
+    const tk = await tokensOf(yt.id);
+    const resealed = sealSecret(
+      requireSecretKeyring(process.env),
+      JSON.stringify({ v: 1, access_token: tk.access, refresh_token: tk.refresh, access_expires_at: new Date(Date.now() - 60_000).toISOString() }),
+      { ownerId: owner, channelAccountId: yt.id, purpose: 'oauth_token' },
+    );
+    await db.update(schema.oauthCredentials).set({ encryptedToken: resealed.ciphertext, keyVersion: resealed.keyVersion }).where(eq(schema.oauthCredentials.channelAccountId, yt.id));
+    const gen = (await credOf(yt.id)).tokenGeneration;
+    restart();
+    const item = await planAndExecute(yt.id, await mediaVariant('youtube'));
+    expect((await tickRoute()).status).toBe(200);
+    expect(await drainUntil(item)).toBe('CONFIRMED');
+    const c = await credOf(yt.id);
+    expect(c).toMatchObject({ status: 'active', lastErrorCode: null });
+    expect(c.tokenGeneration).toBeGreaterThan(gen);
+    expect(mockGoogleTokenCheck()(tk.access, yt.external, new Date())).toBe(false);
+  });
+
+  it('재시작 뒤 첫 사용이 연결 해제(revoke)여도 다시 채운 토큰을 공급자에서 철회하고 정리 대기를 남기지 않는다', async () => {
+    const thr = await linkedAccount('threads');
+    const tk = await tokensOf(thr.id);
+    restart();
+    const r = await rec(await revokePOST(post(`/api/channel-accounts/${thr.id}/revoke`), ctx(thr.id)));
+    expect(r.status, await r.clone().text()).toBe(200);
+    expect((await credOf(thr.id)).status).toBe('revoked');
+    expect(mockOAuthStore().tokens.get(sha(tk.access))?.revoked).toBe(true);
+    expect(await db.select().from(schema.oauthPendingTokens).where(eq(schema.oauthPendingTokens.channelAccountId, thr.id))).toHaveLength(0);
+  });
+
+  it('재시작 뒤 첫 사용이 inline worker(WORKER_MODE=inline)여도 다시 채운 뒤 Threads 전송 CONFIRMED', async () => {
+    const thr = await linkedAccount('threads');
+    const item = await planAndExecute(thr.id, await textVariant('threads', 'inline worker 첫 사용 — 재시작 직후.'));
+    restart();
+    const inline = await runInlineWorker({ ...config, WORKER_MODE: 'inline' }, db);
+    expect(inline?.jobs).not.toBeNull();
+    expect(await mockOAuthStore().rehydration).toMatchObject({ status: 'done' });
+    expect((await jobOf(item)).state).toBe('CONFIRMED');
   });
 });
 

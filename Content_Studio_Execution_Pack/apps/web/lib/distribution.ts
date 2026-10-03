@@ -96,6 +96,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   invalid: '입력값을 확인하세요.',
   conflict: '다른 곳에서 먼저 바뀌었습니다. 새로 고친 뒤 다시 시도하세요.',
   live_blocked: '실제 채널 게시는 허용·구현되지 않았습니다(외부로 아무것도 보내지 않음).',
+  // FIX1-M4DEV1: 재시작 뒤 모의 연결 정보 다시 불러오기 실패(일시) — 작업은 처리하지 않았고 연결 상태도 그대로
+  mock_rehydration_unavailable: '모의 연결 정보를 아직 다시 불러오지 못해 이번에는 작업을 처리하지 않았습니다(연결 상태는 그대로). 잠시 뒤 다시 실행하세요.',
   not_cancellable: '이미 끝났거나 실행 전인 항목은 취소할 수 없습니다.',
   cancel_unknown: '결과를 확인할 수 없는 항목(UNKNOWN)은 취소를 확정할 수 없습니다. 먼저 재확인하세요(자동 재전송은 하지 않습니다).',
   nothing_to_reconcile: '재확인할 작업이 없습니다(확인 중·결과 불명·원격 처리 중인 항목만 재확인합니다).',
@@ -132,7 +134,8 @@ export function distributeFormFailure(e: unknown, request: Request, back: string
   }
   if (res.status === 404) return seeOther(notFoundHref);
   let code = 'server';
-  if (res.status === 503) code = 'live_blocked';
+  if (e instanceof AppError && e.code === 'mock_rehydration_unavailable') code = 'mock_rehydration_unavailable';
+  else if (res.status === 503) code = 'live_blocked';
   else if (e instanceof AppError) {
     if (PASS.has(e.code)) code = e.code;
     else if (e.kind === 'csrf') code = 'csrf';

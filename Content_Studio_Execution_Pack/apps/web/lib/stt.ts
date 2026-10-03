@@ -1,6 +1,7 @@
 /** T08 서버 전용: inline worker 실행·응답 모양. */
 import { refreshExpiringCredentials, type Db } from '@cs/db';
 import { readSecretKeyring, WEB_TICK_UPLOAD_SLICE, type AppConfig } from '@cs/domain';
+import { mockCredentialWorkAllowed } from '@cs/providers';
 import { runWorkerTick, type WorkerTick } from '@cs/worker';
 import { ensureMockOAuthReady, jobCredentials, oauthDeps } from './oauth';
 import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
@@ -14,10 +15,12 @@ import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
 export async function runInlineWorker(config: AppConfig, db: Db): Promise<WorkerTick | null> {
   if (config.WORKER_MODE !== 'inline') return null;
   // M4-DEV1: 만료 임박 갱신·작업 처리 전에(재시작 뒤 첫 tick 이면) DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
-  await ensureMockOAuthReady(config, db);
+  // FIX1-M4DEV1(Codex review-M4DEV1 P1): 다시 채우기가 실패했으면 이번 tick 은 연결 정보를 쓰는 일(배포 작업 처리·만료 임박 갱신·정리 대기 처리)을
+  // 건너뛴다 — 비어 있는 모의 공급자가 토큰을 "알 수 없음"으로 판정해 연결 정보를 error 로 굳히지 않게. 업로드 만료·전사는 그대로. 다음 tick 이 다시 읽는다.
+  const credWork = mockCredentialWorkAllowed(await ensureMockOAuthReady(config, db));
   // T13: 마스터 키가 있을 때만 만료가 가까운 연결 정보를 갱신한다(모의 공급자 — 외부 호출 없음). 키가 없으면 건너뛴다(앱은 그대로).
   const deps = oauthDeps(config);
-  const credentialRefresh = readSecretKeyring(process.env).ok
+  const credentialRefresh = credWork && readSecretKeyring(process.env).ok
     ? (now: Date) => refreshExpiringCredentials(db, { providerFor: deps.providerFor, keyring: deps.keyring, now })
     : undefined;
   return runWorkerTick({
@@ -25,7 +28,7 @@ export async function runInlineWorker(config: AppConfig, db: Db): Promise<Worker
     db,
     transcriber: getWorkerTranscriber(),
     files: getStorage(config),
-    channelAdapters: getChannelAdapters(),
+    channelAdapters: credWork ? getChannelAdapters() : undefined,
     maxJobs: 5,
     credentialRefresh,
     jobCredentials: jobCredentials(config, db),

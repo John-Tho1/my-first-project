@@ -6,7 +6,7 @@
  */
 import { checkCredential, DbLockedError, loadMockCredentialsForRehydration, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
 import { loadConfig, oauthRedirectUri, readSecretKeyring, requireSecretKeyring } from '@cs/domain';
-import { createMockAdapterRegistry, createStorage, ensureMockOAuthRehydrated, resolveOAuthProvider } from '@cs/providers';
+import { createMockAdapterRegistry, createStorage, ensureMockOAuthRehydrated, mockCredentialWorkAllowed, resolveOAuthProvider } from '@cs/providers';
 import { assertWorkerModeSupported, runWorkerTick, WorkerModeError } from './index';
 
 function parseLoop(argv: readonly string[]): number | null {
@@ -65,11 +65,13 @@ try {
   do {
     // M4-DEV1: 이 프로세스의 첫 tick 이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, OAUTH_MODE=mock·키 있음만).
     // 토큰은 모의 공급자 메모리로만 — 출력은 tick JSON 그대로(토큰·개수 없음).
+    // FIX1-M4DEV1(Codex review-M4DEV1 P1): 다시 채우기가 실패하면 이번 tick 은 배포 작업(연결 정보 사용)을 건너뛴다 — 상태를 바꾸지 않고 다음 tick 이 다시 읽는다.
     const ring = readSecretKeyring(process.env);
-    if (ring.ok) {
-      await ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(handle.db, { keyring: ring.keyring }) });
-    }
-    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters, workerId, maxJobs: 20, jobCredentials, media });
+    const rehydrated = ring.ok
+      ? await ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(handle.db, { keyring: ring.keyring }) })
+      : null;
+    const credWork = mockCredentialWorkAllowed(rehydrated);
+    const tick = await runWorkerTick({ config, db: handle.db, channelAdapters: credWork ? channelAdapters : undefined, workerId, maxJobs: 20, jobCredentials, media });
     console.log(JSON.stringify(tick));
     if (loopMs === null || stopping) break;
     await new Promise<void>((resolve) => {

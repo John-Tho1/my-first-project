@@ -18,6 +18,7 @@ import {
   MockGoogleOAuthProvider,
   MockInstagramOAuthProvider,
   MockThreadsOAuthProvider,
+  mockCredentialWorkAllowed,
   resolveOAuthProvider,
   type MockRehydrateOutcome,
 } from '@cs/providers';
@@ -52,6 +53,24 @@ export async function ensureMockOAuthReady(
   const ring = readSecretKeyring(env);
   if (!ring.ok) return null;
   return ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(db, { keyring: ring.keyring }) });
+}
+
+/** FIX1-M4DEV1: 다시 채우기 실패 → 일시 오류(503). 연결 상태는 바꾸지 않았고 공급자도 부르지 않았다. */
+export function mockRehydrationUnavailable(): AppError {
+  return new AppError(
+    'service_unavailable',
+    'mock_rehydration_unavailable',
+    '모의 연결 정보를 아직 다시 불러오지 못했습니다. 연결 상태는 바꾸지 않았습니다. 잠시 뒤 다시 시도하세요.',
+  );
+}
+
+/**
+ * FIX1-M4DEV1(Codex review-M4DEV1 P1 check/route.ts:25): 공급자·작업 처리기 연결 정보 경로(check·refresh·revoke·callback·worker tick) 앞에서 부른다.
+ * 다시 채우기가 실패했으면 공급자를 부르지 않고 연결 상태도 바꾸지 않은 채 503 mock_rehydration_unavailable 을 던진다(표식은 지워져 다음 요청이 다시 읽음).
+ * live 모드·키 없음은 기존 처리 그대로(키 없음은 각 경로가 secrets_not_configured 로 거부).
+ */
+export async function requireMockOAuthReady(config: Pick<AppConfig, 'OAUTH_MODE'>, db: Db, env: Record<string, string | undefined> = process.env): Promise<void> {
+  if (!mockCredentialWorkAllowed(await ensureMockOAuthReady(config, db, env))) throw mockRehydrationUnavailable();
 }
 
 /**
@@ -108,6 +127,7 @@ export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   credential_not_connected: '이 계정에는 저장된 연결 정보가 없습니다.',
   credential_refresh_failed: '연결 정보를 갱신하지 못했습니다. 다시 연결하세요.',
   credential_unreadable: '저장된 연결 정보를 읽을 수 없습니다. 다시 연결하세요.',
+  mock_rehydration_unavailable: '모의 연결 정보를 아직 다시 불러오지 못했습니다. 연결 상태는 바꾸지 않았습니다. 잠시 뒤 다시 시도하세요.',
   not_found: '배포 계정을 찾을 수 없습니다.',
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
   server: '처리하지 못했습니다. 잠시 뒤 다시 시도하세요.',

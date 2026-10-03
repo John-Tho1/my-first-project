@@ -2659,3 +2659,177 @@ describe('FIX7 놓친 케이스 (Codex review-FIX6-T13)', () => {
     expect((await auditDetails(accountId, 'oauth.revoked')).at(-1)).toMatchObject({ outcome: 'revoked', joined: true });
   });
 });
+
+// ---------------- FIX round 8 (Codex review-FIX7-T13) ----------------
+
+describe('FIX8 P2 :1508 — worker 재개는 잠금 안에서 재개 예약도 확인하고 잡은 뒤에만 공급자를 부른다', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** 키 없이 해제(incomplete) → 키 복구. 이 행을 재개 순서 맨 앞에 둔다(limit=1 worker 가 이 행만 고르게). */
+  async function stuckRevokeFirst(accountId: string) {
+    await connectFully(accountId);
+    const token = await decryptToken(ownerA, accountId);
+    useKeys({});
+    expect(await (await revoke(accountId)).json()).toMatchObject({ outcome: 'incomplete', incomplete_code: 'revoke_current_no_key' });
+    key1();
+    await db.update(schema.oauthCredentials).set({ revokeResumeAt: new Date(0) }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    return { token, stuck: (await credRow(accountId))! };
+  }
+  const worker1 = (now: Date) => refreshExpiringCredentials(db, { providerFor: oauthDeps(config).providerFor, keyring: oauthDeps(config).keyring, ownerId: ownerA, now, limit: 1 });
+
+  it('두 worker 가 같은 행을 함께 훑음 → A 가 잡아(1단계 커밋) 공급자 호출 전에 B 가 잠금 확인 → B 는 skipped_busy, 공급자 철회는 한 번', async () => {
+    const accountId = await newThreadsAccount();
+    const { token, stuck } = await stuckRevokeFirst(accountId);
+    const audits = (await auditDetails(accountId, 'oauth.revoked')).length;
+    const T = new Date(Date.now() + 2 * 60_000);
+    const tokens = spyRevokedTokens();
+    let bScanned!: () => void;
+    const bScannedP = new Promise<void>((r) => (bScanned = r));
+    let aMarked!: () => void;
+    const aMarkedP = new Promise<void>((r) => (aMarked = r));
+    let seen = 0;
+    let wB: ReturnType<typeof worker1> | null = null;
+    let leaseSeenByB: Date | null = null;
+    oauthTestHooks.beforeRevokeResume = async (c) => {
+      if (c.accountId !== accountId) return;
+      seen++;
+      if (seen === 1) {
+        // A 가 훑은 뒤 — B 도 같은 행을 훑게 하고, B 가 재개 직전에 멈출 때까지 기다린다
+        wB = worker1(T);
+        await bScannedP;
+      } else if (seen === 2) {
+        bScanned();
+        // A 가 1단계(재개 잡기)를 커밋할 때까지 B 의 잠금 확인을 늦춘다
+        await aMarkedP;
+        leaseSeenByB = (await credRow(accountId))!.revokeResumeAt;
+      }
+    };
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      aMarked();
+      // B 가 잠금 확인을 끝낸 뒤에야 A 가 공급자를 부른다(겹침 구간을 강제)
+      await wB;
+    };
+    const wA = await worker1(T);
+    const b = await wB!;
+    expect(seen).toBe(2);
+    expect(wA).toMatchObject({ revokeResumed: 1, revokeSkippedBusy: 0, revokeSkippedChanged: 0 });
+    expect(b).toMatchObject({ revokeResumed: 0, revokeSkippedBusy: 1, revokeSkippedChanged: 0, revokeWaiting: 0 });
+    // A 의 잡기: 예약이 now + backoff(시도 2 → 2분)로 옮겨졌다
+    expect(leaseSeenByB!.getTime()).toBe(T.getTime() + 2 * 60_000);
+    expect(tokens.filter((t) => t === token)).toHaveLength(1);
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null, revokeOpId: stuck.revokeOpId, revocationEpoch: stuck.revocationEpoch });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect(await auditDetails(accountId, 'oauth.revoked')).toHaveLength(audits + 1);
+  });
+
+  it('훑은 뒤 사용자 해제가 합류해 예약을 새로 잡고 공급자 응답 전 → worker 는 skipped_busy(공급자 호출·쓰기 없음), 사용자 해제만 철회', async () => {
+    const accountId = await newThreadsAccount();
+    const { token, stuck } = await stuckRevokeFirst(accountId);
+    const T = new Date(Date.now() + 2 * 60_000);
+    const tokens = spyRevokedTokens();
+    let userMarked!: () => void;
+    const userMarkedP = new Promise<void>((r) => (userMarked = r));
+    let wP: ReturnType<typeof worker1> | null = null;
+    let userP: Promise<Response> | null = null;
+    let leased = null as Awaited<ReturnType<typeof credRow>>;
+    let afterWorker = null as Awaited<ReturnType<typeof credRow>>;
+    oauthTestHooks.beforeRevokeResume = async (c) => {
+      if (c.accountId !== accountId) return;
+      delete oauthTestHooks.beforeRevokeResume;
+      userP = revoke(accountId);
+      await userMarkedP;
+      leased = await credRow(accountId);
+    };
+    oauthTestHooks.afterRevokeMarked = async () => {
+      delete oauthTestHooks.afterRevokeMarked;
+      userMarked();
+      // 사용자 해제는 worker 가 잠금 확인을 끝낼 때까지 공급자를 부르지 않는다
+      await wP;
+      afterWorker = await credRow(accountId);
+    };
+    wP = worker1(T);
+    const w = await wP;
+    const rv = await userP!;
+    expect(w).toMatchObject({ revokeResumed: 0, revokeSkippedBusy: 1, revokeSkippedChanged: 0 });
+    // 사용자 합류가 예약·시도 수를 바꿨고(시도 +1), worker 는 그 행을 그대로 두었다
+    expect(leased!.revokeResumeAttempts).toBe(stuck.revokeResumeAttempts + 1);
+    expect(leased!.revokeResumeAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(afterWorker).toEqual(leased);
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked', remote_revoke: 'ok' });
+    expect(tokens.filter((t) => t === token)).toHaveLength(1);
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null, revokeOpId: stuck.revokeOpId });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('놓친 케이스: 훑은 뒤 같은 작업의 예약만 미래로 연장 → worker 는 공급자 호출·예약·시도 수·감사 변경 없이 건너뜀, 기한이 지나면 잇는다', async () => {
+    const accountId = await newThreadsAccount();
+    const { token } = await stuckRevokeFirst(accountId);
+    const T = new Date(Date.now() + 2 * 60_000);
+    const audits = (await auditDetails(accountId, 'oauth.revoked')).length;
+    const tokens = spyRevokedTokens();
+    let extended = null as Awaited<ReturnType<typeof credRow>>;
+    oauthTestHooks.beforeRevokeResume = async (c) => {
+      if (c.accountId !== accountId) return;
+      delete oauthTestHooks.beforeRevokeResume;
+      // 다른 worker 가 잡은 것과 같음(시도 수는 그대로, 예약만 T + 1시간)
+      await db.update(schema.oauthCredentials).set({ revokeResumeAt: new Date(T.getTime() + 60 * 60_000) }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+      extended = await credRow(accountId);
+    };
+    const w = await worker1(T);
+    expect(w).toMatchObject({ revokeResumed: 0, revokeSkippedBusy: 1, revokeWaiting: 0 });
+    expect(await credRow(accountId)).toEqual(extended);
+    expect(tokens).toHaveLength(0);
+    expect(await auditDetails(accountId, 'oauth.revoked')).toHaveLength(audits);
+    // 그 예약 시각 뒤의 tick 은 잇는다
+    const w2 = await workerA(new Date(T.getTime() + 61 * 60_000));
+    expect(w2.revokeResumed).toBeGreaterThanOrEqual(1);
+    expect(tokens.filter((t) => t === token)).toHaveLength(1);
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null });
+  });
+
+  it('놓친 케이스: 0035 이전 모양(예약 null·시도 0·오류 코드 null) — updated_at + 60초의 1ms 전에는 잇지 않고, 정확히 그 시각에는 잇는다', async () => {
+    const accountId = await newThreadsAccount();
+    const { token } = await stuckRevokeFirst(accountId);
+    const T = new Date(Date.now() + 10 * 60_000);
+    await db
+      .update(schema.oauthCredentials)
+      .set({ revokeResumeAt: null, revokeResumeAttempts: 0, lastErrorCode: null, updatedAt: new Date(T.getTime() - 60_000 + 1) })
+      .where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    const before = (await credRow(accountId))!;
+    const tokens = spyRevokedTokens();
+    await workerA(T);
+    expect(await credRow(accountId)).toEqual(before);
+    expect(tokens.filter((t) => t === token)).toHaveLength(0);
+    await db.update(schema.oauthCredentials).set({ updatedAt: new Date(T.getTime() - 60_000) }).where(eq(schema.oauthCredentials.channelAccountId, accountId));
+    await workerA(T);
+    expect(tokens.filter((t) => t === token)).toHaveLength(1);
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null, revokeOpId: before.revokeOpId });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+
+  it('놓친 케이스: 훑은 뒤·잠금 전 키 교체(작업 ID·세대·예약 그대로, 암호문만 바뀜) → 잠금 안의 현재 암호문으로 철회·마무리', async () => {
+    const accountId = await newThreadsAccount();
+    const { token, stuck } = await stuckRevokeFirst(accountId);
+    const T = new Date(Date.now() + 2 * 60_000);
+    const tokens = spyRevokedTokens();
+    let resealed = null as Awaited<ReturnType<typeof credRow>>;
+    oauthTestHooks.beforeRevokeResume = async (c) => {
+      if (c.accountId !== accountId) return;
+      delete oauthTestHooks.beforeRevokeResume;
+      useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2', SECRETS_MASTER_KEY_PREVIOUS: KEY1, SECRETS_KEY_VERSION_PREVIOUS: '1' });
+      await rotateSecretKeys(db, requireSecretKeyring(process.env));
+      useKeys({ SECRETS_MASTER_KEY: KEY2, SECRETS_KEY_VERSION: '2' });
+      resealed = await credRow(accountId);
+    };
+    const w = await worker1(T);
+    expect(resealed).toMatchObject({ status: 'revoking', keyVersion: 2, revokeOpId: stuck.revokeOpId, tokenGeneration: stuck.tokenGeneration, revokeResumeAt: stuck.revokeResumeAt });
+    expect(resealed!.encryptedToken).not.toBe(stuck.encryptedToken);
+    expect(w).toMatchObject({ revokeResumed: 1, revokeSkippedBusy: 0, revokeSkippedChanged: 0 });
+    expect(tokens.filter((t) => t === token)).toHaveLength(1);
+    expect(await credRow(accountId)).toMatchObject({ status: 'revoked', encryptedToken: null, revokeOpId: stuck.revokeOpId, revocationEpoch: stuck.revocationEpoch });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+  });
+});

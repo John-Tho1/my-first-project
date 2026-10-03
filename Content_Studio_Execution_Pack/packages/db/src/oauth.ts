@@ -1473,7 +1473,7 @@ export async function revokeCredential(
 ): Promise<RevokeResult> {
   const r = await revokeCredentialOp(db, input, null);
   // 사용자 요청(expect 없음)은 판정 전 건너뛰기가 없다
-  if (r === 'skipped_changed') throw new CredentialNotFoundError();
+  if (r === 'skipped_changed' || r === 'skipped_busy') throw new CredentialNotFoundError();
   return r;
 }
 
@@ -1481,18 +1481,25 @@ export async function revokeCredential(
  * FIX7-T13(Codex review-FIX6-T13 P1 :1791): worker 가 훑어 본 미완료 해제 하나를 **그 작업 그대로** 잇는다. 첫 잠금 트랜잭션 안에서 연결 정보가
  * 아직 revoking 이고 해제 작업 ID·토큰 세대·해제 세대가 훑을 때와 같은지 확인하고, 다르면(그 사이 해제가 끝났거나 다시 연결됐거나 새 해제가 시작됨)
  * 공급자 호출·로컬 변경 없이 'skipped_changed' — 새 해제 작업을 만들지 않는다.
+ * FIX8-T13(Codex review-FIX7-T13 P2 :1508): 같은 작업이어도 훑은 뒤 재개 예약(revoke_resume_at·시도 수)이 바뀌었거나 지금 기한이 지나지 않았으면
+ * (다른 worker 가 이미 재개를 잡았거나 사용자 해제가 합류해 진행 중) 공급자 호출·로컬 변경 없이 'skipped_busy'. 통과하면 같은 잠금 트랜잭션에서
+ * revoke_resume_at = now + max(60초, backoff) 로 재개를 잡은 뒤에야 공급자를 부른다 — 두 번째 재개는 바뀐 예약을 보고 건너뛴다.
  */
 export interface RevokeResumeExpectation {
   opId: string;
   generation: number;
   epoch: number;
+  /** FIX8-T13: 훑을 때 본 revoke_resume_at(0035 이전 행은 null) */
+  resumeAt: Date | null;
+  /** FIX8-T13: 훑을 때 본 revoke_resume_attempts */
+  attempts: number;
 }
 
 async function revokeCredentialOp(
   db: Db,
   input: { ownerId: string; accountId: string; providerFor: ProviderFor; keyring: KeyringSource; now?: Date },
   expect: RevokeResumeExpectation | null,
-): Promise<RevokeResult | 'skipped_changed'> {
+): Promise<RevokeResult | 'skipped_changed' | 'skipped_busy'> {
   const now = input.now ?? new Date();
   const account = await ownedAccount(db, input.ownerId, input.accountId);
   let provider: OAuthProvider | null = null;
@@ -1513,6 +1520,12 @@ async function revokeCredentialOp(
         cred.tokenGeneration === expect.generation &&
         cred.revocationEpoch === expect.epoch;
       if (!same) return { changed: true as const };
+      // FIX8-T13(Codex review-FIX7-T13 P2 :1508): 같은 작업의 재개 예약도 훑을 때 그대로이고 지금 기한이 지났을 때만 잇는다. 아래 합류 분기가 같은
+      // 트랜잭션에서 revoke_resume_at 을 미래로 옮겨(잡기) 커밋하므로, 함께 훑은 다른 worker 는 바뀐 예약을 보고 여기서 건너뛴다.
+      const due = cred.revokeResumeAt ?? new Date(cred.updatedAt.getTime() + REVOKE_RESUME_AFTER_MS);
+      const leaseSame =
+        (cred.revokeResumeAt?.getTime() ?? null) === (expect.resumeAt?.getTime() ?? null) && cred.revokeResumeAttempts === expect.attempts;
+      if (!leaseSame || due.getTime() > now.getTime()) return { busy: true as const };
     }
     if (!cred) throw new CredentialNotFoundError();
     if (cred.revokedAt) return { done: accountHealthView(acc, cred, await pendingInfoOf(tx, input.ownerId, acc.id), now) };
@@ -1582,6 +1595,7 @@ async function revokeCredentialOp(
     return { generation: cred.tokenGeneration, tokens, hadCiphertext, pendings, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
   });
   if ('changed' in marked) return 'skipped_changed';
+  if ('busy' in marked) return 'skipped_busy';
   if ('done' in marked && marked.done) return { health: marked.done, outcome: 'already_revoked', remoteRevoke: 'already_revoked', revokedApprovals: 0, incompleteCode: null };
   if ('done' in marked) throw new CredentialNotFoundError();
   await oauthTestHooks.afterRevokeMarked?.();
@@ -1775,7 +1789,7 @@ async function revokeCredentialOp(
 export async function refreshExpiringCredentials(
   db: Db,
   input: { providerFor: ProviderFor; keyring: KeyringSource; now?: Date; ownerId?: string; limit?: number },
-): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number; revokeResumed: number; revokeWaiting: number; revokeSkippedChanged: number }> {
+): Promise<{ refreshed: number; failed: number; pendingResolved: number; pendingRemaining: number; revokeResumed: number; revokeWaiting: number; revokeSkippedChanged: number; revokeSkippedBusy: number }> {
   const now = input.now ?? new Date();
   // FIX3-T13: 정리 대기가 있는 계정을 먼저 정리한다(만료·상태와 무관 — 해제된 계정·연결 정보 행이 없는 계정 포함).
   // FIX4-T13(Codex review-FIX3-T13 P2 :1293): 다음 시도 시각(next_attempt_at)이 지난 행이 있는 계정만, 가장 이른 시각 순으로 고른다.
@@ -1840,6 +1854,8 @@ export async function refreshExpiringCredentials(
   let revokeResumed = 0;
   let revokeWaiting = 0;
   let revokeSkippedChanged = 0;
+  // FIX8-T13: 같은 작업이지만 훑은 뒤 다른 호출(worker·사용자 해제)이 재개를 잡아 예약이 바뀌었거나 아직 기한 전 — 공급자 호출 없음
+  let revokeSkippedBusy = 0;
   // 훑을 때 본 그 작업이 아직 그대로이고 아직 기한이 지난 상태일 때만 미룬다(다른 호출이 정한 더 늦은 예약·새 연결은 건드리지 않음). updated_at·감사 없음.
   const deferResume = async (c: OAuthCredentialRow) => {
     const attempts = c.revokeResumeAttempts + 1;
@@ -1874,9 +1890,10 @@ export async function refreshExpiringCredentials(
     const r = await revokeCredentialOp(
       db,
       { ownerId: c.ownerId, accountId: c.channelAccountId, providerFor: input.providerFor, keyring: input.keyring, now },
-      { opId: c.revokeOpId!, generation: c.tokenGeneration, epoch: c.revocationEpoch },
+      { opId: c.revokeOpId!, generation: c.tokenGeneration, epoch: c.revocationEpoch, resumeAt: c.revokeResumeAt, attempts: c.revokeResumeAttempts },
     ).catch(() => null);
     if (r === 'skipped_changed') revokeSkippedChanged++;
+    else if (r === 'skipped_busy') revokeSkippedBusy++;
     else if (r && (r.outcome === 'revoked' || r.outcome === 'completed_by_other' || r.outcome === 'already_revoked')) revokeResumed++;
     else {
       revokeWaiting++;
@@ -1908,7 +1925,7 @@ export async function refreshExpiringCredentials(
       failed++;
     }
   }
-  return { refreshed, failed, pendingResolved, pendingRemaining, revokeResumed, revokeWaiting, revokeSkippedChanged };
+  return { refreshed, failed, pendingResolved, pendingRemaining, revokeResumed, revokeWaiting, revokeSkippedChanged, revokeSkippedBusy };
 }
 
 // ---- 키 교체 ----

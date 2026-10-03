@@ -3,7 +3,7 @@ import { assertSameOrigin, isUuid, tickSchema, WEB_TICK_UPLOAD_SLICE } from '@cs
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../lib/body';
 import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../lib/distribution';
-import { jobCredentials } from '../../../../lib/oauth';
+import { ensureMockOAuthReady, jobCredentials } from '../../../../lib/oauth';
 import { getChannelAdapters, getConfig, getStorage } from '../../../../lib/server';
 import { requireOwner } from '../../../../lib/session';
 
@@ -37,6 +37,8 @@ export async function POST(request: Request): Promise<Response> {
     const parsed = tickSchema.safeParse(input);
     if (!parsed.success) throw validationError(parsed.error);
     const workerId = parsed.data.worker_id ? `api-${parsed.data.worker_id}`.slice(0, 40) : newWorkerId('api');
+    // M4-DEV1: 재시작 뒤 첫 작업 처리면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
+    await ensureMockOAuthReady(config, owner.db);
     const r = await runJobsTick(owner.db, getChannelAdapters(), {
       workerId,
       config,

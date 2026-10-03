@@ -1,7 +1,7 @@
 import { completeOAuthCallback } from '@cs/db';
 import { oauthCallbackQuerySchema, OAuthFlowError, requestRedirectTarget } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
-import { accountFormFailure, oauthDeps, oauthEndpoint } from '../../../../lib/oauth';
+import { accountFormFailure, ensureMockOAuthReady, oauthDeps, oauthEndpoint } from '../../../../lib/oauth';
 import { getConfig } from '../../../../lib/server';
 import { requireOwner } from '../../../../lib/session';
 
@@ -24,6 +24,8 @@ export const GET = oauthEndpoint(async (request: Request): Promise<Response> => 
     const url = new URL(request.url);
     const parsed = oauthCallbackQuerySchema.safeParse(Object.fromEntries(url.searchParams.entries()));
     if (!parsed.success) throw new OAuthFlowError('oauth_bad_request');
+    // M4-DEV1: 재시작 뒤 첫 사용이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
+    await ensureMockOAuthReady(config, owner.db);
     const deps = oauthDeps(config);
     const account = await completeOAuthCallback(owner.db, {
       ownerId: owner.ownerId,

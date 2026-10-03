@@ -4,9 +4,9 @@
  * dev 서버가 같은 PGlite 디렉터리를 열고 있으면 먼저 종료한다(한 디렉터리 한 프로세스).
  * 모의 어댑터는 @cs/providers 에서 가져온다(apps/worker/package.json 에 workspace 의존성으로 선언 — CLI 진입점만 쓰고, runWorkerTick 은 레지스트리를 주입받는다).
  */
-import { checkCredential, DbLockedError, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
-import { loadConfig, oauthRedirectUri, requireSecretKeyring } from '@cs/domain';
-import { createMockAdapterRegistry, createStorage, resolveOAuthProvider } from '@cs/providers';
+import { checkCredential, DbLockedError, loadMockCredentialsForRehydration, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
+import { loadConfig, oauthRedirectUri, readSecretKeyring, requireSecretKeyring } from '@cs/domain';
+import { createMockAdapterRegistry, createStorage, ensureMockOAuthRehydrated, resolveOAuthProvider } from '@cs/providers';
 import { assertWorkerModeSupported, runWorkerTick, WorkerModeError } from './index';
 
 function parseLoop(argv: readonly string[]): number | null {
@@ -63,6 +63,12 @@ process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 try {
   do {
+    // M4-DEV1: 이 프로세스의 첫 tick 이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, OAUTH_MODE=mock·키 있음만).
+    // 토큰은 모의 공급자 메모리로만 — 출력은 tick JSON 그대로(토큰·개수 없음).
+    const ring = readSecretKeyring(process.env);
+    if (ring.ok) {
+      await ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(handle.db, { keyring: ring.keyring }) });
+    }
     const tick = await runWorkerTick({ config, db: handle.db, channelAdapters, workerId, maxJobs: 20, jobCredentials, media });
     console.log(JSON.stringify(tick));
     if (loopMs === null || stopping) break;

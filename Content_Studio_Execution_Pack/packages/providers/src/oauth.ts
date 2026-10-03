@@ -6,6 +6,8 @@
  *   → access token(60일, Threads 장기 토큰처럼 refresh token 없음) → refresh(만료 전, 같은 토큰으로) → revoke.
  *   토큰은 'mockthr_' 로 시작하는 난수이며 실제 Threads 에서 쓸 수 없다. 공급자 상태(code·토큰)는 프로세스 메모리(globalThis)에만 있어
  *   서버를 다시 시작하면 모의 토큰은 "알 수 없음"(invalid_token)이 된다 — 그 경우 화면은 다시 연결을 안내한다.
+ *   M4-DEV1: 단, 모의 모드(OAUTH_MODE=mock)에서는 프로세스가 처음 연결 경로를 쓸 때 DB 의 쓸 수 있는 모의 연결 정보로 이 메모리를 한 번 다시 채운다
+ *   (ensureMockOAuthRehydrated) — 재시작 뒤에도 모의 연결이 유지된다. 채널 시뮬레이터의 원격 기록은 다시 채우지 않는다(재시작 → UNKNOWN 유지).
  * - resolveOAuthProvider: 계정 kind 로 공급자를 고른다. 모의 계정 + threads → 모의 공급자. 실제(live) 계정은 liveOAuthReadiness 가
  *   항상 거부한다(T13 에는 live 어댑터가 없다 — LiveOAuthNotConfiguredError, 외부 호출 0).
  */
@@ -69,10 +71,44 @@ export class MockOAuthStore {
   readonly tokens = new Map<string, MockToken>();
   /** 시험용: 다음 교환·갱신을 실패시키는 코드 */
   failNext: { op: 'exchange' | 'refresh' | 'revoke' | 'account'; code: 'provider_error' | 'invalid_grant' } | null = null;
+  /** M4-DEV1: 이 프로세스에서 DB 로부터 다시 채우기를 시작(또는 마쳤)는가 — 프로세스당 한 번(ensureMockOAuthRehydrated). */
+  rehydration: Promise<MockRehydrateOutcome> | null = null;
+  /** 재시작 흉내: code·토큰·실패 주입·다시 채우기 표식을 모두 잊는다. */
   reset(): void {
     this.codes.clear();
     this.tokens.clear();
     this.failNext = null;
+    this.rehydration = null;
+  }
+
+  /**
+   * M4-DEV1: DB 에 봉인돼 있던 모의 토큰을 "공급자가 발급해 둔 유효 토큰"으로 다시 등록한다(재시작 전 공급자 상태 복원).
+   * 이미 아는 토큰(같은 프로세스에서 발급·철회됨)은 건드리지 않는다(멱등 — 철회 상태를 되살리지 않음). 모의 공급자 ID·토큰 접두가 맞지 않으면 등록하지 않는다.
+   * 반환: 등록했으면 true. 토큰 값은 SHA-256 키로만 남는다(원문 보관·기록 없음).
+   */
+  registerRehydrated(e: MockRehydrateEntry): boolean {
+    const spec = REHYDRATE_SPEC[e.provider as MockOAuthProviderId];
+    if (!spec) return false;
+    if (!e.accessToken.startsWith(spec.access) || !Number.isFinite(e.expiresAt.getTime())) return false;
+    if (spec.refresh !== null && (!e.refreshToken || !e.refreshToken.startsWith(spec.refresh))) return false;
+    if (spec.refresh === null && e.refreshToken !== null) return false;
+    const accessKey = h(e.accessToken);
+    const refreshKey = e.refreshToken ? h(e.refreshToken) : null;
+    if (this.tokens.has(accessKey) || (refreshKey && this.tokens.has(refreshKey))) return false;
+    const user = e.externalAccountId.slice(0, 200);
+    if (!user) return false;
+    const scopes = [...e.scopes];
+    const provider = e.provider as MockOAuthProviderId;
+    if (provider === 'mock_google') {
+      // Google 형: access(짧음)·refresh(연결 정보 expires_at)를 같은 동의(grant) 묶음으로 — 갱신·철회가 묶음 전체를 무효로 하도록.
+      const accessExp = e.accessExpiresAt && Number.isFinite(e.accessExpiresAt.getTime()) ? e.accessExpiresAt.getTime() : 0;
+      const base = { user, displayName: spec.displayName, revoked: false, provider, grant: randomBytes(12).toString('base64url') };
+      this.tokens.set(accessKey, { ...base, scopes: [...scopes], expiresAt: accessExp, kind: 'access' });
+      this.tokens.set(refreshKey!, { ...base, scopes: [...scopes], expiresAt: e.expiresAt.getTime(), kind: 'refresh' });
+      return true;
+    }
+    this.tokens.set(accessKey, { user, displayName: spec.displayName, scopes, expiresAt: e.expiresAt.getTime(), revoked: false, provider, kind: 'access' });
+    return true;
   }
 }
 
@@ -84,6 +120,82 @@ const globalForOAuth = globalThis as typeof globalThis & { __contentStudioMockOA
 export function mockOAuthStore(): MockOAuthStore {
   if (!globalForOAuth.__contentStudioMockOAuth) globalForOAuth.__contentStudioMockOAuth = new MockOAuthStore();
   return globalForOAuth.__contentStudioMockOAuth;
+}
+
+// ---- M4-DEV1: 개발 서버 재시작 뒤 모의 연결 유지(DB → 모의 공급자 메모리 다시 채우기) ----
+
+export type MockOAuthProviderId = 'mock_threads' | 'mock_google' | 'mock_instagram';
+/** 모의 공급자 ID(oauth_credentials.provider 의 모의 값과 같다). 이 목록 밖(실제 공급자)은 다시 채우지 않는다. */
+export const MOCK_OAUTH_PROVIDER_IDS: readonly MockOAuthProviderId[] = ['mock_threads', 'mock_google', 'mock_instagram'];
+
+const REHYDRATE_SPEC: Record<MockOAuthProviderId, { access: string; refresh: string | null; displayName: string }> = {
+  mock_threads: { access: 'mockthr_at_', refresh: null, displayName: 'MOCK Threads 사용자' },
+  mock_google: { access: 'mockyt_at_', refresh: 'mockyt_rt_', displayName: 'MOCK YouTube 채널' },
+  mock_instagram: { access: 'mockig_at_', refresh: null, displayName: 'MOCK Instagram 비즈니스 계정' },
+};
+
+/** DB 의 쓸 수 있는 모의 연결 정보 하나(봉인을 연 값 — 서버 메모리 안에서만, 기록·응답 없음). */
+export interface MockRehydrateEntry {
+  provider: string;
+  externalAccountId: string;
+  accessToken: string;
+  refreshToken: string | null;
+  /** oauth_credentials.expires_at — Threads·Instagram 형은 access 만료, Google 형은 refresh 만료 */
+  expiresAt: Date;
+  /** Google 형 access 만료(봉인 평문의 access_expires_at). 없으면 이미 만료로 등록(보내기 전 갱신 경로가 refresh 로 새로 받는다). */
+  accessExpiresAt: Date | null;
+  scopes: readonly string[];
+}
+
+/** 다시 채우기 결과(개수만 — 토큰·계정 값 없음). */
+export type MockRehydrateOutcome =
+  | { status: 'skipped_live_mode' }
+  | { status: 'failed' }
+  | { status: 'done'; registered: number; alreadyKnown: number; skipped: number };
+
+/**
+ * M4-DEV1: 프로세스에서 처음 모의 OAuth·작업 처리기 연결 정보 경로를 쓸 때 한 번, DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다.
+ * - OAUTH_MODE 가 mock 이 아니면 아무것도 하지 않는다(표식도 남기지 않음). load 는 모의 공급자 행만 돌려줘야 하고, 여기서도 모의 ID·접두를 다시 확인한다.
+ * - 프로세스당 한 번(store.rehydration). 두 번 불러도 같은 결과(멱등). load 가 실패하면 표식을 지워 다음 호출이 다시 시도한다.
+ * - 채널 시뮬레이터의 원격 기록(게시물·영상·컨테이너)은 다시 만들지 않는다 — 재시작 뒤 조회는 여전히 UNKNOWN 이다.
+ */
+export function ensureMockOAuthRehydrated(input: {
+  oauthMode: string;
+  load: () => Promise<{ entries: readonly MockRehydrateEntry[]; skipped: number }>;
+  store?: MockOAuthStore;
+}): Promise<MockRehydrateOutcome> {
+  if (input.oauthMode !== 'mock') return Promise.resolve({ status: 'skipped_live_mode' });
+  const store = input.store ?? mockOAuthStore();
+  if (store.rehydration) return store.rehydration;
+  let run: Promise<MockRehydrateOutcome> | null = null;
+  run = (async (): Promise<MockRehydrateOutcome> => {
+    await Promise.resolve(); // store.rehydration 에 run 이 들어간 뒤 시작(동시 호출은 같은 Promise 를 받는다)
+    try {
+      const { entries, skipped } = await input.load();
+      let registered = 0;
+      let alreadyKnown = 0;
+      let invalid = 0;
+      for (const e of entries) {
+        if (!MOCK_OAUTH_PROVIDER_IDS.includes(e.provider as MockOAuthProviderId)) {
+          invalid++;
+          continue;
+        }
+        if (store.registerRehydrated(e)) registered++;
+        else alreadyKnown++;
+      }
+      return { status: 'done', registered, alreadyKnown, skipped: skipped + invalid };
+    } catch {
+      if (store.rehydration === run) store.rehydration = null;
+      return { status: 'failed' };
+    }
+  })();
+  store.rehydration = run;
+  return run;
+}
+
+/** 시험용: 다시 채우기 표식만 지운다(다음 ensureMockOAuthRehydrated 가 다시 읽는다). 토큰은 그대로. */
+export function resetMockOAuthRehydration(store: MockOAuthStore = mockOAuthStore()): void {
+  store.rehydration = null;
 }
 
 export interface MockAuthorizeParams {

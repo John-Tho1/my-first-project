@@ -2,7 +2,7 @@
 import { refreshExpiringCredentials, type Db } from '@cs/db';
 import { readSecretKeyring, WEB_TICK_UPLOAD_SLICE, type AppConfig } from '@cs/domain';
 import { runWorkerTick, type WorkerTick } from '@cs/worker';
-import { jobCredentials, oauthDeps } from './oauth';
+import { ensureMockOAuthReady, jobCredentials, oauthDeps } from './oauth';
 import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
 
 /**
@@ -13,6 +13,8 @@ import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
  */
 export async function runInlineWorker(config: AppConfig, db: Db): Promise<WorkerTick | null> {
   if (config.WORKER_MODE !== 'inline') return null;
+  // M4-DEV1: 만료 임박 갱신·작업 처리 전에(재시작 뒤 첫 tick 이면) DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
+  await ensureMockOAuthReady(config, db);
   // T13: 마스터 키가 있을 때만 만료가 가까운 연결 정보를 갱신한다(모의 공급자 — 외부 호출 없음). 키가 없으면 건너뛴다(앱은 그대로).
   const deps = oauthDeps(config);
   const credentialRefresh = readSecretKeyring(process.env).ok

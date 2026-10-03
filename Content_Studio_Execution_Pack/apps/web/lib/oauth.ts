@@ -2,7 +2,7 @@
  * T13(결정 D24) 서버 전용: 계정 연결(OAuth) 의존성 — 공급자 선택·키 묶음·redirect URI. 비밀 값은 process.env 에서만 읽고 돌려주지 않는다.
  * 기본·개발용 마스터 키는 없다: SECRETS_MASTER_KEY 가 없으면 연결 관련 동작만 503(secrets_not_configured), 나머지 앱은 그대로.
  */
-import { checkCredential, refreshCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
+import { checkCredential, loadMockCredentialsForRehydration, refreshCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
 import {
   AppError,
   envPresent,
@@ -13,7 +13,14 @@ import {
   secretsReadiness,
   type AppConfig,
 } from '@cs/domain';
-import { MockGoogleOAuthProvider, MockInstagramOAuthProvider, MockThreadsOAuthProvider, resolveOAuthProvider } from '@cs/providers';
+import {
+  ensureMockOAuthRehydrated,
+  MockGoogleOAuthProvider,
+  MockInstagramOAuthProvider,
+  MockThreadsOAuthProvider,
+  resolveOAuthProvider,
+  type MockRehydrateOutcome,
+} from '@cs/providers';
 import { errorResponse, seeOther } from './api';
 
 export interface OAuthDeps {
@@ -29,6 +36,22 @@ export function oauthDeps(config: AppConfig, env: Record<string, string | undefi
     providerFor: (account) => resolveOAuthProvider(account, config, env, redirectUri),
     keyring: () => requireSecretKeyring(env),
   };
+}
+
+/**
+ * M4-DEV1: 이 프로세스에서 처음 모의 OAuth·작업 처리기 연결 정보 경로를 쓸 때 한 번, DB 의 쓸 수 있는 모의 연결 정보로 모의 공급자 메모리를 다시 채운다
+ * (개발 서버를 다시 시작해도 모의 연결이 끊기지 않게). OAUTH_MODE=mock 이고 마스터 키가 있을 때만 — 아니면 아무것도 하지 않는다(표식 없음).
+ * 토큰은 모의 공급자 메모리(SHA-256 키)로만 가고 로그·감사·응답에 넣지 않는다. 채널 시뮬레이터 원격 기록은 다시 만들지 않는다(재시작 → UNKNOWN 유지).
+ */
+export async function ensureMockOAuthReady(
+  config: Pick<AppConfig, 'OAUTH_MODE'>,
+  db: Db,
+  env: Record<string, string | undefined> = process.env,
+): Promise<MockRehydrateOutcome | null> {
+  if (config.OAUTH_MODE !== 'mock') return { status: 'skipped_live_mode' };
+  const ring = readSecretKeyring(env);
+  if (!ring.ok) return null;
+  return ensureMockOAuthRehydrated({ oauthMode: config.OAUTH_MODE, load: () => loadMockCredentialsForRehydration(db, { keyring: ring.keyring }) });
 }
 
 /**

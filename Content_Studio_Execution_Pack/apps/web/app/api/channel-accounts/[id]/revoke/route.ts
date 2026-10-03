@@ -1,7 +1,7 @@
 import { revokeCredential } from '@cs/db';
 import { assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
-import { accountFormFailure, oauthDeps } from '../../../../../lib/oauth';
+import { accountFormFailure, ensureMockOAuthReady, oauthDeps } from '../../../../../lib/oauth';
 import { revokeRedirectPath } from '../../../../../lib/revoke-view';
 import { getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
@@ -23,6 +23,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const config = getConfig();
     assertSameOrigin(request, config);
     const owner = await requireOwner(request);
+    // M4-DEV1: 재시작 뒤 첫 사용이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
+    await ensureMockOAuthReady(config, owner.db);
     const deps = oauthDeps(config);
     const r = await revokeCredential(owner.db, { ownerId: owner.ownerId, accountId: id, providerFor: deps.providerFor, keyring: deps.keyring });
     // M4UI FIX1: 끝나지 않은 해제(incomplete)·다른 연결에 밀린 해제(superseded)는 "해제했습니다"로 보내지 않는다(코드는 허용 목록만)

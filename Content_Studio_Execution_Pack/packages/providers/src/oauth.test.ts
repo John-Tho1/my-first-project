@@ -1,7 +1,17 @@
 /** T13(D24): 모의 Threads OAuth 공급자(네트워크 없음)·공급자 선택(live 는 항상 거부). */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { codeChallengeS256, loadConfig, LiveOAuthNotConfiguredError, newCodeVerifier, newOAuthState, OAuthNotSupportedError, OAuthProviderError } from '@cs/domain';
-import { MOCK_CODE_TTL_MS, MOCK_THREADS_CLIENT_ID, MockOAuthStore, MockThreadsOAuthProvider, resolveOAuthProvider } from './oauth';
+import {
+  ensureMockOAuthRehydrated,
+  MOCK_CODE_TTL_MS,
+  MOCK_THREADS_CLIENT_ID,
+  MockGoogleOAuthProvider,
+  MockOAuthStore,
+  MockThreadsOAuthProvider,
+  resetMockOAuthRehydration,
+  resolveOAuthProvider,
+  type MockRehydrateEntry,
+} from './oauth';
 
 const REDIRECT = 'http://localhost:3000/api/oauth/callback';
 const NOW = new Date('2026-10-02T12:00:00Z');
@@ -150,5 +160,88 @@ describe('resolveOAuthProvider', () => {
       expect((e as Error).message).not.toContain('placeholder-secret-value');
     }
     expect(() => resolveOAuthProvider({ kind: 'live', platform: 'threads' }, config, {}, REDIRECT)).toThrow(LiveOAuthNotConfiguredError);
+  });
+});
+
+describe('M4-DEV1: 재시작 뒤 모의 공급자 메모리 다시 채우기', () => {
+  const later = new Date(NOW.getTime() + 30 * 86_400_000);
+  const thr = (over: Partial<MockRehydrateEntry> = {}): MockRehydrateEntry => ({
+    provider: 'mock_threads',
+    externalAccountId: USER,
+    accessToken: `mockthr_at_${'a'.repeat(43)}`,
+    refreshToken: null,
+    expiresAt: later,
+    accessExpiresAt: null,
+    scopes: ['threads_basic', 'threads_content_publish'],
+    ...over,
+  });
+
+  it('등록한 Threads 토큰은 공급자 규칙(계정 조회·갱신 = 이전 토큰 무효)대로 쓰인다', async () => {
+    const { store, p } = setup();
+    expect(store.registerRehydrated(thr())).toBe(true);
+    const tokens = { accessToken: thr().accessToken, refreshToken: null };
+    expect(await p.accountInfo({ accessToken: tokens.accessToken, now: NOW })).toMatchObject({ externalAccountId: USER });
+    const next = await p.refresh({ tokens, now: NOW });
+    expect(next.accessToken).not.toBe(tokens.accessToken);
+    expect(await errCode(p.accountInfo({ accessToken: tokens.accessToken, now: NOW }))).toBe('token_revoked');
+  });
+
+  it('Google 형: access·refresh 를 같은 동의 묶음으로 — refresh 로 갱신하면 둘 다 무효, 짧은 access 만료는 저장값 그대로', async () => {
+    const store = new MockOAuthStore();
+    const g = new MockGoogleOAuthProvider({ registeredRedirectUri: REDIRECT, appBaseUrl: 'http://localhost:3000', store });
+    const e: MockRehydrateEntry = {
+      provider: 'mock_google',
+      externalAccountId: 'mock:youtube:x',
+      accessToken: `mockyt_at_${'b'.repeat(43)}`,
+      refreshToken: `mockyt_rt_${'c'.repeat(43)}`,
+      expiresAt: later,
+      accessExpiresAt: new Date(NOW.getTime() - 1000),
+      scopes: ['youtube.upload(mock)'],
+    };
+    expect(store.registerRehydrated(e)).toBe(true);
+    expect(await errCode(g.accountInfo({ accessToken: e.accessToken, now: NOW }))).toBe('token_expired');
+    const next = await g.refresh({ tokens: { accessToken: e.accessToken, refreshToken: e.refreshToken }, now: NOW });
+    expect(await g.accountInfo({ accessToken: next.accessToken, now: NOW })).toMatchObject({ externalAccountId: 'mock:youtube:x' });
+    expect(await errCode(g.refresh({ tokens: { accessToken: e.accessToken, refreshToken: e.refreshToken }, now: NOW }))).toBe('invalid_grant');
+  });
+
+  it('모의 아닌 공급자·접두 불일치·refresh 모양 불일치·빈 계정·이미 아는 토큰은 등록하지 않는다(철회 상태 유지)', () => {
+    const store = new MockOAuthStore();
+    expect(store.registerRehydrated(thr({ provider: 'threads' }))).toBe(false);
+    expect(store.registerRehydrated(thr({ accessToken: `mockyt_at_${'a'.repeat(43)}` }))).toBe(false);
+    expect(store.registerRehydrated(thr({ refreshToken: `mockyt_rt_${'a'.repeat(43)}` }))).toBe(false);
+    expect(store.registerRehydrated(thr({ provider: 'mock_google', accessToken: `mockyt_at_${'d'.repeat(43)}`, refreshToken: null }))).toBe(false);
+    expect(store.registerRehydrated(thr({ externalAccountId: '' }))).toBe(false);
+    expect(store.tokens.size).toBe(0);
+    expect(store.registerRehydrated(thr())).toBe(true);
+    [...store.tokens.values()][0]!.revoked = true;
+    expect(store.registerRehydrated(thr())).toBe(false);
+    expect([...store.tokens.values()][0]!.revoked).toBe(true);
+  });
+
+  it('ensure: live 모드면 load 를 부르지 않고, 한 번만 읽고(동시 호출 공유), 실패하면 표식을 지워 다시 시도한다, reset 은 표식도 지운다', async () => {
+    const store = new MockOAuthStore();
+    const live = vi.fn(async () => ({ entries: [thr()], skipped: 0 }));
+    expect(await ensureMockOAuthRehydrated({ oauthMode: 'live', load: live, store })).toEqual({ status: 'skipped_live_mode' });
+    expect(live).not.toHaveBeenCalled();
+    expect(store.rehydration).toBeNull();
+
+    const failing = vi.fn(async (): Promise<{ entries: MockRehydrateEntry[]; skipped: number }> => {
+      throw new Error('db down');
+    });
+    expect(await ensureMockOAuthRehydrated({ oauthMode: 'mock', load: failing, store })).toEqual({ status: 'failed' });
+    expect(store.rehydration).toBeNull();
+
+    const load = vi.fn(async () => ({ entries: [thr(), { ...thr(), provider: 'threads' }], skipped: 2 }));
+    const [a, b] = await Promise.all([ensureMockOAuthRehydrated({ oauthMode: 'mock', load, store }), ensureMockOAuthRehydrated({ oauthMode: 'mock', load, store })]);
+    expect(a).toBe(b);
+    expect(a).toEqual({ status: 'done', registered: 1, alreadyKnown: 0, skipped: 3 });
+    expect(await ensureMockOAuthRehydrated({ oauthMode: 'mock', load, store })).toBe(a);
+    expect(load).toHaveBeenCalledTimes(1);
+    resetMockOAuthRehydration(store);
+    expect(await ensureMockOAuthRehydrated({ oauthMode: 'mock', load, store })).toEqual({ status: 'done', registered: 0, alreadyKnown: 1, skipped: 3 });
+    store.reset();
+    expect(store.rehydration).toBeNull();
+    expect(store.tokens.size).toBe(0);
   });
 });

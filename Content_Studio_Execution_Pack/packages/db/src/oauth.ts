@@ -730,6 +730,80 @@ export async function readAccessTokenForSend(
   }
 }
 
+/** M4-DEV1: 다시 채울 수 있는 모의 공급자 ID(실제 공급자 'threads' 는 절대 포함하지 않는다). */
+const REHYDRATABLE_MOCK_PROVIDERS = ['mock_threads', 'mock_google', 'mock_instagram'] as const;
+
+/** M4-DEV1: 모의 공급자 메모리 다시 채우기용 스냅샷 한 건(서버 메모리 안에서만 — 기록·감사·응답에 넣지 않는다). */
+export interface MockCredentialSnapshot {
+  provider: (typeof REHYDRATABLE_MOCK_PROVIDERS)[number];
+  externalAccountId: string;
+  accessToken: string;
+  refreshToken: string | null;
+  expiresAt: Date;
+  accessExpiresAt: Date | null;
+  scopes: string[];
+}
+
+/**
+ * M4-DEV1(개발 품질): 개발 서버 재시작 뒤 모의 연결이 끊기지 않도록, 모의 공급자 메모리를 다시 채울 연결 정보를 읽는다(**읽기 전용**).
+ * 대상: 해제되지 않은(revoked_at null·status active) 모의 공급자 행(is_mock·provider ∈ mock_*), 계정 kind = mock, 연결 상태가 쓸 수 있음
+ * (connected·expiring_soon — 정리 대기 표시는 판정에서 빼고 본다: 현재 토큰은 공급자에 실제로 있던 토큰이므로 등록하고, 정리 대기 토큰 자체
+ * (oauth_pending_tokens)는 읽지도 등록하지도 않는다. 정리 대기 계정의 실행 차단은 health 가 그대로 한다).
+ * 봉인을 열 수 없는 행은 건너뛴다 — 상태를 쓰지 않으므로 기존 오류·차단 처리(readForUse·readAccessTokenForSend 의 decrypt_<문제>)가 그대로다.
+ * 모든 owner 의 행을 읽는다(프로세스 하나의 모의 공급자 상태). 반환값은 개수와 토큰 — 호출자는 토큰을 모의 공급자 메모리에만 넘긴다.
+ */
+export async function loadMockCredentialsForRehydration(
+  db: DbOrTx,
+  input: { keyring: SecretKeyring; now?: Date },
+): Promise<{ entries: MockCredentialSnapshot[]; skipped: number }> {
+  const now = input.now ?? new Date();
+  const rows = await db
+    .select({ cred: oauthCredentials, account: channelAccounts })
+    .from(oauthCredentials)
+    .innerJoin(channelAccounts, and(eq(channelAccounts.id, oauthCredentials.channelAccountId), eq(channelAccounts.ownerId, oauthCredentials.ownerId)))
+    .where(
+      and(
+        eq(oauthCredentials.isMock, true),
+        inArray(oauthCredentials.provider, [...REHYDRATABLE_MOCK_PROVIDERS]),
+        eq(oauthCredentials.status, 'active'),
+        isNull(oauthCredentials.revokedAt),
+        isNotNull(oauthCredentials.encryptedToken),
+        eq(channelAccounts.kind, 'mock'),
+      ),
+    );
+  const entries: MockCredentialSnapshot[] = [];
+  let skipped = 0;
+  for (const { cred, account } of rows) {
+    const provider = REHYDRATABLE_MOCK_PROVIDERS.find((p) => p === cred.provider);
+    if (!provider || !cred.encryptedToken || cred.keyVersion === null || !cred.expiresAt) {
+      skipped++;
+      continue;
+    }
+    if (!healthOf(account, cred, null, now).usable) {
+      skipped++;
+      continue;
+    }
+    let tokens: StoredOAuthTokens;
+    try {
+      tokens = decodeTokens(openSecret(input.keyring, cred.encryptedToken, cred.keyVersion, tokenAad(cred.ownerId, account.id)));
+    } catch (e) {
+      if (!(e instanceof SecretDecryptError)) throw e;
+      skipped++;
+      continue;
+    }
+    entries.push({
+      provider,
+      externalAccountId: account.externalAccountId,
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      expiresAt: cred.expiresAt,
+      accessExpiresAt: tokens.accessExpiresAt ? new Date(tokens.accessExpiresAt) : null,
+      scopes: [...cred.scopes],
+    });
+  }
+  return { entries, skipped };
+}
+
 /** 공급자 오류 → 저장할 상태. 만료는 상태를 바꾸지 않는다(health 가 expired 로 판정). 철회·무효 토큰은 error. */
 function providerFailureStatus(code: string): 'active' | 'error' {
   return code === 'token_revoked' || code === 'invalid_token' || code === 'invalid_grant' ? 'error' : 'active';

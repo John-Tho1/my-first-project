@@ -115,3 +115,6 @@ CHANGES_REQUESTED
 - [P1] packages/db/src/oauth.ts:778 — cleanup_revoke 해소 후에도 현재 토큰의 검증 상태가 복구되지 않는다
 
 ## FIX2-M4DEV1 (63ad062, 재수화 round 2) — **PASS** → 모의 OAuth 재수화 종결
+
+## D30H (e76ff43, 공개 health 정리) — CHANGES_REQUESTED (P1 1)
+- [P1] packages/db/src/uploads.ts:129 — 디렉터리 읽기 실패를 삼켜 ops.uploads 가 null 대신 0 또는 불완전한 수치를 반환한다

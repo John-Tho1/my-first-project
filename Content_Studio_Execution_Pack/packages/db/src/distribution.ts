@@ -91,7 +91,7 @@ import {
   variants,
   variantVersions,
 } from './schema';
-import { instagramSpecProblemsForItems } from './media-spec';
+import { instagramSpecCheckForItems, instagramSpecProblemsForItems, instagramUncheckedInTx } from './media-spec';
 import { variantReviewBlockers } from './variants';
 import { getCurrentBrandProfile } from './writing';
 
@@ -690,7 +690,7 @@ export interface ApproveResult {
  */
 export async function approveItems(db: Db, ownerId: string, planId: string, input: ApproveInput, now: Date = new Date(), opts: { media?: MediaReader } = {}): Promise<ApproveResult> {
   if (!isUuid(planId)) throw new NotFoundError(PLAN_NOT_FOUND);
-  const specProblems = await instagramSpecProblemsForItems(db, ownerId, [...new Set(input.item_ids)], opts.media);
+  const { problems: specProblems, checked: specChecked } = await instagramSpecCheckForItems(db, ownerId, [...new Set(input.item_ids)], opts.media);
   const out = await db.transaction(async (tx) => {
     const plan = await getPlanRow(tx, ownerId, planId);
     if (!plan) throw new NotFoundError(PLAN_NOT_FOUND);
@@ -724,8 +724,10 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
     const active = await activeApprovalsFor(tx, ownerId, ids);
     if (active.size) throw new AppError('conflict', 'already_approved', '이미 승인한 항목이 있습니다', { item_ids: [...active.keys()] });
     const refused: Array<{ item_id: string; reasons: string[] }> = [];
+    // FIX-T16: 밖 검사 뒤 계정 연결·hash 가 바뀌어 지금은 Instagram 모의 연결인데 검사하지 않은 항목 → media_spec:unchecked(fail closed).
+    const unchecked = await instagramUncheckedInTx(tx, ownerId, items, specChecked);
     for (const item of items) {
-      const problems = [...new Set([...(await snapshotProblems(tx, ownerId, item, now)), ...(specProblems.get(item.id) ?? [])])];
+      const problems = [...new Set([...(await snapshotProblems(tx, ownerId, item, now)), ...(specProblems.get(item.id) ?? []), ...(unchecked.get(item.id) ?? [])])];
       if (problems.length) refused.push({ item_id: item.id, reasons: problems });
     }
     if (refused.length) {

@@ -242,14 +242,14 @@ describe('InstagramMockApi(시뮬레이터)', () => {
     expect(() => api.getContainer({ id: c.id, userId: USER, accessToken: TOKEN })).toThrow(/container_not_found/);
   });
 
-  it('오류 분류 표(docs/03): 401 auth, 403·400 permanent, 429 일시(Retry-After), 쓰기 5xx 부작용 불명 → 조회, 읽기 5xx·부작용 없음 → 재시도, 시간 초과 → 결과 불명', () => {
+  it('오류 분류 표(docs/03): 401 auth, 403·400 permanent, 429 일시(Retry-After), 쓰기 5xx → 조회(FIX-T16: 부작용 표시와 무관), 읽기 5xx → 재시도, 시간 초과 → 결과 불명', () => {
     const want: Record<InstagramErrorKind, string> = {
       auth_invalid_token: 'rejected/auth',
       permission_denied: 'rejected/permanent',
       invalid_parameter: 'rejected/permanent',
       not_found: 'ambiguous/transient_unknown_side_effect',
       rate_limited: 'rejected/transient_no_side_effect',
-      server_error: 'rejected/transient_no_side_effect',
+      server_error: 'ambiguous/transient_unknown_side_effect',
       timeout: 'ambiguous/transient_unknown_side_effect',
     };
     for (const k of INSTAGRAM_ERROR_KINDS) {
@@ -320,7 +320,7 @@ describe('InstagramMockChannelAdapter', () => {
     const s = setup(imgs);
     const r = await send(s.adapter, s.snap, ctxOf(s.steps, s.media));
     expect(r.status).toBe('accepted');
-    expect(s.steps.rows.map((x) => `${x.kind}:${x.post_index}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_container:3', 'ig_container:0', 'ig_publish:0']);
+    expect(s.steps.rows.map((x) => `${x.kind}:${x.post_index}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_container:3', 'ig_parent_request:0', 'ig_container:0', 'ig_publish:0']);
     const m = s.api.mediaOf(USER);
     expect(m).toHaveLength(1);
     expect(m[0]!.mediaType).toBe('CAROUSEL_ALBUM');
@@ -395,7 +395,7 @@ describe('InstagramMockChannelAdapter', () => {
     expect(await send(b.adapter, b.snap, ctxOf(b.steps, b.media, scen('instagram_permission_denied')))).toMatchObject({ status: 'rejected', retry_class: 'permanent', error_code: 'permission_denied' });
     const c = setup([jpeg(1080, 1080), jpeg(1080, 1080)]);
     expect(await send(c.adapter, c.snap, ctxOf(c.steps, c.media, scen('instagram_container_error')))).toMatchObject({ status: 'rejected', retry_class: 'permanent', error_code: 'container_error' });
-    expect(c.steps.rows.find((x) => x.post_index === 0)?.status).toBe('error');
+    expect(c.steps.rows.find((x) => x.kind === 'ig_container' && x.post_index === 0)?.status).toBe('error');
     const d = setup([jpeg(1080, 1080)]);
     const ctx = ctxOf(d.steps, d.media, scen('instagram_rate_limited'));
     expect(await send(d.adapter, d.snap, ctx)).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect', retry_after_sec: 5 });
@@ -421,6 +421,260 @@ describe('InstagramMockChannelAdapter', () => {
     expect(await send(s.adapter, s.snap, ctxOf(s.steps, s.media, { credential: { accessToken: async () => ({ ok: false, code: 'credential_expired' }) } }))).toMatchObject({ status: 'rejected', retry_class: 'auth', error_code: 'credential_expired' });
     expect(await send(s.adapter, s.snap, ctxOf(s.steps, s.media, { media: undefined }))).toMatchObject({ status: 'rejected', error_code: 'media_reader_unavailable' });
     expect(s.api.calls.createImageContainer).toBe(0);
+  });
+});
+
+describe('FIX-T16(Codex review-T16)', () => {
+  /** 실제 DB 창구(mediaPortFor)처럼 **메타데이터만** 비교하는 창구 — 바이트는 해시하지 않는다(memMedia 는 해시해서 차이를 가렸다). */
+  function metaOnlyMedia(images: Uint8Array[], snap: PublishSnapshot): MediaPort & { files: Map<string, Uint8Array>; reads: number } {
+    const files = new Map<string, Uint8Array>();
+    const ids = (snap.payload.assets as Array<{ id: string; checksum: string }>).map((a) => a);
+    for (const [i, b] of images.entries()) files.set(ids[i]!.id, b);
+    const port = {
+      files,
+      reads: 0,
+      open: async (a: { id: string; checksum: string; mime: string }) => {
+        const want = ids.find((x) => x.id === a.id);
+        if (!want || want.checksum !== a.checksum) return { ok: false as const, code: 'media_changed' };
+        const size = files.get(a.id)!.byteLength;
+        return {
+          ok: true as const,
+          file: {
+            bytes: size,
+            mime: a.mime,
+            checksum: a.checksum,
+            read: async (s: number, e: number) => {
+              port.reads++;
+              return files.get(a.id)!.slice(s, e);
+            },
+          },
+        };
+      },
+    };
+    return port;
+  }
+  /** 같은 길이·같은 규격의 다른 JPEG(바이트만 다름) */
+  const tamper = (b: Uint8Array) => {
+    const t = Uint8Array.from(b);
+    t[t.length - 10] = (t[t.length - 10]! + 1) % 250;
+    return t;
+  };
+
+  it('[P0] 단일 이미지: 저장소 바이트만 바뀜(메타데이터 checksum 그대로) → asset_checksum_mismatch:1 FAILED, 원격 호출·URL 발급 0', async () => {
+    const img = jpeg(1080, 1080);
+    const s = setup([img]);
+    const media = metaOnlyMedia([tamper(img)], s.snap);
+    const r = await send(s.adapter, s.snap, ctxOf(s.steps, media));
+    expect(r).toMatchObject({ status: 'rejected', retry_class: 'permanent', error_code: 'asset_checksum_mismatch:1' });
+    expect(Object.values(s.api.calls).reduce((x, y) => x + y, 0)).toBe(0);
+    expect(s.publicMedia.stats.issued).toBe(0);
+    expect(s.steps.rows).toHaveLength(0);
+  });
+
+  it('[P0] 캐러셀 3장 중 2번째만 바뀜 → asset_checksum_mismatch:2, 자식 컨테이너도 0(하나라도 다르면 아무것도 만들지 않는다)', async () => {
+    const imgs = [jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100), jpeg(1080, 566, 3200)];
+    const s = setup(imgs);
+    const media = metaOnlyMedia([imgs[0]!, tamper(imgs[1]!), imgs[2]!], s.snap);
+    const r = await send(s.adapter, s.snap, ctxOf(s.steps, media));
+    expect(r).toMatchObject({ status: 'rejected', retry_class: 'permanent', error_code: 'asset_checksum_mismatch:2' });
+    expect(s.api.calls.createImageContainer).toBe(0);
+    expect(s.api.containerIds(USER)).toHaveLength(0);
+    expect(s.publicMedia.stats.issued).toBe(0);
+  });
+
+  it('[P0] 확인 뒤 저장소가 바뀌어도 원격이 받는 바이트 = 확인한(승인) 바이트(공개 URL 창구에는 메모리 사본만)', async () => {
+    const img = jpeg(1080, 1080);
+    const s = setup([img]);
+    const media = metaOnlyMedia([img], s.snap);
+    const id = (s.snap.payload.assets as Array<{ id: string }>)[0]!.id;
+    const base = media.open;
+    // 확인(전체 읽기 — 규격 머리 읽기 다음 두 번째 읽기)이 끝난 직후 저장소 바이트를 바꾼다
+    media.open = async (a) => {
+      const o = await base(a);
+      if (!o.ok) return o;
+      const read = o.file.read;
+      return {
+        ok: true,
+        file: {
+          ...o.file,
+          read: async (st: number, e: number) => {
+            const out = await read(st, e);
+            if (media.reads >= 2) media.files.set(id, tamper(img));
+            return out;
+          },
+        },
+      };
+    };
+    const r = await send(s.adapter, s.snap, ctxOf(s.steps, media));
+    expect(r.status).toBe('accepted');
+    expect(media.files.get(id)).not.toEqual(img);
+    expect(s.api.mediaOf(USER)[0]!.imageSha256).toEqual([sha(img)]);
+  });
+
+  it('[P0] 장애 주입: applied + sideEffect none 은 거부, applied 5xx 는 오류에 sideEffect unknown', async () => {
+    const { api, publicMedia } = setup([]);
+    expect(() => api.injectFault({ op: 'publish', kind: 'server_error', applied: true, sideEffect: 'none' })).toThrow(/sideEffect none/);
+    const b = jpeg(1080, 1080);
+    const url = (
+      await publicMedia.issue({
+        file: { bytes: b.byteLength, mime: 'image/jpeg', checksum: sha(b), read: async (st, e) => b.slice(st, e) },
+        asset: { id: 'x', checksum: sha(b), mime: 'image/jpeg' },
+        now: new Date(),
+        ttlMs: 60_000,
+      })
+    ).url;
+    const c = await api.createImageContainer({ userId: USER, accessToken: TOKEN, imageUrl: url, caption: 'x' });
+    api.injectFault({ op: 'publish', kind: 'server_error', applied: true });
+    let err: unknown;
+    try {
+      api.publish({ userId: USER, creationId: c.id, accessToken: TOKEN });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InstagramMockApiError);
+    expect((err as InstagramMockApiError).sideEffect).toBe('unknown');
+    expect(api.findPublishedByContainer({ creationId: c.id, userId: USER, accessToken: TOKEN })).not.toBeNull();
+  });
+
+  it('[P0] 쓰기 5xx 는 부작용 표시와 무관하게 ambiguous(조회), 읽기 5xx 만 재시도', () => {
+    for (const op of ['createImageContainer', 'createCarouselContainer', 'publish'] as const) {
+      for (const sideEffect of [undefined, 'none', 'unknown'] as const) {
+        expect(classifyInstagramError(new InstagramMockApiError('server_error', { sideEffect }), op)).toMatchObject({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect' });
+      }
+    }
+    for (const op of ['getContainer', 'getMedia', 'findPublishedByContainer', 'findCarouselByChildren'] as const) {
+      expect(classifyInstagramError(new InstagramMockApiError('server_error'), op).retry_class).toBe('transient_no_side_effect');
+    }
+  });
+
+  it('[P0] 게시 5xx(원격은 게시함) → ambiguous → 조회 found, 게시 호출 1·미디어 1', async () => {
+    const s = setup([jpeg(1080, 1080)]);
+    s.api.injectFault({ op: 'publish', kind: 'server_error', applied: true });
+    const ctx = ctxOf(s.steps, s.media);
+    expect(await send(s.adapter, s.snap, ctx)).toMatchObject({ status: 'ambiguous', error_code: 'server_error_side_effect_unknown' });
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'found', result_kind: 'PUBLISHED' });
+    expect(s.api.calls.publish).toBe(1);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+    // 조회 뒤 다시 보내도(재개) 게시하지 않는다
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.publish).toBe(1);
+  });
+
+  it('[P0] 게시 5xx(적용 안 됨) → ambiguous → 조회 resumable → 같은 컨테이너로 게시(컨테이너 1·미디어 1)', async () => {
+    const s = setup([jpeg(1080, 1080)]);
+    s.api.injectFault({ op: 'publish', kind: 'server_error' });
+    const ctx = ctxOf(s.steps, s.media);
+    expect((await send(s.adapter, s.snap, ctx)).status).toBe('ambiguous');
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'resumable', error_code: 'container_not_published' });
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.containerIds(USER)).toHaveLength(1);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+  });
+
+  it('[P0] 컨테이너 생성 5xx(원격은 만듦, 기록 없음) → ambiguous → 조회 not_found → 새 컨테이너로 게시 1번, 기록 없는 컨테이너는 게시되지 않음', async () => {
+    const s = setup([jpeg(1080, 1080)]);
+    s.api.injectFault({ op: 'createImageContainer', kind: 'server_error', applied: true });
+    const ctx = ctxOf(s.steps, s.media);
+    expect(await send(s.adapter, s.snap, ctx)).toMatchObject({ status: 'ambiguous', error_code: 'server_error_side_effect_unknown' });
+    expect(s.steps.rows).toHaveLength(0);
+    const orphan = s.api.containerIds(USER);
+    expect(orphan).toHaveLength(1);
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'not_found' });
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.publish).toBe(1);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+    expect(s.api.mediaOf(USER)[0]!.containerId).not.toBe(orphan[0]);
+    expect(s.publicMedia.unrevokedCount()).toBe(0);
+  });
+
+  it('[P1] 캐러셀 부모 생성 응답 유실(원격은 만듦) → 요청 표식 → 조회가 자식으로 부모를 찾아 기록 → 같은 부모로 게시(부모 생성 1·게시 1)', async () => {
+    const imgs = [jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100)];
+    const s = setup(imgs);
+    s.api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true });
+    const ctx = ctxOf(s.steps, s.media);
+    expect(await send(s.adapter, s.snap, ctx)).toMatchObject({ status: 'ambiguous', error_code: 'timeout' });
+    expect(s.steps.rows.map((x) => `${x.kind}:${x.post_index}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_parent_request:0']);
+    expect(s.steps.rows.find((x) => x.kind === 'ig_parent_request')!.remote_id).toMatch(/^mockig_req_[0-9a-f-]{36}$/);
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'resumable', error_code: 'container_not_published' });
+    expect(s.steps.rows.find((x) => x.kind === 'ig_container' && x.post_index === 0)).toBeTruthy();
+    const r = await send(s.adapter, s.snap, { ...ctx, attempt: 2 });
+    expect(r.status).toBe('accepted');
+    expect(s.api.calls.createCarouselContainer).toBe(1);
+    expect(s.api.calls.publish).toBe(1);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+    expect(s.api.mediaOf(USER)[0]!.imageSha256).toEqual(imgs.map(sha));
+  });
+
+  it('[P1] 부모 응답 유실 뒤 조회 없이 바로 재시도해도 표식 → 찾기 → 두 번째 부모 없음(쓰인 자식 재사용 오류 없음)', async () => {
+    const s = setup([jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100)]);
+    s.api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true });
+    const ctx = ctxOf(s.steps, s.media);
+    expect((await send(s.adapter, s.snap, ctx)).status).toBe('ambiguous');
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.createCarouselContainer).toBe(1);
+    expect(s.api.containerIds(USER)).toHaveLength(3);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+  });
+
+  it('[P1] 부모 생성 시간 초과(원격 안 만듦) → 조회 찾기 null → resumable(부모부터) → 부모 1개·게시 1', async () => {
+    const s = setup([jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100)]);
+    s.api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: false });
+    const ctx = ctxOf(s.steps, s.media);
+    expect((await send(s.adapter, s.snap, ctx)).status).toBe('ambiguous');
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'resumable', error_code: 'carousel_parent_not_created' });
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.createCarouselContainer).toBe(2);
+    expect(s.api.containerIds(USER)).toHaveLength(3);
+    expect(s.steps.rows.filter((x) => x.kind === 'ig_parent_request')).toHaveLength(1);
+  });
+
+  it('[P1] 부모 생성 직후 단계 기록 실패(DB) → submit 예외 → 조회가 부모를 찾아 기록 → 게시 1', async () => {
+    const s = setup([jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100)]);
+    const real = s.steps.record;
+    let failOnce = true;
+    s.steps.record = async (st) => {
+      if (failOnce && st.kind === 'ig_container' && st.post_index === 0) {
+        failOnce = false;
+        throw new Error('db down');
+      }
+      return real(st);
+    };
+    const ctx = ctxOf(s.steps, s.media);
+    await expect(send(s.adapter, s.snap, ctx)).rejects.toThrow(/db down/);
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'resumable', error_code: 'container_not_published' });
+    expect((await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.createCarouselContainer).toBe(1);
+    expect(s.api.mediaOf(USER)).toHaveLength(1);
+  });
+
+  it('[P1] 부모 응답 유실 뒤 원격이 기록을 잃음(재시작) → 조회 unknown(parent_lookup_…), 재시도도 새 부모를 만들지 않음', async () => {
+    const s = setup([jpeg(1080, 1080, 3000), jpeg(1080, 1350, 3100)]);
+    s.api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true });
+    const ctx = ctxOf(s.steps, s.media);
+    await send(s.adapter, s.snap, ctx);
+    s.api.reset();
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'unknown', error_code: 'parent_lookup_container_not_found' });
+    expect(await send(s.adapter, s.snap, { ...ctx, attempt: 2 })).toMatchObject({ status: 'ambiguous' });
+    expect(s.api.calls.createCarouselContainer).toBe(0);
+    expect(s.api.calls.publish).toBe(0);
+  });
+
+  it('[Q6] 공개 범위는 원격 응답 값(모의 계정 private → remote_visibility private, 고정 public 아님)', async () => {
+    const s = setup([jpeg(1080, 1080)]);
+    s.api.setAccountVisibility(USER, 'private');
+    const ctx = ctxOf(s.steps, s.media);
+    expect(await send(s.adapter, s.snap, ctx)).toMatchObject({ status: 'accepted', remote_visibility: 'private' });
+    expect(await s.adapter.reconcile(ref, { ...ctx, snapshot: s.snap })).toMatchObject({ status: 'found', remote_visibility: 'private' });
+  });
+
+  it('게시 뒤 파일이 바뀌어도 이미 게시된 작업의 재확인은 FAILED 로 덮지 않는다(게시 단계 먼저)', async () => {
+    const img = jpeg(1080, 1080);
+    const s = setup([img]);
+    const ctx = ctxOf(s.steps, s.media);
+    expect((await send(s.adapter, s.snap, ctx)).status).toBe('accepted');
+    const media = metaOnlyMedia([tamper(img)], s.snap);
+    expect((await send(s.adapter, s.snap, { ...ctx, media, attempt: 2 })).status).toBe('accepted');
+    expect(s.api.calls.publish).toBe(1);
   });
 });
 

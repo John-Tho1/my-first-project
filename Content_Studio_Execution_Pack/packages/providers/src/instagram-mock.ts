@@ -5,7 +5,9 @@
  * 세부 경로·필드 이름·한도는 **공식 재확인 전**(docs/03 "[공식자료·부분 확인]") — 모의 모양일 뿐 실제 API 계약이 아니다.
  * - createImageContainer(image_url, caption | is_carousel_item) → `mockig_ct_<uuid>` · createCarouselContainer(children, caption) → 부모 컨테이너
  *   · getContainer(IN_PROGRESS → FINISHED|ERROR, 만료 EXPIRED, 게시 뒤 PUBLISHED) · publish(creation_id) → `mockig_m_<uuid>`
- *   · getMedia → permalink `mock://instagram/p/<id>` · findPublishedByContainer.
+ *   · getMedia → permalink `mock://instagram/p/<id>`·visibility(모의 계정 공개 범위) · findPublishedByContainer
+ *   · findCarouselByChildren(자식 목록 → 그 자식으로 만든 부모 컨테이너 — FIX-T16 P1, **모의 가정**: 실제 API 에 같은 조회가 있는지 live 전 확인).
+ * - FIX-T16(P0): applied 장애(원격은 동작을 끝낸 뒤 응답 실패)는 오류의 부작용을 항상 unknown 으로 싣는다. applied + sideEffect 'none' 은 모순 → 주입 거부.
  * - image_url 은 공개 미디어 URL 창구(MockPublicMediaUrlProvider)가 발급한 `mock://public-media/…` 만 "가져올" 수 있다 — 같은 프로세스에서 저장소 창구로
  *   파일을 읽어 원격 규격(잠정 — JPEG·크기·비율·가로)을 다시 검사하고 400 invalid_image_spec 으로 거부할 수 있다. 받은 이미지는 sha256 만 남긴다.
  * - 사용자별 게시 예산(429 + retry-after), 오류 종류 401 auth_invalid_token · 403 permission_denied · 400 invalid_parameter · 404 not_found ·
@@ -15,6 +17,11 @@
  *
  * InstagramMockChannelAdapter(adapter id 'mock_instagram'): 선택 규칙은 @cs/domain adapterIdFor(모의 + instagram + credential_state ≠ none).
  * - 보내기 전(원격 호출 0): 승인 스냅샷의 첨부를 MediaPort 로 열어 잠정 규격(@cs/domain instagramSpecProblems)을 다시 검사 — 어긋나면 FAILED(재시도 없음).
+ *   FIX-T16(P0): 이미지마다 **실제로 읽은 바이트 전체의 sha256 = 승인 checksum** 인지 확인(하나라도 다르면 asset_checksum_mismatch:<order> FAILED,
+ *   원격 호출·URL 발급 0). 공개 URL 창구에는 그 확인한 바이트(메모리 사본)만 넘긴다 — 확인 뒤 저장소가 바뀌어도 원격이 받는 바이트는 승인한 것.
+ * - FIX-T16(P0): 쓰기(컨테이너·부모·게시)의 5xx·시간 초과는 모두 결과 불명(ambiguous → 조회). 다시 보내기는 조회가 "안 됨"을 확인한 뒤에만(A08).
+ * - FIX-T16(P1): 캐러셀 부모를 만들기 **전에** ig_parent_request 단계(요청 표식)를 남긴다. 부모 ID 를 잃으면(응답 유실·기록 실패) 조회·재시도가
+ *   기록한 자식으로 부모를 찾아 기록하고, 찾지 못한 게 확실할 때만 다시 만든다. 찾기 실패(원격 기록 없음 등) → unknown. 쓰인 자식으로 두 번째 부모를 만들지 않는다.
  * - 단일 이미지: [공개 URL 발급 → 컨테이너(post_index 0) → URL 철회 → 단계 기록 → FINISHED 까지 조회 → 게시 → 게시 단계 기록].
  *   캐러셀(이미지 2~10): 자식 컨테이너(post_index 1..n, is_carousel_item)마다 같은 순서 → 자식이 모두 FINISHED → 부모 컨테이너(post_index 0) → 게시.
  *   **원격 참조는 다음 원격 호출 전에 기록**(ctx.steps). 재개·재확인은 기록을 먼저 읽고, 있는 컨테이너는 다시 만들지 않으며 게시된 것은 다시 게시하지 않는다(A08).
@@ -70,7 +77,7 @@ export const INSTAGRAM_ERROR_HTTP: Record<InstagramErrorKind, number | null> = {
 };
 
 export type InstagramContainerStatus = 'IN_PROGRESS' | 'FINISHED' | 'ERROR' | 'EXPIRED' | 'PUBLISHED';
-export type InstagramOp = 'createImageContainer' | 'createCarouselContainer' | 'getContainer' | 'publish' | 'getMedia' | 'findPublishedByContainer';
+export type InstagramOp = 'createImageContainer' | 'createCarouselContainer' | 'getContainer' | 'publish' | 'getMedia' | 'findPublishedByContainer' | 'findCarouselByChildren';
 const WRITE_OPS: readonly InstagramOp[] = ['createImageContainer', 'createCarouselContainer', 'publish'];
 
 /** 시뮬레이터 오류 — 메시지는 종류·코드만(토큰·URL·본문 없음). */
@@ -129,6 +136,8 @@ export interface InstagramMockMedia {
   caption: string | null;
   imageSha256: string[];
   permalink: string;
+  /** 게시 때 계정 공개 범위(모의 — 기본 public) */
+  visibility: 'public' | 'private';
   timestamp: string;
 }
 
@@ -149,12 +158,22 @@ export class InstagramMockApi {
   private readonly containers = new Map<string, Container>();
   private readonly media = new Map<string, InstagramMockMedia>();
   private readonly budgets = new Map<string, { remaining: number; retryAfterSec: number }>();
+  /** 모의 계정 공개 범위(없으면 public — 모의 계정은 공개 계정으로 정의) */
+  private readonly accountVisibility = new Map<string, 'public' | 'private'>();
   private faults: InstagramFault[] = [];
   private tokenCheck: InstagramTokenCheck;
   readonly publicMedia: MockPublicMediaUrlProvider;
   /** 원격이 다시 검사하는 규격(시험이 바꿀 수 있다 — 앱 규격과 다른 원격을 흉내) */
   remoteSpec: InstagramMediaSpec;
-  readonly calls: Record<InstagramOp, number> = { createImageContainer: 0, createCarouselContainer: 0, getContainer: 0, publish: 0, getMedia: 0, findPublishedByContainer: 0 };
+  readonly calls: Record<InstagramOp, number> = {
+    createImageContainer: 0,
+    createCarouselContainer: 0,
+    getContainer: 0,
+    publish: 0,
+    getMedia: 0,
+    findPublishedByContainer: 0,
+    findCarouselByChildren: 0,
+  };
   /** 컨테이너별 게시 수(설계상 항상 ≤ 1) */
   readonly publishCount = new Map<string, number>();
 
@@ -176,7 +195,14 @@ export class InstagramMockApi {
     this.budgets.delete(userId);
   }
 
+  /** 시험: 모의 계정의 공개 범위(게시 결과에 실린다). */
+  setAccountVisibility(userId: string, visibility: 'public' | 'private'): void {
+    this.accountVisibility.set(userId, visibility);
+  }
+
+  /** applied(원격이 끝냄) + sideEffect 'none' 은 모순이라 거부한다(FIX-T16 P0 — 적용된 쓰기를 "부작용 없음"으로 꾸미지 않는다). */
   injectFault(f: InstagramFault): void {
+    if (f.applied && f.sideEffect === 'none') throw new Error('injectFault: applied 장애는 sideEffect none 일 수 없습니다');
     this.faults.push({ ...f });
   }
 
@@ -191,6 +217,7 @@ export class InstagramMockApi {
     this.containers.clear();
     this.media.clear();
     this.budgets.clear();
+    this.accountVisibility.clear();
     this.faults = [];
     this.publishCount.clear();
     this.remoteSpec = { ...INSTAGRAM_PROVISIONAL_MEDIA_SPEC };
@@ -215,14 +242,18 @@ export class InstagramMockApi {
   }
 
   private takeFault(op: InstagramOp, userId: string, given?: InstagramFault | null): InstagramFault | null {
-    if (given && given.op === op) return given;
+    if (given && given.op === op) {
+      if (given.applied && given.sideEffect === 'none') throw new Error('fault: applied 장애는 sideEffect none 일 수 없습니다');
+      return given;
+    }
     const i = this.faults.findIndex((f) => f.op === op && (!f.userId || f.userId === userId));
     if (i < 0) return null;
     return this.faults.splice(i, 1)[0]!;
   }
 
+  /** applied 장애는 원격이 동작을 끝냈으므로 부작용 unknown 을 싣는다(생략·none 이 "부작용 없음"으로 읽히지 않게). */
   private fail(f: InstagramFault): never {
-    throw new InstagramMockApiError(f.kind, { code: f.code, sideEffect: f.sideEffect, retryAfterSec: f.retryAfterSec });
+    throw new InstagramMockApiError(f.kind, { code: f.code, sideEffect: f.applied ? 'unknown' : f.sideEffect, retryAfterSec: f.retryAfterSec });
   }
 
   private run<T>(f: InstagramFault | null, action: () => T): T {
@@ -374,6 +405,7 @@ export class InstagramMockApi {
         caption: c.caption,
         imageSha256: shas,
         permalink: `mock://instagram/p/${id}`,
+        visibility: this.accountVisibility.get(req.userId) ?? 'public',
         timestamp: now.toISOString(),
       });
       c.publishedMediaId = id;
@@ -382,14 +414,39 @@ export class InstagramMockApi {
     });
   }
 
-  getMedia(req: { id: string; userId: string; accessToken: string; now?: Date }, opts: { fault?: InstagramFault | null } = {}): { id: string; permalink: string; mediaType: string } {
+  getMedia(
+    req: { id: string; userId: string; accessToken: string; now?: Date },
+    opts: { fault?: InstagramFault | null } = {},
+  ): { id: string; permalink: string; mediaType: string; visibility: 'public' | 'private' } {
     this.calls.getMedia++;
     this.auth(req.accessToken, req.userId, req.now ?? new Date());
     const f = this.takeFault('getMedia', req.userId, opts.fault);
     return this.run(f, () => {
       const m = this.media.get(req.id);
       if (!m || m.userId !== req.userId) throw new InstagramMockApiError('not_found', { code: 'media_not_found' });
-      return { id: m.id, permalink: m.permalink, mediaType: m.mediaType };
+      return { id: m.id, permalink: m.permalink, mediaType: m.mediaType, visibility: m.visibility };
+    });
+  }
+
+  /**
+   * FIX-T16(P1) 조회: 이 자식들(순서 그대로)로 만든 부모 컨테이너. 없으면 null(자식은 모두 알고 아직 부모에 쓰이지 않음 — 부모 미생성 확실).
+   * 자식을 하나라도 모르면 not_found 오류(재시작 등 — "없음"이라고 단정하지 않는다). **모의 가정** — 실제 API 의 같은 조회는 live 전 확인.
+   */
+  findCarouselByChildren(
+    req: { userId: string; accessToken: string; children: string[]; now?: Date },
+    opts: { fault?: InstagramFault | null } = {},
+  ): { id: string; status: InstagramContainerStatus } | null {
+    this.calls.findCarouselByChildren++;
+    this.auth(req.accessToken, req.userId, req.now ?? new Date());
+    const f = this.takeFault('findCarouselByChildren', req.userId, opts.fault);
+    return this.run(f, () => {
+      for (const id of req.children) this.own(id, req.userId);
+      const key = req.children.join(',');
+      const parent = [...this.containers.values()].find((c) => c.userId === req.userId && c.type === 'CAROUSEL' && c.children.join(',') === key);
+      if (parent) return { id: parent.id, status: parent.publishedMediaId ? ('PUBLISHED' as const) : parent.status };
+      // 자식이 쓰였는데 같은 목록의 부모가 없다(다른 부모에 쓰임) — 확인 불가
+      if (req.children.some((id) => this.containers.get(id)!.usedAsChild)) throw new InstagramMockApiError('not_found', { code: 'carousel_parent_unresolvable' });
+      return null;
     });
   }
 
@@ -497,6 +554,45 @@ export function instagramImagesOf(snapshot: Pick<PublishSnapshot, 'payload'>): S
 
 const publicationId = (mediaId: string) => `mock:instagram:${mediaId}`;
 
+/** FIX-T16(P1): 캐러셀 부모 생성 요청 표식(remote_steps ig_parent_request 의 remote_id — 원격 ID 아님, 이 앱이 만든 모의 상관 값). */
+export const INSTAGRAM_PARENT_REQUEST_PREFIX = 'mockig_req_';
+
+/**
+ * FIX-T16(P0): 승인 checksum 확인. 이미지마다 파일 전체를 읽어 sha256 을 계산하고 승인 스냅샷 checksum 과 비교한다(저장소 창구의 메타데이터가
+ * 아니라 **실제 바이트**). 같으면 확인한 바이트의 메모리 사본을 파일 창구로 돌려준다 — 공개 URL 창구(원격이 가져가는 곳)에는 이것만 넘긴다.
+ * 오류 코드: asset_unavailable:<order> · asset_read_failed:<order> · asset_checksum_mismatch:<order>.
+ */
+export async function verifiedImageFiles(
+  images: readonly SnapshotAssetRef[],
+  files: ReadonlyMap<number, MediaFile>,
+): Promise<{ ok: true; files: Map<number, MediaFile> } | { ok: false; error_code: string }> {
+  const out = new Map<number, MediaFile>();
+  for (const a of images) {
+    const f = files.get(a.order);
+    if (!f || !(f.bytes > 0)) return { ok: false, error_code: `asset_unavailable:${a.order}` };
+    let bytes: Uint8Array;
+    try {
+      bytes = await f.read(0, f.bytes);
+    } catch {
+      return { ok: false, error_code: `asset_read_failed:${a.order}` };
+    }
+    if (bytes.byteLength !== f.bytes) return { ok: false, error_code: `asset_read_failed:${a.order}` };
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (digest !== a.checksum) return { ok: false, error_code: `asset_checksum_mismatch:${a.order}` };
+    const copy = Uint8Array.from(bytes);
+    out.set(a.order, {
+      bytes: copy.byteLength,
+      mime: f.mime,
+      checksum: digest,
+      read: async (start: number, end: number) => {
+        if (!(start >= 0 && end > start && end <= copy.byteLength)) throw new RangeError('media read out of range');
+        return copy.slice(start, end);
+      },
+    });
+  }
+  return { ok: true, files: out };
+}
+
 /** 시뮬레이터 오류 → 어댑터 결과(docs/03 분류). 토큰·URL 은 넣지 않는다. */
 export function classifyInstagramError(e: unknown, op: InstagramOp): AdapterResult {
   if (!(e instanceof InstagramMockApiError)) return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'adapter_error' };
@@ -515,9 +611,10 @@ export function classifyInstagramError(e: unknown, op: InstagramOp): AdapterResu
     case 'rate_limited':
       return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'rate_limited', retry_after_sec: e.opts.retryAfterSec ?? 60 };
     case 'server_error':
-      // "모든 5xx 무조건 재시도 금지"(docs/03): 쓰기의 부작용 불명 → 조회, 부작용 없음이 확실할 때만 재시도. 읽기는 부작용 없음.
-      return e.sideEffect === 'unknown' && WRITE_OPS.includes(op)
-        ? { status: 'rejected', retry_class: 'transient_unknown_side_effect', error_code: 'server_error_side_effect_unknown' }
+      // "모든 5xx 무조건 재시도 금지"(docs/03). FIX-T16(P0): 쓰기(컨테이너·부모·게시)의 5xx 는 원격이 적용했는지 응답만으로 증명할 수 없다 —
+      // 부작용 표시(생략·none)와 무관하게 결과 불명 → 조회(A08). 조회가 "적용 안 됨"을 확인한 뒤에만 다시 보낸다. 읽기 5xx 는 부작용 없음 → 재시도.
+      return WRITE_OPS.includes(op)
+        ? { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'server_error_side_effect_unknown' }
         : { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'server_error' };
     case 'timeout':
     default:
@@ -728,20 +825,24 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
     const scenario = this.scenario(ctx);
     const caption = instagramCaptionOf(snap);
     const images = instagramImagesOf(snap);
-    // 보내기 직전 규격 재검사(원격 호출 0): 승인한 파일(VERIFIED·같은 checksum)을 열어 형식·크기·비율·가로·캡션. 어긋나면 FAILED(재시도 없음).
-    const inspected = await instagramMediaFacts(ctx.media, assetsOf(snap), this.spec);
-    const problems = [...inspected.problems, ...instagramSpecProblems({ caption, media: inspected.facts }, this.spec)];
-    if (problems.length) return res({ status: 'rejected', retry_class: 'permanent', error_code: `invalid_media_spec:${problems[0]!.replace(/^media_spec:/, '')}` });
-    const delay = ctx.mockScenario?.delay_ms ?? 0;
-    if (delay > 0) await sleep(delay, ctx.signal);
 
     let recorded = await steps.list();
     const find = (kind: RemoteStep['kind'], i: number) => recorded.find((s) => s.kind === kind && s.post_index === i) ?? null;
     const published = find('ig_publish', 0);
     if (published) {
-      // 이미 게시됨 — 다시 게시하지 않고 링크만 확인한다.
+      // 이미 게시됨 — 다시 게시하지 않고 링크만 확인한다(파일 검사보다 먼저: 게시 뒤 파일이 바뀌어도 원격 사실을 FAILED 로 덮지 않는다).
       return this.acceptedFor(published.remote_id, token, userId, ctx, requestId);
     }
+    // 보내기 직전 규격 재검사(원격 호출 0): 승인한 파일(VERIFIED·같은 checksum 메타데이터)을 열어 형식·크기·비율·가로·캡션. 어긋나면 FAILED(재시도 없음).
+    const inspected = await instagramMediaFacts(ctx.media, assetsOf(snap), this.spec);
+    const problems = [...inspected.problems, ...instagramSpecProblems({ caption, media: inspected.facts }, this.spec)];
+    if (problems.length) return res({ status: 'rejected', retry_class: 'permanent', error_code: `invalid_media_spec:${problems[0]!.replace(/^media_spec:/, '')}` });
+    // FIX-T16(P0): 실제로 읽은 바이트의 sha256 = 승인 checksum(이미지마다, 컨테이너를 하나도 만들기 전에). 원격에는 이 확인한 바이트만 간다.
+    const verified = await verifiedImageFiles(images, inspected.files);
+    if (!verified.ok) return res({ status: 'rejected', retry_class: 'permanent', error_code: verified.error_code });
+    const delay = ctx.mockScenario?.delay_ms ?? 0;
+    if (delay > 0) await sleep(delay, ctx.signal);
+
     const carousel = images.length > 1;
     let firstCreate = true;
     let target = find('ig_container', 0);
@@ -756,7 +857,7 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
           const asset = images[k - 1]!;
           let created: { id: string; status: InstagramContainerStatus };
           try {
-            created = await this.imageContainer(ctx, inspected.files.get(asset.order)!, asset, { userId, token, caption: null, isCarouselItem: true }, this.faultFor(scenario, 'createImageContainer', { first: firstCreate, target: false }, ctx.attempt));
+            created = await this.imageContainer(ctx, verified.files.get(asset.order)!, asset, { userId, token, caption: null, isCarouselItem: true }, this.faultFor(scenario, 'createImageContainer', { first: firstCreate, target: false }, ctx.attempt));
           } catch (e) {
             if (e instanceof LeaseLostError || (e instanceof Error && e.name === 'AbortError')) throw e;
             return res(classifyInstagramError(e, 'createImageContainer'));
@@ -772,7 +873,17 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
       }
       recorded = await steps.list();
       target = find('ig_container', 0);
+      const marker = find('ig_parent_request', 0);
+      if (!target && marker) {
+        // FIX-T16(P1): 이전 시도가 부모를 요청했다 — 응답(또는 기록)을 잃었을 수 있다. 기록한 자식으로 부모를 찾아 기록하고, 없음이 확실할 때만 새로 만든다.
+        // 찾기 실패(원격 기록 없음·자식이 다른 부모에 쓰임·읽기 오류)는 결과 불명 → 조회(쓰인 자식으로 두 번째 부모를 만들지 않는다).
+        const looked = this.lookupParent(token, userId, childIds, ctx);
+        if (!looked.ok) return res({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: looked.error_code });
+        if (looked.parent) target = await steps.record({ kind: 'ig_container', post_index: 0, remote_id: looked.parent.id, status: looked.parent.status === 'FINISHED' ? 'finished' : 'created' });
+      }
       if (!target) {
+        // 부모 생성 요청 표식을 **원격 호출 전에** 남긴다(같은 작업의 재시도는 같은 표식 — 원격 ID 는 바뀌지 않는다).
+        await steps.record({ kind: 'ig_parent_request', post_index: 0, remote_id: marker?.remote_id ?? `${INSTAGRAM_PARENT_REQUEST_PREFIX}${randomUUID()}`, status: 'created' });
         let created: { id: string; status: InstagramContainerStatus };
         try {
           await this.beforeWrite(ctx);
@@ -790,7 +901,7 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
       const asset = images[0]!;
       let created: { id: string; status: InstagramContainerStatus };
       try {
-        created = await this.imageContainer(ctx, inspected.files.get(asset.order)!, asset, { userId, token, caption, isCarouselItem: false }, this.faultFor(scenario, 'createImageContainer', { first: true, target: true }, ctx.attempt));
+        created = await this.imageContainer(ctx, verified.files.get(asset.order)!, asset, { userId, token, caption, isCarouselItem: false }, this.faultFor(scenario, 'createImageContainer', { first: true, target: true }, ctx.attempt));
       } catch (e) {
         if (e instanceof LeaseLostError || (e instanceof Error && e.name === 'AbortError')) throw e;
         return res(classifyInstagramError(e, 'createImageContainer'));
@@ -811,15 +922,30 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
     return this.acceptedFor(media.id, token, userId, ctx, requestId);
   }
 
-  private acceptedFor(mediaId: string, token: string, userId: string, ctx: AdapterContext, requestId: string): AdapterResult {
-    let permalink: string;
+  /** FIX-T16(P1): 기록한 자식(순서대로)으로 만든 부모 찾기(읽기 전용). parent null = 부모 없음 확실. */
+  private lookupParent(
+    token: string,
+    userId: string,
+    childIds: string[],
+    ctx: Pick<AdapterContext, 'now'>,
+  ): { ok: true; parent: { id: string; status: InstagramContainerStatus } | null } | { ok: false; error_code: string } {
     try {
-      permalink = this.api.getMedia({ id: mediaId, userId, accessToken: token, now: ctx.now }).permalink;
+      return { ok: true, parent: this.api.findCarouselByChildren({ userId, accessToken: token, children: childIds, now: ctx.now }) };
+    } catch (e) {
+      return { ok: false, error_code: `parent_lookup_${e instanceof InstagramMockApiError ? e.code : 'adapter_error'}` };
+    }
+  }
+
+  private acceptedFor(mediaId: string, token: string, userId: string, ctx: AdapterContext, requestId: string): AdapterResult {
+    let m: { permalink: string; visibility: 'public' | 'private' };
+    try {
+      m = this.api.getMedia({ id: mediaId, userId, accessToken: token, now: ctx.now });
     } catch {
       // 게시됐고 단계가 기록됐다 — 링크만 못 읽음. 조회가 링크와 함께 확인한다.
       return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'permalink_unavailable', provider_request_id: requestId };
     }
-    return { status: 'accepted', external_id: publicationId(mediaId), permalink, provider_request_id: requestId, remote_visibility: 'public', result_kind: 'PUBLISHED' };
+    // 공개 범위는 원격 응답 값 그대로(고정 public 이 아님 — Q6).
+    return { status: 'accepted', external_id: publicationId(mediaId), permalink: m.permalink, provider_request_id: requestId, remote_visibility: m.visibility, result_kind: 'PUBLISHED' };
   }
 
   /**
@@ -829,6 +955,8 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
    * - 게시할 컨테이너(post_index 0) 있음: PUBLISHED·FINISHED → 이 컨테이너로 게시된 미디어를 찾아 기록 → found / FINISHED·게시 없음 → resumable
    *   (같은 컨테이너로 게시) / IN_PROGRESS → processing / ERROR → failed(원격이 처리 거부 — 게시물 없음) / 만료·모름·읽기 실패 → unknown.
    * - 게시할 컨테이너 없음(캐러셀 자식만): 자식 상태 — 처리 중 → processing, 오류 → failed, 만료·모름 → unknown, 나머지 → resumable(부모부터).
+   *   FIX-T16(P1): 부모 생성 요청 표식(ig_parent_request)이 있으면 먼저 자식으로 부모를 찾는다 — 찾으면 기록하고 위 판정, 찾기 실패 → unknown,
+   *   없음 확실 → 자식 판정.
    */
   async reconcile(_reference: RemoteReference, ctx: AdapterContext): Promise<ReconcileResult> {
     this.calls.reconcile++;
@@ -850,7 +978,7 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
     const found = (mediaId: string): ReconcileResult => {
       try {
         const m = this.api.getMedia({ id: mediaId, userId, accessToken: token, now: ctx.now });
-        return { status: 'found', external_id: publicationId(mediaId), permalink: m.permalink, remote_visibility: 'public', result_kind: 'PUBLISHED', published_parts: 1 };
+        return { status: 'found', external_id: publicationId(mediaId), permalink: m.permalink, remote_visibility: m.visibility, result_kind: 'PUBLISHED', published_parts: 1 };
       } catch (e) {
         return { status: 'unknown', error_code: e instanceof InstagramMockApiError ? `media_${e.code}` : 'adapter_error' };
       }
@@ -864,7 +992,24 @@ export class InstagramMockChannelAdapter implements ChannelAdapter {
         return { status: 'unknown', error_code: e instanceof InstagramMockApiError ? `container_${e.code}` : 'adapter_error' };
       }
     };
-    const target = find('ig_container', 0);
+    let target = find('ig_container', 0);
+    const marker = find('ig_parent_request', 0);
+    if (!target && marker) {
+      // FIX-T16(P1): 부모 생성을 요청했는데 부모 ID 가 없다(응답 유실·기록 실패). 자식이 준비됐다는 것만으로 "부모 없음"을 확정하지 않는다 —
+      // 기록한 자식(전부, 순서대로)으로 부모를 찾아 기록한다. 찾기 실패 → unknown. 없음이 확실(null) → 아래 자식 판정(resumable 가능).
+      const kids = recorded.filter((s) => s.kind === 'ig_container' && s.post_index > 0).sort((a, b) => a.post_index - b.post_index);
+      if (kids.length !== instagramImagesOf(snap).length) return { status: 'unknown', published_parts: 0, error_code: 'carousel_children_incomplete' };
+      const looked = this.lookupParent(
+        token,
+        userId,
+        kids.map((k) => k.remote_id),
+        ctx,
+      );
+      if (!looked.ok) return { status: 'unknown', published_parts: 0, error_code: looked.error_code };
+      if (looked.parent) {
+        target = await ctx.steps.record({ kind: 'ig_container', post_index: 0, remote_id: looked.parent.id, status: looked.parent.status === 'FINISHED' ? 'finished' : 'created' });
+      }
+    }
     if (target) {
       const st = status(target);
       if (typeof st !== 'string') return st;

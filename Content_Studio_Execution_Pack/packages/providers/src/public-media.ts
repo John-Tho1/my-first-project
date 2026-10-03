@@ -64,6 +64,14 @@ export class MockPublicMediaUrlProvider implements PublicMediaUrlProvider {
     return n;
   }
 
+  /**
+   * FIX-T16(Codex 놓친 케이스): 철회하지 않은 발급 기록 수 — 수명(TTL)과 무관(만료됐어도 철회하지 않았으면 센다). 시험·훈련이 시계를 TTL 너머로
+   * 옮긴 뒤에도 "철회 누락"을 activeCount 처럼 놓치지 않게. 보낸 뒤 0 이어야 한다.
+   */
+  unrevokedCount(): number {
+    return this.entries.size;
+  }
+
   reset(): void {
     this.entries.clear();
     this.stats.issued = 0;

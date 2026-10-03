@@ -94,7 +94,8 @@ export function imageDimensions(head: Uint8Array): ImageDimensions | null {
       const len = u16be(b, i);
       if (len < 2) return null;
       if (JPEG_SOF.has(m)) {
-        if (i + 6 >= b.length) return null;
+        // FIX-T16: SOF 머리 길이는 최소 11(정밀도 1 + 높이 2 + 너비 2 + 성분 수 1 + 성분 1개 3 + 길이 2) — 짧거나 잘린 머리는 읽지 않는다.
+        if (len < 11 || i + len > b.length) return null;
         const height = u16be(b, i + 3);
         const width = u16be(b, i + 5);
         return width > 0 && height > 0 ? { format: 'jpeg', width, height } : null;
@@ -231,7 +232,12 @@ export async function instagramMediaFacts(
         dims = null;
       }
     }
-    facts.push({ order: a.order, role: a.role, mime: f.mime, bytes: f.bytes, width: dims?.width ?? null, height: dims?.height ?? null });
+    // FIX-T16(Codex 놓친 케이스): 메타데이터 MIME 과 실제 형식(헤더)이 다르면 문제(예: image/jpeg 로 기록된 PNG·WebP). 형식 허용 판단은 둘 중
+    // 하나라도 허용 밖이면 허용 밖(실제 형식이 허용 밖이면 실제 형식, 아니면 기록된 MIME 으로 판단).
+    const actual = dims ? `image/${dims.format}` : f.mime;
+    if (dims && actual !== f.mime) problems.push(`media_spec:mime_mismatch:${a.order}`);
+    const judged = spec.image_mimes.includes(actual) ? f.mime : actual;
+    facts.push({ order: a.order, role: a.role, mime: judged, bytes: f.bytes, width: dims?.width ?? null, height: dims?.height ?? null });
   }
   return { facts, problems, files };
 }
@@ -271,6 +277,8 @@ export function instagramSpecProblemLabel(code: string): string {
       return `이미지 외 첨부(썸네일·첨부 파일)는 Instagram 으로 보낼 수 없습니다${order}`;
     case 'mime_not_allowed':
       return `Instagram 이미지는 JPEG 만(잠정)${order}`;
+    case 'mime_mismatch':
+      return `파일 형식(헤더)이 기록된 MIME 과 다릅니다${order}`;
     case 'too_large':
       return `이미지가 ${(s.max_image_bytes / 1024 / 1024).toFixed(0)}MiB 를 넘습니다(잠정)${order}`;
     case 'dimensions_unreadable':

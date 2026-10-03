@@ -7,8 +7,9 @@
  * - 항목마다 컨테이너 단계는 순번(post_index)마다 1개·게시 단계 ≤ 1, 시뮬레이터의 컨테이너별 게시 수 ≤ 1(중복 게시 없음)
  * - 시뮬레이터의 그 계정 미디어 수 = 게시 단계 수(기록 없는 게시·재게시 없음), 받은 이미지 sha256(순서대로) = 승인한 첨부 checksum
  * - CONFIRMED 이면 publication 1개(MOCK·PUBLISHED/public·mock:instagram:·mock://instagram/p/), 게시 단계 전에는 publication 없음
- * - 공개 미디어 URL: 행이 끝나면 살아 있는 URL 0, DB(작업 이력·전송 의도·단계·감사)에 `mock://public-media/` 0
+ * - 공개 미디어 URL: 행이 끝나면 철회하지 않은 URL 0(TTL 과 무관 — FIX-T16), DB(작업 이력·전송 의도·단계·감사)에 `mock://public-media/` 0
  * - 승인 전 규격 위반(비율 밖)은 승인 거절(작업·의도 0), 행마다 기대한 최종 상태와 같다, fetch 0
+ * - FIX-T16: 저장소 바이트만 바뀌면 원격 호출 전 FAILED(asset_checksum_mismatch), 쓰기 5xx(적용됨)·부모 응답 유실은 조회로 확인해 게시 1번
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -252,7 +253,8 @@ async function record(
   }
   const jobState = jobs.at(-1)?.state ?? '(없음)';
   if (jobState === 'CONFIRMED' && pubs.length !== 1) v('CONFIRMED 인데 publication 없음');
-  if (c.publicMedia.activeCount(clockOf(c)()) !== 0) v(`살아 있는 공개 URL ${c.publicMedia.activeCount(clockOf(c)())}개(보낸 뒤 철회되지 않음)`);
+  // FIX-T16: TTL 과 무관하게 철회하지 않은 발급 기록을 센다(activeCount 는 시계를 20분 옮긴 뒤 10분 URL 의 철회 누락을 놓친다).
+  if (c.publicMedia.unrevokedCount() !== 0) v(`철회하지 않은 공개 URL ${c.publicMedia.unrevokedCount()}개(보낸 뒤 철회되지 않음)`);
   const mismatch: string[] = [];
   if (jobState !== expected.job_state) mismatch.push(`job ${jobState} ≠ ${expected.job_state}`);
   if (item.status !== expected.item_status) mismatch.push(`항목 ${item.status} ≠ ${expected.item_status}`);
@@ -390,6 +392,44 @@ export async function runInstagramDrill(): Promise<InstagramDrillResult> {
       instagram.rateLimit = { ...INSTAGRAM_PROVISIONAL_RATE_LIMIT };
     }
 
+    // FIX-T16(Codex review-T16): 저장소 바이트만 바뀜(실제 저장소 창구 — DB checksum 그대로) · 쓰기 5xx(원격은 적용) · 캐러셀 부모 응답 유실
+    {
+      const acc = await linkedAccount(c);
+      const run = await executed(c, acc.id, CAROUSEL);
+      if (!run.approved) out.violations.push(`바이트 변경: 승인 거절(${run.refusedReasons.join(',')})`);
+      else {
+        const asset = (await c.db.select().from(schema.assets).where(eq(schema.assets.checksum, run.checksums[1]!)))[0]!;
+        const bytes = Uint8Array.from((await c.storage.get(asset.key))!);
+        bytes[bytes.length - 10] = (bytes[bytes.length - 10]! + 1) % 250;
+        await c.storage.put(asset.key, bytes);
+        const before = api.calls.createImageContainer;
+        await drain(c, run.itemId);
+        const job = (await c.db.select().from(schema.jobs).where(eq(schema.jobs.itemId, run.itemId)))[0]!;
+        if (job.lastErrorCode !== 'asset_checksum_mismatch:2') out.violations.push(`바이트 변경: 오류 ${job.lastErrorCode} ≠ asset_checksum_mismatch:2`);
+        if (api.calls.createImageContainer !== before) out.violations.push('바이트 변경: 확인 전에 컨테이너를 만듦');
+        await record(c, out, '저장소 바이트 변경(캐러셀 2번째, 같은 길이) → checksum 불일치 FAILED', run, acc.external, { job_state: 'FAILED', item_status: 'FAILED', intents: 1, publication: false });
+      }
+    }
+    for (const f of [
+      { label: '게시 5xx(원격은 게시함) → 조회로 확인', dims: SQUARE, fault: { op: 'publish', kind: 'server_error', applied: true } as const, parents: 0, intents: 1 },
+      { label: '컨테이너 생성 5xx(원격은 만듦·기록 없음) → 조회 not_found → 새 컨테이너', dims: SQUARE, fault: { op: 'createImageContainer', kind: 'server_error', applied: true } as const, parents: 0, intents: 2 },
+      { label: '캐러셀 부모 생성 응답 유실 → 요청 표식으로 부모 찾아 게시', dims: CAROUSEL, fault: { op: 'createCarouselContainer', kind: 'timeout', applied: true } as const, parents: 1, intents: 2 },
+    ]) {
+      const acc = await linkedAccount(c);
+      const run = await executed(c, acc.id, f.dims);
+      if (!run.approved) {
+        out.violations.push(`${f.label}: 승인 거절(${run.refusedReasons.join(',')})`);
+        continue;
+      }
+      api.injectFault({ ...f.fault, userId: acc.external });
+      const parents = api.calls.createCarouselContainer;
+      const publishes = api.calls.publish;
+      await drain(c, run.itemId);
+      if (api.calls.publish - publishes !== 1) out.violations.push(`${f.label}: 게시 호출 ${api.calls.publish - publishes}회(1 이어야)`);
+      if (api.calls.createCarouselContainer - parents !== f.parents) out.violations.push(`${f.label}: 부모 생성 ${api.calls.createCarouselContainer - parents}회 ≠ ${f.parents}`);
+      await record(c, out, f.label, run, acc.external, CONF(f.intents));
+    }
+
     // 재시작: 게시 응답 유실 뒤 모의 Instagram 이 기록을 잃음(재시작) → 확인 불가 3회 → UNKNOWN, 다시 게시하지 않음
     {
       const acc = await linkedAccount(c);
@@ -420,7 +460,7 @@ export async function runInstagramDrill(): Promise<InstagramDrillResult> {
     }
     const leaks = await publicUrlLeaks(c);
     if (leaks > 0) out.violations.push(`DB 에 공개 미디어 URL ${leaks}건`);
-    if (publicMedia.activeCount(clockOf(c)()) !== 0) out.violations.push('끝난 뒤 살아 있는 공개 URL 이 있음');
+    if (publicMedia.unrevokedCount() !== 0) out.violations.push('끝난 뒤 철회하지 않은 공개 URL 이 있음');
     if (out.fetch_calls > 0) out.violations.push(`fetch 호출 ${out.fetch_calls}회`);
     return out;
   } finally {

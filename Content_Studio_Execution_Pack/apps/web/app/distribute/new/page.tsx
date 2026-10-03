@@ -21,6 +21,15 @@ export const dynamic = 'force-dynamic';
  * M4UI(G2, D27): 요청 결과(비공개 업로드·공개 게시·예약 공개 · MOCK 실행)와 예약 공개(모스크바 날짜·시각 → 서버가 UTC 로 저장).
  * 이 채널 초안의 계정들이 고를 수 있는 결과만 보인다(Threads·seed 모의 계정만이면 "MOCK 실행" 고정 문구). 판정은 서버(createPlan)가 한다.
  */
+/**
+ * FIX-T16(Codex 놓친 케이스): 공개 범위 기본값은 **처음 선택되는 계정**(이전 입력의 계정 또는 첫 계정) 기준 — Instagram 모의 연결 계정이면 public,
+ * 아니면 private. 다른 계정에 Instagram 모의 연결이 있다고 해서 seed 계정의 기본값을 public 으로 바꾸지 않는다. 계정을 바꾸면 서버 규칙이 다시 판정한다.
+ */
+function defaultVisibilityFor(a: { kind: string; platform: string; credentialState: string } | undefined): 'public' | 'private' {
+  if (!a) return 'private';
+  return adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram' ? 'public' : 'private';
+}
+
 function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; prev: PlanFormDefaults }) {
   if (sel.fixed) {
     return (
@@ -133,7 +142,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                   <select
                     id={`vis-${v.id}`}
                     name={`visibility_${v.id}`}
-                    defaultValue={prev.visibility[v.id] ?? (accs.some((a) => adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram') ? 'public' : 'private')}
+                    defaultValue={prev.visibility[v.id] ?? defaultVisibilityFor(accs.find((a) => a.id === prev.account[v.id]) ?? accs[0])}
                   >
                     {VISIBILITIES.map((x) => (
                       <option key={x} value={x}>

@@ -67,18 +67,67 @@ export async function instagramPayloadSpecProblems(db: DbOrTx, ownerId: string, 
  * 항목의 payload 는 불변 스냅샷이고, 계정이 그 사이 바뀌면 snapshotProblems(account_changed)가 따로 막는다.
  */
 export async function instagramSpecProblemsForItems(db: DbOrTx, ownerId: string, itemIds: readonly string[], reader: MediaReader | undefined): Promise<Map<string, string[]>> {
-  const out = new Map<string, string[]>();
+  return (await instagramSpecCheckForItems(db, ownerId, itemIds, reader)).problems;
+}
+
+/**
+ * FIX-T16(Codex Q5): 검사 결과 + **검사한 것**(`항목 ID:payload hash` — Instagram 모의 연결 계정으로 판단해 규격을 본 항목). 승인 트랜잭션은
+ * 이것으로 "검사 통과"와 "검사 대상에서 빠짐"을 구분한다(instagramUncheckedInTx).
+ */
+export async function instagramSpecCheckForItems(
+  db: DbOrTx,
+  ownerId: string,
+  itemIds: readonly string[],
+  reader: MediaReader | undefined,
+): Promise<{ problems: Map<string, string[]>; checked: Set<string> }> {
+  const problems = new Map<string, string[]>();
+  const checked = new Set<string>();
   const ids = itemIds.filter((id) => isUuid(id));
-  if (ids.length === 0) return out;
+  if (ids.length === 0) return { problems, checked };
   const rows = await db
-    .select({ id: distributionItems.id, payload: distributionItems.payloadJson, kind: channelAccounts.kind, platform: channelAccounts.platform, credentialState: channelAccounts.credentialState })
+    .select({
+      id: distributionItems.id,
+      payload: distributionItems.payloadJson,
+      payloadHash: distributionItems.payloadHash,
+      kind: channelAccounts.kind,
+      platform: channelAccounts.platform,
+      credentialState: channelAccounts.credentialState,
+    })
     .from(distributionItems)
     .innerJoin(channelAccounts, and(eq(channelAccounts.id, distributionItems.channelAccountId), eq(channelAccounts.ownerId, distributionItems.ownerId)))
     .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.id, [...ids])));
   for (const r of rows) {
     if (adapterIdFor({ kind: r.kind === 'mock' ? 'mock' : 'live', platform: r.platform, credential_state: r.credentialState }) !== 'mock_instagram') continue;
-    const problems = await instagramPayloadSpecProblems(db, ownerId, r.payload as unknown as CanonicalPayload, reader);
-    if (problems.length) out.set(r.id, problems);
+    const p = await instagramPayloadSpecProblems(db, ownerId, r.payload as unknown as CanonicalPayload, reader);
+    checked.add(`${r.id}:${r.payloadHash}`);
+    if (p.length) problems.set(r.id, p);
+  }
+  return { problems, checked };
+}
+
+/**
+ * FIX-T16(Codex 놓친 케이스): 승인 트랜잭션 안(계정 FOR SHARE 잠금 뒤)에서 부른다. 지금 계정 상태로 Instagram 모의 연결(mock_instagram)인데
+ * 트랜잭션 밖 검사가 그 항목·payload hash 를 보지 않았으면(그 사이 연결·hash 가 바뀜) `media_spec:unchecked`(fail closed).
+ */
+export async function instagramUncheckedInTx(
+  tx: DbOrTx,
+  ownerId: string,
+  items: ReadonlyArray<{ id: string; channelAccountId: string; payloadHash: string }>,
+  checked: ReadonlySet<string>,
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  const accIds = [...new Set(items.map((i) => i.channelAccountId))].filter((id) => isUuid(id));
+  if (accIds.length === 0) return out;
+  const accs = await tx
+    .select({ id: channelAccounts.id, kind: channelAccounts.kind, platform: channelAccounts.platform, credentialState: channelAccounts.credentialState })
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.ownerId, ownerId), inArray(channelAccounts.id, accIds)));
+  const byId = new Map(accs.map((a) => [a.id, a]));
+  for (const it of items) {
+    const a = byId.get(it.channelAccountId);
+    if (!a) continue;
+    if (adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) !== 'mock_instagram') continue;
+    if (!checked.has(`${it.id}:${it.payloadHash}`)) out.set(it.id, ['media_spec:unchecked']);
   }
   return out;
 }

@@ -594,6 +594,8 @@ describe('T16(D29 제안) Instagram 모의 화면 문구', () => {
     expect(instagramStepLine({ kind: 'ig_container', status: 'created', postIndex: 0, remoteId: 'mockig_ct_p' }, 3)).toBe('캐러셀(부모) 컨테이너 · 컨테이너 생성됨(처리 중) · mockig_ct_p');
     expect(instagramStepLine({ kind: 'ig_container', status: 'finished', postIndex: 0, remoteId: 'mockig_ct_s' }, 1)).toBe('이미지 컨테이너 · 컨테이너 준비됨 · mockig_ct_s');
     expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'mockig_m_1' }, 1)).toBe('게시 · 게시됨(MOCK) · mockig_m_1');
+    // FIX-T16(P1): 부모 생성 요청 표식은 원격 ID 가 아님을 밝힌다
+    expect(instagramStepLine({ kind: 'ig_parent_request', status: 'created', postIndex: 0, remoteId: 'mockig_req_1' }, 3)).toBe('캐러셀(부모) 생성 요청 · 요청 표식(원격 ID 아님 — 응답을 잃으면 자식으로 부모를 찾음) · mockig_req_1');
     expect(instagramProgressLine({ images: 3, finished: 2, created: 3, published: false })).toBe('컨테이너 2/4 준비 · 처리 중 1 · 게시 대기');
     expect(instagramProgressLine({ images: 1, finished: 1, created: 1, published: true })).toBe('게시됨(MOCK) · 컨테이너 1/1');
     expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'm' }, 1)).not.toContain('게시 완료');

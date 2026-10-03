@@ -445,11 +445,12 @@ export const INSTAGRAM_STEP_LABEL: Record<string, string> = {
   'ig_container:finished': '컨테이너 준비됨',
   'ig_container:error': '컨테이너 오류',
   'ig_publish:published': '게시됨(MOCK)',
+  'ig_parent_request:created': '요청 표식(원격 ID 아님 — 응답을 잃으면 자식으로 부모를 찾음)',
 };
 export function instagramStepLine(step: { kind: string; status: string; postIndex: number; remoteId: string }, images: number): string {
   const label = INSTAGRAM_STEP_LABEL[`${step.kind}:${step.status}`] ?? `${step.kind} ${step.status}`;
   const where =
-    step.kind === 'ig_publish' ? '게시' : step.postIndex === 0 ? (images > 1 ? '캐러셀(부모) 컨테이너' : '이미지 컨테이너') : `캐러셀 이미지 ${step.postIndex}/${images}`;
+    step.kind === 'ig_publish' ? '게시' : step.kind === 'ig_parent_request' ? '캐러셀(부모) 생성 요청' : step.postIndex === 0 ? (images > 1 ? '캐러셀(부모) 컨테이너' : '이미지 컨테이너') : `캐러셀 이미지 ${step.postIndex}/${images}`;
   return `${where} · ${label} · ${step.remoteId}`;
 }
 /** T16: 컨테이너 진행 요약 — `컨테이너 2/4 준비 · 게시 대기`. 캐러셀은 자식 n + 부모 1. */

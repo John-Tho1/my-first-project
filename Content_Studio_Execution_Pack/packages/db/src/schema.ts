@@ -1429,6 +1429,7 @@ export const mockScenarios = pgTable(
  * resume_count(같은 세션을 다음 시도가 이어 받은 횟수)도 앞으로만. 세션 URI 는 내보내기 묶음에서 가린다(bundle-tables selectExpr).
  * T16(D29 제안, migration 0036): Instagram 미디어 게시 단계 — ig_container(post_index 0 = 게시할 컨테이너, 1..n = 캐러셀 자식, created|finished|error)·
  * ig_publish(post_index 0, published). 트리거 규칙은 0032 그대로(종류에 매이지 않음). 공개 미디어 URL 은 이 표에 넣지 않는다.
+ * FIX-T16(P1, migration 0037): ig_parent_request(post_index 0, created) — 캐러셀 부모 생성 요청 표식(remote_id mockig_req_…, 원격 호출 전 기록).
  */
 export const remoteSteps = pgTable(
   'remote_steps',
@@ -1460,11 +1461,11 @@ export const remoteSteps = pgTable(
     unique('remote_steps_job_post_kind_uq').on(t.jobId, t.postIndex, t.kind),
     unique('remote_steps_remote_id_uq').on(t.remoteId),
     index('remote_steps_item_idx').on(t.itemId),
-    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish')`),
+    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request')`),
     check('remote_steps_status_chk', sql`${t.status} in ('created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed')`),
     check(
       'remote_steps_kind_status_chk',
-      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published')`,
+      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published') or (${t.kind} = 'ig_parent_request' and ${t.status} = 'created')`,
     ),
     check('remote_steps_bytes_chk', sql`(${t.receivedBytes} is null or ${t.receivedBytes} >= 0) and (${t.totalBytes} is null or ${t.totalBytes} > 0) and (${t.receivedBytes} is null or ${t.totalBytes} is null or ${t.receivedBytes} <= ${t.totalBytes})`),
     check('remote_steps_resume_count_chk', sql`${t.resumeCount} >= 0`),

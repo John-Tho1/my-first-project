@@ -147,4 +147,26 @@ describe('instagramSnapshotSpecProblems(파일 창구 — 앞부분만 읽음)',
     expect(await instagramSnapshotSpecProblems(port, { caption: '', assets: [asset('tall', 1)] })).toEqual(['media_spec:aspect_out_of_range:1']);
     expect(await instagramSnapshotSpecProblems(port, { caption: '', assets: [asset('missing', 3)] })).toEqual(['media_spec:media_unavailable:media_not_verified:3']);
   });
+  it('FIX-T16: image/jpeg 로 기록됐지만 실제 PNG·WebP 헤더 → mime_mismatch + (실제 형식 기준) mime_not_allowed', async () => {
+    files.set('png', png(1080, 1080));
+    expect(await instagramSnapshotSpecProblems(port, { caption: '', assets: [asset('png', 1)] })).toEqual(['media_spec:mime_mismatch:1', 'media_spec:mime_not_allowed:1']);
+    files.set('webp', webpVp8x(1080, 1080));
+    expect(await instagramSnapshotSpecProblems(port, { caption: '', assets: [asset('webp', 2)] })).toEqual(['media_spec:mime_mismatch:2', 'media_spec:mime_not_allowed:2']);
+    expect(instagramSpecProblemLabel('media_spec:mime_mismatch:2')).toContain('MIME');
+  });
+});
+
+describe('FIX-T16: JPEG SOF 머리 길이', () => {
+  it('SOF 길이가 11 미만이거나 머리가 잘렸으면 null(크기를 추측하지 않는다)', () => {
+    const ok = syntheticJpeg(1080, 1080);
+    expect(imageDimensions(ok)).toEqual({ format: 'jpeg', width: 1080, height: 1080 });
+    const short = Uint8Array.from(ok);
+    // SOF0 표식은 APP0(20바이트) 뒤 — 길이 두 바이트를 5 로
+    expect(short[20]).toBe(0xff);
+    expect(short[21]).toBe(0xc0);
+    short[22] = 0x00;
+    short[23] = 0x05;
+    expect(imageDimensions(short)).toBeNull();
+    expect(imageDimensions(ok.subarray(0, 30))).toBeNull();
+  });
 });

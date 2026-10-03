@@ -20,6 +20,7 @@ import {
   ensureOwner,
   exportOwner,
   getDb,
+  instagramUncheckedInTx,
   listChannelAccounts,
   parseBundleZip,
   reconcileItem,
@@ -286,7 +287,10 @@ describe('승인 전 잠정 규격 검사(approval blocker)', () => {
     const q = (await res.json()) as { plan: { id: string }; items: Array<{ id: string; payload_hash: string }> };
     const ap2 = await approve(q.plan.id, q.items[0]!.id, q.items[0]!.payload_hash);
     expect(ap2.status).toBe(409);
-    expect(JSON.stringify(await ap2.json())).toContain('media_spec:mime_not_allowed:1');
+    const body2 = JSON.stringify(await ap2.json());
+    expect(body2).toContain('media_spec:mime_not_allowed:1');
+    // FIX-T16: 기록된 MIME(png)과 실제 형식(JPEG 헤더)이 다름도 함께
+    expect(body2).toContain('media_spec:mime_mismatch:1');
   });
 
   it('규격이 보내기 직전에 달라지면(잠정 규격 변경 흉내) 원격 호출 0·URL 발급 0 으로 FAILED(재시도 없음)', async () => {
@@ -340,7 +344,7 @@ describe('게시 → 확인', () => {
     await execute(p.planId);
     await tick();
     expect((await jobOf(p.itemId)).state).toBe('CONFIRMED');
-    expect((await stepsOf(p.itemId)).map((s) => `${s.kind}:${s.postIndex}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_container:3', 'ig_container:0', 'ig_publish:0']);
+    expect((await stepsOf(p.itemId)).map((s) => `${s.kind}:${s.postIndex}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_container:3', 'ig_parent_request:0', 'ig_container:0', 'ig_publish:0']);
     const media = api.mediaOf(acc.external);
     expect(media).toHaveLength(1);
     expect(media[0]).toMatchObject({ mediaType: 'CAROUSEL_ALBUM' });
@@ -535,6 +539,130 @@ describe('복원 — Instagram 단계는 읽기 전용 이력, 조회는 확인 
   }, 180_000);
 });
 
+describe('FIX-T16(Codex review-T16)', () => {
+  it('[P0] 승인 뒤 저장소 바이트만 바뀜(같은 길이·규격, DB checksum 그대로 — 실제 mediaPortFor) → FAILED asset_checksum_mismatch:1, 컨테이너·URL 0, 재시도 없음', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id);
+    const asset = (await db.select().from(schema.assets).where(eq(schema.assets.checksum, p.checksums[0]!)))[0]!;
+    const original = (await storage.get(asset.key))!;
+    const tampered = Uint8Array.from(original);
+    tampered[tampered.length - 10] = (tampered[tampered.length - 10]! + 1) % 250;
+    expect(tampered.byteLength).toBe(original.byteLength);
+    await storage.put(asset.key, tampered);
+    const creates = api.calls.createImageContainer;
+    const issued = publicMedia.stats.issued;
+    await execute(p.planId);
+    expect(await drainUntil(p.itemId, DONE)).toBe('FAILED');
+    const job = await jobOf(p.itemId);
+    expect(job.lastErrorCode).toBe('asset_checksum_mismatch:1');
+    expect(api.calls.createImageContainer).toBe(creates);
+    expect(publicMedia.stats.issued).toBe(issued);
+    expect(await stepsOf(p.itemId)).toHaveLength(0);
+    await tick(3_600_000);
+    expect(await intentsOf(job.id)).toHaveLength(1);
+    expect(await pubsOf(p.itemId)).toHaveLength(0);
+  });
+
+  it('[P0] 캐러셀 2번째 이미지만 바뀜 → asset_checksum_mismatch:2, 자식 컨테이너도 0', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+      [1080, 566],
+    ]);
+    const asset = (await db.select().from(schema.assets).where(eq(schema.assets.checksum, p.checksums[1]!)))[0]!;
+    const tampered = Uint8Array.from((await storage.get(asset.key))!);
+    tampered[tampered.length - 10] = (tampered[tampered.length - 10]! + 1) % 250;
+    await storage.put(asset.key, tampered);
+    await execute(p.planId);
+    expect(await drainUntil(p.itemId, DONE)).toBe('FAILED');
+    expect((await jobOf(p.itemId)).lastErrorCode).toBe('asset_checksum_mismatch:2');
+    expect(api.containerIds(acc.external)).toHaveLength(0);
+  });
+
+  it('[P0] 게시 5xx(원격은 게시) → RECONCILING(publication 없음) → 조회로 CONFIRMED, 게시 호출 1·미디어 1·의도 1', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id);
+    api.injectFault({ op: 'publish', kind: 'server_error', applied: true, userId: acc.external });
+    await execute(p.planId);
+    const publishes = api.calls.publish;
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect(await pubsOf(p.itemId)).toHaveLength(0);
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.calls.publish - publishes).toBe(1);
+    expect(api.mediaOf(acc.external)).toHaveLength(1);
+    expect(await intentsOf((await jobOf(p.itemId)).id)).toHaveLength(1);
+  });
+
+  it('[P0] 컨테이너 생성 5xx(원격은 만듦, 기록 없음) → 조회 not_found → 새 컨테이너로 게시 1번(기록 없는 컨테이너는 게시되지 않음)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id);
+    api.injectFault({ op: 'createImageContainer', kind: 'server_error', applied: true, userId: acc.external });
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.containerIds(acc.external)).toHaveLength(2);
+    const media = api.mediaOf(acc.external);
+    expect(media).toHaveLength(1);
+    expect((await stepsOf(p.itemId)).filter((s) => s.kind === 'ig_container').map((s) => s.remoteId)).toEqual([media[0]!.containerId]);
+  });
+
+  it('[P1] 캐러셀 부모 생성 응답 유실(원격은 만듦) → 요청 표식 → 조회가 자식으로 부모를 찾아 기록 → CONFIRMED(부모 생성 1·게시 1)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+    ]);
+    api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true, userId: acc.external });
+    const parents = api.calls.createCarouselContainer;
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    expect((await stepsOf(p.itemId)).map((s) => `${s.kind}:${s.postIndex}`)).toEqual(['ig_container:1', 'ig_container:2', 'ig_parent_request:0']);
+    expect(await drainUntil(p.itemId, DONE)).toBe('CONFIRMED');
+    expect(api.calls.createCarouselContainer - parents).toBe(1);
+    expect(api.containerIds(acc.external)).toHaveLength(3);
+    expect(api.mediaOf(acc.external)).toHaveLength(1);
+    expect(api.mediaOf(acc.external)[0]!.imageSha256).toEqual(p.checksums);
+    const marker = (await stepsOf(p.itemId)).find((s) => s.kind === 'ig_parent_request')!;
+    expect(marker).toMatchObject({ status: 'created' });
+    expect(marker.remoteId).toMatch(/^mockig_req_/);
+    // 0037: ig_parent_request 상태는 created 만
+    await expect(db.execute(sql`update remote_steps set status = 'finished' where id = ${marker.id}::uuid`)).rejects.toThrow();
+  });
+
+  it('[P1] 부모 응답 유실 뒤 모의 Instagram 이 기록을 잃음 → 찾기 실패 → UNKNOWN(새 부모·게시 0)', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [
+      [1080, 1080],
+      [1080, 1350],
+    ]);
+    api.injectFault({ op: 'createCarouselContainer', kind: 'timeout', applied: true, userId: acc.external });
+    await execute(p.planId);
+    await tick();
+    expect((await jobOf(p.itemId)).state).toBe('RECONCILING');
+    // 재시작 흉내(모의 Instagram 기록 전부 유실 — 호출 수도 0 부터)
+    api.reset();
+    expect(await drainUntil(p.itemId, DONE)).toBe('UNKNOWN');
+    expect(api.calls.createCarouselContainer).toBe(0);
+    expect(api.calls.publish).toBe(0);
+    expect(await pubsOf(p.itemId)).toHaveLength(0);
+  });
+
+  it('승인 트랜잭션: 밖 검사 뒤 지금은 Instagram 모의 연결인데 검사하지 않은 항목·hash → media_spec:unchecked(fail closed), seed 계정은 영향 없음', async () => {
+    const acc = await linkedAccount();
+    const p = await planFor(acc.id, [[1080, 1080]], { approve: false });
+    const item = await itemOf(p.itemId);
+    expect((await instagramUncheckedInTx(db, owner, [item], new Set())).get(item.id)).toEqual(['media_spec:unchecked']);
+    expect((await instagramUncheckedInTx(db, owner, [item], new Set([`${item.id}:${item.payloadHash}`]))).size).toBe(0);
+    expect((await instagramUncheckedInTx(db, owner, [item], new Set([`${item.id}:other-hash`]))).get(item.id)).toEqual(['media_spec:unchecked']);
+    const seededIg = (await listChannelAccounts(db, owner)).find((a) => a.platform === 'instagram' && a.credentialState === 'none')!;
+    expect((await instagramUncheckedInTx(db, owner, [{ ...item, channelAccountId: seededIg.id }], new Set())).size).toBe(0);
+  });
+});
+
 describe('비밀 — 토큰·공개 미디어 URL 은 어디에도 나가지 않는다', () => {
   it('콘솔·응답·감사·작업 이력·전송 의도·단계·결과·내보내기에 Instagram 토큰·mock://public-media/ 없음, 살아 있는 공개 URL 0, fetch 0', async () => {
     expect([...mockOAuthStore().tokens.values()].some((t) => t.provider === 'mock_instagram')).toBe(true);
@@ -549,6 +677,7 @@ describe('비밀 — 토큰·공개 미디어 URL 은 어디에도 나가지 않
     expect(raw.includes(Buffer.from('mockig_at_'))).toBe(false);
     expect(raw.includes(Buffer.from(MOCK_PUBLIC_MEDIA_PREFIX))).toBe(false);
     expect(publicMedia.activeCount()).toBe(0);
+    expect(publicMedia.unrevokedCount()).toBe(0);
     expect(fetchCalls).toBe(0);
   });
 });
@@ -563,6 +692,11 @@ describe('drill:mock 의 Instagram 행(같은 표)', () => {
     expect(table).toContain('instagram_success · 캐러셀 3장 | 3 | CONFIRMED | CONFIRMED | 1 | 4 | 1 | MOCK PUBLISHED/public | 없음');
     expect(table).toContain('승인 전 규격 위반(9:16 세로) → 승인 거절 | 1 | (없음) | PLANNED | 0 | 0 | 0 | 없음 | 없음');
     expect(table).toContain('재시작(모의 Instagram 기록 유실) → UNKNOWN | 1 | UNKNOWN | UNKNOWN | 1 | 1 | 0 | 없음 | 없음');
+    // FIX-T16(Codex review-T16)
+    expect(table).toContain('저장소 바이트 변경(캐러셀 2번째, 같은 길이) → checksum 불일치 FAILED | 3 | FAILED | FAILED | 1 | 0 | 0 | 없음 | 없음');
+    expect(table).toContain('게시 5xx(원격은 게시함) → 조회로 확인 | 1 | CONFIRMED | CONFIRMED | 1 | 1 | 1 | MOCK PUBLISHED/public | 없음');
+    expect(table).toContain('컨테이너 생성 5xx(원격은 만듦·기록 없음) → 조회 not_found → 새 컨테이너 | 1 | CONFIRMED | CONFIRMED | 2 | 1 | 1 | MOCK PUBLISHED/public | 없음');
+    expect(table).toContain('캐러셀 부모 생성 응답 유실 → 요청 표식으로 부모 찾아 게시 | 3 | CONFIRMED | CONFIRMED | 2 | 4 | 1 | MOCK PUBLISHED/public | 없음');
     expect(fetchCalls).toBe(0);
   }, 180_000);
 });

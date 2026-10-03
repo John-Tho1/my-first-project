@@ -405,8 +405,10 @@ export function recordedAdapterIdOf(sanitizedDetails: Record<string, unknown> | 
  * T16(D29 제안): Instagram 미디어 게시 — ig_container(post_index 0 = 게시할 컨테이너(단일 이미지 또는 캐러셀 부모), 1..n = 캐러셀 자식 이미지,
  * created|finished|error) · ig_publish(post_index 0, 게시된 미디어 ID, published). Threads 의 container·publish 와 종류를 나눈 이유: 캐러셀 부모·자식
  * 순번 규칙이 다르고, 요청 제한 단위(rateStepKinds)·화면 패널·내보내기에서 플랫폼을 단계 종류만으로 구분할 수 있게.
+ * FIX-T16(P1, migration 0037): ig_parent_request(post_index 0, created) — 캐러셀 부모 생성 **요청 표식**. 부모를 만드는 원격 호출 전에 남기고
+ * (remote_id = 이 앱이 만든 모의 상관 값 mockig_req_…, 원격 ID 아님), 부모 ID 를 잃으면 조회가 자식으로 부모를 찾게 한다.
  */
-export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish'] as const;
+export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request'] as const;
 export type RemoteStepKind = (typeof REMOTE_STEP_KINDS)[number];
 export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed'] as const;
 export type RemoteStepStatus = (typeof REMOTE_STEP_STATUSES)[number];
@@ -418,6 +420,7 @@ export const REMOTE_STEP_KIND_STATUSES: Readonly<Record<RemoteStepKind, readonly
   video: ['uploaded', 'processed', 'error'],
   ig_container: ['created', 'finished', 'error'],
   ig_publish: ['published'],
+  ig_parent_request: ['created'],
 };
 
 export interface RemoteStep {

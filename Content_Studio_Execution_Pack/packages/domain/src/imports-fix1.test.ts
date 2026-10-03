@@ -110,29 +110,49 @@ describe('FIX-T18 round 1 — HTML 선형 처리(P0 :248)', () => {
     ['<script> 뒤 </scrip 반복', (b) => `<script>${fill('</scrip', b - 8)}`],
     ['<h1> 열고 짧은 태그 반복', (b) => `<h1>${fill('<b>x', b - 4)}`],
     ['엔티티 흉내 반복', (b) => fill('&#x1F600&amp', b)],
+    // FIX-T18 round 2: 따옴표 속성 값·자체 종료처럼 쓴 raw text 요소
+    ['닫히지 않은 따옴표 속성 반복', (b) => fill('<a x="', b)],
+    ['= 만 있는 속성 반복', (b) => fill('<a x= ', b)],
+    ['따옴표 값 안 > 반복', (b) => fill(`<a t='>'>`, b)],
+    ['<script/> 반복', (b) => fill('<script/>', b)],
+    ['<script/> 뒤 </script x=" 반복', (b) => `<script/>${fill('</script x="', b - 9)}`],
   ];
-  it.each(adversarial)('%s: 2MB 를 200ms 안에, 크기에 비례(선형)', (_label, make) => {
-    htmlToText(make(64 * 1024)); // 준비(JIT)
-    const small = make(TWO_MB / 4);
-    const big = make(TWO_MB);
-    expect(big.length).toBeLessThanOrEqual(HTML_TO_TEXT_MAX_INPUT);
-    // 이 프로세스(시험 워커 fork)가 쓴 CPU 시간(ms)을 세 번 재어 가장 작은 값 — 다른 시험 파일이 함께 돌 때의
-    // 벽시계 경합을 빼고 이 함수의 실제 작업량만 본다(상한 200ms 자체는 그대로).
-    const best = (input: string, times: number) => {
-      let min = Infinity;
-      for (let k = 0; k < 3; k++) {
-        const c = process.cpuUsage();
-        for (let r = 0; r < times; r++) htmlToText(input);
-        const d = process.cpuUsage(c);
-        min = Math.min(min, (d.user + d.system) / 1000);
-      }
-      return min;
+  /**
+   * FIX-T18 round 2(오케스트레이터 지적): 벽시계·CPU 시간은 병렬 부하에 흔들린다(전체 실행에서 `<` 반복 시험이 1.7초 걸림 — 이 PC 단독은 ~200ms).
+   * 주 판정은 htmlToText 가 실제로 살펴본 글자 수(stats.steps): 입력 글자당 상수(STEP_BOUND) 이하이고, 크기 4배 → 걸음 4배(여유 4.5배) 안.
+   * 제곱 구현(같은 구간을 다시 훑음)이면 2MB 에서 글자당 수십만 걸음이라 반드시 실패한다(인계 문서에 일부러 넣어 실패를 확인한 기록).
+   * 시간은 느슨한 보조 확인만(2MB 한 번, CPU 시간 3회 중 최소 < 1초 — 고치기 전 정규식은 128KB 에서 이미 482ms 였다).
+   */
+  const STEP_BOUND = 4;
+  it.each(adversarial)('%s: 살펴본 글자 수가 입력에 비례(선형) · 2MB 시간은 보조 확인', (_label, make) => {
+    const steps = (input: string) => {
+      const s = { steps: 0 };
+      htmlToText(input, s);
+      return s.steps;
     };
-    const tBig = best(big, 1);
-    const tSmallX4 = best(small, 4); // 1/4 크기를 네 번 = 같은 총 글자 수
-    expect(tBig).toBeLessThan(200);
-    // 같은 총 글자 수: 선형이면 2MB 한 번 ≈ 512KB 네 번, 제곱이면 4 배 — 여유를 두고 2.5 배 + 타이머 눈금 2칸(Windows CPU 시간 눈금 약 15.6ms) 안
-    expect(tBig).toBeLessThan(tSmallX4 * 2.5 + 32);
+    // 작은 크기부터 재고 그 자리에서 판정한다 — 제곱 구현은 16KB 에서 이미 글자당 수천 걸음이라, 2MB(동기 실행이라 시험 시간 제한이
+    // 끊지 못함)에 닿기 전에 실패한다.
+    const sizes = [16 * 1024, 128 * 1024, TWO_MB / 4, TWO_MB];
+    const counts: number[] = [];
+    let big = '';
+    for (const b of sizes) {
+      const input = make(b);
+      expect(input.length).toBeLessThanOrEqual(HTML_TO_TEXT_MAX_INPUT);
+      const c = steps(input);
+      expect(c, `글자당 걸음(${input.length}자)`).toBeLessThanOrEqual(STEP_BOUND * input.length + 16);
+      if (counts.length) expect(c / counts[counts.length - 1]!, '크기 비율 대비 걸음 비율').toBeLessThanOrEqual((b / sizes[counts.length - 1]!) * 1.125);
+      counts.push(c);
+      big = input;
+    }
+    // 보조: 정규식 후처리(엔티티·공백 정리) 처럼 계수기 밖 단계까지 포함한 실제 시간. 병렬 부하를 견디도록 느슨하게.
+    let min = Infinity;
+    for (let k = 0; k < 3; k++) {
+      const c = process.cpuUsage();
+      htmlToText(big);
+      const d = process.cpuUsage(c);
+      min = Math.min(min, (d.user + d.system) / 1000);
+    }
+    expect(min).toBeLessThan(1000);
   });
 
   it('상한을 넘는 입력은 처리하지 않는다', () => {
@@ -144,7 +164,32 @@ describe('FIX-T18 round 1 — HTML 선형 처리(P0 :248)', () => {
     expect(htmlToText('<p>앞 글</p><script>var a = 1; <p>뒤</p>').text).toBe('앞 글');
     expect(htmlToText('<p>a < b 이고 c > d</p>').text).toBe('a < b 이고 c > d');
     expect(htmlToText('<P>대문자</P><SCRIPT>x()</SCRIPT ><BR/>끝').text).toBe('대문자\n\n끝');
-    expect(htmlToText('<script/>남음').text).toBe('남음');
+  });
+
+  it('FIX-T18 round 2(P2 :366): <script/>·<style/>·<title/> 도 raw text — 짝 닫는 태그까지(없으면 끝까지) 버린다', () => {
+    expect(htmlToText('<script/>alert(1)</script><p>본문</p>').text).toBe('본문');
+    expect(htmlToText('<style/>p{color:red}</style><p>본문</p>').text).toBe('본문');
+    expect(htmlToText('<SCRIPT />x()</Script><p>본문</p>').text).toBe('본문');
+    expect(htmlToText('<noscript/>n</noscript>본문').text).toBe('본문');
+    expect(htmlToText('<p>앞</p><script/>닫히지 않음 <p>뒤</p>').text).toBe('앞');
+    const t = htmlToText('<title/>탭 제목</title><p>본문</p>');
+    expect(t).toEqual({ title: '탭 제목', text: '본문' });
+    // void 요소의 '/' 는 그대로 자체 종료
+    expect(htmlToText('줄1<br/>줄2<img src="a.png"/>끝').text).toBe('줄1\n줄2끝');
+  });
+
+  it('FIX-T18 round 2(놓친 케이스): 따옴표 속성 값 안의 > 는 태그 끝이 아니다. 닫히지 않은 따옴표는 나머지를 버린다', () => {
+    expect(htmlToText('<a title="x>y" href=\'a>b\'>링크</a> 뒤').text).toBe('링크 뒤');
+    expect(htmlToText('<p data-x = "1>2">본문</p>').text).toBe('본문');
+    expect(htmlToText('<p class=a"b>본문</p>').text).toBe('본문'); // = 뒤가 따옴표가 아니면 값 안의 따옴표는 글자
+    expect(htmlToText('<p>앞</p><a title="닫히지 않음>뒤').text).toBe('앞');
+    expect(htmlToText('<script>x</script data-a=">">본문').text).toBe('본문');
+  });
+
+  it('FIX-T18 round 2(놓친 케이스): 숫자 엔티티로 NUL·짝 없는 서로게이트를 만들지 않는다', () => {
+    const t = htmlToText('<p>a&#0;b&#x0;c&#xD800;d&#55296;e&#x1F600;</p>').text;
+    expect(t).not.toContain('\0');
+    expect(t).toBe('a&#0;b&#x0;c&#xD800;d&#55296;e😀');
   });
 
   it('제목: 첫 h1(안쪽 태그 제거·엔티티) → 없으면 title. title·script 내용은 본문에 없음', () => {

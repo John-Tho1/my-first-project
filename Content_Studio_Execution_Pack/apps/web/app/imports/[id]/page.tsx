@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
-import { getImportRun, listImportItems, type ImportItemRow } from '@cs/db';
+import { getImportRun, listBackfillableImportItemIds, listImportItems, type ImportItemRow } from '@cs/db';
 import {
   formatMsk,
   IMPORT_DECISION_LABEL,
@@ -45,8 +45,11 @@ export default async function ImportRunPage({
   const run = await getImportRun(db, session.ownerId, id.toLowerCase());
   if (!run) notFound();
   const items = await listImportItems(db, session.ownerId, run.id);
+  const preview0 = run.status === 'preview';
+  // FIX-T18 round 2(P1): 원본 파일이 빠진(0039 이전에 가져온) 동일 항목 — "원본 보충" 을 고를 수 있다.
+  const backfillable = preview0 ? await listBackfillableImportItemIds(db, session.ownerId, items) : new Set<string>();
   const err = str(q.error) ? (IMPORT_ERROR_TEXT[str(q.error)!] ?? IMPORT_ERROR_TEXT.server) : undefined;
-  const preview = run.status === 'preview';
+  const preview = preview0;
   const groups = groupByFolder(items);
   const c = run.counts;
 
@@ -92,6 +95,7 @@ export default async function ImportRunPage({
             가져옴(새 소재) {run.result.imported ?? 0} · 새 버전으로 추가 {run.result.versioned ?? 0} · 동일 건너뜀 {run.result.skipped_identical ?? 0} · 선택 안 함{' '}
             {run.result.skipped_unselected ?? 0} · 충돌 건너뜀 {run.result.skipped_conflict ?? 0} · 지원 안 함 {run.result.skipped_unsupported ?? 0} · 바뀜{' '}
             {run.result.failed_changed ?? 0}
+            {run.result.original_backfilled ? ` · 원본 보충 ${run.result.original_backfilled}` : ''}
           </p>
         ) : null}
       </section>
@@ -102,6 +106,9 @@ export default async function ImportRunPage({
           <p className="note">
             가져올 항목을 고르세요. 새 항목은 기본으로 선택되어 있습니다. 폴더 체크는 그 폴더(하위 폴더 포함)의 새 항목을 모두 고릅니다.
             동일한 항목은 다시 가져오지 않습니다.
+            {backfillable.size
+              ? ` 이전에 가져와 원본 파일이 빠진 동일 항목 ${backfillable.size}개는 "원본 보충" 을 고르면 올린 파일(같은 sha256)로 원본만 채웁니다 — 소재는 그대로입니다.`
+              : ''}
           </p>
         ) : null}
         <form className="form" method="post" action={`/api/imports/${run.id}/commit`}>
@@ -118,7 +125,7 @@ export default async function ImportRunPage({
               </thead>
               <tbody>
                 {groups.map(([folder, list]) => (
-                  <FolderRows key={folder || '(root)'} folder={folder} list={list} preview={preview} />
+                  <FolderRows key={folder || '(root)'} folder={folder} list={list} preview={preview} backfillable={backfillable} />
                 ))}
               </tbody>
             </table>
@@ -137,7 +144,17 @@ export default async function ImportRunPage({
   );
 }
 
-function FolderRows({ folder, list, preview }: { folder: string; list: ImportItemRow[]; preview: boolean }) {
+function FolderRows({
+  folder,
+  list,
+  preview,
+  backfillable,
+}: {
+  folder: string;
+  list: ImportItemRow[];
+  preview: boolean;
+  backfillable: ReadonlySet<string>;
+}) {
   const hasNew = list.some((i) => i.decision === 'new');
   return (
     <>
@@ -161,6 +178,10 @@ function FolderRows({ folder, list, preview }: { folder: string; list: ImportIte
               ) : i.decision === 'conflict' ? (
                 <label>
                   <input type="checkbox" name="version" value={i.id} /> 새 버전으로 추가
+                </label>
+              ) : i.decision === 'identical' && backfillable.has(i.id) ? (
+                <label>
+                  <input type="checkbox" name="backfill" value={i.id} /> 원본 보충
                 </label>
               ) : (
                 '—'

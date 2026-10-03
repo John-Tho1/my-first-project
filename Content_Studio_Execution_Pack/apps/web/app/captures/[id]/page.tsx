@@ -120,11 +120,16 @@ export default async function CaptureDetailPage({
             {importOrigin.outcome === 'versioned' ? '(새 버전)' : ''} · 원래 경로 <span className="hash">{importOrigin.externalPath}</span>
             {importOrigin.externalCreatedText ? ` · 원본 생성 표시 ${importOrigin.externalCreatedText}` : ''} ·{' '}
             <Link href={`/imports/${importOrigin.runId}`}>가져오기 기록</Link> (원본 파일은 바뀌지 않았습니다)
-            {importOrigin.sourceVersionId ? (
+            {/* FIX-T18 round 2(Codex review-FIX-T18 P1 :123): 원본 행이 실제로 있을 때만 받기 링크(0039 이전 가져오기는 원본 없음 → 안내). */}
+            {importOrigin.sourceVersionId && importOrigin.hasOriginal ? (
               <>
                 {' · '}
                 <a href={`/api/imports/originals/${importOrigin.sourceVersionId}`}>원본 파일 그대로 받기</a>
                 {importOrigin.format === 'html' ? ' (위 원문은 HTML 에서 추출한 텍스트)' : ''}
+              </>
+            ) : importOrigin.sourceVersionId ? (
+              <>
+                {' · '}원본 바이트 없음(0039 이전 가져오기) — 같은 파일을 다시 올려 &quot;원본 보충&quot; 을 고르면 채울 수 있습니다
               </>
             ) : null}
           </p>

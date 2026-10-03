@@ -7,9 +7,9 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { and, count, eq, type SQL } from 'drizzle-orm';
+import { and, count, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import type { PgTable } from 'drizzle-orm/pg-core';
-import { closeDb, commitImportRun, getDb, runRestoreDrill, schema, seed, type Db } from '@cs/db';
+import { closeDb, commitImportRun, getDb, getImportOriginForCapture, listBackfillableImportItemIds, runRestoreDrill, schema, seed, type Db } from '@cs/db';
 import { loadConfig, parseImportArchive, sha256Bytes } from '@cs/domain';
 import { DisabledPublisher, LocalStorageAdapter, mockImportConnectorForTest } from '@cs/providers';
 import { POST as cancelPOST } from '../../apps/web/app/api/imports/[id]/cancel/route';
@@ -597,6 +597,178 @@ describe('FIX-T18 round 1 — 크기 경계(P2 :339)', () => {
   });
 });
 
+describe('FIX-T18 round 2 — 0039 이전 가져오기의 원본 표시·보충(Codex review-FIX-T18 P1 captures/[id]:123)', () => {
+  const files = {
+    a: new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('# 보충 a\r\n\r\n원본이 빠진 항목(합성)\r\n')]),
+    b: new TextEncoder().encode('# 보충 b\n\n원본이 있는 항목(합성)\n'),
+    c: new TextEncoder().encode('<h1>보충 c</h1><p>원본이 빠진 채로 둠(합성)</p>'),
+  };
+  const zip = () =>
+    buildTestZip([
+      { path: '보충/a.md', data: files.a },
+      { path: '보충/b.md', data: files.b },
+      { path: '보충/c.html', data: files.c },
+    ]);
+  const originalOf = (versionId: string) =>
+    originalGET(new Request(`${BASE}/api/imports/originals/${versionId}`, { headers: cookieHeader(tokenA) }), { params: Promise.resolve({ versionId }) });
+  const form = (id: string, pairs: Array<[string, string]>) =>
+    commitPOST(
+      new Request(`${BASE}/api/imports/${id}/commit`, {
+        method: 'POST',
+        headers: { accept: 'text/html', 'content-type': 'application/x-www-form-urlencoded', origin: BASE, ...cookieHeader(tokenA) },
+        body: new URLSearchParams(pairs).toString(),
+      }),
+      ctx(id),
+    );
+
+  it('원본 행이 없으면 받기 대신 "원본 없음" 표시, 같은 파일을 다시 올려 "원본 보충" 을 고르면 그 버전에만 원본을 추가(소재·출처·버전 그대로), 이후 불변', async () => {
+    // 1) 처음 가져오기(지금 코드 — 원본 행이 생김) 뒤, 0038 시절 데이터를 흉내 내어 a·c 의 원본 행만 지운다(시험 전용: 사용자 트리거를 잠시 끔).
+    const first = await previewOk(zip(), tokenA, 'drive_export');
+    const firstOut = await (await commit(first.import_id, { folders: ['보충'] })).json();
+    const firstItems = firstOut.items as ItemView[];
+    expect(firstItems.map((i) => i.outcome)).toEqual(['imported', 'imported', 'imported']);
+    const [ia, ib, ic] = ['path:보충/a.md', 'path:보충/b.md', 'path:보충/c.html'].map((e) => byExt(firstItems, e));
+    await db.execute(sql`alter table source_version_originals disable trigger user`);
+    try {
+      await db
+        .delete(schema.sourceVersionOriginals)
+        .where(inArray(schema.sourceVersionOriginals.sourceVersionId, [ia!.target_source_version_id!, ic!.target_source_version_id!]));
+    } finally {
+      await db.execute(sql`alter table source_version_originals enable trigger user`);
+    }
+
+    // 2) 소재 화면 근거: 원본 행 존재 여부. 없는 쪽은 받기 경로도 404 — 화면은 링크 대신 안내를 보인다.
+    expect(await getImportOriginForCapture(db, ownerA, ia!.target_capture_id!)).toMatchObject({ sourceVersionId: ia!.target_source_version_id, hasOriginal: false });
+    expect(await getImportOriginForCapture(db, ownerA, ib!.target_capture_id!)).toMatchObject({ sourceVersionId: ib!.target_source_version_id, hasOriginal: true });
+    expect(await getImportOriginForCapture(db, ownerB, ib!.target_capture_id!)).toBeNull();
+    expect((await originalOf(ia!.target_source_version_id!)).status).toBe(404);
+
+    // 3) 같은 파일을 다시 올림 → 모두 동일. 원본 보충 후보는 a·c 만.
+    const again = await previewOk(zip(), tokenA, 'drive_export');
+    expect(again.items.map((i) => i.decision)).toEqual(['identical', 'identical', 'identical']);
+    const ledger = await db.select().from(schema.importItems).where(eq(schema.importItems.runId, again.import_id));
+    const cand = await listBackfillableImportItemIds(db, ownerA, ledger);
+    const [ra, rb, rc] = ['path:보충/a.md', 'path:보충/b.md', 'path:보충/c.html'].map((e) => byExt(again.items, e));
+    expect([...cand].sort()).toEqual([ra!.id, rc!.id].sort());
+    expect(await listBackfillableImportItemIds(db, ownerB, ledger)).toEqual(new Set()); // 다른 owner 기준으로는 후보 없음
+    const view = await (await importGET(new Request(`${BASE}/api/imports/${again.import_id}`, { headers: cookieHeader(tokenA) }), ctx(again.import_id))).json();
+    expect([...view.backfillable_item_ids].sort()).toEqual([ra!.id, rc!.id].sort());
+
+    // 4) 선택 규칙은 그대로: 동일 항목만 폴더로 고르면 400, 원본이 있는 b 를 보충으로 고르면 400 — 상태·쓰기 없음
+    const before = await writeCounts(ownerA);
+    const originalsBefore = await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.ownerId, ownerA));
+    const onlyFolder = await commit(again.import_id, { folders: ['보충'] });
+    expect((await onlyFolder.json()).error).toBe('import_nothing_selected');
+    const onB = await commit(again.import_id, { backfill_ids: [rb!.id] });
+    expect(onB.status).toBe(400);
+    expect((await onB.json()).error).toBe('import_invalid_selection');
+    expect(await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.ownerId, ownerA))).toBe(originalsBefore);
+    expect((await db.select().from(schema.importRuns).where(eq(schema.importRuns.id, again.import_id)))[0]!.status).toBe('preview');
+
+    // 5) 폼으로 a 만 보충(c 는 고르지 않아 원본 없는 채로 남김 — 복원 훈련에서 구·신 원본이 섞인 묶음이 된다)
+    const res = await form(again.import_id, [['backfill', ra!.id]]);
+    expect(res.status).toBe(303);
+    const out = (await (await importGET(new Request(`${BASE}/api/imports/${again.import_id}`, { headers: { accept: 'application/json', ...cookieHeader(tokenA) } }), ctx(again.import_id))).json()) as {
+      run: { result: Record<string, number> };
+      items: ItemView[];
+    };
+    expect(out.run.result).toMatchObject({ original_backfilled: 1, skipped_identical: 2, imported: 0, versioned: 0 });
+    expect(byExt(out.items, 'path:보충/a.md')).toMatchObject({
+      outcome: 'original_backfilled',
+      target_capture_id: null,
+      target_source_id: ia!.target_source_id,
+      target_source_version_id: ia!.target_source_version_id,
+    });
+    expect(byExt(out.items, 'path:보충/c.html')).toMatchObject({ outcome: 'skipped_identical', target_source_version_id: null });
+    expect(await writeCounts(ownerA)).toEqual(before); // 소재·출처·버전·이력 0 증가
+    expect(await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.ownerId, ownerA))).toBe(originalsBefore + 1);
+
+    // 채운 원본: 바이트 그대로(BOM·CRLF), sha256 = 그 버전 raw_hash, 받기 200, 소재 화면은 이제 링크
+    const [orig] = await db.select().from(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, ia!.target_source_version_id!));
+    const [ver] = await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.id, ia!.target_source_version_id!));
+    expect(Buffer.from(orig!.contentBase64, 'base64').equals(Buffer.from(files.a))).toBe(true);
+    expect(orig).toMatchObject({ ownerId: ownerA, sha256: ver!.rawHash, byteSize: files.a.byteLength, format: 'md' });
+    const got = await originalOf(ia!.target_source_version_id!);
+    expect(got.status).toBe(200);
+    expect(Buffer.from(await got.arrayBuffer()).equals(Buffer.from(files.a))).toBe(true);
+    expect(await getImportOriginForCapture(db, ownerA, ia!.target_capture_id!)).toMatchObject({ hasOriginal: true });
+    expect(await getImportOriginForCapture(db, ownerA, ic!.target_capture_id!)).toMatchObject({ hasOriginal: false });
+    // 기존 소재 원문 그대로
+    const [capA] = await db.select().from(schema.captures).where(eq(schema.captures.id, ia!.target_capture_id!));
+    expect(capA!.rawText.startsWith('# 보충 a\r\n')).toBe(true);
+    expect(capA!.revision).toBe(1);
+    // 보충한 원본도 추가 전용
+    await expect(db.update(schema.sourceVersionOriginals).set({ contentBase64: 'eA==' }).where(eq(schema.sourceVersionOriginals.id, orig!.id))).rejects.toThrow();
+    await expect(db.delete(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.id, orig!.id))).rejects.toThrow();
+
+    // 6) 또 올리면 a 는 더 이상 후보가 아니다(보충 → 400), c 만 후보
+    const third = await previewOk(zip(), tokenA, 'drive_export');
+    const ledger3 = await db.select().from(schema.importItems).where(eq(schema.importItems.runId, third.import_id));
+    expect([...(await listBackfillableImportItemIds(db, ownerA, ledger3))]).toEqual([byExt(third.items, 'path:보충/c.html').id]);
+    const reA = await commit(third.import_id, { backfill_ids: [byExt(third.items, 'path:보충/a.md').id] });
+    expect((await reA.json()).error).toBe('import_invalid_selection');
+    // 새 항목·새 버전에는 backfill 을 쓸 수 없다(동일 항목 전용)
+    const mixed = await previewOk(buildTestZip([{ path: '보충/새.md', data: '# 새\n\n새 항목' }]), tokenA, 'drive_export');
+    const onNew = await commit(mixed.import_id, { backfill_ids: [mixed.items[0]!.id] });
+    expect((await onNew.json()).error).toBe('import_invalid_selection');
+    await cancelPOST(jsonPost(`/api/imports/${third.import_id}/cancel`, {}, cookieHeader(tokenA)), ctx(third.import_id));
+    await cancelPOST(jsonPost(`/api/imports/${mixed.import_id}/cancel`, {}, cookieHeader(tokenA)), ctx(mixed.import_id));
+  });
+
+  it('미리보기 뒤 다른 확정이 먼저 채웠으면(잠금 뒤 재확인) 보충하지 않고 동일 건너뜀 — 원본 하나만', async () => {
+    const body = new TextEncoder().encode('# 경합\n\n두 실행이 같은 원본을 보충(합성)\n');
+    const z = buildTestZip([{ path: '보충경합/x.md', data: body }]);
+    const first = await previewOk(z, tokenA, 'drive_export');
+    const f = (await (await commit(first.import_id, { folders: ['보충경합'] })).json()).items[0] as ItemView;
+    await db.execute(sql`alter table source_version_originals disable trigger user`);
+    try {
+      await db.delete(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, f.target_source_version_id!));
+    } finally {
+      await db.execute(sql`alter table source_version_originals enable trigger user`);
+    }
+    const r1 = await previewOk(z, tokenA, 'drive_export');
+    const r2 = await previewOk(z, tokenA, 'drive_export');
+    const o1 = await (await commit(r1.import_id, { backfill_ids: [r1.items[0]!.id] })).json();
+    const o2 = await (await commit(r2.import_id, { backfill_ids: [r2.items[0]!.id] })).json();
+    expect(o1.items[0].outcome).toBe('original_backfilled');
+    // 두 번째는 확정 전 검사에서 이미 후보가 아니므로 400(아무것도 바꾸지 않음)
+    expect(o2.error).toBe('import_invalid_selection');
+    expect(await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.sourceVersionId, f.target_source_version_id!))).toBe(1);
+    await cancelPOST(jsonPost(`/api/imports/${r2.import_id}/cancel`, {}, cookieHeader(tokenA)), ctx(r2.import_id));
+  });
+
+  it('잠금 뒤 재확인 경로(도메인 경계 직접): 확정 전 검사 뒤에 원본이 채워지면 original_backfilled 대신 skipped_identical', async () => {
+    const body = new TextEncoder().encode('# 경합2\n\n잠금 뒤 재확인(합성)\n');
+    const z = buildTestZip([{ path: '보충경합2/y.md', data: body }]);
+    const first = await previewOk(z, tokenA, 'drive_export');
+    const f = (await (await commit(first.import_id, { folders: ['보충경합2'] })).json()).items[0] as ItemView;
+    const [saved] = await db.select().from(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, f.target_source_version_id!));
+    await db.execute(sql`alter table source_version_originals disable trigger user`);
+    try {
+      await db.delete(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.id, saved!.id));
+    } finally {
+      await db.execute(sql`alter table source_version_originals enable trigger user`);
+    }
+    const r = await previewOk(z, tokenA, 'drive_export');
+    const parsed = parseImportArchive('drive_export', z).items;
+    // loadItems 는 확정 전 검사 뒤·트랜잭션 전에 불린다 — 그 사이 다른 쓰기가 원본을 채운 상황
+    const out = await commitImportRun(
+      db,
+      ownerA,
+      r.import_id,
+      { itemIds: new Set(), folders: [], versionIds: new Set(), backfillIds: new Set([r.items[0]!.id]) },
+      async () => {
+        const { id: _id, createdAt: _c, ...row } = saved!;
+        await db.insert(schema.sourceVersionOriginals).values(row);
+        return parsed;
+      },
+    );
+    expect(out.result).toMatchObject({ original_backfilled: 0, skipped_identical: 1 });
+    expect(out.items[0]!.outcome).toBe('skipped_identical');
+    expect(await n(schema.sourceVersionOriginals, eq(schema.sourceVersionOriginals.sourceVersionId, f.target_source_version_id!))).toBe(1);
+  });
+});
+
 describe('내보내기·복원(원장 포함)', () => {
   it('복원 훈련: import_runs·import_items 를 포함해 빈 DB 복원 → PASS(원장 행·대상 ID 그대로)', async () => {
     const storage = new LocalStorageAdapter(path.join(tmp, 'assets'));
@@ -614,5 +786,10 @@ describe('내보내기·복원(원장 포함)', () => {
     expect(originals.expected_rows).toBeGreaterThanOrEqual(10);
     expect(originals).toMatchObject({ ids: 'same' });
     expect(originals.actual_rows).toBe(originals.expected_rows);
+    // FIX-T18 round 2(P1): 원본 보충 원장(original_backfilled)·원본 없는 구 버전(0039 이전 흉내)이 섞인 묶음도 같은 행으로 복원된다
+    const backfilled = await n(schema.importItems, and(eq(schema.importItems.ownerId, ownerA), eq(schema.importItems.outcome, 'original_backfilled')));
+    expect(backfilled).toBeGreaterThanOrEqual(1);
+    const versions = r.tables.find((t) => t.table === 'source_versions')!;
+    expect(originals.expected_rows).toBeLessThan(versions.expected_rows);
   }, 120_000);
 });

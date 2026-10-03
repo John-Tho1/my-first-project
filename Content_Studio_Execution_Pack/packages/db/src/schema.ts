@@ -1698,7 +1698,8 @@ export const importRuns = pgTable(
 /**
  * T18 가져오기 항목(import ledger 의 줄). 실행마다 외부 항목 하나(external_id: Notion 페이지 ID 또는 내보내기 안 경로).
  * decision(미리보기 판정): new | identical(같은 외부 ID·같은 checksum 이 이미 있음) | conflict(같은 외부 ID, 내용 다름 — 덮어쓰지 않음) | skipped(지원 안 함).
- * outcome(확정 결과, 미리보기 중 null): imported | versioned(사용자가 고른 충돌 → 기존 출처에 새 버전) | skipped_* | failed_changed.
+ * outcome(확정 결과, 미리보기 중 null): imported | versioned(사용자가 고른 충돌 → 기존 출처에 새 버전) | skipped_* | failed_changed
+ *   | original_backfilled(FIX-T18 round 2, 0040: 사용자가 고른 동일 항목 — 빠진 원본 바이트만 기존 출처 버전에 채움, 소재·출처·버전은 그대로).
  * target_*: 확정으로 만든 소재·출처·출처 버전(같은 owner — 복합 FK). 본문은 이 표에 없다(소재 원문에만).
  */
 export const importItems = pgTable(
@@ -1733,7 +1734,12 @@ export const importItems = pgTable(
     check('import_items_decision_chk', sql`${t.decision} in ('new', 'identical', 'conflict', 'skipped')`),
     check(
       'import_items_outcome_chk',
-      sql`${t.outcome} is null or ${t.outcome} in ('imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed')`,
+      sql`${t.outcome} is null or ${t.outcome} in ('imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed', 'original_backfilled')`,
+    ),
+    // FIX-T18 round 2(Codex review-FIX-T18 P1, 0040): 원본 보충(0039 이전 가져오기의 빠진 원본을 같은 바이트로 채움)은 기존 출처 버전만 가리키고 소재는 만들지 않는다.
+    check(
+      'import_items_backfill_chk',
+      sql`${t.outcome} is distinct from 'original_backfilled' or (${t.targetSourceId} is not null and ${t.targetSourceVersionId} is not null and ${t.targetCaptureId} is null)`,
     ),
     check('import_items_checksum_chk', sql`${t.contentChecksum} is null or ${t.contentChecksum} ~ '^[0-9a-f]{64}$'`),
     check('import_items_skip_chk', sql`(${t.decision} = 'skipped') = (${t.skipReason} is not null)`),

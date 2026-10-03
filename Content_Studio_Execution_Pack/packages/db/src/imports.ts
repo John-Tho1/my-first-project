@@ -12,6 +12,10 @@
  *   (P1 :244) 확정 트랜잭션은 owner·공급자 단위 advisory lock 을 잡은 뒤 출처를 다시 읽어 판정한다 — 다른 실행의 동시 확정과 직렬화.
  *            그래도 부분 unique(sources_owner_import_external_uq) 에 걸리면(잠금 밖의 쓰기) savepoint 로 되돌리고 다시 읽어 동일·충돌로 판정한다(500 아님).
  *   (P1 web :122) 원장 기준으로 실제 쓰기를 일으키는 선택이 하나도 없으면 상태를 바꾸기 전에 400 import_nothing_selected. version_ids 는 충돌 항목만.
+ * - FIX-T18 round 2(Codex review-FIX-T18 P1 captures/[id]:123): 0039 이전에 확정한 가져오기는 출처 버전에 원본 행이 없다. 같은 파일을 다시 올리면
+ *   동일(identical) 항목 중 원본이 빠진 것만 "원본 보충"(backfill_ids)으로 고를 수 있고, 확정 때 잠금 뒤 다시 확인해 올린 바이트의
+ *   sha256 = 그 버전 raw_hash 일 때만 source_version_originals 에 **추가**한다(트리거가 raw_hash·owner 를 다시 확인, 이후 UPDATE·DELETE 금지).
+ *   소재·출처·출처 버전은 바꾸지 않는다. 원장 outcome = original_backfilled(target = 기존 출처·버전, 소재 없음).
  */
 import { randomUUID } from 'node:crypto';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
@@ -29,6 +33,7 @@ import {
   type ImportSelection,
   type ImportSourceKind,
   type ParsedImportItem,
+  sha256Bytes,
 } from '@cs/domain';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
@@ -214,6 +219,55 @@ export async function cancelImportRun(db: Db, ownerId: string, id: string, now: 
 
 export type ImportCommitResult = Record<ImportOutcome, number> & { total: number };
 
+/**
+ * FIX-T18 round 2: 원본 행이 없는 출처 버전(owner 의 출처, 주어진 (출처, raw_hash) 쌍). 키 `<출처 ID>:<raw_hash>` → 버전 ID(오래된 순).
+ */
+async function versionsMissingOriginal(
+  db: DbOrTx,
+  ownerId: string,
+  pairs: ReadonlyArray<{ sourceId: string; rawHash: string }>,
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  for (let i = 0; i < pairs.length; i += 500) {
+    const chunk = pairs.slice(i, i + 500);
+    if (!chunk.length) continue;
+    const wanted = new Set(chunk.map((p) => `${p.sourceId}:${p.rawHash}`));
+    const rows = await db
+      .select({ id: sourceVersions.id, sourceId: sourceVersions.sourceId, rawHash: sourceVersions.rawHash, original: sourceVersionOriginals.id })
+      .from(sourceVersions)
+      .innerJoin(sources, and(eq(sources.id, sourceVersions.sourceId), eq(sources.ownerId, ownerId)))
+      .leftJoin(sourceVersionOriginals, eq(sourceVersionOriginals.sourceVersionId, sourceVersions.id))
+      .where(
+        and(
+          inArray(sourceVersions.sourceId, [...new Set(chunk.map((p) => p.sourceId))]),
+          inArray(sourceVersions.rawHash, [...new Set(chunk.map((p) => p.rawHash))]),
+        ),
+      )
+      .orderBy(asc(sourceVersions.fetchedAt), asc(sourceVersions.id));
+    for (const r of rows) {
+      const key = `${r.sourceId}:${r.rawHash}`;
+      if (r.original !== null || !wanted.has(key)) continue;
+      out.set(key, [...(out.get(key) ?? []), r.id]);
+    }
+  }
+  return out;
+}
+
+/**
+ * FIX-T18 round 2: "원본 보충" 을 고를 수 있는 원장 항목 ID — 동일(identical) 판정이고, 맞는 출처의 같은 raw_hash 버전에 원본 행이 없는 것.
+ * 미리보기 화면(체크 상자)과 확정 전 검사가 같은 함수를 쓴다.
+ */
+export async function listBackfillableImportItemIds(db: DbOrTx, ownerId: string, items: readonly ImportItemRow[]): Promise<Set<string>> {
+  const cand = items.filter((i) => i.ownerId === ownerId && i.decision === 'identical' && i.matchedSourceId !== null && i.contentChecksum !== null);
+  if (!cand.length) return new Set();
+  const missing = await versionsMissingOriginal(
+    db,
+    ownerId,
+    cand.map((i) => ({ sourceId: i.matchedSourceId!, rawHash: i.contentChecksum! })),
+  );
+  return new Set(cand.filter((i) => missing.has(`${i.matchedSourceId}:${i.contentChecksum}`)).map((i) => i.id));
+}
+
 /** 시험 전용 훅(운영 경로는 넘기지 않는다). */
 export interface CommitImportHooks {
   /**
@@ -268,6 +322,17 @@ export async function commitImportRun(
       throw new AppError('bad_request', 'import_invalid_selection', '"새 버전으로 추가" 는 충돌 항목만 고를 수 있습니다');
     }
   }
+  // FIX-T18 round 2(P1): "원본 보충" 은 원본이 빠진 동일 항목만 — 아니면 상태를 바꾸기 전에 400.
+  const backfillIds = selection.backfillIds ?? new Set<string>();
+  if (backfillIds.size) {
+    for (const id of backfillIds) {
+      if (!ledgerById.has(id)) throw new BadRequestError('이 가져오기에 없는 항목을 골랐습니다');
+    }
+    const ok = await listBackfillableImportItemIds(db, ownerId, ledger.filter((i) => backfillIds.has(i.id)));
+    for (const id of backfillIds) {
+      if (!ok.has(id)) throw new AppError('bad_request', 'import_invalid_selection', '"원본 보충" 은 원본 파일이 빠진 동일 항목만 고를 수 있습니다');
+    }
+  }
   // 원장 기준으로 실제 쓰기를 일으키는 선택이 하나도 없으면(없는 폴더·동일·건너뜀만 고름) 상태를 바꾸지 않고 거부한다 — 실행은 미리보기로 남고 ZIP 도 남는다.
   if (!ledger.some((i) => effectiveImportChoice(i, selection) !== null)) {
     throw new AppError('bad_request', 'import_nothing_selected', '가져올 항목을 하나 이상 고르세요(새 항목 또는 "새 버전으로 추가" 를 고른 충돌 항목)');
@@ -296,6 +361,7 @@ export async function commitImportRun(
       skipped_conflict: 0,
       skipped_unsupported: 0,
       failed_changed: 0,
+      original_backfilled: 0,
     } satisfies ImportCommitResult;
 
     for (const item of ledger) {
@@ -303,7 +369,7 @@ export async function commitImportRun(
       const selected = selection.itemIds.has(item.id) || choice === 'import';
       const versionChosen = choice === 'version';
       let outcome: ImportOutcome;
-      let target: { captureId: string; sourceId: string; sourceVersionId: string } | null = null;
+      let target: { captureId: string | null; sourceId: string; sourceVersionId: string } | null = null;
       const p = parsed.get(item.externalId);
       if (item.decision === 'skipped') {
         outcome = 'skipped_unsupported';
@@ -312,12 +378,33 @@ export async function commitImportRun(
       } else {
         const cur = decideImportItem(p, existing.get(item.externalId));
         if (cur === 'skipped') outcome = 'skipped_unsupported';
-        else if (cur === 'identical') outcome = 'skipped_identical';
+        else if (cur === 'identical') outcome = choice === 'backfill' ? 'original_backfilled' : 'skipped_identical';
         else if (cur === 'new') outcome = selected ? 'imported' : 'skipped_unselected';
         else outcome = versionChosen ? 'versioned' : selected ? 'skipped_conflict' : 'skipped_unselected';
 
         let sourceId: string | null = null;
-        if (outcome === 'imported') {
+        if (outcome === 'original_backfilled') {
+          // FIX-T18 round 2(P1): 잠금 뒤 다시 확인 — 그사이 다른 확정이 채웠으면 동일 건너뜀. 올린 바이트의 sha256 이 raw_hash 와 다르면 바뀜.
+          const src = existing.get(item.externalId)!.sourceId;
+          const raw = originalBytes(p.original);
+          const missing = (await versionsMissingOriginal(tx, ownerId, [{ sourceId: src, rawHash: p.contentChecksum! }])).get(`${src}:${p.contentChecksum}`) ?? [];
+          if (!missing.length) outcome = 'skipped_identical';
+          else if (sha256Bytes(raw) !== p.contentChecksum) outcome = 'failed_changed';
+          else {
+            for (const versionId of missing) {
+              // 추가만(0039 트리거: sha256 = 버전 raw_hash·owner = 출처 owner, 이후 UPDATE·DELETE 금지).
+              await tx.insert(sourceVersionOriginals).values({
+                sourceVersionId: versionId,
+                ownerId,
+                format: p.format,
+                byteSize: raw.byteLength,
+                sha256: p.contentChecksum!,
+                contentBase64: Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('base64'),
+              });
+            }
+            target = { captureId: null, sourceId: src, sourceVersionId: missing[0]! };
+          }
+        } else if (outcome === 'imported') {
           await hooks.beforeSourceInsert?.(tx, item.externalId);
           try {
             // savepoint: unique 충돌이면 이 INSERT 만 되돌리고 트랜잭션은 이어 간다.
@@ -456,6 +543,8 @@ export async function getImportOriginForCapture(
   committedAt: Date | null;
   sourceVersionId: string | null;
   format: string;
+  /** FIX-T18 round 2(P1 captures/[id]:123): 그 출처 버전에 원본 행이 실제로 있는지(0039 이전 가져오기는 없음) — 받기 링크는 이때만. */
+  hasOriginal: boolean;
 } | null> {
   if (!isUuid(captureId)) return null;
   const rows = await db
@@ -468,11 +557,18 @@ export async function getImportOriginForCapture(
       committedAt: importRuns.committedAt,
       sourceVersionId: importItems.targetSourceVersionId,
       format: importItems.format,
+      originalId: sourceVersionOriginals.id,
     })
     .from(importItems)
     .innerJoin(importRuns, and(eq(importRuns.id, importItems.runId), eq(importRuns.ownerId, importItems.ownerId)))
+    .leftJoin(
+      sourceVersionOriginals,
+      and(eq(sourceVersionOriginals.sourceVersionId, importItems.targetSourceVersionId), eq(sourceVersionOriginals.ownerId, importItems.ownerId)),
+    )
     .where(and(eq(importItems.ownerId, ownerId), eq(importItems.targetCaptureId, captureId)))
     .limit(1);
   const r = rows[0];
-  return r ? { ...r, outcome: r.outcome ?? '' } : null;
+  if (!r) return null;
+  const { originalId, ...rest } = r;
+  return { ...rest, outcome: r.outcome ?? '', hasOriginal: originalId !== null };
 }

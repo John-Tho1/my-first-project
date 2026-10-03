@@ -38,6 +38,11 @@ const MAX_NESTED_ZIP_BYTES = IMPORT_MAX_ZIP_BYTES;
  * 중첩 ZIP 컨테이너를 푸는 바이트와 텍스트 항목을 푸는 바이트를 모두 센다(풀기 **전에** 선언 크기로 검사 — 넘으면 묶음 전체 거부).
  */
 export const IMPORT_MAX_TOTAL_INFLATED_BYTES = 128 * 1024 * 1024;
+/**
+ * FIX-T18 round 2(Codex review-FIX-T18 P0 :499): 묶음 전체에서 실제로 푸는 **압축 입력** 바이트 합 상한(바깥 파일 + 풀린 바이트 상한).
+ * 겹치는 구간을 거부하므로 정상 경로에서는 넘을 수 없다 — 같은 압축 데이터를 되풀이해 푸는 회귀를 막는 방어선.
+ */
+export const IMPORT_MAX_TOTAL_COMPRESSED_BYTES = IMPORT_MAX_ZIP_BYTES + IMPORT_MAX_TOTAL_INFLATED_BYTES;
 /** FIX-T18 round 1: 바깥 ZIP 안에서 풀 수 있는 중첩 ZIP 개수 상한(넘으면 묶음 전체 거부). */
 export const IMPORT_MAX_NESTED_ARCHIVES = 16;
 /** 가져올 수 있는(텍스트) 항목 수 상한 — 미리보기 한 번에 이 수를 넘으면 거부(나눠서 올리기). */
@@ -118,6 +123,8 @@ interface RawEntry {
   compSize: number;
   size: number;
   dataStart: number;
+  /** FIX-T18 round 2: local header 시작(구간 겹침 검사용) */
+  localOffset: number;
 }
 
 function findEocd(buf: Buffer): number {
@@ -191,7 +198,16 @@ function listZip(buf: Buffer): { entries: RawEntry[]; records: number } {
     }
     const dataStart = localOffset + 30 + lNameLen + lExtraLen;
     if (dataStart + compSize > cdOffset) throw new ZipFormatError('ZIP 항목 크기가 올바르지 않습니다', { paths: [name.slice(0, 200)] });
-    out.push({ path: name, method, crc, compSize, size, dataStart });
+    out.push({ path: name, method, crc, compSize, size, dataStart, localOffset });
+  }
+  // FIX-T18 round 2(Codex review-FIX-T18 P0 :499): 항목마다 [local header 시작, 압축 데이터 끝) 구간이 파일 안에 있고 서로 겹치지 않아야 한다.
+  // 겹치면(같은 local header 를 여러 레코드가 가리키거나, 한 항목의 데이터 안에 다른 항목이 들어 있으면) 같은 압축 바이트를 여러 번 풀게 되어
+  // 출력 예산으로는 CPU 를 묶을 수 없다 → 묶음 전체 거부. 구간이 서로 겹치지 않으면 한 ZIP 에서 푸는 압축 바이트 합 ≤ 파일 크기.
+  const ranges = out.map((e) => ({ start: e.localOffset, end: e.dataStart + e.compSize, path: e.path })).sort((a, b) => a.start - b.start || a.end - b.end);
+  for (let k = 1; k < ranges.length; k++) {
+    if (ranges[k]!.start < ranges[k - 1]!.end) {
+      throw new ZipFormatError('ZIP 항목의 데이터 구간이 겹칩니다', { paths: [ranges[k]!.path.slice(0, 200)] });
+    }
   }
   return { entries: out, records: count };
 }
@@ -263,7 +279,8 @@ function decodeEntities(s: string): string {
   return s.replace(/&(#x[0-9a-f]{1,6}|#[0-9]{1,7}|[a-z]{2,6});/gi, (all, ent: string) => {
     if (ent[0] === '#') {
       const code = ent[1] === 'x' || ent[1] === 'X' ? parseInt(ent.slice(2), 16) : parseInt(ent.slice(1), 10);
-      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : all;
+      // FIX-T18 round 2(놓친 케이스): NUL(0)·짝 없는 서로게이트(D800–DFFF) 를 만들지 않는다 — 그대로 둔다.
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : all;
     }
     return ENTITIES[ent.toLowerCase()] ?? all;
   });
@@ -279,18 +296,63 @@ const HTML_BLOCK_TAGS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
 const isAsciiLetter = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 const isTagNameChar = (c: number) => isAsciiLetter(c) || (c >= 48 && c <= 57) || c === 45 || c === 58;
 
+/**
+ * FIX-T18 round 2(선형성 검사): htmlToText 가 실제로 살펴본 글자 수(탐색 구간 길이 + 글자 단위 비교 + 반복 횟수)를 세는 계수기.
+ * 시험은 벽시계 대신 이 값이 입력 길이에 비례하는지(입력 글자당 상수 이하)를 본다 — 같은 구간을 다시 훑는 구현(제곱)이면 바로 드러난다.
+ */
+export interface HtmlScanStats {
+  steps: number;
+}
+
 /** from 부터 `</name`(대소문자 무시, 뒤가 이름 글자가 아님) 의 위치. 없으면 -1. 앞으로만 훑는다(선형). */
-function findClosingTag(html: string, name: string, from: number): number {
+function findClosingTag(html: string, name: string, from: number, st: HtmlScanStats): number {
   let pos = from;
   for (;;) {
     const k = html.indexOf('</', pos);
+    st.steps += (k < 0 ? html.length : k + 2) - pos + 1;
     if (k < 0) return -1;
     // 이름을 글자 단위로 비교(ASCII 대소문자 무시) — 조각 문자열을 만들지 않는다.
     let m = 0;
     while (m < name.length && (html.charCodeAt(k + 2 + m) | 0x20) === name.charCodeAt(m)) m++;
+    st.steps += m + 1;
     if (m === name.length && !isTagNameChar(html.charCodeAt(k + 2 + m))) return k;
     pos = k + 2;
   }
+}
+
+const isHtmlSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 12 || c === 13;
+
+/**
+ * FIX-T18 round 2(Codex review-FIX-T18 놓친 케이스 "속성 안의 `>`"): 태그 이름 뒤 from 부터 태그를 끝내는 `>` 의 위치. 없으면 -1.
+ * `=` 바로 뒤(공백 허용)의 따옴표 값 안 `>` 는 태그 끝이 아니다(브라우저와 같음). 닫히지 않은 따옴표는 끝까지 속성 값(-1).
+ * 글자마다 한 번만 본다 — 따옴표 값은 indexOf 로 건너뛰고 그 자리부터 이어 간다(선형).
+ */
+function findTagEnd(html: string, from: number, st: HtmlScanStats): number {
+  const n = html.length;
+  let k = from;
+  while (k < n) {
+    const c = html.charCodeAt(k);
+    st.steps++;
+    if (c === 62) return k; // '>'
+    if (c === 61) {
+      // '=' 뒤 공백을 건너뛰고 따옴표로 시작하면 짝 따옴표까지 한 번에
+      k++;
+      while (k < n && isHtmlSpace(html.charCodeAt(k))) {
+        k++;
+        st.steps++;
+      }
+      const q = html.charCodeAt(k);
+      if (q === 34 || q === 39) {
+        const close = html.indexOf(q === 34 ? '"' : "'", k + 1);
+        st.steps += (close < 0 ? n : close) - k + 1;
+        if (close < 0) return -1;
+        k = close + 1;
+      }
+      continue;
+    }
+    k++;
+  }
+  return -1;
 }
 
 /**
@@ -300,9 +362,14 @@ function findClosingTag(html: string, name: string, from: number): number {
  * FIX-T18 round 1(Codex review-T18 P0 :248): 정규식 대신 한 번 훑는 토큰 순회(선형 시간). 모든 탐색(indexOf)은 현재 위치에서 앞으로만 가고,
  * 찾은 곳까지 위치를 옮기거나(소비) 찾지 못하면 그 자리에서 끝낸다 — 같은 구간을 다시 훑지 않는다.
  * 닫히지 않은 주석·script/style/noscript/template/title 은 나머지를 버리고(브라우저와 같음), `>` 없는 태그 시작도 나머지를 버린다.
+ *
+ * FIX-T18 round 2: (P2 :366) script/style/noscript/template/title 은 `<script/>` 처럼 `/` 로 끝나도 자체 종료가 아니다(HTML 은 void 요소가 아니면
+ * `/` 를 무시) — 언제나 짝 닫는 태그까지(없으면 끝까지) 버린다. 속성 따옴표 값 안의 `>` 는 태그 끝이 아니다.
+ * 탐색 위치는 언제나 앞으로만 간다 — `stats.steps`(살펴본 글자 수)는 입력 길이의 상수 배 이하다(시험이 확인).
  */
-export function htmlToText(html: string): { text: string; title: string | null } {
+export function htmlToText(html: string, stats?: HtmlScanStats): { text: string; title: string | null } {
   if (html.length > HTML_TO_TEXT_MAX_INPUT) throw new ImportInvalidError('HTML 이 너무 큽니다');
+  const st: HtmlScanStats = { steps: 0 };
   const out: string[] = [];
   let titleRaw: string | null = null;
   let h1: string[] | null = null;
@@ -320,7 +387,9 @@ export function htmlToText(html: string): { text: string; title: string | null }
   let pending = 0;
   let i = 0;
   while (i < n) {
+    st.steps++;
     const lt = html.indexOf('<', i);
+    st.steps += (lt < 0 ? n : lt) - i + 1;
     if (lt < 0) break;
     const c1 = html.charCodeAt(lt + 1);
     const closing = c1 === 47; // '/'
@@ -333,20 +402,29 @@ export function htmlToText(html: string): { text: string; title: string | null }
     if (c1 === 33 && html.startsWith('<!--', lt)) {
       if (lt > pending) emit(html.slice(pending, lt));
       const end = html.indexOf('-->', lt + 4);
+      st.steps += (end < 0 ? n : end + 3) - (lt + 4) + 1;
       pending = i = end < 0 ? n : end + 3; // 닫히지 않은 주석: 나머지는 주석
       if (end >= 0) out.push(' ');
       continue;
     }
     if (lt > pending) emit(html.slice(pending, lt));
-    const gt = html.indexOf('>', nameStart);
+    // 이름을 먼저 읽는다(글자 단위, 최대 11자) — 그 뒤부터 태그 끝을 찾는다.
+    let j = nameStart;
+    while (j < n && j - nameStart <= 10 && isTagNameChar(html.charCodeAt(j))) j++;
+    st.steps += j - nameStart + 1;
+    let gt: number;
+    if (markup) {
+      gt = html.indexOf('>', nameStart);
+      st.steps += (gt < 0 ? n : gt) - nameStart + 1;
+    } else {
+      gt = findTagEnd(html, j, st);
+    }
     if (gt < 0) {
-      pending = n; // '>' 없는 태그 시작: 나머지는 태그(버림) — 뒤에 '>' 가 없으므로 다시 훑을 일이 없다
+      pending = n; // '>' 없는 태그 시작(또는 닫히지 않은 따옴표 값): 나머지는 태그(버림) — 끝까지 훑었으므로 다시 훑을 일이 없다
       break;
     }
     pending = i = gt + 1;
     if (markup) continue;
-    let j = nameStart;
-    while (j < gt && j - nameStart <= 10 && isTagNameChar(html.charCodeAt(j))) j++;
     if (j - nameStart > 10) continue; // 아는 이름(최대 8자)보다 긴 이름 — 지우기만
     const name = html.slice(nameStart, j).toLowerCase();
     if (closing) {
@@ -363,19 +441,21 @@ export function htmlToText(html: string): { text: string; title: string | null }
       h1Open = true;
       continue;
     }
-    if (HTML_RAW_TEXT_TAGS.has(name) && html.charCodeAt(gt - 1) !== 47) {
-      const end = findClosingTag(html, name, i);
+    // FIX-T18 round 2(P2 :366): 끝의 '/' 와 상관없이 raw text 요소 — 짝 닫는 태그까지(없으면 끝까지) 버린다.
+    if (HTML_RAW_TEXT_TAGS.has(name)) {
+      const end = findClosingTag(html, name, i, st);
       if (end < 0) {
         pending = n; // 닫히지 않은 script 등: 나머지는 그 요소의 내용(버림)
         break;
       }
       if (name === 'title' && titleRaw === null) titleRaw = html.slice(i, Math.min(end, i + 1000));
       out.push(' ');
-      const gt2 = html.indexOf('>', end + 2);
+      const gt2 = findTagEnd(html, end + 2 + name.length, st);
       pending = i = gt2 < 0 ? n : gt2 + 1;
       continue;
     }
   }
+  if (stats) stats.steps += st.steps;
   if (pending < n) emit(html.slice(pending));
   const oneLine = (s: string) => decodeEntities(s).replace(/\s+/g, ' ').trim();
   const text = decodeEntities(out.join(''))
@@ -447,8 +527,12 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
   const seenIds = new Set<string>();
   let attachments = 0;
   // FIX-T18 round 1(Codex review-T18 P0 :328): 바깥·안쪽 ZIP 이 함께 쓰는 하나의 예산. 풀기 전에 선언 크기로 검사한다.
-  const budget = { records: 0, inflated: 0, text: 0, nested: 0 };
-  const spend = (bytes: number) => {
+  // FIX-T18 round 2(Codex review-FIX-T18 P0 :499): 푸는 압축 입력 바이트(compressed)도 센다. 한 ZIP 안 구간은 서로 겹치지 않으므로(listZip)
+  // 압축 입력 합 ≤ 바깥 파일 + 풀린 중첩 ZIP 합 — 이 상한은 그 관계가 깨지는 회귀를 막는 방어선이다.
+  const budget = { records: 0, inflated: 0, compressed: 0, text: 0, nested: 0 };
+  const spend = (compressed: number, bytes: number) => {
+    budget.compressed += compressed;
+    if (budget.compressed > IMPORT_MAX_TOTAL_COMPRESSED_BYTES) throw new ImportTooLargeError('푸는 압축 데이터가 너무 큽니다');
     budget.inflated += bytes;
     if (budget.inflated > IMPORT_MAX_TOTAL_INFLATED_BYTES) throw new ImportTooLargeError('풀린 내용이 너무 큽니다(중첩 ZIP 포함 최대 128MB)');
   };
@@ -466,7 +550,7 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
         if (e.size > MAX_NESTED_ZIP_BYTES) throw new ImportTooLargeError('안쪽 ZIP 이 너무 큽니다');
         budget.nested += 1;
         if (budget.nested > IMPORT_MAX_NESTED_ARCHIVES) throw new ImportInvalidError(`안쪽 ZIP 이 너무 많습니다(최대 ${IMPORT_MAX_NESTED_ARCHIVES}개)`);
-        spend(e.size);
+        spend(e.compSize, e.size);
         walk(extract(buf, e), display, depth + 1);
         continue;
       }
@@ -495,7 +579,7 @@ export function parseImportArchive(kind: ImportFileKind, zip: Uint8Array): Parse
       } else {
         budget.text += e.size;
         if (budget.text > IMPORT_MAX_TOTAL_TEXT_BYTES) throw new ImportTooLargeError('풀린 텍스트가 너무 큽니다(최대 64MB)');
-        spend(e.size);
+        spend(e.compSize, e.size);
         item = parseImportFile(kind, e.path, display, extract(buf, e));
       }
       if (seenIds.has(item.externalId)) {
@@ -566,6 +650,8 @@ export const IMPORT_OUTCOMES = [
   'skipped_conflict',
   'skipped_unsupported',
   'failed_changed',
+  // FIX-T18 round 2(Codex review-FIX-T18 P1): 동일 항목의 빠진 원본 바이트만 기존 출처 버전에 채움(소재·출처·버전 그대로).
+  'original_backfilled',
 ] as const;
 export type ImportOutcome = (typeof IMPORT_OUTCOMES)[number];
 
@@ -577,6 +663,7 @@ export const IMPORT_OUTCOME_LABEL: Record<ImportOutcome, string> = {
   skipped_conflict: '충돌 — 덮어쓰지 않고 건너뜀',
   skipped_unsupported: '지원 안 함 — 건너뜀',
   failed_changed: '미리보기 뒤 내용이 바뀜 — 건너뜀',
+  original_backfilled: '원본 보충(빠진 원본 파일만 채움, 소재 그대로)',
 };
 
 /** 확정 선택: item_ids(가져올 항목) ∪ folders(그 폴더·하위 폴더의 new 항목). 충돌은 version_ids 에 있을 때만 새 버전. */
@@ -584,18 +671,27 @@ export interface ImportSelection {
   itemIds: ReadonlySet<string>;
   folders: readonly string[];
   versionIds: ReadonlySet<string>;
+  /**
+   * FIX-T18 round 2(Codex review-FIX-T18 P1): "원본 보충" 을 고른 동일(identical) 항목 — 기존 출처 버전에 원본 행이 없을 때(0039 이전 가져오기)만
+   * 올린 바이트(sha256 = raw_hash)를 채운다. 새 항목·폴더 선택과 별개의 명시 선택이다(선택 규칙을 넓히지 않음).
+   */
+  backfillIds?: ReadonlySet<string>;
 }
 
 export function inSelectedFolder(folder: string, folders: readonly string[]): boolean {
   return folders.some((f) => f === '' || folder === f || folder.startsWith(`${f}/`));
 }
 
-/** 원장 항목이 이 선택으로 실제로 쓰기를 일으키는지(미리보기 판정 기준). new 는 item_ids·폴더, conflict 는 version_ids 에 있을 때만. */
+/**
+ * 원장 항목이 이 선택으로 실제로 쓰기를 일으키는지(미리보기 판정 기준). new 는 item_ids·폴더, conflict 는 version_ids 에 있을 때만,
+ * identical 은 backfill_ids 에 있을 때만 'backfill'(원본이 실제로 빠졌는지는 DB 경계가 다시 확인한다).
+ */
 export function effectiveImportChoice(
   item: { id: string; decision: string; folder: string },
   selection: ImportSelection,
-): 'import' | 'version' | null {
+): 'import' | 'version' | 'backfill' | null {
   if (item.decision === 'new') return selection.itemIds.has(item.id) || inSelectedFolder(item.folder, selection.folders) ? 'import' : null;
   if (item.decision === 'conflict') return selection.versionIds.has(item.id) ? 'version' : null;
+  if (item.decision === 'identical') return selection.backfillIds?.has(item.id) ? 'backfill' : null;
   return null;
 }

@@ -620,7 +620,7 @@ export const ROW_SCHEMAS = {
     skip_reason: nstr,
     matched_source_id: uuid.nullable(),
     outcome: z
-      .enum(['imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed'])
+      .enum(['imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed', 'original_backfilled'])
       .nullable(),
     target_capture_id: uuid.nullable(),
     target_source_id: uuid.nullable(),

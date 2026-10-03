@@ -10,7 +10,8 @@ export const runtime = 'nodejs';
 
 /**
  * POST /api/imports/{id}/commit — 선택 확정(T18, D32 제안).
- * JSON { item_ids?: uuid[], folders?: string[], version_ids?: uuid[] } 또는 폼(item·folder·version 을 여러 번).
+ * JSON { item_ids?: uuid[], folders?: string[], version_ids?: uuid[], backfill_ids?: uuid[] } 또는 폼(item·folder·version·backfill 을 여러 번).
+ * - FIX-T18 round 2: backfill_ids(원본 보충) — 원본 파일이 빠진 동일 항목만. 올린 바이트의 sha256 = 기존 버전 raw_hash 일 때 원본 행만 추가(소재 없음).
  * - item_ids ∪ folders 안의 새 항목 → 새 소재(원문 보존) + 출처(외부 ID) + 출처 버전(원본 checksum).
  * - 동일(같은 외부 ID·checksum) → 건너뜀(멱등). 충돌 → version_ids 에 있을 때만 기존 출처에 새 버전 + 새 소재. 기존 소재는 바꾸지 않는다.
  * 원본을 다시 읽어 미리보기와 checksum 이 다르면 그 항목은 failed_changed(ZIP 자체가 바뀌면 409 import_file_changed).

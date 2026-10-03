@@ -90,7 +90,8 @@ const folderList = (v: unknown): string[] => {
 };
 
 /**
- * 확정 선택 읽기. JSON `{ item_ids, folders, version_ids }` 또는 폼(같은 이름 여러 값: item·folder·version).
+ * 확정 선택 읽기. JSON `{ item_ids, folders, version_ids, backfill_ids }` 또는 폼(같은 이름 여러 값: item·folder·version·backfill).
+ * FIX-T18 round 2: backfill(원본 보충) — 원본 파일이 빠진 동일 항목만(DB 경계가 다시 확인).
  * 아무것도 고르지 않으면 400(빈 확정 금지 — 실수로 전부 건너뛰는 것을 막는다).
  */
 export async function readImportSelection(request: Request): Promise<ImportSelection> {
@@ -99,6 +100,7 @@ export async function readImportSelection(request: Request): Promise<ImportSelec
   let items: string[];
   let folders: string[];
   let versions: string[];
+  let backfills: string[];
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     if (type.startsWith('application/json')) {
@@ -107,11 +109,13 @@ export async function readImportSelection(request: Request): Promise<ImportSelec
       items = uuidList(data.item_ids, 'item_ids');
       folders = folderList(data.folders);
       versions = uuidList(data.version_ids, 'version_ids');
+      backfills = uuidList(data.backfill_ids, 'backfill_ids');
     } else if (type.startsWith('application/x-www-form-urlencoded')) {
       const form = new URLSearchParams(text);
       items = uuidList(form.getAll('item'), 'item');
       folders = folderList(form.getAll('folder'));
       versions = uuidList(form.getAll('version'), 'version');
+      backfills = uuidList(form.getAll('backfill'), 'backfill');
     } else {
       throw new BadRequestError('application/json 또는 폼 형식으로 보내야 합니다');
     }
@@ -119,8 +123,10 @@ export async function readImportSelection(request: Request): Promise<ImportSelec
     if (e instanceof AppError) throw e;
     throw new BadRequestError();
   }
-  if (!items.length && !folders.length && !versions.length) throw new AppError('bad_request', 'import_nothing_selected', '가져올 항목을 하나 이상 고르세요');
-  return { itemIds: new Set(items), folders, versionIds: new Set(versions) };
+  if (!items.length && !folders.length && !versions.length && !backfills.length) {
+    throw new AppError('bad_request', 'import_nothing_selected', '가져올 항목을 하나 이상 고르세요');
+  }
+  return { itemIds: new Set(items), folders, versionIds: new Set(versions), backfillIds: new Set(backfills) };
 }
 
 export function importRunView(r: ImportRunRow) {
@@ -175,7 +181,7 @@ export const IMPORT_ERROR_TEXT: Record<string, string> = {
   import_too_large: '파일이 너무 큽니다. 최대 50MB ZIP 까지 올릴 수 있습니다.',
   import_connector_disabled: '가져오기 커넥터는 준비 중입니다(모의). 내보내기 ZIP 을 올려 가져오세요.',
   import_nothing_selected: '가져올 항목을 하나 이상 고르세요(새 항목, 또는 "새 버전으로 추가" 를 고른 충돌 항목). 아무것도 바꾸지 않았습니다.',
-  import_invalid_selection: '"새 버전으로 추가" 는 충돌 항목만 고를 수 있습니다.',
+  import_invalid_selection: '"새 버전으로 추가" 는 충돌 항목만, "원본 보충" 은 원본 파일이 빠진 동일 항목만 고를 수 있습니다. 아무것도 바꾸지 않았습니다.',
   import_already_committed: '이미 확정한 가져오기입니다.',
   import_not_committable: '이 가져오기는 확정할 수 없는 상태입니다. 파일을 다시 올리세요.',
   import_file_missing: '미리보기에 쓴 파일이 서버에 없습니다. 파일을 다시 올리세요.',

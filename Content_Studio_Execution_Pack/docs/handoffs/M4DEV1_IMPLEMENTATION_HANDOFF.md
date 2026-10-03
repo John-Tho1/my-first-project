@@ -55,3 +55,48 @@
 1. 정리 대기(`oauth_pending_tokens`)가 있는 계정의 **현재** 연결 정보 토큰은 health 판정에서 정리 대기를 빼고 usable 이면 등록한다(정리 대기 토큰 자체는 읽지도 등록하지도 않음). 재시작 전 공급자 상태를 그대로 흉내 내려는 선택인데, 정리 대기 해소 판정(verify_current·cleanup_revoke)이나 차단 불변식을 약하게 만드는 경로가 있는가?
 2. 다시 채우기 표식을 `MockOAuthStore` 인스턴스(globalThis 싱글턴)에 두고 load 실패 시에만 지운다. 키 없음·live 모드는 표식을 남기지 않는다. web 경로(check·refresh·revoke·callback·worker tick·inline worker)와 worker CLI 에 호출을 넣었고 reconcile route·connect·모의 동의 화면에는 넣지 않았다 — 빠진 공급자 호출 경로가 있는가?
 3. `registerRehydrated` 는 Threads 토큰에도 `provider: 'mock_threads'`·`kind: 'access'` 를 붙이고(T13 발급분은 둘 다 없음), Google 형은 새 grant 로 access·refresh 를 묶는다. 이미 아는 토큰은 덮지 않는다. 기존 모의 공급자·시뮬레이터의 토큰 판정(`live()`·`mock*TokenCheck`)과 어긋나는 경우가 있는가?
+
+---
+
+## FIX round 1 (Codex review-M4DEV1)
+- Orchestrator: HEAD_SHA b3041c0 (code only, D28) — reran lint·typecheck·build·unit 830·integration 644·drill:mock 0·real-DB drill:restore PASS.
+
+- 대상 판정: `.handoffs/review-M4DEV1.md`(CHANGES_REQUESTED, BASE `f7d3b37` · HEAD `0d9911b`) — P1 2건 + 놓친 케이스.
+- BASE: `558f0aa`(현재 HEAD) · HEAD_SHA: TBD(커밋하지 않음 — 오케스트레이터가 커밋). 브랜치 `content-studio/m4`. migration 없음. 새 의존성·네트워크 없음.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+| --- | --- | --- |
+| [P1] check/route.ts:25 — 다시 채우기 실패를 무시하고 진행 → 빈 모의 공급자가 토큰을 "알 수 없음"으로 판정 → 연결 정보가 `error` 로 굳음(refresh·worker 도 같음) | `@cs/providers` `mockCredentialWorkAllowed(outcome)`(실패만 false). `apps/web/lib/oauth.ts` `requireMockOAuthReady()` — 실패면 공급자 호출·상태 변경 없이 **503 `mock_rehydration_unavailable`**(`mockRehydrationUnavailable()`). check·refresh·revoke·callback·worker tick route 가 이것을 쓴다. inline worker(`lib/stt.ts`)·worker CLI 는 그 tick 의 배포 작업(`channelAdapters` 없음)·만료 임박 갱신/정리 대기 처리(`credentialRefresh` 없음)를 건너뛴다(업로드 만료·전사는 그대로). 표식은 기존대로 실패 시 지워져 다음 요청·tick 이 다시 읽는다. 화면 폼: 설정 `account_error=mock_rehydration_unavailable`, 배포 `error=mock_rehydration_unavailable`(503 → `live_blocked` 로 뭉개지 않음), 한국어 문구 추가. | 통합 "check·refresh·revoke·worker tick route·inline worker: 503 …"(`oauthTestHooks.beforeMockRehydrationLoad` 로 읽기 실패 주입 → 두 계정 × check/refresh/revoke 503, tick route 503, inline worker `jobs=null`·`credentials=null`, 연결 정보 행·정리 대기 행 `toEqual` 그대로, 작업 state·attempt·nextRunAt 그대로·의도 0, 모의 메모리 0·표식 null → 회복 뒤 check 200 connected, tick CONFIRMED). 통합 "callback: 실패하면 503 … 회복 뒤 같은 callback 성공". 통합 "화면 폼 …". 단위 "FIX1-M4DEV1: … 실패 결과만 연결 정보 작업을 막는다"(실패 → 표식 null → 회복 뒤 성공, load 2회). |
+| [P1] db/oauth.ts:781 — 정리 대기가 있는 계정의 현재 토큰을 유효로 복원 → 회전으로 무효였던 토큰이 유효로 보일 수 있음 | `loadMockCredentialsForRehydration` WHERE 에 `notExists(oauth_pending_tokens where owner_id·channel_account_id 같음)` — refresh_unknown·cleanup_revoke·verify_current 중 하나라도 있으면 계정 통째로 제외. 제외된 계정은 모의 공급자에서 알 수 없는 토큰 그대로(health 차단도 그대로). 기존 통합 시험의 "정리 대기 계정의 현재 토큰은 등록" 기대를 **등록 안 함**으로 바꿨다(동작 변경 — 약화 아님). | 통합 "refresh_unknown·verify_current·cleanup_revoke 계정: …"(로더 결과에 A 없음, 깨끗한 계정은 있음, 재시작 뒤 A 미등록·토큰 확인 false·usable false·pending 표시 유지; check: refresh_unknown·verify_current → connected 아님·usable false; cleanup_revoke → 기존 T13 규칙대로 첫 확인은 정리로 갈음해 정리 대기만 걷히고, 다음 일반 확인이 `invalid_token` → error·usable false; 모든 경우 A 로 성공한 공급자 호출 없음). |
+| 놓친 케이스: 만료·키 버전 누락·복호화되지만 내용이 잘못된 토큰 | `registerRehydrated` 반환을 `'registered' \| 'already_known' \| 'rejected'` 로 — 내용이 잘못된 항목은 "이미 아는 토큰"이 아니라 skipped 로 센다. 접두만 있는 토큰·Date 아닌 만료도 거부. 거부 판정을 이미 아는 토큰 판정보다 먼저. | 통합 "만료된 연결 정보·알 수 없는 키 버전(99)·복호화는 되지만 내용이 잘못된 행 …"(미등록, skipped ≥ 3, 행 그대로, 다른 계정은 등록). 단위 기존 3개 갱신(true/false → 세 값) + 거부 3줄 추가. |
+| 놓친 케이스: Google access 만료·refresh 유효에서 첫 사용 | 코드 변경 없음(기존 `accessExpiresAt` 처리) | 통합 "Google 형 access 는 만료 …"(재시작 → 첫 tick route → 보내기 전 갱신 → 비공개 업로드 CONFIRMED, 세대 증가, 이전 access 무효). |
+| 놓친 케이스: 재시작 뒤 첫 호출이 revoke·callback·inline worker | 코드 변경 없음(위 가드) | 통합 "첫 사용이 연결 해제(revoke) …"(revoked, 모의 공급자에서 철회됨, 정리 대기 0), "첫 사용이 inline worker …"(CONFIRMED), callback 은 위 실패·회복 시험. |
+
+음성 대조: `mockCredentialWorkAllowed` 를 항상 true 로, 로더의 `notExists` 를 빼고 돌리면 이 파일 16개 중 4개 실패(기존 정리 대기 시험·실패 주입 2개·정리 대기 3종)를 확인하고 되돌렸다.
+
+### 바꾼 파일
+`packages/providers/src/oauth.ts`, `packages/providers/src/oauth.test.ts`, `packages/db/src/oauth.ts`(로더 + 시험 훅 `beforeMockRehydrationLoad`), `apps/web/lib/oauth.ts`, `apps/web/lib/distribution.ts`, `apps/web/lib/stt.ts`, `apps/worker/src/cli.ts`, `apps/web/app/api/channel-accounts/[id]/{check,refresh,revoke}/route.ts`, `apps/web/app/api/oauth/callback/route.ts`, `apps/web/app/api/worker/tick/route.ts`, `tests/integration/mock-oauth-rehydrate.test.ts`(8 → 16개, `mediaVariant` 영상 크기를 호출마다 달리해 checksum 중복 방지).
+
+### 실행한 명령과 결과(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, dev 서버 꺼짐)
+| 명령 | 결과 |
+| --- | --- |
+| `corepack pnpm lint` | pass(exit 0) |
+| `corepack pnpm typecheck` | pass(exit 0) |
+| `corepack pnpm build` | pass(exit 0) |
+| `corepack pnpm test` | pass — 42 files, 830 tests |
+| `corepack pnpm test:integration`(단독) | pass — 33 files, 644 tests(397 s) |
+| `corepack pnpm drill:mock` | pass(exit 0) — "불변식 위반 0건", 재시작 행(M3·Threads·YouTube·Instagram) 이전과 같음 |
+| worker CLI 실제 실행 | not_run(분기 판단은 단위 `mockCredentialWorkAllowed` 로만 확인) |
+| `corepack pnpm test:e2e` | not_run(요청 범위 밖) |
+
+### 남은 위험
+1. cleanup_revoke 만 남은 계정은 현재 토큰이 실제로 유효했을 가능성이 크지만(정리 대상은 다른 토큰) 이제 다시 채우지 않는다 — 재시작 뒤 첫 확인은 정리로 갈음해 connected 로 보이고, 다음 실제 사용(전송 401 → 확인)에서 `invalid_token` → 다시 연결 필요. 모의 전용, 안전 쪽 실패.
+2. 다시 채우기 실패 동안 inline worker 는 배포 작업 전체를 건너뛴다(모의 모드에서는 모든 배포 작업이 모의 연결 정보를 쓰므로 계정별 구분 없이). DB 가 계속 실패하면 작업이 대기에 머문다 — 상태 변경 없음, 회복 뒤 다음 tick 이 처리.
+3. reconcile route(`/api/distribution-items/{id}/reconcile`)·connect·모의 동의 화면에는 가드가 없다(연결 정보 공급자 호출 없음 — 이전 인계 위험 4 그대로).
+4. 원래 위험 1·2(DB 를 그대로 믿음, 다른 프로세스 동시 변경)는 그대로다.
+
+### Codex 에 묻는 것
+1. 정리 대기 계정 제외를 kind 구분 없이(cleanup_revoke 포함) 했다. cleanup_revoke 만 있는 계정의 현재 토큰은 등록해도 되는 경우가 있는가, 아니면 지금처럼 일괄 제외가 맞는가(위험 1)?
+2. 실패 시 web route 는 503 으로 막고 inline worker·CLI 는 그 tick 의 배포 작업·만료 임박 갱신을 통째로 건너뛴다. 연결 정보를 쓰지 않는 배포 작업(일반 모의 어댑터)까지 미루는 것이 불변식상 문제 되는 경로가 있는가?
+3. `checkCredential` 은 정리 대기를 정리하면 공급자 확인 없이 health 를 돌려준다(기존 T13 규칙). 다시 채우지 않은 cleanup_revoke 계정이 그 직후 잠깐 connected 로 보이는 것을 이번 범위에서 막아야 하는가?

@@ -106,3 +106,7 @@ CHANGES_REQUESTED
 
 ## FIX2-T16 (914ac36, T16 round 2) — **PASS** → T16 종결(모의 범위)
 - T16: 620ed86 → FIX1 165f0df → **FIX2 914ac36 PASS**. M4 의 T13~T16 모의 범위 모두 Codex 종결.
+
+## M4DEV1 (0d9911b, 모의 OAuth 재수화) — CHANGES_REQUESTED (P1 2)
+- [P1] apps/web/app/api/channel-accounts/[id]/check/route.ts:25 — 재주입 실패를 무시하고 진행하여 일시적 로딩 실패가 연결 오류로 굳어질 수 있다
+- [P1] packages/db/src/oauth.ts:781 — 정리 대기를 무시하면 회전으로 무효화된 이전 토큰을 유효하게 복원한다

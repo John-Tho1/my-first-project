@@ -150,3 +150,7 @@ CHANGES_REQUESTED
 
 ## FIX3-LIVET1 (9273517, LIVE-T1 round 3) — CHANGES_REQUESTED (P0 1)
 - [P0] packages/providers/src/threads-live-oauth.ts:89 — 문자열 error 분기가 일시 신호와 잘못된 코드 필드를 버려 확정 실패를 만든다
+
+## FIX2-T18 (e294aca, T18 round 2) — CHANGES_REQUESTED (P1 1·P2 1)
+- [P1] packages/domain/src/imports.ts:453 — 가짜 raw-text 닫는 태그와 따옴표가 결합하면 정상 HTML의 뒤쪽 본문까지 버린다
+- [P2] packages/domain/src/imports.ts:338 — 따옴표 없는 속성 값 내부의 = 를 새 속성 값 시작으로 해석한다

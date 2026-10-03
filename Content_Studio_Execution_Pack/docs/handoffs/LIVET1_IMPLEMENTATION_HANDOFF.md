@@ -316,3 +316,77 @@ WebFetch 로 받은 본문(마크다운 변환)에 "Updated" 날짜가 보이지
 ## Codex 에게 묻는 것(FIX round 3)
 1. "일시 신호(숫자·문자열·is_transient) → 형식 깨진 코드는 알 수 없음 → 숫자 확정 코드 → (코드·하위 코드 없을 때) 확정 식별자 → 나머지 UNKNOWN, 문구는 확정 범용 결과(코드 100·invalid_request·교환 invalid_grant)를 좁힐 때만" 이 P0 를 닫는가? 특히 (a) 식별자도 코드도 없는 문구 단독 본문까지 UNKNOWN 으로 바꾼 것이 과한가, (b) access_denied·insufficient_scope 를 scope_not_allowed 로, 교환 밖 invalid_grant 를 invalid_token 으로 둔 확정 매핑이 적절한가?
 2. 4xx 본문의 제한 신호를 쓰기 단계에서 ambiguous=true 로 바꾸면서 HTTP 429 자체는 ambiguous 를 달지 않았다. 429 도 쓰기 단계에서 UNKNOWN 으로 남겨야 하는가, 아니면 "요청 제한 응답은 미처리"로 보는 현재 비대칭이 받아들일 만한가?
+
+# FIX round 4 (Codex review-FIX3-LIVET1, 정규화 일원화)
+- Orchestrator: HEAD_SHA f6c3736 (code only, D28) — reran lint·typecheck·build·unit 1126·integration 710(첫 실행이 요약 없이 끝나 단독 재실행으로 확인)·drill:mock 0·real-DB drill:restore PASS.
+- 대상 판정: `.handoffs/review-FIX3-LIVET1.md`(CHANGES_REQUESTED — P0 1) on `9273517`
+- BASE_SHA: `adf064aee5b3669ffed049b2c2dc2644eb86d664`(현재 HEAD, docs 전용 커밋) · HEAD_SHA: TBD(커밋 안 함 — 오케스트레이터가 커밋 후 기록)
+- 범위: D31 1단계 그대로 — Threads·Meta 로 실제 요청 0, fixture 만, 실제 자격 증명·`.env.local`·`./data` 손대지 않음, 실제 게시·실제 갱신 없음. 새 의존성 없음.
+- 배경: 이 분류기는 세 라운드 동안 "본문 형태별 분기마다 일부 필드를 버리는" 같은 종류의 결함이 반복됐다. 이번에는 분기를 고치지 않고 구조를 바꿨다(정규화 1개 + 판정 1개).
+
+## 지적 → 변경 → 시험
+
+### [P0] threads-live-oauth.ts:89 — 문자열 `error` 분기가 함께 온 code·error_subcode·is_transient·형식 깨진 코드를 버림(구조적)
+- 재현(수정 전, 새 시험이 고정 — HEAD 구현으로 새 시험을 돌려 37건 모두 실패 확인 후 되돌림): `mapThreadsError('exchange', 400, { error: 'invalid_client', code: 2, is_transient: true })` → `invalid_client`(ambiguous 없음). `{ error: 'invalid_client', code: 'abc' }` → `invalid_client`. 원인: `parseThreadsErrorBody` 의 문자열 분기가 `code: null, subcode: null, transient: null, malformedCode: false` 를 고정으로 돌려줬다. 같은 종류로, Graph 객체 분기는 최상위 필드를, Threads 분기는 중첩 필드를 읽지 않았다.
+- 변경(`packages/providers/src/threads-live-oauth.ts`):
+  1) **`normalizeThreadsErrorBody`(export, `parseThreadsErrorBody` 대체)** — 형태별 분기 없음. 최상위와 중첩 `error` 객체(있으면) **두 자리 모두에서** 같은 필드 목록을 읽어 한 기록 `NormalizedThreadsError { identifiers[], codes[], numericCode|null, subcodes[], subcode|null, malformedCode, isTransientFlag|null, messages[] }` 에 합친다. 한 자리·형태가 있다고 다른 자리를 버리지 않는다.
+     - 식별자: `error`(문자열)·`error_type`·`type` — trim·소문자, 빈 값 제외, 중복 제거. 중첩 객체 안의 `error` 문자열도 읽는다.
+     - 숫자 코드: `code`·`error_code`, 하위 코드: `error_subcode` — 0 이상 정수만(FIX3 `num()` 그대로). 여러 값이면 모두 보관, `numericCode`·`subcode` 는 정확히 1개일 때만(부가 정보 `providerCode`·`providerSubcode` 로 대표 값을 지어내지 않는다).
+     - `malformedCode`(있는데 형식이 깨진 신호) 범위를 넓혔다: 코드·하위 코드가 정수로 안 읽힘(FIX3) + **is_transient 가 불리언이 아님**(예: `"true"`) + **식별자 자리에 문자열이 아닌 값**(예: `error: 5`, `error_type: 7`; `error` 는 객체 허용).
+     - `isTransientFlag`: 하나라도 true → true, 있는 것이 모두 false → false, 없음 → null.
+     - 문구: `error_description`·`error_message`·`message`·`error_user_msg`·`error_user_title`(두 자리 모두) — 좁히기에만 쓰고 저장하지 않는다.
+     - 인식(공급자 오류 본문으로 볼지): 최상위에 `error`·`error_type`·`error_message`·`error_description`·`error_code`·`error_subcode`·`error_user_msg`·`error_user_title`·`is_transient`·`code` 중 하나라도 null 아닌 값. **새로 `code` 단독·`error_description` 단독 등도 인식**(예: `{ code: 2 }` 는 이제 일시). `type`·`message` 단독은 흔한 이름이라 인식 근거로 쓰지 않는다. 배열은 인식하지 않는다. `#call` 의 2xx 오류 본문 판정도 같은 함수.
+  2) **`classifyThreadsOAuthError(step, n)`(export, 판정 1개)** → `{ kind: 'transient', reason } | { kind: 'definite', code } | { kind: 'unknown', why }`. 우선순위:
+     a) 일시 신호 **하나라도**(숫자 일시 코드 · 일시 식별자 · is_transient=true — 어느 자리든) → transient(제한 신호가 하나라도 있으면 rate_limited, 아니면 server_error)
+     b) malformedCode → unknown · c) 하위 코드 여럿(불일치)·숫자 코드 없이 하위 코드만 → unknown
+     d) 숫자 코드 중 하나라도 확정 표에 없음 → unknown · e) 범용 예외 이름(`OAuthException`·`GraphMethodException`·`FacebookApiException`) 밖의 식별자 중 하나라도 확정 표에 없음 → unknown
+     f) 확정 결과(코드·식별자 전부)가 **한 값으로 일치**해야 definite — 둘 이상이면 conflict(unknown)
+     g) 문구는 f) 결과가 범용(참여한 모든 출처가 코드 100·invalid_request·교환 invalid_grant)일 때만 좁힌다. 문구들이 서로 다른 쪽으로 좁히면 좁히지 않는다. 문구만으로는 아무것도 만들지 않는다(FIX3 그대로).
+     - 이름: 처음 `classifyThreadsError` 로 지었으나 `threads-mock.ts` 의 같은 이름 export 와 `index.ts` 의 `export *` 에서 충돌(typecheck 실패) → `classifyThreadsOAuthError`·`ThreadsOAuthErrorVerdict` 로 바꿨다.
+  3) **`mapThreadsError`** 는 상태 판정(429·5xx·408·비 4xx·비형식 4xx) 뒤 `classifyThreadsOAuthError` 하나만 부른다. 쓰기 단계(exchange·long_lived·refresh)에서 transient·unknown → `ambiguous: true`(transient 의 rate_limited 포함). 읽기 단계(account)는 기존대로(일시 → ambiguous 없음/false, unknown → 401 invalid_token · 그 밖 invalid_request).
+  4) **HTTP 429 도 쓰기 단계면 `ambiguous: true`**(Codex 답 13: 429 가 토큰 발급 전에만 온다는 보장 없음 → 불변식 쪽). 읽기 단계 429 는 그대로(ambiguous 없음). 429 는 본문(확정 invalid_client 포함)과 관계없이 상태가 이긴다.
+  - 우선순위 주석(1~6 단계)과 일시 식별자 표 주석 갱신.
+- **기존 기대와 충돌한 것: 없음** — 기존 단위 164건·통합 전부 그대로 통과(뒤집은 기대 0). 동작이 더 엄격해진 입력(이전 시험에 없던 것): 확정 코드 + 범용이 아닌 모르는 식별자(예: `{ error: { type: 'Foo', code: 190 } }` → 이전 invalid_token, 이제 쓰기 단계 결과 불명·읽기 단계 invalid_request), 서로 다른 확정 신호(코드 101 + invalid_scope 등 → 결과 불명), 코드 100 + invalid_request(교환 → 충돌 결과 불명), `{ code: 2 }`·`{ error_description: … }` 같은 단독 필드 본문(이제 인식), 쓰기 단계 429(이제 ambiguous).
+- 시험:
+  - 단위 `packages/providers/src/threads-live-oauth.test.ts` 새 describe 「정규화 일원화(FIX4-LIVET1 P0)」 +37(164 → 201):
+    - 표 33행: **Codex 재현 2건 그대로**(`{ error: invalid_client, code: 2, is_transient: true }` → server_error·ambiguous·providerCode 2, `{ error: invalid_client, code: 'abc' }` → oauth_exception·ambiguous), 문자열 error + is_transient / 일시 코드 "1" / 제한 코드 4(rate_limited·ambiguous·retryAfterSec) / 형식 깨진 subcode / 하위 코드만 / is_transient "true" / 모르는 코드 / 일치하는 101 / is_transient=false; error·error_type·error_message 충돌 4건(invalid_client vs invalid_scope, invalid_grant vs server_error, 모르는 식별자, OAuthException 은 범용); 코드 101 + invalid_scope, 코드 100 + invalid_request(교환 충돌 / 교환 밖 일치 + 문구로 invalid_client), 좁히는 문구 충돌; 최상위 + 중첩 혼합 8건(중첩 101 + 최상위 is_transient/code 2/code "abc"/code 190 충돌, 중첩 type + 최상위 일시 error_type, 중첩 error.error + error_code 2, error 숫자, error_type 숫자, code 단독, 중첩 error_user_msg 로 좁힘); **429 × 본문 4건**(exchange·long_lived·refresh → rate_limited + ambiguous, account → ambiguous 없음). 모든 행: 확정이면 ambiguous 없음, 코드가 1개가 아니면 providerCode 없음, detail 에 문구·식별자 원문 없음.
+    - 정규화 기록 2건 `toEqual`(문자열 error + code + is_transient 가 모두 남음 / 최상위·중첩 필드가 모두 합쳐짐) + 비인식 4건(`{foo}`, `{type,message}`, 배열, null 값만).
+    - **생성 조합 행렬 1건**: 신호 12종(일시 코드 2 · 일시 식별자 temporarily_unavailable · is_transient true · is_transient false · 형식 깨진 code "abc" · 형식 깨진 subcode "1.5" · 확정 코드 101 · 확정 식별자 invalid_client · 다른 확정 식별자 invalid_scope · 모르는 코드 999 · 모르는 식별자 · 시크릿·redirect 문구)의 모든 부분집합(4095) × 본문 형태 5(평면 Threads · 중첩 Graph · OAuth2 문자열 · 혼합 2종 — 신호를 최상위/중첩에 번갈아 배치, 자리 충돌이면 그 조합은 그 형태에서 건너뜀) × 단계 4 = **본문 13,071개 · 판정 52,284회**(평면 1451 · 중첩 1451 · OAuth2 1979 · 혼합 4095×2). 기대값은 구현과 독립된 단순 판정(oracle): 일시 하나라도 → server_error(쓰기 ambiguous=true, 읽기 false), 아니면 형식 깨짐·모르는 신호 하나라도 → 쓰기 oauth_exception·ambiguous / 읽기 invalid_request, 아니면 확정 신호가 정확히 한 값 → 그 코드(ambiguous 없음), 그 밖 → 결과 불명. 불변식 "쓰기 단계 + 확정 아님 → ambiguous=true" 를 따로 한 번 더 검사(38,973회), 확정 판정 320회. HEAD 구현으로 돌리면 첫 조합(`{ code: 2 }`)에서 실패함을 확인.
+    - 공급자 경유 2건: 코드 교환 성공 뒤 장기 교환 400 `{ error: invalid_client, code: 2, is_transient: true }` → server_error·ambiguous·**shortTokenIssued=true**, `{ error: invalid_client, code: 'abc' }` → oauth_exception·ambiguous·shortTokenIssued=true(놓친 케이스 "장기 교환 문자열 오류에서 UNKNOWN 과 단기 토큰 잔존이 함께 기록되는지").
+  - 통합 `tests/integration/live-threads-oauth.test.ts` +5: callback 코드 교환 {Codex 재현 2건, error/error_type 충돌, **429** + error=invalid_client} → 400 `oauth_exchange_failed` + `reason: provider_error` + **`outcome: unknown`**, 감사 `outcome_ambiguous=yes`·`provider_step=exchange`, 감사에 식별자·문구 원문 없음, 연결 정보 없음, fixture 호출 1회. 장기 교환 400 `{ error: invalid_client, is_transient: true }` → outcome unknown, 감사 `provider_step=long_lived`·`outcome_ambiguous=yes`·`short_token_issued=yes`·`short_token_remote_state=may_be_valid`, 단기 토큰 원문 없음.
+
+### 놓친 케이스(review 목록) 처리
+- 반영: 문자열 error + 숫자 일시 코드·is_transient·형식 깨진 code/error_subcode(단위·통합·행렬), error·error_type·error_message 충돌(단위·통합·행렬), 쓰기 단계별 429 × server_error·is_transient 본문(단위·통합), 장기 교환 문자열 오류의 UNKNOWN + 단기 토큰 잔존(단위·통합).
+- 미반영(남은 위험, FIX round 3 와 같음): 다른 state 로 같은 code 순차·동시 제출, 두 pending 행 동시 묶기·409 변환, 갱신 거부 뒤 pending 정리 완료.
+
+## 바뀐 파일(FIX round 4)
+- `packages/providers/src/threads-live-oauth.ts` — `normalizeThreadsErrorBody`(+`NormalizedThreadsError`) 가 `parseThreadsErrorBody`·`ParsedProviderError` 대체, `classifyThreadsOAuthError`(+`ThreadsOAuthErrorVerdict`, `NEUTRAL_IDENTIFIERS`), `mapThreadsError` 단순화·쓰기 단계 429 ambiguous, 주석
+- 시험: `packages/providers/src/threads-live-oauth.test.ts`(+37, 뒤집은 기대 0), `tests/integration/live-threads-oauth.test.ts`(+5)
+- 문서: 이 인계 문서(추가만)
+- 손대지 않음: T18 인계·DECISIONS·M4_CODEX_VERDICTS·M4_STATUS·다른 인계, `.env.local`, `./data`. (작업 트리의 `docs/handoffs/M4_CODEX_VERDICTS.md` 변경은 이 라운드가 만든 것이 아니다.)
+
+## 실행한 명령(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project unit packages/providers/src/threads-live-oauth.test.ts`(변경 전 시험으로 새 구현) | PASS — 164 tests(기존 기대 충돌 없음) |
+| 같은 파일, 새 시험 + HEAD 구현(일시 교체 후 되돌림, `cmp` 로 복원 확인) | FAIL — 새 시험 37건 실패(행렬 포함) — 새 시험이 결함을 잡는다 |
+| `corepack pnpm lint` | PASS |
+| `corepack pnpm typecheck`(1회차) | FAIL — `classifyThreadsError` 이름이 threads-mock 의 export 와 충돌 → 이름 변경 |
+| `corepack pnpm typecheck`(2회차) | PASS |
+| `corepack pnpm build` | PASS(exit 0) |
+| `corepack pnpm test`(1회차 — build 직후) | FAIL 1 — 새 행렬 시험이 전체 실행 부하에서 기본 10초 제한 초과(10.9s). 반복마다 `expect`·JSON 직렬화를 하던 것을 실패 수집 방식으로 바꾸고 제한 60초 |
+| `corepack pnpm test`(2회차) | PASS — 48 files, 1126 tests |
+| `corepack pnpm test:integration`(단독, unit 과 동시 실행 안 함) | PASS — 35 files, 710 tests |
+| `corepack pnpm drill:mock` | PASS — exit 0, "불변식 위반 0건"(M3·T14·T15·T16), Instagram fetch 호출 0 |
+| `corepack pnpm lint` · `corepack pnpm typecheck`(행렬 수정 뒤 재실행) | PASS · PASS |
+
+## 남은 위험(FIX round 4 기준)
+1. 엄격해진 판정 — 확정 코드 + 범용 아닌 모르는 식별자, 서로 다른 확정 신호, 쓰기 단계 429 가 모두 UNKNOWN 이 된다. 실제 Threads 가 확정 거절에 낯선 `type` 을 붙여 보내면 설정 오류(시크릿 등)도 `outcome: unknown` 으로 보여 사용자가 원인을 바로 알기 어렵다. 범용 이름 목록(`OAuthException`·`GraphMethodException`·`FacebookApiException`)은 Meta 관례 기준이며 Threads 실제 응답은 미확인.
+2. 인식 범위 확대 — 4xx `{ code: … }`·`{ error_description: … }` 단독 본문도 공급자 오류로 본다. 2xx 에서 성공 필드(access_token·id) 없이 이 키가 오면 오류 본문(malformed_response, 쓰기 단계 ambiguous)으로 처리된다. 실제 성공 응답에 이 키들이 함께 오는지는 미확인(성공 필드가 있으면 성공으로 본다).
+3. 행렬의 기대값(oracle)은 구현과 같은 표(확정 101·invalid_client·invalid_scope, 일시 2·temporarily_unavailable)를 고정값으로 쓴다 — 표 자체의 Threads 적용 정확성은 행렬이 검증하지 않는다(Codex 미확인 항목 그대로).
+4. 행렬 시험은 52,284회 판정으로 전체 unit 실행에서 수 초 걸린다(제한 60초). 느린 기기에서 시간이 늘 수 있다.
+5. HEAD 미정 — 커밋 후 SHA 기록 필요. 그 밖 FIX round 3 남은 위험 1·4 와 FIX round 2 남은 위험 4~6 그대로.
+
+## Codex 에게 묻는 것(FIX round 4)
+1. "정규화 1개(최상위 + 중첩 모든 필드 합침, 형식 깨진 신호 범위 확대) → 판정 1개(일시 하나라도 → 형식 깨짐 → 하위 코드 불일치·단독 → 모르는 코드 → 모르는 식별자(범용 이름 제외) → 확정 신호 전부 일치할 때만 확정 → 범용만 문구로 좁힘)" 구조가 P0 와 그 종류(형태별 신호 유실)를 닫는가? 특히 범용 예외 이름 3개를 "중립"으로 두는 것이 불변식 "모르는 신호가 하나라도 있으면 UNKNOWN" 에 비해 너무 느슨하거나(목록 확대 필요) 너무 좁은가?
+2. 쓰기 단계 HTTP 429 를 본문과 관계없이 `ambiguous: true` 로 바꿨다(Codex 답 13). 이 때문에 교환 단계 429 도 `outcome: unknown` 으로 보이고 같은 code 재제출은 막힌다. 429 를 "공급자가 처리하지 않음"으로 보는 근거가 문서에서 확인되기 전까지 이 엄격한 쪽이 맞는가, 아니면 429 + 확정 본문(예: invalid_client)처럼 본문이 결과를 말하는 경우는 다르게 다뤄야 하는가?

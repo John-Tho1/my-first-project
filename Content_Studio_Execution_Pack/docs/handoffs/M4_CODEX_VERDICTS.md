@@ -147,3 +147,6 @@ CHANGES_REQUESTED
 - [P0] packages/domain/src/imports.ts:499 — 겹치는 ZIP 항목으로 같은 압축 데이터를 반복 해제하면 현재 예산으로 CPU 사용량을 제한할 수 없습니다
 - [P1] apps/web/app/captures/[id]/page.tsx:123 — 원본이 없는 기존 가져오기에도 다운로드 링크가 표시되며, 동일 파일 재가져오기로도 원본을 복구할 수 없습니다
 - [P2] packages/domain/src/imports.ts:366 — `<script/>`·`<style/>`를 자체 종료 태그로 취급하여 코드가 소재 본문에 남습니다
+
+## FIX3-LIVET1 (9273517, LIVE-T1 round 3) — CHANGES_REQUESTED (P0 1)
+- [P0] packages/providers/src/threads-live-oauth.ts:89 — 문자열 error 분기가 일시 신호와 잘못된 코드 필드를 버려 확정 실패를 만든다

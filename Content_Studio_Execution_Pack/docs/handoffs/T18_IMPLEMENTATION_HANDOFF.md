@@ -115,3 +115,58 @@
 3. 중첩 예산(레코드 수 디렉터리 포함 5,000 · 실제 푸는 바이트 128MiB · 안쪽 ZIP 16개 · 깊이 1)과 local/central 일치 검사에 남은 우회가 있는가? 특히 같은 local header 를 여러 중앙 레코드가 가리키는 겹침(overlapping entries)은 아직 검사하지 않는다.
 4. `htmlToText` 토큰 순회에 선형이 아닌 경로가 남았는가(decodeEntities·줄 정리 정규식 포함)? CPU 시간 기준 200ms 시험이 회귀 방지로 충분한가?
 5. "유효 선택 0개 → 400" 을 미리보기 판정 기준으로 둔 것(확정 때 재판정으로 결과가 모두 skipped 가 될 수는 있음)과 version_ids 를 충돌 항목으로만 제한한 것이 받아들일 만한가?
+
+## FIX round 2 (Codex review-FIX-T18 + 선형성)
+- Orchestrator: HEAD_SHA e294aca (code only, D28) — reran lint·typecheck·build·unit 1089·integration 705·drill:mock 0·db:migrate 0040·real-DB drill:restore PASS.
+- 입력: `.handoffs/review-FIX-T18.md`(CHANGES_REQUESTED, 6e7ff92 대상) + 오케스트레이터 지적(전체 단위 실행에서 HTML `<` 반복 시험 1,759ms). BASE_SHA: 755bc10856963269ffa7c6b55908104ede833163 · HEAD_SHA: TBD(커밋 안 한 작업 트리 — 오케스트레이터가 커밋).
+- 범위: 파일·모의만. 네트워크·자격 증명·live 커넥터 0, 새 의존성 0, migration 0040(`0040_t18_fix2_backfill`), `./data` 열지 않음, dev 서버 꺼짐.
+- 건드리지 않음: `docs/DECISIONS.md`, `M4_STATUS.md`, `LIVET1_IMPLEMENTATION_HANDOFF.md`, 다른 handoff. `M4_CODEX_VERDICTS.md` 는 작업 트리에서 수정된 상태지만 이 작업의 변경이 아니다(다른 쪽).
+
+### 0. 선형성 조사(오케스트레이터, 먼저)
+- 측정(시간이 아니라 걸음 수): `String.prototype.indexOf` 를 감싸 훑은 글자 수를 센 스크래치 스크립트로 고치기 전 코드(6e7ff92)를 128KB·512KB·2MB 에서 쟀다. 적대 입력 10종 모두 **글자당 훑음 0.83~1.00 으로 크기와 무관(선형)**. `<` 반복은 글자당 indexOf 1회·훑음 1.00, 2MB 168ms(계측 포함) — 제곱 아님. 1,759ms 는 그 시험이 2MB 를 7번(준비 + 3회 최소 × 큰 것 1 + 작은 것 4) 처리하는 동안 병렬 부하가 겹친 벽시계였다.
+- 그래도 시험을 고쳤다: `htmlToText(html, stats?)` 에 **걸음 계수기**(`HtmlScanStats.steps` — 모든 indexOf 구간 길이 + 글자 단위 비교 + 반복 횟수)를 넣고, 시험의 주 판정을 "걸음 ≤ 4 × 입력 글자 + 16"(현재 최대 2.0/글자) + "크기 비율 대비 걸음 비율 ≤ 1.125배" 로 바꿨다. 16KB → 128KB → 512KB → 2MB 순서로 재며 그 자리에서 판정한다(제곱 구현이 2MB 에 닿아 동기 실행으로 멈추기 전에 실패). 시간은 2MB 한 번 CPU 시간(3회 최소) < 1초의 느슨한 보조 확인만.
+- 제곱 구현으로 실패 확인: 태그가 아닌 `<` 마다 끝까지 `>` 를 찾는 탐색(`findTagEnd(html, lt + 1, st)`)을 일부러 넣고 실행 → `< 만 반복`·`</ 만 반복` 2건 실패(`글자당 걸음(16384자): expected 134242304 to be less than or equal to 65552`, 648ms·323ms 에 실패), 원래대로 되돌린 뒤 통과. (첫 시도는 2MB 부터 재는 순서였는데 제곱 구현이 동기 실행으로 멈춰 강제 종료 — 그래서 작은 크기부터 재도록 바꿨다.)
+- 새 적대 입력 5종 추가(닫히지 않은 따옴표 속성, `=` 만, 따옴표 값 안 `>`, `<script/>` 반복, `<script/>` 뒤 `</script x="` 반복). 걸음/글자: 1.0~2.0.
+- 전체 단위 실행(verbose) 에서 이 시험들의 벽시계: 28~1,239ms(`<` 반복 1,232ms) — 판정은 걸음 수라 부하와 무관하게 통과.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+|---|---|---|
+| [P0] domain imports.ts:499 겹치는 ZIP 항목으로 같은 압축 데이터를 반복 해제(CPU 무제한) | `listZip` 이 풀기 **전에** 항목마다 [local header 시작, 압축 데이터 끝) 구간을 모아 정렬하고 서로 겹치면 묶음 전체 거부(`ZipFormatError` "데이터 구간이 겹칩니다"). 구간이 파일(중앙 목록 앞) 안에 있는지는 기존 검사 그대로. 같은 local header 를 가리키는 레코드는 이름이 같으면 중복 이름, 다르면 local/central 불일치로 이미 거부. 바깥·안쪽 ZIP 이 같은 `listZip` 을 쓰므로 중첩에도 적용. 예산에 **압축 입력 바이트**(`budget.compressed`, 상한 `IMPORT_MAX_TOTAL_COMPRESSED_BYTES` = 50MiB + 128MiB)도 더함 — 구간이 겹치지 않으면 넘을 수 없는 방어선 | 단위(`imports-fix2.test.ts` 7): 사슬(항목 i 의 저장 데이터가 뒤 항목 전체를 감쌈 — 각 항목은 이름·방식·CRC·크기 모두 맞음) 3개·첨부 확장자, 레코드 1,000개 사슬, 부분 겹침(선언 압축 크기가 다음 local header 안으로 10바이트) + 올바른 크기 대조는 통과, 같은 local header(같은/다른 이름), 안쪽 ZIP 이 사슬 → 모두 거부. 정상 ZIP(데이터 디스크립터·저장·중첩)은 통과. 겹침 검사를 끄면 4건 실패함을 확인 후 되돌림 |
+| [P1] web captures/[id]/page.tsx:123 원본 없는 가져오기에도 받기 링크, 재가져오기로 복구 불가 | `getImportOriginForCapture` 가 `source_version_originals` 를 left join 해 `hasOriginal` 을 돌려줌 → 소재 상세는 원본 행이 있을 때만 링크, 없으면 "원본 바이트 없음(0039 이전 가져오기) — 같은 파일을 다시 올려 "원본 보충" 을 고르면 채울 수 있습니다". **원본 보충**(선택 규칙을 넓히지 않는 별도 명시 선택): `ImportSelection.backfillIds`(JSON `backfill_ids`, 폼 `backfill`), `effectiveImportChoice` 는 identical 항목이 backfill 에 있을 때만 `'backfill'`. 확정 전 검사: 동일 항목이 아니거나 원본이 빠지지 않았으면 400 `import_invalid_selection`(상태·쓰기 없음). 확정: advisory lock 뒤 다시 확인 — 그 버전(같은 출처·같은 raw_hash, 원본 행 없음)에 올린 바이트의 sha256 = raw_hash 일 때만 `source_version_originals` 에 **INSERT**(0039 트리거가 raw_hash·owner 재확인, 이후 UPDATE·DELETE 금지). 그사이 채워졌으면 `skipped_identical`. 소재·출처·버전·이력은 바꾸지 않음. 원장 outcome `original_backfilled`(target = 기존 출처·버전, 소재 null) — 0040: outcome CHECK 확장 + `import_items_backfill_chk`(보충이면 출처·버전 있음·소재 없음). 묶음 스키마 enum 에 추가. 미리보기 화면: 원본이 빠진 동일 항목에 "원본 보충" 체크 상자와 안내, 결과 줄에 "원본 보충 n". `GET /api/imports/{id}` 는 미리보기 중 `backfillable_item_ids` | 통합(`imports.test.ts` 새 3): 가져온 뒤 a·c 원본 행을 지워(시험 전용 `disable trigger user`) 0038 데이터 흉내 → a `hasOriginal:false`·받기 404, b true, 다른 owner null. 같은 ZIP 재업로드 → 모두 identical, 후보 = a·c(다른 owner 기준 0), API `backfillable_item_ids` 같음. 폴더만 → 400 nothing_selected, b(원본 있음) 보충 → 400 invalid_selection, 원본 수·상태 그대로. 폼 `backfill=a` → 303, 결과 original_backfilled 1·skipped_identical 2, a target = 기존 출처·버전·소재 null, 소재·출처·버전·이력 수 그대로, 원본 +1, 바이트 그대로(BOM·CRLF), sha256 = raw_hash, 받기 200 같은 바이트, `hasOriginal:true`(c 는 false), 기존 소재 원문·revision 그대로, UPDATE·DELETE 거부. 세 번째 업로드: 후보는 c 만, a 보충 → 400, 새 항목에 backfill → 400. 경합: 두 미리보기 중 먼저 확정한 쪽만 보충, 뒤쪽은 400·원본 1개. 잠금 뒤 재확인: `commitImportRun` 의 loadItems 에서 원본을 먼저 채움 → `skipped_identical`·원본 1개. 복원 훈련: original_backfilled 원장과 원본 없는 구 버전이 섞인 묶음 → PASS(원본 행 수 < 버전 수) |
+| [P2] domain imports.ts:366 `<script/>`·`<style/>` 를 자체 종료로 봄 | raw text 요소(script·style·noscript·template·title)는 끝의 `/` 와 상관없이 짝 닫는 태그까지(없으면 끝까지) 버림. round 1 의 `<script/>남음` 시험(잘못된 해석 고정)은 지우고 반대로 단언 | 단위: `<script/>alert(1)</script><p>본문</p>` → "본문", `<style/>`·`<SCRIPT />`·`<noscript/>`, 닫히지 않은 `<script/>` → 앞만, `<title/>탭 제목</title>` → 제목, void 요소 `<br/>`·`<img/>` 는 그대로 |
+
+### 놓친 케이스(리뷰 파일)에서 함께 처리한 것
+- 속성 안의 `>`: 태그 끝 찾기를 `findTagEnd` 로 — `=` 바로 뒤(공백 허용) 따옴표 값은 짝 따옴표까지 건너뜀(글자마다 한 번), 닫히지 않은 따옴표는 나머지를 태그로 버림(브라우저와 같음), `=` 뒤가 따옴표가 아니면 값 안 따옴표는 글자. 닫는 raw text 태그(`</script x=">">`)도 같은 규칙. 단위 5 단언.
+- 숫자 엔티티로 만드는 NUL·짝 없는 서로게이트(`&#0;`·`&#x0;`·`&#xD800;`·`&#55296;`)는 디코딩하지 않고 그대로 둠. 단위.
+- 0038 데이터 업그레이드 뒤 원본 받기·동일 파일 재업로드·구/신 원본 섞인 묶음 복원 — 위 통합 시험.
+- 처리하지 않음: PostgreSQL 별도 연결 동시 확정(DB_DRIVER=postgres 없음), 패딩 없는 base64 의 Node/PostgreSQL 디코더 차이, 다운로드 CSP 의 브라우저 검증, `add_missing` 의 외부 ID unique 충돌 집계.
+
+### 변경 파일
+- 수정: `packages/domain/src/imports.ts`(htmlToText 계수기·findTagEnd·raw text·엔티티, listZip 구간 겹침, 압축 입력 예산, outcome·선택 backfill), `packages/domain/src/bundle.ts`(outcome enum), `packages/db/src/imports.ts`(versionsMissingOriginal·listBackfillableImportItemIds·보충 확정·hasOriginal), `packages/db/src/schema.ts`(CHECK 2), `packages/db/drizzle/meta/_journal.json`, `apps/web/lib/imports.ts`(backfill 선택·문구), `apps/web/app/imports/[id]/page.tsx`(원본 보충 체크 상자·결과), `apps/web/app/captures/[id]/page.tsx`(링크 조건·안내), `apps/web/app/api/imports/[id]/route.ts`(backfillable_item_ids), `apps/web/app/api/imports/[id]/commit/route.ts`(주석), `packages/domain/src/imports-fix1.test.ts`(선형성 시험 교체·P2·놓친 케이스), `tests/helpers/import-zip.ts`(손으로 짠 ZIP·사슬), `tests/integration/imports.test.ts`(새 describe 3 시험 + 복원 훈련 단언 2), `README_KO.md`(가져오기 절 한 문장).
+- 새 파일: `packages/db/drizzle/0040_t18_fix2_backfill.sql`(drizzle-kit 출력 + 머리말 2줄), `packages/db/drizzle/meta/0040_snapshot.json`, `packages/domain/src/imports-fix2.test.ts`.
+
+### 명령과 결과(로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `drizzle-kit generate --name t18_fix2_backfill` → 0040.
+- `corepack pnpm lint`: pass.
+- `corepack pnpm typecheck`: pass.
+- `corepack pnpm build`: pass.
+- `corepack pnpm test`(unit): pass — 48 files, 1089 tests(새 `imports-fix2.test.ts` 7, `imports-fix1.test.ts` 선형성 15종 + P2·놓친 케이스 3).
+- `corepack pnpm test:integration`(혼자): pass — 35 files, 705 tests, 557s(`tests/integration/imports.test.ts` 27, 새 3).
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건".
+- 일부러 넣은 제곱 탐색 → 선형성 시험 2건 fail, 되돌린 뒤 pass(위 0). 겹침 검사 끔 → fix2 4건 fail, 되돌린 뒤 pass.
+- 실제 로컬 DB `db:migrate`(0040)·`drill:restore`: not_run(`./data` 를 열지 말라는 지시 — 오케스트레이터 단계).
+
+### 남은 위험
+- 0040 은 CHECK 를 지우고 다시 만든다(drizzle-kit 출력) — 기존 행 값은 모두 새 목록 안이라 실패하지 않아야 하지만 실제 로컬 DB 적용은 관찰하지 않았다.
+- 원본 보충은 "같은 출처 + 같은 raw_hash + 원본 없음" 버전 모두에 같은 바이트를 넣는다(보통 하나). 원장 target 은 가장 오래된 버전 하나만 가리킨다.
+- 보충 후보 판정은 미리보기 화면·확정 전 검사·잠금 뒤 재확인 세 곳 — 마지막만 권위. 확정 전 검사와 트랜잭션 사이에 채워지면 400 이 아니라 skipped_identical 로 확정된다(시험 있음).
+- 압축 입력 예산은 구간 겹침 거부가 있으면 넘을 수 없는 값이라 단독으로 닿는 시험은 없다(상수 관계만 단언).
+- 걸음 계수기는 토큰 순회만 센다. 뒤의 정규식 후처리(`decodeEntities`·공백 정리)는 세지 않는다 — 두 정규식 모두 겹치는 반복이 없는 형태이고 2MB CPU 시간 < 1초 보조 확인으로만 덮는다.
+- 시험에서 0038 데이터를 흉내 내려고 `alter table source_version_originals disable trigger user` 를 잠깐 쓴다(PGlite 시험 DB 안에서만, finally 로 다시 켬).
+- 화면(소재 상세 안내·미리보기 "원본 보충" 체크 상자)은 build·typecheck 만 — 브라우저로 보지 않음.
+
+### Codex 에게 질문
+1. 구간 겹침 거부(정렬 후 이웃 비교, 디렉터리 레코드 제외)와 압축 입력 예산으로 같은 압축 바이트를 되풀이해 푸는 경로가 모두 막혔는가? 디렉터리 레코드의 local header 를 검사하지 않는 것, 데이터 디스크립터 구간을 범위에 넣지 않는 것이 남은 틈인가?
+2. "원본 보충" 을 새 outcome(`original_backfilled`) + 명시 선택(backfill_ids, 원본이 빠진 동일 항목만)으로 둔 것이 "선택 규칙을 넓히지 않는 별도 경로" 로 충분한가? 같은 raw_hash 버전이 여럿일 때 모두 채우는 것, 원장 target 이 소재 없이 출처·버전만 가리키는 것(0040 CHECK)이 묶음 무결성·복원과 맞는가?
+3. 걸음 계수 기반 선형성 시험(글자당 ≤ 4, 크기 비율 대비 ≤ 1.125배, 작은 크기부터 판정)이 제곱 회귀를 잡기에 충분한가? `findTagEnd` 의 따옴표 처리(`=` 뒤 따옴표만, 닫히지 않으면 나머지 버림)가 선형이고 브라우저와 어긋나 본문을 잃는 경우가 있는가?

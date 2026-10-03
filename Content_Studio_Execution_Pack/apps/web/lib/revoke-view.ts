@@ -11,7 +11,8 @@ export type RevokeIncompleteCodeView = (typeof REVOKE_INCOMPLETE_CODES)[number];
 const ALLOWED = new Set<string>(REVOKE_INCOMPLETE_CODES);
 
 const BLOCKED = '연결 정보는 지우지 않았고, 이 계정은 해제 중으로 남아 배포 실행이 계속 차단됩니다.';
-const RESUME = '작업 처리기가 잠시 뒤 같은 해제 작업을 이어서 마무리하며, 연결 해제를 다시 눌러도 같은 작업으로 이어집니다.';
+// Codex FIX-M4UI P2: 재시도와 완료를 구분한다 — 원인이 해결되지 않으면 재시도해도 끝나지 않을 수 있다.
+const RESUME = '원인이 해결되고 재개 조건이 갖춰지면 작업 처리기가 같은 해제 작업을 다시 시도합니다(연결 해제를 다시 눌러도 같은 작업으로 이어집니다). 해제가 끝날 때까지 이 계정의 배포 실행은 차단됩니다.';
 
 /** incomplete 이유별 문구(무엇이 막혔는지 · 차단 유지 · 다음에 일어나는 일). */
 export const REVOKE_INCOMPLETE_TEXT: Record<RevokeIncompleteCodeView | 'unknown', string> = {

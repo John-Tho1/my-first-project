@@ -24,7 +24,9 @@ describe('M4UI FIX1 — 연결 해제 HTML 폼 결과(revokeRedirectPath·revoke
       expect(n.text).toBe(REVOKE_INCOMPLETE_TEXT[code]);
       expect(n.text).toContain('연결 해제가 끝나지 않았습니다');
       expect(n.text).toContain('배포 실행이 계속 차단됩니다');
-      expect(n.text).toContain('이어서 마무리');
+      expect(n.text).toContain('원인이 해결되고 재개 조건이 갖춰지면');
+      expect(n.text).toContain('해제가 끝날 때까지 이 계정의 배포 실행은 차단됩니다');
+      expect(n.text).not.toMatch(/마무리합니다|마무리하며|자동으로 완료/);
       expect(n.text).not.toContain('연결을 해제했습니다');
     }
     expect(REVOKE_INCOMPLETE_TEXT.revoke_current_no_key).toContain('키를 설정하면');

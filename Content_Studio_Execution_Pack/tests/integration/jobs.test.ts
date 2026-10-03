@@ -34,6 +34,7 @@ import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[i
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { GET as jobGET } from '../../apps/web/app/api/jobs/[id]/route';
 import { GET as planGET } from '../../apps/web/app/api/distribution-plans/[id]/route';
+import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
@@ -592,7 +593,7 @@ describe('API·owner·비밀 제거', () => {
     expect(rc.status).toBe(404);
   });
 
-  it('POST /api/worker/tick: 로그인·같은 출처 필요, 내 작업만 처리, 계획 조회에 CONFIRMED + MOCK 결과, /api/health 에 작업 개수', async () => {
+  it('POST /api/worker/tick: 로그인·같은 출처 필요, 내 작업만 처리, 계획 조회에 CONFIRMED + MOCK 결과, 작업 개수는 /api/ops/summary(owner 범위)', async () => {
     const o = await newOwner();
     const other = await newOwner();
     const x = await executed(o);
@@ -619,10 +620,20 @@ describe('API·owner·비밀 제거', () => {
     expect(pd.items[0].publications[0]).toMatchObject({ is_mock: true, verification: 'MOCK' });
     expect(pd.items[0].publications[0].permalink).toMatch(/^mock:\/\//);
 
-    const h = await healthGET();
-    const hb = await h.json();
-    expect(Object.keys(hb.jobs).sort()).toEqual(['attention_plans', 'blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown']);
-    expect(Object.values(hb.jobs).every((v) => typeof v === 'number')).toBe(true);
+    // D30-3: 작업 상태별 개수는 공개 /api/health 가 아니라 GET /api/ops/summary(로그인한 owner 범위)
+    const summary = async (tok: string) => (await summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookieHeader(tok) }), undefined)).json();
+    const mine = await summary(token);
+    expect(Object.keys(mine.ops.jobs).sort()).toEqual(['blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown']);
+    expect(Object.values(mine.ops.jobs).every((v) => typeof v === 'number')).toBe(true);
+    // o 의 작업은 CONFIRMED(상태별 수 밖), other 의 작업은 아직 QUEUED — o 의 숫자에 other 가 섞이지 않는다
+    expect(mine.ops.jobs).toEqual({ queued: 0, leased: 0, retry_wait: 0, reconciling: 0, unknown: 0, blocked: 0 });
+    expect(typeof mine.ops.attention_plans).toBe('number');
+    const theirs = await summary(await tokenFor(other));
+    expect(theirs.ops.jobs).toMatchObject({ queued: 1, leased: 0, blocked: 0 });
+    // 공개 health 에는 작업 숫자가 없다(inline tick 이 other 의 작업을 처리할 수 있어 summary 확인 뒤에 부른다)
+    const hb = await (await healthGET()).json();
+    expect(hb).not.toHaveProperty('jobs');
+    expect(JSON.stringify(hb)).not.toContain('attention_plans');
   });
 
   it('HTML 폼: 취소·작업 처리 실행은 303 으로 계획 화면(canceled=1·ticked=n), 한 채널 취소 + 한 채널 확인 → partial', async () => {

@@ -87,7 +87,7 @@ import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
 import { accountRateSnapshot, listRemoteSteps, publishedStepCount, remoteStepsPort, type RateInflightJob } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
-import { channelAccounts, distributionItems, distributionPlans, jobEvents, jobs, publications, sendIntents, variants } from './schema';
+import { channelAccounts, distributionItems, jobEvents, jobs, publications, sendIntents, variants } from './schema';
 
 export type SendIntentRow = typeof sendIntents.$inferSelect;
 export type PublicationRow = typeof publications.$inferSelect;
@@ -1474,11 +1474,15 @@ export async function getJobDetail(db: DbOrTx, ownerId: string, jobId: string) {
   };
 }
 
-/** /api/health 용 집계(owner 구분 없이 개수만). */
-export async function jobStateCounts(db: DbOrTx) {
+/**
+ * 배포 작업 상태별 개수(owner 범위, 개수만 — ID·내용 없음). D30-3: 공개 /api/health 에서 빼고 GET /api/ops/summary 로 옮겼다.
+ * 확인 필요 계획 수는 summary 의 attention_plans(owner 범위)로 따로 낸다.
+ */
+export async function jobStateCounts(db: DbOrTx, ownerId: string) {
   const rows = await db
     .select({ state: jobs.state, n: sql<number>`count(*)::int` })
     .from(jobs)
+    .where(eq(jobs.ownerId, ownerId))
     .groupBy(jobs.state);
   const by = new Map(rows.map((r) => [r.state, Number(r.n)]));
   return {
@@ -1488,15 +1492,5 @@ export async function jobStateCounts(db: DbOrTx) {
     reconciling: (by.get('RECONCILING') ?? 0) + (by.get('REMOTE_PROCESSING') ?? 0) + (by.get('CANCEL_REQUESTED') ?? 0),
     unknown: by.get('UNKNOWN') ?? 0,
     blocked: by.get('BLOCKED') ?? 0,
-    attention_plans: await attentionPlanCount(db),
   };
-}
-
-/** T12(D19): 사용자 확인이 필요한 계획(status='attention') 개수. */
-export async function attentionPlanCount(db: DbOrTx): Promise<number> {
-  const rows = await db
-    .select({ n: sql<number>`count(*)::int` })
-    .from(distributionPlans)
-    .where(eq(distributionPlans.status, 'attention'));
-  return Number(rows[0]?.n ?? 0);
 }

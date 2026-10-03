@@ -1,5 +1,5 @@
 /**
- * T20(결정 D22) 운영 화면(/ops)·/api/health 의 숫자. 모두 DB 행·파일 시스템에서 센다 — 원천이 없으면 null("측정 없음").
+ * T20(결정 D22) 운영 화면(/ops)·GET /api/ops/summary 의 숫자(D23(e)·D30-3: 공개 /api/health 에는 숫자 없음). 모두 DB 행·파일 시스템에서 센다 — 원천이 없으면 null("측정 없음").
  * 경로는 응답·화면에 내보내지 않는다(바이트·개수만). 외부 호출 없음.
  */
 import { lstat, readdir } from 'node:fs/promises';
@@ -8,7 +8,11 @@ import { and, asc, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-or
 import { ageHours, backupState, budgetPolicy, cutoffDays, type AppConfig, type BackupState, type CredentialStatus } from '@cs/domain';
 import { monthlyUsage, type CurrencyUsage } from './budget';
 import type { Db } from './client';
-import type { DbOrTx } from './queries';
+import { countCaptures, type DbOrTx } from './queries';
+import { jobStateCounts } from './jobs';
+import { uploadStoreFor } from './uploads';
+
+type JobStateCounts = Awaited<ReturnType<typeof jobStateCounts>>;
 import { credentialHealthCounts } from './oauth';
 import { resolveFromRoot } from './paths';
 import { latestRestoreDrill, type RestoreDrillRow } from './restore-drill';
@@ -474,11 +478,19 @@ export async function incompleteRetentionSweeps(
 }
 
 // ---- GET /api/ops/summary (로그인한 owner 범위, 숫자만) ----
-// D23(e): 공개 /api/health 에서 옮겼다. 폴더 바이트는 이 PC 의 폴더 전체 측정(owner 구분 없음)이라 owner 범위가 아니다.
+// D23(e): 공개 /api/health 에서 옮겼다. 폴더 바이트(disk)는 이 PC 의 폴더 전체 측정(owner 구분 없음)이라 owner 범위가 아니다.
+// D30-3: 남은 health 숫자(jobs 상태별 수·captures·uploads)도 옮겼다. jobs·captures 는 owner 범위 DB 집계,
+// uploads 는 그 owner 의 업로드 임시 폴더(<uploads>/<owner>) 측정(매 요청 측정, 읽기 실패면 null).
 
 export interface OpsSummary {
   backup_age_hours: number | null;
   attention_plans: number;
+  /** 배포 작업 상태별 개수(owner 범위) */
+  jobs: JobStateCounts;
+  /** 소재(capture) 수(owner 범위) */
+  captures: number;
+  /** 업로드 임시 영역 중 이 owner 폴더의 세션 폴더·파일 수·바이트. 측정 실패면 null */
+  uploads: { sessions: number; files: number; bytes: number } | null;
   repeated_failures: number;
   pending_deletes: number;
   /** unavailable(폴더 없음·읽기 실패)이면 null. partial 이면 하한값이고 disk_partial = true */
@@ -496,6 +508,11 @@ export async function opsSummary(db: Db, ownerId: string, config: AppConfig, now
   return {
     backup_age_hours: last ? ageHours(last.createdAt, now) : null,
     attention_plans: await countAttentionPlans(db, ownerId),
+    jobs: await jobStateCounts(db, ownerId),
+    captures: await countCaptures(db, ownerId),
+    uploads: await uploadStoreFor(config)
+      .usage(ownerId)
+      .catch(() => null),
     repeated_failures: (await repeatedFailures(db, ownerId, now)).length,
     pending_deletes: (await pendingDeleteStats(db, ownerId)).count,
     disk: { db: bytes(disk.db), assets: bytes(disk.assets), uploads: bytes(disk.uploads), exports: bytes(disk.exports) },

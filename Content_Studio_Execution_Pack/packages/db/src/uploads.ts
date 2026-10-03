@@ -118,13 +118,18 @@ export class UploadStore {
     await rm(/*turbopackIgnore: true*/ this.dirFor(ownerId, sessionId), { recursive: true, force: true });
   }
 
-  /** 업로드 임시 영역 사용량(health 용 — 파일 수·바이트만) */
-  async usage(): Promise<{ sessions: number; files: number; bytes: number }> {
+  /**
+   * 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트만).
+   * D30-3: ownerId 를 주면 그 owner 의 폴더(<root>/<owner>)만 센다(GET /api/ops/summary). 생략하면 영역 전체.
+   */
+  async usage(ownerId?: string): Promise<{ sessions: number; files: number; bytes: number }> {
     let sessions = 0;
     let files = 0;
     let bytes = 0;
     const list = (p: string) => readdir(/*turbopackIgnore: true*/ p).catch(() => [] as string[]);
-    for (const o of await list(this.root)) {
+    if (ownerId !== undefined && !isUuid(ownerId)) throw new Error('업로드 경로 식별자가 올바르지 않습니다');
+    const owners = ownerId !== undefined ? [ownerId] : await list(this.root);
+    for (const o of owners) {
       for (const d of await list(path.join(/*turbopackIgnore: true*/ this.root, o))) {
         sessions++;
         for (const n of await list(path.join(/*turbopackIgnore: true*/ this.root, o, d))) {

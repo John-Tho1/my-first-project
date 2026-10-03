@@ -41,6 +41,7 @@ import { runWorkerTick } from '@cs/worker';
 import { GET as assetGET } from '../../apps/web/app/api/assets/[id]/route';
 import { POST as transcribePOST } from '../../apps/web/app/api/assets/[id]/transcribe/route';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { GET as jobsGET } from '../../apps/web/app/api/transcription-jobs/route';
 import { GET as jobGET } from '../../apps/web/app/api/transcription-jobs/[id]/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/transcription-jobs/[id]/cancel/route';
@@ -517,11 +518,33 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
     }
   });
 
-  it('health: stt 모드·준비 안 됨(이름만)·업로드 임시 영역 사용량', async () => {
+  it('health: stt 모드·준비 안 됨(이름만), 업로드 임시 영역 사용량은 공개 health 에 없음(D30-3)', async () => {
     const body = await (await healthGET()).json();
     expect(body.stt).toMatchObject({ mode: 'mock', live_ready: false });
     expect(body.stt.missing).toContain('LIVE_STT_ADAPTER(T08 미구현, 별도 승인 후)');
-    expect(body.uploads).toEqual({ sessions: expect.any(Number), files: expect.any(Number), bytes: expect.any(Number) });
+    expect(body).not.toHaveProperty('uploads');
+  });
+
+  it('D30-3: 업로드 임시 영역 사용량은 GET /api/ops/summary(로그인한 owner 의 폴더만), 다른 owner 의 조각은 세지 않음', async () => {
+    const usageOf = async (token: string) => {
+      const res = await summaryGET(get('/api/ops/summary', token), undefined);
+      expect(res.status).toBe(200);
+      return (await res.json()).ops.uploads as { sessions: number; files: number; bytes: number };
+    };
+    as(B);
+    const bBefore = await usageOf(tokenB);
+    as(A);
+    const aBefore = await usageOf(tokenA);
+    expect(aBefore).toEqual(await uploadStoreFor(loadConfig()).usage(ownerA));
+    const s = await (await createSession({ kind: 'audio', mime: 'audio/mpeg', bytes: 3000, chunk_size: CHUNK })).json();
+    expect((await putChunk(s.session.id, 0, media('mp3', 3000, 9))).status).toBe(201);
+    const aAfter = await usageOf(tokenA);
+    expect(aAfter).toEqual({ sessions: aBefore.sessions + 1, files: aBefore.files + 1, bytes: aBefore.bytes + 3000 });
+    as(B);
+    expect(await usageOf(tokenB)).toEqual(bBefore);
+    as(A);
+    expect((await sessionDELETE(bare(`/api/uploads/sessions/${s.session.id}`, tokenA, 'DELETE'), ctx(s.session.id))).status).toBe(200);
+    expect(await usageOf(tokenA)).toEqual(aBefore);
   });
 });
 

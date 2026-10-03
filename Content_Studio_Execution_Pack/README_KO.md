@@ -309,7 +309,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(`/api/health`·전사 목록 조회 때). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
 - **전사 본문**: 버전 불변. 수정은 새 버전(`base_version` 이 최신이 아니면 409). "이 버전을 소재로 보내기" → 소재(원문 = 전사 본문, 메모 "음성 전사(모의)").
 - **원음 보존**(기본 켬): 끄면 전사 성공 뒤 원본 파일을 지우고 `assets.deleted_at` 을 남긴다(다운로드 410, 채널 초안에 첨부된 파일은 지우지 않음). 내보내기에는 메타데이터만(`asset_deleted` 경고).
-- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). `GET /api/health` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름)와 `uploads`(임시 영역 세션 폴더·파일 수·바이트), 설정 화면 "AI 모드·비용"에서 확인.
+- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). `GET /api/health` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름), 설정 화면 "AI 모드·비용"에서 확인. 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트)은 로그인 뒤 `GET /api/ops/summary` 의 `uploads`(내 폴더만, D30-3).
 - **브라우저 녹음**: `/record` 는 `MediaRecorder` 지원 여부만 알려 준다(미지원 → "이 기기에서는 브라우저 녹음을 지원하지 않습니다 → 파일 업로드"). 녹음 기능은 기기 확인 뒤 추가(docs/01).
 
 | API | 설명 |
@@ -367,7 +367,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `POST /api/distribution-items/{id}/reconcile` | `{}` → `{state_before, state, found, remote}` — 조회만(절대 다시 보내지 않음), 대상 없음 409 `nothing_to_reconcile` |
 | `GET /api/jobs/{id}` | 작업 상태·이력(최근 50)·전송 의도·원격 결과(비밀·본문 없음, lease 소유자는 표시 이름뿐) |
 | `POST /api/worker/tick` | `{max_jobs?(1~20), worker_id?}` → `{worker_id, recovered, leased, results, mode:'MOCK'}` — 로그인 owner 의 작업만 |
-| `GET /api/health` | `jobs: {queued, leased, retry_wait, reconciling, unknown, blocked}` 개수(집계만) 추가 |
+| `GET /api/ops/summary`(로그인) | `ops.jobs: {queued, leased, retry_wait, reconciling, unknown, blocked}` 내 작업 상태별 개수(집계만). T11 에서는 공개 `/api/health` 에 있었으나 D30-3 에서 옮김 |
 
 - migration `0017_t11_jobs`: jobs 열(heartbeat_at·last_error_code·last_retry_class·max_attempts·reconcile_count·cancel_requested_at·done_at), 상태 CHECK 확장(`DONE` → `CONFIRMED`), `send_intents`(결과 한 번만 기록·삭제 금지 트리거), `publications`(모의 CHECK·재확인 열만 변경·삭제 금지 트리거). 둘 다 **내보내기만**(복원 안 함) — 복원한 환경은 원격을 다시 확인해야 한다.
 
@@ -384,7 +384,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | --- | --- |
 | `PUT /api/distribution-items/{id}/mock-scenario` | `{scenario, delay_ms?}` → `{item_id, scenario, delay_ms, notice:'개발용 · 모의 결과 선택 (실제 채널 없음)'}`. 모의 계정 아님 400 `not_mock_account`, 끝난 항목 409 `item_finished`(POST = HTML 폼) |
 | `POST /api/distribution-items/{id}/retry` | `{}` → `{state:'QUEUED', attempt_next, mode:'MOCK'}`. 보류 아님 409 `not_retryable`, 승인 없음 409 `approval_required`, 결과 불명 409 `outcome_unknown`, 한도 409 `attempts_exhausted`, 내용 변경 409 `snapshot_stale` |
-| `GET /api/health` | `jobs.attention_plans`(확인 필요 계획 수) 추가 |
+| `GET /api/ops/summary`(로그인) | `ops.attention_plans`(내 확인 필요 계획 수). T12 에서는 공개 `/api/health` 의 `jobs.attention_plans` 였으나 D30-3 에서 옮김 |
 
 - migration `0018_t12_mock_scenarios`: `mock_scenarios`(항목당 1행, 시나리오 CHECK, 지연 0~5000, 모의 계정 항목만 트리거) — **내보내기만**. 계획 상태 CHECK 에 `attention` 추가(기존 `failed`·`partial` 중 확인 없이 보류·불명이 있는 계획은 `attention` 으로 재분류). 브랜드 프로필 새 버전은 옛 브랜드를 가리키는 활성 승인을 `invalidated:brand_changed` 로 철회한다.
 
@@ -405,7 +405,11 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
   - 배포 파일 ZIP 은 `RETENTION_PACKAGES_DAYS`(30일), 내보내기 ZIP 은 최근 `RETENTION_EXPORT_RUNS_KEEP`(10개)만 남긴다. 실행 기록은 남긴다.
   - 원문 소재·출처·원고 버전·파생본·승인·결과 기록은 지우지 않는다. 업로드 세션은 기존 24시간 자동 만료(D15) 그대로. 앱은 파일 로그를 쓰지 않아 로그 보존 설정은 없다.
   - `RETENTION_SWEEP_MODE=auto` 면 작업 처리기가 한 시간에 한 번 같은 정리를 적용한다(기본 manual).
-- 운영 숫자 `GET /api/ops/summary`(**로그인 필요**, 로그인한 owner 범위): `ops: {backup_age_hours, attention_plans, repeated_failures, pending_deletes, disk{db,assets,uploads,exports}, disk_partial}`. 숫자만, 기록이 없으면 null. 폴더 크기는 이 PC 폴더 전체 측정이며 60초 동안 같은 측정값을 쓴다. 공개 `/api/health` 에는 이 숫자가 없다(D23(e)).
+- 운영 숫자 `GET /api/ops/summary`(**로그인 필요**, 로그인한 owner 범위): `ops: {backup_age_hours, attention_plans, jobs{queued,leased,retry_wait,reconciling,unknown,blocked}, captures, uploads{sessions,files,bytes}, repeated_failures, pending_deletes, disk{db,assets,uploads,exports}, disk_partial, account_health}`. 숫자만, 기록이 없으면 null.
+  - `jobs`(작업 상태별 수)·`attention_plans`·`captures`(소재 수)는 내 DB 행만 센다.
+  - `uploads` 는 업로드 임시 영역 중 **내 폴더**(세션 폴더·파일 수·바이트)를 요청마다 측정한다(읽기 실패면 null).
+  - `disk` 는 이 PC 폴더 전체 측정(owner 구분 없음)이며 60초 동안 같은 측정값을 쓴다.
+- 공개 `GET /api/health` 는 생존·준비 상태만 낸다: `app, version, time_utc, time_msk, timezone, status, modes, llm·stt(모드·준비 여부·빠진 조건 이름), db{driver, ok, migrated}, worker{mode, last_tick_utc}`. 운영 숫자(위 목록, 작업 수·업로드 사용량·소재 수 포함)는 없다(D23(e)·D30-3). `WORKER_MODE=inline` 이면 호출마다 worker tick 1회는 그대로 실행한다.
 
 ### 계정 연결(모의)·비밀 보호 (M4, T13 — 로컬·모의 범위)
 결정 D24(docs/DECISIONS.md). **실제 Threads·Meta 연결 0, 외부 호출 0.** 실계정 연결(T14)은 사용자 승인 후.

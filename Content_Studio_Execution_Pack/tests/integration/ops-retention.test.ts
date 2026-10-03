@@ -376,7 +376,10 @@ describe('보존 정리', () => {
 });
 
 const summary = (cookie: Record<string, string> = {}) => summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookie }), undefined);
-const OPS_KEYS = ['account_health', 'attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures'];
+const OPS_KEYS = ['account_health', 'attention_plans', 'backup_age_hours', 'captures', 'disk', 'disk_partial', 'jobs', 'pending_deletes', 'repeated_failures', 'uploads'];
+const JOB_KEYS = ['blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown'];
+/** D30-3: 공개 /api/health 가 가질 수 있는 키 전부(생존·준비 상태만) */
+const HEALTH_KEYS = ['app', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
 
 describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops 없음, GET /api/ops/summary 는 owner 범위', () => {
   it('공개 /api/health 는 ops 와 그 숫자 키를 내보내지 않는다', async () => {
@@ -411,7 +414,7 @@ describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops �
     const body = await res.json();
     const s = await opsSnapshot(db, A.id, cfg());
     expect(body.ops.attention_plans).toBe(s.jobs.attentionPlans.total);
-    expect(Object.keys(body.ops).sort()).toEqual(['account_health', 'attention_plans', 'backup_age_hours', 'disk', 'disk_partial', 'pending_deletes', 'repeated_failures']);
+    expect(Object.keys(body.ops).sort()).toEqual(OPS_KEYS);
     expect(body.ops.disk_partial).toBe(false);
     expect(typeof body.ops.backup_age_hours).toBe('number');
     expect(body.ops.repeated_failures).toBe(1);
@@ -421,6 +424,81 @@ describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops �
     const text = JSON.stringify(body.ops);
     expect(text).not.toContain(tmp);
     expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/u);
+  });
+});
+
+describe('D30-3 남은 health 숫자도 로그인 뒤로: jobs·uploads·db.captures 는 GET /api/ops/summary(owner 범위)', () => {
+  const ownerJobCounts = async (ownerId: string) => {
+    const rows = await db.select({ state: schema.jobs.state, n: count() }).from(schema.jobs).where(eq(schema.jobs.ownerId, ownerId)).groupBy(schema.jobs.state);
+    const by = new Map(rows.map((r) => [r.state as string, Number(r.n)]));
+    const g = (...s: string[]) => s.reduce((a, k) => a + (by.get(k) ?? 0), 0);
+    return {
+      queued: g('QUEUED'),
+      leased: g('LEASED', 'SENDING'),
+      retry_wait: g('RETRY_WAIT'),
+      reconciling: g('RECONCILING', 'REMOTE_PROCESSING', 'CANCEL_REQUESTED'),
+      unknown: g('UNKNOWN'),
+      blocked: g('BLOCKED'),
+    };
+  };
+  const ownerCaptures = async (ownerId: string) => Number((await db.select({ n: count() }).from(schema.captures).where(eq(schema.captures.ownerId, ownerId)))[0]!.n);
+
+  it('공개 /api/health(ok) 는 생존·준비 키만 — jobs·uploads·db.captures·attention_plans 없음', async () => {
+    const res = await healthGET();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(HEALTH_KEYS);
+    expect(Object.keys(body.db).sort()).toEqual(['driver', 'migrated', 'ok']);
+    expect(Object.keys(body.worker).sort()).toEqual(['last_tick_utc', 'mode']);
+    const text = JSON.stringify(body);
+    for (const k of ['jobs', 'uploads', 'captures', 'attention_plans', 'queued', 'retry_wait', 'sessions', 'bytes']) expect(text).not.toContain(`"${k}"`);
+  });
+
+  it('summary: 세션 없음 401(jobs·uploads·captures 숫자 미노출)', async () => {
+    const res = await summary();
+    expect(res.status).toBe(401);
+    const text = await res.text();
+    for (const k of ['jobs', 'uploads', 'captures', 'queued']) expect(text).not.toContain(k);
+  });
+
+  it('summary: A 의 jobs·captures = A 의 DB 행 수, uploads 는 A 폴더 측정(숫자만)', async () => {
+    const body = await (await summary(cookieHeader(A.token))).json();
+    expect(Object.keys(body.ops.jobs).sort()).toEqual(JOB_KEYS);
+    expect(body.ops.jobs).toEqual(await ownerJobCounts(A.id));
+    expect(body.ops.jobs.blocked).toBeGreaterThanOrEqual(1); // blockedA
+    expect(body.ops.captures).toBe(await ownerCaptures(A.id));
+    expect(body.ops.uploads).toEqual({ sessions: expect.any(Number), files: expect.any(Number), bytes: expect.any(Number) });
+  });
+
+  it('owner 격리: 다른 owner 의 작업·소재를 늘려도 내 숫자는 그대로, 새 owner 는 0(작업)·자기 소재 수만', async () => {
+    const C = await newOwner('ops-d30-c');
+    const D = await newOwner('ops-d30-d');
+    as(C.identity);
+    const before = (await (await summary(cookieHeader(C.token))).json()).ops;
+    expect(before.jobs).toEqual({ queued: 0, leased: 0, retry_wait: 0, reconciling: 0, unknown: 0, blocked: 0 });
+    expect(before.attention_plans).toBe(0);
+    expect(before.captures).toBe(await ownerCaptures(C.id));
+    expect(before.uploads).toEqual({ sessions: 0, files: 0, bytes: 0 });
+    // D 에 작업(QUEUED·BLOCKED)과 소재를 더한다
+    await distribute(D, null);
+    const { content } = await createContent(db, D.id, { title: '격리 확인', body: BODY });
+    const { variant } = await createVariantDraft(db, D.id, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, D.id, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const { items } = await createPlan(db, D.id, { items: [{ variant_id: variant.id, channel_account_id: D.accounts.threads }] });
+    await db.insert(schema.jobs).values({ ownerId: D.id, kind: 'publish', itemId: items[0]!.id, payloadRef: items[0]!.payloadHash, state: 'BLOCKED', nextRunAt: new Date(), idempotencyKey: `d30-${randomUUID()}` });
+    await db.insert(schema.captures).values({ ownerId: D.id, rawText: 'D 의 메모', inputType: 'text', commandKey: `d30-${randomUUID()}` });
+    as(D.identity);
+    const d = (await (await summary(cookieHeader(D.token))).json()).ops;
+    expect(d.jobs).toEqual(await ownerJobCounts(D.id));
+    expect(d.jobs.blocked).toBe(1);
+    expect(d.captures).toBe(await ownerCaptures(D.id));
+    expect(d.captures).toBe(before.captures + 1); // 같은 fixture 로 seed 된 두 owner — D 만 1개 더
+    as(C.identity);
+    const after = (await (await summary(cookieHeader(C.token))).json()).ops;
+    expect(after.jobs).toEqual(before.jobs);
+    expect(after.captures).toBe(before.captures);
+    expect(after.uploads).toEqual(before.uploads);
+    as(A.identity);
   });
 });
 

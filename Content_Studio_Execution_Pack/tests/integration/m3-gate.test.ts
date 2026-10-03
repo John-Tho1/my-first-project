@@ -27,7 +27,7 @@ import {
 } from '@cs/db';
 import { buildAssetKey, loadConfig, type Channel } from '@cs/domain';
 import { createMockAdapterRegistry, LocalStorageAdapter } from '@cs/providers';
-import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { PUT as scenarioPUT, POST as scenarioPOST } from '../../apps/web/app/api/distribution-items/[id]/mock-scenario/route';
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
@@ -249,7 +249,7 @@ describe('A09 — 채널 여러 개 중 일부 성공(API 경로)', () => {
     expect(audit.some((a) => a.entityId === byCh.instagram.id)).toBe(true);
   });
 
-  it('HTML 폼: 모의 시나리오 저장·재시도는 303 으로 계획 화면, /api/health 에 attention_plans', async () => {
+  it('HTML 폼: 모의 시나리오 저장·재시도는 303 으로 계획 화면, /api/ops/summary 에 attention_plans(owner 범위)', async () => {
     const o = await newOwner();
     const v = await reviewVariant(o, 'threads');
     const { plan, items } = await createPlan(db, o.id, { items: [{ variant_id: v, channel_account_id: o.accounts.threads }] });
@@ -269,8 +269,10 @@ describe('A09 — 채널 여러 개 중 일부 성공(API 경로)', () => {
     await executePlan(db, o.id, plan.id, { commandKey: `gate-${randomUUID()}` }, config);
     await tick(o, 0);
     expect((await planRow(plan.id)).status).toBe('attention');
-    const h = await (await healthGET()).json();
-    expect(h.jobs.attention_plans).toBeGreaterThanOrEqual(1);
+    // D30-3: 확인 필요 계획 수는 공개 /api/health 가 아니라 GET /api/ops/summary(로그인한 owner 범위) — 새 owner 라 정확히 1
+    const sum = await (await summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookieHeader(o.token) }), undefined)).json();
+    expect(sum.ops.attention_plans).toBe(1);
+    expect(sum.ops.jobs.blocked).toBe(1);
     await scenarioPOST(form(`/api/distribution-items/${items[0]!.id}/mock-scenario`, { plan_id: plan.id, scenario: 'success' }), ctx(items[0]!.id));
     const r = await retryPOST(form(`/api/distribution-items/${items[0]!.id}/retry`, { plan_id: plan.id }), ctx(items[0]!.id));
     expect(r.status).toBe(303);

@@ -69,3 +69,8 @@ BASE cbb8d38, 커밋 안 함(작업 트리 변경). 화면 표시만 — 작업�
 - dev 서버 새로 시작 뒤 설정 → 배포 계정 연결: Threads·YouTube 연결됨 유지(00:08 연결분).
 - YouTube "연결 확인" → `token_expired`(1시간 access token 만료 — 공급자가 토큰을 알아봄, 예전처럼 unknown token/invalid 아님). "지금 갱신" → "연결 정보를 갱신했습니다", 만료 2027-04-01 08:17 로 갱신 — 다시 연결 없이 성공.
 - 서버 오류 로그 0건.
+
+## 2026-10-03 23:40 — T18·T19 화면 확인(dev 서버, 코드 05bb2bb, .env.local 기본값 COLLECTOR_MODE=disabled)
+- `/collect`: "꺼짐(기본)·주기 실행 꺼짐" 표시, 소스·실행 기록 빈 상태 문구. `https://127.0.0.1/feed.xml` 추가 → `?error=collector_url_blocked` "허용되지 않는 주소입니다 … 저장하지 않았습니다", 소스 목록 그대로(빈 상태). 콘솔 오류 0, 서버 오류 0.
+- `/imports`: 업로드 안내·원본 종류 선택·"커넥터 꺼짐(IMPORT_CONNECTOR_MODE=disabled)"·빈 기록 문구 정상.
+- 확인 안 함: 모의 수집 실행·미리보기·받아들이기 화면(로컬 DB 에 시험 행을 남기지 않으려고 COLLECTOR_MODE 를 바꾸지 않음 — 그 흐름은 통합 시험이 다룸), ZIP 업로드 흐름.

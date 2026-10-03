@@ -15,6 +15,7 @@
 import { and, asc, desc, eq, gte, inArray, isNotNull, lt, ne, notInArray, sql } from 'drizzle-orm';
 import {
   AppError,
+  applyLinkPolicy,
   BadRequestError,
   checkCollectorUrl,
   collectedCaptureText,
@@ -170,8 +171,9 @@ export async function fetchCandidates(adapter: CollectorAdapter, source: Pick<Co
   try {
     const req = { url: source.url, allowlist, maxBytes: COLLECTOR_FEED_MAX_BYTES };
     const res = source.kind === 'url' ? await adapter.fetchPage(req) : await adapter.fetchFeed(req);
+    // 상대 링크는 최종 URL(redirect 뒤) 기준으로 풀렸다 — 그 결과에 주소 정책·허용 목록을 다시 적용한다.
     const parsed = source.kind === 'url' ? parsePage(res.bytes, source.url) : parseFeed(res.bytes, res.finalUrl);
-    return { ok: true, cands: parsed.items.map((it, i) => toCandidate(it, i)) };
+    return { ok: true, cands: applyLinkPolicy(parsed.items.map((it, i) => toCandidate(it, i)), allowlist) };
   } catch (e) {
     if (e instanceof CollectorFetchError) {
       return e.code === 'blocked' ? { ok: false, status: 'blocked', code: `blocked:${e.reason ?? 'invalid'}` } : { ok: false, status: 'failed', code: e.code };
@@ -393,7 +395,17 @@ export async function acceptCollectedItems(
       let target: { captureId: string; sourceVersionId: string } | null = null;
       const p = item.externalKey ? parsed.get(item.externalKey) : undefined;
       if (!selected.has(item.id)) outcome = 'not_selected';
-      else if (!p || p.contentChecksum !== item.contentChecksum || p.rawSha256 !== item.rawSha256) outcome = 'failed_changed';
+      // 다시 읽은 항목이 미리보기와 같아야 한다: 내용 checksum·원본 sha256 에 더해 **해석한 링크**(상대 링크는 최종 URL 기준이라
+      // 원본 조각이 같아도 redirect 경로가 바뀌면 달라진다)와 링크 정책 통과 여부까지(Codex review-T19 P1 :396).
+      else if (
+        !p ||
+        p.contentChecksum !== item.contentChecksum ||
+        p.rawSha256 !== item.rawSha256 ||
+        p.link !== item.link ||
+        p.linkNormalized !== item.linkNormalized ||
+        p.blockedLink
+      )
+        outcome = 'failed_changed';
       else {
         const prev = ctx.accepted.get(p.externalKey!);
         if (prev?.has(p.contentChecksum) || (!prev && p.linkNormalized && ctx.knownUrls.has(p.linkNormalized))) outcome = 'skipped_duplicate';
@@ -451,8 +463,8 @@ async function createCollectedCapture(
     .insert(sourceVersions)
     .values({ sourceId, rawHash: p.rawSha256, fetchedAt: now, excerpt: p.excerpt || null, extractionState: 'collected' })
     .returning();
-  // 원본 조각 그대로(변환 없음) — DB CHECK·트리거가 sha256 = raw_hash, owner 를 다시 확인한다.
-  const raw = Buffer.from(p.raw, 'utf8');
+  // 원본 바이트 그대로(응답 바이트의 구간 — 디코딩·재인코딩 없음, BOM·CRLF 포함) — DB CHECK·트리거가 sha256 = raw_hash, owner 를 다시 확인한다.
+  const raw = Buffer.from(p.rawBytes.buffer, p.rawBytes.byteOffset, p.rawBytes.byteLength);
   await tx.insert(sourceVersionOriginals).values({
     sourceVersionId: ver!.id,
     ownerId,
@@ -544,12 +556,23 @@ export async function runDueCollectorSources(
 ): Promise<DueRunsResult> {
   if (config.COLLECTOR_SCHEDULER !== 'on') return { skipped: 'scheduler_off', ran: 0, previews: 0, failed: 0 };
   if (config.COLLECTOR_MODE !== 'mock' || !adapter) return { skipped: 'collector_not_mock', ran: 0, previews: 0, failed: 0 };
+  // 기한 판정을 SQL 에서 먼저 한다(Codex review-T19 P1 :552 — 예전에는 50개로 자른 뒤 기한을 봐서, 기한 전 소스 50개가 앞에 있으면
+  // 기한이 지난 소스가 매 tick 빠졌다). 기한 = last_run_at + 주기(daily 24h·weekly 7d), 처음(null)은 즉시. 기한이 오래된 순 → id.
+  // 간격은 domain scheduleIntervalMs 와 같은 값(시험이 둘을 대조) — isScheduleDue 로 한 번 더 확인한다.
+  const nowIso = now.toISOString();
+  const dueAt = sql`(${collectorSources.lastRunAt} + case ${collectorSources.schedule} when 'daily' then interval '24 hours' when 'weekly' then interval '7 days' end)`;
   const cands = await db
     .select()
     .from(collectorSources)
-    .where(and(eq(collectorSources.enabled, true), ne(collectorSources.schedule, 'off')))
-    .orderBy(sql`${collectorSources.lastRunAt} asc nulls first`, asc(collectorSources.id))
-    .limit(50);
+    .where(
+      and(
+        eq(collectorSources.enabled, true),
+        inArray(collectorSources.schedule, ['daily', 'weekly']),
+        sql`(${collectorSources.lastRunAt} is null or ${dueAt} <= ${nowIso}::timestamptz)`,
+      ),
+    )
+    .orderBy(sql`${dueAt} asc nulls first`, asc(collectorSources.id))
+    .limit(Math.max(max, 0));
   const out: DueRunsResult = { skipped: null, ran: 0, previews: 0, failed: 0 };
   for (const s of cands) {
     if (out.ran >= max) break;

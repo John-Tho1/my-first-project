@@ -369,3 +369,39 @@ describe('T08 전사 표·지운 원본', () => {
     expect(parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS }).tables.assets[0]!.deleted_at).toBe(TS);
   });
 });
+
+describe('FIX-T19 round 1 수집 항목 원장 상태(Codex review-T19 P1 0041:31)', () => {
+  const SRC = '88888888-8888-4888-8888-888888888881';
+  const RUN = '88888888-8888-4888-8888-888888888882';
+  const ITEM = '88888888-8888-4888-8888-888888888883';
+  const SHA = 'a'.repeat(64);
+  const withItem = (over: Partial<BundleTables['collected_items'][number]>): BundleTables => {
+    const t = tables();
+    t.collector_sources = [
+      { id: SRC, kind: 'rss', url: 'https://a.mock.example/feed.xml', normalized_url: 'https://a.mock.example/feed.xml', host: 'a.mock.example', label: null, enabled: false, schedule: 'off', last_run_at: null, last_status: null, created_at: TS, updated_at: TS },
+    ];
+    t.collector_runs = [
+      { id: RUN, source_id: SRC, trigger: 'manual', mode: 'mock', status: 'preview', error_code: null, counts: {}, result: null, created_at: TS, accepted_at: null, closed_at: null },
+    ];
+    t.collected_items = [
+      {
+        id: ITEM, run_id: RUN, source_id: SRC, position: 0, external_key: 'guid:g1', guid: 'g1', link: null, link_normalized: null, title: 't', excerpt: '', published_text: null, published_at: null,
+        content_checksum: SHA, raw_sha256: SHA, byte_size: 1, decision: 'new', reason: 'new', outcome: null, capture_id: null, source_version_id: null, accepted_at: null, created_at: TS,
+        ...over,
+      },
+    ];
+    return t;
+  };
+
+  it('outcome 이 null(또는 accepted 아님)인데 소재·시각이 채워진 항목은 integrity — 정상(null·모두 비움)은 통과', () => {
+    expect(() => checkIntegrity(withItem({}))).not.toThrow();
+    expect(() => checkIntegrity(withItem({ outcome: 'not_selected' }))).not.toThrow();
+    expect(() => checkIntegrity(withItem({ capture_id: CAP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withItem({ accepted_at: TS }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withItem({ outcome: 'not_selected', capture_id: CAP, accepted_at: TS }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // accepted 인데 연결이 비면 integrity
+    expect(() => checkIntegrity(withItem({ outcome: 'accepted' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // 새 항목이 아닌데 outcome 이 있으면 integrity
+    expect(() => checkIntegrity(withItem({ decision: 'duplicate', reason: 'same_item', outcome: 'not_selected' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+});

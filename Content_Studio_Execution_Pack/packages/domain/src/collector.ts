@@ -288,7 +288,17 @@ export interface XmlScanStats {
   steps: number;
 }
 
-const PREDEFINED: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+/**
+ * 기본 엔티티 5개. Map 이라 Object.prototype 의 이름(`&toString;`·`&__proto__;`·`&constructor;`·`&valueOf;`)을 엔티티로 오인하지 않는다
+ * (Codex review-T19 P2 — 예전 `name in {…}` 는 프로토타입 속성을 통과시켰다).
+ */
+const PREDEFINED: ReadonlyMap<string, string> = new Map([
+  ['amp', '&'],
+  ['lt', '<'],
+  ['gt', '>'],
+  ['quot', '"'],
+  ['apos', "'"],
+]);
 
 /** 기본 엔티티 5개와 숫자 문자 참조만 푼다. 그 밖(&nbsp; 등 선언이 필요한 이름)은 글자 그대로 둔다 — 확장 없음. 선형. */
 export function decodeXmlEntities(s: string, st?: XmlScanStats): string {
@@ -315,7 +325,8 @@ export function decodeXmlEntities(s: string, st?: XmlScanStats): string {
     } else {
       const name = s.slice(amp + 1, semi);
       let rep: string | null = null;
-      if (name in PREDEFINED) rep = PREDEFINED[name]!;
+      const predefined = PREDEFINED.get(name);
+      if (predefined !== undefined) rep = predefined;
       else if (/^#[0-9]{1,7}$/.test(name) || /^#x[0-9a-fA-F]{1,6}$/.test(name)) {
         const cp = name[1] === 'x' ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
         if (cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff)) rep = String.fromCodePoint(cp);
@@ -345,6 +356,15 @@ const isWs = (c: string | undefined) => c === ' ' || c === '\n' || c === '\r' ||
  */
 export function parseXml(xml: string, stats?: XmlScanStats): XmlElement {
   const st: XmlScanStats = { steps: 0 };
+  try {
+    return parseXmlScan(xml, st);
+  } finally {
+    // 거부(예외)된 입력도 그때까지 살펴본 단계 수를 남긴다(Codex review-T19 답 2 — 예전에는 정상 반환 때만 더했다).
+    if (stats) stats.steps += st.steps;
+  }
+}
+
+function parseXmlScan(xml: string, st: XmlScanStats): XmlElement {
   const n = xml.length;
   if (n > COLLECTOR_FEED_MAX_BYTES) throw new FeedParseError('feed_too_large');
   const stack: XmlElement[] = [];
@@ -416,7 +436,8 @@ export function parseXml(xml: string, stats?: XmlScanStats): XmlElement {
     if (k >= n || !isNameStart(xml[k]!)) bad();
     const nameStart = k;
     while (k < n && isNameChar(xml[k]!)) k++;
-    const el: XmlElement = { name: xml.slice(nameStart, k), attrs: {}, children: [], start: i, end: -1 };
+    // 속성 사전은 프로토타입 없는 객체 — `toString`·`__proto__` 같은 속성 이름을 "이미 있음"으로 오판하지 않고, __proto__ 도 일반 키로 저장된다.
+    const el: XmlElement = { name: xml.slice(nameStart, k), attrs: Object.create(null) as Record<string, string>, children: [], start: i, end: -1 };
     let selfClosing = false;
     for (;;) {
       while (k < n && isWs(xml[k])) k++;
@@ -446,7 +467,7 @@ export function parseXml(xml: string, stats?: XmlScanStats): XmlElement {
       if (close < 0) bad();
       const value = xml.slice(k + 1, close);
       if (value.includes('<')) bad();
-      if (attrName in el.attrs) bad();
+      if (Object.hasOwn(el.attrs, attrName)) bad();
       el.attrs[attrName] = decodeXmlEntities(value, st);
       k = close + 1;
     }
@@ -465,7 +486,6 @@ export function parseXml(xml: string, stats?: XmlScanStats): XmlElement {
     i = k;
   }
   if (stack.length || !root) bad();
-  if (stats) stats.steps += st.steps;
   return root!;
 }
 
@@ -495,9 +515,14 @@ export interface FeedItem {
   publishedAt: Date | null;
   /** 소재 원문으로 쓸 텍스트(HTML 은 추출 텍스트 — 파생 값). */
   text: string;
-  /** 원본 조각(피드: <item>…</item> 원문, 페이지: HTML 전체) — 받아들일 때 원본 그대로 보존 */
-  raw: string;
+  /**
+   * 원본 바이트(피드: 응답 바이트 중 <item>…</item>/<entry>…</entry> 구간, 페이지: 응답 바이트 전체 — BOM·CRLF 포함).
+   * 받아들일 때 이 바이트를 그대로 보존한다(원본 sha256·크기·base64 모두 이 값). 디코딩·재인코딩한 문자열이 아니다(Codex review-T19 P0).
+   */
+  rawBytes: Uint8Array;
   rawFormat: 'txt' | 'html';
+  /** 링크가 원문에서 상대 주소였는지(최종 URL 기준으로 풀었음 — 수집 쪽이 정책·허용 목록을 다시 적용한다). */
+  linkRelative: boolean;
 }
 
 export interface ParsedFeed {
@@ -506,14 +531,39 @@ export interface ParsedFeed {
   items: FeedItem[];
 }
 
+/**
+ * UTF-8(fatal) 디코딩. ignoreBOM: BOM 도 글자(U+FEFF)로 남겨 문자열 위치와 바이트 위치가 1:1 로 대응하게 한다(원본 구간을 바이트로 자를 때 필요).
+ * 텍스트 추출에서는 호출 쪽이 BOM 을 따로 뺀다.
+ */
 function decodeUtf8(bytes: Uint8Array): string {
   if (bytes.byteLength > COLLECTOR_FEED_MAX_BYTES) throw new FeedParseError('feed_too_large');
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new FeedParseError('feed_not_utf8');
   }
 }
+
+/**
+ * 문자열 구간 [start, end) 에 해당하는 원본 바이트를 잘라 준다(복사본). s 는 bytes 를 손실 없이(fatal, ignoreBOM) 디코딩한 값이어야 한다.
+ * 구간은 앞에서 뒤로 차례로 요청된다고 가정하고 위치를 이어서 센다(전체 선형). 뒤로 돌아가면 처음부터 다시 센다.
+ */
+function byteSlicer(s: string, bytes: Uint8Array) {
+  let charPos = 0;
+  let bytePos = 0;
+  return (start: number, end: number): Uint8Array => {
+    if (start < charPos) {
+      charPos = 0;
+      bytePos = 0;
+    }
+    bytePos += Buffer.byteLength(s.slice(charPos, start), 'utf8');
+    charPos = start;
+    const len = Buffer.byteLength(s.slice(start, end), 'utf8');
+    return bytes.slice(bytePos, bytePos + len);
+  };
+}
+
+const stripBom = (s: string) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
 const clip = (s: string | null, max: number) => (s === null ? null : Array.from(s).slice(0, max).join(''));
 const clean = (s: string | null | undefined) => {
@@ -528,13 +578,33 @@ function parseDate(s: string | null): Date | null {
   return Number.isFinite(t) ? new Date(t) : null;
 }
 
-function resolveLink(href: string | null, base: string): string | null {
-  if (!href) return null;
+/** 링크 해석. relative = 원문이 절대 URL 이 아니었음(`/x`, `//host/x`, `x` 등 — 기준 URL 로 풀었음). */
+function resolveLink(href: string | null, base: string): { link: string | null; relative: boolean } {
+  if (!href) return { link: null, relative: false };
+  const h = href.trim();
+  let relative = false;
   try {
-    return new URL(href.trim(), base).href;
+    new URL(h);
   } catch {
-    return null;
+    relative = true;
   }
+  try {
+    return { link: new URL(h, base).href, relative };
+  } catch {
+    return { link: null, relative: false };
+  }
+}
+
+/** Atom 텍스트 구성(RFC 4287 §3.1): type 없음·'text' → 글자 그대로, 'html' → HTML 에서 텍스트, 'xhtml' → 원문 XHTML 조각에서 텍스트. */
+function atomText(el: XmlElement, xml: string): string {
+  const t = (el.attrs.type ?? 'text').trim().toLowerCase();
+  if (t === 'xhtml') {
+    // 안쪽 XHTML(보통 <div> 하나)만 넘긴다 — 바깥 <title>/<content> 태그가 HTML 의 title 등으로 해석되지 않게.
+    const els = childElements(el);
+    return els.length ? htmlText(xml.slice(els[0]!.start, els[els.length - 1]!.end)) : xmlText(el);
+  }
+  if (t === 'html' || t === 'text/html') return htmlText(xmlText(el));
+  return xmlText(el);
 }
 
 const htmlText = (s: string) => {
@@ -544,10 +614,11 @@ const htmlText = (s: string) => {
 
 /** RSS 2.0·RSS 1.0(rdf)·Atom 피드 → 항목 목록. baseUrl 은 상대 링크 해석용(최종 URL). */
 export function parseFeed(bytes: Uint8Array, baseUrl: string, stats?: XmlScanStats): ParsedFeed {
-  let xml = decodeUtf8(bytes);
-  if (xml.charCodeAt(0) === 0xfeff) xml = xml.slice(1);
+  // BOM 을 글자로 남긴 채 해석한다(앞 공백으로 취급) — 요소 위치가 응답 바이트 위치와 바로 대응한다.
+  const xml = decodeUtf8(bytes);
   const root = parseXml(xml, stats);
   const rootLocal = localName(root.name);
+  const sliceBytes = byteSlicer(xml, bytes);
   if (root.name === 'rss' || rootLocal === 'RDF') {
     const channel = child(root, 'channel');
     const itemEls = root.name === 'rss' ? (channel ? childElements(channel).filter((c) => c.name === 'item') : []) : childLocal(root, 'item');
@@ -559,15 +630,17 @@ export function parseFeed(bytes: Uint8Array, baseUrl: string, stats?: XmlScanSta
       };
       const body = get('content:encoded') ?? get('description') ?? '';
       const published = clean(get('pubDate') ?? get('dc:date'));
+      const { link, relative } = resolveLink(clean(get('link')), baseUrl);
       return {
         guid: clean(get('guid')),
-        link: resolveLink(clean(get('link')), baseUrl),
+        link,
         title: clip(clean(get('title') !== null ? htmlText(get('title')!) : null), 200),
         publishedText: clip(published, 100),
         publishedAt: parseDate(published),
         text: htmlText(body),
-        raw: xml.slice(it.start, it.end),
+        rawBytes: sliceBytes(it.start, it.end),
         rawFormat: 'txt',
+        linkRelative: relative,
       };
     });
     return { kind: 'rss', title: clip(clean(titleEl ? xmlText(titleEl) : null), 200), items };
@@ -579,19 +652,22 @@ export function parseFeed(bytes: Uint8Array, baseUrl: string, stats?: XmlScanSta
       const links = childLocal(en, 'link');
       const alt = links.find((l) => !l.attrs.rel || l.attrs.rel === 'alternate') ?? null;
       const contentEl = first('content') ?? first('summary');
-      const body = contentEl ? (contentEl.attrs.type === 'text' ? xmlText(contentEl) : htmlText(xmlText(contentEl))) : '';
+      // Atom 기본 type 은 text(RFC 4287) — 예전에는 type 이 없으면 HTML 로 보았다(Codex review-T19 놓친 케이스).
+      const body = contentEl ? atomText(contentEl, xml) : '';
       const titleEl = first('title');
       const published = clean(first('published') ? xmlText(first('published')!) : first('updated') ? xmlText(first('updated')!) : null);
       const idEl = first('id');
+      const { link, relative } = resolveLink(alt?.attrs.href ?? null, baseUrl);
       return {
         guid: clean(idEl ? xmlText(idEl) : null),
-        link: resolveLink(alt?.attrs.href ?? null, baseUrl),
-        title: clip(clean(titleEl ? (titleEl.attrs.type === 'html' ? htmlText(xmlText(titleEl)) : xmlText(titleEl)) : null), 200),
+        link,
+        title: clip(clean(titleEl ? atomText(titleEl, xml) : null), 200),
         publishedText: clip(published, 100),
         publishedAt: parseDate(published),
         text: body.trim(),
-        raw: xml.slice(en.start, en.end),
+        rawBytes: sliceBytes(en.start, en.end),
         rawFormat: 'txt',
+        linkRelative: relative,
       };
     });
     const t = childLocal(root, 'title')[0];
@@ -600,15 +676,30 @@ export function parseFeed(bytes: Uint8Array, baseUrl: string, stats?: XmlScanSta
   throw new FeedParseError('feed_not_feed');
 }
 
-/** 선택 URL(페이지 하나) → 항목 하나. 링크 = 그 URL(최종 URL 아님 — 등록한 주소가 외부 키). */
+/**
+ * 선택 URL(페이지 하나) → 항목 하나. 링크 = 그 URL(최종 URL 아님 — 등록한 주소가 외부 키).
+ * 원본은 응답 바이트 전체 그대로(BOM·CRLF·charset 선언과 무관하게 바이트 보존). 텍스트는 별도로 UTF-8(fatal) 디코딩 + BOM 제거 뒤 추출한다 —
+ * UTF-8 이 아닌 바이트(예: 실제 windows-1251 인코딩)는 텍스트를 만들 수 없어 feed_not_utf8 로 거부(저장 0).
+ */
 export function parsePage(bytes: Uint8Array, pageUrl: string): ParsedFeed {
-  let html = decodeUtf8(bytes);
-  if (html.charCodeAt(0) === 0xfeff) html = html.slice(1);
+  const html = stripBom(decodeUtf8(bytes));
   const { text, title } = htmlToText(html);
   return {
     kind: 'page',
     title: clip(clean(title), 200),
-    items: [{ guid: null, link: pageUrl, title: clip(clean(title), 200), publishedText: null, publishedAt: null, text: text.trim(), raw: html, rawFormat: 'html' }],
+    items: [
+      {
+        guid: null,
+        link: pageUrl,
+        title: clip(clean(title), 200),
+        publishedText: null,
+        publishedAt: null,
+        text: text.trim(),
+        rawBytes: bytes.slice(),
+        rawFormat: 'html',
+        linkRelative: false,
+      },
+    ],
   };
 }
 
@@ -629,12 +720,15 @@ export interface CollectedCandidate {
   publishedAt: Date | null;
   /** 내용 checksum(제목 + 본문, 정규화) — 같은 키의 "고쳐진 글" 판정 */
   contentChecksum: string;
-  /** 원본 조각 sha256 = 출처 버전 raw_hash */
+  /** 원본 바이트 sha256 = 출처 버전 raw_hash = source_version_originals.sha256 */
   rawSha256: string;
   byteSize: number;
   text: string;
-  raw: string;
+  /** 원본 바이트 그대로(FeedItem.rawBytes) */
+  rawBytes: Uint8Array;
   rawFormat: 'txt' | 'html';
+  /** 링크가 원문에서 상대 주소였는지(수집 쪽이 정책·허용 목록 재검사) */
+  linkRelative: boolean;
   blockedLink: boolean;
 }
 
@@ -665,13 +759,27 @@ export function toCandidate(item: FeedItem, position: number): CollectedCandidat
     publishedText: item.publishedText,
     publishedAt: item.publishedAt,
     contentChecksum: contentHash(body),
-    rawSha256: sha256Hex(item.raw),
-    byteSize: new TextEncoder().encode(item.raw).byteLength,
+    rawSha256: createHash('sha256').update(item.rawBytes).digest('hex'),
+    byteSize: item.rawBytes.byteLength,
     text: item.text,
-    raw: item.raw,
+    rawBytes: item.rawBytes,
     rawFormat: item.rawFormat,
+    linkRelative: item.linkRelative && link !== null,
     blockedLink,
   };
+}
+
+/**
+ * 원문이 상대 주소였던 링크는 응답의 최종 URL(redirect 뒤) 기준으로 풀었다. 그 결과는 수집 주소와 같은 정책(https·IP 리터럴·내부 이름 거부)과
+ * owner 허용 목록(호스트 정확 일치)을 다시 통과해야 한다 — 통과하지 못하면 blockedLink(판정 skipped/blocked_link, 받아들이기 failed_changed).
+ * 절대 주소 링크는 예전대로 isFetchableUrl(내부 주소 거부)만 본다(다른 사이트 글을 가리키는 피드가 흔하다 — 링크는 조회하지 않고 출처 표시용).
+ * (Codex review-T19 P1 :396)
+ */
+export function applyLinkPolicy(cands: readonly CollectedCandidate[], allowlist: readonly string[]): CollectedCandidate[] {
+  return cands.map((c) => {
+    if (!c.linkRelative || !c.link || c.blockedLink) return c;
+    return checkCollectorUrl(c.link, allowlist).ok ? c : { ...c, blockedLink: true };
+  });
 }
 
 export interface DedupeContext {

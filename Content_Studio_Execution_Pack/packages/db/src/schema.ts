@@ -1921,7 +1921,8 @@ export const collectedItems = pgTable(
     check('collected_items_outcome_chk', sql`${t.outcome} is null or (${t.decision} = 'new' and ${t.outcome} in ('accepted', 'not_selected', 'skipped_duplicate', 'failed_changed'))`),
     check(
       'collected_items_accepted_chk',
-      sql`(${t.outcome} = 'accepted' and ${t.captureId} is not null and ${t.sourceVersionId} is not null and ${t.acceptedAt} is not null) or (${t.outcome} is distinct from 'accepted' and ${t.captureId} is null and ${t.sourceVersionId} is null and ${t.acceptedAt} is null)`,
+      // FIX-T19 round 1(0042): NULL 에 안전한 식 — outcome 이 null 이어도 식 전체가 null(통과)이 되지 않는다.
+      sql`((${t.outcome} is not distinct from 'accepted') = (${t.captureId} is not null)) and ((${t.outcome} is not distinct from 'accepted') = (${t.sourceVersionId} is not null)) and ((${t.outcome} is not distinct from 'accepted') = (${t.acceptedAt} is not null))`,
     ),
     check('collected_items_checksum_chk', sql`${t.contentChecksum} ~ '^[0-9a-f]{64}$' and ${t.rawSha256} ~ '^[0-9a-f]{64}$'`),
     check('collected_items_key_chk', sql`${t.externalKey} is not null or ${t.reason} in ('no_id', 'limit')`),

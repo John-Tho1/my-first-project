@@ -20,7 +20,8 @@ import {
 } from '@cs/domain';
 
 export type MockCollectorResponse =
-  | { kind: 'ok'; contentType: string; body: string | (() => string) }
+  /** body 가 Uint8Array 면 그 바이트 그대로(BOM·CRLF·UTF-8 아닌 바이트 시험용), 문자열이면 UTF-8 로 인코딩. */
+  | { kind: 'ok'; contentType: string; body: string | Uint8Array | (() => string) }
   | { kind: 'redirect'; location: string }
   | { kind: 'error'; code: 'failed' };
 
@@ -190,7 +191,7 @@ export class MockCollectorAdapter implements CollectorAdapter {
         continue;
       }
       const body = typeof res.body === 'function' ? res.body() : res.body;
-      const bytes = enc.encode(body);
+      const bytes = typeof body === 'string' ? enc.encode(body) : body.slice();
       if (bytes.byteLength > req.maxBytes) throw new CollectorFetchError('too_large');
       return { finalUrl: current, redirects, contentType: res.contentType, bytes };
     }

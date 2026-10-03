@@ -1,8 +1,10 @@
 /**
  * T19(D33 제안) 수집 순수 함수: URL 정책(A05)·해석 IP·redirect 재검사, XML 파서 안전(DTD·엔티티·크기·선형), RSS/Atom/페이지 해석, 중복 판정, 모드.
  */
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
+  applyLinkPolicy,
   checkCollectorUrl,
   checkRedirect,
   checkResolvedAddresses,
@@ -18,6 +20,7 @@ import {
   parsePage,
   parseXml,
   toCandidate,
+  xmlText as xmlTextOf,
   type FeedItem,
 } from './collector';
 import { loadConfig } from './config';
@@ -189,7 +192,7 @@ describe('XML 파서 안전', () => {
       try {
         parseXml(xml, st);
       } catch {
-        // 상한 초과로 거부돼도 단계 수는 남는다
+        // 상한 초과로 거부돼도 단계 수는 남는다(parseXml 이 finally 에서 더한다 — 아래 별도 시험)
       }
       expect(st.steps, name).toBeLessThanOrEqual(xml.length * 4 + 16);
     }
@@ -229,8 +232,11 @@ describe('피드 해석', () => {
     expect(a.text).toContain('딜러');
     expect(a.text).toContain('협상');
     expect(a.text).not.toContain('alert');
-    expect(a.raw.startsWith('<item><guid>g1</guid>')).toBe(true);
-    expect(a.raw.endsWith('</item>')).toBe(true);
+    const aRaw = new TextDecoder().decode(a.rawBytes);
+    expect(aRaw.startsWith('<item><guid>g1</guid>')).toBe(true);
+    expect(aRaw.endsWith('</item>')).toBe(true);
+    expect(a.linkRelative).toBe(true);
+    expect(b.linkRelative).toBe(false);
     expect(b.guid).toBeNull();
     expect(b.text).toBe('본문 둘');
   });
@@ -264,8 +270,9 @@ describe('중복 판정(dedupe)', () => {
     publishedText: null,
     publishedAt: null,
     text: 'body',
-    raw: '<item/>',
+    rawBytes: enc('<item/>'),
     rawFormat: 'txt',
+    linkRelative: false,
     ...over,
   });
   const ctx = (accepted: Record<string, string[]> = {}, urls: string[] = []) => ({
@@ -340,5 +347,130 @@ describe('모드·주기', () => {
     expect(isScheduleDue('daily', new Date('2026-10-02T00:00:00Z'), now)).toBe(true);
     expect(isScheduleDue('weekly', new Date('2026-09-28T00:00:00Z'), now)).toBe(false);
     expect(isScheduleDue('weekly', new Date('2026-09-26T00:00:00Z'), now)).toBe(true);
+  });
+});
+
+describe('FIX-T19 round 1 (Codex review-T19)', () => {
+  const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+  const concat = (...parts: Uint8Array[]) => {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.byteLength;
+    }
+    return out;
+  };
+  const BOM = new Uint8Array([0xef, 0xbb, 0xbf]);
+
+  it('[P2] 프로토타입 이름 엔티티(&toString; &__proto__; &constructor; …)는 글자 그대로 — 함수 문자열·[object Object] 로 바뀌지 않는다', () => {
+    const s = '&toString; &valueOf; &__proto__; &constructor; &hasOwnProperty; &isPrototypeOf; &propertyIsEnumerable;';
+    expect(decodeXmlEntities(s)).toBe(s);
+    const root = parseXml(`<rss>${s}</rss>`);
+    expect(xmlTextOf(root)).toBe(s);
+    expect(xmlTextOf(root)).not.toMatch(/function|\[object/);
+    // 기본 5개는 그대로 풀린다
+    expect(decodeXmlEntities('&amp;&lt;&gt;&quot;&apos;')).toBe(`&<>"'`);
+  });
+
+  it('[P2] 속성 이름이 Object.prototype 이름이어도 "중복"으로 오판하지 않고, 진짜 중복만 거부. __proto__ 도 일반 키', () => {
+    const el = parseXml('<rss toString="1" constructor="2" __proto__="3" hasOwnProperty="4" valueOf="&amp;"/>');
+    expect(Object.keys(el.attrs).sort()).toEqual(['__proto__', 'constructor', 'hasOwnProperty', 'toString', 'valueOf'].sort());
+    expect(el.attrs.toString).toBe('1');
+    expect(el.attrs['__proto__']).toBe('3');
+    expect(el.attrs.valueOf).toBe('&');
+    expect(Object.getPrototypeOf(el.attrs)).toBeNull();
+    expect(() => parseXml('<rss toString="1" toString="2"/>')).toThrow(FeedParseError);
+    // type 속성이 없는 Atom 요소에서 attrs.type 은 상속값이 아니다
+    expect(parseXml('<feed/>').attrs.type).toBeUndefined();
+  });
+
+  it('거부된 입력도 steps 를 남긴다(finally)', () => {
+    const st = { steps: 0 };
+    expect(() => parseXml(`<rss>${'a'.repeat(1000)}<a></b></rss>`, st)).toThrow(FeedParseError);
+    expect(st.steps).toBeGreaterThanOrEqual(1000);
+  });
+
+  it('[P0] 피드: BOM·CRLF·한글이 있는 응답에서 <item> 원본은 응답 바이트의 그 구간과 바이트 단위로 같다(디코딩·재인코딩 아님), sha256·크기도 그 바이트', () => {
+    const body = enc(
+      '<?xml version="1.0" encoding="UTF-8"?>\r\n<rss version="2.0"><channel><title>피드</title>\r\n' +
+        '<item><guid>g1</guid><title>첫 글</title>\r\n<description>줄1\r\n줄2 — 가나다</description></item>\r\n' +
+        '<item><guid>g2</guid><title>둘</title><description>本文 😀</description></item>\r\n</channel></rss>\r\n',
+    );
+    const bytes = concat(BOM, body);
+    const f = parseFeed(bytes, 'https://a.mock.example/feed.xml');
+    const buf = Buffer.from(bytes);
+    let from = 0;
+    for (const it of f.items) {
+      const s = buf.indexOf('<item>', from);
+      const e = buf.indexOf('</item>', s) + '</item>'.length;
+      from = e;
+      const expected = bytes.subarray(s, e);
+      expect(Buffer.compare(Buffer.from(it.rawBytes), Buffer.from(expected))).toBe(0);
+      const c = toCandidate(it, 0);
+      expect(c.rawSha256).toBe(sha(expected));
+      expect(c.byteSize).toBe(expected.byteLength);
+    }
+    expect(f.items[0]!.text).toContain('줄1');
+    // 원본은 CRLF 를 그대로 가진다
+    expect(Buffer.from(f.items[0]!.rawBytes).includes(Buffer.from('\r\n'))).toBe(true);
+  });
+
+  it('[P0] 페이지: BOM·CRLF·UTF-8 아닌 charset 선언이 있어도 원본 = 응답 바이트 전체(같은 sha256·크기), 텍스트는 BOM 없이 따로 추출', () => {
+    const html = enc('<!doctype html>\r\n<html><head><meta charset="windows-1251"><title>제목 — 해외</title></head>\r\n<body><h1>머리</h1><p>본문\r\n둘째 줄</p></body></html>\r\n');
+    const bytes = concat(BOM, html);
+    const p = parsePage(bytes, 'https://a.mock.example/p');
+    const it = p.items[0]!;
+    expect(Buffer.compare(Buffer.from(it.rawBytes), Buffer.from(bytes))).toBe(0);
+    expect(it.rawBytes.subarray(0, 3)).toEqual(BOM);
+    const c = toCandidate(it, 0);
+    expect(c.rawSha256).toBe(sha(bytes));
+    expect(c.byteSize).toBe(bytes.byteLength);
+    expect(it.text).toContain('본문');
+    expect(it.text.charCodeAt(0)).not.toBe(0xfeff);
+    expect(p.title?.charCodeAt(0)).not.toBe(0xfeff);
+    // 원본은 응답 버퍼와 독립(복사본) — 나중에 응답 버퍼가 바뀌어도 원본은 그대로
+    bytes[5] = 0x58;
+    expect(Buffer.compare(Buffer.from(it.rawBytes), Buffer.from(bytes))).not.toBe(0);
+  });
+
+  it('[P0] 실제 windows-1251 바이트(UTF-8 아님)는 텍스트를 만들 수 없어 feed_not_utf8 — 원본을 바꿔 저장하지 않는다', () => {
+    const cp1251 = new Uint8Array([...enc('<html><body><p>'), 0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2, ...enc('</p></body></html>')]);
+    expect(() => parsePage(cp1251, 'https://a.mock.example/p')).toThrow(expect.objectContaining({ code: 'feed_not_utf8' }));
+    expect(() => parseFeed(concat(BOM, cp1251), 'https://a.mock.example/f')).toThrow(expect.objectContaining({ code: 'feed_not_utf8' }));
+  });
+
+  it('Atom: type 없는 content 는 text(RFC 4287 기본값), xhtml 은 원문 XHTML 에서 텍스트(script 제외)', () => {
+    const atom = `<feed xmlns="http://www.w3.org/2005/Atom"><title>A</title>
+<entry><id>urn:1</id><title>하나</title><content>&lt;b&gt;글자 그대로&lt;/b&gt;</content></entry>
+<entry><id>urn:2</id><title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">둘 <b>제목</b></div></title><content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>문단 가</p><script>x()</script></div></content></entry></feed>`;
+    const f = parseFeed(enc(atom), 'https://a.mock.example/atom.xml');
+    expect(f.items[0]!.text).toBe('<b>글자 그대로</b>');
+    expect(f.items[1]!.title).toBe('둘 제목');
+    expect(f.items[1]!.text).toContain('문단 가');
+    expect(f.items[1]!.text).not.toContain('x()');
+  });
+
+  it('[P1] 상대 링크는 최종 URL 기준으로 푼 뒤 주소 정책·허용 목록을 다시 통과해야 한다 — 프로토콜 상대 //다른호스트 는 blocked_link', () => {
+    const rssXml = `<rss version="2.0"><channel><title>t</title>
+<item><guid>r1</guid><title>상대</title><link>/posts/1</link><description>본문</description></item>
+<item><guid>r2</guid><title>프로토콜 상대</title><link>//evil.mock.example/x</link><description>본문</description></item>
+<item><guid>r3</guid><title>절대 다른 사이트</title><link>https://other.mock.example/y</link><description>본문</description></item>
+</channel></rss>`;
+    const f = parseFeed(enc(rssXml), 'https://a.mock.example/new/feed.xml');
+    const cands = applyLinkPolicy(
+      f.items.map((it, i) => toCandidate(it, i)),
+      ['a.mock.example'],
+    );
+    expect(cands.map((c) => [c.link, c.linkRelative, c.blockedLink])).toEqual([
+      ['https://a.mock.example/posts/1', true, false],
+      ['https://evil.mock.example/x', true, true],
+      // 절대 링크는 출처 표시용(조회하지 않음) — 예전처럼 내부 주소만 막는다
+      ['https://other.mock.example/y', false, false],
+    ]);
+    const d = decideCollected(cands, { accepted: new Map(), knownUrls: new Set() });
+    expect(d.map((x) => x.reason)).toEqual(['new', 'blocked_link', 'new']);
+    // 허용 목록에서 빠진 호스트로 풀리면 막힌다(예: 최종 URL 이 허용 목록 밖 — 어댑터가 이미 막지만 이중 확인)
+    expect(applyLinkPolicy([cands[0]!], ['b.mock.example'])[0]!.blockedLink).toBe(true);
   });
 });

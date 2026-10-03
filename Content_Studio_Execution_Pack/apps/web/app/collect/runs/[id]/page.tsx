@@ -52,7 +52,12 @@ export default async function CollectRunPage({
         </p>
       ) : null}
       <p className="notice" role="note">
-        MOCK — 모의 수집기가 고정 자료에서 읽은 결과입니다(실제 웹 요청 없음). 아직 소재는 만들어지지 않았습니다. 저장할 새 항목을 고르세요.
+        MOCK — 모의 수집기가 고정 자료에서 읽은 결과입니다(실제 웹 요청 없음).{' '}
+        {run.status === 'preview'
+          ? '아직 소재는 만들어지지 않았습니다. 저장할 새 항목을 고르세요.'
+          : run.status === 'accepted'
+            ? '고른 항목의 결과는 아래 "결과" 열에 있습니다(소재로 저장한 항목은 소재 링크).'
+            : '이 실행에서는 소재를 만들지 않았습니다.'}
       </p>
       <section className="card archive">
         <p className="meta">

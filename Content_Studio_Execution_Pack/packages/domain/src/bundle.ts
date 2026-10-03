@@ -1433,6 +1433,12 @@ export function checkIntegrity(t: BundleTables): void {
     need('collected_items', 'capture_id', i.capture_id, 'captures');
     need('collected_items', 'source_version_id', i.source_version_id, 'source_versions');
     if (runSource.has(i.run_id) && runSource.get(i.run_id) !== i.source_id) problems.push('collected_items.source_id → 실행의 소스');
+    // FIX-T19 round 1(Codex review-T19 P1 0041:31): 받아들인 항목만 소재·출처 버전·시각을 가진다(outcome 이 null 이어도 예외 없음 — DB CHECK 0042 와 같은 규칙).
+    const isAccepted = i.outcome === 'accepted';
+    if ((i.capture_id !== null) !== isAccepted || (i.source_version_id !== null) !== isAccepted || (i.accepted_at !== null) !== isAccepted) {
+      problems.push('collected_items.outcome → accepted 일 때만 소재·출처 버전·시각');
+    }
+    if (i.outcome !== null && i.decision !== 'new') problems.push('collected_items.outcome → 새 항목만 결과를 가짐');
     if (i.capture_id !== null && i.source_version_id !== null && captureSource.has(i.capture_id) && versionSource.has(i.source_version_id) && captureSource.get(i.capture_id) !== versionSource.get(i.source_version_id)) {
       problems.push('collected_items.capture_id → 같은 출처의 소재·버전');
     }

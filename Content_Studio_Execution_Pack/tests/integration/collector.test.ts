@@ -7,13 +7,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { and, count, eq, type SQL } from 'drizzle-orm';
+import { and, count, eq, sql, type SQL } from 'drizzle-orm';
 import type { PgTable } from 'drizzle-orm/pg-core';
 import { closeDb, getDb, runDueCollectorSources, runRestoreDrill, schema, seed, type Db } from '@cs/db';
 import { contentHash, loadConfig, sha256Bytes } from '@cs/domain';
 import { DisabledPublisher, LocalStorageAdapter, MOCK_FEEDS, mockCollectorForTest, OVERSEAS_SALES_RSS } from '@cs/providers';
 import { runWorkerTick } from '@cs/worker';
 import { POST as capturesPOST } from '../../apps/web/app/api/captures/route';
+import { GET as originalGET } from '../../apps/web/app/api/imports/originals/[versionId]/route';
 import { POST as acceptPOST } from '../../apps/web/app/api/collector/runs/[id]/accept/route';
 import { POST as discardPOST } from '../../apps/web/app/api/collector/runs/[id]/discard/route';
 import { GET as runGET } from '../../apps/web/app/api/collector/runs/[id]/route';
@@ -493,6 +494,233 @@ describe('다시 볼 만한 소재(재추천)', () => {
     expect(after).toEqual(before);
     as(B);
     expect((await d(tokenB)).status).toBe(404);
+  });
+});
+
+describe('FIX-T19 round 1 (Codex review-T19)', () => {
+  const BOM = [0xef, 0xbb, 0xbf];
+  const te = new TextEncoder();
+  const u8 = (...parts: Array<number[] | Uint8Array>) => {
+    const arrs = parts.map((p) => (p instanceof Uint8Array ? p : new Uint8Array(p)));
+    const out = new Uint8Array(arrs.reduce((k, a) => k + a.byteLength, 0));
+    let o = 0;
+    for (const a of arrs) {
+      out.set(a, o);
+      o += a.byteLength;
+    }
+    return out;
+  };
+  const rssDoc = (items: string) => `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>FIX 피드</title>\n${items}\n</channel></rss>\n`;
+  async function pgError(p: Promise<unknown>): Promise<string | null> {
+    try {
+      await p;
+      return null;
+    } catch (e) {
+      const err = e as { message?: string; cause?: { message?: string } };
+      return `${err.message ?? ''} ${err.cause?.message ?? ''}`;
+    }
+  }
+
+  it('[P0] BOM·CRLF·windows-1251 선언 페이지: 저장 원본·내려받기 바이트 = 응답 바이트 그대로(BOM 포함), sha256·크기·raw_hash 일치', async () => {
+    const url = 'https://bom-page.mock.example/notes';
+    const page = u8(
+      BOM,
+      te.encode('<!doctype html>\r\n<html><head><meta charset="windows-1251"><title>BOM 페이지</title></head>\r\n<body><h1>BOM 페이지</h1><p>해외 영업 메모\r\n둘째 줄</p></body></html>\r\n'),
+    );
+    mockCollectorForTest().setFixtureForTest(url, { kind: 'ok', contentType: 'text/html', body: page });
+    const s = await addSourceOk('url', url);
+    await settings(s.id, { enabled: true });
+    const r = await runOk(s.id);
+    expect(r.items).toHaveLength(1);
+    expect(r.items[0]).toMatchObject({ decision: 'new', raw_sha256: sha256Bytes(page) });
+    const out = (await (await accept(r.run.run_id, [r.items[0]!.id])).json()) as RunBody;
+    expect(out.result!.accepted).toBe(1);
+    const verId = out.items[0]!.source_version_id!;
+    const [orig] = await db.select().from(schema.sourceVersionOriginals).where(eq(schema.sourceVersionOriginals.sourceVersionId, verId));
+    const stored = new Uint8Array(Buffer.from(orig!.contentBase64, 'base64'));
+    expect(Buffer.compare(Buffer.from(stored), Buffer.from(page))).toBe(0);
+    expect([...stored.subarray(0, 3)]).toEqual(BOM);
+    expect(orig).toMatchObject({ format: 'html', byteSize: page.byteLength, sha256: sha256Bytes(page) });
+    const [ver] = await db.select().from(schema.sourceVersions).where(eq(schema.sourceVersions.id, verId));
+    expect(ver!.rawHash).toBe(sha256Bytes(page));
+    const [item] = await db.select().from(schema.collectedItems).where(eq(schema.collectedItems.id, out.items[0]!.id));
+    expect(item!.byteSize).toBe(page.byteLength);
+    // 내려받기 경로도 같은 바이트
+    const dl = await originalGET(new Request(`${BASE}/api/imports/originals/${verId}`, { headers: cookieHeader(tokenA) }), { params: Promise.resolve({ versionId: verId }) });
+    expect(dl.status).toBe(200);
+    expect(Buffer.compare(Buffer.from(await dl.arrayBuffer()), Buffer.from(page))).toBe(0);
+    expect(dl.headers.get('x-content-sha256')).toBe(sha256Bytes(page));
+    // 소재 원문(파생 값)에는 BOM 이 없다
+    const [cap] = await db.select().from(schema.captures).where(eq(schema.captures.id, out.items[0]!.capture_id!));
+    expect(cap!.rawText.charCodeAt(0)).not.toBe(0xfeff);
+    expect(cap!.rawText).toContain('해외 영업 메모');
+  });
+
+  it('[P0] BOM·CRLF 피드: 받아들인 <item> 원본 = 응답 바이트의 그 구간 그대로. 실제 windows-1251 바이트 페이지는 failed(feed_not_utf8)·쓰기 0', async () => {
+    const url = 'https://bom-feed.mock.example/feed.xml';
+    const body = u8(
+      BOM,
+      te.encode('<?xml version="1.0" encoding="UTF-8"?>\r\n<rss version="2.0"><channel><title>BOM 피드</title>\r\n<item><guid>bom-1</guid><title>딜러 협상 메모</title>\r\n<description>줄1\r\n줄2 — 해외 영업</description></item>\r\n</channel></rss>\r\n'),
+    );
+    mockCollectorForTest().setFixtureForTest(url, { kind: 'ok', contentType: 'application/rss+xml', body });
+    const s = await addSourceOk('rss', url);
+    await settings(s.id, { enabled: true });
+    const r = await runOk(s.id);
+    const it0 = byGuid(r.items, 'bom-1');
+    const buf = Buffer.from(body);
+    const start = buf.indexOf('<item>');
+    const end = buf.indexOf('</item>') + '</item>'.length;
+    const expected = body.subarray(start, end);
+    expect(it0.raw_sha256).toBe(sha256Bytes(expected));
+    const out = (await (await accept(r.run.run_id, [it0.id])).json()) as RunBody;
+    expect(out.result!.accepted).toBe(1);
+    const [orig] = await db
+      .select()
+      .from(schema.sourceVersionOriginals)
+      .where(eq(schema.sourceVersionOriginals.sourceVersionId, byGuid(out.items, 'bom-1').source_version_id!));
+    expect(Buffer.compare(Buffer.from(orig!.contentBase64, 'base64'), Buffer.from(expected))).toBe(0);
+    expect(orig!.byteSize).toBe(expected.byteLength);
+
+    const cpUrl = 'https://cp1251.mock.example/page';
+    mockCollectorForTest().setFixtureForTest(cpUrl, {
+      kind: 'ok',
+      contentType: 'text/html',
+      body: u8(te.encode('<html><body><p>'), [0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2], te.encode('</p></body></html>')),
+    });
+    const cp = await addSourceOk('url', cpUrl);
+    await settings(cp.id, { enabled: true });
+    const before = await writeCounts(ownerA);
+    const cr = await runOk(cp.id);
+    expect(cr.run).toMatchObject({ status: 'failed', error_code: 'feed_not_utf8' });
+    expect(cr.items).toHaveLength(0);
+    expect(await writeCounts(ownerA)).toEqual(before);
+  });
+
+  it('[P1] 받아들일 때 redirect 기준 경로만 바뀌어 상대 링크의 해석 결과가 달라지면 failed_changed(원본 조각·checksum 은 같아도) — 소재 0', async () => {
+    const url = 'https://relink.mock.example/feed.xml';
+    const feed = rssDoc('<item><guid>rl-1</guid><title>상대 링크 글</title><link>post/1</link><description>해외 영업 본문</description></item>');
+    const ad = mockCollectorForTest();
+    ad.setFixtureForTest(url, { kind: 'redirect', location: '/old/feed.xml' });
+    ad.setFixtureForTest('https://relink.mock.example/old/feed.xml', { kind: 'ok', contentType: 'application/rss+xml', body: feed });
+    ad.setFixtureForTest('https://relink.mock.example/new/feed.xml', { kind: 'ok', contentType: 'application/rss+xml', body: feed });
+    const s = await addSourceOk('rss', url);
+    await settings(s.id, { enabled: true });
+    const r = await runOk(s.id);
+    const it0 = byGuid(r.items, 'rl-1');
+    expect(it0.decision).toBe('new');
+    const [ledger] = await db.select().from(schema.collectedItems).where(eq(schema.collectedItems.id, it0.id));
+    expect(ledger!.link).toBe('https://relink.mock.example/old/post/1');
+    ad.setFixtureForTest(url, { kind: 'redirect', location: '/new/feed.xml' });
+    const before = await writeCounts(ownerA);
+    const out = (await (await accept(r.run.run_id, [it0.id])).json()) as RunBody;
+    expect(out.result).toMatchObject({ accepted: 0, failed_changed: 1 });
+    expect(byGuid(out.items, 'rl-1')).toMatchObject({ outcome: 'failed_changed', capture_id: null, raw_sha256: it0.raw_sha256, content_checksum: it0.content_checksum });
+    expect(await writeCounts(ownerA)).toEqual(before);
+  });
+
+  it('[P1] 상대 링크가 허용 목록 밖으로 풀리면(//다른호스트) 미리보기에서 blocked_link — 고를 수 없고 그 주소는 요청하지 않는다', async () => {
+    const url = 'https://relink2.mock.example/feed.xml';
+    mockCollectorForTest().setFixtureForTest(url, {
+      kind: 'ok',
+      contentType: 'application/rss+xml',
+      body: rssDoc(
+        '<item><guid>pr-1</guid><title>프로토콜 상대</title><link>//evil.mock.example/x</link><description>본문</description></item>' +
+          '<item><guid>pr-2</guid><title>같은 호스트 상대</title><link>/ok/1</link><description>본문</description></item>',
+      ),
+    });
+    const s = await addSourceOk('rss', url);
+    await settings(s.id, { enabled: true });
+    const r = await runOk(s.id);
+    expect(r.items.map((i) => [i.guid, i.decision, i.reason])).toEqual([
+      ['pr-1', 'skipped', 'blocked_link'],
+      ['pr-2', 'new', 'new'],
+    ]);
+    const bad = await accept(r.run.run_id, [byGuid(r.items, 'pr-1').id]);
+    expect(bad.status).toBe(400);
+    expect(mockCollectorForTest().requested).not.toContain('https://evil.mock.example/x');
+  });
+
+  it('[P1] 0042: outcome 이 accepted 가 아닌데(NULL 포함) 소재·버전·시각이 채워진 행, accepted 인데 빈 행은 INSERT·UPDATE 모두 CHECK 로 거부', async () => {
+    const [acc] = await db
+      .select()
+      .from(schema.collectedItems)
+      .where(and(eq(schema.collectedItems.ownerId, ownerA), eq(schema.collectedItems.outcome, 'accepted')))
+      .limit(1);
+    expect(acc).toBeDefined();
+    const [maxPos] = await db
+      .select({ p: sql<number>`max(${schema.collectedItems.position})::int` })
+      .from(schema.collectedItems)
+      .where(eq(schema.collectedItems.runId, acc!.runId));
+    const { id: _id, ...rest } = acc!;
+    const base: typeof schema.collectedItems.$inferInsert = { ...rest, position: maxPos!.p + 1, createdAt: new Date() };
+    const ins = (over: Partial<typeof schema.collectedItems.$inferInsert>) => db.insert(schema.collectedItems).values({ ...base, ...over });
+    expect(await pgError(ins({ outcome: null }))).toMatch(/collected_items_accepted_chk/);
+    expect(await pgError(ins({ outcome: null, captureId: null, sourceVersionId: null }))).toMatch(/collected_items_accepted_chk/);
+    expect(await pgError(ins({ outcome: 'not_selected' }))).toMatch(/collected_items_accepted_chk/);
+    expect(await pgError(ins({ outcome: 'accepted', acceptedAt: null }))).toMatch(/collected_items_accepted_chk/);
+    expect(await pgError(ins({ outcome: 'accepted', captureId: null }))).toMatch(/collected_items_accepted_chk/);
+    // UPDATE 로도 못 만든다
+    expect(await pgError(db.execute(sql`update collected_items set outcome = null where id = ${acc!.id}`))).toMatch(/collected_items_accepted_chk/);
+    // 정상 형태(NULL 결과·연결 없음)는 들어간다 — 확인 후 지운다(시험 행)
+    const okRows = await ins({ outcome: null, captureId: null, sourceVersionId: null, acceptedAt: null }).returning();
+    expect(okRows).toHaveLength(1);
+    await db.delete(schema.collectedItems).where(eq(schema.collectedItems.id, okRows[0]!.id));
+    const [still] = await db.select().from(schema.collectedItems).where(eq(schema.collectedItems.id, acc!.id));
+    expect(still).toEqual(acc);
+  });
+
+  it('[P1] 주기 실행: 기한 전 weekly 소스 55개(다른 owner)가 앞에 있어도 기한이 지난 daily 소스는 SQL 기한 판정으로 실행, 24h 경계 정확', async () => {
+    vi.stubEnv('COLLECTOR_SCHEDULER', 'on');
+    const now = new Date(Date.now() + 30 * 86400_000);
+    // 다른 owner(B)에 weekly 55개: 이틀 전 실행(기한 전) — 예전 코드는 last_run_at 오래된 순 50개만 보고 모두 건너뛰었다.
+    const weekly = Array.from({ length: 55 }, (_, i) => ({
+      ownerId: ownerB,
+      kind: 'rss',
+      url: `https://weekly-${i}.mock.example/feed.xml`,
+      normalizedUrl: `https://weekly-${i}.mock.example/feed.xml`,
+      host: `weekly-${i}.mock.example`,
+      enabled: true,
+      schedule: 'weekly',
+      lastRunAt: new Date(now.getTime() - 2 * 86400_000),
+    }));
+    const dailyAt = new Date(now.getTime() - 25 * 3600_000);
+    try {
+      const inserted = await db.insert(schema.collectorSources).values(weekly).returning({ id: schema.collectorSources.id });
+      const [daily] = await db
+        .insert(schema.collectorSources)
+        .values({ ownerId: ownerB, kind: 'rss', url: MOCK_FEEDS.overseasSales, normalizedUrl: MOCK_FEEDS.overseasSales, host: 'overseas-sales.mock.example', enabled: true, schedule: 'daily', lastRunAt: dailyAt })
+        .onConflictDoUpdate({ target: [schema.collectorSources.ownerId, schema.collectorSources.normalizedUrl], set: { enabled: true, schedule: 'daily', lastRunAt: dailyAt } })
+        .returning();
+      // 24시간 경계: 하루 전 + 1초는 아직 기한 전
+      const [edge] = await db
+        .insert(schema.collectorSources)
+        .values({
+          ownerId: ownerB,
+          kind: 'rss',
+          url: 'https://edge.mock.example/feed.xml',
+          normalizedUrl: 'https://edge.mock.example/feed.xml',
+          host: 'edge.mock.example',
+          enabled: true,
+          schedule: 'daily',
+          lastRunAt: new Date(now.getTime() - 24 * 3600_000 + 1000),
+        })
+        .returning();
+      const r = await runDueCollectorSources(db, loadConfig(), mockCollectorForTest(), now, 3);
+      expect(r.skipped).toBeNull();
+      const runs = await db
+        .select()
+        .from(schema.collectorRuns)
+        .where(and(eq(schema.collectorRuns.sourceId, daily!.id), eq(schema.collectorRuns.trigger, 'scheduled')));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.status).toBe('preview');
+      expect(await n(schema.collectorRuns, eq(schema.collectorRuns.sourceId, edge!.id))).toBe(0);
+      for (const w of inserted) expect(await n(schema.collectorRuns, eq(schema.collectorRuns.sourceId, w.id))).toBe(0);
+      // 1초 뒤에는 경계 소스도 기한(>= 24h) — edge 는 모의 자료에 없는 주소라 failed 실행으로 남는다(요청 목록에만)
+      await runDueCollectorSources(db, loadConfig(), mockCollectorForTest(), new Date(now.getTime() + 1000), 3);
+      expect(await n(schema.collectorRuns, eq(schema.collectorRuns.sourceId, edge!.id))).toBe(1);
+    } finally {
+      await db.update(schema.collectorSources).set({ enabled: false, schedule: 'off' }).where(eq(schema.collectorSources.ownerId, ownerB));
+    }
   });
 });
 

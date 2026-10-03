@@ -85,3 +85,12 @@ CHANGES_REQUESTED
 - [P2] packages/db/src/oauth.ts:1508 — worker가 잠금 안에서 갱신된 재개 시각을 확인하지 않아 같은 해제를 중복 재개할 수 있다
 
 ## FIX2-M4UI (cd0a2aa, 화면 기능 round 2) — **PASS** → 화면 기능 G1·G2·S4·S5·해제 안내 종결
+
+## FIX8-T13 (c82c721, T13 round 8) — **PASS** → T13 종결(모의·로컬 범위)
+
+### M4 모의 범위 종결 요약 (2026-10-03 04:35)
+- T13: 구현 bf57eae → FIX1 5479a7f → FIX2 dfc9842 → FIX3 79201d6 → FIX4 ea85ac6 → FIX5 492b1b9 → FIX6 2a974d5 → FIX7 f07d96a → **FIX8 c82c721 PASS**
+- T14: 67ade9e → FIX1 6f766d2 → **FIX2 746aa3a PASS**
+- T15: 427dc71 → **FIX1 cc26535 PASS**
+- 화면: S1–S3 f2bb3b9 PASS · G1·G2 fa37b1a → 2fed5b4 → **cd0a2aa PASS** (S4·S5 8d2cc64 의 지적은 2fed5b4 에서 반영)
+- 업로드 세션 가림: 0c86db2 → **75dd988 PASS**

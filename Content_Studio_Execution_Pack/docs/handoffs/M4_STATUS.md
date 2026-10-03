@@ -81,3 +81,9 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 사용자 확인: D26(a~f)·D27(a~h), 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(D23).
 - 다음 작업 후보(검증이 따라온 뒤): T16 Instagram(모의), 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
 - 실계정 연결 전 사용자 준비물(D24): Meta 앱·Threads 테스트 계정, Google Cloud 프로젝트·OAuth 동의 화면·YouTube API 감사, redirect URI, 마스터 키 위치, 첫 실계정 시험 원고·공개 범위.
+
+## 2026-10-03 04:35 — M4 모의 범위 Codex 종결
+- T13(FIX8 c82c721)·T14(FIX2 746aa3a)·T15(FIX1 cc26535)·화면(cd0a2aa)·가림(75dd988) 모두 Codex(gpt-6-astra/xhigh) PASS. 라운드별 판정은 `M4_CODEX_VERDICTS.md` 하단 요약.
+- 마지막 검사(c82c721): lint·typecheck·build·unit 759·integration 600·drill:mock(M3·T14·T15) 0건·db:migrate(0035)·실제 로컬 DB drill:restore PASS.
+- migration 0030~0035 로컬 적용. 외부 호출·새 의존성·비밀·실제 게시 0.
+- 실계정 연결은 여전히 사용자 준비물·승인 대기(D24). D26(a~f)·D27(a~h) 사용자 확인 대기(잠정대로 진행 중).

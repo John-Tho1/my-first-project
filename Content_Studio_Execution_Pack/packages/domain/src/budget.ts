@@ -5,8 +5,10 @@
  *   numeric(18,6) 을 넘는 값(정수부 13자리 이상·소수 7자리 이상)은 AmountRangeError.
  * - 토큰 추정(mock): 프롬프트 글자 수 / 3(올림). 한국어·영어가 섞인 글에서 보수적으로(많게) 잡는 경험칙이다 — 실제 토크나이저가 아니다.
  * - 출력 여유분(mock): max(256, 입력 추정의 절반) 토큰.
- * - LIVE-L1(D34) live: 입력 = 정확한 프롬프트 UTF-8 바이트 + 시스템 프롬프트·출력 스키마 바이트 + 틀 여유(llm-live.ts — 바이트 ≥ 토큰이라 상한),
- *   출력 = LLM_LIVE_MAX_OUTPUT_TOKENS(요청의 max_tokens 와 같은 값). 그래서 예약액은 그 호출의 실제 비용 상한이다(틀 여유가 가정임은 남은 위험).
+ * - LIVE-L1(D34) live: 입력 = 정확한 프롬프트 UTF-8 바이트 + 시스템 프롬프트·출력 스키마 바이트 + 틀 여유(llm-live.ts),
+ *   출력 = LLM_LIVE_MAX_OUTPUT_TOKENS(요청의 max_tokens 와 같은 값). FIX1-LIVEL1: 이것은 **보수적 추정**이지 증명된 비용 상한이 아니다.
+ *   실제 사용량은 성공·실패 모두 기록하고(실패는 max(예약액, 응답 usage 비용)), 실제액 > 예약액이면 초과액을 남겨 다음 예약의 1회·월 검사에
+ *   포함한다 — 월·1회 상한은 최대 한 호출분 넘을 수 있다.
  * - 예약액 = 입력 추정 × 입력 단가 + 출력 여유분 × 출력 단가(각각 1K 토큰당, 올림).
  * - 가격이 없으면: live 는 차단(liveLlmReadiness), mock 은 0 으로 예약·기록만 한다(한도 검사 없음).
  * - 월 사용액 = 이 owner 의 이번 달(MSK) 원장 합계: reserved 는 예약액, settled 는 실제액, released 는 0.
@@ -19,7 +21,7 @@ import {
   LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS,
   LIVE_LLM_FIXED_INPUT_BYTES,
   LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
-  liveInputUpperBoundTokens,
+  liveInputEstimateTokens,
 } from './llm-live';
 
 export const TOKEN_CHARS = 3;
@@ -75,6 +77,10 @@ export interface BudgetPolicy {
   perRunMaxMicro: bigint | null;
   /** LIVE-L1(D34): live 1회 출력 토큰 상한(= 요청 max_tokens). 없으면 LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS. mock 은 쓰지 않는다. */
   liveMaxOutputTokens?: number;
+  /** FIX1-LIVEL1: 승인 기록(LLM_LIVE_APPROVAL_REF)당 실제 호출 횟수 제한. 없으면 제한 없음. */
+  liveMaxRuns?: number;
+  /** FIX1-LIVEL1: live 원장 스냅숏에 남겨 횟수를 세는 승인 기록 참조(비밀 아님 — 화면·health·사용량 view 에는 내보내지 않는다). */
+  liveApprovalRef?: string;
 }
 
 export function budgetPolicy(config: AppConfig): BudgetPolicy {
@@ -93,6 +99,8 @@ export function budgetPolicy(config: AppConfig): BudgetPolicy {
     monthlyLimitMicro: config.LLM_BUDGET_MONTHLY_LIMIT !== undefined ? toMicro(config.LLM_BUDGET_MONTHLY_LIMIT) : null,
     perRunMaxMicro: config.LLM_BUDGET_PER_RUN_MAX !== undefined ? toMicro(config.LLM_BUDGET_PER_RUN_MAX) : null,
     liveMaxOutputTokens: config.LLM_LIVE_MAX_OUTPUT_TOKENS,
+    liveMaxRuns: config.LLM_LIVE_MAX_RUNS,
+    liveApprovalRef: config.LLM_LIVE_APPROVAL_REF,
   };
 }
 
@@ -119,12 +127,19 @@ export const LIVE_TOKEN_ESTIMATE_LABEL = 'utf8_bytes+fixed+overhead';
 
 export function reserveFor(policy: BudgetPolicy, prompt: string): Reservation {
   const live = policy.mode === 'live';
-  // LIVE-L1(D34): live 는 상한 추정(바이트 + 고정 + 틀 여유)과 설정한 출력 상한. mock 은 기존 글자/3 그대로(D13).
-  const tokensIn = live ? liveInputUpperBoundTokens(prompt) : estimateTokens(prompt);
+  // LIVE-L1(D34): live 는 보수적 추정(바이트 + 고정 + 틀 여유)과 설정한 출력 상한. mock 은 기존 글자/3 그대로(D13).
+  const tokensIn = live ? liveInputEstimateTokens(prompt) : estimateTokens(prompt);
   const tokensOutAllowance = live ? (policy.liveMaxOutputTokens ?? LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS) : outputAllowanceTokens(tokensIn);
   const reserveMicro = costMicro(policy.pricing, tokensIn, tokensOutAllowance);
   const tokenEstimate = live ? LIVE_TOKEN_ESTIMATE_LABEL : `chars/${TOKEN_CHARS}`;
-  const liveExtra = live ? { fixed_input_bytes: LIVE_LLM_FIXED_INPUT_BYTES, overhead_tokens: LIVE_LLM_FRAMING_OVERHEAD_TOKENS } : {};
+  const liveExtra = live
+    ? {
+        fixed_input_bytes: LIVE_LLM_FIXED_INPUT_BYTES,
+        overhead_tokens: LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
+        // FIX1-LIVEL1: LLM_LIVE_MAX_RUNS 계산용(승인 기록당 실제 호출 수)
+        ...(policy.liveApprovalRef ? { approval_ref: policy.liveApprovalRef } : {}),
+      }
+    : {};
   const pricingSnapshot = policy.pricing
     ? {
         mode: policy.mode,
@@ -204,6 +219,49 @@ export class BudgetExceededError extends AppError {
       extra,
     );
   }
+}
+
+/** FIX1-LIVEL1(D34 2단계 범위): 같은 승인 기록으로 허용한 실제 호출 횟수(LLM_LIVE_MAX_RUNS)를 다 썼다 → 429, 아무것도 쓰지 않고 호출하지 않음. */
+export class LiveRunLimitError extends AppError {
+  constructor(extra: { limit: number; used: number }) {
+    super(
+      'budget_exceeded',
+      'live_run_limit',
+      '승인된 실제 AI 호출 횟수(LLM_LIVE_MAX_RUNS)를 모두 써서 AI 를 호출하지 않았습니다. 새 승인 뒤에만 다시 호출할 수 있습니다.',
+      extra,
+    );
+  }
+}
+
+// ---- 실패 호출 정산(FIX1-LIVEL1) ----
+
+export interface TokenUsage {
+  tokensIn: number;
+  tokensOut: number;
+}
+
+const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * provider 실패 오류에 실린 숫자 사용량(예: LiveLlmError.usage — 원문 없음). 두 값이 모두 안전한 음이 아닌 정수일 때만, 아니면 null.
+ * db 층은 provider 구현을 모르므로 구조로만 읽는다.
+ */
+export function failureUsageOf(e: unknown): TokenUsage | null {
+  if (!e || typeof e !== 'object') return null;
+  const u = (e as { usage?: unknown }).usage;
+  if (!u || typeof u !== 'object') return null;
+  const { tokensIn, tokensOut } = u as { tokensIn?: unknown; tokensOut?: unknown };
+  return isUsageInt(tokensIn) && isUsageInt(tokensOut) ? { tokensIn, tokensOut } : null;
+}
+
+/**
+ * 실패 호출의 확정액: D13 은 예약액 전액, FIX1-LIVEL1 은 응답 usage 를 알면 max(예약액, usage 비용) — 확인된 비용이 예약보다 크면
+ * 그 차이를 초과액으로 남긴다(숨기지 않음). usage 를 모르면 예약액 그대로.
+ */
+export function failedSettlement(pricing: Pricing | null, reservedMicro: bigint, usage: TokenUsage | null): { actualMicro: bigint; overageMicro: bigint } {
+  if (!usage) return { actualMicro: reservedMicro, overageMicro: 0n };
+  const cost = costMicro(pricing, usage.tokensIn, usage.tokensOut);
+  return cost > reservedMicro ? { actualMicro: cost, overageMicro: cost - reservedMicro } : { actualMicro: reservedMicro, overageMicro: 0n };
 }
 
 // ---- live 준비 상태(LIVE-L1, D34) ----

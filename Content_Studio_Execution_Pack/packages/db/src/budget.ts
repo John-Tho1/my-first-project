@@ -11,6 +11,9 @@ import {
   isStorableMicro,
   checkBudget,
   costMicro,
+  failedSettlement,
+  LiveRunLimitError,
+  type TokenUsage,
   fromMicro,
   mskMonthStart,
   mskNextMonthStart,
@@ -77,12 +80,36 @@ export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date):
  * - 이번 달 원장에 설정과 다른 통화가 있으면 409 budget_currency_mismatch(통화를 섞어 비교하지 않는다)
  * - 이번 달 사용액(같은 통화) + 예약액이 상한을 넘으면 429 budget_exceeded
  * 반드시 run·원장을 쓰는 트랜잭션 안에서 호출한다 — 거부되면 그 트랜잭션 전체가 되돌아가 아무것도 남지 않는다.
- * 예약액은 "최대 가능 비용"(입력 추정 + 출력 상한 tokensOutAllowance)이며, provider 에 maxOutputTokens 로 그 상한을 넘긴다.
+ * 예약액은 입력 추정 + 출력 상한 tokensOutAllowance(provider 에 maxOutputTokens 로 넘김)의 비용이다. FIX1-LIVEL1: live 의 입력 추정은
+ * 보수적 추정일 뿐 증명된 상한이 아니다 — 실제액이 더 크면 정산이 초과액을 남기고, 그 금액이 다음 예약의 월 합계에 들어간다.
+ * FIX1-LIVEL1(D34 2단계 범위): live + LLM_LIVE_MAX_RUNS 면 같은 owner 잠금 아래에서 같은 승인 기록의 live 원장 행 수를 세어
+ * 한도에 닿았으면 429 live_run_limit(예산 검사보다 먼저 — 아무것도 쓰지 않음). 행은 같은 트랜잭션에서 곧바로 쓰이므로 동시 요청도 직렬화된다.
  */
 export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: BudgetPolicy, prompt: string, now: Date): Promise<Reservation> {
   const reservation = reserveFor(policy, prompt);
+  if (policy.mode === 'live' && policy.liveMaxRuns !== undefined) {
+    await lockOwnerForBudget(tx, ownerId);
+    const used = await liveRunsUsed(tx, ownerId, policy.liveApprovalRef ?? null);
+    if (used >= policy.liveMaxRuns) throw new LiveRunLimitError({ limit: policy.liveMaxRuns, used });
+  }
   await reserveMicroOrThrow(tx, ownerId, policy, reservation.reserveMicro, now);
   return reservation;
+}
+
+/**
+ * FIX1-LIVEL1: 이 owner 의 live 원장 행 중 스냅숏 approval_ref 가 같은 것의 수(상태 무관 — 실패·예약 중 포함, 기간 무관).
+ * 승인 기록이 없으면(이론상 live 준비 전) approval_ref 가 없는 live 행을 센다.
+ */
+export async function liveRunsUsed(tx: DbOrTx, ownerId: string, approvalRef: string | null): Promise<number> {
+  const refCond =
+    approvalRef === null
+      ? sql`${usageLedger.pricingSnapshot} ->> 'approval_ref' is null`
+      : sql`${usageLedger.pricingSnapshot} ->> 'approval_ref' = ${approvalRef}`;
+  const rows = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(usageLedger)
+    .where(and(eq(usageLedger.ownerId, ownerId), sql`${usageLedger.pricingSnapshot} ->> 'mode' = 'live'`, refCond));
+  return Number(rows[0]?.n ?? 0);
 }
 
 /**
@@ -215,11 +242,29 @@ export async function insertReservedLedger(
 }
 
 /** 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02). owner 잠금 아래에서. */
-export async function settleLedgerFailed(tx: DbOrTx, ownerId: string, ledger: UsageLedgerRow, at: Date): Promise<void> {
+export async function settleLedgerFailed(
+  tx: DbOrTx,
+  ownerId: string,
+  ledger: UsageLedgerRow,
+  at: Date,
+  known?: { pricing: BudgetPolicy['pricing']; usage: TokenUsage | null },
+): Promise<void> {
   await lockOwnerForBudget(tx, ownerId);
+  // FIX1-LIVEL1: 응답 usage 를 알면 max(예약액, usage 비용) + 초과액·tokens(숫자만). 모르면 D13 그대로 예약액 전액.
+  const usage = known?.usage ?? null;
+  const { actualMicro, overageMicro } = failedSettlement(known?.pricing ?? null, toMicro(ledger.reservedAmount), usage);
+  if (!isStorableMicro(actualMicro)) throw new AmountRangeError();
   await tx
     .update(usageLedger)
-    .set({ state: 'settled', actualAmount: ledger.reservedAmount, failed: true, settledAt: at })
+    .set({
+      state: 'settled',
+      actualAmount: usage ? fromMicro(actualMicro) : ledger.reservedAmount,
+      failed: true,
+      settledAt: at,
+      ...(usage
+        ? { tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, overageAmount: fromMicro(overageMicro), overBudget: overageMicro > 0n }
+        : {}),
+    })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
 }
 
@@ -307,6 +352,13 @@ export async function getLedgerForRun(db: DbOrTx, ownerId: string, runId: string
   return rows[0] ?? null;
 }
 
+function withoutApprovalRef(snapshot: UsageLedgerRow['pricingSnapshot']): UsageLedgerRow['pricingSnapshot'] {
+  if (!snapshot || typeof snapshot !== 'object' || !('approval_ref' in snapshot)) return snapshot;
+  const { approval_ref: _ref, ...rest } = snapshot as Record<string, unknown>;
+  void _ref;
+  return rest as UsageLedgerRow['pricingSnapshot'];
+}
+
 export function usageLedgerView(l: UsageLedgerRow) {
   return {
     id: l.id,
@@ -320,7 +372,8 @@ export function usageLedgerView(l: UsageLedgerRow) {
     failed: l.failed,
     overage_amount: l.overageAmount,
     over_budget: l.overBudget,
-    pricing_snapshot: l.pricingSnapshot,
+    // FIX1-LIVEL1: 승인 기록 참조(approval_ref)는 횟수 계산용 — 화면·API 응답에는 내보내지 않는다(health·설정과 같은 원칙)
+    pricing_snapshot: withoutApprovalRef(l.pricingSnapshot),
     created_at: l.createdAt.toISOString(),
     settled_at: l.settledAt ? l.settledAt.toISOString() : null,
   };

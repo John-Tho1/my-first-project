@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   budgetPolicy,
+  failedSettlement,
+  failureUsageOf,
   checkBudget,
   costMicro,
   estimateTokens,
@@ -20,7 +22,7 @@ import {
   LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
   LIVE_LLM_OUTPUT_JSON_SCHEMA,
   LIVE_LLM_SYSTEM_PROMPT,
-  liveInputUpperBoundTokens,
+  liveInputEstimateTokens,
   utf8ByteLength,
 } from './llm-live';
 import { filterClaimSources } from './writing';
@@ -157,7 +159,7 @@ describe('live 준비 상태(LIVE-L1, D34 — 빠진 조건 이름만, 모두 �
   });
 });
 
-describe('live 예약(LIVE-L1, D34 — 실제 비용 상한)', () => {
+describe('live 예약(LIVE-L1, D34 — 보수적 추정, 증명된 상한 아님)', () => {
   const live = (extra: Record<string, string> = {}) =>
     budgetPolicy(loadConfig({ LLM_MODE: 'live', LLM_PRICE_INPUT_PER_1K: '0.004', LLM_PRICE_OUTPUT_PER_1K: '0.02', ...extra }));
 
@@ -166,7 +168,7 @@ describe('live 예약(LIVE-L1, D34 — 실제 비용 상한)', () => {
     const r = reserveFor(live(), prompt);
     expect(utf8ByteLength(prompt)).toBe(3003);
     expect(r.tokensIn).toBe(3003 + LIVE_LLM_FIXED_INPUT_BYTES + LIVE_LLM_FRAMING_OVERHEAD_TOKENS);
-    expect(r.tokensIn).toBe(liveInputUpperBoundTokens(prompt));
+    expect(r.tokensIn).toBe(liveInputEstimateTokens(prompt));
     expect(r.tokensOutAllowance).toBe(LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS);
     expect(LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS).toBe(4096);
     expect(r.reserveMicro).toBe(costMicro(live().pricing, r.tokensIn, 4096));
@@ -185,7 +187,7 @@ describe('live 예약(LIVE-L1, D34 — 실제 비용 상한)', () => {
 
   it('한국어에서 live 입력 추정은 글자/3 보다 항상 크다(바이트 ≥ 글자, 상한 쪽)', () => {
     for (const s of ['가나다라마바사', 'mixed 한국어 text 123', '😀 이모지', '']) {
-      expect(liveInputUpperBoundTokens(s)).toBeGreaterThan(estimateTokens(s));
+      expect(liveInputEstimateTokens(s)).toBeGreaterThan(estimateTokens(s));
       expect(utf8ByteLength(s)).toBeGreaterThanOrEqual(s.length);
     }
   });
@@ -265,5 +267,38 @@ describe('FIX-T07 round 2: 합계 범위·월 상한', () => {
   it('다음 달 시작(MSK)', () => {
     expect(mskNextMonthStart(new Date('2026-09-15T00:00:00Z')).toISOString()).toBe('2026-09-30T21:00:00.000Z');
     expect(mskNextMonthStart(new Date('2026-12-31T21:30:00Z')).toISOString()).toBe('2027-01-31T21:00:00.000Z'); // MSK 1월 1일
+  });
+});
+
+describe('FIX1(Codex review-LIVEL1) — 실패 정산·실제 호출 횟수 설정', () => {
+  const live = (extra: Record<string, string> = {}) =>
+    budgetPolicy(loadConfig({ LLM_MODE: 'live', LLM_PRICE_INPUT_PER_1K: '0.004', LLM_PRICE_OUTPUT_PER_1K: '0.02', LLM_LIVE_APPROVAL_REF: 'D34-x', ...extra }));
+
+  it('failedSettlement = max(예약액, usage 비용), 초과액 = 그 차이, usage 없으면 예약액(D13)', () => {
+    const p = live();
+    const reserved = toMicro('0.1');
+    expect(failedSettlement(p.pricing, reserved, null)).toEqual({ actualMicro: reserved, overageMicro: 0n });
+    expect(failedSettlement(p.pricing, reserved, { tokensIn: 10, tokensOut: 10 })).toEqual({ actualMicro: reserved, overageMicro: 0n });
+    const big = costMicro(p.pricing, 200_000, 4096);
+    expect(failedSettlement(p.pricing, reserved, { tokensIn: 200_000, tokensOut: 4096 })).toEqual({ actualMicro: big, overageMicro: big - reserved });
+  });
+
+  it('failureUsageOf: 오류의 usage 가 안전한 음이 아닌 정수 둘일 때만', () => {
+    expect(failureUsageOf({ usage: { tokensIn: 1, tokensOut: 2 } })).toEqual({ tokensIn: 1, tokensOut: 2 });
+    for (const bad of [null, undefined, new Error('x'), { usage: null }, { usage: { tokensIn: -1, tokensOut: 2 } }, { usage: { tokensIn: '1', tokensOut: 2 } }, { usage: { tokensIn: 2 ** 53, tokensOut: 0 } }, { usage: { tokensIn: 1.5, tokensOut: 0 } }]) {
+      expect(failureUsageOf(bad)).toBeNull();
+    }
+  });
+
+  it('LLM_LIVE_MAX_RUNS: 양의 정수(1~1000000), 없으면 제한 없음, 형식 밖은 설정 오류', () => {
+    expect(live().liveMaxRuns).toBeUndefined();
+    expect(live({ LLM_LIVE_MAX_RUNS: '1' }).liveMaxRuns).toBe(1);
+    expect(live({ LLM_LIVE_MAX_RUNS: '1000000' }).liveMaxRuns).toBe(1000000);
+    for (const bad of ['0', '-1', '1.5', 'abc', '1000001', '1e3']) expect(() => loadConfig({ LLM_LIVE_MAX_RUNS: bad })).toThrow();
+  });
+
+  it('live 예약 스냅숏에 승인 기록(approval_ref)을 남긴다(횟수 계산용) — mock 에는 없음', () => {
+    expect(reserveFor(live(), 'x').pricingSnapshot).toMatchObject({ mode: 'live', approval_ref: 'D34-x' });
+    expect(reserveFor(budgetPolicy(loadConfig({ LLM_LIVE_APPROVAL_REF: 'D34-x' })), 'x').pricingSnapshot).not.toHaveProperty('approval_ref');
   });
 });

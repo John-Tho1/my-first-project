@@ -92,6 +92,7 @@ export const WRITING_ERROR_TEXT: Record<string, string> = {
   brand_missing: '브랜드 프로필이 없습니다. 먼저 Brand Profile 을 저장하세요.',
   not_adoptable: '이 제안은 채택할 수 없습니다.',
   budget_exceeded: '이번 달 AI 예산 상한(또는 1회 상한)을 넘게 되어 AI 를 호출하지 않았습니다. 설정에서 사용량을 확인하세요.',
+  live_run_limit: '승인된 실제 AI 호출 횟수(LLM_LIVE_MAX_RUNS)를 모두 써서 AI 를 호출하지 않았습니다.',
   // T09 채널 초안
   media_incomplete: '검토로 보내려면 채널에 필요한 미디어가 더 있어야 합니다(Instagram: 이미지 1개 이상, YouTube: 완성 영상 1개).',
   stale_variant: '원문이 바뀌었습니다. "현재 원문으로 다시 초안"을 만든 뒤 검토로 보내세요.',
@@ -154,6 +155,7 @@ export function writingFormFailure(e: unknown, request: Request, back: string, n
     else if (e.code === 'unconfirmed_experience_claims') code = 'unconfirmed_claims';
     else if (e.code === 'claim_still_in_body') code = 'claim_still_in_body';
     else if (e.code === 'budget_exceeded') code = 'budget_exceeded';
+    else if (e.code === 'live_run_limit') code = 'live_run_limit';
     else if (PASS_THROUGH_CODES.has(e.code)) code = e.code;
     else if (e.kind === 'conflict') code = 'conflict';
     else if (e.kind === 'csrf') code = 'csrf';

@@ -2,7 +2,7 @@
  * LIVE-L1(결정 D34 1단계): 실제 Claude(Anthropic Messages API) 호출의 **공급자 중립이 아닌** 고정 부분 — 순수 값·함수만(네트워크·SDK 없음).
  *
  * - 시스템 프롬프트·모델이 쓰는 출력 JSON 스키마는 여기 한 곳에만 둔다. 예약(budget.ts reserveFor live)과 실제 요청(@cs/providers
- *   ClaudeLlmProvider)이 **같은 문자열**을 쓰므로, 예약의 입력 상한이 실제로 보낸 바이트를 빠짐없이 센다.
+ *   ClaudeLlmProvider)이 **같은 문자열**을 쓰므로, 예약의 입력 추정이 실제로 보낸 바이트를 빠짐없이 센다(추정일 뿐 비용 상한 증명은 아님).
  * - 모델은 result_type·input_version 을 쓰지 않는다(서버가 입력에서 정한다 — 모델 출력을 믿지 않음).
  */
 import { z } from 'zod';
@@ -69,7 +69,8 @@ export type LiveModelOutput = z.infer<typeof liveModelOutputSchema>;
 
 /**
  * 메시지 틀·structured outputs 형식 지시(서버가 붙이는 문구, 공개된 크기 없음)·역할 표식 등 우리가 바이트로 셀 수 없는 입력의 여유(토큰).
- * 근거 없는 고정값(가정) — 2단계 실제 호출의 usage.input_tokens 로 교정한다(D34 When to revisit). 모자라면 초과액이 숨김 없이 기록된다.
+ * 근거 없는 고정값(가정) — 2단계 실제 호출의 usage.input_tokens 로 교정한다(D34 When to revisit). 모자라면 초과액이 숨김 없이 기록되고
+ * 다음 예약 검사에 들어간다.
  */
 export const LIVE_LLM_FRAMING_OVERHEAD_TOKENS = 2048;
 
@@ -86,11 +87,13 @@ export const utf8ByteLength = (s: string): number => encoder.encode(s).length;
 export const LIVE_LLM_FIXED_INPUT_BYTES = utf8ByteLength(LIVE_LLM_SYSTEM_PROMPT) + utf8ByteLength(JSON.stringify(LIVE_LLM_OUTPUT_JSON_SCHEMA));
 
 /**
- * live 입력 토큰 **상한**: 바이트 수준 BPE 토큰은 최소 1바이트를 덮으므로 텍스트 토큰 수 ≤ UTF-8 바이트 수.
+ * live 입력 토큰 **보수적 추정**(FIX1-LIVEL1 — 증명된 상한이 아니다).
  * = 정확히 보낼 프롬프트의 바이트 + 시스템 프롬프트·스키마 바이트 + 틀 여유(LIVE_LLM_FRAMING_OVERHEAD_TOKENS).
- * 한국어(글자당 3바이트)는 실제보다 크게 잡힌다(보수적 — 월 상한 보장이 목적).
+ * "토큰 ≥ 1바이트"·"서버가 더하는 입력 ≤ 여유"는 확인되지 않은 가정이고, 스키마는 서버 안에서 다른 표현으로 바뀔 수 있다.
+ * 그래서 실제 사용량은 성공·실패 모두 응답 usage 로 기록하고, 실제액 > 예약액이면 초과액을 남겨 **다음** 예약의 1회·월 검사에 포함한다
+ * — 상한은 최대 한 호출분 넘을 수 있다. 한국어(글자당 3바이트)는 대개 실제보다 크게 잡힌다.
  */
-export function liveInputUpperBoundTokens(prompt: string): number {
+export function liveInputEstimateTokens(prompt: string): number {
   return utf8ByteLength(prompt) + LIVE_LLM_FIXED_INPUT_BYTES + LIVE_LLM_FRAMING_OVERHEAD_TOKENS;
 }
 

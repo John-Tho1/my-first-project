@@ -22,6 +22,7 @@ const LABELS: Record<string, string> = {
   LLM_PRICE_INPUT_PER_1K: 'LLM_PRICE_INPUT_PER_1K(입력 1K 토큰 가격)',
   LLM_PRICE_OUTPUT_PER_1K: 'LLM_PRICE_OUTPUT_PER_1K(출력 1K 토큰 가격)',
   LLM_LIVE_MAX_OUTPUT_TOKENS: 'LLM_LIVE_MAX_OUTPUT_TOKENS(실제 AI 1회 출력 토큰 상한)',
+  LLM_LIVE_MAX_RUNS: 'LLM_LIVE_MAX_RUNS(승인 기록당 실제 AI 호출 횟수)',
   STT_MODE: 'STT_MODE(음성 전사 모드)',
   STT_PROVIDER: 'STT_PROVIDER(음성 전사 공급자)',
   STT_MODEL: 'STT_MODEL(음성 전사 모델)',
@@ -92,9 +93,22 @@ export const configSchema = z.object({
   LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
   /**
    * LIVE-L1(D34): 실제 AI 1회 출력 토큰 상한(1024 ~ 16000, 기본 4096). 예약의 출력 몫이자 요청의 max_tokens 와 같은 값이다
-   * (예약 = 실제 비용의 상한). Opus 의 thinking 토큰도 출력으로 과금되므로 너무 작으면 max_tokens 로 끝나 실패(예약액 확정)한다. 모의에는 쓰지 않는다.
+   * (FIX1-LIVEL1: 예약은 보수적 **추정**이지 증명된 비용 상한이 아니다 — 실제 사용량을 항상 기록한다). Opus 의 thinking 토큰도 출력으로
+   * 과금되므로 너무 작으면 max_tokens 로 끝나 실패한다. 모의에는 쓰지 않는다.
    */
   LLM_LIVE_MAX_OUTPUT_TOKENS: opt(intRange(LIVE_LLM_MIN_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS)),
+  /**
+   * FIX1-LIVEL1(D34 2단계 범위): 같은 승인 기록(LLM_LIVE_APPROVAL_REF)으로 허용하는 실제 AI 호출 횟수(1 ~ 1000000, 양의 정수). 없으면 제한 없음.
+   * 예약 트랜잭션이 owner 잠금 아래에서 이 owner 의 live 원장 행(스냅숏의 approval_ref 가 같은 것 — 실패 호출 포함)을 세어 넘으면 429 live_run_limit.
+   */
+  LLM_LIVE_MAX_RUNS: opt(
+    z
+      .string()
+      .regex(/^\d{1,7}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(1_000_000))
+      .optional(),
+  ),
   /**
    * T08(결정 D9·D15): 음성 전사. 기본 mock(결정적 모의 전사기, 외부 호출 없음). live 는 승인 기록·공급자·모델·가격이 있어도
    * T08 에는 어댑터(HTTP 호출)가 없어 항상 거부된다. 예산 통화·상한은 LLM_BUDGET_* 를 함께 쓴다(같은 원장).

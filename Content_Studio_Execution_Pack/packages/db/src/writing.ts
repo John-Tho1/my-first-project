@@ -31,6 +31,8 @@ import {
   NotFoundError,
   promptVersionFor,
   estimateTokens,
+  failureUsageOf,
+  type TokenUsage,
   sanitizeLlmOutput,
   renderVariantText,
   type Channel,
@@ -477,6 +479,18 @@ function failureCode(e: unknown): string {
 }
 
 /**
+ * FIX1-LIVEL1: 실패한 live 호출의 확인된 사용량(숫자만). provider 오류에 실린 usage(refusal·max_tokens·형식 오류 등),
+ * 또는 provider 는 성공했지만 서버 검증(input_version·크기·인용 정제)에서 실패했으면 그 호출의 usageOf. 모의·모름 → null(D13 예약액).
+ */
+export function liveFailureUsage(llm: AssistLlm, input: AssistLlmInput, generated: LlmStructuredOutput | null, e: unknown): TokenUsage | null {
+  if (llm.mode !== 'live') return null;
+  const fromError = failureUsageOf(e);
+  if (fromError) return fromError;
+  if (generated && llm.usageOf) return failureUsageOf({ usage: llm.usageOf(input, generated) });
+  return null;
+}
+
+/**
  * AI 작성 보조. run 기록 → provider 호출(트랜잭션 밖) → 성공: 제안 버전(현재 아님) + run succeeded / 실패: run failed.
  * 어느 경우에도 contents.current_version_id 와 기존 버전은 바뀌지 않는다.
  */
@@ -502,8 +516,10 @@ export async function runAssist(
   };
   let output: LlmStructuredOutput;
   let sanitized: ReturnType<typeof sanitizeLlmOutput>;
+  let generated: LlmStructuredOutput | null = null;
   try {
     const raw = await llm.generate(llmInput);
+    generated = raw;
     output = llmStructuredOutputSchema.parse(raw);
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
@@ -517,7 +533,8 @@ export async function runAssist(
         .set({ status: 'failed', error: failureCode(e), finishedAt: finished })
         .where(and(eq(generationRuns.id, runId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'running')));
       // T07: 실패한 호출도 비용이 났을 수 있으므로 예약액 전체를 실제액으로 확정한다(docs/02: 실패 재시도도 예약량에 반영).
-      await settleLedgerFailed(tx, ownerId, prep.ledger, finished);
+      // FIX1-LIVEL1: live 는 응답 usage(숫자)를 알면 max(예약액, usage 비용)으로 — 초과액을 숨기지 않는다.
+      await settleLedgerFailed(tx, ownerId, prep.ledger, finished, { pricing: prep.policy.pricing, usage: liveFailureUsage(llm, llmInput, generated, e) });
       await recordAudit(tx, {
         ownerId,
         action: 'content.assist',

@@ -4,7 +4,20 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { count, eq } from 'drizzle-orm';
-import { closeDb, createContent, ensureOwner, getDb, runAssist, runVariantAssist, schema, seed, type Db } from '@cs/db';
+import {
+  adoptProposal,
+  closeDb,
+  createContent,
+  ensureOwner,
+  getDb,
+  listUnconfirmedExperienceClaims,
+  runAssist,
+  runVariantAssist,
+  schema,
+  seed,
+  usageLedgerView,
+  type Db,
+} from '@cs/db';
 import {
   AppError,
   budgetPolicy,
@@ -17,7 +30,7 @@ import {
   toMicro,
   utf8ByteLength,
 } from '@cs/domain';
-import { ClaudeLlmProvider } from '@cs/providers';
+import { ClaudeLlmProvider, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
 import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/route';
 import { cookieHeader, jsonPost, login } from './helpers';
@@ -330,5 +343,185 @@ describe('route·health(서버 환경의 키, 가짜 fetch 는 전역 stub — �
     } finally {
       reset();
     }
+  });
+});
+
+// ---- FIX round 1(Codex review-LIVEL1) ----
+
+const BIG = { input_tokens: 200_000, output_tokens: 4096 };
+const ledgerOf = async (contentId: string) => {
+  const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.contentId, contentId));
+  const [ledger] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.runId, run!.id));
+  return { run: run!, ledger: ledger! };
+};
+
+describe('FIX1 P1 :93 — 예약은 추정, 실제는 항상 기록, 초과는 다음 예약에서 막힌다(상한 초과는 최대 1회분)', () => {
+  it('실제액이 1회 상한·월 잔여를 넘는 호출 → 초과액 그대로 기록, 다음 예약은 429(호출 0)', async () => {
+    const owner = await freshOwner('live-l1-fix1-cap@example.local');
+    const c = await createContent(db, owner, { title: '상한 초과', body: '짧은 본문.' });
+    const p = policy({ LLM_BUDGET_PER_RUN_MAX: '0.5', LLM_BUDGET_MONTHLY_LIMIT: '0.6' });
+    const { fetch, calls } = fakeFetch(json(200, message({ usage: { input_tokens: 300_000, output_tokens: 4096 } })), json(200, message()));
+    const r = await runAssist(db, owner, c.content.id, draft(p), claude(fetch));
+    const actual = costMicro(p.pricing, 300_000, 4096);
+    expect(actual).toBeGreaterThan(p.perRunMaxMicro!);
+    expect(actual).toBeGreaterThan(p.monthlyLimitMicro!);
+    expect(toMicro(r.ledger.reservedAmount)).toBeLessThanOrEqual(p.perRunMaxMicro!);
+    expect(r.ledger).toMatchObject({ actualAmount: fromMicro(actual), overBudget: true, overageAmount: fromMicro(actual - toMicro(r.ledger.reservedAmount)) });
+    const before = await counts();
+    const e = await runAssist(db, owner, c.content.id, draft(p), claude(fetch)).then(
+      () => null,
+      (x: AppError) => x,
+    );
+    expect([e?.code, (e?.extra as { reason?: string } | undefined)?.reason]).toEqual(['budget_exceeded', 'monthly_limit']);
+    expect(calls).toHaveLength(1);
+    expect(await counts()).toEqual(before);
+  });
+});
+
+describe('FIX1 P1 :222 — 실패 정산 = max(예약액, 응답 usage 비용), failed=true, 초과 기록', () => {
+  it.each<[string, Record<string, unknown>, string | undefined, string]>([
+    ['refusal', { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber', explanation: ECHO } }, `{"x":"${ECHO}`, 'llm_refusal'],
+    ['max_tokens', { stop_reason: 'max_tokens' }, `{"proposed_text":"${ECHO}`, 'llm_max_tokens'],
+    ['unexpected_stop', { stop_reason: 'model_context_window_exceeded' }, undefined, 'llm_unexpected_stop'],
+    ['invalid_output', {}, `nope ${ECHO}`, 'llm_invalid_output'],
+    ['citation', {}, JSON.stringify({ ...modelOut, proposed_text: '자세한 내용은 https://fake.example/report 참고.' }), 'unverifiable_citation'],
+  ])('%s + 예약 초과 usage → run failed, 실제액 = usage 비용, overage·over_budget, tokens 기록, 원문 없음', async (label, over, text, code) => {
+    const owner = await freshOwner(`live-l1-fix1-fail-${label}@example.local`);
+    const c = await createContent(db, owner, { title: `실패 ${label}`, body: '사용자 원문.' });
+    const { fetch } = fakeFetch(json(200, message({ ...over, usage: BIG }, text)));
+    const p = policy();
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(p), claude(fetch)))).toBe('llm_failed');
+    const { run, ledger } = await ledgerOf(c.content.id);
+    expect(run).toMatchObject({ status: 'failed', error: code });
+    const actual = costMicro(p.pricing, BIG.input_tokens, BIG.output_tokens);
+    expect(actual).toBeGreaterThan(toMicro(ledger.reservedAmount));
+    expect(ledger).toMatchObject({
+      state: 'settled',
+      failed: true,
+      tokensIn: BIG.input_tokens,
+      tokensOut: BIG.output_tokens,
+      actualAmount: fromMicro(actual),
+      overageAmount: fromMicro(actual - toMicro(ledger.reservedAmount)),
+      overBudget: true,
+    });
+    const versions = await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.contentId, c.content.id));
+    expect(versions.map((v) => v.body)).toEqual(['사용자 원문.']);
+    await expectDbClean();
+  });
+
+  it('실패 + 예약보다 작은 usage → 실제액은 예약액(D13 그대로), tokens 는 응답 값, 초과 없음', async () => {
+    const owner = await freshOwner('live-l1-fix1-fail-small@example.local');
+    const c = await createContent(db, owner, { title: '작은 실패', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ stop_reason: 'max_tokens', usage: { input_tokens: 10, output_tokens: 20 } })));
+    await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({ failed: true, tokensIn: 10, tokensOut: 20, actualAmount: ledger.reservedAmount, overBudget: false });
+  });
+
+  it('usage 를 모르는 실패(HTTP 529) → D13 그대로(예약액, tokens 없음)', async () => {
+    const owner = await freshOwner('live-l1-fix1-fail-nousage@example.local');
+    const c = await createContent(db, owner, { title: '모름', body: '본문.' });
+    const { fetch } = fakeFetch(json(529, { type: 'error', error: { type: 'overloaded_error', message: ECHO } }));
+    await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({ failed: true, tokensIn: null, tokensOut: null, actualAmount: ledger.reservedAmount, overBudget: false });
+  });
+
+  it('채널 초안(variant) 실패도 같은 정산', async () => {
+    const owner = await freshOwner('live-l1-fix1-variant-fail@example.local');
+    const c = await createContent(db, owner, { title: '채널 실패', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ stop_reason: 'refusal', usage: BIG })));
+    const p = policy();
+    await failCode(runVariantAssist(db, owner, c.content.id, { channel: 'blog', baseVersion: 1, budget: p }, claude(fetch)));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({
+      failed: true,
+      tokensIn: BIG.input_tokens,
+      overBudget: true,
+      actualAmount: fromMicro(costMicro(p.pricing, BIG.input_tokens, BIG.output_tokens)),
+    });
+  });
+
+  it('모의 provider 실패는 기존 D13 그대로(tokens 없음, 예약액)', async () => {
+    const owner = await freshOwner('live-l1-fix1-mock-fail@example.local');
+    const c = await createContent(db, owner, { title: '모의 실패', body: '본문.' });
+    const priced = budgetPolicy(loadConfig({ LLM_PRICE_INPUT_PER_1K: '1', LLM_PRICE_OUTPUT_PER_1K: '1' }));
+    await failCode(runAssist(db, owner, c.content.id, draft(priced), new MockLlmProvider({ fail: true })));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({ failed: true, tokensIn: null, tokensOut: null, actualAmount: ledger.reservedAmount });
+  });
+});
+
+describe('FIX1 놓친 케이스(c) — proposed_text 의 미확인 1인칭 경험은 채택 뒤 게이트에 걸린다', () => {
+  it('claims=[] 인 출력의 1인칭 문장 → experience claim 저장 → 채택하면 미확인 경험으로 남음', async () => {
+    const owner = await freshOwner('live-l1-fix1-gate@example.local');
+    const c = await createContent(db, owner, { title: '게이트', body: '본문.' });
+    const out = { ...modelOut, proposed_text: '해외 영업 이야기. 제가 직접 계약서를 고쳐 썼습니다.', claims: [] };
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.claims.map((x) => [x.text, x.kind, x.needs_user_confirmation])).toEqual([['제가 직접 계약서를 고쳐 썼습니다.', 'experience', true]]);
+    await adoptProposal(db, owner, c.content.id, r.run.id, 1);
+    const unresolved = await listUnconfirmedExperienceClaims(db, owner, c.content.id);
+    expect(unresolved.map((u) => [u.run_id, u.claim_index])).toEqual([[r.run.id, 0]]);
+  });
+});
+
+describe('FIX1 놓친 케이스(d) — LLM_LIVE_MAX_RUNS(D34 2단계 범위)', () => {
+  const limited = (extra: Record<string, string> = {}) => policy({ LLM_LIVE_MAX_RUNS: '1', ...extra });
+
+  it('순차: 같은 승인 기록으로 1회 뒤 2번째는 429 live_run_limit(호출 0·행 0), 승인 기록이 바뀌면 다시 1회', async () => {
+    const owner = await freshOwner('live-l1-fix1-runs-seq@example.local');
+    const c = await createContent(db, owner, { title: '횟수', body: '본문.' });
+    const { fetch, calls } = fakeFetch(json(200, message()), json(200, message()));
+    const first = await runAssist(db, owner, c.content.id, draft(limited()), claude(fetch));
+    expect(first.run.status).toBe('succeeded');
+    const before = await counts();
+    const e = await runAssist(db, owner, c.content.id, draft(limited()), claude(fetch)).then(
+      () => null,
+      (x: AppError) => x,
+    );
+    expect([e?.kind, e?.code]).toEqual(['budget_exceeded', 'live_run_limit']);
+    expect(calls).toHaveLength(1);
+    expect(await counts()).toEqual(before);
+    const next = await runAssist(db, owner, c.content.id, draft(limited({ LLM_LIVE_APPROVAL_REF: 'D34-test-approval-2' })), claude(fetch));
+    expect(next.run.status).toBe('succeeded');
+    expect(calls).toHaveLength(2);
+    // 승인 기록 값은 원장 스냅숏에 남지만 사용량 view(화면·API 응답)에는 나오지 않는다
+    expect(next.ledger.pricingSnapshot).toMatchObject({ approval_ref: 'D34-test-approval-2' });
+    expect(JSON.stringify(usageLedgerView(next.ledger))).not.toContain('D34-test-approval');
+  });
+
+  it('실패한 호출도 1회로 센다', async () => {
+    const owner = await freshOwner('live-l1-fix1-runs-fail@example.local');
+    const c = await createContent(db, owner, { title: '실패 횟수', body: '본문.' });
+    const { fetch, calls } = fakeFetch(json(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }), json(200, message()));
+    await failCode(runAssist(db, owner, c.content.id, draft(limited()), claude(fetch)));
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(limited()), claude(fetch)))).toBe('live_run_limit');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('동시 2건 → 정확히 1건만 호출, 1건은 live_run_limit', async () => {
+    const owner = await freshOwner('live-l1-fix1-runs-conc@example.local');
+    const c1 = await createContent(db, owner, { title: '동시 1', body: '본문 1.' });
+    const c2 = await createContent(db, owner, { title: '동시 2', body: '본문 2.' });
+    const { fetch, calls } = fakeFetch(json(200, message()), json(200, message()));
+    const results = await Promise.allSettled([
+      runAssist(db, owner, c1.content.id, draft(limited()), claude(fetch)),
+      runAssist(db, owner, c2.content.id, draft(limited()), claude(fetch)),
+    ]);
+    expect(results.filter((x) => x.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((x): x is PromiseRejectedResult => x.status === 'rejected');
+    expect(rejected.map((x) => (x.reason as AppError).code)).toEqual(['live_run_limit']);
+    expect(calls).toHaveLength(1);
+    expect((await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, owner))).length).toBe(1);
+  });
+
+  it('LLM_LIVE_MAX_RUNS 없음 → 횟수 제한 없음(기존 동작)', async () => {
+    const owner = await freshOwner('live-l1-fix1-runs-none@example.local');
+    const c = await createContent(db, owner, { title: '무제한', body: '본문.' });
+    const { fetch, calls } = fakeFetch(json(200, message()), json(200, message()));
+    await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(calls).toHaveLength(2);
   });
 });

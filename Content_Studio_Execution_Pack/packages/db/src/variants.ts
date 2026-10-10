@@ -59,7 +59,7 @@ import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './
 import { invalidateApprovalsForVariant } from './approval-invalidation';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, claimConfirmations, contents, distributionItems, generationRuns, variantAssets, variants, variantVersions } from './schema';
-import { getCurrentBrandProfile, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
+import { getCurrentBrandProfile, liveFailureUsage, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
 
 export type VariantRow = typeof variants.$inferSelect;
 export type VariantVersionRow = typeof variantVersions.$inferSelect;
@@ -388,8 +388,10 @@ export async function runVariantAssist(
   };
   let output: LlmStructuredOutput;
   let sanitized: ReturnType<typeof sanitizeLlmOutput>;
+  let generated: LlmStructuredOutput | null = null;
   try {
-    output = llmStructuredOutputSchema.parse(await llm.generate(llmInput));
+    generated = await llm.generate(llmInput);
+    output = llmStructuredOutputSchema.parse(generated);
     if (output.input_version !== prep.inputVersion) throw new AppError('bad_request', 'input_version_mismatch', '입력 버전이 다른 응답');
     if (output.proposed_text.length > MAX_PROPOSAL_BODY) throw new AppError('bad_request', 'proposal_too_large', '제안이 너무 깁니다');
     // FIX-T07 round 4: 채널 초안에는 허용 출처가 없다 — 글에 URL·도메인·[출처…]·[n] 이 있으면 출력 전체 실패(fail-closed).
@@ -402,7 +404,8 @@ export async function runVariantAssist(
         .update(generationRuns)
         .set({ status: 'failed', error: code, finishedAt: finished })
         .where(and(eq(generationRuns.id, prep.run.id), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'running')));
-      await settleLedgerFailed(tx, ownerId, prep.ledger, finished);
+      // FIX1-LIVEL1: live 는 확인된 usage 로 max(예약액, usage 비용) — 초과액을 숨기지 않는다(모의·모름은 D13 예약액).
+      await settleLedgerFailed(tx, ownerId, prep.ledger, finished, { pricing: policy.pricing, usage: liveFailureUsage(llm, llmInput, generated, e) });
       await recordAudit(tx, {
         ownerId,
         action: 'variant.assist',

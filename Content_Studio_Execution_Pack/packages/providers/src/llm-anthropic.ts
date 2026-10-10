@@ -6,11 +6,14 @@
  * - `maxRetries: 0`: SDK 자동 재시도는 과금을 예약 밖으로 늘린다(예약 1건 = 요청 1건). 시간 초과도 재시도하지 않는다.
  * - `max_tokens` = input.maxOutputTokens(필수 — 예약의 출력 몫). 없거나 범위 밖이면 **보내기 전에** 거부한다.
  * - 입력은 예약이 센 것과 같은 문자열만: 시스템 프롬프트(LIVE_LLM_SYSTEM_PROMPT) + input.prompt + 출력 스키마(LIVE_LLM_OUTPUT_JSON_SCHEMA).
+ *   FIX1-LIVEL1: 예약은 보수적 추정이지 증명된 비용 상한이 아니다 — 응답 usage 를 성공·실패 모두 검증해 돌려주고(실패는 오류의 usage),
+ *   db 층이 실제액(초과액 포함)을 기록해 다음 예약 검사에 넣는다.
  * - thinking·temperature·tools·assistant prefill·server-side fallbacks 를 보내지 않는다(Opus 5.5 는 thinking 을 끌 수 없고 effort 로만 조절 —
  *   `effort: 'low'`. fallbacks 는 대체 모델 단가가 예약 밖이라 D34 가 끔).
  * - apiKey·baseURL 을 명시하고 authToken 은 null — ANTHROPIC_BASE_URL·ANTHROPIC_AUTH_TOKEN·프로필이 키를 다른 곳으로 보내거나 다른 자격 증명을
  *   싣지 못하게. 그 위에 fetch 감싸개가 목적지를 `https://api.anthropic.com/v1/messages` 로만 허용하고 `redirect: 'error'`,
- *   헤더는 허용 목록만 남기고 x-api-key 를 다시 쓴다(ANTHROPIC_CUSTOM_HEADERS 가 키를 덮거나 beta·Authorization 을 붙이지 못하게).
+ *   헤더는 허용 목록만 남기고 x-api-key·content-type·accept·anthropic-version 을 고정값으로 다시 쓰며 content-length 는 뺀다
+ *   (ANTHROPIC_CUSTOM_HEADERS 가 키를 덮거나 beta·Authorization·잘못된 길이·형식·버전을 붙이지 못하게).
  * - `logLevel: 'off'`(ANTHROPIC_LOG 무시). SDK 오류의 message·headers·body(입력을 되풀이할 수 있음)는 버리고 고정 한국어 문구·코드만 던진다.
  * - 키는 `#apiKey`·`#client`(직렬화 안 됨). toJSON 은 이름·모델만.
  */
@@ -23,7 +26,7 @@ import {
   LIVE_LLM_MAX_MAX_OUTPUT_TOKENS,
   LIVE_LLM_OUTPUT_JSON_SCHEMA,
   LIVE_LLM_SYSTEM_PROMPT,
-  liveInputUpperBoundTokens,
+  liveInputEstimateTokens,
   liveLlmReadiness,
   LiveProviderNotConfiguredError,
   liveModelOutputSchema,
@@ -31,7 +34,7 @@ import {
   type AppConfig,
   type LlmStructuredOutput,
 } from '@cs/domain';
-import { hasFirstPersonExpression, type LlmGenerateInput, type LlmProvider, type LlmUsage } from './llm';
+import { hasFirstPersonExpression, splitSentences, type LlmGenerateInput, type LlmProvider, type LlmUsage } from './llm';
 
 export const ANTHROPIC_MESSAGES_URL = `${ANTHROPIC_API_ORIGIN}/v1/messages`;
 /** 요청 1건의 시간 제한(ms). 넘으면 재시도 없이 실패(llm_timeout) — 과금됐을 수 있으므로 예약액 전액 확정(D13). */
@@ -87,18 +90,24 @@ export class LiveLlmError extends AppError {
   readonly httpStatus: number | null;
   /** Anthropic request-id(형식이 `req_` + 영숫자일 때만 — 입력을 되풀이하지 않는 불투명 값) */
   readonly requestId: string | null;
-  constructor(code: LiveLlmErrorCode, detail: { httpStatus?: number | null; requestId?: string | null } = {}) {
+  /**
+   * FIX1-LIVEL1: 응답을 받은 실패(refusal·max_tokens·unexpected_stop·invalid_output)의 검증된 사용량(숫자만, 텍스트 없음).
+   * db 층이 max(예약액, 이 사용량 비용)으로 실패를 정산한다. 응답이 없거나 usage 가 이상하면 null(D13 — 예약액).
+   */
+  readonly usage: LlmUsage | null;
+  constructor(code: LiveLlmErrorCode, detail: { httpStatus?: number | null; requestId?: string | null; usage?: LlmUsage | null } = {}) {
     super('llm_failed', code, MESSAGES[code]);
     this.code = code;
     this.httpStatus = typeof detail.httpStatus === 'number' && Number.isInteger(detail.httpStatus) ? detail.httpStatus : null;
     this.requestId = safeRequestId(detail.requestId);
+    this.usage = detail.usage ? { tokensIn: detail.usage.tokensIn, tokensOut: detail.usage.tokensOut } : null;
   }
 }
 
 /** stop_reason=refusal(안전 분류기 거절). 모델 텍스트·stop_details 설명은 저장하지 않는다. */
 export class LiveLlmRefusalError extends LiveLlmError {
-  constructor(requestId: string | null = null) {
-    super('llm_refusal', { requestId });
+  constructor(requestId: string | null = null, usage: LlmUsage | null = null) {
+    super('llm_refusal', { requestId, usage });
   }
 }
 
@@ -137,10 +146,15 @@ export interface ClaudeLlmOptions {
 const requestUrl = (input: Parameters<typeof fetch>[0]): string =>
   typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 
-/** 보낼 수 있는 요청 헤더 이름(SDK 기본 헤더만). 그 밖(authorization·anthropic-beta·사용자 정의 등)은 버린다. */
-const ALLOWED_HEADER = /^(accept|content-type|content-length|user-agent|anthropic-version|x-api-key|x-stainless-[a-z0-9-]+)$/i;
+/**
+ * 보낼 수 있는 요청 헤더 이름(SDK 기본 헤더만). 그 밖(authorization·anthropic-beta·사용자 정의 등)은 버린다.
+ * FIX1-LIVEL1: content-length 는 빼고(전송 계층이 본문으로 계산), content-type·accept·anthropic-version·x-api-key 는 아래에서 고정값으로 다시 쓴다.
+ */
+const ALLOWED_HEADER = /^(user-agent|x-stainless-[a-z0-9-]+)$/i;
+/** 고정 SDK(0.128.0)가 보내는 API 버전(node_modules/@anthropic-ai/sdk/client.js buildHeaders 에서 확인). SDK 를 올리면 함께 확인한다. */
+export const ANTHROPIC_API_VERSION = '2023-06-01';
 
-const isNonNegInt =(v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
 
 export class ClaudeLlmProvider implements LlmProvider {
   readonly name = ANTHROPIC_PROVIDER;
@@ -181,6 +195,9 @@ export class ClaudeLlmProvider implements LlmProvider {
       new Headers(init?.headers).forEach((value, name) => {
         if (ALLOWED_HEADER.test(name)) headers.set(name, value);
       });
+      headers.set('accept', 'application/json');
+      headers.set('content-type', 'application/json');
+      headers.set('anthropic-version', ANTHROPIC_API_VERSION);
       headers.set('x-api-key', apiKey);
       return (base ?? globalThis.fetch)(input, { ...init, headers, redirect: 'error' });
     }) as typeof fetch;
@@ -197,8 +214,10 @@ export class ClaudeLlmProvider implements LlmProvider {
   }
 
   async generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
+    // FIX1-LIVEL1: 같은 입력 객체로 다시 부르면 지난 성공의 usage 가 남지 않게 먼저 지운다(실패면 usageOf 는 보수적 추정).
+    this.#usage.delete(input);
     const maxTokens = input.maxOutputTokens;
-    // 예약이 비용 상한이 되려면 출력 상한이 반드시 있어야 한다 — 없거나 범위 밖이면 보내기 전에 거부.
+    // 예약의 출력 몫 = max_tokens — 없거나 범위 밖이면 보내기 전에 거부.
     if (typeof maxTokens !== 'number' || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > LIVE_LLM_MAX_MAX_OUTPUT_TOKENS) {
       throw new LiveLlmError('llm_request_invalid');
     }
@@ -217,23 +236,34 @@ export class ClaudeLlmProvider implements LlmProvider {
       throw mapAnthropicError(e);
     }
 
-    const requestId = safeRequestId((message as { _request_id?: unknown })._request_id);
+    const requestId = safeRequestId((message as { _request_id?: unknown } | null)?._request_id);
+    // FIX1-LIVEL1: 사용량을 종료 사유·출력 검증보다 먼저 읽어 검증한다 — 실패해도 숫자만 오류에 실어 정산에 쓴다.
+    const usage = readUsage((message as { usage?: unknown } | null)?.usage);
     // stop_reason 을 내용보다 먼저 본다.
-    if (message.stop_reason === 'refusal') throw new LiveLlmRefusalError(requestId);
-    if (message.stop_reason === 'max_tokens') throw new LiveLlmError('llm_max_tokens', { requestId });
-    if (message.stop_reason !== 'end_turn') throw new LiveLlmError('llm_unexpected_stop', { requestId });
+    const stop = (message as { stop_reason?: unknown } | null)?.stop_reason;
+    if (stop === 'refusal') throw new LiveLlmRefusalError(requestId, usage);
+    if (stop === 'max_tokens') throw new LiveLlmError('llm_max_tokens', { requestId, usage });
+    if (stop !== 'end_turn') throw new LiveLlmError('llm_unexpected_stop', { requestId, usage });
 
-    const output = this.#parseOutput(message, input, requestId);
-    this.#usage.set(input, this.#usageFrom(message, input));
+    const output = this.#parseOutput(message, input, requestId, usage);
+    // usage 가 없거나 이상하면 보수적 추정(실제보다 작게 기록하지 않으려는 것 — 증명된 상한은 아님)
+    this.#usage.set(input, usage ?? this.#estimate(input));
     return output;
   }
 
-  #parseOutput(message: Anthropic.Message, input: LlmGenerateInput, requestId: string | null): LlmStructuredOutput {
-    const invalid = () => new LiveLlmError('llm_invalid_output', { requestId });
+  #parseOutput(message: Anthropic.Message, input: LlmGenerateInput, requestId: string | null, usage: LlmUsage | null): LlmStructuredOutput {
+    const invalid = () => new LiveLlmError('llm_invalid_output', { requestId, usage });
+    const content: unknown = (message as { content?: unknown }).content;
+    // FIX1-LIVEL1: content 가 배열이 아니거나 블록이 객체가 아니면 안정된 코드로(TypeError 로 새지 않게)
+    if (!Array.isArray(content)) throw invalid();
     const texts: string[] = [];
-    for (const block of message.content ?? []) {
-      if (block.type === 'text') texts.push(block.text);
-      else if (block.type !== 'thinking' && block.type !== 'redacted_thinking') throw invalid();
+    for (const block of content as unknown[]) {
+      if (!block || typeof block !== 'object') throw invalid();
+      const b = block as { type?: unknown; text?: unknown };
+      if (b.type === 'text') {
+        if (typeof b.text !== 'string') throw invalid();
+        texts.push(b.text);
+      } else if (b.type !== 'thinking' && b.type !== 'redacted_thinking') throw invalid();
     }
     if (texts.length === 0) throw invalid();
     let raw: unknown;
@@ -249,6 +279,16 @@ export class ClaudeLlmProvider implements LlmProvider {
     const claims = m.claims.map((c) =>
       c.kind === 'experience' || hasFirstPersonExpression(c.text) ? { ...c, kind: 'experience' as const, needs_user_confirmation: true } : c,
     );
+    // FIX1-LIVEL1(놓친 케이스 c): 제안 본문의 1인칭 문장이 experience claim 으로 덮이지 않으면 서버가 experience claim(확인 필요, 출처 없음)을
+    // 더한다 — 채택 뒤 미확인 경험 게이트(claims-gate)가 모의와 같이 막도록. 출처·증거 등급을 만들지 않는다(보수적 방향만).
+    const experienceTexts = claims.filter((c) => c.kind === 'experience').map((c) => c.text.trim());
+    for (const sentence of splitSentences(m.proposed_text)) {
+      if (!hasFirstPersonExpression(sentence)) continue;
+      const covered = experienceTexts.some((t) => t !== '' && (t.includes(sentence) || sentence.includes(t)));
+      if (covered) continue;
+      claims.push({ text: sentence, kind: 'experience', source_refs: [], needs_user_confirmation: true });
+      experienceTexts.push(sentence);
+    }
     // result_type·input_version 은 서버가 입력에서 정한다(모델 출력을 믿지 않음).
     const assembled = {
       result_type: input.task,
@@ -264,24 +304,34 @@ export class ClaudeLlmProvider implements LlmProvider {
     return checked.data;
   }
 
-  /** 응답 usage(입력 = input + 캐시 생성·읽기 입력, 출력 = output — thinking 포함). 형식이 이상하면 예약 상한값으로(과소 기록 방지). */
-  #usageFrom(message: Anthropic.Message, input: LlmGenerateInput): LlmUsage {
-    const u = message.usage as Partial<Anthropic.Usage> | undefined;
-    if (!u || !isNonNegInt(u.input_tokens) || !isNonNegInt(u.output_tokens)) return this.#upperBound(input);
-    const cacheCreate = isNonNegInt(u.cache_creation_input_tokens) ? u.cache_creation_input_tokens : 0;
-    const cacheRead = isNonNegInt(u.cache_read_input_tokens) ? u.cache_read_input_tokens : 0;
-    return { tokensIn: u.input_tokens + cacheCreate + cacheRead, tokensOut: u.output_tokens };
+  /** 예약과 같은 보수적 추정(입력 추정 + max_tokens) — usage 를 믿을 수 없을 때. 증명된 상한이 아니다. */
+  #estimate(input: LlmGenerateInput): LlmUsage {
+    return { tokensIn: liveInputEstimateTokens(input.prompt ?? ''), tokensOut: input.maxOutputTokens ?? LIVE_LLM_MAX_MAX_OUTPUT_TOKENS };
   }
 
-  #upperBound(input: LlmGenerateInput): LlmUsage {
-    return { tokensIn: liveInputUpperBoundTokens(input.prompt ?? ''), tokensOut: input.maxOutputTokens ?? LIVE_LLM_MAX_MAX_OUTPUT_TOKENS };
-  }
-
-  /** 그 호출의 실제 usage. 없으면(성공 응답을 본 적 없는 입력) 예약 상한값 — 실제보다 작게 기록하지 않는다. */
+  /** 그 호출의 실제 usage. 없으면(이 입력 객체의 성공 응답이 없음) 보수적 추정. */
   usageOf(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage {
     void output;
-    return this.#usage.get(input) ?? this.#upperBound(input);
+    return this.#usage.get(input) ?? this.#estimate(input);
   }
+}
+
+/**
+ * 응답 usage 검증(FIX1-LIVEL1). 입력 = input + 캐시 생성·읽기 입력, 출력 = output(thinking 포함).
+ * input·output 은 안전한 음이 아닌 정수여야 하고, 캐시 필드는 없음·null 이면 0, **있는데 이상하면**(문자열·음수·소수·안전 정수 밖) 전체를 믿지 않는다.
+ * 합계도 안전 정수여야 한다. 믿을 수 없으면 null.
+ */
+export function readUsage(raw: unknown): LlmUsage | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const u = raw as Record<string, unknown>;
+  if (!isUsageInt(u.input_tokens) || !isUsageInt(u.output_tokens)) return null;
+  const cache = (v: unknown): number | null => (v === undefined || v === null ? 0 : isUsageInt(v) ? v : null);
+  const cacheCreate = cache(u.cache_creation_input_tokens);
+  const cacheRead = cache(u.cache_read_input_tokens);
+  if (cacheCreate === null || cacheRead === null) return null;
+  const tokensIn = u.input_tokens + cacheCreate + cacheRead;
+  if (!Number.isSafeInteger(tokensIn)) return null;
+  return { tokensIn, tokensOut: u.output_tokens };
 }
 
 /**

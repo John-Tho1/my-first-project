@@ -10,12 +10,13 @@ import {
   LIVE_LLM_FIXED_INPUT_BYTES,
   LIVE_LLM_OUTPUT_JSON_SCHEMA,
   LIVE_LLM_SYSTEM_PROMPT,
-  liveInputUpperBoundTokens,
+  liveInputEstimateTokens,
   llmStructuredOutputSchema,
   LiveProviderNotConfiguredError,
   utf8ByteLength,
 } from '@cs/domain';
 import {
+  ANTHROPIC_API_VERSION,
   ANTHROPIC_MESSAGES_URL,
   ClaudeLlmProvider,
   LiveLlmError,
@@ -162,7 +163,7 @@ describe('ClaudeLlmProvider 성공(기록된 응답)', () => {
     const b = calls[0]!.body as { system: string; messages: Array<{ content: string }>; output_config: { format: { schema: unknown } } };
     const sentBytes = utf8ByteLength(b.system) + utf8ByteLength(JSON.stringify(b.output_config.format.schema)) + utf8ByteLength(b.messages[0]!.content);
     expect(utf8ByteLength(b.system) + utf8ByteLength(JSON.stringify(b.output_config.format.schema))).toBe(LIVE_LLM_FIXED_INPUT_BYTES);
-    expect(liveInputUpperBoundTokens(PROMPT)).toBeGreaterThanOrEqual(sentBytes);
+    expect(liveInputEstimateTokens(PROMPT)).toBeGreaterThanOrEqual(sentBytes);
   });
 
   it('헤더: x-api-key 는 키(값 비교만), Authorization 없음, anthropic-version 있음, 재시도 횟수 0', async () => {
@@ -188,13 +189,13 @@ describe('ClaudeLlmProvider 성공(기록된 응답)', () => {
     expect(p.usageOf(b, outB)).toEqual({ tokensIn: 7, tokensOut: 9 });
   });
 
-  it('usage 가 없거나 이상하면 예약 상한값(실제보다 작게 기록하지 않음), 모르는 입력도 상한값', async () => {
+  it('usage 가 없거나 이상하면 예약과 같은 보수적 추정값(실제보다 작게 기록하지 않으려는 것), 모르는 입력도 추정값', async () => {
     const { fetch } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: -1, output_tokens: 'x' } })));
     const p = provider(fetch);
     const a = input({ maxOutputTokens: 3000 });
     const out = await p.generate(a);
-    expect(p.usageOf(a, out)).toEqual({ tokensIn: liveInputUpperBoundTokens(PROMPT), tokensOut: 3000 });
-    expect(p.usageOf(input({ maxOutputTokens: 1111 }), out)).toEqual({ tokensIn: liveInputUpperBoundTokens(PROMPT), tokensOut: 1111 });
+    expect(p.usageOf(a, out)).toEqual({ tokensIn: liveInputEstimateTokens(PROMPT), tokensOut: 3000 });
+    expect(p.usageOf(input({ maxOutputTokens: 1111 }), out)).toEqual({ tokensIn: liveInputEstimateTokens(PROMPT), tokensOut: 1111 });
   });
 
   it('기존 규칙 유지: 1인칭 표현·experience claim → experience + 사용자 확인 필요, 후속 질문은 앞의 3개', async () => {
@@ -390,5 +391,111 @@ describe('ClaudeLlmProvider 보내기 전 거부·설정 경계', () => {
       }
     }
     expect(() => new ClaudeLlmProvider({ apiKey: KEY, model: ' ' })).toThrow(LiveProviderNotConfiguredError);
+  });
+});
+
+// ---- FIX round 1(Codex review-LIVEL1) ----
+
+const BIG_USAGE = { input_tokens: 200_000, output_tokens: 4096, cache_creation_input_tokens: null, cache_read_input_tokens: null };
+
+describe('FIX1 P1 :222 — 실패 응답도 사용량(숫자만)을 오류에 싣는다(stop_reason·출력 검증 전에 읽음)', () => {
+  it.each<[string, Record<string, unknown>, string | undefined, LiveLlmErrorCode]>([
+    ['refusal', { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber', explanation: ECHO } }, `{"x":"${ECHO}`, 'llm_refusal'],
+    ['max_tokens', { stop_reason: 'max_tokens' }, `{"proposed_text":"${ECHO}`, 'llm_max_tokens'],
+    ['unexpected_stop', { stop_reason: 'pause_turn' }, undefined, 'llm_unexpected_stop'],
+    ['invalid_output', {}, `not json ${ECHO}`, 'llm_invalid_output'],
+    ['content 배열 아님', { content: { type: 'text', text: 'x' } }, undefined, 'llm_invalid_output'],
+  ])('%s + 예약 초과 usage → 코드 그대로, e.usage = {200000, 4096}, 원문 없음', async (_l, over, text, code) => {
+    const { fetch } = fakeFetch(jsonResponse(200, message({ ...over, usage: BIG_USAGE }, text)));
+    const e = await rejectionOf(provider(fetch).generate(input()));
+    expect(e.code).toBe(code);
+    expect(e.usage).toEqual({ tokensIn: 200_000, tokensOut: 4096 });
+    expectNoLeak(e);
+  });
+
+  it('실패 응답의 usage 가 이상하면 e.usage 없음(D13 — 예약액 확정)', async () => {
+    const { fetch } = fakeFetch(jsonResponse(200, message({ stop_reason: 'max_tokens', usage: { input_tokens: '5', output_tokens: 1 } })));
+    const e = await rejectionOf(provider(fetch).generate(input()));
+    expect(e.code).toBe('llm_max_tokens');
+    expect(e.usage).toBeNull();
+  });
+
+  it('HTTP 오류(응답 usage 없음)는 e.usage 없음', async () => {
+    const { fetch } = fakeFetch(jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: ECHO } }));
+    expect((await rejectionOf(provider(fetch).generate(input()))).usage).toBeNull();
+  });
+});
+
+describe('FIX1 P2 :271 — 캐시 usage: 없음·null → 0, 있는데 이상하면 전체를 보수적 상한으로', () => {
+  const upper = (maxOut = 4096) => ({ tokensIn: liveInputEstimateTokens(PROMPT), tokensOut: maxOut });
+  it.each<[string, Record<string, unknown>, { tokensIn: number; tokensOut: number } | 'upper']>([
+    ['캐시 필드 없음', { input_tokens: 1000, output_tokens: 100 }, { tokensIn: 1000, tokensOut: 100 }],
+    ['캐시 null', { input_tokens: 1000, output_tokens: 100, cache_creation_input_tokens: null, cache_read_input_tokens: null }, { tokensIn: 1000, tokensOut: 100 }],
+    ['캐시 문자열', { input_tokens: 1000, output_tokens: 100, cache_creation_input_tokens: '2000' }, 'upper'],
+    ['캐시 음수', { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: -1 }, 'upper'],
+    ['캐시 소수', { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 1.5 }, 'upper'],
+    ['캐시 안전 정수 초과', { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 2 ** 53 }, 'upper'],
+    ['합계 안전 정수 초과', { input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 100, cache_read_input_tokens: 1 }, 'upper'],
+    ['input 안전 정수 초과', { input_tokens: 2 ** 53 + 2, output_tokens: 100 }, 'upper'],
+  ])('%s', async (_l, usage, want) => {
+    const { fetch } = fakeFetch(jsonResponse(200, message({ usage })));
+    const p = provider(fetch);
+    const inp = input();
+    const out = await p.generate(inp);
+    expect(p.usageOf(inp, out)).toEqual(want === 'upper' ? upper() : want);
+  });
+});
+
+describe('FIX1 P2 :181 — 프로토콜 헤더 값 고정(ANTHROPIC_CUSTOM_HEADERS 로 못 바꿈)', () => {
+  it('Content-Length 제거, content-type·accept = application/json, anthropic-version = SDK 고정값', async () => {
+    vi.stubEnv('ANTHROPIC_CUSTOM_HEADERS', 'Content-Length: 0\nContent-Type: text/plain\nAccept: text/html\nAnthropic-Version: 1999-01-01');
+    const { fetch, calls } = fakeFetch(jsonResponse(200, message()));
+    await provider(fetch).generate(input());
+    const h = calls[0]!.headers;
+    expect(ANTHROPIC_API_VERSION).toBe('2023-06-01');
+    expect(h.has('content-length')).toBe(false);
+    expect(h.get('content-type')).toBe('application/json');
+    expect(h.get('accept')).toBe('application/json');
+    expect(h.get('anthropic-version')).toBe(ANTHROPIC_API_VERSION);
+    expect(h.get('x-api-key') === KEY).toBe(true);
+  });
+});
+
+describe('FIX1 놓친 케이스', () => {
+  it.each([
+    ['content = null', { content: null }],
+    ['content = 문자열', { content: 'text' }],
+    ['content 에 null 블록', { content: [null, { type: 'text', text: JSON.stringify(modelOut()) }] }],
+    ['content 에 숫자 블록', { content: [1] }],
+  ])('(a) %s → llm_invalid_output', async (_l, over) => {
+    const { fetch } = fakeFetch(jsonResponse(200, message(over)));
+    const e = await rejectionOf(provider(fetch).generate(input()));
+    expect(e).toBeInstanceOf(LiveLlmError);
+    expect(e.code).toBe('llm_invalid_output');
+  });
+
+  it('(b) 같은 입력 객체로 성공 뒤 실패하면 usageOf 는 지난 성공의 usage 를 돌려주지 않는다(보수적 상한)', async () => {
+    const { fetch } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: 7, output_tokens: 9 } })), jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }));
+    const p = provider(fetch);
+    const inp = input();
+    const out = await p.generate(inp);
+    expect(p.usageOf(inp, out)).toEqual({ tokensIn: 7, tokensOut: 9 });
+    await rejectionOf(p.generate(inp));
+    expect(p.usageOf(inp, out)).toEqual({ tokensIn: liveInputEstimateTokens(PROMPT), tokensOut: 4096 });
+  });
+
+  it('(c) proposed_text 의 1인칭 문장이 experience claim 으로 덮이지 않으면 서버가 experience claim(확인 필요)을 더한다', async () => {
+    const text = '해외 영업은 준비가 중요하다. 제가 두바이에서 계약을 놓친 적이 있습니다. 결론은 사전 조사다.';
+    const { fetch } = fakeFetch(jsonResponse(200, message({}, JSON.stringify(modelOut({ proposed_text: text, claims: [] })))));
+    const r = await provider(fetch).generate(input());
+    expect(r.claims).toEqual([{ text: '제가 두바이에서 계약을 놓친 적이 있습니다.', kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
+  });
+
+  it('(c) 이미 experience claim 이 그 문장을 덮으면 더하지 않는다(중복 없음), 출처 참조는 만들지 않는다', async () => {
+    const text = '제가 직접 협상했습니다. 시장은 커진다.';
+    const claims = [{ text: '제가 직접 협상했습니다.', kind: 'experience', source_refs: [], needs_user_confirmation: true }];
+    const { fetch } = fakeFetch(jsonResponse(200, message({}, JSON.stringify(modelOut({ proposed_text: text, claims })))));
+    const r = await provider(fetch).generate(input());
+    expect(r.claims).toEqual(claims);
   });
 });

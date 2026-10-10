@@ -55,7 +55,7 @@ const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|�
 /** LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다. */
 export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text);
 
-function splitSentences(text: string): string[] {
+export function splitSentences(text: string): string[] {
   return text
     .split(/(?<=[.!?。])\s+|\n+/)
     .map((s) => s.trim())

@@ -119,3 +119,11 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - M5 모의 범위(T18·T19) 종결. 남은 것: T17(보류), T21 운영 배포(승인 필요 — D30-1 서명 URL 의 전제), Threads 2단계(사용자와 함께, D31), D32·D33 사용자 확인.
 - 다음(로컬·결정 불필요): T19 남은 위험 중 소스 등록 상한 경쟁(동시 등록으로 51개) 보강.
 - T19-H1(소스 상한 동시 등록 경쟁): 1e47574 **Codex PASS**.
+
+## 2026-10-10 — LIVE-L1(D34 1단계, 실제 Claude 어댑터) 종결
+- D34(사용자 결정): 첫 실제 AI = Claude(Anthropic), 기본 모델 `claude-opus-5-5`, 월 상한 10 USD. 1단계 = 코드·기록된 응답 시험만(실제 호출 0, 과금 0).
+- 2cbcb49 → FIX1 d7da959 → FIX2 ea5954b → FIX3 a4da041 → **FIX4 2b05044 Codex PASS**. 인계: `LIVEL1_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(2b05044): lint·typecheck·build·unit 1401·integration 786·drill:mock 0건·db:migrate·drill:restore PASS.
+- 핵심: 공식 SDK 0.128.0 고정·재시도 0·목적지/헤더 고정·오류 원문 차단, 예약 = 보수적 추정(상한 증명 아님) + 실제 usage 정산(출처 provider/estimate/none/provider_unstorable), `LLM_LIVE_MAX_RUNS`(승인 기록별 실제 호출 수 제한), 본문 1인칭 문단 → 확인 필요 claim.
+- 남은 위험: 동시 초과 누적(LLM_LIVE_MAX_RUNS=1 이면 1회분), provider_unstorable 해제는 수동, Postgres 다중 연결 동시성 미검증, 사용자가 직접 쓴 1인칭은 게이트 대상 아님(기존 설계).
+- 다음: D34 2단계(실제 호출 1회) — 사용자 승인 필요.

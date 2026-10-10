@@ -188,4 +188,4 @@ CHANGES_REQUESTED
 | FIX-LIVEL1 | d7da959 | CHANGES_REQUESTED — P1 1(부분 문자열 경험 claim 이 본문 확인 claim 생성을 막음), P2 2(추정 usage 를 실제처럼 기록·동시 초과 누적 설명 오류) |
 | FIX2-LIVEL1 | ea5954b | CHANGES_REQUESTED — P1 3(부정·인용 claim 의 부분 일치 덮임·인용문 내부 분리·저장 불가 usage 폐기), P2 1(설정 화면 정산 안내) |
 | FIX3-LIVEL1 | a4da041 | CHANGES_REQUESTED — P2 1(provider_unstorable 보고값 복원 무결성 검사 없음). P1 없음 |
-| FIX4-LIVEL1 | 2b05044 | 대기 |
+| FIX4-LIVEL1 | 2b05044 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVE-L1 종결 |

@@ -1238,6 +1238,13 @@ export function fillAnswerSeq(rows: Array<{ id: string; content_id: string; crea
 
 /** FIX3-LIVEL1: 원장 스냅숏 usage_source 허용값(@cs/domain budget.ts UsageSource 와 같음). */
 const LEDGER_USAGE_SOURCES = new Set(['provider', 'estimate', 'none', 'provider_unstorable']);
+/**
+ * FIX4-LIVEL1: provider_unstorable 보고값 형식(문자열 — 안전 정수 너머도 정밀도 손실 없이).
+ * 토큰: 음이 아닌 정수 10진 — 숫자만, 부호·소수점·지수 없음, "0" 이 아니면 앞자리 0 없음, 최대 40자리.
+ * 비용: fromMicro 출력과 같은 형식 — 정수부(같은 앞자리 규칙, 최대 40자리) + "." + 소수 정확히 6자리.
+ */
+const isReportedTokens = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})$/.test(v);
+const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})\.\d{6}$/.test(v);
 
 /** 묶음 안 참조 무결성: PK 중복 없음, 모든 FK 대상이 묶음 안에 있음, 현재 버전은 그 원고의 버전. */
 export function checkIntegrity(t: BundleTables): void {
@@ -1312,9 +1319,21 @@ export function checkIntegrity(t: BundleTables): void {
     need('usage_ledger', 'transcription_job_id', r.transcription_job_id, 'transcription_jobs');
     if ((r.run_id === null) === (r.transcription_job_id === null)) problems.push('usage_ledger: run_id·transcription_job_id 중 정확히 하나');
     // FIX3-LIVEL1: 사용량 출처는 정해진 값만. 키가 없으면 이전 행(그대로 둔다 — none 으로 바꾸지 않는다).
-    if (Object.prototype.hasOwnProperty.call(r.pricing_snapshot, 'usage_source')) {
-      const src = (r.pricing_snapshot as Record<string, unknown>).usage_source;
+    const snap = r.pricing_snapshot as Record<string, unknown>;
+    const has = (k: string) => Object.prototype.hasOwnProperty.call(snap, k);
+    if (has('usage_source')) {
+      const src = snap.usage_source;
       if (typeof src !== 'string' || !LEDGER_USAGE_SOURCES.has(src)) problems.push('usage_ledger.pricing_snapshot.usage_source 값');
+    }
+    // FIX4-LIVEL1: provider_unstorable 은 수동 정산에 필요한 보고값 세 개가 필수(형식 엄격). reported_* 는 그 출처에서만 허용
+    // (다른 출처·usage_source 없는 이전 행에 있으면 손상으로 본다).
+    const reportedKeys = ['reported_tokens_in', 'reported_tokens_out', 'reported_cost'];
+    if (snap.usage_source === 'provider_unstorable') {
+      if (!isReportedTokens(snap.reported_tokens_in) || !isReportedTokens(snap.reported_tokens_out) || !isReportedCost(snap.reported_cost)) {
+        problems.push('usage_ledger.pricing_snapshot: provider_unstorable 보고값(reported_tokens_in/out·reported_cost) 형식');
+      }
+    } else if (reportedKeys.some(has)) {
+      problems.push('usage_ledger.pricing_snapshot: reported_* 는 usage_source=provider_unstorable 에서만');
     }
   }
   // T08: job 은 묶음 안 파일, 전사 버전은 그 job 의 것(버전 번호 unique), job 의 첫 전사는 같은 job 의 버전, 소재의 전사는 묶음 안.

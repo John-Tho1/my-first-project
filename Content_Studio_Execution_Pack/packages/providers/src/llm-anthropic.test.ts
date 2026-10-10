@@ -633,8 +633,12 @@ describe('FIX3 P1 :310·:372 — 1인칭 확인 claim 은 문단 단위, 정규�
     expect(await claimsOut('제가 협상했습니다. 저는 계약을 따냈습니다.')).toEqual([exp('제가 협상했습니다. 저는 계약을 따냈습니다.')]);
   });
 
-  it('여러 문단 → 1인칭 문단마다 claim(빈 줄·줄바꿈 경계), 1인칭 아닌 문단 제외', async () => {
-    expect(await claimsOut('제가 협상했습니다.\n\n시장은 크다.\n저는 계약을 따냈습니다.')).toEqual([exp('제가 협상했습니다.'), exp('저는 계약을 따냈습니다.')]);
+  // FIX4-LIVEL1: 문단 경계는 빈 줄만(의도한 동작 변경) — 한 줄바꿈으로 이어진 "시장은 크다.\n저는 …" 은 한 문단이다.
+  it('여러 문단 → 1인칭 문단마다 claim(빈 줄 경계, 한 줄바꿈은 문단 안), 1인칭 아닌 문단 제외', async () => {
+    expect(await claimsOut('제가 협상했습니다.\n\n시장은 크다.\n저는 계약을 따냈습니다.\n\n시장은 크다.')).toEqual([
+      exp('제가 협상했습니다.'),
+      exp('시장은 크다.\n저는 계약을 따냈습니다.'),
+    ]);
   });
 
   it('정규화(NFKC·공백 접기·trim) 후 정확히 같은 claim 은 덮는다, 짧은 부분 claim 은 못 덮는다', async () => {
@@ -677,5 +681,42 @@ describe('FIX3 P1 db/budget.ts:255 — 열 범위 밖이어도 공급자가 보�
     expect(p.confirmedUsageOf(inp)).toEqual({ tokensIn: 2_147_483_648, tokensOut: 5 });
     const bad = fakeFetch(jsonResponse(200, message({ stop_reason: 'refusal', usage })));
     expect((await rejectionOf(provider(bad.fetch).generate(input()))).usage).toEqual({ tokensIn: 2_147_483_648, tokensOut: 5 });
+  });
+});
+
+// ---- FIX round 4(Codex review-FIX3-LIVEL1) ----
+
+describe('FIX4 놓친 (a)·(b)·(c) — 문단은 빈 줄로만, NFC 정규화, 자르지 않음', () => {
+  it('(a) 한 줄바꿈은 문단 경계가 아니다 — 주어와 서술이 다른 줄이어도 한 claim', async () => {
+    expect(await claimsOut('저는\n두바이에서 계약을 따냈습니다.')).toEqual([exp('저는\n두바이에서 계약을 따냈습니다.')]);
+  });
+
+  it('(a) 빈 줄(공백만 있는 줄 포함, CRLF 포함)은 문단 경계', async () => {
+    expect(await claimsOut('제가 협상했습니다.\r\n  \r\n시장은 크다.\n\n저는 계약을 따냈습니다.')).toEqual([exp('제가 협상했습니다.'), exp('저는 계약을 따냈습니다.')]);
+  });
+
+  it('(a) 한 줄바꿈으로 이어진 문단 + 그 문단과 같은 claim(줄바꿈↔공백 차이) → 덮임', async () => {
+    const same = exp('저는 두바이에서 계약을 따냈습니다.');
+    expect(await claimsOut('저는\n두바이에서 계약을 따냈습니다.', [same])).toEqual([same]);
+  });
+
+  it('(b) 분해된 한글(NFD) claim 과 조합형(NFC) 본문은 같은 것으로 본다 → 덮임', async () => {
+    const nfd = exp('제가 협상했습니다.'.normalize('NFD'));
+    expect(nfd.text).not.toBe('제가 협상했습니다.');
+    expect(await claimsOut('제가 협상했습니다.', [nfd])).toEqual([nfd]);
+    const nfc = exp('제가 협상했습니다.');
+    expect(await claimsOut('제가 협상했습니다.'.normalize('NFD'), [nfc])).toEqual([nfc]);
+  });
+
+  it('(b) NFC 만 — 호환 문자(전각 등)는 같은 것으로 보지 않는다(NFKC 아님, 보수적)', async () => {
+    const fullwidth = exp('제가 협상했습니다．'); // 전각 마침표
+    expect(await claimsOut('제가 협상했습니다.', [fullwidth])).toEqual([fullwidth, exp('제가 협상했습니다.')]);
+  });
+
+  it('(c) 긴 문단(1만 자)도 자르지 않고 문단 전체가 한 claim(스키마에 claim 길이·개수 제한 없음)', async () => {
+    const long = `제가 ${'계약을 검토했습니다 '.repeat(1000)}끝.`;
+    expect(long.length).toBeGreaterThan(10_000);
+    const claims = await claimsOut(long);
+    expect(claims).toEqual([exp(long)]);
   });
 });

@@ -336,10 +336,60 @@ describe('T08 전사 표·지운 원본', () => {
     expect(parsed.tables.captures[0]!.capture_transcript_id).toBe(T1);
   });
 
+  it('FIX4-LIVEL1: provider_unstorable 행은 reported_tokens_in/out(음이 아닌 정수 10진 문자열)·reported_cost(정수부 + 소수 6자리) 필수', () => {
+    const REP = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
+    const withSnap = (snap: Record<string, unknown>) => {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', ...snap };
+      return t;
+    };
+    // 정상: 보통 값, 0, MAX_SAFE_INTEGER 근처와 그 너머(문자열이므로 정밀도 손실 없음)
+    for (const ok of [
+      REP,
+      { reported_tokens_in: '0', reported_tokens_out: '0', reported_cost: '0.000000' },
+      { reported_tokens_in: '9007199254740991', reported_tokens_out: '9007199254740993', reported_cost: '36028797018963.968000' },
+      { reported_tokens_in: '123456789012345678901234567890', reported_tokens_out: '1', reported_cost: '493827156049382715604938271.560000' },
+    ]) {
+      expect(() => checkIntegrity(withSnap({ usage_source: 'provider_unstorable', ...ok }))).not.toThrow();
+    }
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['in 없음', { reported_tokens_out: '7', reported_cost: REP.reported_cost }],
+      ['out 없음', { reported_tokens_in: '1', reported_cost: REP.reported_cost }],
+      ['cost 없음', { reported_tokens_in: '1', reported_tokens_out: '7' }],
+      ['in 음수', { ...REP, reported_tokens_in: '-1' }],
+      ['out 소수', { ...REP, reported_tokens_out: '1.5' }],
+      ['in 지수', { ...REP, reported_tokens_in: '1e5' }],
+      ['in 앞자리 0', { ...REP, reported_tokens_in: '01' }],
+      ['in 부호', { ...REP, reported_tokens_in: '+1' }],
+      ['in 공백', { ...REP, reported_tokens_in: ' 1' }],
+      ['in 숫자형', { ...REP, reported_tokens_in: 1 }],
+      ['in 빈 문자열', { ...REP, reported_tokens_in: '' }],
+      ['cost 문자', { ...REP, reported_cost: 'abc' }],
+      ['cost 음수', { ...REP, reported_cost: '-1.000000' }],
+      ['cost 소수 6자리 아님', { ...REP, reported_cost: '1.5' }],
+      ['cost 소수 없음', { ...REP, reported_cost: '1' }],
+      ['cost 지수', { ...REP, reported_cost: '1e3.000000' }],
+      ['cost 앞자리 0', { ...REP, reported_cost: '01.000000' }],
+      ['cost 숫자형', { ...REP, reported_cost: 1.5 }],
+    ];
+    for (const [label, rep] of bad) {
+      expect(() => checkIntegrity(withSnap({ usage_source: 'provider_unstorable', ...rep })), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+    // reported_* 는 provider_unstorable 에서만 — 다른 출처·키 없는(이전) 행에 있으면 거부
+    for (const src of ['provider', 'estimate', 'none']) {
+      expect(() => checkIntegrity(withSnap({ usage_source: src, ...REP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+      expect(() => checkIntegrity(withSnap({ usage_source: src, reported_cost: REP.reported_cost }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+    expect(() => checkIntegrity(withSnap({ ...REP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withSnap({ reported_tokens_in: '1' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
   it('FIX3-LIVEL1: 원장 pricing_snapshot.usage_source 는 provider·estimate·none·provider_unstorable 또는 없음(이전 행)만 — 그 밖은 integrity', () => {
+    // FIX4-LIVEL1: provider_unstorable 은 보고값 세 개가 필수가 됐다(의도한 동작 변경) — 이 시험은 출처 값만 보므로 유효한 보고값을 함께 둔다.
+    const REPORTED = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
     for (const v of ['provider', 'estimate', 'none', 'provider_unstorable']) {
       const ok = withJob();
-      ok.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: v };
+      ok.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: v, ...(v === 'provider_unstorable' ? REPORTED : {}) };
       expect(() => checkIntegrity(ok)).not.toThrow();
     }
     expect(() => checkIntegrity(withJob())).not.toThrow(); // 키 없음 = 이전 행

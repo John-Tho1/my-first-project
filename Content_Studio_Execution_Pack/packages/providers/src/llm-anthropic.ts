@@ -337,15 +337,20 @@ export class ClaudeLlmProvider implements LlmProvider {
   }
 }
 
-const normalizeForCoverage = (s: string): string => s.normalize('NFKC').replace(/\s+/g, ' ').trim();
+/**
+ * FIX4-LIVEL1: 덮임 판정용 정규화 = NFC(분해형 한글 등 같은 글자의 다른 표현만 맞춤 — 호환 문자 접기(NFKC)는 하지 않는 보수적 선택)
+ * + 공백 접기(줄바꿈 포함) + trim. 본문 문단과 claim 양쪽에 같은 함수를 쓴다.
+ */
+const normalizeForCoverage = (s: string): string => s.normalize('NFC').replace(/\s+/g, ' ').trim();
 
 /**
- * FIX3-LIVEL1: 1인칭 확인 claim 의 단위 = **문단**(줄바꿈 경계만 — 빈 줄·한 줄바꿈 모두). 문장 분리는 쓰지 않는다(인용문 안 종결 부호·
- * 공백 없는 연결·약어에서 경험 서술이 잘려 나가던 문제를 피하는 보수적 단위). 앞뒤 공백을 뗀 빈 문단은 버린다.
+ * FIX3/FIX4-LIVEL1: 1인칭 확인 claim 의 단위 = **문단** — 빈 줄(공백만 있는 줄 포함, CRLF·CR 은 LF 로 맞춘 뒤 `\n\s*\n`)로만 나눈다.
+ * 한 줄바꿈은 문단 안(주어와 서술이 다른 줄이어도 한 단위). 문장 분리는 쓰지 않는다. 앞뒤 공백을 뗀 빈 문단은 버린다.
  */
 export function splitParagraphs(text: string): string[] {
   return text
-    .split(/\r?\n|\r/)
+    .replace(/\r\n?/g, '\n')
+    .split(/\n\s*\n/)
     .map((p) => p.trim())
     .filter(Boolean);
 }

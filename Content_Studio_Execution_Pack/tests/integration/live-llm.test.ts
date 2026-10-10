@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { count, eq, sql } from 'drizzle-orm';
 import {
   adoptProposal,
+  appendContentVersion,
   closeDb,
   commitRestore,
   confirmClaims,
@@ -18,6 +19,7 @@ import {
   ensureOwner,
   exportOwner,
   getDb,
+  hasUnresolvedLiveUsage,
   listUnconfirmedExperienceClaims,
   liveRunsUsed,
   runAssist,
@@ -841,6 +843,71 @@ describe('FIX3 놓친 (b) — export→restore 와 usage_source', () => {
         );
         expect(e?.code).toBe('live_usage_unresolved');
         expect(again.calls).toHaveLength(0);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- FIX round 4(Codex review-FIX3-LIVEL1) ----
+
+describe('FIX4 놓친 (d) — 문단 claim 을 확인한 뒤 본문을 고치면(현재 동작 고정)', () => {
+  it('confirmed 는 본문 변경과 무관하게 해결 상태 — 확인 뒤 사용자가 다른 경험 문장을 직접 써 넣어도 게이트는 다시 막지 않는다', async () => {
+    const owner = await freshOwner('live-l1-fix4-edit@example.local');
+    const c = await createContent(db, owner, { title: '확인 뒤 수정', body: '본문.' });
+    const para = '저는 두바이에서 계약을 따냈습니다.';
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify({ ...modelOut, proposed_text: para, claims: [] }))));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    await adoptProposal(db, owner, c.content.id, r.run.id, 1);
+    await confirmClaims(db, owner, c.content.id, r.run.id, [0]);
+    expect(await listUnconfirmedExperienceClaims(db, owner, c.content.id)).toEqual([]);
+    // 사용자가 문단 일부를 바꾸고 새 1인칭 경험을 직접 덧붙인다(AI run 이 아님 — claim 이 새로 생기지 않는다)
+    const cur = (await db.select().from(schema.contents).where(eq(schema.contents.id, c.content.id)))[0]!;
+    const curVersion = (await db.select().from(schema.contentVersions).where(eq(schema.contentVersions.id, cur.currentVersionId!)))[0]!;
+    await appendContentVersion(db, owner, c.content.id, { baseVersion: curVersion.version, body: '저는 두바이에서 계약을 놓쳤습니다.\n\n제가 직접 팀을 꾸렸습니다.' });
+    expect(await listUnconfirmedExperienceClaims(db, owner, c.content.id)).toEqual([]);
+    const rev = async () => (await db.select().from(schema.contents).where(eq(schema.contents.id, c.content.id)))[0]!.revision;
+    await updateContentMeta(db, owner, c.content.id, { lifecycle: 'review' }, await rev());
+    const ready = await updateContentMeta(db, owner, c.content.id, { lifecycle: 'ready' }, await rev());
+    expect(ready.lifecycle).toBe('ready');
+    // claims 행은 AI 제안 버전·run 에 묶여 있고(추가 전용) 사용자 버전으로 옮겨지지 않는다
+    const rows = await db.select().from(schema.claims).where(eq(schema.claims.runId, r.run.id));
+    expect(rows.map((x) => x.statement)).toEqual([para]);
+  });
+});
+
+describe('FIX4 P2 bundle.ts:1315 — provider_unstorable 보고값 문자열은 export→restore 에서 그대로', () => {
+  it('MAX_SAFE_INTEGER 보고값과 그 너머(직접 쓴 문자열)가 복원 뒤에도 같은 문자열', async () => {
+    const owner = await freshOwner('live-l1-fix4-maxsafe@example.local');
+    const c = await createContent(db, owner, { title: '경계', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ usage: { input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 } })));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    const s = r.ledger.pricingSnapshot as Record<string, string>;
+    expect(s.reported_tokens_in).toBe('9007199254740991');
+    expect(s.reported_cost).toBe(fromMicro(costMicro(policy().pricing, Number.MAX_SAFE_INTEGER, 1)));
+    // 안전 정수 너머(다른 경로에서 온 문자열) — 정밀도 손실 없이 보존돼야 한다
+    await db.execute(sql`update usage_ledger set pricing_snapshot = jsonb_set(pricing_snapshot, '{reported_tokens_out}', '"9007199254740993"') where id = ${r.ledger.id}::uuid`);
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-fix4-'));
+    try {
+      const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), owner, { outDir: path.join(tmp, 'exports') });
+      const zip = new Uint8Array(readFileSync(exported.zipPath));
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-fix4@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores');
+        const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+        await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-b')), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+        const [row] = await h.db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, r.ledger.id));
+        expect(row!.pricingSnapshot).toMatchObject({
+          usage_source: 'provider_unstorable',
+          reported_tokens_in: '9007199254740991',
+          reported_tokens_out: '9007199254740993',
+          reported_cost: s.reported_cost,
+        });
+        expect(await hasUnresolvedLiveUsage(h.db, target)).toBe(true);
       } finally {
         await h.close();
       }

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_MIN_MAX_OUTPUT_TOKENS } from './llm-live';
 
 /**
  * 환경변수 계약(docs/04 "환경변수 계약").
@@ -20,6 +21,7 @@ const LABELS: Record<string, string> = {
   LLM_BUDGET_PER_RUN_MAX: 'LLM_BUDGET_PER_RUN_MAX(1회 예약 상한)',
   LLM_PRICE_INPUT_PER_1K: 'LLM_PRICE_INPUT_PER_1K(입력 1K 토큰 가격)',
   LLM_PRICE_OUTPUT_PER_1K: 'LLM_PRICE_OUTPUT_PER_1K(출력 1K 토큰 가격)',
+  LLM_LIVE_MAX_OUTPUT_TOKENS: 'LLM_LIVE_MAX_OUTPUT_TOKENS(실제 AI 1회 출력 토큰 상한)',
   STT_MODE: 'STT_MODE(음성 전사 모드)',
   STT_PROVIDER: 'STT_PROVIDER(음성 전사 공급자)',
   STT_MODEL: 'STT_MODEL(음성 전사 모델)',
@@ -79,7 +81,7 @@ export const configSchema = z.object({
   LLM_MODEL: opt(z.string().min(1).optional()),
   /**
    * T07(결정 D13): 실제 AI 호출 승인 기록 참조(예: 결정 ID). 사용자가 명시적으로 승인한 뒤에만 설정한다.
-   * 값 자체는 비밀이 아니지만 화면·로그·health 에는 "설정됨/없음"만 보인다. 이것만으로 호출이 열리지는 않는다(T07 에는 어댑터 없음).
+   * 값 자체는 비밀이 아니지만 화면·로그·health 에는 "설정됨/없음"만 보인다. LIVE-L1(D34): 공급자 anthropic·모델·가격·월 상한·서버 환경의 ANTHROPIC_API_KEY 와 함께 있을 때만 실제 호출이 열린다(D34 2단계 승인 뒤에만 설정).
    */
   LLM_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
   /** T07 예산(A15). 금액은 소수 6자리까지의 10진 문자열. 가격이 없으면 live 는 차단, mock 은 0 으로 기록. */
@@ -88,6 +90,11 @@ export const configSchema = z.object({
   LLM_BUDGET_PER_RUN_MAX: opt(decimalString.optional()),
   LLM_PRICE_INPUT_PER_1K: opt(decimalString.optional()),
   LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
+  /**
+   * LIVE-L1(D34): 실제 AI 1회 출력 토큰 상한(1024 ~ 16000, 기본 4096). 예약의 출력 몫이자 요청의 max_tokens 와 같은 값이다
+   * (예약 = 실제 비용의 상한). Opus 의 thinking 토큰도 출력으로 과금되므로 너무 작으면 max_tokens 로 끝나 실패(예약액 확정)한다. 모의에는 쓰지 않는다.
+   */
+  LLM_LIVE_MAX_OUTPUT_TOKENS: opt(intRange(LIVE_LLM_MIN_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS)),
   /**
    * T08(결정 D9·D15): 음성 전사. 기본 mock(결정적 모의 전사기, 외부 호출 없음). live 는 승인 기록·공급자·모델·가격이 있어도
    * T08 에는 어댑터(HTTP 호출)가 없어 항상 거부된다. 예산 통화·상한은 LLM_BUDGET_* 를 함께 쓴다(같은 원장).

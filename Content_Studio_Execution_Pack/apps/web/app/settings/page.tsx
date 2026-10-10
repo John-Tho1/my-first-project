@@ -35,7 +35,7 @@ export default async function SettingsPage({
   const { db } = await getAppDb(config);
   const usage = await monthlyUsage(db, session.ownerId);
   const policy = budgetPolicy(config);
-  const live = liveLlmReadiness(config);
+  const live = liveLlmReadiness(config, process.env);
   const stt = sttBudgetPolicy(config);
   const sttLive = sttLiveReadiness(config);
   const exports = await listExportRuns(db, session.ownerId, 20);
@@ -99,9 +99,11 @@ export default async function SettingsPage({
           <p className="empty-text">이번 달 AI 사용 기록이 없습니다.</p>
         )}
         <p className="notice" role="note">
-          live 준비 안 됨: {live.missing.join(', ')}
+          {live.ready
+            ? `실제 AI(Claude) 준비됨 — 작성 보조 요청마다 실제 호출·과금이 일어납니다(1회 출력 상한 ${policy.liveMaxOutputTokens ?? '-'} 토큰).`
+            : `live 준비 안 됨: ${live.missing.join(', ')}`}
         </p>
-        <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D8·D13). 설정 값·키는 이 화면에 보이지 않습니다.</p>
+        <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D13·D34). 설정 값·키는 이 화면에 보이지 않습니다.</p>
         <p className="meta">
           <span className={config.STT_MODE === 'live' ? 'tag warn' : 'tag'}>음성 전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 없음)' : '실제(live)'}</span>
           <span>{stt.pricing ? `1분 가격 설정됨(${stt.currency})` : '1분 가격 미설정(모의는 0 으로 기록)'}</span>

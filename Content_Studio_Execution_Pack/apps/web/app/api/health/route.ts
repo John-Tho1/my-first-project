@@ -33,8 +33,8 @@ export async function GET(): Promise<Response> {
   }
 
   const modes = getModes(config);
-  // T07: live AI 준비 상태 — 빠진 조건 이름만(값 없음). T07 에는 어댑터가 없어 항상 false.
-  const live = liveLlmReadiness(config);
+  // T07·LIVE-L1(D34): live AI 준비 상태 — 모드·준비 여부·빠진 조건 이름만(값·키 길이 없음). 모두 갖춰지면 live_ready=true.
+  const live = liveLlmReadiness(config, process.env);
   const llm = { mode: config.LLM_MODE, live_ready: live.ready, missing: live.missing };
   const sttLive = sttLiveReadiness(config);
   const stt = { mode: config.STT_MODE, live_ready: sttLive.ready, missing: sttLive.missing };

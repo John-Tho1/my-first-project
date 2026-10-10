@@ -10,3 +10,8 @@ engineStrict: true
 allowBuilds:
   esbuild: false
   unrs-resolver: false
+
+# LIVE-L1(D34): @anthropic-ai/sdk 0.128.0 의 전이 의존성(json-schema-to-ts → @babel/runtime ^7)이 3일 된 7.29.10 으로 풀려
+# 공급망 규칙(공개 후 2주 이상)에 맞게 2026-05-25 공개판으로 고정한다.
+overrides:
+  '@babel/runtime': 7.29.7

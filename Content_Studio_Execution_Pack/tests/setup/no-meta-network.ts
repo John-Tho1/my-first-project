@@ -1,6 +1,6 @@
 /**
- * LIVE-T1(D31 1단계 — 실제 호출 0): 모든 시험(unit·integration)의 setupFiles. Threads·Meta 호스트
- * (*.threads.com · *.threads.net · *.facebook.com · *.instagram.com · *.fbcdn.net — 대소문자·끝의 점 "graph.threads.net." 정규화)로 가는 요청을
+ * LIVE-T1(D31 1단계 — 실제 호출 0)·LIVE-L1(D34 1단계): 모든 시험(unit·integration)의 setupFiles. Threads·Meta·Anthropic 호스트
+ * (*.threads.com · *.threads.net · *.facebook.com · *.instagram.com · *.fbcdn.net · *.anthropic.com — 대소문자·끝의 점 "graph.threads.net." 정규화)로 가는 요청을
  * **연결·DNS 조회 전에** 거부하고 시도를 기록한다. 파일이 끝날 때(afterAll) 거부된 시도가 하나라도 있으면 그 시험 파일을 실패시킨다.
  *
  * FIX1-LIVET1(Codex review-LIVET1 P2 :37) — 막는 경로(이 프로세스 안, 각각 시험으로 확인: packages/providers/src/no-meta-network.test.ts):
@@ -23,7 +23,8 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
-const BLOCKED = /(^|\.)(threads\.com|threads\.net|facebook\.com|instagram\.com|fbcdn\.net)$/;
+// LIVE-L1(D34 1단계 — 실제 Claude 호출 0): *.anthropic.com(api.anthropic.com)도 같은 경로들에서 막는다.
+const BLOCKED = /(^|\.)(threads\.com|threads\.net|facebook\.com|instagram\.com|fbcdn\.net|anthropic\.com)$/;
 const DISPATCHER = Symbol.for('undici.globalDispatcher.1');
 
 export interface GuardState {
@@ -70,7 +71,7 @@ export function blockedMetaHost(input: unknown): string | null {
 }
 
 function blockedError(host: string, via: string): Error {
-  return new Error(`BLOCKED_EXTERNAL_NETWORK: 시험에서 실제 ${host} 요청 금지(${via} — LIVE-T1/D31, fixture fetch 를 주입하세요)`);
+  return new Error(`BLOCKED_EXTERNAL_NETWORK: 시험에서 실제 ${host} 요청 금지(${via} — LIVE-T1/D31·LIVE-L1/D34, fixture fetch 를 주입하세요)`);
 }
 
 if (!g.__csMetaNetworkGuard) {
@@ -219,7 +220,7 @@ afterAll(() => {
   }
   if (attempts.length) {
     throw new Error(
-      `BLOCKED_EXTERNAL_NETWORK: 이 시험 파일이 실제 Threads·Meta 호스트로 ${attempts.length}번 요청하려 했습니다(${[...new Set(attempts)].join(', ')} / ${[...new Set(via)].join(', ')})`,
+      `BLOCKED_EXTERNAL_NETWORK: 이 시험 파일이 실제 Threads·Meta·Anthropic 호스트로 ${attempts.length}번 요청하려 했습니다(${[...new Set(attempts)].join(', ')} / ${[...new Set(via)].join(', ')})`,
     );
   }
 });

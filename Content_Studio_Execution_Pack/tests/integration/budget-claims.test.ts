@@ -383,10 +383,11 @@ describe('live 경계(fail-closed, 외부 호출 0)', () => {
       const res = await healthGET();
       const text = await res.text();
       const body = JSON.parse(text);
+      // LIVE-L1(D34): LIVE_ADAPTER 표식 대신 실제 조건 — 공급자는 anthropic 이어야 하고 서버 환경의 키가 있어야 한다(의도한 동작 변경).
       expect(body.llm).toEqual({
         mode: 'live',
         live_ready: false,
-        missing: ['LLM_LIVE_APPROVAL_REF', 'LIVE_ADAPTER(T07 미구현, D8 결정 후)'],
+        missing: ['LLM_PROVIDER=anthropic', 'LLM_LIVE_APPROVAL_REF', 'ANTHROPIC_API_KEY'],
       });
       expect(text).not.toMatch(/placeholder/);
     } finally {

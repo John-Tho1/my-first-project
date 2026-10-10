@@ -312,8 +312,12 @@ export const promptAnswer = (a: InterviewAnswerRow): PromptAnswer => ({
 export interface AssistLlm {
   readonly name: string;
   readonly mode: 'mock' | 'live';
+  /** LIVE-L1: 실제 모델 ID(live run 의 model 로 기록). 없으면 provider 이름. */
+  readonly model?: string;
   generate(input: AssistLlmInput): Promise<LlmStructuredOutput>;
-  /** T07: 실제 사용량(토큰). 없으면 글자/3 추정(D13). */
+  /**
+   * T07: 실제 사용량(토큰). 없으면 글자/3 추정(D13). LIVE-L1: live 는 generate 에 넘긴 **같은 입력 객체**로 부른다(그 호출의 응답 usage).
+   */
   usageOf?(input: AssistLlmInput, output: LlmStructuredOutput): { tokensIn: number; tokensOut: number };
 }
 
@@ -443,7 +447,7 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
         },
         promptVersion: promptVersionFor(sourceIds.length),
         provider: llm.name,
-        model: llm.mode === 'mock' ? 'mock' : llm.name,
+        model: llm.mode === 'mock' ? 'mock' : (llm.model ?? llm.name),
         status: 'running',
         createdAt: now,
       })

@@ -3,14 +3,24 @@
  *
  * - 금액은 micro 단위(1e-6 통화) **bigint** 로 계산한다(FIX-T07 P2 — numeric(18,6) 전체 범위를 정확히). DB 에는 numeric(18,6) 문자열.
  *   numeric(18,6) 을 넘는 값(정수부 13자리 이상·소수 7자리 이상)은 AmountRangeError.
- * - 토큰 추정: 프롬프트 글자 수 / 3(올림). 한국어·영어가 섞인 글에서 보수적으로(많게) 잡는 경험칙이다 — 실제 토크나이저가 아니다.
- * - 출력 여유분: max(256, 입력 추정의 절반) 토큰.
+ * - 토큰 추정(mock): 프롬프트 글자 수 / 3(올림). 한국어·영어가 섞인 글에서 보수적으로(많게) 잡는 경험칙이다 — 실제 토크나이저가 아니다.
+ * - 출력 여유분(mock): max(256, 입력 추정의 절반) 토큰.
+ * - LIVE-L1(D34) live: 입력 = 정확한 프롬프트 UTF-8 바이트 + 시스템 프롬프트·출력 스키마 바이트 + 틀 여유(llm-live.ts — 바이트 ≥ 토큰이라 상한),
+ *   출력 = LLM_LIVE_MAX_OUTPUT_TOKENS(요청의 max_tokens 와 같은 값). 그래서 예약액은 그 호출의 실제 비용 상한이다(틀 여유가 가정임은 남은 위험).
  * - 예약액 = 입력 추정 × 입력 단가 + 출력 여유분 × 출력 단가(각각 1K 토큰당, 올림).
  * - 가격이 없으면: live 는 차단(liveLlmReadiness), mock 은 0 으로 예약·기록만 한다(한도 검사 없음).
  * - 월 사용액 = 이 owner 의 이번 달(MSK) 원장 합계: reserved 는 예약액, settled 는 실제액, released 는 0.
  */
 import type { AppConfig } from './config';
 import { AppError } from './errors';
+import {
+  ANTHROPIC_PROVIDER,
+  anthropicApiKeyState,
+  LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS,
+  LIVE_LLM_FIXED_INPUT_BYTES,
+  LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
+  liveInputUpperBoundTokens,
+} from './llm-live';
 
 export const TOKEN_CHARS = 3;
 export const MIN_OUTPUT_ALLOWANCE_TOKENS = 256;
@@ -63,6 +73,8 @@ export interface BudgetPolicy {
   pricing: Pricing | null;
   monthlyLimitMicro: bigint | null;
   perRunMaxMicro: bigint | null;
+  /** LIVE-L1(D34): live 1회 출력 토큰 상한(= 요청 max_tokens). 없으면 LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS. mock 은 쓰지 않는다. */
+  liveMaxOutputTokens?: number;
 }
 
 export function budgetPolicy(config: AppConfig): BudgetPolicy {
@@ -80,6 +92,7 @@ export function budgetPolicy(config: AppConfig): BudgetPolicy {
     pricing,
     monthlyLimitMicro: config.LLM_BUDGET_MONTHLY_LIMIT !== undefined ? toMicro(config.LLM_BUDGET_MONTHLY_LIMIT) : null,
     perRunMaxMicro: config.LLM_BUDGET_PER_RUN_MAX !== undefined ? toMicro(config.LLM_BUDGET_PER_RUN_MAX) : null,
+    liveMaxOutputTokens: config.LLM_LIVE_MAX_OUTPUT_TOKENS,
   };
 }
 
@@ -101,20 +114,28 @@ export interface Reservation {
   pricingSnapshot: Record<string, unknown>;
 }
 
+/** LIVE-L1: 원장 스냅숏의 live 추정식 표기(값만). */
+export const LIVE_TOKEN_ESTIMATE_LABEL = 'utf8_bytes+fixed+overhead';
+
 export function reserveFor(policy: BudgetPolicy, prompt: string): Reservation {
-  const tokensIn = estimateTokens(prompt);
-  const tokensOutAllowance = outputAllowanceTokens(tokensIn);
+  const live = policy.mode === 'live';
+  // LIVE-L1(D34): live 는 상한 추정(바이트 + 고정 + 틀 여유)과 설정한 출력 상한. mock 은 기존 글자/3 그대로(D13).
+  const tokensIn = live ? liveInputUpperBoundTokens(prompt) : estimateTokens(prompt);
+  const tokensOutAllowance = live ? (policy.liveMaxOutputTokens ?? LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS) : outputAllowanceTokens(tokensIn);
   const reserveMicro = costMicro(policy.pricing, tokensIn, tokensOutAllowance);
+  const tokenEstimate = live ? LIVE_TOKEN_ESTIMATE_LABEL : `chars/${TOKEN_CHARS}`;
+  const liveExtra = live ? { fixed_input_bytes: LIVE_LLM_FIXED_INPUT_BYTES, overhead_tokens: LIVE_LLM_FRAMING_OVERHEAD_TOKENS } : {};
   const pricingSnapshot = policy.pricing
     ? {
         mode: policy.mode,
         currency: policy.pricing.currency,
         input_per_1k: fromMicro(policy.pricing.inputPer1kMicro),
         output_per_1k: fromMicro(policy.pricing.outputPer1kMicro),
-        token_estimate: `chars/${TOKEN_CHARS}`,
+        token_estimate: tokenEstimate,
         output_allowance_tokens: tokensOutAllowance,
+        ...liveExtra,
       }
-    : { mode: policy.mode, priced: false, token_estimate: `chars/${TOKEN_CHARS}`, output_allowance_tokens: tokensOutAllowance };
+    : { mode: policy.mode, priced: false, token_estimate: tokenEstimate, output_allowance_tokens: tokensOutAllowance, ...liveExtra };
   return { tokensIn, tokensOutAllowance, reserveMicro, pricingSnapshot };
 }
 
@@ -185,27 +206,33 @@ export class BudgetExceededError extends AppError {
   }
 }
 
-// ---- live 준비 상태(T07: 어댑터가 없으므로 항상 준비 안 됨) ----
+// ---- live 준비 상태(LIVE-L1, D34) ----
 
 export interface LiveReadiness {
-  ready: false;
+  /** 실제 Claude 호출을 열 수 있는가 — true 일 때만 getLlm 이 ClaudeLlmProvider 를 돌려준다. */
+  ready: boolean;
   /** 빠진 조건 이름(값 없음). */
   missing: string[];
 }
 
 /**
- * 실제 AI 호출의 전제 조건. 모두 갖춰져도 T07 에는 HTTP 어댑터가 없으므로 ready 는 항상 false 이고
- * 'LIVE_ADAPTER(T07 미구현, D8 결정 후)' 가 목록에 남는다. 값은 절대 넣지 않는다.
+ * 실제 AI 호출의 전제 조건(이름만 — 값·길이 없음). LIVE-L1(D34): 모두 갖춰지면 ready=true.
+ * 조건: LLM_MODE=live · LLM_PROVIDER=anthropic(없으면 'LLM_PROVIDER', 다른 값이면 'LLM_PROVIDER=anthropic') · LLM_MODEL · 입력·출력 단가 ·
+ * 월 상한 · 승인 기록 LLM_LIVE_APPROVAL_REF · 서버 환경의 ANTHROPIC_API_KEY(존재·형식 — env 에서만 읽고 값은 돌려주지 않는다).
+ * 화면(health·설정·/ops)과 공급자 선택(web getLlm)이 **같은 함수**를 쓴다(표시와 실제 선택이 어긋나지 않게).
  */
-export function liveLlmReadiness(config: AppConfig): LiveReadiness {
+export function liveLlmReadiness(config: AppConfig, env: Record<string, string | undefined>): LiveReadiness {
   const missing: string[] = [];
   if (config.LLM_MODE !== 'live') missing.push('LLM_MODE=live');
   if (!config.LLM_PROVIDER) missing.push('LLM_PROVIDER');
+  else if (config.LLM_PROVIDER !== ANTHROPIC_PROVIDER) missing.push(`LLM_PROVIDER=${ANTHROPIC_PROVIDER}`);
   if (!config.LLM_MODEL) missing.push('LLM_MODEL');
   if (!config.LLM_PRICE_INPUT_PER_1K) missing.push('LLM_PRICE_INPUT_PER_1K');
   if (!config.LLM_PRICE_OUTPUT_PER_1K) missing.push('LLM_PRICE_OUTPUT_PER_1K');
   if (!config.LLM_BUDGET_MONTHLY_LIMIT) missing.push('LLM_BUDGET_MONTHLY_LIMIT');
   if (!config.LLM_LIVE_APPROVAL_REF) missing.push('LLM_LIVE_APPROVAL_REF');
-  missing.push('LIVE_ADAPTER(T07 미구현, D8 결정 후)');
-  return { ready: false, missing };
+  const key = anthropicApiKeyState(env);
+  if (key === 'missing') missing.push('ANTHROPIC_API_KEY');
+  else if (key === 'invalid') missing.push('ANTHROPIC_API_KEY(형식)');
+  return { ready: missing.length === 0, missing };
 }

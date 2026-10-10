@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { LiveProviderNotConfiguredError, loadConfig } from '@cs/domain';
-import { LiveLlmProvider, MOCK_WARNING, MockLlmFailure, MockLlmProvider } from './llm';
+import { MOCK_WARNING, MockLlmFailure, MockLlmProvider } from './llm';
+import { ClaudeLlmProvider, resolveLiveLlmProvider } from './llm-anthropic';
 
 describe('MockLlmProvider 실패 주입(T06)', () => {
   const input = { task: 'draft' as const, inputVersion: 'cv:x;bp:1;ans:', text: '제가 직접 협상했습니다. 시장은 커지고 있다.', prompt: 'P' };
@@ -25,7 +26,7 @@ describe('MockLlmProvider 실패 주입(T06)', () => {
   });
 });
 
-describe('LiveLlmProvider(T07 경계, HTTP 없음)', () => {
+describe('live 공급자 선택(LIVE-L1 — 준비 판정 기반, 외부 호출 없음)', () => {
   const full = {
     LLM_MODE: 'live',
     LLM_PROVIDER: 'provider-x',
@@ -35,26 +36,31 @@ describe('LiveLlmProvider(T07 경계, HTTP 없음)', () => {
     LLM_BUDGET_MONTHLY_LIMIT: '10',
     LLM_LIVE_APPROVAL_REF: 'D99',
   };
-  it('전제 조건이 모두 있어도 assertReady·generate 가 LiveProviderNotConfiguredError(어댑터 미구현)', async () => {
-    const p = new LiveLlmProvider(loadConfig(full));
-    expect(() => p.assertReady()).toThrow(LiveProviderNotConfiguredError);
-    await expect(p.generate({ task: 'draft', inputVersion: 'v', text: 't' })).rejects.toBeInstanceOf(LiveProviderNotConfiguredError);
+  it('anthropic 이 아닌 공급자는 다른 조건이 모두 있어도 LiveProviderNotConfiguredError(이름만, 값 없음)', () => {
     try {
-      p.assertReady();
+      resolveLiveLlmProvider(loadConfig(full), { ANTHROPIC_API_KEY: 'sk-ant-FAKE-x' });
+      throw new Error('should throw');
     } catch (e) {
-      expect((e as LiveProviderNotConfiguredError).missing).toEqual(['LIVE_ADAPTER(T07 미구현, D8 결정 후)']);
-      expect((e as Error).message).not.toMatch(/provider-x|model-y|D99/);
+      expect(e).toBeInstanceOf(LiveProviderNotConfiguredError);
+      expect((e as LiveProviderNotConfiguredError).missing).toEqual(['LLM_PROVIDER=anthropic']);
+      expect((e as Error).message).not.toMatch(/provider-x|model-y|D99|sk-ant/);
     }
   });
   it('승인 기록이 없으면 그 이름이 빠진 조건에 나온다', () => {
     const { LLM_LIVE_APPROVAL_REF: _omit, ...rest } = full;
     void _omit;
     try {
-      new LiveLlmProvider(loadConfig(rest)).assertReady();
+      resolveLiveLlmProvider(loadConfig({ ...rest, LLM_PROVIDER: 'anthropic' }), { ANTHROPIC_API_KEY: 'sk-ant-FAKE-x' });
       throw new Error('should throw');
     } catch (e) {
-      expect((e as LiveProviderNotConfiguredError).missing).toContain('LLM_LIVE_APPROVAL_REF');
+      expect((e as LiveProviderNotConfiguredError).missing).toEqual(['LLM_LIVE_APPROVAL_REF']);
     }
+  });
+  it('모두 있으면 ClaudeLlmProvider(이름 anthropic, 모델 = LLM_MODEL) — 만들기만 하고 호출하지 않는다', () => {
+    const p = resolveLiveLlmProvider(loadConfig({ ...full, LLM_PROVIDER: 'anthropic' }), { ANTHROPIC_API_KEY: 'sk-ant-FAKE-x' });
+    expect(p).toBeInstanceOf(ClaudeLlmProvider);
+    expect([p.name, p.mode, p.model]).toEqual(['anthropic', 'live', 'model-y']);
+    expect(JSON.stringify(p)).not.toContain('sk-ant');
   });
   it('모의 provider 는 허용 출처만 의견 claim 에 붙이고, 사용량은 글자/3', async () => {
     const m = new MockLlmProvider();

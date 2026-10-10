@@ -368,7 +368,7 @@ export async function runVariantAssist(
         },
         promptVersion: VARIANT_PROMPT_VERSION,
         provider: llm.name,
-        model: llm.mode === 'mock' ? 'mock' : llm.name,
+        model: llm.mode === 'mock' ? 'mock' : (llm.model ?? llm.name),
         status: 'running',
         createdAt: now,
       })

@@ -4,10 +4,10 @@ import { assertLiveLlmAllowed, loadConfig, type AppConfig } from '@cs/domain';
 import {
   createMockAdapterRegistry,
   createStorage,
-  LiveLlmProvider,
   LiveTranscriber,
   MockLlmProvider,
   MockTranscriber,
+  resolveLiveLlmProvider,
   type LlmProvider,
   type MockChannelAdapterRegistry,
   type StorageAdapter,
@@ -29,17 +29,15 @@ export function getStorage(config: AppConfig = getConfig()): StorageAdapter {
 
 /**
  * T06: 작성 보조용 LLM provider. 기본은 모의(결정 D7).
- * LLM_MODE=live 는 assertLiveLlmAllowed(fail-closed)를 먼저 통과해야 하고, 통과해도 live provider 가 아직 없으므로
- * LiveProviderNotConfiguredError 로 거부한다(T07 에서 승인 후 연결). 외부 호출은 일어나지 않는다.
+ * LLM_MODE=live 는 assertLiveLlmAllowed(fail-closed)를 먼저 통과해야 하고, LIVE-L1(D34): 그다음 화면과 같은 준비 판정(liveLlmReadiness —
+ * 공급자 anthropic·모델·가격·월 상한·승인 기록·서버 환경의 ANTHROPIC_API_KEY)이 모두 갖춰졌을 때만 실제 Claude provider 를 돌려준다.
+ * 아니면 LiveProviderNotConfiguredError(503, 빠진 이름만). 키는 이 시점에 process.env 에서 읽는다(서버 전용, 값은 어디에도 내보내지 않음).
  * 실패 주입: NODE_ENV=test 이고 LLM_MOCK_FAIL_NEXT=1 일 때만 모의 provider 가 실패한다(운영 빌드에서는 무시).
  */
 export function getLlm(config: AppConfig = getConfig()): LlmProvider {
   if (config.LLM_MODE === 'live') {
     assertLiveLlmAllowed(config);
-    // T07: live provider 경계. 승인 기록·가격·상한이 모두 있어도 어댑터가 없어 assertReady 가 항상 거부한다(외부 호출 0).
-    const live = new LiveLlmProvider(config);
-    live.assertReady();
-    return live;
+    return resolveLiveLlmProvider(config, process.env);
   }
   const fail = process.env.NODE_ENV === 'test' && process.env.LLM_MOCK_FAIL_NEXT === '1';
   return new MockLlmProvider({ fail });

@@ -14,6 +14,15 @@ import {
   toMicro,
 } from './budget';
 import { loadConfig } from './config';
+import {
+  LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS,
+  LIVE_LLM_FIXED_INPUT_BYTES,
+  LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
+  LIVE_LLM_OUTPUT_JSON_SCHEMA,
+  LIVE_LLM_SYSTEM_PROMPT,
+  liveInputUpperBoundTokens,
+  utf8ByteLength,
+} from './llm-live';
 import { filterClaimSources } from './writing';
 
 const priced = (extra: Record<string, string> = {}) =>
@@ -74,10 +83,11 @@ describe('금액·토큰 계산(T07, D13)', () => {
   });
 });
 
-describe('live 준비 상태(항상 false, 빠진 조건 이름만)', () => {
+describe('live 준비 상태(LIVE-L1, D34 — 빠진 조건 이름만, 모두 있으면 ready)', () => {
+  const KEY = 'sk-ant-FAKE-sentinel-key-never-real-0123456789';
   const full = {
     LLM_MODE: 'live',
-    LLM_PROVIDER: 'provider-x',
+    LLM_PROVIDER: 'anthropic',
     LLM_MODEL: 'model-y',
     LLM_PRICE_INPUT_PER_1K: '1',
     LLM_PRICE_OUTPUT_PER_1K: '1',
@@ -94,19 +104,112 @@ describe('live 준비 상태(항상 false, 빠진 조건 이름만)', () => {
     ['LLM_LIVE_APPROVAL_REF', 'LLM_LIVE_APPROVAL_REF'],
   ];
 
-  it('모두 있어도 어댑터가 없어 ready=false(LIVE_ADAPTER 만 남음), 값은 목록에 없다', () => {
-    const r = liveLlmReadiness(loadConfig(full));
-    expect(r.ready).toBe(false);
-    expect(r.missing).toEqual(['LIVE_ADAPTER(T07 미구현, D8 결정 후)']);
-    expect(JSON.stringify(r)).not.toMatch(/provider-x|model-y|D99-approval/);
+  it('모두 있으면 ready=true, missing 없음, 값·키(길이 포함)는 결과에 없다', () => {
+    const r = liveLlmReadiness(loadConfig(full), { ANTHROPIC_API_KEY: KEY });
+    expect(r).toEqual({ ready: true, missing: [] });
+    expect(JSON.stringify(r)).not.toMatch(/model-y|D99-approval|sk-ant|sentinel/);
+    expect(JSON.stringify(r)).not.toContain(String(KEY.length));
   });
 
-  it.each(keys)('%s 가 빠지면 목록에 이름이 나온다', (key, name) => {
+  it.each(keys)('%s 가 빠지면 ready=false, 목록에 그 이름만', (key, name) => {
     const env: Record<string, string> = { ...full };
     delete env[key];
-    const r = liveLlmReadiness(loadConfig(env));
+    const r = liveLlmReadiness(loadConfig(env), { ANTHROPIC_API_KEY: KEY });
     expect(r.ready).toBe(false);
-    expect(r.missing).toContain(name);
+    expect(r.missing).toEqual([name]);
+  });
+
+  it.each([
+    ['없음', {}, 'ANTHROPIC_API_KEY'],
+    ['빈 값', { ANTHROPIC_API_KEY: '' }, 'ANTHROPIC_API_KEY'],
+    ['공백뿐', { ANTHROPIC_API_KEY: '   ' }, 'ANTHROPIC_API_KEY'],
+    ['중간 공백', { ANTHROPIC_API_KEY: 'sk-ant FAKE' }, 'ANTHROPIC_API_KEY(형식)'],
+    ['513자', { ANTHROPIC_API_KEY: 'x'.repeat(513) }, 'ANTHROPIC_API_KEY(형식)'],
+  ])('ANTHROPIC_API_KEY %s → ready=false, %s', (_l, env, name) => {
+    const r = liveLlmReadiness(loadConfig(full), env);
+    expect(r).toEqual({ ready: false, missing: [name] });
+    expect(JSON.stringify(r)).not.toContain('FAKE');
+  });
+
+  it('키 앞뒤 공백은 떼고 본다(서버도 뗀 값을 쓴다)', () => {
+    expect(liveLlmReadiness(loadConfig(full), { ANTHROPIC_API_KEY: `  ${KEY}  ` }).ready).toBe(true);
+  });
+
+  it.each(['openai', 'Anthropic', 'anthropic-x', 'provider-placeholder'])('LLM_PROVIDER=%s(anthropic 아님) → 준비 안 됨 LLM_PROVIDER=anthropic', (p) => {
+    const r = liveLlmReadiness(loadConfig({ ...full, LLM_PROVIDER: p }), { ANTHROPIC_API_KEY: KEY });
+    expect(r).toEqual({ ready: false, missing: ['LLM_PROVIDER=anthropic'] });
+  });
+
+  it('기본(mock, 아무것도 없음) → 모든 이름, LIVE_ADAPTER 표식은 더 없다', () => {
+    const r = liveLlmReadiness(loadConfig({}), {});
+    expect(r.ready).toBe(false);
+    expect(r.missing).toEqual([
+      'LLM_MODE=live',
+      'LLM_PROVIDER',
+      'LLM_MODEL',
+      'LLM_PRICE_INPUT_PER_1K',
+      'LLM_PRICE_OUTPUT_PER_1K',
+      'LLM_BUDGET_MONTHLY_LIMIT',
+      'LLM_LIVE_APPROVAL_REF',
+      'ANTHROPIC_API_KEY',
+    ]);
+    expect(r.missing.join(',')).not.toContain('LIVE_ADAPTER');
+  });
+});
+
+describe('live 예약(LIVE-L1, D34 — 실제 비용 상한)', () => {
+  const live = (extra: Record<string, string> = {}) =>
+    budgetPolicy(loadConfig({ LLM_MODE: 'live', LLM_PRICE_INPUT_PER_1K: '0.004', LLM_PRICE_OUTPUT_PER_1K: '0.02', ...extra }));
+
+  it('입력 = 프롬프트 UTF-8 바이트 + 시스템·스키마 바이트 + 틀 여유, 출력 = LLM_LIVE_MAX_OUTPUT_TOKENS(기본 4096)', () => {
+    const prompt = '가'.repeat(1000) + 'abc'; // 3003 바이트
+    const r = reserveFor(live(), prompt);
+    expect(utf8ByteLength(prompt)).toBe(3003);
+    expect(r.tokensIn).toBe(3003 + LIVE_LLM_FIXED_INPUT_BYTES + LIVE_LLM_FRAMING_OVERHEAD_TOKENS);
+    expect(r.tokensIn).toBe(liveInputUpperBoundTokens(prompt));
+    expect(r.tokensOutAllowance).toBe(LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS);
+    expect(LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS).toBe(4096);
+    expect(r.reserveMicro).toBe(costMicro(live().pricing, r.tokensIn, 4096));
+    expect(r.pricingSnapshot).toMatchObject({
+      mode: 'live',
+      token_estimate: 'utf8_bytes+fixed+overhead',
+      output_allowance_tokens: 4096,
+      fixed_input_bytes: LIVE_LLM_FIXED_INPUT_BYTES,
+      overhead_tokens: LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
+    });
+  });
+
+  it('고정분 = 실제로 보내는 시스템 프롬프트 + 직렬화한 출력 스키마의 바이트(같은 상수에서)', () => {
+    expect(LIVE_LLM_FIXED_INPUT_BYTES).toBe(utf8ByteLength(LIVE_LLM_SYSTEM_PROMPT) + utf8ByteLength(JSON.stringify(LIVE_LLM_OUTPUT_JSON_SCHEMA)));
+  });
+
+  it('한국어에서 live 입력 추정은 글자/3 보다 항상 크다(바이트 ≥ 글자, 상한 쪽)', () => {
+    for (const s of ['가나다라마바사', 'mixed 한국어 text 123', '😀 이모지', '']) {
+      expect(liveInputUpperBoundTokens(s)).toBeGreaterThan(estimateTokens(s));
+      expect(utf8ByteLength(s)).toBeGreaterThanOrEqual(s.length);
+    }
+  });
+
+  it('LLM_LIVE_MAX_OUTPUT_TOKENS: 설정값을 쓰고, 범위(1024~16000)·형식 밖은 설정 오류', () => {
+    expect(reserveFor(live({ LLM_LIVE_MAX_OUTPUT_TOKENS: '8000' }), 'x').tokensOutAllowance).toBe(8000);
+    expect(reserveFor(live({ LLM_LIVE_MAX_OUTPUT_TOKENS: '1024' }), 'x').tokensOutAllowance).toBe(1024);
+    expect(reserveFor(live({ LLM_LIVE_MAX_OUTPUT_TOKENS: '16000' }), 'x').tokensOutAllowance).toBe(16000);
+    for (const bad of ['1023', '16001', '-1', '4096.5', 'abc', '1e4']) expect(() => loadConfig({ LLM_LIVE_MAX_OUTPUT_TOKENS: bad })).toThrow();
+  });
+
+  it('mock 경로의 숫자는 그대로(글자/3, max(256, 입력/2)) — LLM_LIVE_MAX_OUTPUT_TOKENS 를 바꿔도 영향 없음', () => {
+    const r = reserveFor(priced({ LLM_LIVE_MAX_OUTPUT_TOKENS: '9000' }), 'x'.repeat(3000));
+    expect([r.tokensIn, r.tokensOutAllowance]).toEqual([1000, 500]);
+    expect(r.pricingSnapshot).toMatchObject({ mode: 'mock', token_estimate: 'chars/3', output_allowance_tokens: 500 });
+    expect(r.pricingSnapshot).not.toHaveProperty('overhead_tokens');
+  });
+
+  it('제안 1회 상한 0.5 USD: 보통 원고(한글 4천 자 프롬프트)는 통과, 한글 4만 자는 per_run_max', () => {
+    const p = live({ LLM_BUDGET_PER_RUN_MAX: '0.5', LLM_BUDGET_MONTHLY_LIMIT: '10' });
+    const typical = reserveFor(p, '가'.repeat(4000));
+    expect(typical.reserveMicro).toBeLessThan(toMicro('0.2'));
+    expect(checkBudget(p, 0n, typical.reserveMicro)).toEqual({ ok: true });
+    expect(checkBudget(p, 0n, reserveFor(p, '가'.repeat(40000)).reserveMicro)).toEqual({ ok: false, reason: 'per_run_max' });
   });
 });
 

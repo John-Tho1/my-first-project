@@ -7,6 +7,7 @@ import { DisabledPublisher, type Publisher } from './publisher';
 export * from './channel-adapter';
 export * from './collector';
 export * from './llm';
+export * from './llm-anthropic';
 export * from './oauth';
 export * from './threads-live-oauth';
 export * from './publisher';

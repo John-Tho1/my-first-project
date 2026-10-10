@@ -1,13 +1,5 @@
 import { createHash } from 'node:crypto';
-import {
-  estimateTokens,
-  liveLlmReadiness,
-  TOKEN_CHARS,
-  LiveProviderNotConfiguredError,
-  llmStructuredOutputSchema,
-  type AppConfig,
-  type LlmStructuredOutput,
-} from '@cs/domain';
+import { estimateTokens, TOKEN_CHARS, llmStructuredOutputSchema, type LlmStructuredOutput } from '@cs/domain';
 
 export interface LlmGenerateInput {
   task: LlmStructuredOutput['result_type'];
@@ -36,8 +28,10 @@ export interface LlmUsage {
 export interface LlmProvider {
   readonly name: string;
   readonly mode: 'mock' | 'live';
+  /** LIVE-L1: 실제 모델 ID(live 만 — run 기록의 model). 모의는 없음. */
+  readonly model?: string;
   generate(input: LlmGenerateInput): Promise<LlmStructuredOutput>;
-  /** T07: 실제 사용량(토큰). 모의는 결정적 추정(글자/3), live 는 공급자 응답에서 읽는다(T07 미구현). */
+  /** T07: 실제 사용량(토큰). 모의는 결정적 추정(글자/3), live(LIVE-L1)는 그 호출의 공급자 응답 usage 에서 읽는다. */
   usageOf?(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage;
 }
 
@@ -58,6 +52,8 @@ export interface MockLlmOptions {
 
 /** 1인칭 경험 표현(한국어). 걸리면 experience + 사용자 확인 필요로 분류한다. */
 const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|저의|제 |우리는|우리가|직접 )/;
+/** LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다. */
+export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text);
 
 function splitSentences(text: string): string[] {
   return text
@@ -124,29 +120,5 @@ export class MockLlmProvider implements LlmProvider {
   }
 }
 
-/**
- * T07 live provider 경계(공급자 중립, D8 미정). **HTTP 호출이 없다.**
- * - assertReady(): 전제 조건(LLM_MODE=live·공급자·모델·가격·월 상한·승인 기록 LLM_LIVE_APPROVAL_REF)과 무관하게
- *   T07 에서는 어댑터가 없으므로 항상 LiveProviderNotConfiguredError(빠진 조건 이름만 포함).
- * - generate(): 방어적으로 같은 오류. 환경변수만으로 실제 호출이 열리는 경로는 없다.
- */
-export class LiveLlmProvider implements LlmProvider {
-  readonly name: string;
-  readonly mode = 'live' as const;
-  private readonly config: AppConfig;
-
-  constructor(config: AppConfig) {
-    this.config = config;
-    this.name = config.LLM_PROVIDER ?? 'live';
-  }
-
-  assertReady(): void {
-    throw new LiveProviderNotConfiguredError(liveLlmReadiness(this.config).missing);
-  }
-
-  async generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
-    void input;
-    // T07: 실제 호출은 별도 승인 후 구현(D8)
-    throw new LiveProviderNotConfiguredError(liveLlmReadiness(this.config).missing);
-  }
-}
+// LIVE-L1(D34): T07 의 자리 표시 LiveLlmProvider(항상 거부)는 실제 Claude 어댑터(llm-anthropic.ts ClaudeLlmProvider)와
+// 준비 판정 기반 선택(resolveLiveLlmProvider)으로 바뀌었다.

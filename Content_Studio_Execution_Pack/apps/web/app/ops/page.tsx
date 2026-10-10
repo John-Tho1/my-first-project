@@ -54,7 +54,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const s = await opsSnapshot(db, session.ownerId, config, now);
   const plan = await planRetention(db, session.ownerId, config, exportsDir(config), now);
   const err = str(q.error) ? (OPS_ERROR_TEXT[str(q.error)!] ?? OPS_ERROR_TEXT.server) : undefined;
-  const live = liveLlmReadiness(config);
+  const live = liveLlmReadiness(config, process.env);
   const sttLive = sttLiveReadiness(config);
   const oauth = oauthReadinessView(config);
   const drill = s.backup.lastDrill;
@@ -266,7 +266,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           <span className="tag">음성 전사: {config.STT_MODE === 'mock' ? '모의' : '실제'}</span>
           <span className="tag">작업 처리기: {config.WORKER_MODE}</span>
         </p>
-        <p className="note">AI live 준비 안 됨: {live.missing.length ? live.missing.join(', ') : '없음'}</p>
+        <p className="note">AI live 준비 안 됨: {live.missing.length ? live.missing.join(', ') : '없음(준비됨 — 실제 Claude 호출·과금, D34)'}</p>
         <p className="note">음성 전사 live 준비 안 됨: {sttLive.missing.length ? sttLive.missing.join(', ') : '없음'}</p>
         <p className="note">
           계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 Threads 연결 준비 안 됨:{' '}

@@ -127,3 +127,5 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 핵심: 공식 SDK 0.128.0 고정·재시도 0·목적지/헤더 고정·오류 원문 차단, 예약 = 보수적 추정(상한 증명 아님) + 실제 usage 정산(출처 provider/estimate/none/provider_unstorable), `LLM_LIVE_MAX_RUNS`(승인 기록별 실제 호출 수 제한), 본문 1인칭 문단 → 확인 필요 claim.
 - 남은 위험: 동시 초과 누적(LLM_LIVE_MAX_RUNS=1 이면 1회분), provider_unstorable 해제는 수동, Postgres 다중 연결 동시성 미검증, 사용자가 직접 쓴 1인칭은 게이트 대상 아님(기존 설계).
 - 다음: D34 2단계(실제 호출 1회) — 사용자 승인 필요.
+- LIVEL1-H1(Codex FIX4 놓친 케이스 보강): 259f4f9 **Codex PASS**. 검사: unit 1405·integration 789·drill·restore PASS. NFD 1인칭 탐지 수정 1줄, 나머지는 시험 추가.
+- 남은 보강 후보(Codex LIVEL1H1 놓친 케이스, 우선순위 낮음): resolution 형식 검증, 모의 provider 도 공통 1인칭 판별 함수 사용, NFC/NFD 교차 중복, 복원 후 월 예산 반영, 복원 실패 시 필드 값 보존, Postgres 다중 연결(미검증).

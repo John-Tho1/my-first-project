@@ -173,3 +173,65 @@
 ### FIX round 1 — 오케스트레이터 기록
 - FIX HEAD: d7da959b4da89311efa622f6101cac38d0967b48 (code only, D28). BASE 8a54ef3.
 - checks-FIX-LIVEL1: lint 0 · typecheck 0 · build 0 · unit 1회차 1 실패(이 변경과 무관한 `imports-fix3.test.ts` 성능 시험 5초 초과 5345ms) → 단위만 재실행 **56 파일 · 1368 시험 모두 통과(UNIT2=0)** · integration 0(37 파일 · 766 시험) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS).
+
+# FIX round 2 (Codex review-FIX-LIVEL1, CHANGES_REQUESTED on d7da959)
+- BASE_SHA: f170ecd (d7da959 + 판정·인계 docs 커밋, 코드는 d7da959 와 같음). HEAD_SHA: uncommitted (orchestrator commits). `git add -A` 하지 않음.
+- 수정하지 않음: `.env.local`·`./data`·`docs/handoffs/*`·`docs/DECISIONS.md`·`.claude/`. External calls: **none**(Anthropic 요청 0, 의존성 변경 없음).
+- **정정(이 문서 FIX round 1 의 표현)**: FIX round 1 머리와 남은 위험 1 의 "월·1회 상한은 **최대 한 호출분** 넘을 수 있다", "실제 사용량은 **성공·실패 모두** 기록"은 틀렸다. 맞는 설명은 아래 "초과 동작".
+- 재현: 고치기 전에(작업 트리 = f170ecd, 코드 = d7da959) 새 시험만 추가해 실행했다.
+  - unit `llm-anthropic.test.ts` FIX2 블록: **11 failed / 72 passed**.
+  - unit `budget.test.ts` FIX2 블록: **1 failed / 43 passed**.
+  - integration `live-llm.test.ts` FIX2 블록: **9 failed**. 처음 실행에서 10 failed 였는데, (b) 동시 초과 시험의 단언을 내가 잘못 세웠던 탓이다(두 호출이 실제로 겹치지 않음). 응답을 붙잡는 게이트를 넣어 다시 쓴 (b) 와 (a)·(d) 는 d7da959 에서도 **통과** — 지금 동작을 기록하는 시험이다(아래 표).
+
+## 초과 동작(정확한 설명 — 코드 주석·`.env.example`·설정 화면을 이 내용으로 고침)
+1. 실제 사용량은 **공급자가 유효 usage 를 보고한 경우에만** 기록한다(성공·실패 모두. 실패는 max(예약액, usage 비용)). 보고가 없거나 이상하거나 원장 열 범위 밖이면 예약액으로 확정하고 `tokens_in/out` 은 NULL, 스냅숏 `usage_source = 'none'`.
+2. 실제액 > 예약액이면 `overage_amount`·`over_budget` 을 기록하고, 그 금액은 월 합계에 들어간다.
+3. 다음 요청이 거부되는 경우는 둘이다. 하나는 "월 합계(기록된 초과액 포함) + 그 요청의 예약액 > 월 상한"(429 `monthly_limit`), 다른 하나는 "그 요청의 예약 **추정** > 1회 상한"(429 `per_run_max`). 1회 상한은 실제액에 적용되지 않는다 — 실제액이 1회 상한을 넘어도 월 잔여가 있으면 다음 요청은 허용된다(시험 (a)).
+4. 예약 검사는 진행 중 호출의 **예약액**만 본다. 그래서 동시에 진행 중인 호출들이 각각 예약을 넘으면 초과액이 모두 합쳐져 월 상한을 넘는다(시험 (b)). 월 상한 초과가 한 호출분으로 묶이는 것은 같은 승인 기록에 `LLM_LIVE_MAX_RUNS=1` 일 때뿐이다.
+
+## 지적 → 재현 → 수정 → 시험
+| 지적 | 재현(d7da959 에서) | 수정 | 시험(수정 후) |
+|---|---|---|---|
+| [P1] llm-anthropic.ts:287 부분 claim 이 문장 전체를 덮음 | unit 3행 실패: 짧은 claim `제가 협상했습니다` 가 `제가 협상했습니다 그리고 계약을 따냈습니다.` 를 덮음 / 공백 없는 `…했습니다.그리고 제가…` 가 한 덩어리 / 여러 경험·`…있었습니다?우리는…` 이 안 나뉨. integ 1행 실패 | (1) 덮임 판정: 기존 experience claim 의 정규화 텍스트(NFKC·공백 접기·trim)가 문장 정규화 텍스트 **전체를 포함할 때만**. (2) 새 분리기 `splitSentencesStrict`(live 확인 claim 전용 — 모의 provider 의 분리는 그대로). 규칙: 종결 부호(`. ! ? 。 ！ ？ …`) 연속 + 닫는 따옴표·괄호 뒤에, **다음 글자가 끝·공백·영문/숫자가 아닌 글자(한글 등)** 면 끊는다. 다음 글자가 영문·숫자면 끊지 않는다 — 소수 `3.5`, 도메인·URL `example.com`, 약어 `e.g.` 안쪽은 한 문장으로 남는다(약어 뒤에 공백이 오면 끊길 수 있지만 확인 대상만 늘어나는 보수적 방향). 줄바꿈도 경계 | unit 4행: 짧은 부분 claim + 긴 문장 → 문장 claim 추가 · 공백 없이 이어진 두 경험 → 덮이지 않은 둘째만 추가 · 여러 경험(`!`·`?`·`。`·공백 없음)과 `3.5` → 1인칭 3문장만 · 전체를 포함한 claim(앞뒤 공백)은 중복 없음. integ: 그 출력 → claims 2개 → 채택 → **첫 claim 만 확인(`confirmClaims [0]`) → 미확인 [1] 남음 → `updateContentMeta` review → ready 가 `unconfirmed_experience_claims`** |
+| [P2] writing.ts:489 추정을 실제 usage 로 저장 | unit 7행(`confirmedUsageOf` 없음 / usage 없음·이상·열 범위 밖에서 null 이 아님 / 응답 없는 실패 뒤). integ 6행(usage_source 없음, usage 이상한 성공·usage 없는 인용 검증 실패에서 tokens 에 추정값) | provider: `#confirmed` WeakMap 에는 **확인된 usage 만**(없으면 null) 넣고 `confirmedUsageOf(input)` 을 추가. `usageOf` 는 호환용(확인값 → 없으면 추정). db: `successUsage` — live 는 `confirmedUsageOf` 만, 없으면 usage null → 예약액·tokens NULL. 모의는 기존 결정적 추정(estimate). `liveFailureUsage` 도 `confirmedUsageOf` 만 쓴다(추정값 안 씀). `settleLedgerSucceeded(…, usage \| null, at, source)`·`settleLedgerFailed(…, known)` 이 `pricing_snapshot.usage_source`(`provider`·`estimate`·`none`)를 남긴다. 실패 정산의 usage_source 는 LLM 경로(`known` 을 넘길 때)만 — STT 실패 정산은 그대로. **열 정의 확인**: `usage_ledger.tokens_in/tokens_out` 은 `integer` **nullable**(schema.ts·migration 0008) → 모르면 NULL 로 둔다(추정값 저장 없음). 예산 합계는 그대로 확정액(actual_amount) | unit: 유효 → 그 값 · 없음/이상/2^31/출력 2^31/캐시 합 초과 → null(usageOf 는 추정, 실패 e.usage null) · 529 뒤 null. integ: 성공 유효 → provider·tokens · 성공 usage 이상 → 성공 run·예약액·tokens NULL·none · usage 없음 + 인용 검증 실패 → 예약액·NULL·none · 529 → NULL·none · refusal + usage → provider · 모의 성공 → estimate |
+| [P2] .env.example:37 등 설명 | (설명 문제) | 위 "초과 동작" 1~4 로 고침: `packages/domain/src/budget.ts` 머리 (1)~(4), `llm-live.ts`, `config.ts`, `packages/db/src/budget.ts` reserveOrThrow 주석, `llm-anthropic.ts` 머리, `.env.example`, 설정 화면 문구("공급자가 사용량을 보고하면 그 값으로 확정 … 보고가 없으면 예약액 … 이번 달 합계(초과액 포함)가 월 상한을 넘게 되는 요청부터 거부 … 동시에 진행 중인 요청들의 초과액은 합쳐질 수 있습니다(LLM_LIVE_MAX_RUNS=1 이면 한 건)"), 이 문서 | 시험 (a)·(b) 가 설명 3·4 를 고정 |
+| 놓친 (a) 실제 > 예약·1회 상한, 월 잔여 충분 | d7da959 에서 통과(동작 기록) | 코드 변경 없음, 설명 3 에 명시 | integ: 1회 0.5·월 10, usage 200000/4096(0.88 USD) → over_budget, 다음 요청 성공(호출 2번) |
+| 놓친 (b) 횟수 제한 없는 동시 초과 누적 | d7da959 에서 통과(동작 기록) | 코드 변경 없음, 설명 4 에 명시(남은 위험) | integ: 월 0.3, 두 호출이 모두 공급자 호출 중일 때까지 응답을 붙잡는 게이트, 각 usage 0.88 → 둘 다 over_budget, **월 상한을 넘은 양 > 어느 한 호출의 초과액**, 그 뒤 요청은 `budget_exceeded` |
+| 놓친 (c) JS 안전 정수지만 DB 범위 밖 | integ 2행 실패(2^31 tokens → integer 열 오류 / 금액이 numeric(18,6) 밖 → `AmountRangeError` 로 성공 트랜잭션이 깨짐) | `MAX_TOKEN_COLUMN = 2_147_483_647`(domain): provider `readUsage` 와 domain `failureUsageOf` 가 각 값·입력 합계가 넘으면 확인된 usage 가 아님. db `storableUsage`: provider usage 의 비용이 numeric(18,6) 밖이면 확인된 usage 로 쓰지 않음(예약액·NULL·none). 모의 추정은 기존대로 `AmountRangeError` | unit(2^31 3종) · domain `failureUsageOf` 경계 · integ: input 2^31 성공 → 예약액·NULL·none · 입력 단가 999999999 + usage 2e9(비용 > numeric 최대) 성공·refusal → 두 행 모두 settled·NULL·none, DB 오류 없음 |
+| 놓친 (d) approval_ref 원장의 export→restore, 보존 정리 | d7da959 에서 통과 | 코드 변경 없음. **보존 정리 확인**: `packages/db/src/retention.ts`·`ops.ts` 와 db 패키지 전체에 `usage_ledger` 를 지우는 코드가 없다(grep `delete(usageLedger`·`delete from usage_ledger` 0건, 원장 트리거 없음). 그래서 보존 정리로 횟수가 0 으로 돌아가지 않는다. 다른 owner·DB 로 복원하면 그 대상 owner 의 행으로 들어와 같이 센다 | integ: live 1회(MAX_RUNS=1) → export → 빈 DB(createTestDb)에 empty_only 복원 → 대상 owner 의 `liveRunsUsed(ref)` = 1 |
+| 놓친 (e) 같은 입력 객체 동시 재사용 | unit 1행 실패(두 호출 모두 나감) | 제품 경로(writing.ts·variants.ts)는 run 마다 새 `llmInput` 객체를 만든다. 그래도 provider 가 `#inflight` WeakSet 으로 진행 중인 입력 객체의 두 번째 `generate` 를 **보내기 전에** `llm_request_invalid` 로 거부한다(usage 대응이 섞일 수 없게). 순차 재사용은 허용(시작 때 이전 usage 를 지움) | unit: 첫 호출이 공급자 응답을 기다리는 동안 같은 객체로 두 번째 → 거부·fetch 1번, 끝난 뒤 같은 객체 순차 2회 → 성공 |
+
+## 바뀐 파일(FIX round 2)
+- 코드: `packages/providers/src/llm-anthropic.ts`(`confirmedUsageOf`·`#confirmed`·`#inflight`·`readUsage` 범위·`splitSentencesStrict`·전체 포함 판정·주석), `packages/providers/src/llm.ts`(`LlmProvider.confirmedUsageOf?`), `packages/domain/src/budget.ts`(`MAX_TOKEN_COLUMN`·`UsageSource`·`failureUsageOf` 범위·머리 주석), `packages/domain/src/llm-live.ts`·`config.ts`(주석), `packages/db/src/budget.ts`(`storableUsage`·`settleLedgerSucceeded` usage null·source·`settleLedgerFailed` usage_source·주석), `packages/db/src/writing.ts`(`successUsage`·`liveFailureUsage` 확인값만·`AssistLlm.confirmedUsageOf?`), `packages/db/src/variants.ts`(`successUsage`·쓰지 않게 된 import 제거), `apps/web/app/settings/page.tsx`(문구), `.env.example`(문구)
+- 시험: `llm-anthropic.test.ts`·`budget.test.ts`·`live-llm.test.ts` 에 FIX2 블록 추가(import 추가). 기존 단언은 바꾸거나 지우지 않음. migration 없음
+
+## 실행한 명령과 결과(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 실행 전 node 프로세스 0개 확인)
+| 명령 | 결과 |
+|---|---|
+| 재현(수정 전): unit `llm-anthropic.test.ts` | 11 failed / 72 passed |
+| 재현(수정 전): unit `budget.test.ts` | 1 failed / 43 passed |
+| 재현(수정 전): integration `live-llm.test.ts` | 9 failed(첫 실행 10 — (b) 단언 오류, 게이트로 다시 쓴 (b)·(a)·(d) 는 d7da959 에서 통과) |
+| 수정 후 단독: unit `packages/providers/src` + `budget.test.ts` | 16 files, 560 passed |
+| 수정 후 단독: integration live-llm·budget-claims·writing·variants | 4 files, 126 passed |
+| `bash .handoffs/run-checks.sh FIX2-LIVEL1` → `.handoffs/checks-FIX2-LIVEL1.log` | **LINT=0 · TYPECHECK=0 · BUILD=0 · UNIT=0(56 files, 1381 tests) · INTEG=0(37 files, 778 tests) · DRILL=0(불변식 위반 0건) · MIGRATE=0 · DRILL_RESTORE=0(PASS)** — 시간 초과·워커 비정상 종료 없음, 단독 재실행 불필요 |
+
+## 남은 위험(FIX round 2 기준)
+1. 예약은 추정이다. 확인된 실제액이 예약을 넘는 크기는 증명되지 않은 가정 2개(토큰 ≤ 바이트, 틀 여유 2048)에 달려 있다.
+2. **동시 초과 누적**: `LLM_LIVE_MAX_RUNS` 가 없거나 2 이상이면, 진행 중인 호출들이 각각 예약을 넘을 때 초과액이 합쳐져 월 상한을 그 합만큼 넘을 수 있다(시험 (b)). 한 호출분으로 묶이는 것은 `LLM_LIVE_MAX_RUNS=1` 일 때뿐이다.
+3. 1회 상한은 예약 추정에만 적용된다. 실제액이 1회 상한을 넘은 호출은 막지 못하고, 그 뒤 요청도 월 잔여가 있으면 허용된다(시험 (a)).
+4. usage 를 모르는 경우(HTTP 오류·시간 초과·usage 없음·이상값·DB 범위 밖)에는 예약액으로 확정한다. 실제 청구액과 다를 수 있고(크거나 작게), tokens 는 NULL 이다.
+5. **Postgres 드라이버 동시성 미검증**: `LLM_LIVE_MAX_RUNS` 의 동시 안전성(owner 행 `FOR UPDATE` → 세기 → 같은 트랜잭션 삽입)과 예약 직렬화는 **PGlite 에서만** 시험했다. 이 앱의 운영 DB 도 지금은 PGlite 이고, `DB_DRIVER=postgres`(다른 연결·READ COMMITTED)에서는 **시험하지 않았다**.
+6. 1인칭 판별은 정규식 휴리스틱이라 주어를 생략한 경험은 놓친다. 새 분리기는 약어 뒤 공백에서 끊을 수 있다(확인 대상만 늘어남).
+7. `usage_source` 는 스냅숏 jsonb 키라 DB 제약이 없다(값 검증은 코드에서만). 이전 원장 행에는 이 키가 없다(LIVE-L1 이전 행 = 출처 미표시).
+
+## Codex 에게 묻는 것(FIX round 2)
+1. "덮임 = 기존 claim 이 문장 전체를 포함" 판정과 `splitSentencesStrict` 규칙(다음 글자가 영문·숫자면 끊지 않음)에 우회 경로가 남는가? 예: 한 문장 안의 두 경험을 쉼표로 잇는 경우(한 claim 으로 묶임 — 확인 한 번으로 둘 다 해결됨).
+2. live 성공인데 usage 를 모를 때 예약액으로 확정(tokens NULL, `usage_source none`)하는 것이 맞는가, 아니면 그 run 을 실패로 봐야 하는가(현재는 제안을 저장하는 성공)?
+3. `usage_source` 를 `pricing_snapshot` 안에 둔 것(migration 없음)이 충분한가, 별도 열·CHECK 가 필요한가?
+4. 같은 입력 객체 동시 호출을 거부(`llm_request_invalid`, 보내기 전)하는 방식이 호출별 키보다 나은가?
+5. DB 범위 밖 usage(정수 2^31, 금액 numeric 초과)를 "확인된 usage 아님"으로 보고 예약액으로 확정하는 것이 맞는가(실제로는 큰 비용이 났을 수 있음 — 숨김이 되지 않는가)?
+
+
+### FIX round 2 — 오케스트레이터 기록
+- FIX2 HEAD: ea5954b02ab78d6a7ed4d9183070c66e7fb4c41c (code only, D28). BASE f170ecd.
+- checks-FIX2-LIVEL1: lint 0 · typecheck 0 · build 0 · unit 0(56 파일 · 1381) · integration 0(37 파일 · 778) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS). 재실행 없음.

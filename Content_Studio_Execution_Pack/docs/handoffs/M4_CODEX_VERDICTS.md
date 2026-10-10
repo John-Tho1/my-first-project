@@ -180,3 +180,9 @@ CHANGES_REQUESTED
 
 ## T19H1 (1e47574, 소스 상한 동시 등록 보강) — **PASS**
 - 지적 없음. 답: 등록은 다른 작업보다 advisory 잠금을 먼저 잡아 등록끼리 순서 역전 없음(INSERT 도 일반 잠금을 잡는다는 점은 정정). 받아들이기는 실행 행 claim(행 잠금) 뒤 advisory — 등록은 advisory 대기 중 아무 잠금도 쥐지 않으므로 순환 없음(오케스트레이터 확인).
+
+## LIVE-L1 (D34 1단계, Claude 어댑터)
+| 라운드 | HEAD | 판정 |
+|---|---|---|
+| LIVE-L1 | 2cbcb49 | CHANGES_REQUESTED — P1 2(예약 상한 근거 없음·실패 응답 usage 버림), P2 2(캐시 usage 이상값·헤더 값 덮어쓰기) |
+| FIX-LIVEL1 | d7da959 | 대기 |

@@ -1,6 +1,7 @@
 # Implementation handoff — LIVE-L1 (D34 1단계: 실제 Claude 어댑터 코드, 실제 호출 0·과금 0)
 - Task ID / milestone: LIVE-L1 / M4 후속 — D34 승인 범위 1단계(실제 Claude(Anthropic Messages API) 어댑터 코드 + 기록된 응답(fixture)·가짜 fetch 시험만). 2단계(사용자가 `.env.local` 에 키를 넣고 가상/공개 소재 1건으로 실제 호출 1회)는 **별도 승인**.
-- Purpose and changed behavior: `LLM_MODE=live` + `LLM_PROVIDER=anthropic` + 모델·단가·월 상한·`LLM_LIVE_APPROVAL_REF` + 서버 환경 `ANTHROPIC_API_KEY` 가 모두 있으면 작성 보조·채널 초안이 실제 Claude 를 부른다(그 전에는 지금처럼 503, 빠진 이름만). T07 의 자리 표시 `LiveLlmProvider`(항상 거부)와 `LIVE_ADAPTER(T07 미구현, D8 결정 후)` 표식은 없어졌다. live 예약은 실제 비용 상한(바이트 기반)으로 바뀌었고 모의 경로 숫자는 그대로.
+- Purpose and changed behavior: `LLM_MODE=live` + `LLM_PROVIDER=anthropic` + 모델·단가·월 상한·`LLM_LIVE_APPROVAL_REF` + 서버 환경 `ANTHROPIC_API_KEY` 가 모두 있으면 작성 보조·채널 초안이 실제 Claude 를 부른다(그 전에는 지금처럼 503, 빠진 이름만). T07 의 자리 표시 `LiveLlmProvider`(항상 거부)와 `LIVE_ADAPTER(T07 미구현, D8 결정 후)` 표식은 없어졌다. live 예약은 바이트 기반 보수적 추정(증명된 비용 상한 아님 — FIX round 1 정정)으로 바뀌었고 모의 경로 숫자는 그대로.
+- **FIX round 1 정정**: 이 문서 아래의 "상한"·"상한값"·"예약 = 실제 비용 상한" 표현은 정정한다 — 예약은 UTF-8 바이트 + 틀 여유 + max_tokens 의 **보수적 추정**이고 실제 사용량은 성공·실패 모두 기록하며, 실제액 > 예약액이면 초과액이 다음 예약 검사에 들어가 월·1회 상한을 최대 한 호출분 넘을 수 있다. 자세한 것은 맨 아래 "FIX round 1".
 - BASE_SHA: 40bd0c2 (D34 기록 docs 커밋)
 - HEAD_SHA: 2cbcb49ed556b46027f433bccc02dbf4947674cb (code only, D28 — 오케스트레이터 커밋. 인계·판정은 별도 docs 커밋)
 - Clean tracked tree confirmed: 작업 시작 시 yes(`?? .claude/` 만, 건드리지 않음).
@@ -111,3 +112,64 @@
 7. 1인칭 재분류·후속 질문 3개 자르기가 "모델 출력을 고쳐 살리는" 정제로 보아 fail-closed 원칙(FIX-T07 round 4)과 충돌하는가? (둘 다 확인 필요를 늘리는 쪽·질문 목록 자르기.)
 
 - Next authorized task: 없음 — D34 2단계(실제 호출 1회)는 사용자 별도 승인 필요.
+
+# FIX round 1 (Codex review-LIVEL1, CHANGES_REQUESTED on 2cbcb49)
+- BASE_SHA: 8a54ef3 (2cbcb49 + 인계 docs 커밋). 리뷰 대상 HEAD 2cbcb49 와 코드 동일(8a54ef3 은 docs 만).
+- HEAD_SHA: uncommitted (orchestrator commits). `git add -A` 하지 않음. `.env.local`·`./data`·`docs/handoffs/*`·`docs/DECISIONS.md`·`.claude/` 수정 없음.
+- External calls: **none**(Anthropic 요청 0 — 가짜 fetch·setupFiles 가드). 이번 라운드엔 npm 레지스트리 접근도 없음(의존성 변경 없음).
+- 재현 방법: 코드를 고치기 전에(작업 트리 = 8a54ef3, 코드는 2cbcb49 와 같음) 새 시험만 추가해 실행 → 아래 "재현" 열의 시험이 **실패**함을 확인한 뒤 고쳤다.
+  - unit `llm-anthropic.test.ts` FIX1 블록: 2cbcb49 코드에서 **17 failed / 54 passed**.
+  - unit `budget.test.ts` FIX1 블록: **4 failed / 39 passed**.
+  - integration `live-llm.test.ts` FIX1 블록: **11 failed / 16 passed**. P1 :93 의 "다음 예약 429" 시험은 2cbcb49 에서도 통과했다. 성공 경로의 초과 기록과 다음 예약 차단은 이미 있었고, 지적의 핵심은 "상한이라고 주장한 것"과 실패 경로였다.
+
+## 지적 → 재현 → 수정 → 시험
+| 지적 | 재현(2cbcb49 에서 실패) | 수정 | 시험(수정 후 통과) |
+|---|---|---|---|
+| [P1] llm-live.ts:93 증명 안 된 상한 | 주장의 문제라 코드 실패는 없음(성공 경로 초과 시험은 통과) | 상한 주장 제거: `liveInputUpperBoundTokens` → **`liveInputEstimateTokens`** 이름 변경, llm-live.ts·budget.ts(domain·db)·config.ts·llm-anthropic.ts 주석, `.env.example`, 설정 화면 문구("예약액은 추정이며 실제 사용량이 기록됩니다 — 초과하면 다음 요청부터 거부"), 이 문서 머리 정정. 식(바이트 + 2048 + max_tokens)은 그대로. count_tokens 등 네트워크 없음 | integ "실제액이 1회 상한·월 잔여를 넘는 호출 → 초과액 그대로 기록, 다음 예약은 429(호출 0)": 1회 0.5·월 0.6, usage 300000/4096(= 1.281920 USD) → actual·overage·over_budget 정확, 다음 예약 `budget_exceeded`/`monthly_limit`, fetch 1번, 행 변화 0 |
+| [P1] llm-anthropic.ts:222 실패 응답의 usage 버림 | unit 5행(refusal·max_tokens·unexpected_stop·invalid_output·content 비배열 + usage 200000/4096 → `e.usage` 없음), 2행(usage 이상·HTTP 오류 → `e.usage` 가 null 이 아니라 undefined). integ 7행(실패 4종·인용 정제 실패·작은 usage·variant → 원장에 tokens/actual/overage 없음) | provider: `readUsage` 로 **stop_reason·출력 검증 전에** usage 를 검증하고, `LiveLlmError.usage`(숫자 `{tokensIn,tokensOut}` 만, 텍스트 없음)를 refusal·max_tokens·unexpected_stop·invalid_output 에 싣는다. domain: `failureUsageOf(e)`(구조로 읽고 안전 정수만), `failedSettlement(pricing, reserved, usage)` = max(예약액, usage 비용) + 초과액. db: `settleLedgerFailed(…, {pricing, usage})` — usage 가 있으면 actual = max, `tokens_in/out`, `overage_amount`, `over_budget`, failed=true, 없으면 D13 그대로. `liveFailureUsage`(writing.ts·variants.ts 공용)는 live 만: 오류의 usage, 또는 provider 는 성공했는데 서버 검증(input_version·크기·`unverifiable_citation`)이 실패하면 그 호출의 `usageOf`. 모의와 HTTP 오류(usage 모름)는 D13 그대로 | unit 7행(원문 누출 없음 포함). domain `failedSettlement`·`failureUsageOf`. integ: 실패 5종 + usage 200000/4096 → actual = usage 비용 > 예약, overage·over_budget·tokens, 본문 그대로, DB 에 원문·키 없음. 작은 usage → actual = 예약(D13), tokens 기록. HTTP 529 → tokens null·예약액. variant 실패도 같은 정산. 모의 실패는 기존 그대로 |
+| [P2] :271 캐시 usage | unit 6행(캐시 문자열·음수·소수·2^53·합계 초과·input 2^53+2 → 추정값 대신 그 값을 씀) | `readUsage`: input·output 은 `Number.isSafeInteger` ≥ 0. 캐시 필드는 없음·null 이면 0, 있는데 이상하면 **전체 null**. 그러면 성공은 보수적 추정, 실패는 usage 없음(D13). 합계도 안전 정수 검사 | unit 8행(없음·null → 그 값, 이상한 6종 → 추정값) |
+| [P2] :181 헤더 값 | unit 1행(CUSTOM_HEADERS 로 `Content-Length: 0`·`Content-Type: text/plain`·`Accept: text/html`·`Anthropic-Version: 1999-01-01` 을 넣으면 그대로 나감) | 허용 목록을 `user-agent·x-stainless-*` 로 줄이고 `accept`·`content-type` = `application/json`, `anthropic-version` = **`ANTHROPIC_API_VERSION = '2023-06-01'`**(node_modules/@anthropic-ai/sdk/client.js buildHeaders 에서 확인한 고정 SDK 값), `x-api-key` = 키로 다시 쓴다. `content-length` 는 버림(전송 계층이 계산) | unit: 최종 헤더 **값** 단언(content-length 없음, 세 값 고정, 키) + 기존 허용 목록 시험 |
+| 놓친 (a) content 비배열·null 블록 | unit 1행(null 블록 → TypeError 가 나고 LiveLlmError 가 아님) | `Array.isArray(content)`, 블록 객체, text 문자열 검사 → `llm_invalid_output` | unit 4행(null·문자열·null 블록·숫자 블록) |
+| 놓친 (b) 같은 입력 재사용 | unit 1행(성공 뒤 실패해도 지난 usage 를 돌려줌) | `generate` 시작 때 `#usage.delete(input)` | unit 1행(실패 뒤 usageOf = 추정값) |
+| 놓친 (c) proposed_text 의 1인칭 | unit 1행·integ 1행(claims=[] 이면 경험 claim 없음) | provider: `splitSentences`(모의와 같은 문장 분리, llm.ts 에서 export)로 제안 본문을 나누고, 1인칭 표현이 있는데 experience claim 으로 덮이지 않은 문장마다 `{kind:'experience', needs_user_confirmation:true, source_refs:[]}` 를 더한다(출처·증거 등급을 만들지 않음, 중복 없음). 하류 게이트 확인: `claims-gate.ts` `listUnconfirmedExperienceClaims` 가 채택한 run 의 output_json claims 중 확인 안 된 experience 를 찾고, lifecycle(ready 등) 전이가 409 `unconfirmed_experience_claims` 로 막힌다(writing.test.ts 의 모의 경로와 같은 함수) | unit 2행(더함·이미 덮였으면 안 더함). integ: live 출력 → 저장된 claim → `adoptProposal` → `listUnconfirmedExperienceClaims` = [[run, 0]] |
+| 놓친 (d) D34 2단계 호출 횟수 | integ 3행(2번째 호출도 나감, 동시 2건 모두 호출) + domain 2행(설정·스냅숏 없음) | 새 설정 **`LLM_LIVE_MAX_RUNS`**(선택, 1~1000000 정수). live 예약 스냅숏에 `approval_ref`(LLM_LIVE_APPROVAL_REF)를 저장. `reserveOrThrow`: live 이고 설정이 있으면 **owner 잠금(lockOwnerForBudget) 아래에서** 이 owner 의 live 원장 행 중 같은 approval_ref 수(상태·기간 무관, 실패 호출 포함)를 세어 한도 이상이면 429 `live_run_limit`(`LiveRunLimitError`, kind budget_exceeded). 예산 검사보다 먼저이고 같은 트랜잭션이라 아무것도 쓰지 않고 호출하지 않는다. 원장 행이 같은 트랜잭션에서 바로 쓰여 동시 요청도 직렬화된다. `usageLedgerView` 는 `approval_ref` 를 빼고 내보낸다(화면·API 응답). 폼 오류 코드 `live_run_limit` 문구 추가. `.env.example` 에 `LLM_LIVE_MAX_RUNS=1`(2단계 권장) 주석 | domain: 설정 범위(0·-1·1.5·문자·1000001·1e3 거부), 스냅숏 approval_ref(mock 은 없음). integ: 순차(2번째는 429 `live_run_limit`·호출 0·행 0, 새 승인 기록이면 다시 1회, view 에 ref 없음), 실패 호출도 1회로 셈, **동시 2건 → fulfilled 1·`live_run_limit` 1·fetch 1·원장 1행**, 설정이 없으면 제한 없음 |
+
+## 바뀐 파일(FIX round 1)
+- 코드: `packages/domain/src/llm-live.ts`(이름 변경·주석), `packages/domain/src/budget.ts`(`liveMaxRuns`·`liveApprovalRef`·스냅숏 `approval_ref`·`LiveRunLimitError`·`failureUsageOf`·`failedSettlement`·주석), `packages/domain/src/config.ts`(`LLM_LIVE_MAX_RUNS`·주석), `packages/db/src/budget.ts`(`reserveOrThrow` 횟수 검사·`liveRunsUsed`·`settleLedgerFailed` usage 정산·view 에서 approval_ref 제외), `packages/db/src/writing.ts`(`liveFailureUsage`·실패 정산), `packages/db/src/variants.ts`(같음), `packages/providers/src/llm-anthropic.ts`(usage 선검증·오류 usage·`readUsage`·헤더 값 고정·`ANTHROPIC_API_VERSION`·content 검사·WeakMap 초기화·1인칭 문장 claim), `packages/providers/src/llm.ts`(`splitSentences` export), `apps/web/app/settings/page.tsx`(문구), `apps/web/lib/writing.ts`(폼 코드 `live_run_limit`), `.env.example`
+- 시험: `packages/providers/src/llm-anthropic.test.ts`(+FIX1 블록, 기존 시험 제목 1개에서 "상한값" 표현만 바꿈 — 단언 그대로), `packages/domain/src/budget.test.ts`(+FIX1 블록, describe 제목 "실제 비용 상한" → "보수적 추정" — 단언 그대로), `tests/integration/live-llm.test.ts`(+FIX1 블록, import 추가). 함수 이름 변경(`liveInputUpperBoundTokens` → `liveInputEstimateTokens`)에 따라 참조를 고침. 지우거나 약하게 바꾼 단언은 없음
+- migration 없음(스냅숏은 jsonb, 횟수는 기존 열로 센다)
+
+## 실행한 명령과 결과(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, node 프로세스 0개를 확인한 뒤)
+| 명령 | 결과 |
+|---|---|
+| 재현(수정 전): `vitest run --project unit packages/providers/src/llm-anthropic.test.ts` | 17 failed / 54 passed (FIX1 시험만 실패) |
+| 재현(수정 전): `vitest run --project unit packages/domain/src/budget.test.ts` | 4 failed / 39 passed |
+| 재현(수정 전): `vitest run --project integration tests/integration/live-llm.test.ts` | 11 failed / 16 passed |
+| 수정 후 단독: unit 4개 파일(llm-anthropic·budget·llm·no-anthropic-network) | 128 passed |
+| 수정 후 단독: integration live-llm + budget-claims | 58 passed |
+| `bash .handoffs/run-checks.sh FIX-LIVEL1` → `.handoffs/checks-FIX-LIVEL1.log` | LINT=0 · TYPECHECK=0 · BUILD=0 · **UNIT=1** · INTEG=0 · DRILL=0 · MIGRATE=0 · DRILL_RESTORE=0 |
+| ├ unit | Test Files 1 failed / 55 passed (56), Tests 1 failed / 1367 passed (1368). 실패 1건: `packages/domain/src/imports-fix3.test.ts > FIX-T18 round 3 … > 엔티티만` — **"Test timed out in 5000ms"(5345ms)**. 이 작업이 건드리지 않은 파일(가져오기 파서의 걸음 수 시험)이고, 전체 실행 부하 아래에서 시간 초과가 난 것으로 보인다 |
+| ├ 그 파일만 다시(`corepack pnpm exec vitest run --project unit packages/domain/src/imports-fix3.test.ts`, 다른 시험 없이) | 86 passed (7.9 s) |
+| ├ integration | Test Files 37 passed (37), Tests 766 passed (766) — 이번에는 워커 비정상 종료 없음(`--maxWorkers=2` 재실행 불필요) |
+| ├ drill:mock | 불변식 위반 0건(M3·T14·T15·T16 MOCK) |
+| └ drill:restore | PASS — 복원한 빈 환경이 원본 묶음과 일치 |
+
+## 남은 위험(FIX round 1 기준)
+1. 예약은 추정이다. 실제액이 예약보다 크면 월·1회 상한을 **최대 한 호출분** 넘을 수 있다(초과액을 기록하고 다음 예약을 거부). 한 호출의 최대 초과 크기는 입력 추정의 오차(가정 2개)에 달려 있고 증명되지 않았다. 2단계 실제 usage 로 교정해야 한다.
+2. 동시 요청: 예약 검사 때의 합계에는 진행 중 호출의 **예약액**만 들어간다. 동시에 여러 호출이 각자 예약을 넘으면 초과가 호출 수만큼 쌓일 수 있다(`LLM_LIVE_MAX_RUNS=1` 이면 1건으로 묶인다).
+3. HTTP 오류·시간 초과·연결 오류는 응답 usage 가 없어 D13(예약액 전액)이다. 실제로 과금됐는지는 모른다(401/400 은 아마 0).
+4. 1인칭 문장 판별은 모의와 같은 정규식 휴리스틱이다. 놓치는 표현(예: 주어를 생략한 "작년에 두바이로 이직했다")에는 claim 이 생기지 않는다. 오탐은 확인 대상만 늘린다.
+5. `LLM_LIVE_MAX_RUNS` 는 approval_ref 문자열 기준으로 센다. 승인 기록 값을 바꾸면 새로 센다(의도). 복원한 원장 행도 센다(보수적). 설정을 비우면 제한이 없다(운영자 책임).
+6. `anthropic-version` 은 고정 SDK 값을 상수로 둔다. SDK 를 올리면 함께 확인해야 한다(시험이 상수 = '2023-06-01' 을 단언).
+
+## Codex 에게 묻는 것(FIX round 1)
+1. 실패 정산 = max(예약액, 응답 usage 비용)과 "usage 모름 → 예약액"의 경계가 맞는가? 특히 provider 성공 뒤 서버 검증 실패(`unverifiable_citation` 등)에서 `usageOf` 를 쓰는 것, 그 usage 가 이상해 추정값이 들어가면 tokens 열에 추정값이 기록되는 것.
+2. `LLM_LIVE_MAX_RUNS` 횟수 검사가 동시성에서 안전한가? 원고 잠금(lockContentForWrite) → owner 잠금 → 횟수 → 예산 → 원장 삽입이 한 트랜잭션이다. PGlite 밖의 postgres 드라이버에서도 같은가? 세는 조건(스냅숏 mode='live' + approval_ref 같음, 상태·기간 무관)이 맞는가?
+3. 헤더: 허용 목록(`user-agent`·`x-stainless-*`) + 고정 4개(`accept`·`content-type`·`anthropic-version`·`x-api-key`)로 충분한가? `user-agent`·`x-stainless-*` 를 환경변수로 바꿀 수 있다는 점은 받아들일 만한가?
+4. 1인칭 문장 claim 추가가 FIX-T07 round 4 의 fail-closed 원칙(모델 출력을 고쳐 살리지 않음)과 충돌하는가? (출력은 고치지 않고 확인 대상만 더한다.)
+5. 상한 주장 정정(코드 주석·화면·`.env.example`·이 문서)이 충분한가, 남은 표현이 있는가?
+
+
+### FIX round 1 — 오케스트레이터 기록
+- FIX HEAD: d7da959b4da89311efa622f6101cac38d0967b48 (code only, D28). BASE 8a54ef3.
+- checks-FIX-LIVEL1: lint 0 · typecheck 0 · build 0 · unit 1회차 1 실패(이 변경과 무관한 `imports-fix3.test.ts` 성능 시험 5초 초과 5345ms) → 단위만 재실행 **56 파일 · 1368 시험 모두 통과(UNIT2=0)** · integration 0(37 파일 · 766 시험) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS).

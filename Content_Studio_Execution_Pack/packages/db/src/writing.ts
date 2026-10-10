@@ -33,6 +33,7 @@ import {
   estimateTokens,
   failureUsageOf,
   type TokenUsage,
+  type UsageSource,
   sanitizeLlmOutput,
   renderVariantText,
   type Channel,
@@ -321,6 +322,8 @@ export interface AssistLlm {
    * T07: 실제 사용량(토큰). 없으면 글자/3 추정(D13). LIVE-L1: live 는 generate 에 넘긴 **같은 입력 객체**로 부른다(그 호출의 응답 usage).
    */
   usageOf?(input: AssistLlmInput, output: LlmStructuredOutput): { tokensIn: number; tokensOut: number };
+  /** FIX2-LIVEL1: 공급자가 보고한 유효 usage 만(없으면 null — 추정값을 돌려주지 않는다). live 원장은 이것으로만 tokens 를 기록한다. */
+  confirmedUsageOf?(input: AssistLlmInput): { tokensIn: number; tokensOut: number } | null;
 }
 
 export interface AssistLlmInput {
@@ -479,15 +482,33 @@ function failureCode(e: unknown): string {
 }
 
 /**
- * FIX1-LIVEL1: 실패한 live 호출의 확인된 사용량(숫자만). provider 오류에 실린 usage(refusal·max_tokens·형식 오류 등),
- * 또는 provider 는 성공했지만 서버 검증(input_version·크기·인용 정제)에서 실패했으면 그 호출의 usageOf. 모의·모름 → null(D13 예약액).
+ * FIX1/FIX2-LIVEL1: 실패한 live 호출의 **공급자가 보고한** 사용량(숫자만). provider 오류에 실린 usage(refusal·max_tokens·형식 오류 등),
+ * 또는 provider 는 성공했지만 서버 검증(input_version·크기·인용 정제)에서 실패했으면 그 호출의 confirmedUsageOf.
+ * 추정값은 쓰지 않는다(없으면 null → D13 예약액, tokens NULL, usage_source none). 모의는 null.
  */
 export function liveFailureUsage(llm: AssistLlm, input: AssistLlmInput, generated: LlmStructuredOutput | null, e: unknown): TokenUsage | null {
   if (llm.mode !== 'live') return null;
   const fromError = failureUsageOf(e);
   if (fromError) return fromError;
-  if (generated && llm.usageOf) return failureUsageOf({ usage: llm.usageOf(input, generated) });
+  if (generated && llm.confirmedUsageOf) return failureUsageOf({ usage: llm.confirmedUsageOf(input) });
   return null;
+}
+
+/**
+ * FIX2-LIVEL1: 성공 호출의 확정 사용량과 출처. live = 공급자가 보고한 유효 usage(confirmedUsageOf)만 — 없으면 null(예약액, tokens NULL, none).
+ * 모의 = 기존 결정적 추정(usageOf, 없으면 글자/3) — usage_source estimate.
+ */
+export function successUsage(
+  llm: AssistLlm,
+  input: AssistLlmInput,
+  output: LlmStructuredOutput,
+  prompt: string,
+): { usage: TokenUsage | null; source: UsageSource } {
+  if (llm.mode === 'live') {
+    const usage = llm.confirmedUsageOf ? failureUsageOf({ usage: llm.confirmedUsageOf(input) }) : null;
+    return { usage, source: usage ? 'provider' : 'none' };
+  }
+  return { usage: llm.usageOf?.(input, output) ?? { tokensIn: estimateTokens(prompt), tokensOut: estimateTokens(output.proposed_text) }, source: 'estimate' };
 }
 
 /**
@@ -568,8 +589,8 @@ export async function runAssist(
     const proposal = inserted[0]!;
     await insertClaims(tx, ownerId, runId, proposal.id, clean.claims, prep.locators, finished);
     // T07: 실제 사용량으로 확정(모의는 결정적 추정). 예약을 넘으면 초과액을 기록한다(FIX-T07).
-    const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
-    const settled = await settleLedgerSucceeded(tx, ownerId, prep.ledger, prep.policy.pricing, usage, finished);
+    const { usage, source } = successUsage(llm, llmInput, output, prep.prompt);
+    const settled = await settleLedgerSucceeded(tx, ownerId, prep.ledger, prep.policy.pricing, usage, finished, source);
     const outputJson = {
       result_type: clean.result_type,
       input_version: clean.input_version,

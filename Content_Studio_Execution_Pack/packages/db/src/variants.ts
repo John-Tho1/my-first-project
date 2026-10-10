@@ -21,7 +21,6 @@ import {
   channelDraft,
   CHANNEL_LABEL,
   deriveBodyFields,
-  estimateTokens,
   sanitizeLlmOutput,
   isUuid,
   isVariantStale,
@@ -59,7 +58,7 @@ import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './
 import { invalidateApprovalsForVariant } from './approval-invalidation';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, claimConfirmations, contents, distributionItems, generationRuns, variantAssets, variants, variantVersions } from './schema';
-import { getCurrentBrandProfile, liveFailureUsage, promptBrand, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
+import { getCurrentBrandProfile, liveFailureUsage, promptBrand, successUsage, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
 
 export type VariantRow = typeof variants.$inferSelect;
 export type VariantVersionRow = typeof variantVersions.$inferSelect;
@@ -441,8 +440,8 @@ export async function runVariantAssist(
       .returning();
     const proposal = inserted[0]!;
     await insertClaims(tx, ownerId, prep.run.id, prep.current.id, clean.claims, new Map(), finished, proposal.id);
-    const usage = llm.usageOf?.(llmInput, output) ?? { tokensIn: estimateTokens(prep.prompt), tokensOut: estimateTokens(output.proposed_text) };
-    const ledger = await settleLedgerSucceeded(tx, ownerId, prep.ledger, policy.pricing, usage, finished);
+    const { usage, source } = successUsage(llm, llmInput, output, prep.prompt);
+    const ledger = await settleLedgerSucceeded(tx, ownerId, prep.ledger, policy.pricing, usage, finished, source);
     const updated = await tx
       .update(generationRuns)
       .set({

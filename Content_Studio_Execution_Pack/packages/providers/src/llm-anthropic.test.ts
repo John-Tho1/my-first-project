@@ -499,3 +499,104 @@ describe('FIX1 놓친 케이스', () => {
     expect(r.claims).toEqual(claims);
   });
 });
+
+// ---- FIX round 2(Codex review-FIX-LIVEL1) ----
+
+const claimsOut = async (proposed_text: string, claims: unknown[] = []) => {
+  const { fetch } = fakeFetch(jsonResponse(200, message({}, JSON.stringify(modelOut({ proposed_text, claims })))));
+  return (await provider(fetch).generate(input())).claims;
+};
+const exp = (text: string) => ({ text, kind: 'experience', source_refs: [], needs_user_confirmation: true });
+
+describe('FIX2 P1 :287 — 경험 claim 은 문장 전체를 덮을 때만 중복, 문장 분리는 공백 없는 종결도', () => {
+  it('짧은 부분 claim 은 더 긴 본문 문장을 덮지 못한다 → 본문 문장 claim 추가', async () => {
+    const short = exp('제가 협상했습니다');
+    expect(await claimsOut('제가 협상했습니다 그리고 계약을 따냈습니다.', [short])).toEqual([short, exp('제가 협상했습니다 그리고 계약을 따냈습니다.')]);
+  });
+
+  it('공백 없이 이어진 두 경험 → 두 문장으로 나뉘고, 덮이지 않은 쪽만 추가', async () => {
+    const first = exp('제가 직접 협상했습니다.');
+    expect(await claimsOut('제가 직접 협상했습니다.그리고 제가 매출을 두 배로 늘렸습니다.', [first])).toEqual([first, exp('그리고 제가 매출을 두 배로 늘렸습니다.')]);
+  });
+
+  it('여러 경험 → 각각 claim, 1인칭 아닌 문장은 제외, 소수점(3.5)은 문장 경계가 아님', async () => {
+    expect(await claimsOut('매출이 3.5배 늘었다.제가 팀을 이끌었습니다! 시장은 크다. 저는 두바이에 3년 있었습니다?우리는 계약을 지켰다。')).toEqual([
+      exp('제가 팀을 이끌었습니다!'),
+      exp('저는 두바이에 3년 있었습니다?'),
+      exp('우리는 계약을 지켰다。'),
+    ]);
+  });
+
+  it('claim 이 문장 전체를 포함하면(앞뒤 공백·NFKC 무시) 추가하지 않는다', async () => {
+    const whole = exp('  제가 직접 협상했습니다. ');
+    expect(await claimsOut('제가 직접 협상했습니다.', [whole])).toEqual([whole]);
+  });
+});
+
+describe('FIX2 P2 :489 — 확인된 usage 와 추정 구분(confirmedUsageOf)', () => {
+  it('유효 usage → confirmedUsageOf = 그 값', async () => {
+    const { fetch } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: 11, output_tokens: 22 } })));
+    const p = provider(fetch);
+    const inp = input();
+    await p.generate(inp);
+    expect(p.confirmedUsageOf(inp)).toEqual({ tokensIn: 11, tokensOut: 22 });
+  });
+
+  it.each([
+    ['usage 없음', undefined],
+    ['usage 이상', { input_tokens: 'x', output_tokens: 1 }],
+    ['DB integer 열 범위 초과(2^31)', { input_tokens: 2_147_483_648, output_tokens: 1 }],
+    ['출력 integer 범위 초과', { input_tokens: 1, output_tokens: 2_147_483_648 }],
+    ['캐시 합이 integer 범위 초과', { input_tokens: 2_000_000_000, output_tokens: 1, cache_read_input_tokens: 200_000_000 }],
+  ])('%s → confirmedUsageOf = null(usageOf 는 추정값), 실패면 e.usage = null', async (_l, usage) => {
+    const ok = fakeFetch(jsonResponse(200, message({ usage })));
+    const p = provider(ok.fetch);
+    const inp = input();
+    await p.generate(inp);
+    expect(p.confirmedUsageOf(inp)).toBeNull();
+    expect(p.usageOf(inp, llmStructuredOutputSchema.parse({ result_type: 'draft', input_version: 'v', proposed_text: '', proposed_tags: [], claims: [], followup_questions: [], warnings: [] }))).toEqual({
+      tokensIn: liveInputEstimateTokens(PROMPT),
+      tokensOut: 4096,
+    });
+    const bad = fakeFetch(jsonResponse(200, message({ stop_reason: 'max_tokens', usage })));
+    expect((await rejectionOf(provider(bad.fetch).generate(input()))).usage).toBeNull();
+  });
+
+  it('응답을 못 받은 실패 뒤 confirmedUsageOf = null', async () => {
+    const { fetch } = fakeFetch(jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }));
+    const p = provider(fetch);
+    const inp = input();
+    await rejectionOf(p.generate(inp));
+    expect(p.confirmedUsageOf(inp)).toBeNull();
+  });
+});
+
+describe('FIX2 놓친 (e) — 같은 입력 객체를 동시에 쓰는 호출은 거부(제품 경로 없음)', () => {
+  it('진행 중인 입력으로 다시 generate → llm_request_invalid, fetch 1번만', async () => {
+    let release: (r: Response) => void = () => undefined;
+    let called: () => void = () => undefined;
+    const fetched = new Promise<void>((r) => (called = r));
+    const calls: string[] = [];
+    const slow = (async (u: Parameters<typeof fetch>[0]) => {
+      calls.push(String(u));
+      const res = new Promise<Response>((r) => (release = r));
+      called();
+      return res;
+    }) as typeof fetch;
+    const p = provider(slow);
+    const inp = input();
+    const first = p.generate(inp);
+    const second = await rejectionOf(p.generate(inp));
+    expect(second.code).toBe('llm_request_invalid');
+    await fetched;
+    release(new Response(JSON.stringify(message()), { status: 200, headers: { 'content-type': 'application/json' } }));
+    await first;
+    expect(calls).toHaveLength(1);
+    // 끝난 뒤에는 같은 객체로 다시 부를 수 있다(순차 재사용)
+    const again = fakeFetch(jsonResponse(200, message()), jsonResponse(200, message()));
+    const p2 = provider(again.fetch);
+    await p2.generate(inp);
+    await p2.generate(inp);
+    expect(again.calls).toHaveLength(2);
+  });
+});

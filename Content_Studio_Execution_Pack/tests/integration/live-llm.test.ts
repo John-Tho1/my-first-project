@@ -2,19 +2,29 @@
  * LIVE-L1(D34 1단계): 실제 Claude 어댑터(ClaudeLlmProvider)를 db 층·route 로 끝까지 — 가짜 fetch 가 기록된 Messages API 응답을 돌려준다.
  * 네트워크 0(setupFiles 가드가 api.anthropic.com 을 막는다), 과금 0. 시험 키는 가짜 sentinel 이며 응답·DB·감사에 나오지 않아야 한다.
  */
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { count, eq } from 'drizzle-orm';
 import {
   adoptProposal,
   closeDb,
+  commitRestore,
+  confirmClaims,
   createContent,
+  createRestorePreview,
+  createTestDb,
   ensureOwner,
+  exportOwner,
   getDb,
   listUnconfirmedExperienceClaims,
+  liveRunsUsed,
   runAssist,
   runVariantAssist,
   schema,
   seed,
+  updateContentMeta,
   usageLedgerView,
   type Db,
 } from '@cs/db';
@@ -30,7 +40,7 @@ import {
   toMicro,
   utf8ByteLength,
 } from '@cs/domain';
-import { ClaudeLlmProvider, MockLlmProvider } from '@cs/providers';
+import { ClaudeLlmProvider, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
 import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/route';
 import { cookieHeader, jsonPost, login } from './helpers';
@@ -523,5 +533,191 @@ describe('FIX1 놓친 케이스(d) — LLM_LIVE_MAX_RUNS(D34 2단계 범위)', (
     await runAssist(db, owner, c.content.id, draft(), claude(fetch));
     await runAssist(db, owner, c.content.id, draft(), claude(fetch));
     expect(calls).toHaveLength(2);
+  });
+});
+
+// ---- FIX round 2(Codex review-FIX-LIVEL1) ----
+
+const snapshotOf = (l: { pricingSnapshot: Record<string, unknown> }) => l.pricingSnapshot;
+
+describe('FIX2 P1 :287 — 짧은 경험 claim 을 확인해도 본문의 다른 경험은 게이트에 남는다', () => {
+  it('공백 없이 이어진 두 경험 + 첫 문장만 claim → 둘째 문장 claim 추가 → 첫째만 확인해도 ready 전환은 409', async () => {
+    const owner = await freshOwner('live-l1-fix2-gate@example.local');
+    const c = await createContent(db, owner, { title: '부분 claim', body: '본문.' });
+    const out = {
+      ...modelOut,
+      proposed_text: '제가 직접 협상했습니다.그리고 제가 매출을 두 배로 늘렸습니다.',
+      claims: [{ text: '제가 직접 협상했습니다.', kind: 'experience', source_refs: [], needs_user_confirmation: true }],
+    };
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.claims.map((x) => x.text)).toEqual(['제가 직접 협상했습니다.', '그리고 제가 매출을 두 배로 늘렸습니다.']);
+    await adoptProposal(db, owner, c.content.id, r.run.id, 1);
+    const after = await confirmClaims(db, owner, c.content.id, r.run.id, [0]);
+    expect(after.unconfirmed.map((u) => u.claim_index)).toEqual([1]);
+    const rev = async () => (await db.select().from(schema.contents).where(eq(schema.contents.id, c.content.id)))[0]!.revision;
+    await updateContentMeta(db, owner, c.content.id, { lifecycle: 'review' }, await rev());
+    const e = await updateContentMeta(db, owner, c.content.id, { lifecycle: 'ready' }, await rev()).then(
+      () => null,
+      (x: AppError) => x,
+    );
+    expect(e?.code).toBe('unconfirmed_experience_claims');
+  });
+});
+
+describe('FIX2 P2 :489 — 원장 usage 출처(usage_source): provider | estimate | none', () => {
+  it('성공 + 유효 usage → provider, tokens = 응답 값', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-ok@example.local');
+    const c = await createContent(db, owner, { title: '출처 provider', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message()));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.ledger).toMatchObject({ tokensIn: 1500, tokensOut: 800 });
+    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'provider' });
+  });
+
+  it('성공 + usage 이상 → run 은 성공, 원장은 예약액(D13)·tokens NULL·usage_source none', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-bad@example.local');
+    const c = await createContent(db, owner, { title: '출처 none', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ usage: { input_tokens: 'x', output_tokens: 1 } })));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.run.status).toBe('succeeded');
+    expect(r.ledger).toMatchObject({ tokensIn: null, tokensOut: null, actualAmount: r.ledger.reservedAmount, overBudget: false, failed: false });
+    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'none' });
+  });
+
+  it('usage 없음 + 서버 인용 검증 실패 → 예약액·tokens NULL·usage_source none(추정을 실제처럼 쓰지 않음)', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-cite@example.local');
+    const c = await createContent(db, owner, { title: '출처 인용', body: '본문.' });
+    const text = JSON.stringify({ ...modelOut, proposed_text: '자세한 내용은 https://fake.example/x 참고.' });
+    const { fetch } = fakeFetch(json(200, message({ usage: undefined }, text)));
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)))).toBe('llm_failed');
+    const { run, ledger } = await ledgerOf(c.content.id);
+    expect(run.error).toBe('unverifiable_citation');
+    expect(ledger).toMatchObject({ failed: true, tokensIn: null, tokensOut: null, actualAmount: ledger.reservedAmount });
+    expect(snapshotOf(ledger)).toMatchObject({ usage_source: 'none' });
+  });
+
+  it('응답 없는 실패(HTTP 529) → usage_source none, tokens NULL', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-529@example.local');
+    const c = await createContent(db, owner, { title: '출처 529', body: '본문.' });
+    const { fetch } = fakeFetch(json(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }));
+    await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({ tokensIn: null, tokensOut: null });
+    expect(snapshotOf(ledger)).toMatchObject({ usage_source: 'none' });
+  });
+
+  it('실패 + 응답 usage(refusal) → usage_source provider', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-refusal@example.local');
+    const c = await createContent(db, owner, { title: '출처 거절', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ stop_reason: 'refusal', usage: { input_tokens: 5, output_tokens: 6 } })));
+    await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)));
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger).toMatchObject({ tokensIn: 5, tokensOut: 6 });
+    expect(snapshotOf(ledger)).toMatchObject({ usage_source: 'provider' });
+  });
+
+  it('모의 성공 → usage_source estimate(글자/3 결정적 추정)', async () => {
+    const owner = await freshOwner('live-l1-fix2-src-mock@example.local');
+    const c = await createContent(db, owner, { title: '출처 모의', body: '모의 본문.' });
+    const r = await runAssist(db, owner, c.content.id, { ...draft(), budget: undefined }, new MockLlmProvider());
+    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'estimate' });
+  });
+});
+
+describe('FIX2 놓친 케이스 — 초과·동시·범위·복원', () => {
+  it('(a) 실제액 > 예약액·1회 상한이어도 월 잔여가 충분하면 다음 요청은 허용(1회 상한은 예약 추정에만 적용)', async () => {
+    const owner = await freshOwner('live-l1-fix2-next-ok@example.local');
+    const c = await createContent(db, owner, { title: '다음 허용', body: '본문.' });
+    const p = policy({ LLM_BUDGET_PER_RUN_MAX: '0.5', LLM_BUDGET_MONTHLY_LIMIT: '10' });
+    const { fetch, calls } = fakeFetch(json(200, message({ usage: { input_tokens: 200_000, output_tokens: 4096 } })), json(200, message()));
+    const first = await runAssist(db, owner, c.content.id, draft(p), claude(fetch));
+    expect(toMicro(first.ledger.actualAmount!)).toBeGreaterThan(p.perRunMaxMicro!);
+    expect(first.ledger.overBudget).toBe(true);
+    const next = await runAssist(db, owner, c.content.id, draft(p), claude(fetch));
+    expect(next.run.status).toBe('succeeded');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('(b) 횟수 제한 없는 동시 호출 2건이 각각 예약을 넘으면 초과액이 합쳐져, 월 상한을 한 호출의 초과액보다 더 넘는다(문서화한 동작)', async () => {
+    const owner = await freshOwner('live-l1-fix2-conc-over@example.local');
+    const c1 = await createContent(db, owner, { title: '동시 초과 1', body: '본문 1.' });
+    const c2 = await createContent(db, owner, { title: '동시 초과 2', body: '본문 2.' });
+    const p = policy({ LLM_BUDGET_MONTHLY_LIMIT: '0.3' });
+    const big = { usage: { input_tokens: 200_000, output_tokens: 4096 } };
+    // 두 호출이 모두 예약을 마치고 공급자 호출 중일 때까지 응답을 붙잡는다(실제 동시 진행)
+    let arrived = 0;
+    let open: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (open = r));
+    const calls: string[] = [];
+    const gated = (async (u: Parameters<typeof fetch>[0]) => {
+      calls.push(String(u));
+      if (++arrived === 2) open();
+      await gate;
+      return json(200, message(big))();
+    }) as typeof fetch;
+    const rs = await Promise.all([runAssist(db, owner, c1.content.id, draft(p), claude(gated)), runAssist(db, owner, c2.content.id, draft(p), claude(gated))]);
+    expect(calls).toHaveLength(2);
+    expect(rs.every((r) => r.ledger.overBudget)).toBe(true);
+    const total = rs.reduce((s, r) => s + toMicro(r.ledger.actualAmount!), 0n);
+    const overages = rs.map((r) => toMicro(r.ledger.overageAmount));
+    expect(overages.every((o) => o > 0n)).toBe(true);
+    // 월 상한을 넘은 양 > 어느 한 호출의 초과액 — "한 호출분" 경계는 LLM_LIVE_MAX_RUNS=1 일 때만 성립
+    expect(total - p.monthlyLimitMicro!).toBeGreaterThan(overages.reduce((a, b) => (a > b ? a : b)));
+    // 그 뒤 요청은 월 합계(초과액 포함)가 상한을 넘으므로 거부된다
+    expect(await failCode(runAssist(db, owner, c1.content.id, draft(p), claude(gated)))).toBe('budget_exceeded');
+  });
+
+  it('(c) JS 안전 정수지만 integer 열 범위 밖 usage → 확인된 usage 아님(예약액·tokens NULL·none), DB 오류 없음', async () => {
+    const owner = await freshOwner('live-l1-fix2-int4@example.local');
+    const c = await createContent(db, owner, { title: '열 범위', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ usage: { input_tokens: 2_147_483_648, output_tokens: 10 } })));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.ledger).toMatchObject({ tokensIn: null, tokensOut: null, actualAmount: r.ledger.reservedAmount });
+    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'none' });
+  });
+
+  it('(c) 금액이 numeric(18,6) 를 넘게 되는 usage(성공·실패) → 확인된 usage 로 쓰지 않음, DB 오류 없음', async () => {
+    const owner = await freshOwner('live-l1-fix2-amount@example.local');
+    const c = await createContent(db, owner, { title: '금액 범위', body: '본문.' });
+    const huge = policy({ LLM_PRICE_INPUT_PER_1K: '999999999', LLM_BUDGET_MONTHLY_LIMIT: '', LLM_BUDGET_PER_RUN_MAX: '' });
+    const usage = { input_tokens: 2_000_000_000, output_tokens: 1 };
+    expect(costMicro(huge.pricing, 2_000_000_000, 1)).toBeGreaterThan(999_999_999_999_999_999n);
+    const { fetch } = fakeFetch(json(200, message({ usage })), json(200, message({ stop_reason: 'refusal', usage })));
+    const ok = await runAssist(db, owner, c.content.id, draft(huge), claude(fetch));
+    expect(ok.ledger).toMatchObject({ state: 'settled', tokensIn: null, actualAmount: ok.ledger.reservedAmount });
+    expect(snapshotOf(ok.ledger)).toMatchObject({ usage_source: 'none' });
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(huge), claude(fetch)))).toBe('llm_failed');
+    const rows = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, owner));
+    expect(rows.map((l) => [l.state, l.tokensIn, (l.pricingSnapshot as { usage_source?: string }).usage_source])).toEqual([
+      ['settled', null, 'none'],
+      ['settled', null, 'none'],
+    ]);
+  });
+
+  it('(d) approval_ref 가 있는 원장을 내보내고 빈 DB 에 복원해도 횟수(LLM_LIVE_MAX_RUNS)가 이어진다', async () => {
+    const owner = await freshOwner('live-l1-fix2-restore@example.local');
+    const c = await createContent(db, owner, { title: '복원 횟수', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message()));
+    await runAssist(db, owner, c.content.id, draft(policy({ LLM_LIVE_MAX_RUNS: '1' })), claude(fetch));
+    expect(await liveRunsUsed(db, owner, LIVE.LLM_LIVE_APPROVAL_REF)).toBe(1);
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-fix2-'));
+    try {
+      const storage = new LocalStorageAdapter(path.join(tmp, 'assets'));
+      const exported = await exportOwner(db, storage, owner, { outDir: path.join(tmp, 'exports') });
+      const zip = new Uint8Array(readFileSync(exported.zipPath));
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-fix2@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores');
+        const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+        await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-b')), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+        expect(await liveRunsUsed(h.db, target, LIVE.LLM_LIVE_APPROVAL_REF)).toBe(1);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

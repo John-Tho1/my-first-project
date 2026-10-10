@@ -90,8 +90,9 @@ export const LIVE_LLM_FIXED_INPUT_BYTES = utf8ByteLength(LIVE_LLM_SYSTEM_PROMPT)
  * live 입력 토큰 **보수적 추정**(FIX1-LIVEL1 — 증명된 상한이 아니다).
  * = 정확히 보낼 프롬프트의 바이트 + 시스템 프롬프트·스키마 바이트 + 틀 여유(LIVE_LLM_FRAMING_OVERHEAD_TOKENS).
  * "토큰 ≥ 1바이트"·"서버가 더하는 입력 ≤ 여유"는 확인되지 않은 가정이고, 스키마는 서버 안에서 다른 표현으로 바뀔 수 있다.
- * 그래서 실제 사용량은 성공·실패 모두 응답 usage 로 기록하고, 실제액 > 예약액이면 초과액을 남겨 **다음** 예약의 1회·월 검사에 포함한다
- * — 상한은 최대 한 호출분 넘을 수 있다. 한국어(글자당 3바이트)는 대개 실제보다 크게 잡힌다.
+ * 그래서 공급자가 usage 를 보고하면(성공·실패 모두) 그 값을 기록하고, 실제액 > 예약액이면 초과액을 남겨 월 합계에 넣는다. 다음 요청은
+ * 월 합계(초과액 포함)가 월 상한을 넘게 될 때만 거부된다(1회 상한은 예약 추정에만 적용). 동시에 진행 중인 호출들의 초과액은 합쳐질 수 있고,
+ * 한 호출분으로 묶이는 것은 LLM_LIVE_MAX_RUNS=1 일 때뿐이다(budget.ts 머리 주석 (1)~(4)). 한국어(글자당 3바이트)는 대개 실제보다 크게 잡힌다.
  */
 export function liveInputEstimateTokens(prompt: string): number {
   return utf8ByteLength(prompt) + LIVE_LLM_FIXED_INPUT_BYTES + LIVE_LLM_FRAMING_OVERHEAD_TOKENS;

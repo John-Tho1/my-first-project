@@ -6,8 +6,9 @@
  * - `maxRetries: 0`: SDK 자동 재시도는 과금을 예약 밖으로 늘린다(예약 1건 = 요청 1건). 시간 초과도 재시도하지 않는다.
  * - `max_tokens` = input.maxOutputTokens(필수 — 예약의 출력 몫). 없거나 범위 밖이면 **보내기 전에** 거부한다.
  * - 입력은 예약이 센 것과 같은 문자열만: 시스템 프롬프트(LIVE_LLM_SYSTEM_PROMPT) + input.prompt + 출력 스키마(LIVE_LLM_OUTPUT_JSON_SCHEMA).
- *   FIX1-LIVEL1: 예약은 보수적 추정이지 증명된 비용 상한이 아니다 — 응답 usage 를 성공·실패 모두 검증해 돌려주고(실패는 오류의 usage),
- *   db 층이 실제액(초과액 포함)을 기록해 다음 예약 검사에 넣는다.
+ *   FIX1/FIX2-LIVEL1: 예약은 보수적 추정이지 증명된 비용 상한이 아니다 — 응답 usage 를 검증해 유효하면 돌려주고(성공은 confirmedUsageOf,
+ *   실패는 오류의 usage), 없거나 이상하면 null(추정값을 실제처럼 넘기지 않음).
+ *   db 층이 확인된 실제액(초과액 포함)을 기록해 월 합계에 넣는다(초과 동작은 @cs/domain budget.ts 머리 주석 (1)~(4)).
  * - thinking·temperature·tools·assistant prefill·server-side fallbacks 를 보내지 않는다(Opus 5.5 는 thinking 을 끌 수 없고 effort 로만 조절 —
  *   `effort: 'low'`. fallbacks 는 대체 모델 단가가 예약 밖이라 D34 가 끔).
  * - apiKey·baseURL 을 명시하고 authToken 은 null — ANTHROPIC_BASE_URL·ANTHROPIC_AUTH_TOKEN·프로필이 키를 다른 곳으로 보내거나 다른 자격 증명을
@@ -29,12 +30,13 @@ import {
   liveInputEstimateTokens,
   liveLlmReadiness,
   LiveProviderNotConfiguredError,
+  MAX_TOKEN_COLUMN,
   liveModelOutputSchema,
   llmStructuredOutputSchema,
   type AppConfig,
   type LlmStructuredOutput,
 } from '@cs/domain';
-import { hasFirstPersonExpression, splitSentences, type LlmGenerateInput, type LlmProvider, type LlmUsage } from './llm';
+import { hasFirstPersonExpression, type LlmGenerateInput, type LlmProvider, type LlmUsage } from './llm';
 
 export const ANTHROPIC_MESSAGES_URL = `${ANTHROPIC_API_ORIGIN}/v1/messages`;
 /** 요청 1건의 시간 제한(ms). 넘으면 재시도 없이 실패(llm_timeout) — 과금됐을 수 있으므로 예약액 전액 확정(D13). */
@@ -154,7 +156,8 @@ const ALLOWED_HEADER = /^(user-agent|x-stainless-[a-z0-9-]+)$/i;
 /** 고정 SDK(0.128.0)가 보내는 API 버전(node_modules/@anthropic-ai/sdk/client.js buildHeaders 에서 확인). SDK 를 올리면 함께 확인한다. */
 export const ANTHROPIC_API_VERSION = '2023-06-01';
 
-const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+/** FIX2-LIVEL1: 0 ~ MAX_TOKEN_COLUMN(원장 integer 열) 안전 정수만 — 그 밖은 저장할 수 없으므로 확인된 usage 가 아니다. */
+const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKEN_COLUMN;
 
 export class ClaudeLlmProvider implements LlmProvider {
   readonly name = ANTHROPIC_PROVIDER;
@@ -164,8 +167,16 @@ export class ClaudeLlmProvider implements LlmProvider {
   readonly #fetch: typeof fetch | undefined;
   readonly #timeoutMs: number;
   #client: Anthropic | null = null;
-  /** 호출 입력 객체 → 그 응답의 실제 usage(db 층은 같은 입력 객체로 usageOf 를 부른다 — 출력은 zod 재파싱으로 새 객체라 키로 못 쓴다). */
-  readonly #usage = new WeakMap<LlmGenerateInput, LlmUsage>();
+  /**
+   * 호출 입력 객체 → 그 응답에서 **공급자가 보고한 유효 usage**(없으면 null). db 층은 같은 입력 객체로 조회한다 — 출력은 zod 재파싱으로 새 객체라 키로 못 쓴다.
+   * FIX2-LIVEL1: 추정값은 여기 넣지 않는다(confirmedUsageOf 가 null 을 돌려줘야 원장이 추정을 실제처럼 기록하지 않는다).
+   */
+  readonly #confirmed = new WeakMap<LlmGenerateInput, LlmUsage | null>();
+  /**
+   * FIX2-LIVEL1(놓친 e): 진행 중인 입력 객체. 같은 객체로 동시에 두 번 부르면 usage 대응이 섞일 수 있어 두 번째를 보내기 전에 거부한다.
+   * 제품 경로(writing.ts·variants.ts)는 run 마다 새 입력 객체를 만들므로 이 거부에 걸리지 않는다.
+   */
+  readonly #inflight = new WeakSet<LlmGenerateInput>();
 
   constructor(opts: ClaudeLlmOptions) {
     const key = typeof opts.apiKey === 'string' ? opts.apiKey.trim() : '';
@@ -214,8 +225,18 @@ export class ClaudeLlmProvider implements LlmProvider {
   }
 
   async generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
-    // FIX1-LIVEL1: 같은 입력 객체로 다시 부르면 지난 성공의 usage 가 남지 않게 먼저 지운다(실패면 usageOf 는 보수적 추정).
-    this.#usage.delete(input);
+    if (this.#inflight.has(input)) throw new LiveLlmError('llm_request_invalid');
+    this.#inflight.add(input);
+    try {
+      return await this.#generate(input);
+    } finally {
+      this.#inflight.delete(input);
+    }
+  }
+
+  async #generate(input: LlmGenerateInput): Promise<LlmStructuredOutput> {
+    // FIX1-LIVEL1: 같은 입력 객체로 다시 부르면 지난 성공의 usage 가 남지 않게 먼저 지운다.
+    this.#confirmed.delete(input);
     const maxTokens = input.maxOutputTokens;
     // 예약의 출력 몫 = max_tokens — 없거나 범위 밖이면 보내기 전에 거부.
     if (typeof maxTokens !== 'number' || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > LIVE_LLM_MAX_MAX_OUTPUT_TOKENS) {
@@ -246,8 +267,8 @@ export class ClaudeLlmProvider implements LlmProvider {
     if (stop !== 'end_turn') throw new LiveLlmError('llm_unexpected_stop', { requestId, usage });
 
     const output = this.#parseOutput(message, input, requestId, usage);
-    // usage 가 없거나 이상하면 보수적 추정(실제보다 작게 기록하지 않으려는 것 — 증명된 상한은 아님)
-    this.#usage.set(input, usage ?? this.#estimate(input));
+    // FIX2-LIVEL1: 확인된 usage 만 저장(없으면 null). 추정이 필요한 곳은 usageOf(추정 대체)를 쓴다.
+    this.#confirmed.set(input, usage);
     return output;
   }
 
@@ -281,13 +302,14 @@ export class ClaudeLlmProvider implements LlmProvider {
     );
     // FIX1-LIVEL1(놓친 케이스 c): 제안 본문의 1인칭 문장이 experience claim 으로 덮이지 않으면 서버가 experience claim(확인 필요, 출처 없음)을
     // 더한다 — 채택 뒤 미확인 경험 게이트(claims-gate)가 모의와 같이 막도록. 출처·증거 등급을 만들지 않는다(보수적 방향만).
-    const experienceTexts = claims.filter((c) => c.kind === 'experience').map((c) => c.text.trim());
-    for (const sentence of splitSentences(m.proposed_text)) {
+    // FIX2-LIVEL1(P1 :287): 기존 experience claim 이 그 문장 **전체**를 (정규화 후) 포함할 때만 덮였다고 본다 — 짧은 부분 claim 은 덮지 못한다.
+    const experienceTexts = claims.filter((c) => c.kind === 'experience').map((c) => normalizeForCoverage(c.text));
+    for (const sentence of splitSentencesStrict(m.proposed_text)) {
       if (!hasFirstPersonExpression(sentence)) continue;
-      const covered = experienceTexts.some((t) => t !== '' && (t.includes(sentence) || sentence.includes(t)));
-      if (covered) continue;
+      const s = normalizeForCoverage(sentence);
+      if (s === '' || experienceTexts.some((t) => t.includes(s))) continue;
       claims.push({ text: sentence, kind: 'experience', source_refs: [], needs_user_confirmation: true });
-      experienceTexts.push(sentence);
+      experienceTexts.push(s);
     }
     // result_type·input_version 은 서버가 입력에서 정한다(모델 출력을 믿지 않음).
     const assembled = {
@@ -309,17 +331,57 @@ export class ClaudeLlmProvider implements LlmProvider {
     return { tokensIn: liveInputEstimateTokens(input.prompt ?? ''), tokensOut: input.maxOutputTokens ?? LIVE_LLM_MAX_MAX_OUTPUT_TOKENS };
   }
 
-  /** 그 호출의 실제 usage. 없으면(이 입력 객체의 성공 응답이 없음) 보수적 추정. */
+  /** 그 호출에서 공급자가 보고한 유효 usage. 없거나(응답 없음·usage 없음·이상값·열 범위 밖) 모르는 입력이면 null — 추정값을 돌려주지 않는다. */
+  confirmedUsageOf(input: LlmGenerateInput): LlmUsage | null {
+    return this.#confirmed.get(input) ?? null;
+  }
+
+  /** LlmProvider 호환: 확인된 usage, 없으면 보수적 추정(원장 기록에는 쓰지 않는다 — db 층은 confirmedUsageOf 를 쓴다). */
   usageOf(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage {
     void output;
-    return this.#usage.get(input) ?? this.#estimate(input);
+    return this.confirmedUsageOf(input) ?? this.#estimate(input);
   }
+}
+
+const normalizeForCoverage = (s: string): string => s.normalize('NFKC').replace(/\s+/g, ' ').trim();
+
+const TERMINATORS = new Set(['.', '!', '?', '。', '！', '？', '…']);
+const CLOSERS = new Set(['"', "'", '”', '’', ')', ']', '」', '』', '）']);
+
+/**
+ * FIX2-LIVEL1: 1인칭 확인 claim 용 문장 분리(모의 provider 의 분리는 그대로 둔다).
+ * 규칙: 종결 부호(. ! ? 。 ！ ？ …)가 하나 이상 이어진 뒤 닫는 따옴표·괄호를 붙이고, **그 다음 글자가 끝·공백·영문/숫자가 아닌 글자**(한글 등)면
+ * 거기서 끊는다 — "했습니다.그리고" 처럼 공백 없이 이어진 문장도 나뉜다. 다음 글자가 영문·숫자면 끊지 않는다: 소수(3.5)·도메인/URL(example.com)·
+ * 약어(e.g.) 안쪽은 한 문장으로 남는다(약어 뒤 공백이 오면 끊길 수 있음 — 확인 대상이 늘 뿐인 보수적 방향). 줄바꿈도 문장 경계.
+ */
+export function splitSentencesStrict(text: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  const chars = Array.from(text);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]!;
+    if (ch === '\n' || ch === '\r') {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+      continue;
+    }
+    cur += ch;
+    if (!TERMINATORS.has(ch)) continue;
+    while (i + 1 < chars.length && (TERMINATORS.has(chars[i + 1]!) || CLOSERS.has(chars[i + 1]!))) cur += chars[++i]!;
+    const next = chars[i + 1];
+    if (next === undefined || /\s/.test(next) || !/[A-Za-z0-9]/.test(next)) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+    }
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
 }
 
 /**
  * 응답 usage 검증(FIX1-LIVEL1). 입력 = input + 캐시 생성·읽기 입력, 출력 = output(thinking 포함).
- * input·output 은 안전한 음이 아닌 정수여야 하고, 캐시 필드는 없음·null 이면 0, **있는데 이상하면**(문자열·음수·소수·안전 정수 밖) 전체를 믿지 않는다.
- * 합계도 안전 정수여야 한다. 믿을 수 없으면 null.
+ * input·output 은 0 ~ MAX_TOKEN_COLUMN(원장 integer 열) 정수여야 하고, 캐시 필드는 없음·null 이면 0, **있는데 이상하면**(문자열·음수·소수·범위 밖) 전체를 믿지 않는다.
+ * 합계도 그 범위여야 한다(FIX2-LIVEL1). 믿을 수 없으면 null.
  */
 export function readUsage(raw: unknown): LlmUsage | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -330,7 +392,7 @@ export function readUsage(raw: unknown): LlmUsage | null {
   const cacheRead = cache(u.cache_read_input_tokens);
   if (cacheCreate === null || cacheRead === null) return null;
   const tokensIn = u.input_tokens + cacheCreate + cacheRead;
-  if (!Number.isSafeInteger(tokensIn)) return null;
+  if (!Number.isSafeInteger(tokensIn) || tokensIn > MAX_TOKEN_COLUMN) return null;
   return { tokensIn, tokensOut: u.output_tokens };
 }
 

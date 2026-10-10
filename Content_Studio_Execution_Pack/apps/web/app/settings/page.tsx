@@ -100,7 +100,7 @@ export default async function SettingsPage({
         )}
         <p className="notice" role="note">
           {live.ready
-            ? `실제 AI(Claude) 준비됨 — 작성 보조 요청마다 실제 호출·과금이 일어납니다(1회 출력 상한 ${policy.liveMaxOutputTokens ?? '-'} 토큰${policy.liveMaxRuns !== undefined ? `, 승인당 호출 ${policy.liveMaxRuns}회` : ''}). 예약액은 추정이며 실제 사용량이 기록됩니다 — 초과하면 다음 요청부터 거부합니다.`
+            ? `실제 AI(Claude) 준비됨 — 작성 보조 요청마다 실제 호출·과금이 일어납니다(1회 출력 상한 ${policy.liveMaxOutputTokens ?? '-'} 토큰${policy.liveMaxRuns !== undefined ? `, 승인당 호출 ${policy.liveMaxRuns}회` : ''}). 예약액은 추정입니다. 공급자가 사용량을 보고하면 그 값으로 확정하고(예약보다 크면 초과액 기록), 보고가 없으면 예약액으로 확정합니다. 이번 달 합계(초과액 포함)가 월 상한을 넘게 되는 요청부터 거부하며, 동시에 진행 중인 요청들의 초과액은 합쳐질 수 있습니다(LLM_LIVE_MAX_RUNS=1 이면 한 건).`
             : `live 준비 안 됨: ${live.missing.join(', ')}`}
         </p>
         <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D13·D34). 설정 값·키는 이 화면에 보이지 않습니다.</p>

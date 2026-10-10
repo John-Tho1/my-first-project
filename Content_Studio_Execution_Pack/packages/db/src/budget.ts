@@ -14,6 +14,7 @@ import {
   failedSettlement,
   LiveRunLimitError,
   type TokenUsage,
+  type UsageSource,
   fromMicro,
   mskMonthStart,
   mskNextMonthStart,
@@ -81,7 +82,8 @@ export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date):
  * - 이번 달 사용액(같은 통화) + 예약액이 상한을 넘으면 429 budget_exceeded
  * 반드시 run·원장을 쓰는 트랜잭션 안에서 호출한다 — 거부되면 그 트랜잭션 전체가 되돌아가 아무것도 남지 않는다.
  * 예약액은 입력 추정 + 출력 상한 tokensOutAllowance(provider 에 maxOutputTokens 로 넘김)의 비용이다. FIX1-LIVEL1: live 의 입력 추정은
- * 보수적 추정일 뿐 증명된 상한이 아니다 — 실제액이 더 크면 정산이 초과액을 남기고, 그 금액이 다음 예약의 월 합계에 들어간다.
+ * 보수적 추정일 뿐 증명된 상한이 아니다 — 확인된 실제액이 더 크면 정산이 초과액을 남기고, 그 금액이 다음 예약의 월 합계에 들어간다.
+ * 이 검사는 진행 중 호출의 예약액만 보므로 동시에 진행 중인 호출들의 초과액은 합쳐질 수 있다(LLM_LIVE_MAX_RUNS=1 이면 한 건).
  * FIX1-LIVEL1(D34 2단계 범위): live + LLM_LIVE_MAX_RUNS 면 같은 owner 잠금 아래에서 같은 승인 기록의 live 원장 행 수를 세어
  * 한도에 닿았으면 429 live_run_limit(예산 검사보다 먼저 — 아무것도 쓰지 않음). 행은 같은 트랜잭션에서 곧바로 쓰이므로 동시 요청도 직렬화된다.
  */
@@ -241,7 +243,23 @@ export async function insertReservedLedger(
   return rows[0]!;
 }
 
-/** 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02). owner 잠금 아래에서. */
+/**
+ * FIX2-LIVEL1: 확정에 쓸 사용량을 고른다. provider 가 보고한 usage 라도 그 비용이 numeric(18,6) 에 담기지 않으면(또는 usage 가 없으면)
+ * 확인된 usage 로 쓰지 않는다 → null(예약액, tokens NULL, usage_source none). 모의 추정(estimate)은 기존대로 범위 밖이면 AmountRangeError.
+ */
+function storableUsage(pricing: BudgetPolicy['pricing'], usage: TokenUsage | null, source: UsageSource): { usage: TokenUsage | null; cost: bigint | null } {
+  if (!usage) return { usage: null, cost: null };
+  const cost = costMicro(pricing, usage.tokensIn, usage.tokensOut);
+  if (isStorableMicro(cost)) return { usage, cost };
+  if (source === 'estimate') throw new AmountRangeError();
+  return { usage: null, cost: null };
+}
+
+/**
+ * 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02, D13). owner 잠금 아래에서.
+ * FIX1-LIVEL1: 공급자가 보고한 유효 usage 를 알면 max(예약액, usage 비용) + 초과액·tokens(숫자만).
+ * FIX2-LIVEL1: `known` 이 있으면(LLM 경로) 스냅숏에 usage_source(provider|none)를 남기고, usage 를 모르면 tokens 는 NULL 그대로.
+ */
 export async function settleLedgerFailed(
   tx: DbOrTx,
   ownerId: string,
@@ -250,10 +268,8 @@ export async function settleLedgerFailed(
   known?: { pricing: BudgetPolicy['pricing']; usage: TokenUsage | null },
 ): Promise<void> {
   await lockOwnerForBudget(tx, ownerId);
-  // FIX1-LIVEL1: 응답 usage 를 알면 max(예약액, usage 비용) + 초과액·tokens(숫자만). 모르면 D13 그대로 예약액 전액.
-  const usage = known?.usage ?? null;
+  const { usage } = storableUsage(known?.pricing ?? null, known?.usage ?? null, 'provider');
   const { actualMicro, overageMicro } = failedSettlement(known?.pricing ?? null, toMicro(ledger.reservedAmount), usage);
-  if (!isStorableMicro(actualMicro)) throw new AmountRangeError();
   await tx
     .update(usageLedger)
     .set({
@@ -264,27 +280,31 @@ export async function settleLedgerFailed(
       ...(usage
         ? { tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, overageAmount: fromMicro(overageMicro), overBudget: overageMicro > 0n }
         : {}),
+      ...(known ? { pricingSnapshot: { ...ledger.pricingSnapshot, usage_source: usage ? 'provider' : 'none' } } : {}),
     })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
 }
 
 /**
- * 성공한 호출: 실제 토큰 × 단가로 확정 — 예약과 같은 owner 잠금 아래에서.
- * 실제액 > 예약액이면(provider 가 상한을 어겼거나 추정이 모자람) 초과액을 overage_amount 에 그대로 기록하고 over_budget=true.
- * 숨기거나 자르지 않는다. 그 결과 월 합계가 상한을 넘으면 다음 예약이 거부된다.
+ * 성공한 호출의 확정 — 예약과 같은 owner 잠금 아래에서.
+ * - usage 가 있으면 실제 토큰 × 단가. 실제액 > 예약액이면(예약 추정이 모자람) 초과액을 overage_amount 에 그대로 기록하고 over_budget=true
+ *   (숨기거나 자르지 않는다). 그 금액이 월 합계에 들어가 다음 예약의 월 상한 검사에 반영된다.
+ * - FIX2-LIVEL1: usage 가 null(live 에서 공급자가 유효 usage 를 보고하지 않음, 또는 그 비용이 저장 범위 밖)이면 예약액으로 확정하고
+ *   tokens 는 NULL — 추정을 실제 사용량처럼 기록하지 않는다. 스냅숏 usage_source 로 출처(provider|estimate|none)를 남긴다.
  */
 export async function settleLedgerSucceeded(
   tx: DbOrTx,
   ownerId: string,
   ledger: UsageLedgerRow,
   pricing: BudgetPolicy['pricing'],
-  usage: { tokensIn: number; tokensOut: number },
+  usageIn: TokenUsage | null,
   at: Date,
+  source: UsageSource = 'estimate',
 ): Promise<UsageLedgerRow> {
   await lockOwnerForBudget(tx, ownerId);
-  const actual = costMicro(pricing, usage.tokensIn, usage.tokensOut);
-  if (!isStorableMicro(actual)) throw new AmountRangeError();
+  const { usage, cost } = storableUsage(pricing, usageIn, source);
   const reserved = toMicro(ledger.reservedAmount);
+  const actual = cost ?? reserved;
   const overage = actual > reserved ? actual - reserved : 0n;
   const rows = await tx
     .update(usageLedger)
@@ -293,8 +313,9 @@ export async function settleLedgerSucceeded(
       actualAmount: fromMicro(actual),
       overageAmount: fromMicro(overage),
       overBudget: overage > 0n,
-      tokensIn: usage.tokensIn,
-      tokensOut: usage.tokensOut,
+      tokensIn: usage ? usage.tokensIn : null,
+      tokensOut: usage ? usage.tokensOut : null,
+      pricingSnapshot: { ...ledger.pricingSnapshot, usage_source: usage ? source : 'none' },
       settledAt: at,
     })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')))

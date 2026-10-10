@@ -93,7 +93,7 @@ export const configSchema = z.object({
   LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
   /**
    * LIVE-L1(D34): 실제 AI 1회 출력 토큰 상한(1024 ~ 16000, 기본 4096). 예약의 출력 몫이자 요청의 max_tokens 와 같은 값이다
-   * (FIX1-LIVEL1: 예약은 보수적 **추정**이지 증명된 비용 상한이 아니다 — 실제 사용량을 항상 기록한다). Opus 의 thinking 토큰도 출력으로
+   * (예약은 보수적 **추정**이지 증명된 비용 상한이 아니다 — 공급자가 usage 를 보고한 경우에만 실제 사용량을 기록한다, budget.ts 머리 주석). Opus 의 thinking 토큰도 출력으로
    * 과금되므로 너무 작으면 max_tokens 로 끝나 실패한다. 모의에는 쓰지 않는다.
    */
   LLM_LIVE_MAX_OUTPUT_TOKENS: opt(intRange(LIVE_LLM_MIN_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS)),

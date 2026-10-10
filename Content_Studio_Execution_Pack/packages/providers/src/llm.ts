@@ -33,6 +33,8 @@ export interface LlmProvider {
   generate(input: LlmGenerateInput): Promise<LlmStructuredOutput>;
   /** T07: 실제 사용량(토큰). 모의는 결정적 추정(글자/3), live(LIVE-L1)는 그 호출의 공급자 응답 usage 에서 읽는다. */
   usageOf?(input: LlmGenerateInput, output: LlmStructuredOutput): LlmUsage;
+  /** FIX2-LIVEL1: 공급자가 보고한 유효 usage 만(없거나 이상하면 null — 추정값 없음). live 만 구현. */
+  confirmedUsageOf?(input: LlmGenerateInput): LlmUsage | null;
 }
 
 export const MOCK_WARNING = '모의 응답: 실제 AI 호출 아님';

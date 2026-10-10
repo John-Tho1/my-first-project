@@ -302,3 +302,11 @@ describe('FIX1(Codex review-LIVEL1) — 실패 정산·실제 호출 횟수 설�
     expect(reserveFor(budgetPolicy(loadConfig({ LLM_LIVE_APPROVAL_REF: 'D34-x' })), 'x').pricingSnapshot).not.toHaveProperty('approval_ref');
   });
 });
+
+describe('FIX2(Codex review-FIX-LIVEL1) — DB 열 범위 밖 usage 는 확인된 usage 가 아니다', () => {
+  it('failureUsageOf: integer 열(2^31-1) 범위 밖이면 null', () => {
+    expect(failureUsageOf({ usage: { tokensIn: 2_147_483_647, tokensOut: 2_147_483_647 } })).toEqual({ tokensIn: 2_147_483_647, tokensOut: 2_147_483_647 });
+    expect(failureUsageOf({ usage: { tokensIn: 2_147_483_648, tokensOut: 1 } })).toBeNull();
+    expect(failureUsageOf({ usage: { tokensIn: 1, tokensOut: 2_147_483_648 } })).toBeNull();
+  });
+});

@@ -186,4 +186,5 @@ CHANGES_REQUESTED
 |---|---|---|
 | LIVE-L1 | 2cbcb49 | CHANGES_REQUESTED — P1 2(예약 상한 근거 없음·실패 응답 usage 버림), P2 2(캐시 usage 이상값·헤더 값 덮어쓰기) |
 | FIX-LIVEL1 | d7da959 | CHANGES_REQUESTED — P1 1(부분 문자열 경험 claim 이 본문 확인 claim 생성을 막음), P2 2(추정 usage 를 실제처럼 기록·동시 초과 누적 설명 오류) |
-| FIX2-LIVEL1 | ea5954b | 대기 |
+| FIX2-LIVEL1 | ea5954b | CHANGES_REQUESTED — P1 3(부정·인용 claim 의 부분 일치 덮임·인용문 내부 분리·저장 불가 usage 폐기), P2 1(설정 화면 정산 안내) |
+| FIX3-LIVEL1 | a4da041 | 대기 |

@@ -235,3 +235,87 @@
 ### FIX round 2 — 오케스트레이터 기록
 - FIX2 HEAD: ea5954b02ab78d6a7ed4d9183070c66e7fb4c41c (code only, D28). BASE f170ecd.
 - checks-FIX2-LIVEL1: lint 0 · typecheck 0 · build 0 · unit 0(56 파일 · 1381) · integration 0(37 파일 · 778) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS). 재실행 없음.
+
+# FIX round 3 (Codex review-FIX2-LIVEL1, CHANGES_REQUESTED on ea5954b)
+- BASE_SHA: 84aa2f0 (ea5954b + 판정·인계 docs 커밋, 코드는 ea5954b 와 같음). HEAD_SHA: uncommitted (orchestrator commits). `git add -A` 하지 않음.
+- 수정하지 않음: `.env.local`·`./data`·`docs/handoffs/*`·`docs/DECISIONS.md`·`.claude/`. External calls: **none**(Anthropic 요청 0, 의존성 변경 없음).
+- 재현: 고치기 전에(작업 트리 = 84aa2f0, 코드 = ea5954b) 새 시험만 추가해 실행했다.
+  - unit(`llm-anthropic.test.ts`·`budget.test.ts`·`bundle.test.ts`) FIX3 블록: **11 failed / 147 passed**.
+  - integration `live-llm.test.ts` FIX3 블록: **6 failed / 39 passed**.
+  - FIX3 시험 중 "여러 문단"·"정확히 같은 claim 이 덮음"은 ea5954b 에서도 통과했다(규칙이 바뀌어도 유지되는 동작).
+- **설계 전환(1인칭 영역, 3라운드 연속 지적)**: 문장 분리를 없애고 **문단 단위 + 정규화 텍스트 완전 일치**로 바꿨다. 포함·부분 일치는 어디에도 쓰지 않는다.
+
+## 확정액 규칙(설정·/ops·`.env.example`·코드 주석이 같은 문장을 쓴다 — `LIVE_SETTLEMENT_POLICY_TEXT`)
+확정액은 이 앱의 예산 기록이며 **Anthropic 청구액과 같다고 보장하지 않는다**.
+| 경우 | 확정액 | tokens | usage_source |
+|---|---|---|---|
+| 성공 + 공급자 보고 usage(열·금액 범위 안) | 보고 토큰 × 설정 단가 | 보고값 | provider |
+| 실패 + 보고 usage(범위 안) | max(예약액, 보고 비용) | 보고값 | provider |
+| usage 모름(보고 없음·형식 오류·응답 없음) | 예약액 | NULL | none |
+| 보고 usage 가 열(2^31-1)·금액(numeric(18,6)) 범위 밖 | 예약액 + 스냅숏에 `reported_tokens_in/out`·`reported_cost`(10진 문자열) 보존 | NULL | provider_unstorable → **그 owner 의 새 live 예약 모두 429 `live_usage_unresolved`**(운영자 수동 해결 전까지) |
+| 모의 | 결정적 추정(글자/3) | 추정값 | estimate |
+그 밖은 FIX round 2 의 "초과 동작" 2~4 그대로(초과액 기록, 월 합계 기준 거부, 1회 상한은 예약 추정에만, 동시 초과 누적 — `LLM_LIVE_MAX_RUNS=1` 이면 한 건).
+
+## 지적 → 재현 → 수정 → 시험
+| 지적 | 재현(ea5954b 에서 실패) | 수정 | 시험(수정 후 통과) |
+|---|---|---|---|
+| [P1] :310 부분 일치(부정·인용·가정문 claim 이 본문을 덮음) + [P1] :372 인용문 안 종결 부호에서 분리 | unit 6행: 부정·인용·가정문으로 감싼 긴 claim 3종이 본문을 덮음 / `저는 “좋습니다.”라고 답하고 계약을 따냈습니다.` 가 두 조각으로 나뉨 / 한 문단의 두 경험이 두 claim / 짧은 부분 claim 이 문단을 못 덮는지. integ 1행 | `splitSentencesStrict` 와 관련 상수를 **삭제**하고, `splitParagraphs`(줄바꿈 경계만 — `\r?\n`·`\r`, 빈 줄 포함, trim, 빈 문단 버림)로 바꿨다. 1인칭 표현이 든 문단마다, experience claim 의 정규화 텍스트(NFKC·공백 접기·trim)가 문단 정규화 텍스트와 **정확히 같을 때만** 덮였다고 본다. 아니면 문단 전체를 `experience`·`needs_user_confirmation:true`·`source_refs:[]` claim 으로 더한다. 모델 claim 의 1인칭 재분류는 그대로 | unit: 부정·인용·가정 3종 → 문단 claim 추가 · 인용문 품은 문단 → 문단 전체 한 claim · 한 문단 두 경험 → 한 claim · 여러 문단(빈 줄·줄바꿈) → 1인칭 문단마다 · 정규화 후 같은 claim 은 덮고 짧은 부분 claim 은 못 덮음. integ: 인용문 문단 → claim 저장 → 채택 → review → **ready 409 `unconfirmed_experience_claims` → 그 claim 확인 → ready 성공** |
+| [P1] db/budget.ts:255 저장 범위 밖 보고 usage 를 버림 | unit 1행(2^31 보고값이 null 로 버려짐). integ 5행(assist 성공·assist 실패·variant·금액 범위 밖 → `none` 으로 끝나고 다음 live 예약이 허용됨) | provider `readUsage`·domain `failureUsageOf` 는 **0 이상 안전 정수면 그대로** 돌려준다(열 범위 판정을 하지 않음). db `judgeUsage` 가 판정한다: 토큰이 `MAX_TOKEN_COLUMN` 밖이거나 비용이 numeric(18,6) 밖이면 `unstorable` → 예약액 확정, tokens NULL, 스냅숏 `usage_source:'provider_unstorable'` + `reported_tokens_in/out`·`reported_cost`(10진 문자열, bigint 정확). `reserveOrThrow`(live 만): owner 잠금 뒤 `hasUnresolvedLiveUsage`(그 owner 의 provider_unstorable 행 존재, 기간·상태 무관) → 있으면 `LiveUsageUnresolvedError`(429 `live_usage_unresolved`, 아무것도 쓰지 않음·호출 0). 검사 순서: 잠금 → 미해결 → 횟수 → 예산. 모의 예약은 막지 않는다. 폼 오류 코드·문구 추가. **해결은 운영자 수동 작업**(해당 행의 usage_source 를 확인·정리) — 이 작업에 화면·API 없음. **단가 범위**: `LLM_PRICE_INPUT/OUTPUT_PER_1K` 를 0~100(1K 토큰당)으로 제한했다(2^31-1 토큰 × 100/1000 × 2 ≈ 4.3e11 < numeric 최대 ≈ 1e12 — 열 범위 안의 토큰이면 비용이 늘 저장 가능). 차단은 이 범위와 상관없이 동작한다(설정을 우회한 정책으로 시험) | unit: 2^31 보고값을 confirmedUsageOf·e.usage 로 그대로. domain: 단가 100 허용·100.000001·101·999999999 거부, 최대 토큰 × 100 이 numeric 안. integ: **assist 성공**(보고값·계산 비용 문자열 보존, 예약액, 다음 live 429·호출 0·행 0, 모의는 허용) · **assist 실패(refusal)**(failed·보존, **유한 월 상한 10 에서 두 번째 live 예약 거부**) · **variant 성공**(보존, 이후 variant·assist live 모두 거부) · 금액 범위 밖(설정을 우회한 정책 객체) → 보존·차단 |
+| [P2] settings/page.tsx:103 문구 | (설명 문제) | 확정액 규칙을 한 상수 `LIVE_SETTLEMENT_POLICY_TEXT`(domain budget.ts)로 만들어 설정 화면(준비됨 문구)·/ops(live 모드일 때 "AI 비용 확정 규칙")에 쓴다. `.env.example`·domain budget.ts 머리 (1) 도 같은 4가지 경우로 고쳤다. "청구액과 같다"는 표현은 쓰지 않는다 | lint·typecheck·build. 문구는 시험으로 고정하지 않음 |
+| 놓친 (a) 같은 입력 객체 재사용 | unit 2행(순차 재사용이 나감) | `#inflight` 를 `#used` WeakSet 으로 바꿨다: 한 번 쓴 입력 객체로 두 번째 `generate` 는 **동시든 순차든 보내기 전에** `llm_request_invalid`. 그래서 `confirmedUsageOf`·`usageOf(input)` 는 그 객체의 유일한 호출만 가리킨다 | unit: 성공 뒤 재사용 거부·fetch 1·usage 는 첫 호출 / 실패 뒤 재사용 거부 / 진행 중 재사용 거부(기존) |
+| 놓친 (b) export→restore 의 usage_source | unit 1행(`bogus` 등이 통과) + integ 1행 | `checkIntegrity`(domain bundle.ts): 원장 스냅숏에 `usage_source` 키가 **있으면** `provider`·`estimate`·`none`·`provider_unstorable` 중 하나여야 하고, 아니면 integrity 오류(복원 거부 — 다른 무결성 오류와 같은 경로). 키가 없으면(이전 행) 그대로 통과하고 복원도 키 없이 남긴다(none 으로 바꾸지 않음) | unit: 네 값 통과·키 없음 통과·`bogus`·빈 문자열·대문자·숫자·null·true·배열 → integrity. integ: 키를 지운 이전 행 + provider_unstorable 행을 내보내 빈 DB 에 복원 → 이전 행은 키 없음, unstorable 행 보존, **복원된 owner 의 live 예약이 `live_usage_unresolved`(호출 0)** |
+| 놓친 (c) Postgres 다른 연결 경쟁 | — | **시험하지 않음**(이 환경에 Postgres 서버가 없다). 횟수 제한·미해결 차단·예산 직렬화는 owner 행 `FOR UPDATE` + 같은 트랜잭션 삽입에 기대며 PGlite 에서만 확인했다 | 없음(미검증으로 표시) |
+
+## 의도한 동작 변경으로 고친 기존 시험(약화 아님 — 바뀐 규칙에 맞춘 단언, 주석으로 표시)
+- `llm-anthropic.test.ts`
+  - FIX1 (b): 재사용 후 usage 가 추정값 → 재사용 **거부**·usage 는 첫 호출.
+  - FIX1 (c) 2개: 문장 claim → 문단 claim. "덮음"은 정확히 같은 문단으로.
+  - FIX2 문장 분리 2개: 문단 전체 한 claim.
+  - FIX2 열 범위 밖 3행: null 이 아니라 보고값을 돌려줌(별도 행으로 분리). 없음·이상 행에는 "안전 정수 밖"을 더함.
+  - FIX2 (e) 꼬리: 순차 재사용 허용 → 거부.
+- `budget.test.ts` FIX2 `failureUsageOf`: 2^31 null → 보고값 그대로, 안전 정수 밖·음수 null 을 더함.
+- `live-llm.test.ts`
+  - FIX1·FIX2 게이트 시험의 claim 텍스트: 문장 → 문단.
+  - FIX2 (c) 2^31: `none` → `provider_unstorable` + 보고값.
+  - FIX2 (c) 금액: 설정 999999999 로 만든 정책 → 설정 거부를 단언. 정산 경로는 FIX3 금액 시험(설정을 우회한 정책 객체)이 더 강하게 확인한다.
+
+## 바뀐 파일(FIX round 3)
+- 코드:
+  - `packages/providers/src/llm-anthropic.ts`: `splitParagraphs`·완전 일치, `splitSentencesStrict` 삭제, `#used`, 열 범위 판정 제거.
+  - `packages/domain/src/budget.ts`: `UsageSource` 에 provider_unstorable, `USAGE_SOURCES`, `LiveUsageUnresolvedError`, `LIVE_SETTLEMENT_POLICY_TEXT`, `failureUsageOf` 범위, 머리 주석.
+  - `packages/domain/src/config.ts`: 단가 0~100.
+  - `packages/domain/src/bundle.ts`: usage_source 무결성.
+  - `packages/db/src/budget.ts`: `judgeUsage`·unstorable 보존·`hasUnresolvedLiveUsage`·`reserveOrThrow` 차단.
+  - `apps/web/lib/writing.ts`: 폼 코드 `live_usage_unresolved`.
+  - `apps/web/app/settings/page.tsx`·`apps/web/app/ops/page.tsx`: 규칙 문구.
+  - `.env.example`.
+- 시험: `llm-anthropic.test.ts`·`budget.test.ts`·`bundle.test.ts`·`live-llm.test.ts`(FIX3 블록 + 위 의도한 변경).
+- migration 없음.
+
+## 실행한 명령과 결과(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 실행 전 node 프로세스 0개 확인)
+| 명령 | 결과 |
+|---|---|
+| 재현(수정 전): unit `llm-anthropic.test.ts`·`budget.test.ts`·`bundle.test.ts` | 11 failed / 147 passed |
+| 재현(수정 전): integration `live-llm.test.ts` | 6 failed / 39 passed |
+| 수정 후 단독: unit `packages/providers/src` + `packages/domain/src` | 46 files, 1287 passed |
+| 수정 후 단독: integration live-llm(45 passed), live-llm·budget-claims·writing·variants·export-restore | 5 files — 기존 시험 4건을 바뀐 규칙에 맞춘 뒤 모두 통과 |
+| `bash .handoffs/run-checks.sh FIX3-LIVEL1` → `.handoffs/checks-FIX3-LIVEL1.log` | **LINT=0 · TYPECHECK=0 · BUILD=0 · UNIT=0(56 files, 1394 tests) · INTEG=0(37 files, 784 tests) · DRILL=0(불변식 위반 0건) · MIGRATE=0 · DRILL_RESTORE=0(PASS)** — 시간 초과·워커 비정상 종료 없음, 단독 재실행 불필요 |
+
+## 남은 위험(FIX round 3 기준)
+1. **미해결 차단의 해결 경로가 수동**이다: provider_unstorable 행이 생기면 그 owner 의 실제 호출이 모두 막힌다. 해결은 운영자가 원장을 직접 확인·정리해야 하고 화면·API 가 없다(이 작업 범위 밖). 단가 0~100 제한 아래에서는 2^31 이상 토큰 보고가 아니면 생기지 않는다.
+2. 문단 단위는 보수적이다. 긴 문단은 문단 전체를 확인해야 해서 확인 부담이 늘고, 모델이 문단 전체와 같은 claim 을 만들지 않으면 늘 서버 claim 이 더해진다(중복처럼 보일 수 있음). 1인칭 판별은 여전히 정규식이라 주어를 생략한 경험은 놓친다.
+3. 예약은 추정이고 동시 초과는 누적된다(`LLM_LIVE_MAX_RUNS=1` 이면 한 건). 1회 상한은 예약 추정에만 적용된다.
+4. 확정액은 예산 회계 값이다 — Anthropic 청구액과 다를 수 있다(usage 모름·실패 시 예약액 등).
+5. **Postgres 드라이버(다른 연결) 경쟁: 미검증.** 횟수 제한·미해결 차단·예산 직렬화는 PGlite 에서만 시험했다.
+6. 같은 입력 객체 거부는 provider 인스턴스 안에서만 동작한다(인스턴스가 다르면 각자 1회). 제품 경로는 run 마다 새 객체·요청마다 새 provider 다.
+
+## Codex 에게 묻는 것(FIX round 3)
+1. 문단 단위 + 정규화 완전 일치 규칙에 남은 우회가 있는가? (예: 모델이 문단과 글자까지 같은 claim 을 `opinion`/`fact` 로 내면 1인칭 표현이 있으므로 experience 로 재분류된다 — 그대로 덮음으로 본다.)
+2. provider_unstorable 차단의 범위(그 owner 의 모든 live 예약, 기간·상태·승인 기록 무관)가 맞는가? 해결 절차를 화면 없이 운영자 수동으로 두는 것이 받아들일 만한가?
+3. 단가 0~100 제한이 운영상 너무 좁거나 넓은가?
+4. 복원 무결성: `usage_source` 키가 있으면 네 값만, 없으면 통과 — 이 구분이 충분한가? provider_unstorable 행의 `reported_*` 키도 검증해야 하는가?
+
+
+### FIX round 3 — 오케스트레이터 기록
+- FIX3 HEAD: a4da041c24167fdbc8934c7577530931bbc0db33 (code only, D28). BASE 84aa2f0.
+- checks-FIX3-LIVEL1: lint 0 · typecheck 0 · build 0 · unit 0(56 파일 · 1394) · integration 0(37 파일 · 784) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS). 재실행 없음.

@@ -453,3 +453,14 @@
 - 상태: **잠정**. 실제 웹 수집(실제 HTTP 요청)은 없으며 별도 승인 대상.
 
 ## Proposed D33 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D34 — 첫 실제 AI 공급자: Claude(Anthropic), 월 상한 10 USD — D8 결정, 1단계(코드·기록된 응답 시험)까지 승인
+- Decision ID / date: D34 / 2026-10-10 (Europe/Moscow), 사용자 결정("2번 먼저, Claude로 월 상한 10 USD로 진행해줘"). D8(미정)을 닫는다.
+- 공급자·모델: Anthropic Messages API, 공식 TypeScript SDK `@anthropic-ai/sdk`(정확한 버전 고정, 공개 후 2주 이상 지난 판). 기본 모델 `claude-opus-5-5`(2026-10 기준 입력 4 USD·출력 20 USD / 1M 토큰 → `LLM_PRICE_INPUT_PER_1K=0.004`, `LLM_PRICE_OUTPUT_PER_1K=0.02`). 모델은 `LLM_MODEL` 로 바꿀 수 있고 단가도 같이 바꿔야 한다.
+- 예산: `LLM_BUDGET_MONTHLY_LIMIT=10`(USD). 1회 상한(`LLM_BUDGET_PER_RUN_MAX`)은 구현자 제안값을 따른다(잠정).
+- 승인 범위(정확히):
+  1. 1단계 — 실제 Claude 어댑터 코드 작성. 시험은 기록된 응답(fixture)·가짜 fetch 로만, 네트워크 호출 0, 과금 0.
+  2. 2단계(**별도 승인 필요**) — 사용자가 `ANTHROPIC_API_KEY` 를 `.env.local` 에 직접 넣고, 사용자가 고른 가상/공개 소재 1건으로 실제 호출 1회 확인.
+- 불변: 키는 서버에만(대화·저장소·로그·브라우저·프롬프트에 값 없음). 예약 비용이 실제 비용의 상한이 되도록 `max_tokens` = 예약 출력 상한. 모델 출력은 승인을 만들지 않고, 허용 출처 밖 인용·미제공 1인칭 경험은 기존 규칙대로 막는다.
+- 거부 대체 모델(server-side fallback): 켜지 않는다(잠정) — 대체 모델 단가가 예약 계산 밖이라 월 상한 보장이 깨진다. 거부(`refusal`)는 실패로 기록하고 사용자 원문은 보존.
+- When to revisit: 2단계 실제 호출 뒤 실제 토큰 사용량으로 예약 추정식 교정.

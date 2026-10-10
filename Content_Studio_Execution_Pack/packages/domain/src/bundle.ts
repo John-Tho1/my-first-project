@@ -1236,6 +1236,9 @@ export function fillAnswerSeq(rows: Array<{ id: string; content_id: string; crea
   }
 }
 
+/** FIX3-LIVEL1: 원장 스냅숏 usage_source 허용값(@cs/domain budget.ts UsageSource 와 같음). */
+const LEDGER_USAGE_SOURCES = new Set(['provider', 'estimate', 'none', 'provider_unstorable']);
+
 /** 묶음 안 참조 무결성: PK 중복 없음, 모든 FK 대상이 묶음 안에 있음, 현재 버전은 그 원고의 버전. */
 export function checkIntegrity(t: BundleTables): void {
   const problems: string[] = [];
@@ -1308,6 +1311,11 @@ export function checkIntegrity(t: BundleTables): void {
     need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
     need('usage_ledger', 'transcription_job_id', r.transcription_job_id, 'transcription_jobs');
     if ((r.run_id === null) === (r.transcription_job_id === null)) problems.push('usage_ledger: run_id·transcription_job_id 중 정확히 하나');
+    // FIX3-LIVEL1: 사용량 출처는 정해진 값만. 키가 없으면 이전 행(그대로 둔다 — none 으로 바꾸지 않는다).
+    if (Object.prototype.hasOwnProperty.call(r.pricing_snapshot, 'usage_source')) {
+      const src = (r.pricing_snapshot as Record<string, unknown>).usage_source;
+      if (typeof src !== 'string' || !LEDGER_USAGE_SOURCES.has(src)) problems.push('usage_ledger.pricing_snapshot.usage_source 값');
+    }
   }
   // T08: job 은 묶음 안 파일, 전사 버전은 그 job 의 것(버전 번호 unique), job 의 첫 전사는 같은 job 의 버전, 소재의 전사는 묶음 안.
   const transcriptJob = new Map(t.transcripts.map((x) => [x.id, x.job_id]));

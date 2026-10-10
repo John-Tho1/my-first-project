@@ -13,6 +13,8 @@ import {
   costMicro,
   failedSettlement,
   LiveRunLimitError,
+  LiveUsageUnresolvedError,
+  MAX_TOKEN_COLUMN,
   type TokenUsage,
   type UsageSource,
   fromMicro,
@@ -89,13 +91,29 @@ export async function monthlyCurrencies(tx: DbOrTx, ownerId: string, now: Date):
  */
 export async function reserveOrThrow(tx: DbOrTx, ownerId: string, policy: BudgetPolicy, prompt: string, now: Date): Promise<Reservation> {
   const reservation = reserveFor(policy, prompt);
-  if (policy.mode === 'live' && policy.liveMaxRuns !== undefined) {
+  if (policy.mode === 'live') {
     await lockOwnerForBudget(tx, ownerId);
-    const used = await liveRunsUsed(tx, ownerId, policy.liveApprovalRef ?? null);
-    if (used >= policy.liveMaxRuns) throw new LiveRunLimitError({ limit: policy.liveMaxRuns, used });
+    // FIX3-LIVEL1: 저장 범위 밖 보고 usage(provider_unstorable)가 남은 owner 는 새 live 예약을 모두 거부(운영자 수동 해결 전까지).
+    if (await hasUnresolvedLiveUsage(tx, ownerId)) throw new LiveUsageUnresolvedError();
+    if (policy.liveMaxRuns !== undefined) {
+      const used = await liveRunsUsed(tx, ownerId, policy.liveApprovalRef ?? null);
+      if (used >= policy.liveMaxRuns) throw new LiveRunLimitError({ limit: policy.liveMaxRuns, used });
+    }
   }
   await reserveMicroOrThrow(tx, ownerId, policy, reservation.reserveMicro, now);
   return reservation;
+}
+
+/**
+ * FIX3-LIVEL1: 이 owner 에 usage_source='provider_unstorable' 원장 행이 있는가(기간·상태 무관). 해결(행 정리)은 운영자 수동 작업이며 이 작업에는 화면이 없다.
+ */
+export async function hasUnresolvedLiveUsage(tx: DbOrTx, ownerId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ id: usageLedger.id })
+    .from(usageLedger)
+    .where(and(eq(usageLedger.ownerId, ownerId), sql`${usageLedger.pricingSnapshot} ->> 'usage_source' = 'provider_unstorable'`))
+    .limit(1);
+  return rows.length > 0;
 }
 
 /**
@@ -244,21 +262,34 @@ export async function insertReservedLedger(
 }
 
 /**
- * FIX2-LIVEL1: 확정에 쓸 사용량을 고른다. provider 가 보고한 usage 라도 그 비용이 numeric(18,6) 에 담기지 않으면(또는 usage 가 없으면)
- * 확인된 usage 로 쓰지 않는다 → null(예약액, tokens NULL, usage_source none). 모의 추정(estimate)은 기존대로 범위 밖이면 AmountRangeError.
+ * 확정에 쓸 사용량 판정.
+ * - usage 없음 → none(예약액, tokens NULL).
+ * - FIX3-LIVEL1: 공급자 보고 usage 인데 토큰이 원장 integer 열(MAX_TOKEN_COLUMN) 밖이거나 비용이 numeric(18,6) 밖 → **unstorable**:
+ *   보고 토큰·계산 비용을 문자열로 돌려준다(버리지 않음). 호출자는 예약액으로 확정하고 스냅숏에 보존하며, 이후 새 live 예약은 막힌다.
+ * - 모의 추정(estimate)은 기존대로 비용이 범위 밖이면 AmountRangeError.
  */
-function storableUsage(pricing: BudgetPolicy['pricing'], usage: TokenUsage | null, source: UsageSource): { usage: TokenUsage | null; cost: bigint | null } {
-  if (!usage) return { usage: null, cost: null };
+type UsageVerdict =
+  | { kind: 'ok'; usage: TokenUsage; cost: bigint }
+  | { kind: 'none' }
+  | { kind: 'unstorable'; reported: { reported_tokens_in: string; reported_tokens_out: string; reported_cost: string } };
+
+function judgeUsage(pricing: BudgetPolicy['pricing'], usage: TokenUsage | null, source: UsageSource): UsageVerdict {
+  if (!usage) return { kind: 'none' };
   const cost = costMicro(pricing, usage.tokensIn, usage.tokensOut);
-  if (isStorableMicro(cost)) return { usage, cost };
+  const fitsColumns = usage.tokensIn <= MAX_TOKEN_COLUMN && usage.tokensOut <= MAX_TOKEN_COLUMN;
+  if (fitsColumns && isStorableMicro(cost)) return { kind: 'ok', usage, cost };
   if (source === 'estimate') throw new AmountRangeError();
-  return { usage: null, cost: null };
+  return {
+    kind: 'unstorable',
+    reported: { reported_tokens_in: String(usage.tokensIn), reported_tokens_out: String(usage.tokensOut), reported_cost: fromMicro(cost) },
+  };
 }
 
 /**
  * 실패한 호출: 예약액 전체를 실제액으로 확정(failed=true, docs/02, D13). owner 잠금 아래에서.
  * FIX1-LIVEL1: 공급자가 보고한 유효 usage 를 알면 max(예약액, usage 비용) + 초과액·tokens(숫자만).
- * FIX2-LIVEL1: `known` 이 있으면(LLM 경로) 스냅숏에 usage_source(provider|none)를 남기고, usage 를 모르면 tokens 는 NULL 그대로.
+ * FIX2/FIX3-LIVEL1: `known` 이 있으면(LLM 경로) 스냅숏에 usage_source(provider|none|provider_unstorable)를 남긴다. usage 를 모르면 tokens 는 NULL,
+ * 저장 범위 밖이면 예약액 확정 + 보고값 보존(provider_unstorable).
  */
 export async function settleLedgerFailed(
   tx: DbOrTx,
@@ -268,8 +299,13 @@ export async function settleLedgerFailed(
   known?: { pricing: BudgetPolicy['pricing']; usage: TokenUsage | null },
 ): Promise<void> {
   await lockOwnerForBudget(tx, ownerId);
-  const { usage } = storableUsage(known?.pricing ?? null, known?.usage ?? null, 'provider');
+  const verdict = judgeUsage(known?.pricing ?? null, known?.usage ?? null, 'provider');
+  const usage = verdict.kind === 'ok' ? verdict.usage : null;
   const { actualMicro, overageMicro } = failedSettlement(known?.pricing ?? null, toMicro(ledger.reservedAmount), usage);
+  const snapshot =
+    verdict.kind === 'unstorable'
+      ? { ...ledger.pricingSnapshot, usage_source: 'provider_unstorable', ...verdict.reported }
+      : { ...ledger.pricingSnapshot, usage_source: usage ? 'provider' : 'none' };
   await tx
     .update(usageLedger)
     .set({
@@ -280,17 +316,18 @@ export async function settleLedgerFailed(
       ...(usage
         ? { tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, overageAmount: fromMicro(overageMicro), overBudget: overageMicro > 0n }
         : {}),
-      ...(known ? { pricingSnapshot: { ...ledger.pricingSnapshot, usage_source: usage ? 'provider' : 'none' } } : {}),
+      ...(known ? { pricingSnapshot: snapshot } : {}),
     })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')));
 }
 
 /**
  * 성공한 호출의 확정 — 예약과 같은 owner 잠금 아래에서.
- * - usage 가 있으면 실제 토큰 × 단가. 실제액 > 예약액이면(예약 추정이 모자람) 초과액을 overage_amount 에 그대로 기록하고 over_budget=true
- *   (숨기거나 자르지 않는다). 그 금액이 월 합계에 들어가 다음 예약의 월 상한 검사에 반영된다.
- * - FIX2-LIVEL1: usage 가 null(live 에서 공급자가 유효 usage 를 보고하지 않음, 또는 그 비용이 저장 범위 밖)이면 예약액으로 확정하고
- *   tokens 는 NULL — 추정을 실제 사용량처럼 기록하지 않는다. 스냅숏 usage_source 로 출처(provider|estimate|none)를 남긴다.
+ * - usage 가 있고 저장 가능하면 그 토큰 × 단가(공급자 보고 비용 — Anthropic 청구액과 같다고 보장하지 않음). 실제액 > 예약액이면 초과액을
+ *   overage_amount 에 그대로 기록하고 over_budget=true. 그 금액이 월 합계에 들어가 다음 예약의 월 상한 검사에 반영된다.
+ * - usage 가 null(live 에서 공급자가 유효 usage 를 보고하지 않음)이면 예약액으로 확정하고 tokens 는 NULL(usage_source none).
+ * - FIX3-LIVEL1: 보고했지만 저장 범위 밖이면 예약액으로 확정하고 보고 토큰·계산 비용을 스냅숏에 문자열로 보존(usage_source provider_unstorable)
+ *   — 이후 그 owner 의 새 live 예약은 LiveUsageUnresolvedError(운영자 수동 해결 전까지).
  */
 export async function settleLedgerSucceeded(
   tx: DbOrTx,
@@ -302,10 +339,14 @@ export async function settleLedgerSucceeded(
   source: UsageSource = 'estimate',
 ): Promise<UsageLedgerRow> {
   await lockOwnerForBudget(tx, ownerId);
-  const { usage, cost } = storableUsage(pricing, usageIn, source);
+  const verdict = judgeUsage(pricing, usageIn, source);
   const reserved = toMicro(ledger.reservedAmount);
-  const actual = cost ?? reserved;
+  const actual = verdict.kind === 'ok' ? verdict.cost : reserved;
   const overage = actual > reserved ? actual - reserved : 0n;
+  const snapshot =
+    verdict.kind === 'unstorable'
+      ? { ...ledger.pricingSnapshot, usage_source: 'provider_unstorable', ...verdict.reported }
+      : { ...ledger.pricingSnapshot, usage_source: verdict.kind === 'ok' ? source : 'none' };
   const rows = await tx
     .update(usageLedger)
     .set({
@@ -313,9 +354,9 @@ export async function settleLedgerSucceeded(
       actualAmount: fromMicro(actual),
       overageAmount: fromMicro(overage),
       overBudget: overage > 0n,
-      tokensIn: usage ? usage.tokensIn : null,
-      tokensOut: usage ? usage.tokensOut : null,
-      pricingSnapshot: { ...ledger.pricingSnapshot, usage_source: usage ? source : 'none' },
+      tokensIn: verdict.kind === 'ok' ? verdict.usage.tokensIn : null,
+      tokensOut: verdict.kind === 'ok' ? verdict.usage.tokensOut : null,
+      pricingSnapshot: snapshot,
       settledAt: at,
     })
     .where(and(eq(usageLedger.id, ledger.id), eq(usageLedger.ownerId, ownerId), eq(usageLedger.state, 'reserved')))

@@ -7,10 +7,12 @@
  * - 출력 여유분(mock): max(256, 입력 추정의 절반) 토큰.
  * - LIVE-L1(D34) live: 입력 = 정확한 프롬프트 UTF-8 바이트 + 시스템 프롬프트·출력 스키마 바이트 + 틀 여유(llm-live.ts),
  *   출력 = LLM_LIVE_MAX_OUTPUT_TOKENS(요청의 max_tokens 와 같은 값). FIX1-LIVEL1: 이것은 **보수적 추정**이지 증명된 비용 상한이 아니다.
- *   FIX2-LIVEL1 초과 동작(정확히):
- *   (1) 실제 사용량은 **공급자가 유효 usage 를 보고한 경우에만** 기록한다(성공·실패 모두, 실패는 max(예약액, usage 비용)). 보고가 없거나 이상하면
- *       예약액으로 확정하고 tokens 는 NULL, 스냅숏 usage_source='none'.
- *   (2) 실제액 > 예약액이면 초과액(overage_amount)을 기록한다 — 그 금액은 월 합계에 들어간다.
+ *   FIX2/FIX3-LIVEL1 확정·초과 동작(정확히 — 화면 문구는 LIVE_SETTLEMENT_POLICY_TEXT):
+ *   (1) 확정액(원장 actual_amount — 우리 예산 회계의 값이지 Anthropic 청구액과 같다고 보장하지 않는다):
+ *       성공 + 공급자 보고 usage → 보고 토큰 × 설정 단가 / 실패 + 보고 usage → max(예약액, 보고 비용) / usage 모름(없음·이상·응답 없음) → 예약액
+ *       (tokens NULL, usage_source 'none') / 보고했지만 열·금액 범위 밖 → 예약액 + 보고값 보존(usage_source 'provider_unstorable')
+ *       + 그 owner 의 새 live 예약 차단(429 live_usage_unresolved, 운영자 수동 해결 전까지).
+ *   (2) 확정액 > 예약액이면 초과액(overage_amount)을 기록한다 — 그 금액은 월 합계에 들어간다.
  *   (3) 다음 요청은 "월 합계(기록된 초과액 포함) + 그 요청의 예약액 > 월 상한" 이거나 "그 요청의 예약 추정 > 1회 상한" 일 때만 거부된다.
  *       1회 상한은 예약 추정에만 적용된다 — 실제액이 1회 상한을 넘어도 월 잔여가 있으면 다음 요청은 허용된다.
  *   (4) 예약 검사는 진행 중 호출의 **예약액**만 본다 — 동시에 진행 중인 호출들이 각각 예약을 넘으면 초과액이 모두 합쳐져 월 상한을 넘는다.
@@ -247,19 +249,49 @@ export interface TokenUsage {
 }
 
 /**
- * FIX2-LIVEL1: 원장 토큰 열(usage_ledger.tokens_in/out, PostgreSQL integer)의 최대값. 이보다 큰 usage 는 저장할 수 없으므로
- * "확인된 usage 아님"으로 보고 보수적 경로(예약액, tokens NULL, usage_source none)로 간다.
+ * 원장 토큰 열(usage_ledger.tokens_in/out, PostgreSQL integer)의 최대값.
+ * FIX3-LIVEL1: 공급자가 보고한 usage 가 이보다 크거나 그 비용이 numeric(18,6) 를 넘으면 **버리지 않고** 보고값·계산 비용을 스냅숏에 문자열로
+ * 보존하고(usage_source 'provider_unstorable'), 예약액으로 확정한 뒤 그 owner 의 새 live 예약을 막는다(LiveUsageUnresolvedError).
  */
 export const MAX_TOKEN_COLUMN = 2_147_483_647;
 
-/** FIX2-LIVEL1: 원장 확정의 사용량 출처 — provider(공급자가 보고한 유효 usage) · estimate(모의의 결정적 추정) · none(모름 → 예약액, tokens NULL). */
-export type UsageSource = 'provider' | 'estimate' | 'none';
-
-const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKEN_COLUMN;
+/**
+ * 원장 확정의 사용량 출처(스냅숏 usage_source). provider = 공급자가 보고한 유효 usage 로 확정 · estimate = 모의의 결정적 추정 ·
+ * none = 모름(예약액, tokens NULL) · provider_unstorable(FIX3) = 보고했지만 열·금액 범위 밖(예약액 확정 + 보고값 보존 + 새 live 예약 차단).
+ * 키가 없는 행 = LIVE-L1 이전 행(출처 미표시 — 복원 때도 없음 그대로).
+ */
+export type UsageSource = 'provider' | 'estimate' | 'none' | 'provider_unstorable';
+export const USAGE_SOURCES: readonly UsageSource[] = ['provider', 'estimate', 'none', 'provider_unstorable'];
 
 /**
- * provider 실패 오류에 실린 숫자 사용량(예: LiveLlmError.usage — 원문 없음). 두 값이 모두 0 ~ MAX_TOKEN_COLUMN 정수일 때만, 아니면 null.
- * db 층은 provider 구현을 모르므로 구조로만 읽는다.
+ * FIX3-LIVEL1: 설정·운영 화면에 그대로 보이는 실제 AI 비용 확정 규칙(머리 주석 (1)~(4) 와 같은 내용). 확정액을 청구액이라고 말하지 않는다.
+ */
+export const LIVE_SETTLEMENT_POLICY_TEXT =
+  '예약액은 추정입니다. 확정액은 이 앱의 예산 기록이며 Anthropic 청구액과 같다고 보장하지 않습니다 — ' +
+  '성공하고 공급자가 사용량을 보고하면 보고된 토큰 × 설정 단가, ' +
+  '실패했지만 사용량을 보고하면 예약액과 보고 비용 중 큰 값, ' +
+  '사용량을 모르면(보고 없음·형식 오류·응답 없음) 예약액으로 확정합니다. ' +
+  '보고된 사용량이 기록 범위를 넘으면 예약액으로 확정하고 보고값을 보존한 뒤, 운영자가 정리할 때까지 새 실제 호출을 막습니다. ' +
+  '확정액이 예약보다 크면 초과액을 기록하고, 이번 달 합계(초과액 포함)가 월 상한을 넘게 되는 요청부터 거부합니다(1회 상한은 예약 추정에만 적용). ' +
+  '동시에 진행 중인 요청들의 초과액은 합쳐질 수 있습니다(LLM_LIVE_MAX_RUNS=1 이면 한 건).';
+
+/** FIX3-LIVEL1: 저장 범위 밖 보고 usage 가 남아 있는 owner 의 새 live 예약 거부(429). 해결은 운영자 수동 작업(이 작업에 화면 없음). */
+export class LiveUsageUnresolvedError extends AppError {
+  constructor() {
+    super(
+      'budget_exceeded',
+      'live_usage_unresolved',
+      '공급자가 보고한 사용량이 기록 범위를 넘어 확정하지 못한 실제 AI 호출이 있어 새 실제 호출을 막았습니다. 운영자가 원장을 확인·정리해야 합니다.',
+    );
+  }
+}
+
+/** 0 이상 안전 정수(JS) — 열 범위 판정은 db 층(MAX_TOKEN_COLUMN)에서 한다. */
+const isUsageInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * provider 실패 오류에 실린 숫자 사용량(예: LiveLlmError.usage — 원문 없음). 두 값이 모두 0 이상 안전 정수일 때만, 아니면 null.
+ * FIX3-LIVEL1: 열 범위 밖이어도 여기서 버리지 않는다(db 층이 provider_unstorable 로 보존·차단). db 층은 provider 구현을 모르므로 구조로만 읽는다.
  */
 export function failureUsageOf(e: unknown): TokenUsage | null {
   if (!e || typeof e !== 'object') return null;

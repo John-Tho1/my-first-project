@@ -71,6 +71,11 @@ const intRange = (min: number, max: number, def: number) =>
 
 /** 0 이상, 소수 6자리까지의 10진 문자열(부동소수 오차 없이 micro 단위 정수로 바꾼다 — budget.ts). */
 const decimalString = z.string().regex(/^\d{1,9}(\.\d{1,6})?$/);
+/**
+ * FIX3-LIVEL1: AI 단가(1K 토큰당) 0 ~ 100. 원장 토큰 열 최대(2^31-1) × 100 / 1000 × 2(입력+출력)도 numeric(18,6) 최대(약 1e12) 안에 들어간다.
+ * (실제 단가는 0.004·0.02 수준 — 100 은 넉넉한 상한이고, 그래도 넘는 보고 비용은 db 층이 provider_unstorable 로 막는다.)
+ */
+const priceString = decimalString.refine((v) => Number(v) <= 100);
 
 export const configSchema = z.object({
   APP_BASE_URL: opt(z.url().default('http://localhost:3000')),
@@ -89,8 +94,8 @@ export const configSchema = z.object({
   LLM_BUDGET_CURRENCY: opt(z.string().regex(/^[A-Z]{3}$/).default('USD')),
   LLM_BUDGET_MONTHLY_LIMIT: opt(decimalString.optional()),
   LLM_BUDGET_PER_RUN_MAX: opt(decimalString.optional()),
-  LLM_PRICE_INPUT_PER_1K: opt(decimalString.optional()),
-  LLM_PRICE_OUTPUT_PER_1K: opt(decimalString.optional()),
+  LLM_PRICE_INPUT_PER_1K: opt(priceString.optional()),
+  LLM_PRICE_OUTPUT_PER_1K: opt(priceString.optional()),
   /**
    * LIVE-L1(D34): 실제 AI 1회 출력 토큰 상한(1024 ~ 16000, 기본 4096). 예약의 출력 몫이자 요청의 max_tokens 와 같은 값이다
    * (예약은 보수적 **추정**이지 증명된 비용 상한이 아니다 — 공급자가 usage 를 보고한 경우에만 실제 사용량을 기록한다, budget.ts 머리 주석). Opus 의 thinking 토큰도 출력으로

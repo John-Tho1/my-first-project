@@ -336,6 +336,20 @@ describe('T08 전사 표·지운 원본', () => {
     expect(parsed.tables.captures[0]!.capture_transcript_id).toBe(T1);
   });
 
+  it('FIX3-LIVEL1: 원장 pricing_snapshot.usage_source 는 provider·estimate·none·provider_unstorable 또는 없음(이전 행)만 — 그 밖은 integrity', () => {
+    for (const v of ['provider', 'estimate', 'none', 'provider_unstorable']) {
+      const ok = withJob();
+      ok.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: v };
+      expect(() => checkIntegrity(ok)).not.toThrow();
+    }
+    expect(() => checkIntegrity(withJob())).not.toThrow(); // 키 없음 = 이전 행
+    for (const bad of ['bogus', '', 'PROVIDER', 1, null, true, ['provider']]) {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: bad };
+      expect(() => checkIntegrity(t)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+  });
+
   it('원장은 run_id·transcription_job_id 중 정확히 하나, job 의 첫 전사는 같은 job, 소재의 전사는 묶음 안', () => {
     const both = withJob();
     both.usage_ledger[0]!.run_id = JOB;

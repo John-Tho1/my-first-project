@@ -303,10 +303,26 @@ describe('FIX1(Codex review-LIVEL1) — 실패 정산·실제 호출 횟수 설�
   });
 });
 
-describe('FIX2(Codex review-FIX-LIVEL1) — DB 열 범위 밖 usage 는 확인된 usage 가 아니다', () => {
-  it('failureUsageOf: integer 열(2^31-1) 범위 밖이면 null', () => {
+// FIX3-LIVEL1: 열 범위 밖 보고값은 버리지 않고 db 층이 provider_unstorable 로 보존·차단한다(의도한 동작 변경 — 이전 FIX2 시험은 null 을 기대했다).
+describe('FIX2→FIX3 — failureUsageOf 는 열 범위 밖 보고값도 돌려준다(안전 정수만)', () => {
+  it('failureUsageOf: 2^31 이상도 그대로, 안전 정수 밖·음수는 null', () => {
     expect(failureUsageOf({ usage: { tokensIn: 2_147_483_647, tokensOut: 2_147_483_647 } })).toEqual({ tokensIn: 2_147_483_647, tokensOut: 2_147_483_647 });
-    expect(failureUsageOf({ usage: { tokensIn: 2_147_483_648, tokensOut: 1 } })).toBeNull();
-    expect(failureUsageOf({ usage: { tokensIn: 1, tokensOut: 2_147_483_648 } })).toBeNull();
+    expect(failureUsageOf({ usage: { tokensIn: 2_147_483_648, tokensOut: 1 } })).toEqual({ tokensIn: 2_147_483_648, tokensOut: 1 });
+    expect(failureUsageOf({ usage: { tokensIn: 2 ** 53, tokensOut: 1 } })).toBeNull();
+    expect(failureUsageOf({ usage: { tokensIn: 1, tokensOut: 2_147_483_648 } })).toEqual({ tokensIn: 1, tokensOut: 2_147_483_648 });
+    expect(failureUsageOf({ usage: { tokensIn: -1, tokensOut: 1 } })).toBeNull();
+  });
+});
+
+describe('FIX3(Codex review-FIX2-LIVEL1) — 단가 설정 범위', () => {
+  it('LLM_PRICE_*_PER_1K 는 0 ~ 100(1K 토큰당) — 넘으면 설정 오류(열 범위 안의 토큰이면 비용이 numeric(18,6) 안에 들어가게)', () => {
+    expect(() => loadConfig({ LLM_PRICE_INPUT_PER_1K: '100', LLM_PRICE_OUTPUT_PER_1K: '100.000000' })).not.toThrow();
+    for (const bad of ['100.000001', '101', '999999999']) {
+      expect(() => loadConfig({ LLM_PRICE_INPUT_PER_1K: bad })).toThrow();
+      expect(() => loadConfig({ LLM_PRICE_OUTPUT_PER_1K: bad })).toThrow();
+    }
+    // 열 최대 토큰(입력·출력 각각 2^31-1) × 최대 단가도 numeric(18,6) 최대 안
+    const p = budgetPolicy(loadConfig({ LLM_PRICE_INPUT_PER_1K: '100', LLM_PRICE_OUTPUT_PER_1K: '100' }));
+    expect(costMicro(p.pricing, 2_147_483_647, 2_147_483_647)).toBeLessThanOrEqual(999_999_999_999_999_999n);
   });
 });

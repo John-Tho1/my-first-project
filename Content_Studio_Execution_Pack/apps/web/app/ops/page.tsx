@@ -9,6 +9,7 @@ import {
   formatAgeHours,
   formatByteSize,
   formatMsk,
+  LIVE_SETTLEMENT_POLICY_TEXT,
   liveLlmReadiness,
   sttLiveReadiness,
   type Channel,
@@ -267,6 +268,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           <span className="tag">작업 처리기: {config.WORKER_MODE}</span>
         </p>
         <p className="note">AI live 준비 안 됨: {live.missing.length ? live.missing.join(', ') : '없음(준비됨 — 실제 Claude 호출·과금, D34)'}</p>
+        {config.LLM_MODE === 'live' ? <p className="note">AI 비용 확정 규칙: {LIVE_SETTLEMENT_POLICY_TEXT}</p> : null}
         <p className="note">음성 전사 live 준비 안 됨: {sttLive.missing.length ? sttLive.missing.join(', ') : '없음'}</p>
         <p className="note">
           계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 Threads 연결 준비 안 됨:{' '}

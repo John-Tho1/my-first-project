@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { count, eq } from 'drizzle-orm';
+import { count, eq, sql } from 'drizzle-orm';
 import {
   adoptProposal,
   closeDb,
@@ -469,7 +469,8 @@ describe('FIX1 놓친 케이스(c) — proposed_text 의 미확인 1인칭 경�
     const out = { ...modelOut, proposed_text: '해외 영업 이야기. 제가 직접 계약서를 고쳐 썼습니다.', claims: [] };
     const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
     const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
-    expect(r.claims.map((x) => [x.text, x.kind, x.needs_user_confirmation])).toEqual([['제가 직접 계약서를 고쳐 썼습니다.', 'experience', true]]);
+    // FIX3-LIVEL1: 확인 claim 단위가 문단으로 바뀌었다(의도한 동작 변경) — 1인칭 문장이 든 문단 전체
+    expect(r.claims.map((x) => [x.text, x.kind, x.needs_user_confirmation])).toEqual([['해외 영업 이야기. 제가 직접 계약서를 고쳐 썼습니다.', 'experience', true]]);
     await adoptProposal(db, owner, c.content.id, r.run.id, 1);
     const unresolved = await listUnconfirmedExperienceClaims(db, owner, c.content.id);
     expect(unresolved.map((u) => [u.run_id, u.claim_index])).toEqual([[r.run.id, 0]]);
@@ -551,7 +552,8 @@ describe('FIX2 P1 :287 — 짧은 경험 claim 을 확인해도 본문의 다른
     };
     const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
     const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
-    expect(r.claims.map((x) => x.text)).toEqual(['제가 직접 협상했습니다.', '그리고 제가 매출을 두 배로 늘렸습니다.']);
+    // FIX3-LIVEL1: 문단 단위 — 첫 문장 claim 은 문단과 같지 않으므로 문단 전체 claim 이 더해진다(의도한 동작 변경)
+    expect(r.claims.map((x) => x.text)).toEqual(['제가 직접 협상했습니다.', '제가 직접 협상했습니다.그리고 제가 매출을 두 배로 늘렸습니다.']);
     await adoptProposal(db, owner, c.content.id, r.run.id, 1);
     const after = await confirmClaims(db, owner, c.content.id, r.run.id, [0]);
     expect(after.unconfirmed.map((u) => u.claim_index)).toEqual([1]);
@@ -668,31 +670,19 @@ describe('FIX2 놓친 케이스 — 초과·동시·범위·복원', () => {
     expect(await failCode(runAssist(db, owner, c1.content.id, draft(p), claude(gated)))).toBe('budget_exceeded');
   });
 
-  it('(c) JS 안전 정수지만 integer 열 범위 밖 usage → 확인된 usage 아님(예약액·tokens NULL·none), DB 오류 없음', async () => {
+  // FIX3-LIVEL1: 열·금액 범위 밖 보고값은 'none' 이 아니라 provider_unstorable 로 보존하고 새 live 예약을 막는다(의도한 동작 변경).
+  it('(c) JS 안전 정수지만 integer 열 범위 밖 usage → 예약액·tokens NULL·provider_unstorable(보고값 보존), DB 오류 없음', async () => {
     const owner = await freshOwner('live-l1-fix2-int4@example.local');
     const c = await createContent(db, owner, { title: '열 범위', body: '본문.' });
     const { fetch } = fakeFetch(json(200, message({ usage: { input_tokens: 2_147_483_648, output_tokens: 10 } })));
     const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
     expect(r.ledger).toMatchObject({ tokensIn: null, tokensOut: null, actualAmount: r.ledger.reservedAmount });
-    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'none' });
+    expect(snapshotOf(r.ledger)).toMatchObject({ usage_source: 'provider_unstorable', reported_tokens_in: '2147483648', reported_tokens_out: '10' });
   });
 
-  it('(c) 금액이 numeric(18,6) 를 넘게 되는 usage(성공·실패) → 확인된 usage 로 쓰지 않음, DB 오류 없음', async () => {
-    const owner = await freshOwner('live-l1-fix2-amount@example.local');
-    const c = await createContent(db, owner, { title: '금액 범위', body: '본문.' });
-    const huge = policy({ LLM_PRICE_INPUT_PER_1K: '999999999', LLM_BUDGET_MONTHLY_LIMIT: '', LLM_BUDGET_PER_RUN_MAX: '' });
-    const usage = { input_tokens: 2_000_000_000, output_tokens: 1 };
-    expect(costMicro(huge.pricing, 2_000_000_000, 1)).toBeGreaterThan(999_999_999_999_999_999n);
-    const { fetch } = fakeFetch(json(200, message({ usage })), json(200, message({ stop_reason: 'refusal', usage })));
-    const ok = await runAssist(db, owner, c.content.id, draft(huge), claude(fetch));
-    expect(ok.ledger).toMatchObject({ state: 'settled', tokensIn: null, actualAmount: ok.ledger.reservedAmount });
-    expect(snapshotOf(ok.ledger)).toMatchObject({ usage_source: 'none' });
-    expect(await failCode(runAssist(db, owner, c.content.id, draft(huge), claude(fetch)))).toBe('llm_failed');
-    const rows = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, owner));
-    expect(rows.map((l) => [l.state, l.tokensIn, (l.pricingSnapshot as { usage_source?: string }).usage_source])).toEqual([
-      ['settled', null, 'none'],
-      ['settled', null, 'none'],
-    ]);
+  // FIX3-LIVEL1: 단가 설정은 0~100 으로 제한됐다 — 999999999 는 설정 단계에서 거부. 금액 범위 밖 정산 자체는 FIX3 블록(설정을 우회한 정책)에서 시험한다.
+  it('(c) 금액이 numeric(18,6) 를 넘게 되는 단가는 설정에서 거부(정산 경로는 FIX3 시험)', () => {
+    expect(() => policy({ LLM_PRICE_INPUT_PER_1K: '999999999' })).toThrow();
   });
 
   it('(d) approval_ref 가 있는 원장을 내보내고 빈 DB 에 복원해도 횟수(LLM_LIVE_MAX_RUNS)가 이어진다', async () => {
@@ -713,6 +703,144 @@ describe('FIX2 놓친 케이스 — 초과·동시·범위·복원', () => {
         const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
         await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-b')), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
         expect(await liveRunsUsed(h.db, target, LIVE.LLM_LIVE_APPROVAL_REF)).toBe(1);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- FIX round 3(Codex review-FIX2-LIVEL1) ----
+
+const OVER_INT = { input_tokens: 2_147_483_648, output_tokens: 7 };
+const snap = (l: { pricingSnapshot: Record<string, unknown> }) => l.pricingSnapshot as Record<string, unknown>;
+
+describe('FIX3 P1 :310·:372 — 문단 claim 이 확인될 때까지 게이트가 막는다', () => {
+  it('인용문을 품은 1인칭 문단 → 문단 전체 claim → 확인 전 ready 409, 확인 뒤 ready', async () => {
+    const owner = await freshOwner('live-l1-fix3-gate@example.local');
+    const c = await createContent(db, owner, { title: '문단 claim', body: '본문.' });
+    const out = { ...modelOut, proposed_text: '저는 “좋습니다.”라고 답하고 계약을 따냈습니다.', claims: [] };
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.claims.map((x) => [x.text, x.kind, x.needs_user_confirmation])).toEqual([['저는 “좋습니다.”라고 답하고 계약을 따냈습니다.', 'experience', true]]);
+    await adoptProposal(db, owner, c.content.id, r.run.id, 1);
+    const rev = async () => (await db.select().from(schema.contents).where(eq(schema.contents.id, c.content.id)))[0]!.revision;
+    await updateContentMeta(db, owner, c.content.id, { lifecycle: 'review' }, await rev());
+    const blocked = await updateContentMeta(db, owner, c.content.id, { lifecycle: 'ready' }, await rev()).then(
+      () => null,
+      (x: AppError) => x,
+    );
+    expect(blocked?.code).toBe('unconfirmed_experience_claims');
+    await confirmClaims(db, owner, c.content.id, r.run.id, [0]);
+    const ready = await updateContentMeta(db, owner, c.content.id, { lifecycle: 'ready' }, await rev());
+    expect(ready.lifecycle).toBe('ready');
+  });
+});
+
+describe('FIX3 P1 db/budget.ts:255 — 저장 범위 밖 보고 usage: 보존(provider_unstorable) + 새 live 예약 차단', () => {
+  const expectUnstorable = (l: { pricingSnapshot: Record<string, unknown>; tokensIn: number | null; actualAmount: string | null; reservedAmount: string }, tokensIn: string, tokensOut: string) => {
+    expect(l.tokensIn).toBeNull();
+    expect(l.actualAmount).toBe(l.reservedAmount);
+    expect(snap(l)).toMatchObject({ usage_source: 'provider_unstorable', reported_tokens_in: tokensIn, reported_tokens_out: tokensOut });
+    expect(snap(l).reported_cost).toMatch(/^\d+\.\d{6}$/);
+  };
+
+  it('assist 성공 + 2^31 tokens → 보고값·계산 비용을 문자열로 보존, 예약액 확정, 다음 live 예약은 429 live_usage_unresolved(호출 0·행 0)', async () => {
+    const owner = await freshOwner('live-l1-fix3-unst-ok@example.local');
+    const c = await createContent(db, owner, { title: '범위 밖 성공', body: '본문.' });
+    const { fetch, calls } = fakeFetch(json(200, message({ usage: OVER_INT })), json(200, message()));
+    const p = policy();
+    const r = await runAssist(db, owner, c.content.id, draft(p), claude(fetch));
+    expect(r.run.status).toBe('succeeded');
+    expectUnstorable(r.ledger, '2147483648', '7');
+    expect(snap(r.ledger).reported_cost).toBe(fromMicro(costMicro(p.pricing, 2_147_483_648, 7)));
+    const before = await counts();
+    const e = await runAssist(db, owner, c.content.id, draft(p), claude(fetch)).then(
+      () => null,
+      (x: AppError) => x,
+    );
+    expect([e?.kind, e?.code]).toEqual(['budget_exceeded', 'live_usage_unresolved']);
+    expect(calls).toHaveLength(1);
+    expect(await counts()).toEqual(before);
+    // 모의 예약은 막지 않는다(실제 과금 경로가 아님)
+    const mock = await runAssist(db, owner, c.content.id, { ...draft(), budget: undefined }, new MockLlmProvider());
+    expect(mock.run.status).toBe('succeeded');
+  });
+
+  it('assist 실패(refusal) + 2^31 tokens → provider_unstorable·failed, 유한 월 상한에서 두 번째 live 예약도 거부', async () => {
+    const owner = await freshOwner('live-l1-fix3-unst-fail@example.local');
+    const c = await createContent(db, owner, { title: '범위 밖 실패', body: '본문.' });
+    const { fetch, calls } = fakeFetch(json(200, message({ stop_reason: 'refusal', usage: OVER_INT })), json(200, message()));
+    const p = policy({ LLM_BUDGET_MONTHLY_LIMIT: '10' });
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(p), claude(fetch)))).toBe('llm_failed');
+    const { ledger } = await ledgerOf(c.content.id);
+    expect(ledger.failed).toBe(true);
+    expectUnstorable(ledger, '2147483648', '7');
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(p), claude(fetch)))).toBe('live_usage_unresolved');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('채널 초안(variant) 성공 + 2^31 tokens → provider_unstorable, 이후 variant·assist live 예약 모두 거부', async () => {
+    const owner = await freshOwner('live-l1-fix3-unst-variant@example.local');
+    const c = await createContent(db, owner, { title: '범위 밖 채널', body: '본문.' });
+    const plain = { ...modelOut, claims: [{ text: '사전 조사가 중요하다.', kind: 'opinion', source_refs: [], needs_user_confirmation: false }] };
+    const { fetch, calls } = fakeFetch(json(200, message({ usage: OVER_INT }, JSON.stringify(plain))), json(200, message()));
+    const p = policy();
+    const r = await runVariantAssist(db, owner, c.content.id, { channel: 'blog', baseVersion: 1, budget: p }, claude(fetch));
+    expectUnstorable(r.ledger, '2147483648', '7');
+    expect(await failCode(runVariantAssist(db, owner, c.content.id, { channel: 'threads', baseVersion: 1, budget: p }, claude(fetch)))).toBe('live_usage_unresolved');
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(p), claude(fetch)))).toBe('live_usage_unresolved');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('금액이 numeric(18,6) 밖(설정 범위를 우회한 정책) → provider_unstorable 로 보고 비용 보존, 차단', async () => {
+    const owner = await freshOwner('live-l1-fix3-unst-amount@example.local');
+    const c = await createContent(db, owner, { title: '금액 밖', body: '본문.' });
+    const base = policy();
+    const huge = { ...base, pricing: { ...base.pricing!, inputPer1kMicro: toMicro('999999999') }, monthlyLimitMicro: null, perRunMaxMicro: null };
+    const { fetch } = fakeFetch(json(200, message({ usage: { input_tokens: 2_000_000_000, output_tokens: 1 } })));
+    const r = await runAssist(db, owner, c.content.id, draft(huge), claude(fetch));
+    expectUnstorable(r.ledger, '2000000000', '1');
+    expect(snap(r.ledger).reported_cost).toBe(fromMicro(costMicro(huge.pricing, 2_000_000_000, 1)));
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(huge), claude(fetch)))).toBe('live_usage_unresolved');
+  });
+});
+
+describe('FIX3 놓친 (b) — export→restore 와 usage_source', () => {
+  it('provider_unstorable 행은 복원 뒤에도 live 예약을 막고, 키 없는 이전 행은 키 없이 남는다', async () => {
+    const owner = await freshOwner('live-l1-fix3-restore@example.local');
+    const c1 = await createContent(db, owner, { title: '복원 1', body: '본문 1.' });
+    const c2 = await createContent(db, owner, { title: '복원 2', body: '본문 2.' });
+    const { fetch } = fakeFetch(json(200, message()), json(200, message({ usage: OVER_INT })));
+    const legacy = await runAssist(db, owner, c1.content.id, draft(), claude(fetch));
+    // 이전(LIVE-L1 전) 행 흉내: usage_source 키 없음
+    await db.execute(sql`update usage_ledger set pricing_snapshot = pricing_snapshot - 'usage_source' where id = ${legacy.ledger.id}::uuid`);
+    await runAssist(db, owner, c2.content.id, draft(), claude(fetch));
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-fix3-'));
+    try {
+      const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets')), owner, { outDir: path.join(tmp, 'exports') });
+      const zip = new Uint8Array(readFileSync(exported.zipPath));
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-fix3@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores');
+        const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+        await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-b')), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+        const rows = await h.db.select().from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, target));
+        const byRun = new Map(rows.map((x) => [x.id, x.pricingSnapshot as Record<string, unknown>]));
+        expect(byRun.get(legacy.ledger.id)).not.toHaveProperty('usage_source');
+        expect([...byRun.values()].map((s) => s.usage_source ?? '(없음)').sort()).toEqual(['(없음)', 'provider_unstorable']);
+        // 복원된 원고로 live 예약 → 차단
+        const restoredContent = (await h.db.select().from(schema.contents).where(eq(schema.contents.ownerId, target)))[0]!;
+        const again = fakeFetch(json(200, message()));
+        const e = await runAssist(h.db, target, restoredContent.id, draft(), claude(again.fetch)).then(
+          () => null,
+          (x: AppError) => x,
+        );
+        expect(e?.code).toBe('live_usage_unresolved');
+        expect(again.calls).toHaveLength(0);
       } finally {
         await h.close();
       }

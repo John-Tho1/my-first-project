@@ -474,25 +474,28 @@ describe('FIX1 놓친 케이스', () => {
     expect(e.code).toBe('llm_invalid_output');
   });
 
-  it('(b) 같은 입력 객체로 성공 뒤 실패하면 usageOf 는 지난 성공의 usage 를 돌려주지 않는다(보수적 상한)', async () => {
-    const { fetch } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: 7, output_tokens: 9 } })), jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }));
+  // FIX3-LIVEL1: 같은 입력 객체 재사용은 거부로 바뀌었다(의도한 동작 변경) — 두 번째 호출은 보내지 않고, usage 는 첫 호출 그대로.
+  it('(b) 같은 입력 객체로 성공 뒤 다시 generate → 보내기 전에 거부, usageOf 는 첫 호출의 usage', async () => {
+    const { fetch, calls } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: 7, output_tokens: 9 } })), jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }));
     const p = provider(fetch);
     const inp = input();
     const out = await p.generate(inp);
     expect(p.usageOf(inp, out)).toEqual({ tokensIn: 7, tokensOut: 9 });
-    await rejectionOf(p.generate(inp));
-    expect(p.usageOf(inp, out)).toEqual({ tokensIn: liveInputEstimateTokens(PROMPT), tokensOut: 4096 });
+    expect((await rejectionOf(p.generate(inp))).code).toBe('llm_request_invalid');
+    expect(calls).toHaveLength(1);
+    expect(p.usageOf(inp, out)).toEqual({ tokensIn: 7, tokensOut: 9 });
   });
 
-  it('(c) proposed_text 의 1인칭 문장이 experience claim 으로 덮이지 않으면 서버가 experience claim(확인 필요)을 더한다', async () => {
+  // FIX3-LIVEL1: 단위가 문단으로 바뀌었다(의도한 동작 변경) — 1인칭 문장이 든 문단 전체가 확인 대상.
+  it('(c) proposed_text 의 1인칭 문단이 experience claim 으로 덮이지 않으면 서버가 문단 전체 experience claim(확인 필요)을 더한다', async () => {
     const text = '해외 영업은 준비가 중요하다. 제가 두바이에서 계약을 놓친 적이 있습니다. 결론은 사전 조사다.';
     const { fetch } = fakeFetch(jsonResponse(200, message({}, JSON.stringify(modelOut({ proposed_text: text, claims: [] })))));
     const r = await provider(fetch).generate(input());
-    expect(r.claims).toEqual([{ text: '제가 두바이에서 계약을 놓친 적이 있습니다.', kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
+    expect(r.claims).toEqual([{ text, kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
   });
 
-  it('(c) 이미 experience claim 이 그 문장을 덮으면 더하지 않는다(중복 없음), 출처 참조는 만들지 않는다', async () => {
-    const text = '제가 직접 협상했습니다. 시장은 커진다.';
+  it('(c) 이미 experience claim 이 그 문단과 정확히 같으면 더하지 않는다(중복 없음), 출처 참조는 만들지 않는다', async () => {
+    const text = '제가 직접 협상했습니다.';
     const claims = [{ text: '제가 직접 협상했습니다.', kind: 'experience', source_refs: [], needs_user_confirmation: true }];
     const { fetch } = fakeFetch(jsonResponse(200, message({}, JSON.stringify(modelOut({ proposed_text: text, claims })))));
     const r = await provider(fetch).generate(input());
@@ -514,20 +517,19 @@ describe('FIX2 P1 :287 — 경험 claim 은 문장 전체를 덮을 때만 중�
     expect(await claimsOut('제가 협상했습니다 그리고 계약을 따냈습니다.', [short])).toEqual([short, exp('제가 협상했습니다 그리고 계약을 따냈습니다.')]);
   });
 
-  it('공백 없이 이어진 두 경험 → 두 문장으로 나뉘고, 덮이지 않은 쪽만 추가', async () => {
+  // FIX3-LIVEL1: 문장 분리를 없애고 문단 단위로 바꿨다(의도한 동작 변경) — 아래 두 시험은 같은 입력에서 문단 전체가 한 claim 이 됨을 확인한다.
+  it('공백 없이 이어진 두 경험 + 첫 문장 claim → 그 claim 은 문단과 같지 않으므로 문단 전체 claim 추가', async () => {
     const first = exp('제가 직접 협상했습니다.');
-    expect(await claimsOut('제가 직접 협상했습니다.그리고 제가 매출을 두 배로 늘렸습니다.', [first])).toEqual([first, exp('그리고 제가 매출을 두 배로 늘렸습니다.')]);
+    const text = '제가 직접 협상했습니다.그리고 제가 매출을 두 배로 늘렸습니다.';
+    expect(await claimsOut(text, [first])).toEqual([first, exp(text)]);
   });
 
-  it('여러 경험 → 각각 claim, 1인칭 아닌 문장은 제외, 소수점(3.5)은 문장 경계가 아님', async () => {
-    expect(await claimsOut('매출이 3.5배 늘었다.제가 팀을 이끌었습니다! 시장은 크다. 저는 두바이에 3년 있었습니다?우리는 계약을 지켰다。')).toEqual([
-      exp('제가 팀을 이끌었습니다!'),
-      exp('저는 두바이에 3년 있었습니다?'),
-      exp('우리는 계약을 지켰다。'),
-    ]);
+  it('여러 경험이 한 문단에 있으면(소수점·!·?·。 포함) 문단 전체 한 claim', async () => {
+    const text = '매출이 3.5배 늘었다.제가 팀을 이끌었습니다! 시장은 크다. 저는 두바이에 3년 있었습니다?우리는 계약을 지켰다。';
+    expect(await claimsOut(text)).toEqual([exp(text)]);
   });
 
-  it('claim 이 문장 전체를 포함하면(앞뒤 공백·NFKC 무시) 추가하지 않는다', async () => {
+  it('claim 이 문단과 정규화 후 같으면(앞뒤 공백·NFKC 무시) 추가하지 않는다', async () => {
     const whole = exp('  제가 직접 협상했습니다. ');
     expect(await claimsOut('제가 직접 협상했습니다.', [whole])).toEqual([whole]);
   });
@@ -542,12 +544,11 @@ describe('FIX2 P2 :489 — 확인된 usage 와 추정 구분(confirmedUsageOf)',
     expect(p.confirmedUsageOf(inp)).toEqual({ tokensIn: 11, tokensOut: 22 });
   });
 
+  // FIX3-LIVEL1: 열 범위 밖(2^31 이상) 보고값은 provider 가 버리지 않는다(의도한 동작 변경) — 아래 별도 시험. 여기에는 없음·이상값만.
   it.each([
     ['usage 없음', undefined],
     ['usage 이상', { input_tokens: 'x', output_tokens: 1 }],
-    ['DB integer 열 범위 초과(2^31)', { input_tokens: 2_147_483_648, output_tokens: 1 }],
-    ['출력 integer 범위 초과', { input_tokens: 1, output_tokens: 2_147_483_648 }],
-    ['캐시 합이 integer 범위 초과', { input_tokens: 2_000_000_000, output_tokens: 1, cache_read_input_tokens: 200_000_000 }],
+    ['안전 정수 밖', { input_tokens: 2 ** 53, output_tokens: 1 }],
   ])('%s → confirmedUsageOf = null(usageOf 는 추정값), 실패면 e.usage = null', async (_l, usage) => {
     const ok = fakeFetch(jsonResponse(200, message({ usage })));
     const p = provider(ok.fetch);
@@ -560,6 +561,20 @@ describe('FIX2 P2 :489 — 확인된 usage 와 추정 구분(confirmedUsageOf)',
     });
     const bad = fakeFetch(jsonResponse(200, message({ stop_reason: 'max_tokens', usage })));
     expect((await rejectionOf(provider(bad.fetch).generate(input()))).usage).toBeNull();
+  });
+
+  it.each([
+    ['입력 2^31', { input_tokens: 2_147_483_648, output_tokens: 1 }, { tokensIn: 2_147_483_648, tokensOut: 1 }],
+    ['출력 2^31', { input_tokens: 1, output_tokens: 2_147_483_648 }, { tokensIn: 1, tokensOut: 2_147_483_648 }],
+    ['캐시 합 2^31 초과', { input_tokens: 2_000_000_000, output_tokens: 1, cache_read_input_tokens: 200_000_000 }, { tokensIn: 2_200_000_000, tokensOut: 1 }],
+  ])('열 범위 밖 보고값(%s) → confirmedUsageOf·e.usage 는 그 보고값(저장 가능 여부는 db 층)', async (_l, usage, want) => {
+    const ok = fakeFetch(jsonResponse(200, message({ usage })));
+    const p = provider(ok.fetch);
+    const inp = input();
+    await p.generate(inp);
+    expect(p.confirmedUsageOf(inp)).toEqual(want);
+    const bad = fakeFetch(jsonResponse(200, message({ stop_reason: 'max_tokens', usage })));
+    expect((await rejectionOf(provider(bad.fetch).generate(input()))).usage).toEqual(want);
   });
 
   it('응답을 못 받은 실패 뒤 confirmedUsageOf = null', async () => {
@@ -592,11 +607,75 @@ describe('FIX2 놓친 (e) — 같은 입력 객체를 동시에 쓰는 호출은
     release(new Response(JSON.stringify(message()), { status: 200, headers: { 'content-type': 'application/json' } }));
     await first;
     expect(calls).toHaveLength(1);
-    // 끝난 뒤에는 같은 객체로 다시 부를 수 있다(순차 재사용)
-    const again = fakeFetch(jsonResponse(200, message()), jsonResponse(200, message()));
-    const p2 = provider(again.fetch);
-    await p2.generate(inp);
-    await p2.generate(inp);
-    expect(again.calls).toHaveLength(2);
+    // FIX3-LIVEL1: 끝난 뒤의 순차 재사용도 거부(의도한 동작 변경) — 보내지 않는다
+    expect((await rejectionOf(p.generate(inp))).code).toBe('llm_request_invalid');
+    expect(calls).toHaveLength(1);
+  });
+});
+
+// ---- FIX round 3(Codex review-FIX2-LIVEL1) — 문단 단위·정확 일치 ----
+
+describe('FIX3 P1 :310·:372 — 1인칭 확인 claim 은 문단 단위, 정규화 텍스트가 정확히 같을 때만 덮임', () => {
+  it.each([
+    ['부정', '"제가 매출을 두 배로 늘렸습니다."라는 주장은 사실이 아닙니다.'],
+    ['인용', '그는 "제가 매출을 두 배로 늘렸습니다."라고 말했다고 제가 들었습니다.'],
+    ['가정', '만약 제가 매출을 두 배로 늘렸습니다.라고 쓴다면 과장입니다.'],
+  ])('본문 문장을 감싼 더 긴 %s claim 은 덮지 못한다 → 본문 문단 claim 추가', async (_l, wrapping) => {
+    const w = exp(wrapping);
+    expect(await claimsOut('제가 매출을 두 배로 늘렸습니다.', [w])).toEqual([w, exp('제가 매출을 두 배로 늘렸습니다.')]);
+  });
+
+  it('인용문 안의 종결 부호에서 끊지 않는다 — 문단 전체가 한 claim', async () => {
+    expect(await claimsOut('저는 “좋습니다.”라고 답하고 계약을 따냈습니다.')).toEqual([exp('저는 “좋습니다.”라고 답하고 계약을 따냈습니다.')]);
+  });
+
+  it('한 문단의 두 경험 → 문단 전체 한 claim', async () => {
+    expect(await claimsOut('제가 협상했습니다. 저는 계약을 따냈습니다.')).toEqual([exp('제가 협상했습니다. 저는 계약을 따냈습니다.')]);
+  });
+
+  it('여러 문단 → 1인칭 문단마다 claim(빈 줄·줄바꿈 경계), 1인칭 아닌 문단 제외', async () => {
+    expect(await claimsOut('제가 협상했습니다.\n\n시장은 크다.\n저는 계약을 따냈습니다.')).toEqual([exp('제가 협상했습니다.'), exp('저는 계약을 따냈습니다.')]);
+  });
+
+  it('정규화(NFKC·공백 접기·trim) 후 정확히 같은 claim 은 덮는다, 짧은 부분 claim 은 못 덮는다', async () => {
+    const same = exp('  제가   협상했습니다. ');
+    expect(await claimsOut('제가 협상했습니다.', [same])).toEqual([same]);
+    const part = exp('제가 협상했습니다.');
+    expect(await claimsOut('제가 협상했습니다. 저는 계약을 따냈습니다.', [part])).toEqual([part, exp('제가 협상했습니다. 저는 계약을 따냈습니다.')]);
+  });
+});
+
+describe('FIX3 놓친 (a) — 같은 입력 객체는 한 번만(순차 재사용도 보내기 전 거부)', () => {
+  it('성공 뒤 같은 객체로 다시 generate → llm_request_invalid, fetch 1번, usage 는 첫 호출 그대로', async () => {
+    const { fetch, calls } = fakeFetch(jsonResponse(200, message({ usage: { input_tokens: 7, output_tokens: 9 } })), jsonResponse(200, message({ usage: { input_tokens: 70, output_tokens: 90 } })));
+    const p = provider(fetch);
+    const inp = input();
+    await p.generate(inp);
+    const e = await rejectionOf(p.generate(inp));
+    expect(e.code).toBe('llm_request_invalid');
+    expect(calls).toHaveLength(1);
+    expect(p.confirmedUsageOf(inp)).toEqual({ tokensIn: 7, tokensOut: 9 });
+  });
+
+  it('실패 뒤에도 같은 객체 재사용은 거부', async () => {
+    const { fetch, calls } = fakeFetch(jsonResponse(529, { type: 'error', error: { type: 'overloaded_error', message: 'x' } }), jsonResponse(200, message()));
+    const p = provider(fetch);
+    const inp = input();
+    await rejectionOf(p.generate(inp));
+    expect((await rejectionOf(p.generate(inp))).code).toBe('llm_request_invalid');
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('FIX3 P1 db/budget.ts:255 — 열 범위 밖이어도 공급자가 보고한 usage 는 버리지 않는다', () => {
+  it('2^31 이상(안전 정수) usage → confirmedUsageOf 는 그 값, 실패면 e.usage 도 그 값(저장 가능 여부는 db 층이 판단)', async () => {
+    const usage = { input_tokens: 2_147_483_648, output_tokens: 5 };
+    const ok = fakeFetch(jsonResponse(200, message({ usage })));
+    const p = provider(ok.fetch);
+    const inp = input();
+    await p.generate(inp);
+    expect(p.confirmedUsageOf(inp)).toEqual({ tokensIn: 2_147_483_648, tokensOut: 5 });
+    const bad = fakeFetch(jsonResponse(200, message({ stop_reason: 'refusal', usage })));
+    expect((await rejectionOf(provider(bad.fetch).generate(input()))).usage).toEqual({ tokensIn: 2_147_483_648, tokensOut: 5 });
   });
 });

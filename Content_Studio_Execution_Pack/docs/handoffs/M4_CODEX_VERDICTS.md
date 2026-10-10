@@ -189,3 +189,4 @@ CHANGES_REQUESTED
 | FIX2-LIVEL1 | ea5954b | CHANGES_REQUESTED — P1 3(부정·인용 claim 의 부분 일치 덮임·인용문 내부 분리·저장 불가 usage 폐기), P2 1(설정 화면 정산 안내) |
 | FIX3-LIVEL1 | a4da041 | CHANGES_REQUESTED — P2 1(provider_unstorable 보고값 복원 무결성 검사 없음). P1 없음 |
 | FIX4-LIVEL1 | 2b05044 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVE-L1 종결 |
+| LIVEL1-H1 | 259f4f9 | 대기 |

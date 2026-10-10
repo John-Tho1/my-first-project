@@ -2,6 +2,7 @@
  * LIVE-L1(D34 1단계): 실제 Claude 어댑터(ClaudeLlmProvider)를 db 층·route 로 끝까지 — 가짜 fetch 가 기록된 Messages API 응답을 돌려준다.
  * 네트워크 0(setupFiles 가드가 api.anthropic.com 을 막는다), 과금 0. 시험 키는 가짜 sentinel 이며 응답·DB·감사에 나오지 않아야 한다.
  */
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -19,6 +20,7 @@ import {
   ensureOwner,
   exportOwner,
   getDb,
+  parseBundleZip,
   hasUnresolvedLiveUsage,
   listUnconfirmedExperienceClaims,
   liveRunsUsed,
@@ -33,6 +35,7 @@ import {
 import {
   AppError,
   budgetPolicy,
+  buildBundle,
   costMicro,
   fromMicro,
   LIVE_LLM_FIXED_INPUT_BYTES,
@@ -41,6 +44,8 @@ import {
   reserveFor,
   toMicro,
   utf8ByteLength,
+  writeZip,
+  type BundleTables,
 } from '@cs/domain';
 import { ClaudeLlmProvider, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
@@ -908,6 +913,134 @@ describe('FIX4 P2 bundle.ts:1315 — provider_unstorable 보고값 문자열은 
           reported_cost: s.reported_cost,
         });
         expect(await hasUnresolvedLiveUsage(h.db, target)).toBe(true);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- LIVEL1-H1(review-FIX4-LIVEL1 놓친 케이스) ----
+
+describe('LIVEL1-H1 — 실제 복원 경로·수동 해결 왕복', () => {
+  /** owner 에 provider_unstorable 행 1개를 만들고 내보낸 묶음(zip)을 돌려준다 */
+  async function unstorableBundle(identity: string, tmp: string) {
+    const owner = await freshOwner(identity);
+    const c = await createContent(db, owner, { title: 'H1', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({ usage: OVER_INT })));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, `assets-${owner}`)), owner, { outDir: path.join(tmp, 'exports') });
+    return { owner, ledgerId: r.ledger.id, zip: new Uint8Array(readFileSync(exported.zipPath)) };
+  }
+
+  it('보고값이 손상된 provider_unstorable 행을 담은 묶음 → 실제 복원 경로에서 integrity 거부, 대상 DB 변화 없음', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h1a-'));
+    try {
+      const { ledgerId, zip } = await unstorableBundle('live-l1-h1-corrupt@example.local', tmp);
+      const parsed = await parseBundleZip(zip);
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-h1a@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores');
+        const countAll = async () =>
+          Object.fromEntries(
+            await Promise.all(
+              (['usageLedger', 'generationRuns', 'contents', 'contentVersions', 'claims'] as const).map(async (k) => [k, (await h.db.select({ n: count() }).from(schema[k]))[0]!.n] as const),
+            ),
+          );
+        const before = await countAll();
+        for (const [label, mutate] of [
+          ['reported_cost 없음', (s: Record<string, unknown>) => void delete s.reported_cost],
+          ['reported_tokens_in 음수', (s: Record<string, unknown>) => void (s.reported_tokens_in = '-1')],
+          ['reported_* 만 남고 usage_source 없음', (s: Record<string, unknown>) => void delete s.usage_source],
+        ] as const) {
+          const t = structuredClone(parsed.tables) as BundleTables;
+          const row = t.usage_ledger.find((l) => l.id === ledgerId)!;
+          mutate(row.pricing_snapshot as Record<string, unknown>);
+          const bundle = buildBundle({
+            exportId: randomUUID(),
+            exportedAt: new Date().toISOString(),
+            appVersion: parsed.manifest.app_version,
+            migrations: parsed.manifest.schema_migrations,
+            owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+            tables: t,
+            assetBytes: new Map(parsed.assetBytes),
+          });
+          const e = await createRestorePreview(h.db, target, writeZip(bundle.entries), { restoresDir, source: 'upload' }).then(
+            () => null,
+            (x: AppError) => x,
+          );
+          expect(e?.code, label).toBe('integrity');
+        }
+        expect(await countAll()).toEqual(before);
+        expect(await hasUnresolvedLiveUsage(h.db, target)).toBe(false);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('수동 해결 절차(reported_* → resolution.original_reported, 재정산, usage_source 변경) → 차단 해제, 월 예산에 재정산액 반영, export→restore 성공·original_reported 보존', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h1b-'));
+    try {
+      const { owner, ledgerId } = await unstorableBundle('live-l1-h1-resolve@example.local', tmp);
+      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
+      const [row] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
+      const s = row!.pricingSnapshot as Record<string, unknown>;
+      const original = { reported_tokens_in: s.reported_tokens_in, reported_tokens_out: s.reported_tokens_out, reported_cost: s.reported_cost };
+      // 인계의 수동 해결 절차 4~6: 보고값은 resolution 안에 보존, 재정산(월 상한 10 에 거의 닿는 9.95), 출처를 provider 로
+      const { reported_tokens_in: _a, reported_tokens_out: _b, reported_cost: _c, ...rest } = s;
+      void _a;
+      void _b;
+      void _c;
+      const resolved = {
+        ...rest,
+        usage_source: 'provider',
+        resolution: {
+          resolved_at: '2026-10-10T12:00:00.000Z',
+          resolved_by: 'operator',
+          reason: '시험: 콘솔 확인 결과 실제 청구 9.95 USD 로 판단',
+          settled_amount: '9.950000',
+          original_usage_source: 'provider_unstorable',
+          original_reported: original,
+        },
+      };
+      const reserved = toMicro(row!.reservedAmount);
+      const settled = toMicro('9.950000');
+      await db
+        .update(schema.usageLedger)
+        .set({ pricingSnapshot: resolved, actualAmount: '9.950000', overageAmount: fromMicro(settled > reserved ? settled - reserved : 0n), overBudget: settled > reserved })
+        .where(eq(schema.usageLedger.id, ledgerId));
+      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
+      // 월 예산 검사는 재정산액을 포함한다: 월 상한 10 에서 다음 예약(약 0.1)은 거부
+      const c2 = await createContent(db, owner, { title: 'H1 다음', body: '본문.' });
+      const { fetch, calls } = fakeFetch(json(200, message()));
+      const e = await runAssist(db, owner, c2.content.id, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '10' })), claude(fetch)).then(
+        () => null,
+        (x: AppError) => x,
+      );
+      expect([e?.code, (e?.extra as { reason?: string } | undefined)?.reason]).toEqual(['budget_exceeded', 'monthly_limit']);
+      expect(calls).toHaveLength(0);
+      // 상한을 올리면 차단 없이 호출된다(live_usage_unresolved 아님)
+      const ok = await runAssist(db, owner, c2.content.id, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '100' })), claude(fetch));
+      expect(ok.run.status).toBe('succeeded');
+      // export → 빈 DB 복원: 무결성 통과, original_reported 그대로, 차단 없음
+      const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, 'assets-r')), owner, { outDir: path.join(tmp, 'exports-r') });
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-h1b@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores-r');
+        const pv = await createRestorePreview(h.db, target, new Uint8Array(readFileSync(exported.zipPath)), { restoresDir, source: 'upload' });
+        await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-r2')), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+        const [back] = await h.db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
+        expect(back!.actualAmount).toBe('9.950000');
+        expect((back!.pricingSnapshot as { resolution: { original_reported: unknown } }).resolution.original_reported).toEqual(original);
+        expect(back!.pricingSnapshot).not.toHaveProperty('reported_cost');
+        expect(await hasUnresolvedLiveUsage(h.db, target)).toBe(false);
       } finally {
         await h.close();
       }

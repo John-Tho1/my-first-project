@@ -336,6 +336,41 @@ describe('T08 전사 표·지운 원본', () => {
     expect(parsed.tables.captures[0]!.capture_transcript_id).toBe(T1);
   });
 
+  it('LIVEL1-H1: 보고값 경계 — 40자리 허용·41자리 거부, 소수 5·7자리, 뒤 공백·줄바꿈, 비ASCII 숫자, null·배열·객체 거부', () => {
+    const base = { reported_tokens_in: '1', reported_tokens_out: '1', reported_cost: '1.000000' };
+    const check = (rep: Record<string, unknown>) => {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: 'provider_unstorable', ...base, ...rep };
+      return () => checkIntegrity(t);
+    };
+    const d40 = '1'.repeat(40);
+    const d41 = '1'.repeat(41);
+    // 40자리 허용
+    expect(check({ reported_tokens_in: d40 })).not.toThrow();
+    expect(check({ reported_tokens_out: d40 })).not.toThrow();
+    expect(check({ reported_cost: `${d40}.000000` })).not.toThrow();
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['in 41자리', { reported_tokens_in: d41 }],
+      ['out 41자리', { reported_tokens_out: d41 }],
+      ['cost 정수부 41자리', { reported_cost: `${d41}.000000` }],
+      ['cost 소수 5자리', { reported_cost: '1.00000' }],
+      ['cost 소수 7자리', { reported_cost: '1.0000000' }],
+      ['in 뒤 공백', { reported_tokens_in: '1 ' }],
+      ['in 뒤 줄바꿈', { reported_tokens_in: '1\n' }],
+      ['cost 뒤 줄바꿈', { reported_cost: '1.000000\n' }],
+      ['cost 뒤 공백', { reported_cost: '1.000000 ' }],
+      ['in 전각 숫자', { reported_tokens_in: '１' }],
+      ['in 아라비아-인도 숫자', { reported_tokens_in: '٣' }],
+      ['cost 전각 숫자', { reported_cost: '１.000000' }],
+      ['cost 데바나가리 숫자', { reported_cost: '1.००००००' }],
+      ['in null', { reported_tokens_in: null }],
+      ['out 배열', { reported_tokens_out: ['1'] }],
+      ['cost 객체', { reported_cost: { v: '1.000000' } }],
+      ['cost null', { reported_cost: null }],
+    ];
+    for (const [label, rep] of bad) expect(check(rep), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
   it('FIX4-LIVEL1: provider_unstorable 행은 reported_tokens_in/out(음이 아닌 정수 10진 문자열)·reported_cost(정수부 + 소수 6자리) 필수', () => {
     const REP = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
     const withSnap = (snap: Record<string, unknown>) => {

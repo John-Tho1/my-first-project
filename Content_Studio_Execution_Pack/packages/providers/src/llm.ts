@@ -54,8 +54,11 @@ export interface MockLlmOptions {
 
 /** 1인칭 경험 표현(한국어). 걸리면 experience + 사용자 확인 필요로 분류한다. */
 const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|저의|제 |우리는|우리가|직접 )/;
-/** LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다. */
-export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text);
+/**
+ * LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다.
+ * LIVEL1-H1: 판별 전에 NFC 로 정규화한다 — 분해형(NFD) 한글 "저는" 도 같은 표현으로 잡는다(원문은 바꾸지 않음).
+ */
+export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text.normalize('NFC'));
 
 export function splitSentences(text: string): string[] {
   return text

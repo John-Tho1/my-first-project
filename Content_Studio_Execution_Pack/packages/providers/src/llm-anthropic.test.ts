@@ -720,3 +720,19 @@ describe('FIX4 놓친 (a)·(b)·(c) — 문단은 빈 줄로만, NFC 정규화, 
     expect(claims).toEqual([exp(long)]);
   });
 });
+
+// ---- LIVEL1-H1(review-FIX4-LIVEL1 놓친 케이스) ----
+
+describe('LIVEL1-H1 — NFD(분해형 한글) 본문·claim 의 1인칭 판별', () => {
+  it('NFD 본문 + claims=[] → 1인칭 문단을 찾아 experience claim 추가(텍스트는 본문 그대로)', async () => {
+    const body = '저는 두바이에서 계약을 따냈습니다.'.normalize('NFD');
+    expect(body).not.toBe(body.normalize('NFC'));
+    expect(await claimsOut(body)).toEqual([exp(body)]);
+  });
+
+  it.each(['fact', 'opinion'])('NFD %s claim 에 1인칭 표현 → experience + 확인 필요로 재분류', async (kind) => {
+    const text = '제가 직접 협상했습니다.'.normalize('NFD');
+    const claims = await claimsOut('시장은 커지고 있다.', [{ text, kind, source_refs: [], needs_user_confirmation: false }]);
+    expect(claims).toEqual([{ text, kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
+  });
+});

@@ -318,6 +318,22 @@ describe('A06: 승인 뒤 변경은 승인을 무효로 한다', () => {
     expect(plan!.status).toBe('draft');
   });
 
+  // LIVEL1-H1(review-FIX4-LIVEL1 놓친 케이스): (c) 는 철회 사유만 확인했다 — 원고 본문 수정 뒤 이전 승인으로 실행(게시)이 거부되는지까지 고정한다.
+  it('(c2) 원고 본문 수정 뒤 이전 승인으로 실행 → 403 approval_required, 작업 0, 재승인 409 snapshot_stale', async () => {
+    const x = await approvedPlan('blog');
+    await appendContentVersion(db, ownerA, x.contentId, { baseVersion: 1, body: `${BODY}\n\n승인 뒤 고친 문단` });
+    const a = await approvalRow(x.approvalId);
+    expect(a.revokedAt).not.toBeNull();
+    expect(a.revokeReason).toBe('invalidated:content_changed');
+    let res = await executeApi(x.planId, { command_key: `a06-c2-${randomUUID()}` });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('approval_required');
+    expect(await jobsOf(x.itemId)).toHaveLength(0);
+    res = await approveApi(x.planId, { item_ids: [x.itemId], expected_hashes: { [x.itemId]: x.hash }, confirm: true, purpose: 'mock_publish' });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('snapshot_stale');
+  });
+
   it('(d) 계정 상태 변경 → invalidated:account_changed, 파생본 review, 계정 되돌려도 승인은 되살아나지 않음', async () => {
     const y = await approvedPlan('blog');
     await setChannelAccountState(db, ownerA, acc[ownerA]!.blog, 'disconnected');

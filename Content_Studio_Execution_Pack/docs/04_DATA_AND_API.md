@@ -82,6 +82,7 @@ APP_BASE_URL, APP_TIMEZONE=Europe/Moscow, DATABASE_URL, AUTH_*(AUTH_MODE=dev 는
 STORAGE_DRIVER=local|object, STORAGE_*, ENCRYPTION_KEY_REF,
 LLM_MODE=mock|live, LLM_PROVIDER, LLM_MODEL, LLM_BUDGET_*,
 PUBLISH_MODE=disabled|enabled, COLLECTOR_MODE=disabled|enabled,
+WORKER_MODE=inline|separate, WORKER_INLINE_INTERVAL_SECONDS=0(끔, 기본)|5~600(web 안 주기 tick 간격 초 — T21-P2. 직전 tick 이 끝난 뒤 간격, 겹치지 않음),
 THREADS_*, YOUTUBE_*, INSTAGRAM_*, NOTION_*, GOOGLE_DRIVE_*.
 환경 예시에는 placeholder만. source control에 .env.local/credential/log/raw source를 넣지 않는다.
 설정 미완료 시 로컬 mock 경로는 동작하며 live 기능은 명확한 설명과 함께 차단한다.

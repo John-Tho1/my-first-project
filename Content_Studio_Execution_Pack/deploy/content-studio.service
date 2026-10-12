@@ -1,0 +1,61 @@
+# Content Studio web(Next, inline worker 포함) — systemd unit 예시(T21-P2, 파일만 · 배포한 적 없음 · 실제 Linux 에서 검증하지 않음)
+# 설치: /etc/systemd/system/content-studio.service 로 복사 → systemctl daemon-reload → systemctl enable --now content-studio
+# 경로·사용자 이름은 deploy/README_KO.md 의 배치와 같다. 다르게 두면 아래 경로를 함께 고친다.
+#
+# - 단일 프로세스: PGlite 는 한 데이터 디렉터리를 한 프로세스만 연다. 같은 데이터 폴더로 두 번째 인스턴스·`pnpm worker`·`pnpm export` 를
+#   동시에 돌리지 않는다(잠금 때문에 실패한다). 주기 작업은 web 안 타이머(WORKER_INLINE_INTERVAL_SECONDS)가 맡는다 — 별도 timer unit 없음.
+# - 비밀은 EnvironmentFile 에만(소유자 root, 권한 600). systemd 가 root 로 읽은 뒤 서비스 사용자로 넘긴다. 저장소·로그에 값을 두지 않는다.
+
+[Unit]
+Description=Content Studio web (Next.js, inline worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=content-studio
+Group=content-studio
+WorkingDirectory=/srv/content-studio/app
+
+Environment=NODE_ENV=production
+Environment=TZ=UTC
+Environment=NEXT_TELEMETRY_DISABLED=1
+# 비밀·설정(placeholder 는 deploy/content-studio.env.example). chown root:root, chmod 600.
+EnvironmentFile=/etc/content-studio/env
+
+# pnpm·corepack 을 거치지 않고 Node 로 직접 실행한다(apps/web/scripts/next.mjs = 텔레메트리 끔 + SIGTERM 전달).
+# Node 경로는 설치 방법에 맞춘다(`command -v node`). 127.0.0.1 에서만 듣는다 — 외부 노출은 Caddy 만.
+ExecStart=/usr/bin/node apps/web/scripts/next.mjs start --hostname 127.0.0.1 --port 3000
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# ---- 보호 설정(데이터 폴더·.next 만 쓰기 허용) ----
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/content-studio/data /srv/content-studio/app/.next
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# MemoryDenyWriteExecute 는 켜지 않는다 — V8 JIT·WebAssembly(PGlite)가 쓰기+실행 메모리를 쓴다.
+# SystemCallFilter=@system-service 는 실제 서버에서 시작·tick·export 를 확인한 뒤 켤지 정한다(미검증).
+
+[Install]
+WantedBy=multi-user.target

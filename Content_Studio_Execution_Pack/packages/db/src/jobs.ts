@@ -30,6 +30,7 @@ import {
   decideRetryAt,
   DEFAULT_LEASE_TTL_MS,
   FREE_RESUME_MAX,
+  isScheduleStale,
   LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
   requireSecretKeyring,
@@ -614,6 +615,16 @@ function inflightRateUnitsOf(rows: readonly RateInflightJob[], acc: typeof chann
   return total;
 }
 
+/** T21-P2: 이 작업을 사용자가 "재시도"(retryItem → unblock 이력)로 다시 대기열에 넣은 적이 있는가. 오래 지난 예약 판정에서만 부른다(드묾). */
+async function userRetriedJob(tx: DbOrTx, ownerId: string, jobId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ id: jobEvents.id })
+    .from(jobEvents)
+    .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, jobId), sql`${jobEvents.sanitizedDetails}->>'event' = 'unblock'`))
+    .limit(1);
+  return rows.length > 0;
+}
+
 /** 1단계(한 트랜잭션): 재검사 + SENDING + 전송 의도. 보낼 수 없으면 상태를 정하고 null. */
 async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRow, opts: JobRunOptions, now: Date): Promise<SendPlan | JobState | 'lease_lost'> {
   const ownerId = leased.ownerId;
@@ -652,6 +663,20 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         now,
         { ...CLEAR_LEASE, lastErrorCode: 'snapshot_stale' },
         'PLANNED',
+      );
+    }
+    // T21-P2(docs/07): 서버·작업 처리기가 오래 멈췄다 돌아온 뒤 오래 지난 예약을 자동으로 보내지 않는다 — 첫 전송(attempt 0)만, 보내지 않은 채 BLOCKED.
+    // 승인은 그대로 둔다(내용은 바뀌지 않았다). 사용자가 "재시도"로 확인하면(unblock 이력) 이 작업은 다시 판정하지 않는다.
+    if (job.attempt === 0 && isScheduleStale(item.scheduledAtUtc, now) && !(await userRetriedJob(tx, ownerId, job.id))) {
+      return settle(
+        tx,
+        ownerId,
+        job,
+        item,
+        'blocked',
+        { reason: 'schedule_stale', not_sent: true, late_minutes: Math.floor((now.getTime() - item.scheduledAtUtc!.getTime()) / 60_000) },
+        now,
+        { ...CLEAR_LEASE, lastErrorCode: 'schedule_stale' },
       );
     }
     const acc = await accountOf(tx, ownerId, item.channelAccountId);

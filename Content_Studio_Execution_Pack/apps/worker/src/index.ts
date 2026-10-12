@@ -9,7 +9,8 @@
  * - T11(D18): 배포 작업(채널 어댑터가 주어졌을 때만) — lease 만료 복구 → lease(최대 maxJobs) → 전송·원격 조회. 어댑터는 호출자가 넣는다
  *   (web·CLI: 모의 어댑터 레지스트리, 외부 호출 없음). worker 는 @cs/providers 에 의존하지 않는다.
  *
- * WORKER_MODE=inline(기본, M0–M2): web 프로세스 안에서 호출된다(로그인한 전사 목록 조회가 지연 실행 — T21-P3 부터 공개 /api/health 는 tick 을 돌리지 않는다).
+ * WORKER_MODE=inline(기본, M0–M2): web 프로세스 안에서 호출된다(로그인한 전사 목록 조회가 지연 실행 — T21-P3 부터 공개 /api/health 는 tick 을 돌리지 않는다.
+ * T21-P2: WORKER_INLINE_INTERVAL_SECONDS > 0 이면 web 안 타이머(apps/web/lib/inline-timer.ts)도 같은 경로로 주기 실행한다).
  * WORKER_MODE=separate + DB_DRIVER=pglite 는 거부한다 — PGlite 는 한 데이터 디렉터리에 한 연결만 허용하므로
  * web 과 별도 프로세스가 같은 DB 를 동시에 열 수 없다.
  */

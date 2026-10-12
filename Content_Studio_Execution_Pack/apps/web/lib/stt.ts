@@ -7,6 +7,7 @@ import { ensureMockOAuthReady, jobCredentials, oauthDeps } from './oauth';
 import { getChannelAdapters, getStorage, getWorkerTranscriber } from './server';
 
 /**
+ * 호출하는 곳: 로그인한 GET /api/transcription-jobs, T21-P2 주기 타이머(lib/inline-worker-timer.ts — WORKER_INLINE_INTERVAL_SECONDS > 0 일 때).
  * WORKER_MODE=inline 이면 tick 1회(업로드 만료 정리 + 모의 전사 한 단계 + T11 배포 작업 최대 5개 — 모의 어댑터, 외부 호출 없음).
  * separate 면 아무것도 하지 않는다.
  * FIX-T15(Codex review-T15 P1, docs/02): web 요청 안이므로 영상 업로드는 작업당 조각 1개(WEB_TICK_UPLOAD_SLICE)만 보내고 양보한다 — 남은 조각은

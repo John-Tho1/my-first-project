@@ -31,6 +31,26 @@ describe('loadConfig', () => {
     expect(loadConfig({ PUBLISH_MODE: '', LLM_MODE: '  ' }).PUBLISH_MODE).toBe('disabled');
   });
 
+  it('T21-P2: WORKER_INLINE_INTERVAL_SECONDS — 기본 0(끔), 0 또는 5~600 정수만, 오류에는 이름만(값 없음)', () => {
+    expect(loadConfig({}).WORKER_INLINE_INTERVAL_SECONDS).toBe(0);
+    expect(loadConfig({ WORKER_INLINE_INTERVAL_SECONDS: '' }).WORKER_INLINE_INTERVAL_SECONDS).toBe(0);
+    expect(loadConfig({ WORKER_INLINE_INTERVAL_SECONDS: '  ' }).WORKER_INLINE_INTERVAL_SECONDS).toBe(0);
+    for (const [raw, n] of [['0', 0], ['5', 5], ['30', 30], ['600', 600], ['0030', 30]] as const) {
+      expect(loadConfig({ WORKER_INLINE_INTERVAL_SECONDS: raw }).WORKER_INLINE_INTERVAL_SECONDS).toBe(n);
+    }
+    for (const bad of ['1', '4', '601', '3600', '-1', '1.5', '30s', 'abc', '99999', ' 30']) {
+      let msg = '';
+      try {
+        loadConfig({ WORKER_INLINE_INTERVAL_SECONDS: bad });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toContain('WORKER_INLINE_INTERVAL_SECONDS');
+      expect(msg).not.toContain(`: ${bad}`);
+    }
+  });
+
   it('memory:// DATABASE_URL 을 허용한다', () => {
     expect(loadConfig({ DATABASE_URL: 'memory://' }).DATABASE_URL).toBe('memory://');
   });

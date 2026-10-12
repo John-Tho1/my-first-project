@@ -343,3 +343,17 @@ describe('FIX-T14(Codex review-T14): 기록된 어댑터 해석·처리 지연 �
     }
   });
 });
+
+describe('T21-P2 isScheduleStale (docs/07 오래 지난 예약)', () => {
+  it('예약 없음 → false, 60분 이하 → false, 60분 초과 → true', async () => {
+    const { isScheduleStale, SCHEDULE_STALE_GRACE_MS } = await import('./jobs');
+    expect(SCHEDULE_STALE_GRACE_MS).toBe(60 * 60_000);
+    const at = new Date('2026-10-12T09:00:00.000Z');
+    expect(isScheduleStale(null, at)).toBe(false);
+    expect(isScheduleStale(at, new Date(at.getTime() - 60_000))).toBe(false); // 아직 예약 전
+    expect(isScheduleStale(at, at)).toBe(false);
+    expect(isScheduleStale(at, new Date(at.getTime() + SCHEDULE_STALE_GRACE_MS))).toBe(false); // 경계값
+    expect(isScheduleStale(at, new Date(at.getTime() + SCHEDULE_STALE_GRACE_MS + 1))).toBe(true);
+    expect(isScheduleStale(at, new Date(at.getTime() + 3 * 24 * 3600_000))).toBe(true);
+  });
+});

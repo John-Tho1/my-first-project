@@ -281,6 +281,8 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
   auth: '계정 인증 필요(자동 재시도 안 함)',
   execution_not_allowed: '실행 모드가 허용하지 않음',
   account_missing: '계정 없음',
+  // T21-P2(docs/07): 서버가 멈췄다 돌아온 뒤 예약 시각이 오래 지난 첫 전송 — 자동으로 보내지 않음(확인 후 재시도)
+  schedule_stale: '예약 시각이 오래 지나 자동으로 보내지 않음 — 확인 후 재시도',
   // T13: 연결 정보 차단(보내지 않음 — 다시 연결 뒤 재시도)
   credential_blocked: '계정 연결 만료·해제 — 다시 연결 필요(보내지 않음)',
   credential_expired: '계정 연결 만료 — 다시 연결 필요(보내지 않음)',

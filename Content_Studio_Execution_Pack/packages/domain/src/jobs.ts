@@ -181,6 +181,20 @@ export const REMOTE_POLL_MAX = 20;
 export const RECONCILE_BASE_MS = 10_000;
 export const REMOTE_POLL_MS = 15_000;
 export const DEFAULT_LEASE_TTL_MS = 60_000;
+
+/**
+ * T21-P2(docs/07 장애별 처리 "서버/worker 종료 — 복구 뒤 오래 지난 예약을 자동 공개하지 않고 확인 요청"):
+ * 예약 항목의 **첫 전송**(전송 의도가 아직 한 번도 없는 작업)을 할 때 예약 시각이 이 시간보다 더 지났으면 보내지 않고 BLOCKED(schedule_stale)로 둔다.
+ * 사용자가 항목의 "재시도"(retryItem — 명시적 동작·감사 기록)로 확인하면 그 작업은 다시 판정하지 않는다.
+ * 60분은 잠정값이다(사용자 결정 대상): 주기 tick 상한(WORKER_INLINE_INTERVAL_SECONDS 최대 600초)과 재시도 대기보다 충분히 길고,
+ * "서버가 멈췄다 돌아온 경우"만 걸리게 한 값. 이미 한 번이라도 보낸 작업(attempt > 0 — 재시도·이어 올리기)은 이 규칙을 적용하지 않는다.
+ */
+export const SCHEDULE_STALE_GRACE_MS = 60 * 60_000;
+
+/** 예약 시각이 판정 시각보다 SCHEDULE_STALE_GRACE_MS 를 넘게 지났는가(예약 없음 → false, 경계값은 아직 오래되지 않음). */
+export function isScheduleStale(scheduledAtUtc: Date | null, now: Date): boolean {
+  return scheduledAtUtc !== null && now.getTime() - scheduledAtUtc.getTime() > SCHEDULE_STALE_GRACE_MS;
+}
 /**
  * FIX-T11 round 2(P1): 전송 의도 없이 lease 가 만료된 횟수의 한도(시도 한도 max_attempts 와 별개). 시도(attempt)는 전송 의도를 쓸 때만 센다.
  * 이 횟수가 한도에 이르면 보내지 않은 채 FAILED(lease_expired_before_intent) — 보내기 전에 되풀이해 죽는 작업이 끝없이 lease 되지 않게.

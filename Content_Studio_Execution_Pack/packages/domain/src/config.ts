@@ -32,6 +32,7 @@ const LABELS: Record<string, string> = {
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   COLLECTOR_SCHEDULER: 'COLLECTOR_SCHEDULER(주기 수집 실행)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
+  WORKER_INLINE_INTERVAL_SECONDS: 'WORKER_INLINE_INTERVAL_SECONDS(web 안 작업 처리기 주기, 초 — 0 또는 5~600)',
   AUTH_ALLOWED_IDENTITY: 'AUTH_ALLOWED_IDENTITY(허용 사용자)',
   AUTH_MODE: 'AUTH_MODE(인증 방식)',
   AUTH_SESSION_TTL_MINUTES: 'AUTH_SESSION_TTL_MINUTES(세션 유효 시간, 분)',
@@ -76,6 +77,10 @@ const decimalString = z.string().regex(/^\d{1,9}(\.\d{1,6})?$/);
  * (실제 단가는 0.004·0.02 수준 — 100 은 넉넉한 상한이고, 그래도 넘는 보고 비용은 db 층이 provider_unstorable 로 막는다.)
  */
 const priceString = decimalString.refine((v) => Number(v) <= 100);
+
+/** T21-P2: 주기 tick 간격(초)의 허용 범위(0 = 끔은 따로 허용). */
+export const INLINE_INTERVAL_MIN_SECONDS = 5;
+export const INLINE_INTERVAL_MAX_SECONDS = 600;
 
 export const configSchema = z.object({
   APP_BASE_URL: opt(z.url().default('http://localhost:3000')),
@@ -135,6 +140,20 @@ export const configSchema = z.object({
    */
   COLLECTOR_SCHEDULER: opt(z.enum(['off', 'on']).default('off')),
   WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),
+  /**
+   * T21-P2(T21_DEPLOY_REVIEW G3): WORKER_MODE=inline 일 때 web 프로세스 안에서 작업 처리기(tick)를 주기 실행하는 간격(초).
+   * 0(기본) = 끔 — 지금처럼 로그인한 요청(전사 목록 조회·"작업 처리 실행")에서만 처리한다. 개발·시험·운영 모두 기본은 끔이고 운영 환경 파일에서 명시적으로 켠다
+   * (deploy/README_KO.md 권장 30). 켜면 5 ~ 600 — 상한 10분은 오래 지난 예약 판정(SCHEDULE_STALE_GRACE_MS, 60분)보다 충분히 작게 둔 것이다.
+   * 직전 tick 이 끝난 뒤 이 간격만큼 쉬고 다음 tick 을 시작한다(겹치지 않음, 고정 간격·흔들림 없음).
+   */
+  WORKER_INLINE_INTERVAL_SECONDS: opt(
+    z
+      .string()
+      .regex(/^\d{1,4}$/)
+      .transform(Number)
+      .pipe(z.int().refine((v) => v === 0 || (v >= INLINE_INTERVAL_MIN_SECONDS && v <= INLINE_INTERVAL_MAX_SECONDS)))
+      .default(0),
+  ),
   AUTH_ALLOWED_IDENTITY: opt(z.string().min(3).default('owner@example.local')),
   /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T13, 미구현 → 로그인 거부). */
   AUTH_MODE: opt(z.enum(['dev', 'oidc']).default('dev')),

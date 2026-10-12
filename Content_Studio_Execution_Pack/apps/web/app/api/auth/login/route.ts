@@ -19,6 +19,7 @@ import {
   LoginDeniedError,
   loginInputSchema,
   LoginRateLimitedError,
+  LoginSequenceExhaustedError,
   OidcNotConfiguredError,
   sessionTtlMs,
 } from '@cs/domain';
@@ -59,6 +60,7 @@ function loginErrorCode(e: unknown): string {
   if (e instanceof DevLoginNotAllowedError) return 'not_allowed';
   if (e instanceof DevLoginRefusedInProductionError) return 'production_dev';
   if (e instanceof LoginRateLimitedError) return 'rate_limited';
+  if (e instanceof LoginSequenceExhaustedError) return 'server';
   if (e instanceof CsrfError) return 'csrf';
   if (e instanceof AppError) return 'invalid';
   return 'server';

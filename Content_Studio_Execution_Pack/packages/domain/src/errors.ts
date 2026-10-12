@@ -135,6 +135,15 @@ export class DevLoginRefusedInProductionError extends AppError {
 }
 
 /**
+ * FIX3-T21P1A: 다음 로그인 순번이 읽을 수 있는 범위(10진 30자리)를 넘는다 → 503. 읽을 수 없는 순번을 쓰지 않고 로그인을 거부한다(fail closed).
+ */
+export class LoginSequenceExhaustedError extends AppError {
+  constructor() {
+    super('service_unavailable', 'login_sequence_exhausted', '로그인 기록 순번이 한도에 도달해 로그인할 수 없습니다. 관리자 확인이 필요합니다');
+  }
+}
+
+/**
  * T21-P1a: 최근 실패한 로그인 시도가 상한을 넘었다 → 429. 입력한 식별자가 맞든 틀리든 같은 응답이다
  * (어떤 식별자가 허용되는지 드러내지 않음).
  */

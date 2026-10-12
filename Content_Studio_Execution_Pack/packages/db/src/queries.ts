@@ -4,7 +4,7 @@
  * 다른 owner 의 ID 를 넘기면 "없음(null)" 으로 응답한다(존재 여부를 구분해 드러내지 않음).
  */
 import { and, asc, count, desc, eq, gt, inArray, isNull, sql, type SQL } from 'drizzle-orm';
-import { isUuid } from '@cs/domain';
+import { isUuid, LoginSequenceExhaustedError } from '@cs/domain';
 import type { Db } from './client';
 import { assets, auditEvents, captures, sessions, users } from './schema';
 
@@ -348,7 +348,10 @@ export async function countRecentLoginFailures(
  * 로그인 순번: version_or_hash 가 10진 숫자(1~30자리)일 때만 numeric, 아니면 null.
  * FIX2-T21P1A: 15자리 제한(16자리부터 순번이 아닌 것으로 읽힘)과 JS Number 정밀도(2^53) 문제를 없애려고 numeric·문자열로 다룬다.
  */
-const seqOf = (col: SQL) => sql`(case when ${col} ~ '^[0-9]{1,30}$' then ${col}::numeric end)`;
+/** 순번으로 읽는 범위(SQL·JS 같은 규칙). */
+const LOGIN_SEQ_PATTERN = '^[0-9]{1,30}$';
+const LOGIN_SEQ_RE = new RegExp(LOGIN_SEQ_PATTERN);
+const seqOf = (col: SQL) => sql`(case when ${col} ~ ${LOGIN_SEQ_PATTERN} then ${col}::numeric end)`;
 const loginSeqExpr = seqOf(sql`${auditEvents.versionOrHash}`);
 
 /** 전역 로그인 판정 잠금 키(제한이 전역이므로 키도 하나). */
@@ -382,6 +385,10 @@ export async function withLoginAttemptLock<T>(
       .select({ next: sql<string>`(coalesce(max(${loginSeqExpr}), 0) + 1)::text` })
       .from(auditEvents)
       .where(inArray(auditEvents.action, ['auth.login', 'auth.login_denied']));
-    return fn(tx, { now, failures, seq: m?.next ?? '1' });
+    const seq = m?.next ?? '1';
+    // FIX3-T21P1A: 다음 순번이 seqOf 가 읽는 범위(1~30자리)를 넘으면 쓰지 않고 거부한다 — 읽을 수 없는 순번을 쓰면 순서·횟수 계산에서
+    // 빠져(같은 순번 반복) 제한이 풀린다. 던지면 트랜잭션이 되돌려져 세션·감사 행이 남지 않는다. 복원 행의 범위 밖 순번은 seqOf 가 null 로 본다.
+    if (!LOGIN_SEQ_RE.test(seq)) throw new LoginSequenceExhaustedError();
+    return fn(tx, { now, failures, seq });
   });
 }

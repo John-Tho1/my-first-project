@@ -8,6 +8,7 @@ import type { AssetRow, VariantState } from '@cs/db';
 import { CHANNEL_LABEL, CHANNELS, editableMetadata, formatMsk, VARIANT_BODY_MAX, VARIANT_ROLES, type Channel } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { preview } from '../../../lib/labels';
+import { assistModeText, isMockResult, resultLabel, type LlmMode } from '../../../lib/ai-labels';
 
 const LIFECYCLE: Record<string, string> = { draft: '초안', review: '검토 중', approved: '승인됨' };
 const ROLE_LABEL: Record<string, string> = { image: '이미지', video: '영상', thumbnail: '썸네일', attachment: '첨부' };
@@ -23,6 +24,7 @@ export function VariantsPanel({
   newPackageId,
   contentTitle,
   planByVariant,
+  llmMode,
 }: {
   contentId: string;
   coreVersion: number;
@@ -36,7 +38,10 @@ export function VariantsPanel({
   contentTitle: string;
   /** T10: 파생본 id → 가장 최근 배포 계획 id */
   planByVariant: Map<string, string>;
+  /** LIVE-UI: 설정의 LLM_MODE — AI 초안 버튼 문구 */
+  llmMode: LlmMode;
 }) {
+  const modeText = assistModeText(llmMode);
   const byChannel = new Map(states.map((s) => [s.variant.channel, s]));
   return (
     <section className="card archive" id="variants" aria-labelledby="variants-title">
@@ -168,7 +173,9 @@ export function VariantsPanel({
             {s?.proposal ? (
               <div className="assist-run">
                 <p className="notice" role="note">
-                  {MOCK_WARNING} — AI 초안(모의, 버전 {s.proposal.version})은 채택하기 전까지 현재 초안이 아닙니다.
+                  {isMockResult({ createdBy: s.proposal.createdBy }) ? `${MOCK_WARNING} — ` : ''}
+                  {resultLabel('초안', isMockResult({ createdBy: s.proposal.createdBy }))}(버전 {s.proposal.version})은 채택하기 전까지 현재 초안이
+                  아닙니다.
                 </p>
                 <pre className="raw-text">{preview(s.proposal.body, 400)}</pre>
                 <form className="form inline" method="post" action={`/api/variants/${s.variant.id}/adopt/${s.proposal.id}`}>
@@ -192,7 +199,7 @@ export function VariantsPanel({
               <input type="hidden" name="channel" value={ch} />
               <input type="hidden" name="base_version" value={coreVersion} />
               <input type="hidden" name="mode" value="ai_draft" />
-              <button type="submit">AI 초안(모의)</button>
+              <button type="submit">{modeText.variantButton}</button>
             </form>
           </div>
         );

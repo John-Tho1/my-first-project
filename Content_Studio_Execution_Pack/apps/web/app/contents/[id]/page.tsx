@@ -195,6 +195,7 @@ export default async function ContentPage({
             proposal={proposal}
             answeredCount={Number.isInteger(Number(str(q.answered))) && str(q.answered) !== undefined ? Number(str(q.answered)) : null}
             confirmedCount={str(q.confirmed) !== undefined ? Number(str(q.confirmed)) : null}
+            llmMode={config.LLM_MODE}
           />
 
           <VariantsPanel
@@ -207,6 +208,7 @@ export default async function ContentPage({
             editError={err && VARIANT_EDIT_ERROR_CODES.has(str(q.error)!) ? err : null}
             contentTitle={c.title}
             planByVariant={planByVariant}
+            llmMode={config.LLM_MODE}
             newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}
           />
 

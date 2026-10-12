@@ -23,6 +23,7 @@ import {
   type BrandTone,
 } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
+import { assistModeText, failedSettlementLabel, isMockResult, resultLabel, usageSourceLabel, type LlmMode } from '../../../lib/ai-labels';
 import { DiffView } from '../../../lib/diff-view';
 import { proposalActions } from '../../../lib/proposals';
 
@@ -54,6 +55,7 @@ export function WritingPanel({
   proposal,
   answeredCount,
   confirmedCount,
+  llmMode,
 }: {
   contentId: string;
   title: string;
@@ -65,7 +67,10 @@ export function WritingPanel({
   proposal: ProposalView | null;
   answeredCount: number | null;
   confirmedCount: number | null;
+  /** LIVE-UI: 설정의 LLM_MODE — 요청 버튼·안내 문구를 실제 모드에 맞춘다 */
+  llmMode: LlmMode;
 }) {
+  const modeText = assistModeText(llmMode);
   const { brand, answers } = state;
   const answerByKey = new Map(answers.map((a) => [a.questionKey, a]));
   const answerIds = answers.map((a) => a.id).sort();
@@ -131,7 +136,7 @@ export function WritingPanel({
       <section className="card archive" id="assist" aria-labelledby="assist-title">
         <h3 id="assist-title">AI 작성 보조</h3>
         <p className="notice" role="note">
-          {MOCK_WARNING} — 지금은 모의 AI 만 동작합니다(결정 D7). 제안은 현재 본문을 바꾸지 않고 &quot;AI 제안&quot; 버전으로만 저장됩니다.
+          {modeText.notice}
         </p>
         {brand ? (
           <p className="meta">
@@ -173,7 +178,9 @@ export function WritingPanel({
                 </option>
               ))}
             </select>
-            <button type="submit">모의 제안 만들기 (버전 {current.version} 기준)</button>
+            <button type="submit">
+              {modeText.assistButton} (버전 {current.version} 기준)
+            </button>
           </form>
         ) : null}
         <p className="note">
@@ -181,7 +188,7 @@ export function WritingPanel({
           고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있습니다. 서버가 자동으로 거부하는 것(제안 전체를 저장하지 않음, 실패로
           기록, 본문 그대로): 글 속 URL·도메인·IP 주소 모양 표기, 범위 밖 번호 인용, AI 가 허용 목록 밖 출처로 적었다가 버려진 문구. 그 밖의 일반 문헌
           제목·기관명(예: &quot;OO연구소 보고서에 따르면&quot;)은 <strong>자동으로 검증되지 않습니다</strong> — 아래 주장에 &quot;출처 미검증 · 사용자 확인
-          필요&quot;로 표시되니 직접 확인하세요. 본문에 URL 이 있으면 모의 제안도 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
+          필요&quot;로 표시되니 직접 확인하세요. 본문에 URL 이 있으면 제안이 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
         </p>
 
         {run ? (
@@ -199,9 +206,11 @@ export function WritingPanel({
                 <span>
                   비용({ledger.currency}): 예약 {ledger.reservedAmount}
                   {ledger.actualAmount !== null ? ` · 실제 ${ledger.actualAmount}` : ' · 확정 전'}
-                  {ledger.failed ? ' · 실패(예약액 전체 반영)' : ''}
+                  {ledger.failed ? ` · ${failedSettlementLabel(ledger.pricingSnapshot)}` : ''}
                 </span>
-                {ledger.tokensIn !== null ? <span>토큰 입력 {ledger.tokensIn} · 출력 {ledger.tokensOut}(추정)</span> : null}
+                {ledger.tokensIn !== null ? <span>
+                    토큰 입력 {ledger.tokensIn} · 출력 {ledger.tokensOut}({usageSourceLabel(ledger.pricingSnapshot)})
+                  </span> : null}
                 {(ledger.pricingSnapshot as { priced?: boolean }).priced === false ? <span>가격 미설정(모의 0)</span> : null}
               </p>
             ) : null}
@@ -222,7 +231,7 @@ export function WritingPanel({
             {proposal ? (
               <>
                 <h4>
-                  제안(<Link href={`/contents/${contentId}/versions/${proposal.version}`}>버전 {proposal.version}</Link>, AI 제안(모의)) — 현재 본문(버전{' '}
+                  제안(<Link href={`/contents/${contentId}/versions/${proposal.version}`}>버전 {proposal.version}</Link>, {resultLabel('제안', isMockResult({ provider: run.provider }))}) — 현재 본문(버전{' '}
                   {current.version}) 과 비교
                 </h4>
                 <DiffView lines={diffLines(current.body, proposal.body)} label="현재 본문 → AI 제안 차이" />

@@ -229,6 +229,7 @@ describe('describeTickError (FIX1-T21P2 P0 :53 — 허용 목록만)', () => {
     expect(describeTickError(new RangeError('secret'))).toBe('RangeError');
     expect(describeTickError(Object.assign(new Error('secret'), { code: 'ECONNRESET' }))).toBe('Error(ECONNRESET)');
     expect(describeTickError(Object.assign(new Error('secret'), { code: 'job_state_changed' }))).toBe('Error(job_state_changed)');
+    for (const code of ['EROFS', 'ENOSPC', 'EACCES', 'EPERM', 'EIO', 'EDQUOT']) expect(describeTickError(Object.assign(new Error('secret'), { code }))).toBe(`Error(${code})`);
     expect(describeTickError(Object.assign(new Error('secret'), { code: 'x'.repeat(65) }))).toBe('Error');
     expect(describeTickError(Object.assign(new Error('m'), { name: 'bad name with secret' }))).toBe('UnknownError');
     expect(describeTickError(42)).toBe('NonErrorThrown');

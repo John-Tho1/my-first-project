@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Content Studio — 지정한 커밋을 서버에서 빌드한다(T21-P2 · FIX1, 실제 서버에서 실행한 적 없음 — bash -n 만 확인).
+# Content Studio — 지정한 커밋을 서버에서 빌드한다(T21-P2 · FIX1 · FIX2, 실제 서버에서 실행한 적 없음 — bash -n·로컬 stub 시험만).
 # 사용(서비스 사용자로, 서비스를 멈춘 뒤):
 #   sudo systemctl stop content-studio
 #   sudo -u content-studio -H bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/build-release.sh <40자리 SHA>
+#   처음 설치(아직 unit 을 등록하지 않음): ... build-release.sh --first-install <40자리 SHA>
 # 어느 단계든 실패하면 즉시 멈추고 0 이 아닌 종료 코드로 끝난다(이전 코드를 빌드하는 일이 없게).
 # 경로: 저장소 루트(git checkout) = CS_REPO_ROOT(기본 /srv/content-studio/repo), 앱 루트 = <저장소 루트>/Content_Studio_Execution_Pack.
 set -euo pipefail
 umask 022
+CS_SCRIPT_TAG=build-release
+# shellcheck source=lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
-die() {
-  echo "[build-release] 실패: $*" >&2
-  exit 1
-}
-
-[[ $# -eq 1 ]] || die "인수는 커밋 SHA 하나(40자리 16진수)입니다"
+FIRST_INSTALL=0
+if [[ "${1:-}" == "--first-install" ]]; then
+  FIRST_INSTALL=1
+  shift
+fi
+[[ $# -eq 1 ]] || die "인수는 [--first-install] <커밋 SHA(40자리 16진수)> 입니다"
 SHA="$1"
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || die "SHA 는 40자리 소문자 16진수여야 합니다(짧은 SHA·브랜치 이름 금지)"
 
@@ -22,9 +26,8 @@ APP_ROOT="$REPO_ROOT/Content_Studio_Execution_Pack"
 SERVICE_USER="${CS_SERVICE_USER:-content-studio}"
 
 [[ "$(id -un)" == "$SERVICE_USER" ]] || die "서비스 사용자($SERVICE_USER)로 실행하세요"
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet content-studio; then
-  die "content-studio 서비스가 실행 중입니다 — 먼저 멈추세요(실행 중인 서버가 읽는 .next 를 덮어쓰지 않게)"
-fi
+# FIX2-T21P2: systemd 가 멈춤(inactive/failed)을 확인해 줄 때만 진행 — 조회 실패·systemctl 없음·activating 등은 중단(lib/common.sh)
+require_service_stopped content-studio.service "$FIRST_INSTALL"
 [[ -d "$REPO_ROOT/.git" ]] || die "저장소 루트가 아닙니다: $REPO_ROOT"
 
 cd "$REPO_ROOT"

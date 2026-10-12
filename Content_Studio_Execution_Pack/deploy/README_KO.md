@@ -44,13 +44,18 @@ test -f /srv/content-studio/repo/Content_Studio_Execution_Pack/pnpm-workspace.ya
 - 방화벽: 22 = 사용자 IP 만, 80·443 공개. **3000 은 열지 않는다**(web 은 127.0.0.1 에서만 듣는다).
 
 ## 3. 빌드(지정 SHA)
-`deploy/scripts/build-release.sh` 를 쓴다. `set -euo pipefail` 로 어느 단계든 실패하면 바로 멈추고, 아래를 순서대로 확인한다: 인수가 40자리 SHA → 서비스 사용자로 실행 → 서비스가 멈춰 있음 → 추적 파일 변경 없음 → `git fetch` → 커밋 존재 → `git checkout --detach <SHA>` → **`git rev-parse HEAD` 가 요청 SHA 와 같음** → 앱 루트에 `.env`·`.env.local` 없음 → `pnpm install --frozen-lockfile` → `pnpm build` → `apps/web/.next/BUILD_ID` 존재.
+`deploy/scripts/build-release.sh` 를 쓴다. `set -euo pipefail` 로 어느 단계든 실패하면 바로 멈추고, 아래를 순서대로 확인한다: 인수가 40자리 SHA → 서비스 사용자로 실행 → **systemd 가 조회에 성공하고 `inactive`/`failed` 라고 답함**(조회 실패·systemctl 없음·`active`·`activating`·`deactivating`·`reloading` 이면 중단, FIX2) → 추적 파일 변경 없음 → `git fetch` → 커밋 존재 → `git checkout --detach <SHA>` → **`git rev-parse HEAD` 가 요청 SHA 와 같음** → 앱 루트에 `.env`·`.env.local` 없음 → `pnpm install --frozen-lockfile` → `pnpm build` → `apps/web/.next/BUILD_ID` 존재.
 
 ```sh
-sudo systemctl stop content-studio 2>/dev/null || true     # 처음 설치 때는 서비스가 없다
+# 처음 설치(아직 content-studio.service 를 등록하지 않음): unit 이 없음이 확인될 때만 진행
+sudo -u content-studio -H bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/build-release.sh --first-install <40자리 SHA>
+
+# 그 뒤(업그레이드·되돌리기): 먼저 멈추고 빌드
+sudo systemctl stop content-studio
 sudo -u content-studio -H bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/build-release.sh <40자리 SHA>
 echo "exit=$?"                                              # 0 이 아니면 멈춘다(이전 빌드를 그대로 시작하지 않는다)
 ```
+- `--first-install` 은 `systemctl show` 가 unit 을 `not-found` 로 답하고 `systemctl list-unit-files` 가 **성공**했으며 목록에 `content-studio.service` 가 **없을** 때만 통한다. 이미 등록된 뒤에는 쓰면 중단된다.
 - 스크립트는 checkout 한 SHA 의 저장소 안에 있으므로, 처음에는 위 §2 의 clone 결과(기본 브랜치)에 있는 스크립트가 돈다. 스크립트 자체를 바꾼 SHA 로 올릴 때는 그 SHA 를 먼저 checkout 한 뒤 다시 실행한다.
 - 빌드에는 비밀이 필요 없다. 출력 마지막 줄 `BUILD_OK sha=…` 와 종료 코드를 기록한다.
 
@@ -64,6 +69,7 @@ sudo bash "$APP_ROOT/deploy/scripts/check-env.sh"           # 파일 존재·roo
 ```
 - 예시 파일은 placeholder 뿐이다. 실제 도메인·키는 이 파일에만 둔다(저장소·대화·로그 금지).
 - 고정 설정(게시·수집·OAuth live·LLM live 끔, `AUTH_MODE=oidc`)은 승인 없이 바꾸지 않는다. `check-env.sh` 가 어긋나면 종료 코드 1 이다.
+- 환경 파일 문법은 좁게 제한한다(FIX2 — 검사기와 systemd 가 다르게 읽지 않게): 빈 줄, `#` 로 시작하는 주석 줄, `KEY=값`(대문자 KEY, 줄 맨 앞, `=` 주변 공백 없음, 값에 따옴표·역슬래시·`$`·앞뒤 공백 없음) 뿐이고 같은 KEY 는 한 번만. `export`·앞 공백·연속 행(줄 끝 ``)·CRLF 는 `check-env.sh` 가 거부한다. 데이터 경로는 `..`·심볼릭 링크를 해석한 실제 위치가 `/srv/content-studio/data` 아래여야 한다.
 - 환경 파일이 없으면 systemd 가 서비스를 시작하지 않는다(`EnvironmentFile=` 에 `-` 를 붙이지 않았다).
 - `WORKER_INLINE_INTERVAL_SECONDS`: 0(끔) 또는 5~600 초. 0 이면 예약 작업·업로드 24시간 만료 정리·`RETENTION_SWEEP_MODE=auto`·주기 수집이 로그인한 요청이 있을 때만 진행되고, 서버 시작 로그에 경고가 남는다.
 
@@ -125,15 +131,22 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 
 ## 8. 되돌리기
 - **코드만 되돌리지 않는다.** 새 migration 이 이미 적용된 DB 를 이전 코드로 열면 안 된다(지원하지 않음).
-- 순서: 서비스 정지 → `build-release.sh <이전 SHA>` → 데이터 폴더를 §7-2 사본으로 교체 → 시작 → §5 확인.
+- 순서: 서비스 정지 → `build-release.sh <이전 SHA>` → 데이터를 §7-2 사본으로 되돌림 → `check-env.sh` → 시작 → §5 확인.
+- 데이터 되돌리기는 `deploy/scripts/restore-data.sh` 로 한다. FIX2(Codex P1 README:132): `/srv/content-studio/data` 가 **볼륨 마운트 지점**이면 `mv` 가 "Device or resource busy" 로 실패하므로 스크립트가 `mountpoint -q` 로 먼저 구분한다.
+
+| 데이터 폴더 | 스크립트 동작 |
+| --- | --- |
+| 일반 폴더(같은 디스크) | 지금 폴더를 `data.replaced-<UTC 시각>` 으로 옮긴 뒤(mv) 사본을 푼다 |
+| 마운트 지점(볼륨) | 폴더(마운트)는 그대로 두고 **안의 내용만** 지운 뒤 사본을 같은 자리에 푼다 — mv 하지 않음 |
+| 공통 | root·서비스 정지 확인(조회 실패면 중단) → 사본 안 경로가 모두 `data/` 아래인지 확인 → 바꾸기 전 지금 내용을 `/srv/content-studio-backup/data-before-restore-<시각>.tar.gz`(600)로 남김 → 풀기 → 소유자 `content-studio`·700. `mountpoint` 명령이 없거나 오류면 중단(일반 폴더로 가정하지 않음) |
+
   ```sh
   set -eu
   sudo systemctl stop content-studio
-  sudo mv /srv/content-studio/data "/srv/content-studio/data.failed-$(date -u +%Y%m%dT%H%M%SZ)"
-  sudo tar -C /srv/content-studio -xzf /srv/content-studio-backup/<사본 파일 이름>.tar.gz
-  sudo chown -R content-studio:content-studio /srv/content-studio/data
-  sudo chmod 700 /srv/content-studio/data
+  sudo bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/restore-data.sh /srv/content-studio-backup/<사본 파일 이름>.tar.gz
   ```
+- **복원 도중 실패하면**(풀기 중 디스크 부족 등): 서비스는 정지 상태 그대로 둔다. 스크립트가 바꾸기 전에 남긴 `/srv/content-studio-backup/data-before-restore-<시각>.tar.gz` 를 인자로 `restore-data.sh` 를 다시 실행하면 복원 직전 상태로 돌아간다. 그 뒤 원인(공간·권한)을 해결하고 원하는 사본으로 다시 시도한다.
+- **공급자 볼륨 스냅숏**으로 되돌릴 때(마운트 구성에서 선택): 서비스 정지 → 공급자 화면·CLI 로 데이터 볼륨을 업그레이드 전 스냅숏으로 복구(볼륨 분리·재연결이 필요하면 그 절차대로, 마운트 경로는 `/srv/content-studio/data` 유지) → `findmnt /srv/content-studio/data` 로 마운트 확인 → 시작. 스냅숏은 서비스가 멈춘 상태에서 만든 것만 쓴다(실행 중 스냅숏은 PGlite 일관성 미보장). 공급자 절차는 공급자를 정한 뒤 기록한다(미정).
 - 정지 상태 사본이 없으면: 이전 SHA + 빈 데이터 폴더로 시작 → export ZIP 을 복원(`/ops` 복원 미리보기 → `empty_only` 확정). 원격 SNS 게시물은 없다(게시 disabled).
 
 ## 9. 운영 중 확인
@@ -142,7 +155,7 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 - 백업 나이(24시간)는 `/ops` 에 표시된다. 자동 일별 export 는 없다.
 
 ## 10. 하지 않은 것·남은 위험
-- 실제 서버·Caddy·systemd·인증서·방화벽에서 한 번도 실행하지 않았다. unit 의 보호 설정(`ProtectSystem=strict`·`ReadWritePaths`)이 PGlite·Next 와 맞는지 실측하지 않았다 — 처음 시작 때 `journalctl` 로 확인한다. `SystemCallFilter` 는 넣지 않았다. shellcheck 는 이 PC 에 없어 돌리지 않았다(bash -n 만).
+- 실제 서버·Caddy·systemd·인증서·방화벽에서 한 번도 실행하지 않았다. 스크립트는 `deploy/scripts/tests/run-all.sh`(가짜 systemctl·mountpoint·id 로 동작 확인, pnpm 불필요)로만 시험했다. unit 의 보호 설정(`ProtectSystem=strict`·`ReadWritePaths`)이 PGlite·Next 와 맞는지 실측하지 않았다 — 처음 시작 때 `journalctl` 로 확인한다. `SystemCallFilter` 는 넣지 않았다. shellcheck 는 이 PC 에 없어 돌리지 않았다(bash -n 만).
 - CSP 헤더 없음(Next 인라인 스크립트 nonce 필요). 프록시 수준 요청 제한(rate limit) 없음 — 로그인 횟수 제한은 앱(T21-P1a/b)에 있다.
 - 주기 처리는 웹 요청과 같은 프로세스에서 돈다. 부하에서의 응답 지연은 측정하지 않았다(T21_DEPLOY_REVIEW §5-5).
 - 서버 밖 백업 위치는 아직 정하지 않았다(T21-P4).

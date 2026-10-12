@@ -14,6 +14,7 @@ import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 import {
+  appendVariantVersion,
   approveItems,
   closeDb,
   createContent,
@@ -28,6 +29,7 @@ import {
   runJobsTick,
   schema,
   seed,
+  setChannelAccountState,
   setVariantLifecycle,
   type Db,
 } from '@cs/db';
@@ -411,5 +413,79 @@ describe('FIX1-T21P2(Codex P1 jobs.ts:623): 오래 지난 예약 확인은 sched
     expect(r.recovered).toBeGreaterThanOrEqual(1);
     expect(await jobRow(x.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale', attempt: 0 });
     expect(await intentsOf(x.jobId)).toHaveLength(0);
+  });
+});
+
+describe('FIX2-T21P2: 확인 뒤 다른 사유 차단의 lastErrorCode 일관성 · 계정/내용 변경이 확인을 무효화', () => {
+  const config = loadConfig({});
+  const tickAt = (o: Owner, at: Date) =>
+    runJobsTick(db, registry, { workerId: 'fix2-w', config, ownerId: o.id, clock: () => at, random: () => 0.5, submitTimeoutMs: 1500, maxJobs: 10 });
+  const lastEventDetails = async (jobId: string) =>
+    (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, jobId)).orderBy(asc(schema.jobEvents.eventSeq))).at(-1)!.sanitizedDetails as Record<string, unknown>;
+  const activeApprovals = async (itemId: string) =>
+    db.select().from(schema.approvals).where(and(eq(schema.approvals.distributionItemId, itemId), isNull(schema.approvals.revokedAt)));
+
+  /** 오래 지난 예약으로 막힌 뒤 사용자가 확인(재시도)한 상태를 만든다. */
+  async function confirmedStale(o: Owner) {
+    const x = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const late = new Date(x.scheduledAt!.getTime() + 5 * HOUR);
+    await tickAt(o, late);
+    expect((await jobRow(x.jobId)).lastErrorCode).toBe('schedule_stale');
+    await retryItem(db, o.id, x.itemId, late);
+    expect(await lastEventDetails(x.jobId)).toMatchObject({ event: 'unblock', stale_schedule_confirmed: true });
+    expect((await jobRow(x.jobId)).lastErrorCode).toBeNull(); // 재시도가 이전 코드를 지운다
+    return { ...x, late };
+  }
+
+  it('확인 뒤 원격 401(다른 사유)로 BLOCKED → lastErrorCode 는 그 사유(schedule_stale 아님), 그 재시도는 오래 지난 예약 확인으로 기록되지 않는다', async () => {
+    const o = await newOwner();
+    const x = await confirmedStale(o);
+    adapter.setScenario('auth');
+    await tickAt(o, new Date(x.late.getTime() + MIN));
+    const j = await jobRow(x.jobId);
+    expect(j).toMatchObject({ state: 'BLOCKED', attempt: 1 });
+    expect(j.lastErrorCode).not.toBeNull();
+    expect(j.lastErrorCode).not.toBe('schedule_stale');
+    expect(await lastEventDetails(x.jobId)).toMatchObject({ event: 'blocked', reason: 'auth' });
+    adapter.setScenario('success');
+    await retryItem(db, o.id, x.itemId, new Date(x.late.getTime() + 2 * MIN));
+    const unblock = await lastEventDetails(x.jobId);
+    expect(unblock).toMatchObject({ event: 'unblock', cause: 'user_retry' });
+    expect(unblock.stale_schedule_confirmed).toBeUndefined();
+    expect(unblock.previous_error).toBe(j.lastErrorCode);
+  });
+
+  it('확인 뒤 보내기 전 차단(승인 철회 — A10 즉시 BLOCKED)도 lastErrorCode=approval_revoked — 이전 schedule_stale 코드가 남지 않는다', async () => {
+    const o = await newOwner();
+    const x = await confirmedStale(o);
+    const [appr] = await activeApprovals(x.itemId);
+    await revokeApproval(db, o.id, appr!.id, 'test', new Date(x.late.getTime() + MIN));
+    await tickAt(o, new Date(x.late.getTime() + 2 * MIN));
+    expect((await jobRow(x.jobId)).lastErrorCode).toBe('approval_revoked');
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+  });
+
+  it('확인 뒤 배포 계정 상태 변경 → 승인 무효 → 확인으로 보내지 않음(전송 의도 0)', async () => {
+    const o = await newOwner();
+    const x = await confirmedStale(o);
+    await setChannelAccountState(db, o.id, o.accounts.threads, 'disconnected', new Date(x.late.getTime() + MIN));
+    expect(await activeApprovals(x.itemId)).toHaveLength(0);
+    await setChannelAccountState(db, o.id, o.accounts.threads, 'mock_ready', new Date(x.late.getTime() + 2 * MIN));
+    await tickAt(o, new Date(x.late.getTime() + 3 * MIN));
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+    expect(await pubsOf(x.itemId)).toHaveLength(0);
+    expect((await jobRow(x.jobId)).state).not.toBe('CONFIRMED');
+  });
+
+  it('확인 뒤 본문(내용 hash) 변경 → 승인 무효 → 확인으로 보내지 않음(전송 의도 0)', async () => {
+    const o = await newOwner();
+    const x = await confirmedStale(o);
+    const variantId = (await itemRow(x.itemId)).variantId;
+    await appendVariantVersion(db, o.id, variantId, { baseVersion: 1, body: '바꾼 글', metadata: { text: '바꾼 글', thread_parts: ['바꾼 글'] } }, new Date(x.late.getTime() + MIN));
+    expect(await activeApprovals(x.itemId)).toHaveLength(0);
+    await tickAt(o, new Date(x.late.getTime() + 2 * MIN));
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+    expect(await pubsOf(x.itemId)).toHaveLength(0);
+    expect((await jobRow(x.jobId)).state).not.toBe('CONFIRMED');
   });
 });

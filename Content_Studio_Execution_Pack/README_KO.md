@@ -130,7 +130,7 @@ T01은 앱 뼈대(web·worker·DB·모의 provider·가상 데이터)다. 외부
 corepack pnpm install --frozen-lockfile   # lockfile 고정 설치
 cp .env.example .env.local                # placeholder 만 있음. 기본값으로도 동작
 pnpm db:seed                              # migration + owner·brand profile·가상 소재 10건 (재실행해도 중복 없음)
-pnpm dev                                  # http://localhost:3000 , 상태: http://localhost:3000/api/health
+pnpm dev                                  # http://localhost:3000 , 생존: http://localhost:3000/api/health , 자세한 상태(로그인 뒤): /api/health/details
 ~~~
 `pnpm dev`는 첫 요청에서 migration을 자동 적용하므로 `db:seed` 없이도 뜬다(이때 화면에 `pnpm db:seed 를 실행하세요`가 보인다).
 
@@ -279,7 +279,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **허용 출처**: 작성실의 AI 작성 보조는 이 원고에 연결된 소재의 출처(source_version)만 근거로 넘긴다(`source_version_ids`, 그 밖이면 404). 입력 버전(`generation_runs.input_version_refs`)에 함께 고정된다.
 - **claim–근거**: 제안의 주장마다 `claims` 행(불변)과 허용 출처 연결 `claim_sources`(locator)가 남는다. AI 가 목록 밖 출처(만든 URL 등)를 내면 저장하지 않고 "출처 미확인"·확인 필요로만 표시한다. 경험 주장을 사용자가 확인하면 근거 등급이 "사용자 확인"으로 보인다(파생).
 - **비용 예약(A15)**: 호출 전 `usage_ledger` 에 예약(프롬프트 글자/3 토큰 추정 × 단가 + 출력 여유분), 호출 후 실제 사용량으로 확정. 이번 달(MSK) 합계 + 예약이 `LLM_BUDGET_MONTHLY_LIMIT` 또는 1회 예약이 `LLM_BUDGET_PER_RUN_MAX` 를 넘으면 429 `budget_exceeded`(아무것도 기록하지 않음). 실패한 호출은 예약액 전체를 비용으로 확정. 가격(`LLM_PRICE_*`)이 비어 있으면 모의는 0 으로 기록만, live 는 차단.
-- **live 경계**: `LLM_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`LLM_LIVE_APPROVAL_REF`)이 모두 있어도 T07 에는 어댑터가 없어 503 으로 거부된다(아무것도 기록하지 않음). `GET /api/health` 의 `llm.live_ready`(항상 false)와 `llm.missing`(빠진 조건 이름만), 설정 화면의 "AI 모드·비용"(이번 달 사용액/상한, live 준비 안 됨 목록)으로 확인한다.
+- **live 경계**: `LLM_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`LLM_LIVE_APPROVAL_REF`)이 모두 있어도 T07 에는 어댑터가 없어 503 으로 거부된다(아무것도 기록하지 않음). 로그인 뒤 `GET /api/health/details` 의 `llm.live_ready`(항상 false)와 `llm.missing`(빠진 조건 이름만), 설정 화면의 "AI 모드·비용"(이번 달 사용액/상한, live 준비 안 됨 목록)으로 확인한다.
 - migration `0008_t07_budget_claims`(claims·claim_sources·usage_ledger). 새 표는 내보내기·복원에 포함된다.
 
 ### 채널 초안·배포 파일 (M2, T09)
@@ -306,10 +306,10 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 - **업로드 세션(A14)**: 음성(MP3·M4A·WAV·WebM, 최대 200MB)·영상(MP4·WebM·MOV, 최대 2GB)을 4–8MiB 조각(기본 8MiB)으로 올린다. 끊기면 같은 세션을 `GET` 해 받은 위치(`next_index`)부터 이어 올린다. 화면은 먼저 파일 전체 sha256 을 계산해 세션에 신고하고(`sha256`), 이어 올릴 때는 신고 sha256·크기·이미 받은 조각별 sha256(`GET` 의 `chunks`)이 이 파일과 모두 같을 때만 재사용한다(다르면 새 세션). 같은 조각 재전송은 그대로(200), 다른 내용이면 409. 세션은 24시간 뒤 만료되고 worker 가 조각을 지운다.
 - **완료 검사**: 서버가 조각을 이어 붙이며(메모리에 전체를 올리지 않음) 크기·앞부분 형식 서명·sha256 을 확인한다. 통과하면 asset `VERIFIED`(`verification_scope=signature_size_checksum` — 재생 가능 여부·디코딩은 확인하지 않음). 실패하면 세션 rejected + 조각 삭제(415 형식, 400 크기·checksum).
-- **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(`/api/health`·전사 목록 조회 때). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
+- **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(로그인한 전사 목록 조회 `GET /api/transcription-jobs` 때 — 공개 `/api/health` 는 T21-P3 부터 tick 을 돌리지 않는다). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
 - **전사 본문**: 버전 불변. 수정은 새 버전(`base_version` 이 최신이 아니면 409). "이 버전을 소재로 보내기" → 소재(원문 = 전사 본문, 메모 "음성 전사(모의)").
 - **원음 보존**(기본 켬): 끄면 전사 성공 뒤 원본 파일을 지우고 `assets.deleted_at` 을 남긴다(다운로드 410, 채널 초안에 첨부된 파일은 지우지 않음). 내보내기에는 메타데이터만(`asset_deleted` 경고).
-- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). `GET /api/health` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름), 설정 화면 "AI 모드·비용"에서 확인. 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트)은 로그인 뒤 `GET /api/ops/summary` 의 `uploads`(내 폴더만, D30-3).
+- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). 로그인 뒤 `GET /api/health/details` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름), 설정 화면 "AI 모드·비용"에서 확인. 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트)은 로그인 뒤 `GET /api/ops/summary` 의 `uploads`(내 폴더만, D30-3).
 - **브라우저 녹음**: `/record` 는 `MediaRecorder` 지원 여부만 알려 준다(미지원 → "이 기기에서는 브라우저 녹음을 지원하지 않습니다 → 파일 업로드"). 녹음 기능은 기기 확인 뒤 추가(docs/01).
 
 | API | 설명 |
@@ -359,7 +359,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **승인 철회(A10)**: 재시도 대기 중 승인을 철회하면 **즉시** `BLOCKED`(항목은 `PLANNED` — 다시 승인 후 실행, T12 D19). 훅을 거치지 않은 변경도 다음 전송 직전 재검사가 `BLOCKED`(`approval_missing`)로 막고 새 전송 의도를 만들지 않는다.
 - **계획 상태**(T12 D19 에서 정리): 모두 확인 → `completed`, 확인 1개 이상 + 나머지 끝남·멈춤 → `partial`(부분 성공), 확인 없이 보류·불명·다시 승인할 항목 → `attention`(확인 필요), 모두 취소 → `canceled`, 실패·취소만 → `failed`.
 - **화면**: `/distribute/{id}` 항목 카드에 작업 상태 한 줄, `취소`·`재확인(조회만 — 다시 보내지 않음)` 버튼, 원격 결과(`MOCK` 배지 + **실제 발행 실적 아님**), 작업 이력 최근 10개. 계획 아래 `작업 처리 실행(모의 1회)`(내 작업 최대 5개).
-- **처리기 실행**: web(`WORKER_MODE=inline`)은 `/api/health` 호출마다 배포 작업을 최대 5개 처리한다. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
+- **처리기 실행**: web(`WORKER_MODE=inline`)은 로그인한 요청에서만 배포 작업을 처리한다 — 화면의 "작업 처리 실행"(`POST /api/worker/tick`, 내 작업 최대 5개)과 전사 목록 조회(`GET /api/transcription-jobs`, tick 1회·최대 5개). 공개 `/api/health` 는 T21-P3 부터 처리하지 않는다. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
 
 | API | 설명 |
 | --- | --- |
@@ -409,7 +409,8 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
   - `jobs`(작업 상태별 수)·`attention_plans`·`captures`(소재 수)는 내 DB 행만 센다.
   - `uploads` 는 업로드 임시 영역 중 **내 폴더**(세션 폴더·파일 수·바이트)를 요청마다 측정한다(읽기 실패면 null).
   - `disk` 는 이 PC 폴더 전체 측정(owner 구분 없음)이며 60초 동안 같은 측정값을 쓴다.
-- 공개 `GET /api/health` 는 생존·준비 상태만 낸다: `app, version, time_utc, time_msk, timezone, status, modes, llm·stt(모드·준비 여부·빠진 조건 이름), db{driver, ok, migrated}, worker{mode, last_tick_utc}`. 운영 숫자(위 목록, 작업 수·업로드 사용량·소재 수 포함)는 없다(D23(e)·D30-3). `WORKER_MODE=inline` 이면 호출마다 worker tick 1회는 그대로 실행한다.
+- 공개 `GET /api/health`(로그인 없음)는 **생존 여부만** 낸다: 정확히 `{status: ok|degraded, app, time_utc, db_ok}`(ok 200, degraded 503). 부작용이 없다 — worker tick 을 돌리지 않는다(T21-P3, T21_DEPLOY_REVIEW G4). 프록시는 이 경로만 외부에 열어도 된다.
+- 자세한 상태는 `GET /api/health/details`(**로그인 필요**, 없으면 401): `app, version, time_utc, time_msk, timezone, status, modes, llm·stt(모드·준비 여부·빠진 조건 이름), db{driver, ok, migrated}, worker{mode, last_tick_utc}`. 읽기 전용(tick 없음). 운영 숫자(위 목록, 작업 수·업로드 사용량·소재 수 포함)는 어느 health 에도 없다(D23(e)·D30-3).
 
 ### 계정 연결(모의)·비밀 보호 (M4, T13 — 로컬·모의 범위)
 결정 D24(docs/DECISIONS.md). **실제 Threads·Meta 연결 0, 외부 호출 0.** 실계정 연결(T14)은 사용자 승인 후.
@@ -527,7 +528,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 ### PGlite 단일 연결 주의
 - 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.
-- PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline`, `/api/health` 호출 시 tick 1회).
+- PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline` — 로그인한 "작업 처리 실행"·전사 목록 조회 때 tick. 공개 `/api/health` 는 tick 을 돌리지 않는다).
 - `pnpm dev`/`pnpm start`가 켜져 있는 동안 `pnpm db:seed`·`pnpm db:migrate`·`pnpm worker`는 잠금 파일(`data/pglite/.content-studio.lock`) 때문에 한국어 안내와 함께 exit 1로 거부된다. 서버를 끄고 실행한다.
 - `WORKER_MODE=separate`는 `DB_DRIVER=postgres`(M3 예정, 아직 미구현)에서만 허용된다.
 

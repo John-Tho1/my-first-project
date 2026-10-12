@@ -49,8 +49,9 @@ import {
 } from '@cs/domain';
 import { ClaudeLlmProvider, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as healthDetailsGET } from '../../apps/web/app/api/health/details/route';
 import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/route';
-import { cookieHeader, jsonPost, login } from './helpers';
+import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
 const KEY = 'sk-ant-FAKE-integration-sentinel-9a8b7c';
 const ECHO = 'UPSTREAM-ECHO-통합-원문-5d4c';
@@ -296,6 +297,8 @@ describe('route·health(서버 환경의 키, 가짜 fetch 는 전역 stub — �
     vi.unstubAllGlobals();
   };
   const ctx = (id: string) => ({ params: Promise.resolve({ id }) });
+  /** T21-P3(G4): llm 준비 상태는 로그인 뒤 GET /api/health/details 에만 있다. */
+  const healthDetails = () => healthDetailsGET(new Request(`${BASE}/api/health/details`, { headers: cookieHeader(tokenA) }), undefined);
 
   it('모두 갖추면 POST assist → 201 실제 provider(anthropic), mock_warning 없음, 응답에 키 없음 / health live_ready=true', async () => {
     const c = await createContent(db, ownerA, { title: 'route live', body: '라우트 본문.' });
@@ -313,8 +316,13 @@ describe('route·health(서버 환경의 키, 가짜 fetch 는 전역 stub — �
       expect(calls).toHaveLength(1);
       expect(calls[0]!.url).toBe('https://api.anthropic.com/v1/messages');
       expect(calls[0]!.headers.get('x-api-key') === KEY).toBe(true);
-      const h = await healthGET();
+      const h = await healthDetails();
+      expect(h.status).toBe(200);
       const htext = await h.text();
+      // T21-P3(G4): 공개 health 에는 llm 준비 상태가 없다(키·승인 기록 참조도 물론 없음)
+      const pub = await (await healthGET()).text();
+      expect(Object.keys(JSON.parse(pub)).sort()).toEqual(['app', 'db_ok', 'status', 'time_utc']);
+      expect(pub.includes(KEY)).toBe(false);
       expect(JSON.parse(htext).llm).toEqual({ mode: 'live', live_ready: true, missing: [] });
       expect(htext.includes(KEY)).toBe(false);
       expect(htext).not.toContain('D34-test-approval');
@@ -339,7 +347,7 @@ describe('route·health(서버 환경의 키, 가짜 fetch 는 전역 stub — �
       expect(JSON.parse(text).error).toBe('live_provider_not_configured');
       expect(text).toContain(name);
       expect(text).not.toContain('FAKE');
-      const h = await (await healthGET()).json();
+      const h = await (await healthDetails()).json();
       expect(h.llm).toEqual({ mode: 'live', live_ready: false, missing: [name] });
     } finally {
       reset();

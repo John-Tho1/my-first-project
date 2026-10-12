@@ -9,7 +9,7 @@
  * - T11(D18): 배포 작업(채널 어댑터가 주어졌을 때만) — lease 만료 복구 → lease(최대 maxJobs) → 전송·원격 조회. 어댑터는 호출자가 넣는다
  *   (web·CLI: 모의 어댑터 레지스트리, 외부 호출 없음). worker 는 @cs/providers 에 의존하지 않는다.
  *
- * WORKER_MODE=inline(기본, M0–M2): web 프로세스 안에서 호출된다(/api/health·전사 목록 조회가 지연 실행).
+ * WORKER_MODE=inline(기본, M0–M2): web 프로세스 안에서 호출된다(로그인한 전사 목록 조회가 지연 실행 — T21-P3 부터 공개 /api/health 는 tick 을 돌리지 않는다).
  * WORKER_MODE=separate + DB_DRIVER=pglite 는 거부한다 — PGlite 는 한 데이터 디렉터리에 한 연결만 허용하므로
  * web 과 별도 프로세스가 같은 DB 를 동시에 열 수 없다.
  */
@@ -104,7 +104,7 @@ export interface WorkerTickInput {
   /** T15(D27): 배포 작업이 올릴 미디어 파일 범위 읽기(로컬 저장소). 없으면 미디어가 필요한 어댑터는 원격 호출 없이 닫는다. */
   media?: MediaReader;
   /**
-   * FIX-T15(Codex review-T15 P1): 전송 실행 하나의 조각 예산. inline 모드(web 요청 안 — /api/health·목록 조회)는 WEB_TICK_UPLOAD_SLICE 를 넣어
+   * FIX-T15(Codex review-T15 P1): 전송 실행 하나의 조각 예산. inline 모드(web 요청 안 — 로그인한 목록 조회)는 WEB_TICK_UPLOAD_SLICE 를 넣어
    * 영상 전체를 한 요청에서 올리지 않는다(docs/02). 별도 worker 프로세스(CLI)는 넣지 않는다(제한 없음 — 시간 제한만).
    */
   uploadSlice?: JobRunOptions['uploadSlice'];

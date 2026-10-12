@@ -45,6 +45,7 @@ import {
 import { buildAssetKey, loadConfig, type AppConfig, type Channel } from '@cs/domain';
 import { createMockAdapterRegistry, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as healthDetailsGET } from '../../apps/web/app/api/health/details/route';
 import { POST as drillPOST } from '../../apps/web/app/api/ops/restore-drill/route';
 import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { POST as retentionPOST } from '../../apps/web/app/api/ops/retention/route';
@@ -378,8 +379,10 @@ describe('보존 정리', () => {
 const summary = (cookie: Record<string, string> = {}) => summaryGET(new Request(`${BASE}/api/ops/summary`, { headers: cookie }), undefined);
 const OPS_KEYS = ['account_health', 'attention_plans', 'backup_age_hours', 'captures', 'disk', 'disk_partial', 'jobs', 'pending_deletes', 'repeated_failures', 'uploads'];
 const JOB_KEYS = ['blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'unknown'];
-/** D30-3: 공개 /api/health 가 가질 수 있는 키 전부(생존·준비 상태만) */
-const HEALTH_KEYS = ['app', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
+/** D30-3·T21-P3(G4): 공개 /api/health 가 가질 수 있는 키 전부(생존 여부만) */
+const HEALTH_KEYS = ['app', 'db_ok', 'status', 'time_utc'];
+/** T21-P3: 로그인 뒤 GET /api/health/details 의 키(모드·준비 상태·DB·worker — 운영 숫자 없음) */
+const DETAIL_KEYS = ['app', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
 
 describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops 없음, GET /api/ops/summary 는 owner 범위', () => {
   it('공개 /api/health 는 ops 와 그 숫자 키를 내보내지 않는다', async () => {
@@ -443,15 +446,25 @@ describe('D30-3 남은 health 숫자도 로그인 뒤로: jobs·uploads·db.capt
   };
   const ownerCaptures = async (ownerId: string) => Number((await db.select({ n: count() }).from(schema.captures).where(eq(schema.captures.ownerId, ownerId)))[0]!.n);
 
-  it('공개 /api/health(ok) 는 생존·준비 키만 — jobs·uploads·db.captures·attention_plans 없음', async () => {
+  it('공개 /api/health(ok) 는 생존 키만 — jobs·uploads·db.captures·attention_plans 없음', async () => {
     const res = await healthGET();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Object.keys(body).sort()).toEqual(HEALTH_KEYS);
+    const text = JSON.stringify(body);
+    for (const k of ['jobs', 'uploads', 'captures', 'attention_plans', 'queued', 'retry_wait', 'sessions', 'bytes']) expect(text).not.toContain(`"${k}"`);
+  });
+
+  it('T21-P3: 로그인 뒤 GET /api/health/details 도 자세한 상태 키만 — 운영 숫자는 여전히 summary 에만', async () => {
+    as(A.identity);
+    const res = await healthDetailsGET(new Request(`${BASE}/api/health/details`, { headers: cookieHeader(A.token) }), undefined);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(DETAIL_KEYS);
     expect(Object.keys(body.db).sort()).toEqual(['driver', 'migrated', 'ok']);
     expect(Object.keys(body.worker).sort()).toEqual(['last_tick_utc', 'mode']);
     const text = JSON.stringify(body);
-    for (const k of ['jobs', 'uploads', 'captures', 'attention_plans', 'queued', 'retry_wait', 'sessions', 'bytes']) expect(text).not.toContain(`"${k}"`);
+    for (const k of ['jobs', 'uploads', 'captures', 'attention_plans', 'queued', 'retry_wait', 'sessions', 'bytes', 'ops']) expect(text).not.toContain(`"${k}"`);
   });
 
   it('summary: 세션 없음 401(jobs·uploads·captures 숫자 미노출)', async () => {

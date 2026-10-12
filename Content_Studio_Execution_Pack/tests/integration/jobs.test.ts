@@ -603,8 +603,16 @@ describe('API·owner·비밀 제거', () => {
       new Request(`${BASE}/api/worker/tick`, { method: 'POST', headers: { 'content-type': 'application/json', ...cookieHeader(token) }, body: '{}' }),
     );
     expect(noOrigin.status).toBe(403);
+    // T21-P3(G4): 세션 없는 tick·잘못된 세션 tick·공개 health 는 아무 작업도 건드리지 않는다(상태·이력 그대로)
+    const eventsBefore = [(await eventsOf(x.jobIds[0]!)).length, (await eventsOf(y.jobIds[0]!)).length];
     const anon = await tickPOST(jsonPost('/api/worker/tick', {}));
     expect(anon.status).toBe(401);
+    const forged = await tickPOST(jsonPost('/api/worker/tick', {}, cookieHeader('not-a-real-token')));
+    expect(forged.status).toBe(401);
+    for (let i = 0; i < 3; i++) expect((await healthGET()).status).toBe(200);
+    expect((await jobRow(x.jobIds[0]!)).state).toBe('QUEUED');
+    expect((await jobRow(y.jobIds[0]!)).state).toBe('QUEUED');
+    expect([(await eventsOf(x.jobIds[0]!)).length, (await eventsOf(y.jobIds[0]!)).length]).toEqual(eventsBefore);
     const bad = await tickPOST(jsonPost('/api/worker/tick', { max_jobs: 50 }, cookieHeader(token)));
     expect(bad.status).toBe(400);
     const res = await tickPOST(jsonPost('/api/worker/tick', { max_jobs: 5, worker_id: 'demo' }, cookieHeader(token)));
@@ -630,10 +638,11 @@ describe('API·owner·비밀 제거', () => {
     expect(typeof mine.ops.attention_plans).toBe('number');
     const theirs = await summary(await tokenFor(other));
     expect(theirs.ops.jobs).toMatchObject({ queued: 1, leased: 0, blocked: 0 });
-    // 공개 health 에는 작업 숫자가 없다(inline tick 이 other 의 작업을 처리할 수 있어 summary 확인 뒤에 부른다)
+    // 공개 health 에는 작업 숫자가 없다. T21-P3(G4): 공개 health 는 tick 을 돌리지 않으므로 other 의 작업은 그대로 QUEUED
     const hb = await (await healthGET()).json();
     expect(hb).not.toHaveProperty('jobs');
     expect(JSON.stringify(hb)).not.toContain('attention_plans');
+    expect((await jobRow(y.jobIds[0]!)).state).toBe('QUEUED');
   });
 
   it('HTML 폼: 취소·작업 처리 실행은 303 으로 계획 화면(canceled=1·ticked=n), 한 채널 취소 + 한 채널 확인 → partial', async () => {

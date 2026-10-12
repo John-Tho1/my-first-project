@@ -821,7 +821,7 @@ describe('DB 규칙·앱 경로', () => {
     expect(api.videosOf(acc.external)[0]!.sha256).toBe(v.checksum);
   });
 
-  it('FIX-T15 P1: inline worker(web 요청 안 — health·목록)도 같은 조각 예산(작업당 조각 1개)', async () => {
+  it('FIX-T15 P1: inline worker(web 요청 안 — 로그인한 목록 조회)도 같은 조각 예산(작업당 조각 1개)', async () => {
     // 실행 환경 설정(시험용 저장소 위치 — beforeAll 의 env)으로 web 과 같은 inline 경로를 부른다
     const live = loadConfig();
     expect(live.WORKER_MODE).toBe('inline');

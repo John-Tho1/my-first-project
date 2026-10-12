@@ -65,6 +65,9 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |
 | 복원 미리보기 | POST /api/restores/preview | 버전·checksum·충돌 검사 |
+| 생존 확인(공개 예외) | GET /api/health | 로그인 없음. 응답은 정확히 `{status:'ok'\|'degraded', app, time_utc, db_ok}`(ok 200, degraded 503). 부작용 없음(worker tick 안 돎). 모드·준비 상태·버전·DB 드라이버·worker 정보 없음(T21-P3) |
+| 자세한 상태 | GET /api/health/details | 로그인한 owner 만(없으면 401). 모드·llm/stt 준비 상태(빠진 조건 이름만)·DB 드라이버/migrated·worker 모드/마지막 tick. 읽기 전용(tick 없음). 운영 숫자는 GET /api/ops/summary |
+| 작업 처리 실행 | POST /api/worker/tick | 로그인·같은 출처(CSRF) 필수, 이 owner 의 작업만(모의 어댑터). 세션 없음 401 — 아무 작업도 건드리지 않음 |
 
 런타임 입력·출력 validation은 M0/M1에서 이 계약에 맞춰 구현한다.
 

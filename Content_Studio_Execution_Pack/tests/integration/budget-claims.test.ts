@@ -52,6 +52,7 @@ import {
 } from '@cs/domain';
 import { LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as healthDetailsGET } from '../../apps/web/app/api/health/details/route';
 import { POST as assistPOST } from '../../apps/web/app/api/contents/[id]/assist/route';
 import { assistResponse } from '../../apps/web/lib/writing';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
@@ -70,6 +71,8 @@ let tmp: string;
 const as = (identity: string) => vi.stubEnv('AUTH_ALLOWED_IDENTITY', identity);
 const ctx = (id: string) => ({ params: Promise.resolve({ id }) });
 const assist = (id: string, body: unknown) => assistPOST(jsonPost(`/api/contents/${id}/assist`, body, cookieHeader(tokenA)), ctx(id));
+/** T21-P3(G4): llm 준비 상태는 로그인 뒤 GET /api/health/details 에만 있다(공개 /api/health 는 생존 여부만). */
+const healthDetails = () => healthDetailsGET(new Request(`${BASE}/api/health/details`, { headers: cookieHeader(tokenA) }), undefined);
 
 const n = async (t: typeof schema.generationRuns | typeof schema.usageLedger | typeof schema.claims) =>
   (await db.select({ n: count() }).from(t))[0]!.n;
@@ -377,12 +380,17 @@ describe('live 경계(fail-closed, 외부 호출 0)', () => {
     expect(await counts(contentId)).toEqual(before);
   });
 
-  it('health: llm.live_ready=false, 빠진 조건 이름만(값 없음)', async () => {
+  it('health/details(로그인): llm.live_ready=false, 빠진 조건 이름만(값 없음) / 공개 health 에는 llm 자체가 없음', async () => {
     try {
       for (const [k, v] of Object.entries(FULL)) vi.stubEnv(k, k === 'LLM_LIVE_APPROVAL_REF' ? '' : v);
-      const res = await healthGET();
+      const res = await healthDetails();
+      expect(res.status).toBe(200);
       const text = await res.text();
       const body = JSON.parse(text);
+      // T21-P3(G4): 공개 health 는 모드·준비 상태·빠진 조건 이름을 내보내지 않는다
+      const pub = await (await healthGET()).text();
+      expect(Object.keys(JSON.parse(pub)).sort()).toEqual(['app', 'db_ok', 'status', 'time_utc']);
+      for (const s of ['llm', 'missing', 'live_ready', 'LLM_PROVIDER', 'ANTHROPIC_API_KEY']) expect(pub).not.toContain(s);
       // LIVE-L1(D34): LIVE_ADAPTER 표식 대신 실제 조건 — 공급자는 anthropic 이어야 하고 서버 환경의 키가 있어야 한다(의도한 동작 변경).
       expect(body.llm).toEqual({
         mode: 'live',
@@ -393,7 +401,7 @@ describe('live 경계(fail-closed, 외부 호출 0)', () => {
     } finally {
       reset();
     }
-    const body = await (await healthGET()).json();
+    const body = await (await healthDetails()).json();
     expect(body.llm.live_ready).toBe(false);
     expect(body.llm.missing).toContain('LLM_MODE=live');
   });

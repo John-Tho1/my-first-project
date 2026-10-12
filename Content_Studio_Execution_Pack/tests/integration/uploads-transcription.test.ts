@@ -41,6 +41,7 @@ import { runWorkerTick } from '@cs/worker';
 import { GET as assetGET } from '../../apps/web/app/api/assets/[id]/route';
 import { POST as transcribePOST } from '../../apps/web/app/api/assets/[id]/transcribe/route';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
+import { GET as healthDetailsGET } from '../../apps/web/app/api/health/details/route';
 import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { GET as jobsGET } from '../../apps/web/app/api/transcription-jobs/route';
 import { GET as jobGET } from '../../apps/web/app/api/transcription-jobs/[id]/route';
@@ -518,11 +519,17 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
     }
   });
 
-  it('health: stt 모드·준비 안 됨(이름만), 업로드 임시 영역 사용량은 공개 health 에 없음(D30-3)', async () => {
-    const body = await (await healthGET()).json();
+  it('health/details(로그인): stt 모드·준비 안 됨(이름만), 업로드 임시 영역 사용량은 어느 health 에도 없음(D30-3·T21-P3)', async () => {
+    const res = await healthDetailsGET(get('/api/health/details'), undefined);
+    expect(res.status).toBe(200);
+    const body = await res.json();
     expect(body.stt).toMatchObject({ mode: 'mock', live_ready: false });
     expect(body.stt.missing).toContain('LIVE_STT_ADAPTER(T08 미구현, 별도 승인 후)');
     expect(body).not.toHaveProperty('uploads');
+    // T21-P3(G4): 공개 health 는 생존 여부만 — stt·uploads 없음
+    const pub = await (await healthGET()).json();
+    expect(Object.keys(pub).sort()).toEqual(['app', 'db_ok', 'status', 'time_utc']);
+    expect(JSON.stringify(pub)).not.toContain('LIVE_STT_ADAPTER');
   });
 
   it('D30-3: 업로드 임시 영역 사용량은 GET /api/ops/summary(로그인한 owner 의 폴더만), 다른 owner 의 조각은 세지 않음', async () => {

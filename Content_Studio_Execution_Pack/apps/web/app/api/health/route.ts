@@ -1,71 +1,34 @@
 import { getDb } from '@cs/db';
-import { DISPLAY_TIMEZONE, formatMsk, getModes, liveLlmReadiness, loadConfig, sttLiveReadiness } from '@cs/domain';
-import { getLastTick } from '@cs/worker';
-import { runInlineWorker } from '../../../lib/stt';
-import pkg from '../../../package.json';
+import { loadConfig } from '@cs/domain';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 /**
- * 공개 상태 확인 — 생존·준비 상태만. 모드와 DB 상태만 반환하고 환경변수 값(경로·식별자·키)은 노출하지 않는다.
- * WORKER_MODE=inline 이면 요청마다 worker tick 을 1회 실행해 last_tick_utc 를 갱신한다(T08: 업로드 만료 정리 + 모의 전사 한 단계,
- * T11: 배포 작업 최대 5개 — 모의 어댑터).
- * T07/T08: llm·stt 는 모드·live 준비 여부·빠진 조건 이름만(값 없음).
- * D23(e)·D30-3: 운영 숫자(백업 나이·확인 필요 계획·반복 실패·삭제 대기·폴더 바이트, 배포 작업 상태별 수, 업로드 임시 영역 사용량, 소재 수)는
- * 공개 응답에 없다 — 로그인이 필요한 GET /api/ops/summary(owner 범위)로 옮겼다.
+ * 공개 상태 확인(로그인 없음) — **생존 여부만**. 응답 키는 정확히 { status, app, time_utc, db_ok }.
+ * T21-P3(T21_DEPLOY_REVIEW G4): 공개 요청은 부작용이 없다 — worker tick(업로드 만료 정리·전사·배포 작업·연결 정보 갱신·수집)을
+ * 실행하지 않는다. 모드·llm/stt 준비 상태(빠진 조건 이름)·버전·DB 드라이버·migrated·worker 정보도 내보내지 않는다.
+ * 그 자세한 상태는 로그인한 owner 만 보는 GET /api/health/details 로 옮겼다(읽기 전용, tick 없음).
+ * 별도 경로로 둔 이유: 프록시가 `/api/health` 하나만 외부에 열어도 자세한 정보가 새지 않게(경로 단위로 허용 가능).
+ * D23(e)·D30-3 의 운영 숫자는 계속 GET /api/ops/summary(로그인, owner 범위).
+ * DB 확인은 앱 공용 연결을 여는 것뿐이다(다른 화면 첫 요청과 같은 연결 — 새로 쓰는 행 없음).
  */
 export async function GET(): Promise<Response> {
-  const now = new Date();
-  const base = {
-    app: 'content-studio',
-    version: pkg.version,
-    time_utc: now.toISOString(),
-    time_msk: formatMsk(now),
-    timezone: DISPLAY_TIMEZONE,
-  };
+  const base = { app: 'content-studio', time_utc: new Date().toISOString() };
+  const headers = { 'cache-control': 'no-store' };
 
   let config;
   try {
     config = loadConfig(process.env);
   } catch {
-    return Response.json({ ...base, status: 'error', error: 'config_invalid' }, { status: 500 });
+    // 설정 오류의 내용(변수 이름·값)은 공개 응답에 넣지 않는다. 서버 로그에도 종류만.
+    console.error('[health] config_invalid');
+    return Response.json({ status: 'degraded', ...base, db_ok: false }, { status: 503, headers });
   }
-
-  const modes = getModes(config);
-  // T07·LIVE-L1(D34): live AI 준비 상태 — 모드·준비 여부·빠진 조건 이름만(값·키 길이 없음). 모두 갖춰지면 live_ready=true.
-  const live = liveLlmReadiness(config, process.env);
-  const llm = { mode: config.LLM_MODE, live_ready: live.ready, missing: live.missing };
-  const sttLive = sttLiveReadiness(config);
-  const stt = { mode: config.STT_MODE, live_ready: sttLive.ready, missing: sttLive.missing };
   try {
-    const handle = await getDb(config);
-    await runInlineWorker(config, handle.db);
-    const last = getLastTick();
-    return Response.json(
-      {
-        status: 'ok',
-        ...base,
-        modes,
-        llm,
-        stt,
-        db: { driver: handle.driver, ok: true, migrated: handle.migrated },
-        worker: { mode: config.WORKER_MODE, last_tick_utc: last?.ranAt ?? null },
-      },
-      { headers: { 'cache-control': 'no-store' } },
-    );
+    await getDb(config);
+    return Response.json({ status: 'ok', ...base, db_ok: true }, { headers });
   } catch {
-    return Response.json(
-      {
-        status: 'degraded',
-        ...base,
-        modes,
-        llm,
-        stt,
-        db: { driver: config.DB_DRIVER, ok: false, migrated: false },
-        worker: { mode: config.WORKER_MODE, last_tick_utc: getLastTick()?.ranAt ?? null },
-      },
-      { status: 503, headers: { 'cache-control': 'no-store' } },
-    );
+    return Response.json({ status: 'degraded', ...base, db_ok: false }, { status: 503, headers });
   }
 }

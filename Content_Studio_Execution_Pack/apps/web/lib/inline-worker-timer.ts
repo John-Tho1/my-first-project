@@ -16,7 +16,7 @@ export async function inlineWorkerTickOnce(): Promise<void> {
   await runInlineWorker(config, db);
 }
 
-export type StartOutcome = 'started' | 'already_running' | 'interval_off' | 'worker_separate' | 'build_phase' | 'config_invalid';
+export type StartOutcome = 'started' | 'already_running' | 'stopping' | 'interval_off' | 'worker_separate' | 'build_phase' | 'config_invalid';
 
 /**
  * 설정을 읽어 주기 tick 을 시작한다(프로세스당 한 번 — 이미 있으면 그대로). 예외를 밖으로 던지지 않는다(서버 시작을 막지 않음).

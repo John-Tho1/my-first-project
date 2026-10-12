@@ -195,6 +195,40 @@ export const SCHEDULE_STALE_GRACE_MS = 60 * 60_000;
 export function isScheduleStale(scheduledAtUtc: Date | null, now: Date): boolean {
   return scheduledAtUtc !== null && now.getTime() - scheduledAtUtc.getTime() > SCHEDULE_STALE_GRACE_MS;
 }
+
+/** 오래 지난 예약 확인이 가리키는 대상 — 지금의 활성 승인·내용 hash·예약 시각(ISO). */
+export interface StaleScheduleConfirmTarget {
+  approvalId: string;
+  payloadHash: string;
+  scheduledAtUtc: string;
+}
+
+/**
+ * FIX1-T21P2(Codex review-T21P2 P1 jobs.ts:623): 작업 이력에 **오래 지난 예약에 대한 명시적 확인**이 있는가.
+ * 인정 조건(모두): ① 이 작업에 `blocked`(reason `schedule_stale`) 이력이 있고 ② 그 가운데 **마지막** 차단보다 뒤에
+ * ③ `unblock`·cause `user_retry`·`stale_schedule_confirmed: true` 이력이 있으며 ④ 그 확인의 승인 ID·내용 hash·예약 시각이 지금 것과 모두 같다.
+ * 일반 재시도(다른 사유 차단 뒤의 unblock)·차단 없는 확인·다른 승인/예약/내용에 대한 확인은 인정하지 않는다. 순수 함수(DB 없음).
+ */
+export function staleScheduleConfirmedBy(
+  events: ReadonlyArray<{ eventSeq: number; details: Record<string, unknown> }>,
+  target: StaleScheduleConfirmTarget,
+): boolean {
+  let lastStaleBlock = -1;
+  for (const e of events) {
+    if (e.details.event === 'blocked' && e.details.reason === 'schedule_stale') lastStaleBlock = Math.max(lastStaleBlock, e.eventSeq);
+  }
+  if (lastStaleBlock < 0) return false;
+  return events.some(
+    (e) =>
+      e.eventSeq > lastStaleBlock &&
+      e.details.event === 'unblock' &&
+      e.details.cause === 'user_retry' &&
+      e.details.stale_schedule_confirmed === true &&
+      e.details.approval_id === target.approvalId &&
+      e.details.confirmed_payload_hash === target.payloadHash &&
+      e.details.confirmed_scheduled_at_utc === target.scheduledAtUtc,
+  );
+}
 /**
  * FIX-T11 round 2(P1): 전송 의도 없이 lease 가 만료된 횟수의 한도(시도 한도 max_attempts 와 별개). 시도(attempt)는 전송 의도를 쓸 때만 센다.
  * 이 횟수가 한도에 이르면 보내지 않은 채 FAILED(lease_expired_before_intent) — 보내기 전에 되풀이해 죽는 작업이 끝없이 lease 되지 않게.

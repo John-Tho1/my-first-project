@@ -363,7 +363,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **화면**: `/distribute/{id}` 항목 카드에 작업 상태 한 줄, `취소`·`재확인(조회만 — 다시 보내지 않음)` 버튼, 원격 결과(`MOCK` 배지 + **실제 발행 실적 아님**), 작업 이력 최근 10개. 계획 아래 `작업 처리 실행(모의 1회)`(내 작업 최대 5개).
 - **처리기 실행**: web(`WORKER_MODE=inline`)은 기본적으로 로그인한 요청에서만 배포 작업을 처리한다 — 화면의 "작업 처리 실행"(`POST /api/worker/tick`, 내 작업 최대 5개)과 전사 목록 조회(`GET /api/transcription-jobs`, tick 1회·최대 5개). 공개 `/api/health` 는 T21-P3 부터 처리하지 않는다.
   - **주기 처리(T21-P2, G3)**: `WORKER_INLINE_INTERVAL_SECONDS`(기본 `0` = 끔, 켜면 `5`~`600` 초)를 주면 서버 시작 훅(`apps/web/instrumentation.ts`, 시작 가드 다음)이 web 안 타이머를 하나 띄운다. 직전 처리가 **끝난 뒤** 그 간격만큼 쉬고 다음 처리를 시작한다(겹치지 않음·흔들림 없음·`unref`·프로세스당 한 타이머 — 모듈이 다시 읽혀도 두 번 띄우지 않음). 처리 함수는 전사 목록 조회와 같은 `runInlineWorker`(HTTP 요청·인증 우회 없음)이고, 실패는 오류 이름·코드만 로그에 남긴 뒤 다음 주기에 다시 한다(서버는 계속). 개발(`pnpm dev`)·시험에서는 기본이 끔이라 동작이 바뀌지 않는다. 운영 빌드에서 끈 채로 시작하면 경고 한 줄. 운영 권장값 30 — `deploy/README_KO.md`.
-  - **오래 지난 예약(docs/07, T21-P2)**: 예약 항목의 **첫 전송**을 할 때 예약 시각이 60분(`SCHEDULE_STALE_GRACE_MS`, 잠정)보다 더 지났으면 보내지 않고 `BLOCKED`(`schedule_stale`, 화면 "예약 시각이 오래 지나 자동으로 보내지 않음 — 확인 후 재시도")로 둔다. 승인은 그대로라 항목의 "재시도"로 확인하면 그때 보낸다. 이미 한 번 보낸 작업(재시도·이어 올리기)과 예약 없는 작업은 해당 없음. 주기 처리·화면 버튼·`pnpm worker` 모두 같은 경로. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
+  - **오래 지난 예약(docs/07, T21-P2)**: 예약 항목의 **첫 전송**을 할 때 예약 시각이 60분(`SCHEDULE_STALE_GRACE_MS`, 잠정)보다 더 지났으면 보내지 않고 `BLOCKED`(`schedule_stale`, 화면 "예약 시각이 오래 지나 자동으로 보내지 않음 — 확인 후 재시도")로 둔다. 승인은 그대로라 항목의 "재시도"로 확인하면 그때 보낸다(FIX1-T21P2: 재시도가 승인 ID·내용 hash·예약 시각을 담은 확인을 기록하고, 보내기 직전 셋이 지금과 모두 같을 때만 통과 — 다른 사유의 재시도는 확인이 아니다). 이미 한 번 보낸 작업(재시도·이어 올리기)과 예약 없는 작업은 해당 없음. 주기 처리·화면 버튼·`pnpm worker` 모두 같은 경로. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
 
 | API | 설명 |
 | --- | --- |
@@ -533,7 +533,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 ### PGlite 단일 연결 주의
 - 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.
 - PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline` — 로그인한 "작업 처리 실행"·전사 목록 조회 때 tick, `WORKER_INLINE_INTERVAL_SECONDS` > 0 이면 web 안 타이머로도 주기 tick(T21-P2). 공개 `/api/health` 는 tick 을 돌리지 않는다).
-- 운영 배포 파일(T21-P2, 파일만 — 배포한 적 없음, 운영 로그인 T21-P1b 전에는 배포 불가): `deploy/Caddyfile`·`deploy/content-studio.service`·`deploy/content-studio.env.example`·`deploy/README_KO.md`(설치·확인·업그레이드 전 백업·되돌리기).
+- 운영 배포 파일(T21-P2, 파일만 — 배포한 적 없음, 운영 로그인 T21-P1b 전에는 배포 불가): `deploy/Caddyfile`·`deploy/content-studio.service`·`deploy/content-studio.env.example`·`deploy/scripts/`(build-release·check-env·backup-data — 실패 즉시 중단)·`deploy/README_KO.md`(저장소 루트와 앱 루트 `Content_Studio_Execution_Pack/` 구분, 설치·확인·업그레이드 전 백업·되돌리기).
 - `pnpm dev`/`pnpm start`가 켜져 있는 동안 `pnpm db:seed`·`pnpm db:migrate`·`pnpm worker`는 잠금 파일(`data/pglite/.content-studio.lock`) 때문에 한국어 안내와 함께 exit 1로 거부된다. 서버를 끄고 실행한다.
 - `WORKER_MODE=separate`는 `DB_DRIVER=postgres`(M3 예정, 아직 미구현)에서만 허용된다.
 

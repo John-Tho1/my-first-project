@@ -357,3 +357,38 @@ describe('T21-P2 isScheduleStale (docs/07 오래 지난 예약)', () => {
     expect(isScheduleStale(at, new Date(at.getTime() + 3 * 24 * 3600_000))).toBe(true);
   });
 });
+
+describe('FIX1-T21P2 staleScheduleConfirmedBy (오래 지난 예약 확인은 schedule_stale 차단 뒤의 명시적 확인만)', () => {
+  const target = { approvalId: 'a1', payloadHash: 'h1', scheduledAtUtc: '2026-10-12T09:00:00.000Z' };
+  const block = (seq: number, reason = 'schedule_stale') => ({ eventSeq: seq, details: { event: 'blocked', reason } });
+  const confirm = (seq: number, over: Record<string, unknown> = {}) => ({
+    eventSeq: seq,
+    details: {
+      event: 'unblock',
+      cause: 'user_retry',
+      stale_schedule_confirmed: true,
+      approval_id: 'a1',
+      confirmed_payload_hash: 'h1',
+      confirmed_scheduled_at_utc: '2026-10-12T09:00:00.000Z',
+      ...over,
+    },
+  });
+  it('차단 → 같은 승인·내용·예약의 확인 → 인정', async () => {
+    const { staleScheduleConfirmedBy } = await import('./jobs');
+    expect(staleScheduleConfirmedBy([block(2), confirm(3)], target)).toBe(true);
+    // 확인 뒤 다른 사유 차단·일반 재시도가 있어도 같은 대상이면 인정
+    expect(staleScheduleConfirmedBy([block(2), confirm(3), block(4, 'credential_blocked'), { eventSeq: 5, details: { event: 'unblock', cause: 'user_retry' } }], target)).toBe(true);
+  });
+  it('인정하지 않음: 차단 없음 / 일반 unblock / 다른 승인·내용·예약 / 확인 플래그 없음 / 마지막 차단보다 앞선 확인', async () => {
+    const { staleScheduleConfirmedBy } = await import('./jobs');
+    expect(staleScheduleConfirmedBy([], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([confirm(3)], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2, 'credential_blocked'), { eventSeq: 3, details: { event: 'unblock', cause: 'user_retry', approval_id: 'a1' } }], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3, { approval_id: 'a2' })], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3, { confirmed_payload_hash: 'h2' })], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3, { confirmed_scheduled_at_utc: '2026-10-12T08:00:00.000Z' })], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3, { stale_schedule_confirmed: 'true' })], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3, { cause: 'system' })], target)).toBe(false);
+    expect(staleScheduleConfirmedBy([block(2), confirm(3), block(4)], target)).toBe(false); // 확인 뒤 다시 오래 지난 예약으로 차단 → 새 확인 필요
+  });
+});

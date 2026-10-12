@@ -84,26 +84,36 @@ describe('createInlineTickTimer', () => {
     await stopFake(timer);
   });
 
-  it('수동 실행(runNow) 중 타이머 차례가 오면 타이머 쪽이 건너뛰고, 다음 예약은 그대로 이어진다', async () => {
-    let calls = 0;
+  it('FIX1-T21P2(P2 :185): runNow 는 예약을 다시 잡는다 — 수동 실행이 끝난 뒤에도 간격만큼 쉬고 다음 실행', async () => {
+    const starts: number[] = [];
+    const t0 = Date.now();
     const timer = createInlineTickTimer({
       intervalMs: 1000,
       tick: async () => {
-        calls += 1;
+        starts.push(Date.now() - t0);
         await sleep(1500);
       },
     });
-    timer.start();
-    const manual = timer.runNow(); // t=0 시작, 1500 끝
-    await vi.advanceTimersByTimeAsync(1000); // 타이머 차례 → 진행 중이라 건너뜀, 다음 예약 2000
-    expect(timer.state().skipped).toBe(1);
-    await vi.advanceTimersByTimeAsync(500); // t=1500 수동 실행 끝
+    timer.start(); // 예약 t=1000
+    await vi.advanceTimersByTimeAsync(500);
+    const manual = timer.runNow(); // t=500 시작, 2000 끝 → 기존 예약(1000)은 지우고 끝난 뒤 다시 예약(3000)
+    await vi.advanceTimersByTimeAsync(1500);
     expect(await manual).toBe('ran');
-    expect(calls).toBe(1);
-    await vi.advanceTimersByTimeAsync(500); // t=2000 타이머 실행
-    expect(calls).toBe(2);
-    expect(timer.state().scheduled || timer.state().inFlight).toBe(true);
+    expect(starts).toEqual([500]);
+    expect(timer.state()).toMatchObject({ scheduled: true, inFlight: false, skipped: 0 });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(starts).toEqual([500]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(starts).toEqual([500, 3000]);
+    expect(vi.getTimerCount()).toBe(1); // 진행 중 sleep 하나뿐(예약 사슬 중복 없음)
     await stopFake(timer);
+  });
+
+  it('runNow 는 시작하지 않은 제어기에서 예약을 만들지 않는다', async () => {
+    const timer = createInlineTickTimer({ intervalMs: 1000, tick: async () => {} });
+    expect(await timer.runNow()).toBe('ran');
+    expect(timer.state().scheduled).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('오류: 로그는 이름·코드만(메시지·값 없음), 서버를 멈추지 않고 다음 주기에 다시 실행', async () => {
@@ -114,7 +124,7 @@ describe('createInlineTickTimer', () => {
       log: (l) => lines.push(l),
       tick: async () => {
         n += 1;
-        if (n === 1) throw Object.assign(new Error('SECRET_TOKEN=abc123 postgres://user:pw@host/db'), { code: 'db_unavailable' });
+        if (n === 1) throw Object.assign(new Error('SECRET_TOKEN=abc123 postgres://user:pw@host/db'), { code: 'ECONNRESET' });
         if (n === 2) throw 'raw string secret';
         if (n === 3) throw Object.assign(new TypeError('x'), { code: 'has space secret' });
       },
@@ -124,8 +134,8 @@ describe('createInlineTickTimer', () => {
     expect(n).toBe(4);
     expect(timer.state()).toMatchObject({ runs: 1, failures: 3 });
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toContain('Error(db_unavailable)');
-    expect(lines[1]).toContain('string');
+    expect(lines[0]).toContain('Error(ECONNRESET)');
+    expect(lines[1]).toContain('NonErrorThrown');
     expect(lines[2]).toContain('TypeError');
     for (const l of lines) {
       expect(l).not.toMatch(/SECRET|abc123|postgres|pw@|raw string|has space/);
@@ -214,15 +224,73 @@ describe('createInlineTickTimer', () => {
   });
 });
 
-describe('describeTickError', () => {
-  it('이름·짧은 코드만', () => {
+describe('describeTickError (FIX1-T21P2 P0 :53 — 허용 목록만)', () => {
+  it('표준·앱 오류 이름과 허용한 코드만 그대로, 나머지는 고정 문자열', () => {
     expect(describeTickError(new RangeError('secret'))).toBe('RangeError');
     expect(describeTickError(Object.assign(new Error('secret'), { code: 'ECONNRESET' }))).toBe('Error(ECONNRESET)');
+    expect(describeTickError(Object.assign(new Error('secret'), { code: 'job_state_changed' }))).toBe('Error(job_state_changed)');
     expect(describeTickError(Object.assign(new Error('secret'), { code: 'x'.repeat(65) }))).toBe('Error');
-    expect(describeTickError(Object.assign(new Error('m'), { name: 'bad name with secret' }))).toBe('Object');
-    expect(describeTickError(42)).toBe('number');
-    expect(describeTickError(null)).toBe('object');
-    expect(describeTickError({ code: 'oops' })).toBe('Object(oops)');
+    expect(describeTickError(Object.assign(new Error('m'), { name: 'bad name with secret' }))).toBe('UnknownError');
+    expect(describeTickError(42)).toBe('NonErrorThrown');
+    expect(describeTickError(null)).toBe('NonErrorThrown');
+    expect(describeTickError({ code: 'ECONNRESET' })).toBe('NonErrorThrown');
+  });
+
+  it('식별자 모양의 비밀(이름·코드)은 남기지 않는다', () => {
+    const e = Object.assign(new Error('x'), { name: 'SECRET_TOKEN_abc123', code: 'api_key_123' });
+    expect(describeTickError(e)).toBe('UnknownError');
+    expect(describeTickError(Object.assign(new TypeError('x'), { code: 'sk_live_51HxYz' }))).toBe('TypeError');
+    expect(describeTickError(Object.assign(new Error('x'), { code: 'ghp_abcdefABCDEF0123456789' }))).toBe('Error');
+    class MyTokenError extends Error {}
+    const custom = new MyTokenError('x');
+    custom.name = 'Bearer_eyJhbGciOiJIUzI1NiJ9';
+    expect(describeTickError(custom)).toBe('UnknownError');
+  });
+
+  it('접근자가 예외를 던져도(이름·코드) 고정 문자열, 로깅이 실패하지 않는다', () => {
+    const e = new Error('x');
+    Object.defineProperty(e, 'name', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(describeTickError(e)).toBe('UnknownError');
+    const e2 = new TypeError('x');
+    Object.defineProperty(e2, 'code', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(describeTickError(e2)).toBe('TypeError');
+    const proxy = new Proxy(new Error('x'), {
+      get() {
+        throw new Error('trap');
+      },
+      getPrototypeOf() {
+        throw new Error('trap');
+      },
+      has() {
+        throw new Error('trap');
+      },
+    });
+    expect(describeTickError(proxy)).toBe('UnknownError');
+  });
+
+  it('제어기 로그에도 비밀이 남지 않는다', async () => {
+    const lines: string[] = [];
+    const timer = createInlineTickTimer({
+      intervalMs: 1000,
+      log: (l) => lines.push(l),
+      tick: async () => {
+        throw Object.assign(new Error('x'), { name: 'SECRET_TOKEN_abc123', code: 'api_key_123' });
+      },
+    });
+    timer.start();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toMatch(/SECRET|abc123|api_key/);
+    expect(lines[0]).toContain('UnknownError');
+    await stopFake(timer);
   });
 });
 
@@ -276,6 +344,43 @@ describe('installInlineTimer (프로세스당 한 소유자)', () => {
     expect(c.status).toBe('started');
     await vi.advanceTimersByTimeAsync(1000);
     expect(tickB).toHaveBeenCalledTimes(1);
+  });
+
+  it('FIX1-T21P2(P2 :185): 이전 타이머가 멈추는 중(진행 중 tick)이면 새 설치는 거부되고 두 tick 이 겹치지 않는다', async () => {
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const slow = async () => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await sleep(10_000);
+      concurrent -= 1;
+    };
+    const tickB = vi.fn(slow);
+    const a = installInlineTimer({ intervalMs: 1000, tick: slow });
+    await vi.advanceTimersByTimeAsync(1000); // A 의 tick 진행 중(11000 까지)
+    expect(a.timer.state().inFlight).toBe(true);
+    const removing = uninstallInlineTimer(); // 기다리지 않음
+    const b = installInlineTimer({ intervalMs: 1000, tick: tickB });
+    expect(b.status).toBe('stopping');
+    expect(b.timer).toBe(a.timer);
+    expect(currentInlineTimer()).toBe(a.timer); // 끝날 때까지 자리를 지킨다
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await removing).toBe(true);
+    expect(currentInlineTimer()).toBeNull();
+    const c = installInlineTimer({ intervalMs: 1000, tick: tickB });
+    expect(c.status).toBe('started');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tickB).toHaveBeenCalledTimes(1);
+    expect(maxConcurrent).toBe(1);
+    await stopFake(c.timer);
+  });
+
+  it('멈춘 타이머가 자리에 남아 있어도(진행 중 없음) 새로 설치한다', async () => {
+    const a = installInlineTimer({ intervalMs: 1000, tick: async () => {} });
+    await a.timer.stop(); // 자리를 비우지 않고 직접 멈춤
+    const b = installInlineTimer({ intervalMs: 1000, tick: async () => {} });
+    expect(b.status).toBe('started');
+    expect(b.timer).not.toBe(a.timer);
   });
 
   it('모듈을 다시 읽어도(HMR·번들 중복 흉내) 같은 소유자 자리를 본다', async () => {

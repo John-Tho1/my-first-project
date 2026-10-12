@@ -31,6 +31,7 @@ import {
   DEFAULT_LEASE_TTL_MS,
   FREE_RESUME_MAX,
   isScheduleStale,
+  staleScheduleConfirmedBy,
   LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
   requireSecretKeyring,
@@ -615,14 +616,24 @@ function inflightRateUnitsOf(rows: readonly RateInflightJob[], acc: typeof chann
   return total;
 }
 
-/** T21-P2: 이 작업을 사용자가 "재시도"(retryItem → unblock 이력)로 다시 대기열에 넣은 적이 있는가. 오래 지난 예약 판정에서만 부른다(드묾). */
-async function userRetriedJob(tx: DbOrTx, ownerId: string, jobId: string): Promise<boolean> {
+/**
+ * T21-P2 · FIX1-T21P2(Codex P1 :623): 이 작업에 **오래 지난 예약에 대한 사용자 확인**(schedule_stale 차단 뒤 retryItem 이 남긴 확인 이력)이 있고
+ * 그 확인이 지금의 활성 승인·내용 hash·예약 시각과 같은가(staleScheduleConfirmedBy). 일반 재시도 이력은 인정하지 않는다.
+ * 복원 표시 작업(restored_needs_review — 복원된 이력)은 인정하지 않는다. 오래 지난 예약 판정에서만 부른다(드묾).
+ */
+async function staleScheduleConfirmed(
+  tx: DbOrTx,
+  ownerId: string,
+  job: Pick<JobRow, 'id' | 'restoredNeedsReview'>,
+  target: { approvalId: string; payloadHash: string; scheduledAtUtc: Date },
+): Promise<boolean> {
+  if (job.restoredNeedsReview) return false;
   const rows = await tx
-    .select({ id: jobEvents.id })
+    .select({ eventSeq: jobEvents.eventSeq, details: jobEvents.sanitizedDetails })
     .from(jobEvents)
-    .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, jobId), sql`${jobEvents.sanitizedDetails}->>'event' = 'unblock'`))
-    .limit(1);
-  return rows.length > 0;
+    .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, job.id)))
+    .orderBy(asc(jobEvents.eventSeq));
+  return staleScheduleConfirmedBy(rows, { approvalId: target.approvalId, payloadHash: target.payloadHash, scheduledAtUtc: target.scheduledAtUtc.toISOString() });
 }
 
 /** 1단계(한 트랜잭션): 재검사 + SENDING + 전송 의도. 보낼 수 없으면 상태를 정하고 null. */
@@ -666,8 +677,12 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       );
     }
     // T21-P2(docs/07): 서버·작업 처리기가 오래 멈췄다 돌아온 뒤 오래 지난 예약을 자동으로 보내지 않는다 — 첫 전송(attempt 0)만, 보내지 않은 채 BLOCKED.
-    // 승인은 그대로 둔다(내용은 바뀌지 않았다). 사용자가 "재시도"로 확인하면(unblock 이력) 이 작업은 다시 판정하지 않는다.
-    if (job.attempt === 0 && isScheduleStale(item.scheduledAtUtc, now) && !(await userRetriedJob(tx, ownerId, job.id))) {
+    // 승인은 그대로 둔다(내용은 바뀌지 않았다). FIX1-T21P2: schedule_stale 차단 뒤 사용자가 "재시도"로 남긴 확인이 지금의 승인·내용·예약과 같을 때만 통과한다.
+    if (
+      job.attempt === 0 &&
+      isScheduleStale(item.scheduledAtUtc, now) &&
+      !(await staleScheduleConfirmed(tx, ownerId, job, { approvalId: approval.id, payloadHash: item.payloadHash, scheduledAtUtc: item.scheduledAtUtc! }))
+    ) {
       return settle(
         tx,
         ownerId,
@@ -1401,7 +1416,13 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
     // T13: 연결 정보가 아직 쓸 수 없으면(만료·해제·다시 연결 필요) 다시 대기열에 넣지 않는다 — 먼저 다시 연결.
     const cred = (await credentialGate(tx, ownerId, [item.channelAccountId], now)).get(item.channelAccountId);
     if (cred && !cred.usable) throw new AccountCredentialBlockedError([{ item_id: item.id, account_id: item.channelAccountId, status: cred.status }]);
-    await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id }, now, {
+    // FIX1-T21P2(Codex P1 :623): 오래 지난 예약(schedule_stale)으로 막힌 작업의 재시도 = 그 예약을 지금 보내겠다는 명시적 확인. 승인 ID·내용 hash·예약 시각을
+    // 함께 기록한다 — 보내기 직전(beginSend) 이 값이 지금과 모두 같을 때만 통과(승인·내용·예약이 바뀌면 확인은 효력이 없다). 다른 사유 재시도는 확인이 아니다.
+    const staleConfirm =
+      job.lastErrorCode === 'schedule_stale'
+        ? { stale_schedule_confirmed: true, confirmed_payload_hash: item.payloadHash, confirmed_scheduled_at_utc: item.scheduledAtUtc ? item.scheduledAtUtc.toISOString() : null }
+        : {};
+    await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id, ...staleConfirm }, now, {
       ...CLEAR_LEASE,
       nextRunAt: now,
       lastErrorCode: null,
@@ -1413,7 +1434,13 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
       action: 'item.retry',
       entity: 'distribution_item',
       entityId: item.id,
-      details: { job_id: job.id, previous_error: job.lastErrorCode, attempt_next: job.attempt + 1, mode: 'MOCK' },
+      details: {
+        job_id: job.id,
+        previous_error: job.lastErrorCode,
+        attempt_next: job.attempt + 1,
+        mode: 'MOCK',
+        ...(job.lastErrorCode === 'schedule_stale' ? { stale_schedule_confirmed: true } : {}),
+      },
       at: now,
     });
     return { item_id: item.id, job_id: job.id, state: 'QUEUED' as const, attempt_next: job.attempt + 1, message: '다시 대기열에 넣었습니다(MOCK — 새 시도·새 전송 의도)' };

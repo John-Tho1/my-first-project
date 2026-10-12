@@ -42,18 +42,100 @@ export interface InlineTickTimer {
   readonly intervalMs: number;
   /** 첫 tick 을 intervalMs 뒤에 예약한다. 이미 시작했거나 멈췄으면 false(아무것도 하지 않음). */
   start(): boolean;
-  /** 지금 한 번 실행(시험·수동). 진행 중이면 건너뛴다. 다음 예약은 바꾸지 않는다. */
+  /**
+   * 지금 한 번 실행(시험·수동). 진행 중이면 건너뛴다. FIX1-T21P2(Codex P2 :185): 시작한 제어기면 기존 예약을 지우고 실행이 **끝난 뒤** 다시
+   * intervalMs 를 예약한다(수동 실행을 포함해도 "끝난 뒤 한 간격" 규칙 유지). 시작하지 않은 제어기에서는 예약을 만들지 않는다.
+   */
   runNow(): Promise<RunOutcome>;
   stop(): Promise<void>;
   state(): InlineTickTimerState;
 }
 
-/** 오류를 로그에 남길 이름·코드로만 줄인다(메시지·값·스택 없음). 코드는 짧은 식별자 모양일 때만. */
+/**
+ * FIX1-T21P2(Codex review-T21P2 P0 :53): 로그에 남길 수 있는 오류 이름 — **허용 목록만**. 모양(정규식)으로는 비밀 여부를 가릴 수 없다
+ * (예: name 'SECRET_TOKEN_abc123'). 목록 밖 이름은 'UnknownError', Error 가 아닌 값은 'NonErrorThrown'.
+ */
+export const LOGGABLE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  // JS 표준
+  'Error',
+  'TypeError',
+  'RangeError',
+  'SyntaxError',
+  'ReferenceError',
+  'EvalError',
+  'URIError',
+  'AggregateError',
+  'AbortError',
+  'TimeoutError',
+  // tick 경로에서 날 수 있는 앱 오류(packages/domain·db·worker)
+  'AppError',
+  'GuardError',
+  'ConfigError',
+  'DbLockedError',
+  'DbDriverNotImplementedError',
+  'WorkerModeError',
+  'LeaseLostError',
+  'IllegalJobTransitionError',
+  'SecretsNotConfiguredError',
+  'SecretDecryptError',
+  'CredentialRefreshFailedError',
+  'OAuthProviderError',
+  'CollectorFetchError',
+  'MockTranscriberFailure',
+]);
+
+/** 로그에 남길 수 있는 오류 코드 — 허용 목록만(Node 시스템 오류 코드 일부 + 확인한 앱 코드). 목록 밖 코드는 생략한다. */
+export const LOGGABLE_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ENOENT',
+  'EACCES',
+  'EPERM',
+  'EBUSY',
+  'EEXIST',
+  'EMFILE',
+  'ENOSPC',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ABORT_ERR',
+  'job_state_changed',
+  'lease_lost',
+  'mock_rehydration_unavailable',
+  'secrets_not_configured',
+  'credential_refresh_failed',
+]);
+
+/** 속성 읽기(접근자·Proxy 가 던질 수 있음)를 안전하게. */
+function safeRead(o: object, key: string): unknown {
+  try {
+    return (o as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 오류를 로그에 남길 이름·코드로만 줄인다(메시지·값·스택 없음). 이름·코드 모두 허용 목록에 있을 때만 그대로 쓰고 나머지는 고정 문자열.
+ * 어떤 입력(던지는 접근자·Proxy 포함)에도 예외를 던지지 않는다.
+ */
 export function describeTickError(e: unknown): string {
-  const name = e instanceof Error && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(e.name) ? e.name : typeof e === 'object' && e !== null ? 'Object' : typeof e;
-  const raw = typeof e === 'object' && e !== null && 'code' in e ? (e as { code: unknown }).code : undefined;
-  const code = typeof raw === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : null;
-  return code ? `${name}(${code})` : name;
+  try {
+    let isError = false;
+    try {
+      isError = e instanceof Error;
+    } catch {
+      return 'UnknownError';
+    }
+    if (!isError) return 'NonErrorThrown';
+    const rawName = safeRead(e as object, 'name');
+    const name = typeof rawName === 'string' && LOGGABLE_ERROR_NAMES.has(rawName) ? rawName : 'UnknownError';
+    const rawCode = safeRead(e as object, 'code');
+    const code = typeof rawCode === 'string' && LOGGABLE_ERROR_CODES.has(rawCode) ? rawCode : null;
+    return code ? `${name}(${code})` : name;
+  } catch {
+    return 'UnknownError';
+  }
 }
 
 export function createInlineTickTimer(opts: InlineTickTimerOptions): InlineTickTimer {
@@ -122,7 +204,21 @@ export function createInlineTickTimer(opts: InlineTickTimerOptions): InlineTickT
       schedule();
       return true;
     },
-    runNow: runOnce,
+    async runNow() {
+      if (stopped) return 'stopped';
+      if (inFlight) {
+        skipped += 1;
+        return 'skipped_in_flight';
+      }
+      if (handle !== null) {
+        clearTimer(handle);
+        handle = null;
+      }
+      const outcome = await runOnce();
+      // 실행 중에 다른 runNow 가 예약을 만들었을 수는 없다(진행 중이면 건너뜀). 시작했고 멈추지 않았으며 예약이 없을 때만 다시 예약.
+      if (started && !stopped && handle === null) schedule();
+      return outcome;
+    },
     async stop() {
       stopped = true;
       if (handle !== null) {
@@ -178,11 +274,19 @@ export function currentInlineTimer(): InlineTickTimer | null {
   return (globalThis as GlobalWithTimer)[OWNER_KEY] ?? null;
 }
 
-/** 이미 이 프로세스에 타이머가 있으면 그대로 두고 'already_running'. 없으면 만들어 시작하고 'started'. */
-export function installInlineTimer(opts: InlineTickTimerOptions): { status: 'started' | 'already_running'; timer: InlineTickTimer } {
+/**
+ * 이미 이 프로세스에 타이머가 있으면 그대로 두고 'already_running'. 멈추는 중(진행 중 tick 있음)이면 'stopping'(설치 거부 — 자리는 이전 타이머가
+ * 끝날 때까지 유지, uninstallInlineTimer 가 끝난 뒤 비운다). 없거나 완전히 멈췄으면 새로 만들어 시작하고 'started'.
+ */
+export function installInlineTimer(opts: InlineTickTimerOptions): { status: 'started' | 'already_running' | 'stopping'; timer: InlineTickTimer } {
   const g = globalThis as GlobalWithTimer;
   const existing = g[OWNER_KEY];
-  if (existing && !existing.state().stopped) return { status: 'already_running', timer: existing };
+  if (existing) {
+    const st = existing.state();
+    if (!st.stopped) return { status: 'already_running', timer: existing };
+    // FIX1-T21P2(Codex P2 :185): 멈추는 중(진행 중 tick 이 아직 끝나지 않음)이면 자리를 넘기지 않는다 — 두 tick 이 겹치지 않게 설치를 거부.
+    if (st.inFlight) return { status: 'stopping', timer: existing };
+  }
   const timer = createInlineTickTimer(opts);
   g[OWNER_KEY] = timer;
   timer.start();

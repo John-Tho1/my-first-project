@@ -1,8 +1,7 @@
 # Content Studio — Caddy 예시(T21-P2, 파일만 · 배포한 적 없음 · 실제 서버에서 검증하지 않음)
-# 사용: /etc/caddy/Caddyfile 로 복사. APP_DOMAIN 은 Caddy 서비스 환경변수로 넣는다(예: systemctl edit caddy →
-#   [Service]
-#   Environment=APP_DOMAIN=studio.example.com
-# ). 도메인 값은 placeholder — 실제 값은 사용자가 정한다(deploy/README_KO.md §4).
+# 사용: /etc/caddy/Caddyfile 로 복사. APP_DOMAIN 은 /etc/caddy/content-studio.env(APP_DOMAIN=<도메인> 한 줄) 한 곳에 두고
+#   Caddy 서비스(systemctl edit caddy → [Service] EnvironmentFile=/etc/caddy/content-studio.env)와 `caddy validate` 가 같은 파일을 읽게 한다
+#   (deploy/README_KO.md §6 — FIX1-T21P2: 검증 명령에도 같은 값을 넘긴다). 도메인 값은 사용자가 정한다.
 #
 # - 자동 HTTPS: Caddy 가 Let's Encrypt 인증서를 받고 http → https 로 넘긴다(80·443 이 열려 있어야 함).
 # - web 은 127.0.0.1:3000 에서만 듣는다(systemd unit 의 --hostname 127.0.0.1). 외부에서 3000 으로 직접 들어올 수 없다.

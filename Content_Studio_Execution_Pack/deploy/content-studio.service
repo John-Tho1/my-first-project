@@ -1,6 +1,8 @@
 # Content Studio web(Next, inline worker 포함) — systemd unit 예시(T21-P2, 파일만 · 배포한 적 없음 · 실제 Linux 에서 검증하지 않음)
 # 설치: /etc/systemd/system/content-studio.service 로 복사 → systemctl daemon-reload → systemctl enable --now content-studio
 # 경로·사용자 이름은 deploy/README_KO.md 의 배치와 같다. 다르게 두면 아래 경로를 함께 고친다.
+# FIX1-T21P2(Codex P1 README:40): 저장소 루트(git checkout) = /srv/content-studio/repo, **앱 루트** = /srv/content-studio/repo/Content_Studio_Execution_Pack
+#   (pnpm-workspace.yaml·package.json 이 있는 곳). Next 빌드 결과는 앱 루트의 apps/web/.next 다(next.mjs 가 apps/web 에서 next 를 실행).
 #
 # - 단일 프로세스: PGlite 는 한 데이터 디렉터리를 한 프로세스만 연다. 같은 데이터 폴더로 두 번째 인스턴스·`pnpm worker`·`pnpm export` 를
 #   동시에 돌리지 않는다(잠금 때문에 실패한다). 주기 작업은 web 안 타이머(WORKER_INLINE_INTERVAL_SECONDS)가 맡는다 — 별도 timer unit 없음.
@@ -15,7 +17,7 @@ Wants=network-online.target
 Type=simple
 User=content-studio
 Group=content-studio
-WorkingDirectory=/srv/content-studio/app
+WorkingDirectory=/srv/content-studio/repo/Content_Studio_Execution_Pack
 
 Environment=NODE_ENV=production
 Environment=TZ=UTC
@@ -23,7 +25,7 @@ Environment=NEXT_TELEMETRY_DISABLED=1
 # 비밀·설정(placeholder 는 deploy/content-studio.env.example). chown root:root, chmod 600.
 EnvironmentFile=/etc/content-studio/env
 
-# pnpm·corepack 을 거치지 않고 Node 로 직접 실행한다(apps/web/scripts/next.mjs = 텔레메트리 끔 + SIGTERM 전달).
+# pnpm·corepack 을 거치지 않고 Node 로 직접 실행한다(apps/web/scripts/next.mjs = 텔레메트리 끔 + SIGTERM 전달, 상대 경로 = 위 WorkingDirectory 기준).
 # Node 경로는 설치 방법에 맞춘다(`command -v node`). 127.0.0.1 에서만 듣는다 — 외부 노출은 Caddy 만.
 ExecStart=/usr/bin/node apps/web/scripts/next.mjs start --hostname 127.0.0.1 --port 3000
 
@@ -36,7 +38,7 @@ KillSignal=SIGTERM
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/srv/content-studio/data /srv/content-studio/app/.next
+ReadWritePaths=/srv/content-studio/data /srv/content-studio/repo/Content_Studio_Execution_Pack/apps/web/.next
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

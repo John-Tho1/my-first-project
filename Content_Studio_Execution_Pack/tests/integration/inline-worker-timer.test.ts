@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 import {
   approveItems,
   closeDb,
@@ -20,9 +20,11 @@ import {
   createPlan,
   createVariantDraft,
   executePlan,
+  leaseJobs,
   getDb,
   listChannelAccounts,
   retryItem,
+  revokeApproval,
   runJobsTick,
   schema,
   seed,
@@ -168,9 +170,15 @@ describe('주기 처리 켜짐(5초, HTTP 없음)', () => {
     expect(currentInlineTimer()).toBe(r.timer);
     expect((await jobRow(plain.jobId)).state).toBe('QUEUED'); // 시작 직후에는 아직 실행하지 않음
 
-    const done = await waitFor(async () => (await jobRow(plain.jobId)).state === 'CONFIRMED' && (await jobRow(stale.jobId)).state === 'BLOCKED', 40_000);
-    expect(done).toBe(true);
-    expect(r.timer!.state().runs).toBeGreaterThanOrEqual(1);
+    // FIX1-T21P2(Codex P2 :171): 필요한 작업 상태 전부 + 그 상태를 만든 tick 이 끝났음(진행 중 아님·완료 1회 이상)을 함께 기다린 뒤 단언한다.
+    const timer = r.timer!;
+    const settled = async () =>
+      (await jobRow(plain.jobId)).state === 'CONFIRMED' &&
+      (await jobRow(recent.jobId)).state === 'CONFIRMED' &&
+      (await jobRow(stale.jobId)).state === 'BLOCKED' &&
+      timer.state().runs >= 1 &&
+      !timer.state().inFlight;
+    expect(await waitFor(settled, 60_000)).toBe(true);
     expect(r.timer!.state().failures).toBe(0);
 
     // 보통 작업·최근 예약: MOCK 확인(실제 게시 아님 — PUBLISH_MODE=disabled 그대로)
@@ -192,15 +200,17 @@ describe('주기 처리 켜짐(5초, HTTP 없음)', () => {
     expect(blockedEv.sanitizedDetails).toMatchObject({ event: 'blocked', reason: 'schedule_stale', not_sent: true });
     expect((blockedEv.sanitizedDetails as { late_minutes: number }).late_minutes).toBeGreaterThanOrEqual(119);
 
-    // 다음 주기들이 지나도 그대로(자동으로 다시 보내지 않음)
-    await new Promise((res) => setTimeout(res, 6000));
+    // 다음 주기들이 지나도 그대로(자동으로 다시 보내지 않음) — 시간 대신 완료된 tick 수로 기다린다
+    const runsBefore = timer.state().runs;
+    expect(await waitFor(async () => timer.state().runs >= runsBefore + 2 && !timer.state().inFlight, 60_000)).toBe(true);
     expect((await jobRow(stale.jobId)).state).toBe('BLOCKED');
     expect(await intentsOf(stale.jobId)).toHaveLength(0);
 
     // 사용자 확인(재시도) → 다음 주기에 보냄
     const retry = await retryItem(db, o.id, stale.itemId);
     expect(retry.state).toBe('QUEUED');
-    expect(await waitFor(async () => (await jobRow(stale.jobId)).state === 'CONFIRMED', 30_000)).toBe(true);
+    const runsAtRetry = timer.state().runs;
+    expect(await waitFor(async () => (await jobRow(stale.jobId)).state === 'CONFIRMED' && timer.state().runs > runsAtRetry && !timer.state().inFlight, 60_000)).toBe(true);
     expect(await pubsOf(stale.itemId)).toHaveLength(1);
 
     // HTTP 요청 0(자기 자신에게도 외부로도), 오류 로그 없음
@@ -213,7 +223,7 @@ describe('주기 처리 켜짐(5초, HTTP 없음)', () => {
     const after = await queued(o);
     await new Promise((res) => setTimeout(res, 6000));
     expect((await jobRow(after.jobId)).state).toBe('QUEUED');
-  });
+  }, 240_000);
 });
 
 describe('오래 지난 예약 규칙(runJobsTick, 시계 주입) — CLI·화면 tick 도 같은 경로', () => {
@@ -266,5 +276,140 @@ describe('오래 지난 예약 규칙(runJobsTick, 시계 주입) — CLI·화�
     await tickAt(o, new Date(late.getTime() + MIN));
     expect(await jobRow(a.jobId)).toMatchObject({ state: 'CONFIRMED', attempt: 1 });
     expect(await intentsOf(a.jobId)).toHaveLength(1);
+  });
+});
+
+describe('FIX1-T21P2(Codex P1 jobs.ts:623): 오래 지난 예약 확인은 schedule_stale 차단 뒤의 명시적 확인만 — 같은 승인·예약·내용일 때만', () => {
+  const config = loadConfig({});
+  const tickAt = (o: Owner, at: Date) =>
+    runJobsTick(db, registry, { workerId: 'confirm-w', config, ownerId: o.id, clock: () => at, random: () => 0.5, submitTimeoutMs: 1500, maxJobs: 10 });
+  const eventsOf = (jobId: string) => db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, jobId)).orderBy(asc(schema.jobEvents.eventSeq));
+  const activeApprovalOf = async (itemId: string) =>
+    (await db.select().from(schema.approvals).where(and(eq(schema.approvals.distributionItemId, itemId), isNull(schema.approvals.revokedAt))))[0]!;
+
+  /** 작업 이력 행을 직접 넣는다(복원된 이력·다른 경로의 기록 흉내). */
+  async function insertEvent(ownerId: string, jobId: string, stateBefore: string, stateAfter: string, details: Record<string, unknown>, at: Date) {
+    const seq = (await db.select({ m: sql<number>`coalesce(max(${schema.jobEvents.eventSeq}), 0)::int` }).from(schema.jobEvents).where(eq(schema.jobEvents.jobId, jobId)))[0]!.m;
+    await db.insert(schema.jobEvents).values({ ownerId, jobId, eventSeq: seq + 1, stateBefore, stateAfter, at, sanitizedDetails: details });
+  }
+
+  /** 보내기 전(attempt 0) 다른 사유(연결 정보 만료)로 BLOCKED 된 상태를 만든다 — 실제 credentialGate 차단과 같은 행 모양. */
+  async function blockForOtherReason(o: Owner, x: { jobId: string; itemId: string }, at: Date) {
+    await db.update(schema.jobs).set({ state: 'BLOCKED', lastErrorCode: 'credential_expired', leaseOwner: null, leaseUntil: null, updatedAt: at }).where(eq(schema.jobs.id, x.jobId));
+    await db.update(schema.distributionItems).set({ status: 'BLOCKED', updatedAt: at }).where(eq(schema.distributionItems.id, x.itemId));
+    await insertEvent(o.id, x.jobId, 'QUEUED', 'BLOCKED', { event: 'blocked', reason: 'credential_blocked', credential_status: 'expired', not_sent: true, transition: 'blocked' }, at);
+  }
+
+  it('다른 사유(연결 정보) 재시도 뒤 장시간 중단 → 첫 전송이 오래 지난 예약이면 여전히 BLOCKED(schedule_stale), 전송 의도 0', async () => {
+    const o = await newOwner();
+    const x = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const t1 = new Date(x.scheduledAt!.getTime() + MIN);
+    await blockForOtherReason(o, x, t1);
+    expect((await retryItem(db, o.id, x.itemId, t1)).state).toBe('QUEUED'); // 일반 재시도(오래 지난 예약 확인 아님)
+    const unblock = (await eventsOf(x.jobId)).at(-1)!.sanitizedDetails as Record<string, unknown>;
+    expect(unblock).toMatchObject({ event: 'unblock', cause: 'user_retry' });
+    expect(unblock.stale_schedule_confirmed).toBeUndefined();
+    // 전송 의도 전에 서버가 멈췄다가 5시간 뒤 복구
+    await tickAt(o, new Date(x.scheduledAt!.getTime() + 5 * HOUR));
+    expect(await jobRow(x.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale', attempt: 0 });
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+  });
+
+  it('schedule_stale 재시도는 확인 기록(승인 ID·내용 hash·예약 시각)을 남기고, 그 뒤 다른 사유 차단·재시도가 있어도 같은 승인·예약이면 보낸다', async () => {
+    const o = await newOwner();
+    const x = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const late = new Date(x.scheduledAt!.getTime() + 5 * HOUR);
+    await tickAt(o, late);
+    expect((await jobRow(x.jobId)).lastErrorCode).toBe('schedule_stale');
+    await retryItem(db, o.id, x.itemId, late);
+    const approval = await activeApprovalOf(x.itemId);
+    const item = await itemRow(x.itemId);
+    const confirm = (await eventsOf(x.jobId)).at(-1)!.sanitizedDetails as Record<string, unknown>;
+    expect(confirm).toMatchObject({
+      event: 'unblock',
+      cause: 'user_retry',
+      stale_schedule_confirmed: true,
+      approval_id: approval.id,
+      confirmed_payload_hash: item.payloadHash,
+      confirmed_scheduled_at_utc: x.scheduledAt!.toISOString(),
+    });
+    const audit = (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, o.id), eq(schema.auditEvents.action, 'item.retry')))).at(-1)!;
+    expect(audit.sanitizedDetails).toMatchObject({ stale_schedule_confirmed: true });
+    // 확인 뒤 보내기 전에 다른 사유로 다시 막혔다가 일반 재시도 — 확인은 이 승인·예약에 대해 그대로 유효
+    await blockForOtherReason(o, x, new Date(late.getTime() + MIN));
+    await retryItem(db, o.id, x.itemId, new Date(late.getTime() + 2 * MIN));
+    await tickAt(o, new Date(late.getTime() + 3 * MIN));
+    expect(await jobRow(x.jobId)).toMatchObject({ state: 'CONFIRMED', attempt: 1 });
+  });
+
+  it('복원·위조된 이력: 일반 unblock 이나 다른 승인·예약·내용에 대한 확인, 차단 없는 확인, 복원 표시 작업의 확인은 인정하지 않는다', async () => {
+    const o = await newOwner();
+    const a = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const late = new Date(a.scheduledAt!.getTime() + 5 * HOUR);
+    const item = await itemRow(a.itemId);
+    const approval = await activeApprovalOf(a.itemId);
+    // 1) 먼저 오래 지난 예약으로 차단(정상 경로)
+    await tickAt(o, late);
+    expect((await jobRow(a.jobId)).lastErrorCode).toBe('schedule_stale');
+    // 2) 그 뒤의 기록 — 일반 unblock(복원된 이력 흉내), 다른 승인 ID·다른 예약 시각·다른 내용 hash 에 대한 확인
+    const base = { event: 'unblock', cause: 'user_retry', transition: 'unblock' };
+    const conf = { ...base, stale_schedule_confirmed: true };
+    await insertEvent(o.id, a.jobId, 'BLOCKED', 'BLOCKED', base, late);
+    await insertEvent(o.id, a.jobId, 'BLOCKED', 'BLOCKED', { ...conf, approval_id: randomUUID(), confirmed_payload_hash: item.payloadHash, confirmed_scheduled_at_utc: a.scheduledAt!.toISOString() }, late);
+    await insertEvent(o.id, a.jobId, 'BLOCKED', 'BLOCKED', { ...conf, approval_id: approval.id, confirmed_payload_hash: item.payloadHash, confirmed_scheduled_at_utc: new Date(a.scheduledAt!.getTime() - HOUR).toISOString() }, late);
+    await insertEvent(o.id, a.jobId, 'BLOCKED', 'BLOCKED', { ...conf, approval_id: approval.id, confirmed_payload_hash: 'f'.repeat(64), confirmed_scheduled_at_utc: a.scheduledAt!.toISOString() }, late);
+    // 다시 대기열로(작업·항목만 — 확인 기록은 위의 위조뿐)
+    await db.update(schema.jobs).set({ state: 'QUEUED', lastErrorCode: null, nextRunAt: late }).where(eq(schema.jobs.id, a.jobId));
+    await db.update(schema.distributionItems).set({ status: 'QUEUED' }).where(eq(schema.distributionItems.id, a.itemId));
+    await tickAt(o, new Date(late.getTime() + MIN));
+    expect(await jobRow(a.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale' });
+    expect(await intentsOf(a.jobId)).toHaveLength(0);
+
+    // 3) schedule_stale 차단 이력 없이 맞는 모양의 확인만 있음 → 인정 안 함
+    const b = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const bItem = await itemRow(b.itemId);
+    const bAppr = await activeApprovalOf(b.itemId);
+    await insertEvent(o.id, b.jobId, 'QUEUED', 'QUEUED', { ...conf, approval_id: bAppr.id, confirmed_payload_hash: bItem.payloadHash, confirmed_scheduled_at_utc: b.scheduledAt!.toISOString() }, new Date(b.scheduledAt!.getTime() + MIN));
+    await tickAt(o, new Date(b.scheduledAt!.getTime() + 5 * HOUR));
+    expect(await jobRow(b.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale' });
+    expect(await intentsOf(b.jobId)).toHaveLength(0);
+
+    // 4) 복원 표시(restored_needs_review) 작업은 올바른 확인 이력이 있어도 인정하지 않는다
+    const c = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const cLate = new Date(c.scheduledAt!.getTime() + 5 * HOUR);
+    await tickAt(o, cLate);
+    await retryItem(db, o.id, c.itemId, cLate); // 올바른 확인
+    await db.update(schema.jobs).set({ restoredNeedsReview: true }).where(eq(schema.jobs.id, c.jobId));
+    await tickAt(o, new Date(cLate.getTime() + MIN));
+    expect(await jobRow(c.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale' });
+    expect(await intentsOf(c.jobId)).toHaveLength(0);
+  });
+
+  it('확인 뒤 승인 철회 → 보내지 않음(전송 의도 0, 항목 PLANNED)', async () => {
+    const o = await newOwner();
+    const x = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const late = new Date(x.scheduledAt!.getTime() + 5 * HOUR);
+    await tickAt(o, late);
+    await retryItem(db, o.id, x.itemId, late);
+    const approval = await activeApprovalOf(x.itemId);
+    await revokeApproval(db, o.id, approval.id, 'test', new Date(late.getTime() + MIN));
+    await tickAt(o, new Date(late.getTime() + 2 * MIN));
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
+    expect(await pubsOf(x.itemId)).toHaveLength(0);
+    expect((await jobRow(x.jobId)).state).not.toBe('CONFIRMED');
+    expect((await itemRow(x.itemId)).status).toBe('PLANNED');
+  });
+
+  it('lease 뒤·전송 의도 전 중단 → lease 만료 복구(QUEUED) 뒤에도 오래 지난 예약 판정은 같다(BLOCKED, 의도 0)', async () => {
+    const o = await newOwner();
+    const x = await queued(o, { scheduleAt: new Date(Date.now() + 2 * HOUR) });
+    const leased = await leaseJobs(db, { workerId: 'crashed-w', now: new Date(x.scheduledAt!.getTime() + MIN), limit: 5, ownerId: o.id });
+    expect(leased.map((j) => j.id)).toContain(x.jobId);
+    expect((await jobRow(x.jobId)).state).toBe('LEASED');
+    // 처리 없이 프로세스가 죽고 5시간 뒤 복구 tick
+    const r = await tickAt(o, new Date(x.scheduledAt!.getTime() + 5 * HOUR));
+    expect(r.recovered).toBeGreaterThanOrEqual(1);
+    expect(await jobRow(x.jobId)).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'schedule_stale', attempt: 0 });
+    expect(await intentsOf(x.jobId)).toHaveLength(0);
   });
 });

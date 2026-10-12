@@ -197,4 +197,4 @@ CHANGES_REQUESTED
 | 라운드 | HEAD | 판정 |
 |---|---|---|
 | T21-P3 | 449da0f | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
-| T21-P1a | e70f7d4 | 대기 |
+| T21-P1a | e70f7d4 | CHANGES_REQUESTED — P1 1(로그인 실패 횟수 확인·기록 분리로 동시 요청 초과 무제한) |

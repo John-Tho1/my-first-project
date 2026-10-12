@@ -139,3 +139,60 @@
 ### FIX round 1 — 오케스트레이터 기록
 - FIX HEAD: f351b7a923b5945d920304339ead39db0863770c (code only). BASE 8ce1044(+ docs 2065e1d·650dc9a).
 - checks-FIX-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 youtube.test.ts 워커 exit 2147483651 — 메모리) → maxWorkers=2 재실행 42 파일 · 829 통과 · drill · migrate · restore PASS.
+
+
+---
+
+# FIX round 2 — Codex review-FIX-T21P2(CHANGES_REQUESTED, 리뷰 대상 f351b7a) 반영
+
+- 리뷰: `.handoffs/review-FIX-T21P2.md` — 코드 지적은 해결됨, 배포 스크립트·문서 P1 4개 + 놓친 케이스.
+- BASE_SHA: 8e1e8e4(f351b7a + docs). HEAD_SHA: **없음(미커밋)** — 커밋·`git add -A` 안 함. `.claude/`·docs/handoffs/*·DECISIONS.md 수정 없음.
+
+## 재현(수정 전 스크립트에서 실패)
+새 시험 실행기 `deploy/scripts/tests/run-all.sh`(일반 bash, pnpm·node 불필요. 임시 폴더의 가짜 `systemctl`·`mountpoint`·`id` 를 PATH 앞에 둠)를 **수정 전** 스크립트에 먼저 돌렸다 → `DEPLOY-SCRIPT-TESTS: FAIL`, `test-check-env` 19 실패 · `test-restore-data` 10 실패 · `test-service-state` 16 실패. 로그 `.handoffs/fix2-t21p2-repro-deploy.log`.
+- 서비스 상태: build-release 는 `activating`·`reloading`·빈 값·systemctl 없음·미등록에서 진행, backup-data 는 `active`·`activating`·조회 실패·systemctl 없음·미등록에서 진행(데이터 폴더 단계까지 감).
+- check-env: 앞 공백·탭·중복 키·export·연속 행·따옴표·소문자 키·`=` 주변 공백 등에 "지원하지 않는 줄" 판정이 없음, `..` 경로를 데이터 루트 기준으로 가리지 못함.
+- restore: 마운트 지점을 구분하는 스크립트 없음(README 는 마운트 지점을 `mv`).
+
+## 지적 → 변경 → 시험
+| 지적 | 변경 | 시험(`deploy/scripts/tests/`) |
+| --- | --- | --- |
+| **P1** build-release.sh:25 · backup-data.sh:21 조회 실패를 정지로 취급 | 공용 `deploy/scripts/lib/common.sh` `require_service_stopped <unit> <first_install>`: `systemctl show -p LoadState` 와 `-p ActiveState` 를 **각각 종료 코드까지 확인**. `LoadState=loaded` + `ActiveState ∈ {inactive, failed}` 일 때만 진행. 조회 실패·systemctl 없음·`active`·`activating`·`deactivating`·`reloading`·빈 값·masked 등은 중단. `not-found` 는 `--first-install` 일 때만, 그리고 `list-unit-files --type=service` 가 **성공**하고 목록에 unit 이 **없을** 때만 진행(이미 등록됐는데 `--first-install` 이면 중단). build-release 에 `--first-install` 인수 추가. backup-data 는 최초 설치 예외 없음, 서비스 확인을 데이터 폴더 확인보다 먼저 | `test-service-state.sh` 43개(진행 2·중단 상태 5·버스 오류·명령 없음·미등록·first-install 성공/목록 실패/목록에 있음/이미 등록·masked, backup 쪽 같은 조합) |
+| **P1** check-env.sh:22 systemd 와 다른 해석 | 문법을 좁게: 빈 줄 / `#` 로 시작하는 줄 / `^[A-Z][A-Z0-9_]*=값$`(앞 공백·export·`=` 주변 공백 없음, 값에 `" ' \ $`·제어 문자(CR 포함)·앞뒤 공백 없음) 만. 같은 KEY 두 번이면 거부. 나머지 줄은 모두 "지원하지 않는 줄(N행)" — 값은 출력하지 않음. 따옴표는 **거부**로 정함(systemd 의 따옴표·이스케이프 해석을 흉내 내지 않음). 값은 한 번 읽어 연관 배열로 판정(grep 마지막 값 방식 제거). `deploy/content-studio.env.example` 이 새 문법을 통과함을 확인 | `test-check-env.sh`: 앞 공백 재할당 ` LLM_MODE=live`·탭·중복 키·export·줄 끝 `\`·큰/작은따옴표·소문자 키·`=` 주변 공백·값 끝 공백·`${HOME}`·CRLF·앞 공백 주석 → 모두 거부, 거부 메시지에 값 없음 |
+| **P1** check-env.sh:43 문자열 접두사 경로 검사 | 데이터 루트 `CS_DATA_ROOT`(기본 `/srv/content-studio/data`)를 `realpath -e` 로 정규화(없으면 실패). 각 경로는 절대 경로여야 하고 `realpath -m`(`..`·기존 링크 해석)이 루트 **아래**(루트 자체 아님)여야 하며, 가장 가까운 **기존 부모**의 `realpath -e` 도 루트 안이어야 함 | `..` 탈출·루트 자체(`exports/..`)·상대 경로·이름이 비슷한 형제 폴더(`data-evil`)→ 거부, 아직 없는 하위 경로 → 허용, 루트 없음 → 거부, **실제 심볼릭 링크**(이 PC 에서 native symlink 생성 성공)로 밖을 가리키면 거부·안을 가리키면 허용 |
+| **P1** README:132 마운트 지점에서 mv 실패 | 새 `deploy/scripts/restore-data.sh`: root·서비스 정지 확인 → 사본 안 경로가 모두 `data/` 아래(절대 경로·`..` 거부) → `mountpoint -q`(종료 코드 0=마운트, 32=아님, 그 밖·명령 없음=중단) → 바꾸기 전 지금 내용을 `data-before-restore-<시각>.tar.gz`(600) → **마운트 지점이면 폴더는 두고 내용만 지운 뒤 풀기**, 일반 폴더면 `data.replaced-<시각>` 으로 mv 후 풀기 → 소유자·700. README §8 을 일반 폴더/마운트 지점 표 + 공급자 볼륨 스냅숏 절차(정지 → 스냅숏 복구 → `findmnt` 확인 → 시작)로 다시 씀. backup-data 는 mv·삭제를 하지 않음(주석 명시) | `test-restore-data.sh` 27개: 일반 폴더(교체·이전 폴더 보존·사전 사본), 마운트 지점(mv 없음·내용 교체·사전 사본), 서비스 실행 중·조회 실패·mountpoint 없음·mountpoint 오류(1)·`../` 사본·최상위가 data 아님 → 중단하고 데이터 그대로, backup-data 정상(마운트 지점 그대로) |
+| 덧붙임(Codex 답 1) `EROFS` | 허용 코드에 `EROFS`·`EIO`·`EDQUOT` 추가(`ENOSPC`·`EACCES`·`EPERM` 은 이미 있음) → 이름 24·코드 21개 | inline-timer.test 허용 목록 시험에 6개 코드 단언 |
+| 덧붙임(Codex 답 3) 다른 사유 차단 뒤 lastErrorCode | 코드 변경 없음(확인 결과 모든 `blocked` 경로가 자기 코드를 쓰고, 재시도는 `lastErrorCode=null`) | 통합 `FIX2-T21P2` ① 확인 → 원격 401(실제 경로) → BLOCKED, `lastErrorCode` ≠ schedule_stale, 그 재시도는 확인 플래그 없음·`previous_error` 일치 ② 확인 → 승인 철회 → `approval_revoked`(A10 즉시 BLOCKED), 의도 0 |
+| 덧붙임(놓친 케이스) 계정·내용 변경이 확인을 무효화 | 코드 변경 없음(승인 무효화가 먼저 막고, 확인은 승인 ID·hash·예약 시각에 묶임) | ③ 확인 → 계정 `disconnected`(승인 철회 확인) → 다시 `mock_ready` → tick: 의도 0·CONFIRMED 아님 ④ 확인 → 본문 새 버전(`appendVariantVersion`) → 승인 0 → tick: 의도 0. 공개 범위·예약 시각은 계획 생성 뒤 바꾸는 경로가 없어(새 계획 필요) 위조 확인 시험(FIX1, 다른 예약 시각)으로만 덮음 |
+
+## 바뀐 파일(FIX2)
+- 신규: `deploy/scripts/lib/common.sh`, `deploy/scripts/restore-data.sh`, `deploy/scripts/tests/{lib.sh,run-all.sh,test-service-state.sh,test-check-env.sh,test-restore-data.sh}`
+- 수정: `deploy/scripts/build-release.sh`(`--first-install`, 공용 상태 확인), `deploy/scripts/backup-data.sh`(공용 상태 확인·순서), `deploy/scripts/check-env.sh`(문법·정규 경로, `CS_DATA_ROOT`·`CS_ENV_OWNER_MODE` 시험용 바꿔치기), `deploy/README_KO.md`(§3 first-install·상태 판정, §4 문법, §8 되돌리기 재작성, §10), `apps/web/lib/inline-timer.ts`(코드 3개), `apps/web/lib/inline-timer.test.ts`, `tests/integration/inline-worker-timer.test.ts`(FIX2 describe 4개)
+- 시험 전용 바꿔치기 변수(운영에서 설정하지 않음): `CS_SYSTEMCTL`, `CS_MOUNTPOINT_CMD`, `CS_TEST_SKIP_CHOWN`, `CS_ENV_OWNER_MODE`, `CS_DATA_ROOT`/`CS_DATA_PARENT`/`CS_BACKUP_DIR`/`CS_REPO_ROOT`/`CS_SERVICE_USER`. `CS_TEST_SKIP_CHOWN=1` 은 root 소유자 지정을 건너뛴다 — Windows Git Bash 에서 `install -d -m 700` 이 실패해 그 분기만 `mkdir`+`chmod` 를 쓴다.
+
+## 실행한 명령과 결과
+- 재현: 위 절(수정 전 스크립트 45 실패, `.handoffs/fix2-t21p2-repro-deploy.log`).
+- 개발 중: `vitest run --project integration tests/integration/inline-worker-timer.test.ts` → 17 passed(약 57초; FIX2 describe 4개 포함. 처음 승인 철회 시험이 `approval_missing` 을 기대해 실패 → 실제는 A10 즉시 BLOCKED 의 `approval_revoked` 라 기대값을 고침, 코드 변경 없음). `vitest run --project unit apps/web/lib/inline-timer.test.ts` → 22 passed. `deploy/content-studio.env.example` 을 시험 경로로 바꿔 check-env 실행 → OK.
+- `bash deploy/scripts/tests/run-all.sh` → `.handoffs/checks-FIX2-T21P2.deploy-tests.log`: bash -n 전부 ok, test-check-env 46 passed(심볼릭 링크 시험 포함 — SKIP 없음), test-restore-data 27 passed, test-service-state 43 passed, **DEPLOY-SCRIPT-TESTS: PASS**(exit 0, 약 8분).
+- `bash .handoffs/run-checks.sh FIX2-T21P2` → `.handoffs/checks-FIX2-T21P2.log`: LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(61 files / 1466 passed), **INTEG=1**(워커 종료 2147483651 — 미변경 `threads.test.ts`·`collector.test.ts`·`migration-0003-guard.test.ts`, 39/42 files), DRILL=0(불변식 위반 0건), MIGRATE=0, DRILL_RESTORE=0(PASS), CHECKS-DONE.
+- 규칙대로 통합만 재실행: `corepack pnpm exec vitest run --project integration --maxWorkers=2` → **42 files / 833 passed, exit 0**(`.handoffs/checks-FIX2-T21P2.integ2.log`).
+
+## 남은 위험·미검증(FIX2)
+1. 스크립트는 가짜 systemctl·mountpoint·id 로만 시험했다. 실제 systemd(`show --value` 출력, `list-unit-files --type=service` 형식)와 util-linux `mountpoint` 종료 코드(32)는 문서 기준이며 실 Linux 에서 확인하지 않았다. shellcheck 미실행(설치 안 됨).
+2. check-env 의 좁은 문법은 systemd 가 받아들이는 일부 정상 형식(따옴표 값 등)도 거부한다 — 의도(검사기와 systemd 가 다르게 읽을 여지를 없앰). systemd 버전별 EnvironmentFile 해석 차이는 조사하지 않았다.
+3. restore-data 의 마운트 지점 경로는 내용을 지운 뒤 사본을 푼다. 풀기가 중간에 실패하면 폴더가 일부만 남는다 — 바로 앞에 만든 `data-before-restore-*.tar.gz` 로 다시 restore-data 를 돌려야 한다(README 에 명시하지 않음 → Codex 판단 요청).
+4. 이 PC 에서 deploy 시험 전체가 약 8분 걸린다(Git Bash 프로세스 생성 비용). Linux 에서는 짧을 것으로 보지만 측정하지 않았다.
+5. 공급자 볼륨 스냅숏 절차는 공급자를 정하지 않아 일반 단계만 적었다.
+
+## Codex 재검증 질문
+1. `require_service_stopped` 의 판정(LoadState·ActiveState 각각 조회 성공 확인, inactive/failed 만 진행, not-found 는 `--first-install` + list-unit-files 성공·부재)이 놓치는 상태가 있는가(예: `maintenance`, 템플릿 unit)?
+2. check-env 문법 제한이 systemd 가 적용하는데 검사기는 무시하는 할당을 모두 막는가? 주석 줄(`#` 시작만 허용, `;` 주석은 거부)의 처리는 적절한가?
+3. 정규 경로 검사(루트 `realpath -e`, 값 `realpath -m`, 기존 부모 `realpath -e`)에 남은 우회(검사 후 링크 교체 같은 TOCTOU 제외)가 있는가?
+4. restore-data 의 마운트 지점 처리(내용 삭제 → 풀기)와 사본 경로 검사(`data/` 아래·`..`·절대 경로 거부)가 충분한가? 위험 3 을 문서화만 할지, 풀기를 임시 폴더에 먼저 하고 옮기는 방식으로 바꿔야 하는가?
+5. 시험 전용 바꿔치기 변수가 운영에서 잘못 설정될 때의 위험(특히 `CS_TEST_SKIP_CHOWN`, `CS_ENV_OWNER_MODE`)을 막아야 하는가?
+
+
+### FIX round 2 — 오케스트레이터 기록
+- FIX2 HEAD: 69bf4b01933163fcf778a5667e725b8c1cc08f20 (code only). BASE 8e1e8e4(+ docs eae0d1e).
+- checks-FIX2-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 파일 워커 exit 2147483651) → maxWorkers=2 재실행 42 파일 · 833 통과 · drill · migrate · restore PASS. 배포 스크립트 bash 시험 116/116(가짜 명령, 실제 Linux 미실행).
+- 오케스트레이터 추가: deploy/README_KO.md §8 에 "복원 도중 실패" 시 직전 tar 로 restore-data.sh 재실행 안내 1줄.

@@ -23,7 +23,7 @@ import {
   type BrandTone,
 } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
-import { assistModeText, failedSettlementLabel, isMockResult, resultLabel, usageSourceLabel, type LlmMode } from '../../../lib/ai-labels';
+import { assistModeText, failedSettlementLabel, resultLabel, resultOrigin, unpricedLabel, usageSourceLabel, type LlmMode } from '../../../lib/ai-labels';
 import { DiffView } from '../../../lib/diff-view';
 import { proposalActions } from '../../../lib/proposals';
 
@@ -100,6 +100,7 @@ export function WritingPanel({
     : null;
 
   const run = selectedRun;
+  const origin = resultOrigin({ provider: run?.provider ?? null });
   const claims = run ? claimsOf(run.outputJson) : [];
   const adopted = run ? state.adopted.has(run.id) : false;
   // FIX-T09(P1): 채택·무시 여부는 run.proposal_status 로 본다.
@@ -208,10 +209,14 @@ export function WritingPanel({
                   {ledger.actualAmount !== null ? ` · 실제 ${ledger.actualAmount}` : ' · 확정 전'}
                   {ledger.failed ? ` · ${failedSettlementLabel(ledger.pricingSnapshot)}` : ''}
                 </span>
-                {ledger.tokensIn !== null ? <span>
+                {ledger.tokensIn !== null ? (
+                  <span>
                     토큰 입력 {ledger.tokensIn} · 출력 {ledger.tokensOut}({usageSourceLabel(ledger.pricingSnapshot)})
-                  </span> : null}
-                {(ledger.pricingSnapshot as { priced?: boolean }).priced === false ? <span>가격 미설정(모의 0)</span> : null}
+                  </span>
+                ) : ledger.actualAmount !== null ? (
+                  <span>토큰: {usageSourceLabel(ledger.pricingSnapshot)}</span>
+                ) : null}
+                {(ledger.pricingSnapshot as { priced?: boolean }).priced === false ? <span>{unpricedLabel(origin)}</span> : null}
               </p>
             ) : null}
             {run.status === 'failed' ? <p className="note">제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다.</p> : null}
@@ -231,7 +236,7 @@ export function WritingPanel({
             {proposal ? (
               <>
                 <h4>
-                  제안(<Link href={`/contents/${contentId}/versions/${proposal.version}`}>버전 {proposal.version}</Link>, {resultLabel('제안', isMockResult({ provider: run.provider }))}) — 현재 본문(버전{' '}
+                  제안(<Link href={`/contents/${contentId}/versions/${proposal.version}`}>버전 {proposal.version}</Link>, {resultLabel('제안', origin)}) — 현재 본문(버전{' '}
                   {current.version}) 과 비교
                 </h4>
                 <DiffView lines={diffLines(current.body, proposal.body)} label="현재 본문 → AI 제안 차이" />

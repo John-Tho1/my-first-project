@@ -31,16 +31,35 @@ export function assistModeText(mode: LlmMode): AssistModeText {
   };
 }
 
-/** run.provider(작성 보조) 또는 버전 createdBy('ai:mock' | 'ai:live')로 그 결과가 모의였는지. 모르면 모의로 보지 않는다(실제 가능성을 숨기지 않음). */
-export function isMockResult(by: { provider?: string | null; createdBy?: string | null }): boolean {
-  if (by.provider != null) return by.provider === 'mock';
-  if (by.createdBy != null) return by.createdBy === 'ai:mock';
-  return false;
+export type ResultOrigin = 'mock' | 'live' | 'unknown';
+
+/** 실제 AI 로 확인된 provider 이름(ClaudeLlmProvider.name). 그 밖의 값은 출처 미확인. */
+const LIVE_PROVIDERS = new Set(['anthropic']);
+
+/**
+ * FIX-LIVEUI: 그 결과의 출처. run.provider(작성 보조) 또는 버전 createdBy('ai:mock' | 'ai:live')로만 정한다.
+ * 확인된 값만 mock/live 로 보고, 없음·빈 값·모르는 값은 unknown(모의라고도 실제라고도 단정하지 않는다).
+ */
+export function resultOrigin(by: { provider?: string | null; createdBy?: string | null }): ResultOrigin {
+  if (by.provider != null && by.provider !== '') {
+    if (by.provider === 'mock') return 'mock';
+    return LIVE_PROVIDERS.has(by.provider) ? 'live' : 'unknown';
+  }
+  if (by.createdBy === 'ai:mock') return 'mock';
+  if (by.createdBy === 'ai:live') return 'live';
+  return 'unknown';
 }
 
-/** 제안·초안 이름표: "AI 제안(모의)" / "AI 제안(실제 AI)" */
-export function resultLabel(kind: '제안' | '초안', mock: boolean): string {
-  return `AI ${kind}(${mock ? '모의' : '실제 AI'})`;
+const ORIGIN_TEXT: Record<ResultOrigin, string> = { mock: '모의', live: '실제 AI', unknown: '출처 미확인' };
+
+/** 제안·초안 이름표: "AI 제안(모의)" / "AI 제안(실제 AI)" / "AI 제안(출처 미확인)" */
+export function resultLabel(kind: '제안' | '초안', origin: ResultOrigin): string {
+  return `AI ${kind}(${ORIGIN_TEXT[origin]})`;
+}
+
+/** 가격 미설정 원장 표시 — "모의"는 모의 결과일 때만 붙인다. */
+export function unpricedLabel(origin: ResultOrigin): string {
+  return origin === 'mock' ? '가격 미설정(모의 0)' : '가격 미설정(0 으로 기록)';
 }
 
 /** 원장 토큰 출처 표시(스냅숏 usage_source). 키 없음 = LIVE-L1 이전 행(모의 추정). */

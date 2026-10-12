@@ -8,7 +8,7 @@ import type { AssetRow, VariantState } from '@cs/db';
 import { CHANNEL_LABEL, CHANNELS, editableMetadata, formatMsk, VARIANT_BODY_MAX, VARIANT_ROLES, type Channel } from '@cs/domain';
 import { MOCK_WARNING } from '@cs/providers';
 import { preview } from '../../../lib/labels';
-import { assistModeText, isMockResult, resultLabel, type LlmMode } from '../../../lib/ai-labels';
+import { assistModeText, resultLabel, resultOrigin, type LlmMode } from '../../../lib/ai-labels';
 
 const LIFECYCLE: Record<string, string> = { draft: '초안', review: '검토 중', approved: '승인됨' };
 const ROLE_LABEL: Record<string, string> = { image: '이미지', video: '영상', thumbnail: '썸네일', attachment: '첨부' };
@@ -173,8 +173,8 @@ export function VariantsPanel({
             {s?.proposal ? (
               <div className="assist-run">
                 <p className="notice" role="note">
-                  {isMockResult({ createdBy: s.proposal.createdBy }) ? `${MOCK_WARNING} — ` : ''}
-                  {resultLabel('초안', isMockResult({ createdBy: s.proposal.createdBy }))}(버전 {s.proposal.version})은 채택하기 전까지 현재 초안이
+                  {resultOrigin({ createdBy: s.proposal.createdBy }) === 'mock' ? `${MOCK_WARNING} — ` : ''}
+                  {resultLabel('초안', resultOrigin({ createdBy: s.proposal.createdBy }))}(버전 {s.proposal.version})은 채택하기 전까지 현재 초안이
                   아닙니다.
                 </p>
                 <pre className="raw-text">{preview(s.proposal.body, 400)}</pre>

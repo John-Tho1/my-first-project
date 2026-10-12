@@ -442,13 +442,13 @@
 - 설정: `OAUTH_MODE=live`, `OAUTH_LIVE_APPROVAL_REF=D31`, `PUBLISH_MODE` 는 **disabled 유지**(게시 불가). 앱 ID·시크릿·redirect URI 는 사용자가 `.env.local` 에 직접 넣는다(대화·저장소·로그에 값 없음).
 - redirect URI: 앱 대시보드의 유효한 OAuth 리디렉션 URI 와 정확히 일치해야 함(공식 문서 2026-08-12 판 확인). 로컬 기본값 `http://localhost:3000/api/oauth/callback`. Meta 가 http 를 거부하면 HTTPS 로컬 주소가 필요 — 그때 방법을 다시 정한다(외부 노출 방식은 별도 승인).
 
-## D32 — T18 Notion·Drive 선택 가져오기(파일·모의): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+## D32 — T18 Notion·Drive 선택 가져오기(파일·모의): 잠정 판단 → 2026-10-12 확정(아래 "D32·D33 확정")
 - Decision ID / date: D32 / 2026-10-03. 코드 1427118. 출처: docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md "Proposed D32".
 - 상태: **잠정**. 실제 Notion·Drive 연결(OAuth·API)은 하지 않으며 별도 승인 대상.
 
 ## Proposed D32 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
 
-## D33 — T19 허용 소스 수집·재추천(모의 수집기): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+## D33 — T19 허용 소스 수집·재추천(모의 수집기): 잠정 판단 → 2026-10-12 확정(아래 "D32·D33 확정")
 - Decision ID / date: D33 / 2026-10-03. 코드 4a2e02f. 출처: docs/handoffs/T19_IMPLEMENTATION_HANDOFF.md "Proposed D33".
 - 상태: **잠정**. 실제 웹 수집(실제 HTTP 요청)은 없으며 별도 승인 대상.
 
@@ -474,3 +474,9 @@
 - 입력 규칙(AGENTS.md 그대로): 고용주 기밀·고객·직원·비공개 수치·자격 증명은 넣지 않는다. 사용자가 직접 확인한 개인 경험·공개 자료만. 앱은 이를 자동 판별하지 않는다(사용자 책임) — 화면 안내 유지.
 - 불변: 게시(PUBLISH_MODE)는 계속 disabled. AI 출력은 승인을 만들지 않고, 1인칭 경험 문단은 확인 전 '준비됨' 전환 불가. 동시 요청의 초과액은 합쳐질 수 있다(D34 기록) — 한 번에 하나씩 쓰는 것을 권장.
 - 되돌리기: `.env.local` 에서 `LLM_LIVE_APPROVAL_REF` 를 지우면 즉시 실제 호출 차단(dev 서버 재시작).
+
+## D32·D33 확정 (2026-10-12, 사용자 "D32·D33 권고대로")
+- D32(T18 가져오기)와 D33(T19 수집·재추천)의 잠정 판단을 **현재 구현 그대로 확정**한다. 세부 근거는 `docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md`·`T19_IMPLEMENTATION_HANDOFF.md` 의 "Proposed D32/D33".
+- D32: 입력은 사용자가 올린 Notion·Drive 내보내기 ZIP 의 .md·.markdown·.txt·.html·.htm·.csv 만(.docx·이미지는 목록만 — 필요 시 다음 라운드), 충돌 기본 건너뜀(체크한 항목만 새 버전), 20,000자 초과 페이지 건너뜀, 가져온 소재 위험 표시 none, 원장(import_runs·import_items) 내보내기·복원 포함, 상한 그대로.
+- D33: 허용 소스 = 사용자가 직접 등록한 https 주소(owner 당 50, 호스트 정확 일치), 주기 실행 기본 꺼짐·켜도 미리보기만, 고쳐진 글은 새 소재·버린 글은 다시 표시, 재추천 30일/14일/핵심어 2개/최대 5개/닫기 영구, 원장(수집 실행·항목·닫기) 내보내기·복원 포함. 실제 등록할 소스 목록·rights_status 는 실제 사용 때 사용자가 정한다.
+- 범위 밖(별도 승인): 실제 Notion·Drive API 연결, 실제 웹 수집(COLLECTOR_MODE=enabled), 주기 실행 켜기.

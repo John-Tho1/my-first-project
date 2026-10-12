@@ -249,8 +249,40 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     });
     throw new ConfigError(`환경변수 설정이 올바르지 않습니다.\n${lines.join('\n')}`);
   }
+  // T21-P1a(G1a): 운영 빌드에서 비밀번호 없는 dev 로그인 설정이면 설정 읽기 자체를 실패시킨다(fail closed).
+  if (parsed.data.AUTH_MODE === 'dev' && !isDevAuthAllowedForNodeEnv(env.NODE_ENV)) {
+    throw new ConfigError(DEV_AUTH_REFUSED_CONFIG_MESSAGE);
+  }
   return parsed.data;
 }
+
+/**
+ * T21-P1a(G1a, docs/handoffs/T21_DEPLOY_REVIEW.md §2): 비밀번호 없는 개발용 로그인(AUTH_MODE=dev)을 허용하는 실행 환경.
+ * NODE_ENV 가 없거나 빈 값·`development`·`test` 일 때만 허용한다. `production` 을 포함한 그 밖의 값은 모두 거부한다(fail closed).
+ *
+ * 탈출구(운영 빌드를 로컬에서 dev 로그인으로 실행)는 두지 않는다: Next route handler 는 소켓의 실제 원격 주소를 주지 않고,
+ * Host·Origin·X-Forwarded-* 는 클라이언트·프록시가 바꿀 수 있어 "loopback 에서 온 요청"을 믿을 수 있게 판별할 수 없다.
+ * 로컬 개발은 `pnpm dev`(NODE_ENV=development)로 한다.
+ */
+export function isDevAuthAllowedForNodeEnv(nodeEnv: string | undefined): boolean {
+  return nodeEnv === undefined || nodeEnv === '' || nodeEnv === 'development' || nodeEnv === 'test';
+}
+
+/**
+ * 원시 환경변수 기준 판정(설정 객체를 만들기 전 — 서버 시작 훅·로그인 경로의 첫 검사).
+ * AUTH_MODE 가 없거나 빈 값(기본값 dev)·`dev` 이고 NODE_ENV 가 허용 목록 밖이면 true.
+ * 그 밖의 잘못된 AUTH_MODE 값은 여기서 판정하지 않고 loadConfig 가 거부한다.
+ */
+export function devAuthRefusedByRuntime(env: Record<string, string | undefined>): boolean {
+  const mode = env.AUTH_MODE;
+  const isDev = mode === undefined || mode.trim() === '' || mode === 'dev';
+  return isDev && !isDevAuthAllowedForNodeEnv(env.NODE_ENV);
+}
+
+/** 설정 이름만 말한다(값 없음). 서버 시작 거부·설정 읽기 실패에 같은 문구를 쓴다. */
+export const DEV_AUTH_REFUSED_CONFIG_MESSAGE =
+  `환경변수 설정이 올바르지 않습니다.\n- ${LABELS.AUTH_MODE}: 운영 빌드(NODE_ENV=production 등)에서는 비밀번호 없는 개발용 로그인을 쓸 수 없습니다. ` +
+  '운영 인증을 설정하세요(로컬 개발은 pnpm dev)';
 
 export interface Modes {
   llm: AppConfig['LLM_MODE'];

@@ -3,13 +3,20 @@
  *
  * M1 은 운영 인증 공급자(OIDC)가 없으므로 "비밀번호 없는 개발용 세션 모드(AUTH_MODE=dev)"만 제공한다.
  * - dev 로그인은 APP_BASE_URL 이 localhost/127.0.0.1 일 때만 허용한다.
- * - oidc 는 T13 전까지 모든 로그인 시도를 거부한다.
+ * - T21-P1a(G1a): 운영 빌드(NODE_ENV 가 development·test·없음 이외)에서는 dev 로그인을 거부한다(config.ts isDevAuthAllowedForNodeEnv).
+ * - oidc 는 운영 인증(T21-P1b)이 구현되기 전까지 모든 로그인 시도를 거부한다.
  * 자체 비밀번호·암호 알고리즘은 구현하지 않는다. 세션 토큰은 CSPRNG 난수, DB 에는 sha256 해시만 저장한다.
- * 로그인 시도 횟수 제한(rate limit)은 T02 범위 밖이다(localhost 전용 모드이므로 위험이 제한됨, T13 에서 재검토).
+ * 로그인 시도 횟수 제한: T21-P1a 에서 추가(전역 15분 창, 아래 assertLoginNotRateLimited).
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import type { AppConfig } from './config';
-import { CsrfError, DevLoginNotAllowedError, OidcNotConfiguredError } from './errors';
+import { isDevAuthAllowedForNodeEnv, type AppConfig } from './config';
+import {
+  CsrfError,
+  DevLoginNotAllowedError,
+  DevLoginRefusedInProductionError,
+  LoginRateLimitedError,
+  OidcNotConfiguredError,
+} from './errors';
 
 export const SESSION_COOKIE_NAME = 'cs_session';
 /** last_seen_at 갱신 최소 간격 */
@@ -32,10 +39,36 @@ export function assertDevLoginAllowed(config: Pick<AppConfig, 'APP_BASE_URL'>): 
   if (!isLocalhostBaseUrl(config.APP_BASE_URL)) throw new DevLoginNotAllowedError();
 }
 
-/** 로그인 시도 전에 호출. oidc → OidcNotConfiguredError, dev → localhost 검사. */
-export function assertLoginAvailable(config: Pick<AppConfig, 'AUTH_MODE' | 'APP_BASE_URL'>): void {
+/**
+ * 로그인 시도 전에 호출. oidc → OidcNotConfiguredError, dev → 실행 환경 검사(T21-P1a) 후 localhost 검사.
+ * nodeEnv 는 호출 측이 반드시 넘긴다(web 은 빌드 때 고정되는 `process.env.NODE_ENV`). production 등이면
+ * 설정 객체가 어떻게 만들어졌든 dev 로그인을 거부한다(loadConfig 의 거부와 겹치는 두 번째 방어선).
+ */
+export function assertLoginAvailable(
+  config: Pick<AppConfig, 'AUTH_MODE' | 'APP_BASE_URL'>,
+  nodeEnv: string | undefined,
+): void {
   if (config.AUTH_MODE === 'oidc') throw new OidcNotConfiguredError();
+  if (!isDevAuthAllowedForNodeEnv(nodeEnv)) throw new DevLoginRefusedInProductionError();
   assertDevLoginAllowed(config);
+}
+
+// ---- 로그인 시도 횟수 제한(T21-P1a) ----
+
+/** 실패를 세는 시간 창. */
+export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+/** 시간 창 안에서 허용하는 실패 횟수. 이만큼 실패가 쌓이면 다음 시도부터 429. */
+export const LOGIN_MAX_FAILURES = 10;
+/** 실패로 세는 감사 사유(auth.login_denied 의 details.reason). 설정 거부(not_allowed 등)는 세지 않는다. */
+export const LOGIN_FAILURE_REASONS = ['identity_mismatch', 'invalid_request'] as const;
+
+/**
+ * 전역(식별자·IP 와 무관) 시간 창 제한. IP 는 프록시 헤더로 위조할 수 있고 식별자별로 세면 다른 식별자를 계속 바꿔 넣을 수 있으므로
+ * 전체 실패 수로 센다. 마지막 성공 로그인 이전의 실패는 세지 않는다(호출 측이 그렇게 센 값을 넘긴다).
+ * 대가: 시간 창 안에서는 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로). 창이 지나면 풀린다.
+ */
+export function assertLoginNotRateLimited(failuresInWindow: number): void {
+  if (failuresInWindow >= LOGIN_MAX_FAILURES) throw new LoginRateLimitedError();
 }
 
 /**

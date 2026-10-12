@@ -145,7 +145,7 @@ M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`A
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용). `oidc` = 운영 인증(T13 예정) — 지금은 모든 로그인을 `운영 인증 공급자는 아직 설정되지 않았습니다(T13)` 로 거부 |
+| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용, **운영 빌드에서는 거부** — 아래 T21-P1a). `oidc` = 운영 인증(T21-P1b 예정, 미구현) — 지금은 모든 로그인을 `운영 인증 공급자는 아직 설정되지 않았습니다(T13)` 로 거부 |
 | `AUTH_ALLOWED_IDENTITY` | `owner@example.local` | 로그인 가능한 유일한 식별자. 바꾸면 기존 세션도 무효 |
 | `AUTH_SESSION_TTL_MINUTES` | `720` | 세션 유효 시간(분, 5~43200). 연장(sliding) 없음 |
 | `AUTH_COOKIE_SECURE` | `auto` | `auto` = `http://localhost`·`127.0.0.1` 이면 Secure 끔, 그 외 켬 |
@@ -154,7 +154,9 @@ M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`A
 - 세션: 쿠키 `cs_session`(HttpOnly, SameSite=Lax, Path=/). 토큰 원문은 쿠키에만 있고 DB(`sessions`)에는 sha256 해시만 저장한다. 로그아웃은 POST 로만 가능하다.
 - 상태를 바꾸는 요청(로그인·로그아웃·업로드)은 `Origin`(없으면 `Referer`)이 `APP_BASE_URL` 과 같아야 한다. 그래서 `APP_BASE_URL=http://localhost:3000` 이면 `http://127.0.0.1:3000` 으로 열었을 때 403 이 난다 — 주소창 주소를 `APP_BASE_URL` 과 맞춘다.
 - 다른 사용자의 capture·파일 ID 로는 조회·다운로드할 수 없다(항상 404).
-- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 로그인 시도 횟수 제한은 없다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영 인증(OIDC)은 T13 에서 추가한다.
+- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영 인증(OIDC)은 아직 없다(T21-P1b, `docs/handoffs/T21_DEPLOY_REVIEW.md` G1).
+- **운영 빌드에서 dev 로그인 거부(T21-P1a, G1a)**: `NODE_ENV` 가 없음·빈 값·`development`·`test` 가 아니면(운영 빌드 `pnpm build`/`pnpm start` 는 `production`) `AUTH_MODE=dev`(또는 미설정)를 세 곳에서 거부한다 — ① 서버 시작(`apps/web/instrumentation.ts`: 한국어 안내 후 종료 코드 1, 요청을 받지 않음) ② 설정 읽기(`loadConfig` 가 `AUTH_MODE(인증 방식)` 이름만 담은 설정 오류 — 화면·API 가 열리지 않고 공개 `/api/health` 는 `degraded` 503) ③ 로그인 요청(`POST /api/auth/login` 503 `dev_login_refused_in_production`, 폼은 `/login?error=production_dev`). web 은 Next 빌드가 고정한 `NODE_ENV` 를 쓰므로 `pnpm start` 때 `NODE_ENV` 를 바꿔도 풀리지 않는다. **탈출구 없음**: 운영 빌드를 로컬에서 dev 로그인으로 돌리는 설정은 두지 않았다 — Next route handler 는 소켓의 실제 원격 주소를 주지 않고 Host·Origin·X-Forwarded-* 는 위조할 수 있어 "loopback 요청만"을 믿고 가릴 수 없기 때문이다. 로컬 사용·확인은 `pnpm dev` 로 한다.
+- **로그인 시도 횟수 제한(T21-P1a)**: 최근 15분 동안 실패한 로그인(식별자 불일치·잘못된 요청 본문)이 **전체 합계 10회**가 되면 그 뒤 시도는 식별자가 맞든 틀리든 같은 429 `login_rate_limited`(폼은 `/login?error=rate_limited`)로 거부한다. IP 는 프록시 헤더로 위조할 수 있어 쓰지 않고(전역 창), 식별자 존재 여부도 드러내지 않는다. 마지막 성공 로그인 이전의 실패는 세지 않는다. 실패 기록은 기존 감사 기록(`auth.login_denied`)을 그대로 세므로 별도 표·migration 이 없고 서버를 다시 켜도 유지된다. 429 자체는 감사 기록을 남기지 않는다. 대가: 막힌 동안(가장 오래된 실패가 15분을 넘을 때까지)은 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로). 같은 순간의 동시 요청 몇 개는 잠금 없이 세므로 상한을 조금 넘을 수 있다.
 
 ### 수집 (M1, T03)
 필수 입력은 원문 하나다. 오늘 화면(`/`)의 **빠른 수집**에서 저장한다.
@@ -518,7 +520,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm test:integration` | vitest 통합 테스트(`tests/integration`, PGlite 메모리 DB) | exit 0 |
 | `pnpm test:e2e` | Playwright E2E — M0에서는 실행하지 않음 | **exit 2 = NOT_RUN** (통과 아님) |
 | `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
-| `pnpm start` | 빌드 결과 실행(포트 3000) | `/api/health` 200 |
+| `pnpm start` | 빌드 결과 실행(포트 3000). T21-P1a: 운영 빌드이므로 `AUTH_MODE=dev`(기본값)이면 시작을 거부한다(종료 코드 1). `AUTH_MODE=oidc` 면 시작하지만 운영 인증이 아직 없어 로그인할 수 없다(T21-P1b) — 로컬 사용은 `pnpm dev` | dev 설정: exit 1 + 한국어 안내 / oidc 설정: `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표 + T16 Instagram 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |

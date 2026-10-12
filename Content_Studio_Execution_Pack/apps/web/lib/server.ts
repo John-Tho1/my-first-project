@@ -14,8 +14,12 @@ import {
   type Transcriber,
 } from '@cs/providers';
 
+/**
+ * T21-P1a(G1a): NODE_ENV 는 `process.env.NODE_ENV` 식으로 따로 넘긴다 — Next 빌드가 이 식을 상수로 고정하므로
+ * 운영 빌드(`next start`)는 실행할 때 NODE_ENV 를 다른 값으로 줘도 production 으로 판정된다(dev 로그인 설정이면 loadConfig 가 거부).
+ */
 export function getConfig(): AppConfig {
-  return loadConfig(process.env);
+  return loadConfig({ ...process.env, NODE_ENV: process.env.NODE_ENV });
 }
 
 export async function getAppDb(config: AppConfig = getConfig()): Promise<DbHandle> {

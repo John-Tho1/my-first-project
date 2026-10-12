@@ -855,6 +855,9 @@ describe('D25-3 — 모의 시험 매개변수는 운영에서 거부', () => {
   it('NODE_ENV=production: mock_user·mock_grant·mock_deny → 400 mock_params_not_allowed, 매개변수 없으면 정상 303', async () => {
     const accountId = await newThreadsAccount();
     vi.stubEnv('NODE_ENV', 'production');
+    // T21-P1a(G1a): 운영 빌드는 AUTH_MODE=dev 설정을 거부하므로(설정 읽기 실패) 운영에서 가능한 유일한 설정(oidc)으로 확인한다.
+    // 세션 검증은 AUTH_MODE 와 무관 — 앞에서 만든 세션으로 계속 요청한다(D25-3 판정 자체는 그대로).
+    vi.stubEnv('AUTH_MODE', 'oidc');
     try {
       for (const p of [{ mock_user: 'mock:threads:other' }, { mock_grant: 'threads_basic' }, { mock_deny: '1' }] as Array<Record<string, string>>) {
         const url = (await (await connect(accountId)).json()).authorize_url as string;
@@ -866,6 +869,7 @@ describe('D25-3 — 모의 시험 매개변수는 운영에서 거부', () => {
       expect((await authorize(url)).status).toBe(303);
     } finally {
       vi.stubEnv('NODE_ENV', 'test');
+      vi.stubEnv('AUTH_MODE', 'dev');
     }
     const url = (await (await connect(accountId)).json()).authorize_url as string;
     expect((await authorize(url, { mock_deny: '1' })).status).toBe(303);

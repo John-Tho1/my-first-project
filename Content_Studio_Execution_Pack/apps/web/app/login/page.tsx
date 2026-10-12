@@ -12,6 +12,8 @@ const ERROR_TEXT: Record<string, string> = {
   csrf: '요청 출처를 확인할 수 없어 거부했습니다. 이 화면에서 다시 시도하세요.',
   unavailable: '운영 인증은 아직 설정되지 않았습니다(T13)',
   not_allowed: '개발용 로그인은 localhost 에서만 허용됩니다.',
+  production_dev: '운영 빌드에서는 개발용 로그인을 쓸 수 없습니다.',
+  rate_limited: '로그인 시도가 너무 많습니다. 잠시 뒤(최대 15분) 다시 시도하세요.',
   server: '서버 오류가 발생했습니다. 잠시 후 다시 시도하세요.',
 };
 
@@ -37,7 +39,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
         ) : (
           <>
             <p className="muted-text">
-              개발용 로그인(AUTH_MODE=dev): 허용된 식별자 1개만 접속할 수 있습니다. 비밀번호 없음, localhost 전용.
+              개발용 로그인(AUTH_MODE=dev): 허용된 식별자 1개만 접속할 수 있습니다. 비밀번호 없음, localhost 전용(운영 빌드에서는 거부).
             </p>
             {errorText ? (
               <p className="notice" role="alert">

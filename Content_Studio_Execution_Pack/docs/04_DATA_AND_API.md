@@ -65,6 +65,7 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |
 | 복원 미리보기 | POST /api/restores/preview | 버전·checksum·충돌 검사 |
+| 로그인(공개 예외) | POST /api/auth/login | 같은 출처(CSRF) 필수. AUTH_MODE=dev(D3): 허용 식별자 1개, localhost 전용, **운영 빌드(NODE_ENV 가 development·test·없음 이외)에서는 서버 시작·설정 읽기·로그인 모두 거부**(503 `dev_login_refused_in_production`, T21-P1a/G1a). 시도 횟수 제한: 최근 15분 실패(식별자 불일치·잘못된 본문) 전체 10회 이상이면 식별자와 무관하게 429 `login_rate_limited`(IP 미사용, 마지막 성공 이전 실패는 세지 않음, `auth.login_denied` 감사 기록으로 셈). AUTH_MODE=oidc 는 운영 인증 미구현으로 503(T21-P1b) |
 | 생존 확인(공개 예외) | GET /api/health | 로그인 없음. 응답은 정확히 `{status:'ok'\|'degraded', app, time_utc, db_ok}`(ok 200, degraded 503). 부작용 없음(worker tick 안 돎). 모드·준비 상태·버전·DB 드라이버·worker 정보 없음(T21-P3) |
 | 자세한 상태 | GET /api/health/details | 로그인한 owner 만(없으면 401). 모드·llm/stt 준비 상태(빠진 조건 이름만)·DB 드라이버/migrated·worker 모드/마지막 tick. 읽기 전용(tick 없음). 운영 숫자는 GET /api/ops/summary |
 | 작업 처리 실행 | POST /api/worker/tick | 로그인·같은 출처(CSRF) 필수, 이 owner 의 작업만(모의 어댑터). 세션 없음 401 — 아무 작업도 건드리지 않음 |
@@ -77,7 +78,7 @@ claim의 source_ref는 실제 허용 source_version 목록에 포함되어야 �
 HTML·코드·외부 명령은 자료로만 저장하고 실행하지 않는다. structured output은 출처 진위나 공개 승인 증거가 아니다.
 
 ## 환경변수 계약(실제 키 없음)
-APP_BASE_URL, APP_TIMEZONE=Europe/Moscow, DATABASE_URL, AUTH_*,
+APP_BASE_URL, APP_TIMEZONE=Europe/Moscow, DATABASE_URL, AUTH_*(AUTH_MODE=dev 는 NODE_ENV=production 등 운영 빌드에서 설정 오류 — T21-P1a),
 STORAGE_DRIVER=local|object, STORAGE_*, ENCRYPTION_KEY_REF,
 LLM_MODE=mock|live, LLM_PROVIDER, LLM_MODEL, LLM_BUDGET_*,
 PUBLISH_MODE=disabled|enabled, COLLECTOR_MODE=disabled|enabled,

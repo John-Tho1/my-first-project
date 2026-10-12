@@ -3,7 +3,7 @@
  * captures/assets 등 owner 소유 데이터를 다루는 함수는 모두 ownerId 를 받아 WHERE 에 넣는다.
  * 다른 owner 의 ID 를 넘기면 "없음(null)" 으로 응답한다(존재 여부를 구분해 드러내지 않음).
  */
-import { and, asc, count, desc, eq, gt, isNull } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, inArray, isNull, lte, max, sql } from 'drizzle-orm';
 import { isUuid } from '@cs/domain';
 import type { Db } from './client';
 import { assets, auditEvents, captures, sessions, users } from './schema';
@@ -293,4 +293,35 @@ export async function recordAudit(db: DbOrTx, e: AuditInput): Promise<void> {
     sanitizedDetails: e.details ?? {},
     ...(e.at ? { at: e.at } : {}),
   });
+}
+
+/**
+ * T21-P1a: 로그인 시도 횟수 제한용 — 시간 창(since < at <= now) 안의 실패한 로그인 수(전역, owner·식별자·IP 무관).
+ * 실패 = `auth.login_denied` 중 details.reason 이 reasons 에 든 것. 창 안에 성공 로그인(`auth.login`)이 있으면
+ * 마지막 성공 이후의 실패만 센다. 감사 기록을 그대로 쓰므로 별도 표·migration 이 없다.
+ * 동시 요청은 잠그지 않는다(같은 순간의 요청 몇 개가 상한을 조금 넘을 수 있음 — 단일 사용자 앱에서 허용한 오차).
+ */
+export async function countRecentLoginFailures(
+  db: DbOrTx,
+  opts: { now: Date; windowMs: number; reasons: readonly string[] },
+): Promise<number> {
+  const windowStart = new Date(opts.now.getTime() - opts.windowMs);
+  const [lastOk] = await db
+    .select({ at: max(auditEvents.at) })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.action, 'auth.login'), gt(auditEvents.at, windowStart), lte(auditEvents.at, opts.now)));
+  const since = lastOk?.at && lastOk.at.getTime() > windowStart.getTime() ? lastOk.at : windowStart;
+  if (opts.reasons.length === 0) return 0;
+  const [row] = await db
+    .select({ n: count() })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.action, 'auth.login_denied'),
+        gt(auditEvents.at, since),
+        lte(auditEvents.at, opts.now),
+        inArray(sql<string>`${auditEvents.sanitizedDetails}->>'reason'`, [...opts.reasons]),
+      ),
+    );
+  return row?.n ?? 0;
 }

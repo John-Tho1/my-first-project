@@ -33,10 +33,10 @@ describe('assertDevLoginAllowed (localhost 전용)', () => {
     expect(() => assertDevLoginAllowed({ APP_BASE_URL: url })).toThrow(DevLoginNotAllowedError);
   });
   it('oidc 는 항상 OidcNotConfiguredError(T13)', () => {
-    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }))).toThrow(OidcNotConfiguredError);
-    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }))).toThrow('운영 인증 공급자는 아직 설정되지 않았습니다(T13)');
-    expect(() => assertLoginAvailable(loadConfig({}))).not.toThrow();
-    expect(() => assertLoginAvailable(loadConfig({ APP_BASE_URL: 'https://example.com' }))).toThrow(DevLoginNotAllowedError);
+    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow(OidcNotConfiguredError);
+    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow('운영 인증 공급자는 아직 설정되지 않았습니다(T13)');
+    expect(() => assertLoginAvailable(loadConfig({}), 'test')).not.toThrow();
+    expect(() => assertLoginAvailable(loadConfig({ APP_BASE_URL: 'https://example.com' }), 'test')).toThrow(DevLoginNotAllowedError);
   });
 });
 

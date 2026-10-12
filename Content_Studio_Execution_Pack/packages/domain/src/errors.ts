@@ -74,7 +74,9 @@ export type AppErrorKind =
   /** T07: AI 예산 상한 초과 → 429 */
   | 'budget_exceeded'
   /** T08: 의도적으로 지운 자료(원음 삭제 등) → 410 */
-  | 'gone';
+  | 'gone'
+  /** T21-P1a: 로그인 시도 횟수 제한 → 429 */
+  | 'too_many_requests';
 
 export class AppError extends Error {
   readonly kind: AppErrorKind;
@@ -115,6 +117,30 @@ export class LoginDeniedError extends AppError {
 export class CsrfError extends AppError {
   constructor() {
     super('csrf', 'csrf', '요청 출처를 확인할 수 없어 거부했습니다');
+  }
+}
+
+/**
+ * T21-P1a(G1a): 운영 빌드(NODE_ENV=production)에서 비밀번호 없는 개발용 로그인(AUTH_MODE=dev) 거부 → 503.
+ * 설정 이름만 말하고 값은 넣지 않는다.
+ */
+export class DevLoginRefusedInProductionError extends AppError {
+  constructor() {
+    super(
+      'service_unavailable',
+      'dev_login_refused_in_production',
+      '운영 빌드에서는 개발용 로그인(AUTH_MODE=dev)을 쓸 수 없습니다. 운영 인증 설정이 필요합니다',
+    );
+  }
+}
+
+/**
+ * T21-P1a: 최근 실패한 로그인 시도가 상한을 넘었다 → 429. 입력한 식별자가 맞든 틀리든 같은 응답이다
+ * (어떤 식별자가 허용되는지 드러내지 않음).
+ */
+export class LoginRateLimitedError extends AppError {
+  constructor() {
+    super('too_many_requests', 'login_rate_limited', '로그인 시도가 너무 많습니다. 잠시 뒤(최대 15분) 다시 시도하세요.');
   }
 }
 

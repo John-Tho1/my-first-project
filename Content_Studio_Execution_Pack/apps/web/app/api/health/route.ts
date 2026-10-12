@@ -19,7 +19,8 @@ export async function GET(): Promise<Response> {
 
   let config;
   try {
-    config = loadConfig(process.env);
+    // T21-P1a: NODE_ENV 는 빌드가 고정한 값으로(운영 빌드 + AUTH_MODE=dev → 설정 오류 → degraded). lib/server.ts getConfig 와 같다.
+    config = loadConfig({ ...process.env, NODE_ENV: process.env.NODE_ENV });
   } catch {
     // 설정 오류의 내용(변수 이름·값)은 공개 응답에 넣지 않는다. 서버 로그에도 종류만.
     console.error('[health] config_invalid');

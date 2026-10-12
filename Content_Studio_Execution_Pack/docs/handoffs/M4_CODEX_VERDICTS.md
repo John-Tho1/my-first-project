@@ -204,4 +204,4 @@ CHANGES_REQUESTED
 | T21-P2 | b73fc65 | CHANGES_REQUESTED — P0 1(타이머 오류 로그 비밀 노출 가능), P1 3(일반 unblock 을 오래된 예약 확인으로 인정·배포 문서 앱 경로·실패 무시), P2 3(재설치 겹침·caddy validate 변수·시험 대기 조건) |
 | TEST-TIMEOUT | f71f7ad | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
 | FIX-T21P2 | f351b7a | CHANGES_REQUESTED — 코드 지적 해소, 배포 스크립트·문서 P1 4(상태 조회 실패를 정지로 취급·env 해석 불일치·경로 정규화·마운트 지점 되돌리기) |
-| FIX2-T21P2 | 69bf4b0 | 대기 |
+| FIX2-T21P2 | 69bf4b0 | CHANGES_REQUESTED — restore-data.sh P0 2(심볼릭 링크 data 복원·직전 사본 덮어쓰기), P1 1(교체 실패 후 재실행 불가), P2 1(pipefail+grep -q) |

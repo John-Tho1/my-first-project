@@ -202,3 +202,4 @@ CHANGES_REQUESTED
 | FIX2-T21P1A | a448b78 | CHANGES_REQUESTED — P2 1(31자리 순번이 파서 밖 — 순번 재사용) |
 | FIX3-T21P1A | 6f7a2a7 | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P1a 종결 |
 | T21-P2 | b73fc65 | 대기 |
+| TEST-TIMEOUT | f71f7ad | 대기 |

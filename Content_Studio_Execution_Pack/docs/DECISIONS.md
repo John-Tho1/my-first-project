@@ -466,3 +466,11 @@
 - When to revisit: 2단계 실제 호출 뒤 실제 토큰 사용량으로 예약 추정식 교정.
 - **2단계 승인(2026-10-12, 사용자 "2단계 승인")**: 실제 Claude 호출 1회. 소재는 구현자가 만든 가상 소재(AI 자동화 주제, 실명·회사·수치 없음 — `docs/handoffs/LIVEL1_STAGE2_MATERIAL.md`). 설정: `LLM_MODE=live`·`LLM_PROVIDER=anthropic`·`LLM_MODEL=claude-opus-5-5`·단가 0.004/0.02·월 10·1회 0.5·출력 4096·`LLM_LIVE_MAX_RUNS=1`·`LLM_LIVE_APPROVAL_REF=D34-2`. 키는 사용자가 `.env.local` 에 직접 입력. 공유 범위: run 상태·오류 코드·예약액·실제액·tokens_in/out 만. 끝나면 `LLM_LIVE_APPROVAL_REF` 제거. 범위 밖: 두 번째 호출, 실제 사용자 원고, 채널 초안(variants) 실제 호출, 게시.
 - **2단계 결과(2026-10-12 15:38 MSK)**: 실제 Claude 호출 1회 **성공**. 가상 소재 원고 버전 1, 모드 '개요', provider anthropic · model claude-opus-5-5. run succeeded, 제안은 버전 2(AI 제안·현재 본문 아님). 원장: 예약 0.105476 USD · 실제 0.035192 USD · 토큰 입력 1988 · 출력 1362(usage_source provider). 예약 입력 추정 ≈ 5889 토큰(실제의 약 3배 — 보수적). 모델이 허용 목록 밖 출처 4건을 냈고 서버가 버렸다(설계대로). 공개 범위 밖 동작 없음(게시 disabled). 직후 `LLM_LIVE_APPROVAL_REF` 제거로 잠금(키는 `.env.local` 에 남음 — 사용자 소유).
+
+## D35 — Claude 평상시 사용 허용(실제 AI 작성 보조·채널 초안), 월 10 USD 안에서
+- Decision ID / date: D35 / 2026-10-12 (Europe/Moscow), 사용자 결정("1번 진행해줘" — Claude 평상시 사용 허용, 오케스트레이터 추천값 수용).
+- 범위: 사용자 본인 원고에 대한 작성 보조(assist)와 채널 초안(variants) AI 호출. 공급자·모델 D34 그대로(Anthropic, `claude-opus-5-5`).
+- 설정: `LLM_LIVE_APPROVAL_REF=D35`, `LLM_BUDGET_MONTHLY_LIMIT=10`(USD), `LLM_BUDGET_PER_RUN_MAX=0.5`, `LLM_LIVE_MAX_OUTPUT_TOKENS=4096`, `LLM_LIVE_MAX_RUNS=300`(이 승인 기록 아래 실제 호출 총 횟수 안전장치 — 월 상한이 먼저 걸리는 것이 정상. 다 쓰면 새 승인 기록으로 갱신).
+- 입력 규칙(AGENTS.md 그대로): 고용주 기밀·고객·직원·비공개 수치·자격 증명은 넣지 않는다. 사용자가 직접 확인한 개인 경험·공개 자료만. 앱은 이를 자동 판별하지 않는다(사용자 책임) — 화면 안내 유지.
+- 불변: 게시(PUBLISH_MODE)는 계속 disabled. AI 출력은 승인을 만들지 않고, 1인칭 경험 문단은 확인 전 '준비됨' 전환 불가. 동시 요청의 초과액은 합쳐질 수 있다(D34 기록) — 한 번에 하나씩 쓰는 것을 권장.
+- 되돌리기: `.env.local` 에서 `LLM_LIVE_APPROVAL_REF` 를 지우면 즉시 실제 호출 차단(dev 서버 재시작).

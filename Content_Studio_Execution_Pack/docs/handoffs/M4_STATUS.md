@@ -139,3 +139,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - D35 일시 중지(Anthropic 지원 지역 확인 전 — 사용자 확인 필요). Threads 2단계는 설정 완료·형식 확인, 실제 OAuth 는 사용자 로그인 필요로 대기.
 - T21-P3(공개 health 생존 확인만·상세는 세션): 449da0f **Codex PASS**. 검사 unit 1411·integration 793·drill·restore PASS.
 - 진행 순서: P1a(운영 빌드 dev 로그인 차단·로그인 횟수 제한) → P2(tick 타이머·배포 설정 파일) → P1b(일반 OIDC, 가짜 IdP 시험).
+- T21-P1a(운영 빌드 dev 로그인 거부·로그인 실패 15분 10회 제한·판정 원자화): e70f7d4 → FIX1 e57cfa5 → FIX2 a448b78 → **FIX3 6f7a2a7 Codex PASS**. 검사 unit 1437·integration 816·drill·restore PASS. 남은 위험: Postgres 다중 연결 미검증(G2), 공격자의 전역 잠금으로 새 로그인 15분 차단 가능(기존 세션 유지), 순번 소진 시 관리자 정리 필요.

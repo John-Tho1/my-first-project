@@ -87,3 +87,33 @@
 ### FIX round 1 — 오케스트레이터 기록
 - FIX HEAD: e57cfa5157da22ff2a499c433c6d66dfcddc5272 (code only). BASE b820278(+ docs 82eeef4).
 - checks-FIX-T21P1A: lint·typecheck·build 0 · unit 1437 · integration 39 파일 · 809 · drill:mock 0 · migrate 0 · drill:restore PASS. 재실행 없음.
+
+---
+
+## FIX round 2 (Codex CHANGES_REQUESTED on e57cfa5, `.handoffs/review-FIX-T21P1A.md`)
+- BASE_SHA: 7c982a1(코드 = e57cfa5, 이후 docs 전용 577ae20). HEAD_SHA: 없음 — 커밋하지 않음(지시). 검토 대상 = 577ae20 위 작업 트리 변경.
+- 재현(e57cfa5 코드로 새 시험 `tests/integration/auth-rate-limit-fix2.test.ts`, `vitest run --project integration --maxWorkers=1`): **3 failed | 1 passed**
+  - 조기 검사 두 SELECT 사이 커밋: `expected [9, 1] to include 10`(섞인 상태 10 → 그 상태면 즉시 429)
+  - 순번 15자리 경계: 16자리 순번이 순번으로 읽히지 않아 같은 ms 실패가 안 세짐 → `expected 200 to be 429`
+  - 2^53 초과 순번 +1: `Number` 반올림으로 `9007199254740994` 행 없음
+  - 처음부터 통과: 성공 감사 기록 실패 시 세션까지 되돌림(이미 한 트랜잭션이었음 — 회귀 시험으로 남김)
+
+| Finding | 변경 | 시험 |
+| --- | --- | --- |
+| P2 조기 검사의 두 SELECT 불일치 → 잘못된 429 | `countRecentLoginFailures` 를 **SQL 한 문장**으로(마지막 성공 = 상관 하위 질의 `(select … order by at desc, seq desc nulls last limit 1)`, 실패 계수와 같은 문장). 선택 이유: 한 문장은 Postgres(READ COMMITTED 포함)·PGlite 에서 한 스냅숏을 보므로 결과는 항상 어떤 실제 시점의 정확한 값이다 → 조기 검사의 429 는 "그 시점에 잠금 안 판정을 했어도 429" 와 같다. 조기 429 를 없애는 안보다 변경이 작고(동작 동일), 막힌 동안 본문을 읽지 않는 이점도 유지. 잠금 안 판정·기록은 그대로(같은 함수) | PGlite 클라이언트 `query` 를 감싸 **첫 질의 직후** 성공(순번 1010)·실패(1011) 커밋 → 결과 ∈ {9, 1}(섞인 10 아님), 커밋 뒤 다시 세면 1, 실제 요청 401 |
+| (a) 순번 자릿수 | 순번 파싱 `^[0-9]{1,30}$` + `::numeric`(이전 `{1,15}`·bigint), 다음 순번은 SQL `(coalesce(max,0)+1)::text` 로 계산해 문자열로 전달(JS Number 미사용). `LoginAttemptContext.seq` 를 `string` 으로 | 성공 순번 `999999999999999`(같은 ms) 뒤 route 실패 10회 → 순번 `1000000000000000`~`…009` 연속·모두 셈 → 429 / `9007199254740993` 다음 `…994` 정확 |
+| (b) 세션 생성 후 감사 실패 | 변경 없음(이미 한 트랜잭션) | 시험용 트리거(`auth.login` insert 시 예외) → 500, 쿠키 없음, 세션·`auth.login` 행 수 그대로, 트리거 제거 후 200 |
+| (c) 복원·순번 혼합·시계 역행 | 코드 주석(`countRecentLoginFailures`)·README 에 보수적 규칙 명시: 다른 이력의 성공 행이 add_missing 복원으로 창 안에 섞여 순번이 더 크면 그 창(최대 15분) 동안 실패를 덜 셈. 다음 순번은 섞인 최대 + 1 이라 이후 기록은 다시 앞섬. 실패 행은 owner 가 없어 내보내기·복원 대상 아님. 시계가 뒤로 가면 `at <= now` 로 미래가 된 기록을 무시 → 되돌린 폭 동안 느슨. 순번·시각 순서가 어긋나도 마지막 성공은 (시각, 순번) 최대 | (문서 — 추가 시험 없음, 지시대로 과설계하지 않음) |
+| (d) Postgres 다중 연결 | `withLoginAttemptLock` 주석에 "Postgres 드라이버가 없어(G2) 여러 연결에서의 잠금 대기·커밋·롤백·격리 수준 동작 미검증" 명시 | **not_run** |
+
+- 변경 파일(이번 라운드): `packages/db/src/queries.ts`, `apps/web/app/api/auth/login/route.ts`(순번 문자열), `README_KO.md`, 추가 `tests/integration/auth-rate-limit-fix2.test.ts`. 기존 시험 변경 없음.
+- Actual commands and results:
+  - 수정 후 `vitest run --project integration --maxWorkers=1` auth-rate-limit-fix2·auth-rate-limit-concurrency·auth-production-rate-limit·auth → 4 files, 37 passed. `tsc -p tsconfig.json --noEmit` → 0.
+  - 3000·3999 LISTEN 없음 확인 후 `bash .handoffs/run-checks.sh FIX2-T21P1A` → LINT=0, TYPECHECK=0, BUILD=0, **UNIT=1**(1 failed | 1436 passed: 손대지 않은 `imports-fix1.test.ts` "<h1> 열고 짧은 태그 반복" 5307ms 시간 초과), INTEG=0(40 files, 813 passed), DRILL=0, MIGRATE=0, DRILL_RESTORE=0(PASS).
+  - 시간 초과 단독 재실행: `corepack pnpm exec vitest run --project unit packages/domain/src/imports-fix1.test.ts` → 34 passed.
+- Known risks / not run: Postgres 다중 연결(G2) not_run. 운영 번들 시작과 동시 로그인 not_run(보장은 설정 읽기·route 거부). 복원 혼합·시계 역행의 느슨함은 위 규칙대로 수용(창 15분 한정).
+
+
+### FIX round 2 — 오케스트레이터 기록
+- FIX2 HEAD: a448b7859f155daf6ae9e62f48a3b920bad16369 (code only). BASE 7c982a1(+ docs 577ae20).
+- checks-FIX2-T21P1A: lint·typecheck·build 0 · unit 1회차 1(손대지 않은 imports-fix1 시간 초과 — 단독 34 통과) · integration 813 · drill:mock 0 · migrate 0 · drill:restore PASS.

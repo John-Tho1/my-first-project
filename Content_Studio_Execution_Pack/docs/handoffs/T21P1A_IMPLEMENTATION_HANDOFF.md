@@ -117,3 +117,23 @@
 ### FIX round 2 — 오케스트레이터 기록
 - FIX2 HEAD: a448b7859f155daf6ae9e62f48a3b920bad16369 (code only). BASE 7c982a1(+ docs 577ae20).
 - checks-FIX2-T21P1A: lint·typecheck·build 0 · unit 1회차 1(손대지 않은 imports-fix1 시간 초과 — 단독 34 통과) · integration 813 · drill:mock 0 · migrate 0 · drill:restore PASS.
+
+---
+
+## FIX round 3 (Codex CHANGES_REQUESTED on a448b78, `.handoffs/review-FIX2-T21P1A.md`)
+- BASE_SHA: 7c2c220(코드 = a448b78, 이후 docs 전용 b737090). HEAD_SHA: 없음 — 커밋하지 않음(지시). 검토 대상 = b737090 위 작업 트리 변경.
+- 재현(a448b78 코드로 새 시험 `tests/integration/auth-rate-limit-fix3.test.ts`, `--maxWorkers=1`): **1 failed | 2 passed** — 최대 순번 30자리 `9…9` 뒤 로그인이 `expected 200 to be 503`(31자리 순번을 써서 이후 순서·횟수에서 빠짐). 처음부터 통과(회귀 시험으로 남김): 복원된 31자리 순번 행은 무시(유효 최대 500 → 다음 501), `auth.login_denied` 감사 insert 실패 → 500·실패 행 없음.
+
+| Finding | 변경 | 시험 |
+| --- | --- | --- |
+| P2 순번 31자리 → 파싱 밖 → 같은 순번 반복·제한 풀림 | `withLoginAttemptLock`: 다음 순번이 `^[0-9]{1,30}$`(SQL `seqOf` 와 같은 상수 `LOGIN_SEQ_PATTERN`)를 벗어나면 `LoginSequenceExhaustedError`(503 `login_sequence_exhausted`)를 잠금 안에서 던짐 → 트랜잭션 되돌림, 세션·감사 행 없음. 폼은 `/login?error=server`. 복원 행의 범위 밖 순번은 기존대로 `seqOf` 가 null(순번 없음 규칙) | 최대 순번 30×'9' → 맞는·틀린 식별자 모두 503 `login_sequence_exhausted`, 쿠키 없음, 감사·세션 행 수 그대로 / 31자리 복원 행 무시 → 정상 로그인, 순번 501 |
+| 놓친 케이스: 실패 감사 기록 실패 | 변경 없음(이미 한 트랜잭션, 401 은 커밋 뒤에만) | 트리거로 `auth.login_denied` insert 예외 → 500 `internal`(401 아님), 감사 행 수 그대로, 트리거 제거 뒤 401 |
+
+- 변경 파일(이번 라운드): `packages/domain/src/errors.ts`(`LoginSequenceExhaustedError`), `packages/db/src/queries.ts`, `apps/web/app/api/auth/login/route.ts`(폼 오류 코드 매핑), 추가 `tests/integration/auth-rate-limit-fix3.test.ts`. 기존 시험 변경 없음.
+- Actual commands and results: 수정 후 인증 시험 5 files(fix3·fix2·concurrency·production-rate-limit·auth) `--maxWorkers=1` → 40 passed, `tsc -p tsconfig.json --noEmit` → 0. 3000·3999 LISTEN 없음 확인 후 `bash .handoffs/run-checks.sh FIX3-T21P1A` → LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(59 files, 1437 passed), INTEG=0(41 files, 816 passed), DRILL=0, MIGRATE=0, DRILL_RESTORE=0(PASS). 재실행 없음.
+- Known risks / not run: Postgres 다중 연결(G2) not_run. 운영 번들 시작과 동시 로그인 not_run. 순번 소진(10^30 회)은 실제로는 복원된 비정상 큰 순번으로만 생기며, 그때는 관리자가 해당 감사 행을 정리해야 로그인이 다시 된다(자동 복구 없음 — 닫힘 쪽 선택).
+
+
+### FIX round 3 — 오케스트레이터 기록
+- FIX3 HEAD: 6f7a2a7ad88170dba15d634331a9c9067c28b80f (code only). BASE 7c2c220(+ docs b737090).
+- checks-FIX3-T21P1A: 전부 0 — unit 1437 · integration 816 · drill · migrate · restore PASS. 재실행 없음.

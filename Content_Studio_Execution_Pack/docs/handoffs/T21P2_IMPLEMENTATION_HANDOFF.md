@@ -74,3 +74,68 @@
 ## 오케스트레이터 재검사(커밋 전)
 - 단위만 다시 실행: 2 실패 / 1456 통과 — 실패는 손대지 않은 `imports-fix1.test.ts`·`imports-fix3.test.ts` 의 2MB 선형성 시험 5초 시간 초과(단독 실행은 통과). 전체 실행 부하에서 반복되므로 별도 시험 전용 작업으로 처리 예정(걸음 수 단언은 유지).
 - 60분 기준은 D36(잠정)으로 DECISIONS.md 에 기록.
+
+
+---
+
+# FIX round 1 — Codex review-T21P2(CHANGES_REQUESTED, 리뷰 대상 b73fc65) 반영
+
+- 리뷰: `.handoffs/review-T21P2.md`(P0 1 · P1 3 · P2 3). 지시: `prompts/CLAUDE_FIX.md` — 코드 지적은 먼저 b73fc65 코드(작업 트리의 코드 = b73fc65, 그 뒤 커밋은 docs·시험 시간 제한뿐)에서 실패하는 시험으로 재현한 뒤 고쳤다.
+- BASE_SHA: 8ce1044(리뷰 대상 코드 HEAD b73fc65 + docs 9afaedd + TEST-TIMEOUT f71f7ad/8ce1044)
+- HEAD_SHA: **없음(미커밋)** — 지시대로 커밋하지 않았다(`git add -A` 안 함). `.claude/` 손대지 않음. docs/handoffs/*·DECISIONS.md 수정 없음.
+
+## 재현(수정 전 코드에서 실패)
+| 지적 | 재현 시험 | 수정 전 결과 |
+| --- | --- | --- |
+| P0 inline-timer.ts:53 | inline-timer.test `describeTickError` 4개(식별자 모양 비밀 name `SECRET_TOKEN_abc123`·code `api_key_123`·`sk_live_…`·`ghp_…`·`Bearer_…`, 던지는 접근자·Proxy, 제어기 로그) + 기존 오류 로그 시험 기대값 갱신 | 5개 실패(이름·코드가 그대로 로그에 남음 / 접근자 예외) |
+| P2 inline-timer.ts:185(재설치 경쟁) | "이전 타이머가 멈추는 중(진행 중 tick)이면 새 설치는 거부…" | 실패(`started` 반환 → 두 tick 겹칠 수 있음) |
+| P2(Codex 답 3, runNow 예약) | "runNow 는 예약을 다시 잡는다 — 수동 실행이 끝난 뒤에도 간격만큼…" | 실패(기존 예약이 남아 수동 실행 직후 다시 실행) |
+| P1 jobs.ts:623 | inline-worker-timer.test `FIX1-T21P2(Codex P1 …)` 의 ① 다른 사유 재시도 뒤 장시간 중단 ② 확인 기록 내용 ③ 복원·위조 이력 | 3개 실패(① 일반 unblock 때문에 오래 지난 예약을 그대로 전송 ② 확인 필드 없음 ③ 위조된 일반 unblock 으로 전송). 로그 `.handoffs/fix1-t21p2-repro-p1.log` |
+| 놓친 케이스(확인 뒤 승인 철회, lease 만료 복구) | 같은 describe 의 ④ ⑤ | 수정 전에도 통과(승인 재검사가 앞에 있고, 복구 뒤에도 같은 판정) — 회귀 방지로 유지 |
+
+(P0·P2 단위 재현 실행 결과는 이 세션 콘솔에서 7 failed / 15 passed 로 관찰. 파일로 남기지 않았다.)
+
+## 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+| --- | --- | --- |
+| **P0** :53 정규식은 비밀을 못 막음 | `describeTickError` 를 **허용 목록**으로: 이름은 `LOGGABLE_ERROR_NAMES`(JS 표준 10개 + tick 경로 앱 오류 14개)만, 코드는 `LOGGABLE_ERROR_CODES`(Node 시스템 코드 13개 + 확인한 앱 코드 5개: `job_state_changed`·`lease_lost`·`mock_rehydration_unavailable`·`secrets_not_configured`·`credential_refresh_failed`)만. 목록 밖 이름 → `UnknownError`, Error 가 아닌 값 → `NonErrorThrown`, 목록 밖 코드는 생략. `instanceof`·속성 읽기 모두 try 로 감싸 접근자·Proxy 예외도 고정 문자열 | `describeTickError (FIX1-T21P2 P0 :53 — 허용 목록만)` 4개 + 오류 로그 시험 |
+| **P1** jobs.ts:623 아무 unblock 이나 확인으로 인정 | `retryItem`: 막힌 사유가 `schedule_stale` 일 때만 unblock 이력에 `stale_schedule_confirmed: true`·`approval_id`·`confirmed_payload_hash`·`confirmed_scheduled_at_utc` 를 남기고 감사 기록에도 `stale_schedule_confirmed: true`. `beginSend`: 순수 함수 `staleScheduleConfirmedBy`(domain) — 이 작업의 **마지막 schedule_stale 차단 뒤**에 cause `user_retry` + 확인 플래그가 있고 승인 ID·내용 hash·예약 시각이 **지금의 활성 승인·항목과 모두 같을 때만** 통과. `restored_needs_review` 작업은 확인을 인정하지 않음. 이전 `userRetriedJob`(아무 unblock) 삭제 | 통합 ①~⑤ + domain `staleScheduleConfirmedBy` 2개(인정 2가지·불인정 9가지: 차단 없음·일반 unblock·다른 승인/hash/예약·플래그 문자열·cause 다름·확인 뒤 다시 stale 차단) |
+| **P1** README:40 저장소 루트·앱 루트 혼동 | 저장소 루트 `/srv/content-studio/repo`, 앱 루트 `…/repo/Content_Studio_Execution_Pack` 로 분리. unit `WorkingDirectory`=앱 루트, `ReadWritePaths` 를 실제 빌드 출력 **`<앱 루트>/apps/web/.next`** 로 고침(이전 `/app/.next` 는 틀렸다 — 로컬 build 결과가 `apps/web/.next/BUILD_ID` 에 있음을 확인). 복사 명령은 모두 `$APP_ROOT/deploy/...` | 경로 표(README §1), 로컬 `apps/web/.next` 확인 |
+| **P1** README:42 실패 뒤 계속 진행 | `deploy/scripts/build-release.sh`(`set -euo pipefail`): 40자리 SHA·서비스 사용자·서비스 정지·추적 변경 없음·fetch·커밋 존재·checkout·**`git rev-parse HEAD` == 요청 SHA**·`.env` 없음·`install --frozen-lockfile`·build·`BUILD_ID` 를 단계마다 확인하고 실패 즉시 exit 1. `check-env.sh`(root): 환경 파일 존재·`root:root 600`·고정 설정·데이터 절대 경로·간격 범위·비어 있어야 할 키(값 출력 없음). `backup-data.sh`(root): 서비스 정지 확인, `/srv/content-studio-backup` 를 `install -d -o root -g root -m 700` 로 생성, `umask 077`·파일 600, 다시 읽기 확인. README 블록은 `set -eu`·개별 명령, 실패 시 다음 단계 금지 명시 | `bash -n` 3개 OK. 인수 검사 실행: 인수 없음·짧은 SHA·다른 사용자·origin 없는 임시 저장소(fetch 실패)·SHA 형식 오류·환경 파일 없음·예시 env(소유자/권한·예시 도메인 지적) → 모두 exit 1. shellcheck 는 이 PC 에 없음(not_run) |
+| **P2** README:78 caddy validate 에 APP_DOMAIN 없음 | 도메인을 `/etc/caddy/content-studio.env` 한 파일에 두고 Caddy 서비스(`EnvironmentFile=`)와 검증(`sh -c 'set -a; . file; set +a; test -n "$APP_DOMAIN" && exec caddy validate --config … --adapter caddyfile'`)이 같은 파일을 읽게 함. Caddyfile 머리 주석도 같게 | 문서만(Caddy 미설치 — not_run) |
+| **P2** inline-timer.ts:185 멈추는 중 재설치 | `installInlineTimer`: 기존 타이머가 멈췄더라도 **진행 중 tick 이 있으면 `stopping` 으로 거부**(자리 유지 — `uninstallInlineTimer` 가 stop 완료 뒤 비움). 완전히 멈춘 타이머가 남아 있으면 교체. `StartOutcome` 에 `stopping` 추가 | 재설치 경쟁 시험(동시 실행 최대 1) + "멈춘 타이머가 자리에 남아 있어도…" |
+| (Codex 답 3) runNow 와 고정 간격 | `runNow()`: 시작한 제어기면 기존 예약을 지우고 실행이 끝난 뒤 다시 intervalMs 예약(진행 중이면 건너뜀, 시작 전이면 예약 안 함). 인터페이스 주석에 명시 | runNow 시험 2개(이전 "수동 실행 중 타이머 차례" 시험은 새 동작과 맞지 않아 교체 — 같은 성질(겹침 없음)을 더 엄격히 확인) |
+| **P2** 통합 :171 대기 조건 | 단언 전에 plain·recent CONFIRMED·stale BLOCKED **그리고** `runs ≥ 1 && !inFlight` 를 함께 기다림. "다음 주기에도 그대로"는 6초 고정 대기 대신 완료 tick 수 +2 를 기다림. 재시도 뒤 CONFIRMED 도 `runs` 증가·`!inFlight` 와 함께. 이 시험만 시간 제한 240초(대기 상한 합계 수용) | 통합 13개 통과(약 54초). 꺼짐·uninstall 뒤 "처리하지 않음"은 부재 확인이라 고정 대기(6초)를 유지 |
+
+## 바뀐 파일(FIX1)
+- 코드: `apps/web/lib/inline-timer.ts`, `apps/web/lib/inline-worker-timer.ts`(StartOutcome), `packages/domain/src/jobs.ts`(`staleScheduleConfirmedBy`·`StaleScheduleConfirmTarget`), `packages/db/src/jobs.ts`(`staleScheduleConfirmed`·beginSend 조건·retryItem 확인 기록·감사 세부)
+- 시험: `apps/web/lib/inline-timer.test.ts`, `packages/domain/src/jobs.test.ts`, `tests/integration/inline-worker-timer.test.ts`
+- 배포·문서: `deploy/README_KO.md`(재작성), `deploy/content-studio.service`, `deploy/Caddyfile`(주석), 신규 `deploy/scripts/build-release.sh`·`check-env.sh`·`backup-data.sh`, `README_KO.md`(deploy 안내·확인 규칙 한 줄)
+- migration·export/restore 형식: 변화 없음(확인 정보는 기존 job_events·audit JSON 에만).
+
+## 실행한 명령과 결과(port 3000 LISTEN 없음 확인 후)
+- 재현: 위 표. 수정 후 `vitest run --project unit apps/web/lib/inline-timer.test.ts` 22 passed, `… packages/domain/src/jobs.test.ts apps/web/lib/inline-timer.test.ts apps/web/instrumentation.test.ts` 116 passed, `vitest run --project integration tests/integration/inline-worker-timer.test.ts` 13 passed.
+- `bash -n deploy/scripts/*.sh` 3개 OK, 인수·실패 경로 실행 7가지 모두 exit 1(위 표).
+- `bash .handoffs/run-checks.sh FIX-T21P2` → `.handoffs/checks-FIX-T21P2.log`: LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(61 files / 1466 passed), **INTEG=1**(워커 종료 2147483651 — `tests/integration/youtube.test.ts`(미변경)에서 fork 가 죽음, 41/42 files·801/829 실행), DRILL=0(불변식 위반 0건), MIGRATE=0, DRILL_RESTORE=0(PASS), CHECKS-DONE.
+- 규칙대로 통합만 재실행: `corepack pnpm exec vitest run --project integration --maxWorkers=2` → **42 files / 829 passed, exit 0**(`.handoffs/checks-FIX-T21P2.integ2.log`).
+
+## 남은 위험·미검증(FIX1)
+1. 허용 목록 밖의 오류는 `UnknownError` 로만 보인다 — 운영 진단 정보가 줄어든다(의도). 새 앱 오류를 로그에 보이게 하려면 목록에 추가해야 한다.
+2. 확인 일치 판정은 job_events JSON 의 문자열 비교다. 예약 시각 ISO 표기가 바뀌면(같은 시각 다른 표기) 확인이 무효가 되는 쪽으로 실패한다(fail closed).
+3. 확인 뒤 다른 사유로 다시 막혔다가 일반 재시도하면, 승인·내용·예약이 같으므로 이전 확인이 유효하다(시험으로 고정). 이것이 너무 느슨하면 "확인 뒤 첫 차단 이후에는 무효"로 좁힐 수 있다 — Codex 판단 요청.
+4. 복원된 작업은 `restored_needs_review` 로만 거른다. 복원 경로가 이 표시 없이 작업을 실행 가능 상태로 만드는 일은 코드상 없다고 보았으나(restore.ts 347~364행) 실제 복원 후 오래 지난 예약 조합은 위조 이력 시험으로만 확인했다.
+5. deploy 스크립트·절차는 실제 Linux·systemd·Caddy 에서 실행하지 않았다. shellcheck 미실행. `ReadWritePaths` 가 Next 런타임 쓰기 전부를 덮는지 실측하지 않았다(README §5 에 확인 방법). Windows 작업 트리는 CRLF 로 체크아웃되지만 저장소에는 LF 로 들어가므로 Linux checkout 은 LF 라고 가정했다(미확인).
+6. 통합 1차 실행의 워커 종료(2147483651)는 이 PC 의 알려진 PGlite 메모리 문제로 보고 재실행으로 처리했다 — 변경 파일이 아닌 youtube.test.ts 에서 발생.
+
+## Codex 재검증 질문
+1. 허용 목록(이름 24·코드 18)에 비밀이 될 수 있는 값이 있는가, 또는 tick 경로에서 자주 나는데 빠진 안전한 이름·코드가 있는가?
+2. `staleScheduleConfirmedBy` 의 조건(마지막 schedule_stale 차단 뒤, cause user_retry, 플래그 true, 승인 ID·hash·예약 시각 일치)과 `restored_needs_review` 제외가 지적한 놓친 케이스를 모두 막는가? 위험 3(확인 뒤 다른 사유 재차단)은 허용해도 되는가?
+3. `retryItem` 이 `job.lastErrorCode === 'schedule_stale'` 로 확인 여부를 정하는 것이 충분한가(같은 작업의 마지막 차단 사유를 lastErrorCode 로 판단)?
+4. `installInlineTimer` 의 `stopping` 거부와 `runNow` 재예약에 남은 경쟁(예: runNow 실행 중 stop, 타이머 콜백과 runNow 의 순서)이 있는가?
+5. build-release.sh 의 단계 순서(서비스 정지 확인 → 변경 없음 → fetch → 존재 → checkout → HEAD 비교 → .env 없음 → install → build → BUILD_ID)와 check-env.sh·backup-data.sh 의 검사가 충분한가? `systemctl is-active` 를 서비스 사용자 권한으로 부르는 것이 문제 되는가?
+6. 통합 시험의 대기 조건(상태 + `runs`·`inFlight`)에 남은 시간 의존이 있는가?
+
+
+### FIX round 1 — 오케스트레이터 기록
+- FIX HEAD: f351b7a923b5945d920304339ead39db0863770c (code only). BASE 8ce1044(+ docs 2065e1d·650dc9a).
+- checks-FIX-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 youtube.test.ts 워커 exit 2147483651 — 메모리) → maxWorkers=2 재실행 42 파일 · 829 통과 · drill · migrate · restore PASS.

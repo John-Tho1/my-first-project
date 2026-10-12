@@ -3,18 +3,18 @@
  * captures/assets 등 owner 소유 데이터를 다루는 함수는 모두 ownerId 를 받아 WHERE 에 넣는다.
  * 다른 owner 의 ID 를 넘기면 "없음(null)" 으로 응답한다(존재 여부를 구분해 드러내지 않음).
  */
-import { and, asc, count, desc, eq, gt, inArray, isNull, lte, max, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { isUuid } from '@cs/domain';
 import type { Db } from './client';
 import { assets, auditEvents, captures, sessions, users } from './schema';
 
-export async function findOwner(db: Db, allowedIdentity: string) {
+export async function findOwner(db: DbOrTx, allowedIdentity: string) {
   const rows = await db.select().from(users).where(eq(users.allowedIdentity, allowedIdentity)).limit(1);
   return rows[0] ?? null;
 }
 
 /** 허용 식별자의 users 행을 보장한다(seed 와 같은 방식: 없으면 만들고, 있으면 그대로). */
-export async function ensureOwner(db: Db, allowedIdentity: string) {
+export async function ensureOwner(db: DbOrTx, allowedIdentity: string) {
   await db.insert(users).values({ allowedIdentity }).onConflictDoNothing();
   const owner = await findOwner(db, allowedIdentity);
   if (!owner) throw new Error('owner 생성에 실패했습니다');
@@ -125,7 +125,7 @@ export interface NewSession {
   now: Date;
 }
 
-export async function createSession(db: Db, s: NewSession) {
+export async function createSession(db: DbOrTx, s: NewSession) {
   const rows = await db
     .insert(sessions)
     .values({
@@ -296,32 +296,83 @@ export async function recordAudit(db: DbOrTx, e: AuditInput): Promise<void> {
 }
 
 /**
- * T21-P1a: 로그인 시도 횟수 제한용 — 시간 창(since < at <= now) 안의 실패한 로그인 수(전역, owner·식별자·IP 무관).
- * 실패 = `auth.login_denied` 중 details.reason 이 reasons 에 든 것. 창 안에 성공 로그인(`auth.login`)이 있으면
- * 마지막 성공 이후의 실패만 센다. 감사 기록을 그대로 쓰므로 별도 표·migration 이 없다.
- * 동시 요청은 잠그지 않는다(같은 순간의 요청 몇 개가 상한을 조금 넘을 수 있음 — 단일 사용자 앱에서 허용한 오차).
+ * T21-P1a: 로그인 시도 횟수 제한용 — 시간 창(windowStart < at <= now) 안의 실패한 로그인 수(전역, owner·식별자·IP 무관).
+ * 실패 = `auth.login_denied` 중 details.reason 이 reasons 에 든 것. 창 안에 성공 로그인(`auth.login`)이 있으면 마지막 성공 **이후**의 실패만 센다.
+ *
+ * FIX-T21P1A(P2) 순서 규칙: "이후" 는 시각만이 아니라 로그인 순번(version_or_hash 의 10진 숫자, withLoginAttemptLock 이 잠금 안에서 붙임)으로 정한다.
+ * - 성공·실패 둘 다 순번이 있으면 순번이 큰 실패만 센다(같은 ms 여도 기록 순서대로).
+ * - 어느 한쪽이라도 순번이 없으면(이 변경 전 기록·복원·직접 넣은 행) 시각이 성공보다 **엄격히** 뒤인 실패만 센다 — 같은 ms 면 성공 우선(세지 않음).
+ * - 마지막 성공 = 창 안 성공 중 (시각, 순번) 이 가장 큰 행.
  */
 export async function countRecentLoginFailures(
   db: DbOrTx,
   opts: { now: Date; windowMs: number; reasons: readonly string[] },
 ): Promise<number> {
-  const windowStart = new Date(opts.now.getTime() - opts.windowMs);
-  const [lastOk] = await db
-    .select({ at: max(auditEvents.at) })
-    .from(auditEvents)
-    .where(and(eq(auditEvents.action, 'auth.login'), gt(auditEvents.at, windowStart), lte(auditEvents.at, opts.now)));
-  const since = lastOk?.at && lastOk.at.getTime() > windowStart.getTime() ? lastOk.at : windowStart;
   if (opts.reasons.length === 0) return 0;
+  const windowStart = new Date(opts.now.getTime() - opts.windowMs);
+  const inWindow = and(gt(auditEvents.at, windowStart), lte(auditEvents.at, opts.now));
+  const [lastOk] = await db
+    .select({ at: auditEvents.at, seq: loginSeqExpr })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.action, 'auth.login'), inWindow))
+    .orderBy(desc(auditEvents.at), sql`${loginSeqExpr} desc nulls last`)
+    .limit(1);
+  let afterLastOk = sql`true`;
+  if (lastOk) {
+    const okSeq = lastOk.seq === null ? null : Number(lastOk.seq);
+    afterLastOk =
+      okSeq === null
+        ? sql`${auditEvents.at} > ${lastOk.at}`
+        : sql`(case when ${loginSeqExpr} is not null then ${loginSeqExpr} > ${okSeq} else ${auditEvents.at} > ${lastOk.at} end)`;
+  }
   const [row] = await db
     .select({ n: count() })
     .from(auditEvents)
     .where(
       and(
         eq(auditEvents.action, 'auth.login_denied'),
-        gt(auditEvents.at, since),
-        lte(auditEvents.at, opts.now),
+        inWindow,
         inArray(sql<string>`${auditEvents.sanitizedDetails}->>'reason'`, [...opts.reasons]),
+        afterLastOk,
       ),
     );
   return row?.n ?? 0;
+}
+
+/** 로그인 순번: auth 행의 version_or_hash 가 10진 숫자(최대 15자리)일 때만 bigint, 아니면 null. */
+const loginSeqExpr = sql<string | null>`(case when ${auditEvents.versionOrHash} ~ '^[0-9]{1,15}$' then ${auditEvents.versionOrHash}::bigint end)`;
+
+/** 전역 로그인 판정 잠금 키(제한이 전역이므로 키도 하나). */
+export const LOGIN_ATTEMPT_LOCK_KEY = 'cs.auth.login';
+
+export interface LoginAttemptContext {
+  /** 잠금을 얻은 뒤의 시각 — 판정·기록 시각(본문이 늦게 와도 창이 밀리지 않게). */
+  now: Date;
+  /** now 기준 창 안 실패 수(잠금 안 재계산). */
+  failures: number;
+  /** 이번 시도의 기록에 붙일 로그인 순번(기존 최대 + 1). auth 기록의 versionOrHash 로 String(seq) 를 넣는다. */
+  seq: number;
+}
+
+/**
+ * FIX-T21P1A(P1): 로그인 시도의 "재검사 → 판정 → 성공·실패 기록" 을 한 트랜잭션·전역 advisory 잠금 안에서 직렬화한다.
+ * fn 이 던지면 기록도 함께 되돌려진다 — 기록을 남겨야 하는 거부(401·400)는 fn 이 값으로 돌려주고 호출 측이 잠금 밖에서 던진다.
+ * PGlite 는 연결 하나에서 트랜잭션을 이미 하나씩만 실행하고, Postgres 에서는 이 잠금이 프로세스·연결 사이를 직렬화한다.
+ */
+export async function withLoginAttemptLock<T>(
+  db: Db,
+  opts: { windowMs: number; reasons: readonly string[] },
+  fn: (tx: DbOrTx, ctx: LoginAttemptContext) => Promise<T>,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${LOGIN_ATTEMPT_LOCK_KEY}))`);
+    const now = new Date();
+    const failures = await countRecentLoginFailures(tx, { now, windowMs: opts.windowMs, reasons: opts.reasons });
+    const [m] = await tx
+      .select({ max: sql<string | null>`max(${loginSeqExpr})` })
+      .from(auditEvents)
+      .where(inArray(auditEvents.action, ['auth.login', 'auth.login_denied']));
+    const seq = (m?.max === null || m?.max === undefined ? 0 : Number(m.max)) + 1;
+    return fn(tx, { now, failures, seq });
+  });
 }

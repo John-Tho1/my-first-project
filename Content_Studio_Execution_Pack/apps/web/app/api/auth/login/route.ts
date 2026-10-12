@@ -1,4 +1,4 @@
-import { countRecentLoginFailures, createSession, ensureOwner, recordAudit } from '@cs/db';
+import { countRecentLoginFailures, createSession, ensureOwner, recordAudit, withLoginAttemptLock } from '@cs/db';
 import {
   AppError,
   assertLoginAvailable,
@@ -81,51 +81,65 @@ export async function POST(request: Request): Promise<Response> {
     const config = getConfig();
     assertSameOrigin(request, config);
     const { db } = await getAppDb(config);
-    const now = new Date();
 
     try {
       assertLoginAvailable(config, process.env.NODE_ENV);
     } catch (e) {
-      if (e instanceof AppError) await recordAudit(db, denied(e.code, now));
+      if (e instanceof AppError) await recordAudit(db, denied(e.code, new Date()));
       throw e;
     }
 
+    const limit = { windowMs: LOGIN_FAILURE_WINDOW_MS, reasons: LOGIN_FAILURE_REASONS };
     // T21-P1a: 전역 시도 횟수 제한 — 식별자를 보기 전에 판정하므로 맞는 식별자든 틀린 식별자든 같은 429(식별자 존재 여부 비노출).
     // 429 자체는 감사 기록을 남기지 않는다(막힌 동안 요청마다 행이 쌓이지 않게).
-    assertLoginNotRateLimited(
-      await countRecentLoginFailures(db, { now, windowMs: LOGIN_FAILURE_WINDOW_MS, reasons: LOGIN_FAILURE_REASONS }),
-    );
+    // 이 조기 검사는 막힌 동안 본문을 읽지 않으려는 값싼 거름이고, 보장은 아래 잠금 안 재검사다(FIX-T21P1A P1).
+    assertLoginNotRateLimited(await countRecentLoginFailures(db, { now: new Date(), ...limit }));
 
-    let identity: string;
+    // 본문은 잠금 밖에서 읽는다(느린 본문이 전역 잠금을 붙잡지 않게). 실패는 잠금 안에서 기록한다.
+    let identity: string | null = null;
+    let parseError: unknown = null;
     try {
       identity = await parseIdentity(request);
     } catch (e) {
-      await recordAudit(db, denied('invalid_request', now));
-      throw e;
-    }
-    if (!identityMatches(identity, config.AUTH_ALLOWED_IDENTITY)) {
-      // 어떤 식별자가 허용되는지·입력값이 무엇이었는지는 기록·응답하지 않는다.
-      await recordAudit(db, denied('identity_mismatch', now));
-      throw new LoginDeniedError();
+      parseError = e;
     }
 
-    const owner = await ensureOwner(db, config.AUTH_ALLOWED_IDENTITY);
-    const token = generateSessionToken();
-    const session = await createSession(db, {
-      ownerId: owner.id,
-      tokenHash: hashSessionToken(token),
-      expiresAt: new Date(now.getTime() + sessionTtlMs(config)),
-      userAgentHash: hashUserAgent(request.headers.get('user-agent')),
-      now,
+    // FIX-T21P1A(P1·P2): 재검사(잠금을 얻은 뒤의 시각으로) → 판정 → 성공·실패 기록을 전역 잠금 한 트랜잭션에서 직렬화한다.
+    // 기록에는 로그인 순번(versionOrHash)을 붙여 같은 ms 의 성공·실패도 기록 순서로 가린다.
+    const outcome = await withLoginAttemptLock(db, limit, async (tx, { now, failures, seq }) => {
+      assertLoginNotRateLimited(failures); // 던지면 트랜잭션은 아무것도 쓰지 않은 채 되돌려진다
+      if (parseError !== null || identity === null) {
+        await recordAudit(tx, denied('invalid_request', now, seq));
+        return { kind: 'invalid' as const };
+      }
+      if (!identityMatches(identity, config.AUTH_ALLOWED_IDENTITY)) {
+        // 어떤 식별자가 허용되는지·입력값이 무엇이었는지는 기록·응답하지 않는다.
+        await recordAudit(tx, denied('identity_mismatch', now, seq));
+        return { kind: 'denied' as const };
+      }
+      const owner = await ensureOwner(tx, config.AUTH_ALLOWED_IDENTITY);
+      const token = generateSessionToken();
+      const session = await createSession(tx, {
+        ownerId: owner.id,
+        tokenHash: hashSessionToken(token),
+        expiresAt: new Date(now.getTime() + sessionTtlMs(config)),
+        userAgentHash: hashUserAgent(request.headers.get('user-agent')),
+        now,
+      });
+      await recordAudit(tx, {
+        ownerId: owner.id,
+        action: 'auth.login',
+        entity: 'session',
+        entityId: session.id,
+        versionOrHash: String(seq),
+        details: { mode: config.AUTH_MODE },
+        at: now,
+      });
+      return { kind: 'ok' as const, token, session };
     });
-    await recordAudit(db, {
-      ownerId: owner.id,
-      action: 'auth.login',
-      entity: 'session',
-      entityId: session.id,
-      details: { mode: config.AUTH_MODE },
-      at: now,
-    });
+    if (outcome.kind === 'invalid') throw parseError instanceof AppError ? parseError : new BadRequestError();
+    if (outcome.kind === 'denied') throw new LoginDeniedError();
+    const { token, session } = outcome;
 
     const headers = { 'set-cookie': buildSessionCookie(token, config) };
     if (html) return seeOther('/', headers);
@@ -136,7 +150,14 @@ export async function POST(request: Request): Promise<Response> {
   }
 }
 
-/** 시각은 횟수 제한이 쓰는 시계(now)와 같게 명시한다. */
-function denied(reason: string, at: Date) {
-  return { ownerId: null, action: 'auth.login_denied' as const, entity: 'session', details: { reason }, at };
+/** 시각은 횟수 제한이 쓰는 시계(now)와 같게 명시한다. seq = 로그인 순번(잠금 안 판정 기록만, FIX-T21P1A P2). */
+function denied(reason: string, at: Date, seq?: number) {
+  return {
+    ownerId: null,
+    action: 'auth.login_denied' as const,
+    entity: 'session',
+    details: { reason },
+    at,
+    ...(seq === undefined ? {} : { versionOrHash: String(seq) }),
+  };
 }

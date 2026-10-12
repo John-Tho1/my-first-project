@@ -7,3 +7,13 @@
 - 검사(checks-LIVEUI): lint 0 · typecheck 0 · build 0 · unit 0(57 파일 · 1409) · integration 0(37 파일 · 789) · drill:mock 0 · db:migrate 0 · drill:restore 0(PASS).
 - 외부 호출 0. 남은 위험: 서버 컴포넌트 렌더 자체의 자동 시험은 없음(helper 시험 + 수동 화면 확인).
 - Codex 질문: (1) 결과 이름표를 provider/createdBy 로 정하는 것이 맞는가(설정을 mock 으로 되돌린 뒤 과거 실제 결과가 '실제 AI'로 남는가)? (2) 그 밖에 live 에서 '모의'로 남는 화면(배포·ops 등 AI 관련)이 있는가?
+
+## FIX round 1 (Codex review-LIVEUI: CHANGES_REQUESTED, P2 1)
+- FIX HEAD: 5bd62f341919da1071652442d9c4f8463e54c40c (code only). BASE 7ffafd6(+ docs a7ccb03).
+- [P2 ai-labels.ts:35] 출처 불명을 '실제 AI'로 표시 → `resultOrigin()` = mock | live | unknown. live 는 provider ∈ {'anthropic'} 또는 createdBy 'ai:live' 만. 없음·빈 문자열·모르는 provider·'ai:other'·'owner' → unknown("AI 제안(출처 미확인)"). provider 가 있으면 createdBy 보다 우선. 모의 경고(MOCK_WARNING)는 origin=mock 일 때만.
+- 답변 2 반영: `가격 미설정(모의 0)` → `unpricedLabel(origin)`(모의 결과에만 '모의').
+- 놓친 케이스 반영: tokens NULL 이고 확정된 원장이면 "토큰: 사용량 모름 — 예약액으로 확정" / "보고값이 기록 범위 밖 — 운영자 확인 필요" 표시. 제안은 selectedRun.outputRef 의 버전이므로 이름표 run 과 제안이 대응(page.tsx:82-86).
+- 시험: ai-labels.test.ts 6개(출처 미확인 8가지 입력, provider 우선, unpriced 문구).
+- 화면 확인(dev, 잠금 상태 — 실제 호출 0): D34-2 실제 결과 run 이 "AI 제안(실제 AI)", "토큰 입력 1988 · 출력 1362(공급자 보고)"로 표시.
+- 검사(checks-FIX-LIVEUI): lint·typecheck·build 0 · unit 1411 · integration 789 · drill:mock 0 · migrate 0 · drill:restore PASS.
+- 남은 위험: 서버 컴포넌트 렌더 자동 시험 없음(helper 시험 + 수동 확인).

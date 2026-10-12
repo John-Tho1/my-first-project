@@ -47,3 +47,43 @@
 
 ## 오케스트레이터 재검사(커밋 전)
 - 구현자 실행 뒤 oauth.test.ts D25-3 수정분을 포함해 전체를 다시 돌림: unit **59 파일 · 1437 통과(UNIT2=0)**, integration **38 파일 · 801 통과(INTEG2=0)**. 1회차 UNIT=1 은 손대지 않은 imports-fix1/fix3 의 5초 시간 초과.
+
+---
+
+## FIX round 1 (Codex CHANGES_REQUESTED on e70f7d4, `.handoffs/review-T21P1A.md`)
+- BASE_SHA: b820278 (리뷰 대상 코드 HEAD e70f7d4 + docs 전용 커밋; 작업 중 coordinator 가 docs 전용 82eeef4 를 더 커밋함 — 코드 차이 없음). HEAD_SHA: 없음 — 커밋하지 않음(지시). 검토 대상 = 82eeef4 위 작업 트리 변경.
+- 재현(수정 전 e70f7d4 코드로 새 시험 실행): `corepack pnpm exec vitest run --project integration --maxWorkers=1 tests/integration/auth-rate-limit-concurrency.test.ts` → **5 failed | 3 passed**
+  - 동시 4건: `expected [401,401,401,401] to deeply equal [401,429,429,429]`(실패 9 → 13)
+  - 조기 검사 뒤 상한 도달: 맞는 식별자 `expected 200 to be 429`
+  - 경합 순서: 순번 없음(`expected 0 to be less than 0`)
+  - 느린 본문: 실패 행 시각이 조기 검사 시각(20분 전)
+  - 같은 ms: 실패 9 → 성공 → 실패 10 뒤에도 `expected 200 to be 429`
+  - 처음부터 통과(놓친 케이스 확인용): 잘못된 본문 10회 → invalid_request 10행 → 429, 창 경계(창 시작 제외·now 포함), 순번 없는 같은 ms(성공 우선)
+
+| Finding | 변경 | 시험 |
+| --- | --- | --- |
+| P1 확인·기록 분리(초과량 무제한) | `packages/db/src/queries.ts` `withLoginAttemptLock`: 한 트랜잭션 + `pg_advisory_xact_lock(hashtext('cs.auth.login'))`(전역) → 잠금 안 새 `now` → `countRecentLoginFailures` 재계산 → 판정 → 성공(세션·`auth.login`)·실패(`auth.login_denied`) 기록 후 커밋. route 는 조기 검사(잠금 밖, 값싼 거름) 유지 → 본문 읽기(잠금 밖, 느린 본문이 잠금을 잡지 않게) → 잠금 안 판정. 429 는 트랜잭션 안에서 던져 아무것도 쓰지 않음. 401·400 은 값으로 돌려 기록을 커밋한 뒤 밖에서 던짐. `ensureOwner`·`createSession`·`findOwner` 인자 타입을 `DbOrTx` 로 넓힘 | `auth-rate-limit-concurrency.test.ts`: 실패 9 + 조기 검사 통과 후 멈춘 틀린 식별자 4건 동시 해제 → `[401,429,429,429]`, 창 안 실패 정확히 10 / 조기 검사 뒤 10번째 실패 → 기다리던 맞는 식별자 429·세션 없음 / 경계 경합(맞음·틀림) → `401/429` 또는 `401/200`(성공 행 순번 < 실패 행 순번) |
+| P2(질문 3) 같은 ms 순서 | 잠금 안에서 로그인 순번 `seq = max+1` 을 판정 기록의 `version_or_hash` 에 저장(10진 문자열, 새 열·migration 없음). 셈 규칙: 마지막 성공 = 창 안 (시각, 순번) 최대, 둘 다 순번이 있으면 순번 비교, 어느 한쪽이라도 없으면(예전·복원·직접 넣은 행) 시각 엄격 비교(같은 ms = 성공 우선) | 시계 정지(모든 요청 같은 ms): 실패 9 → 성공 → 실패 10 → 429 / 직접 넣은 행: 창 시작 정확히 = 제외, now 정확히 = 포함 / 순번 없는 같은 ms 성공·실패 = 실패 제외, 1ms 뒤 = 포함 |
+| 놓친 케이스: 느린 본문·`now` | 판정·기록 시각 = 잠금을 얻은 뒤 `new Date()`(본문 다 읽은 뒤) | 본문 20분 지연 → 실패 행 `at` = 해제 시각 |
+| 놓친 케이스: 잘못된 본문 | 동작 변경 없음(잠금 안 기록으로 옮김) | 깨진 JSON·필드 누락·빈 식별자·숫자 식별자·text/plain 10회 → 400, invalid_request 10행, 다음 429 |
+| 질문 2 "요청을 받지 않음" 단정 | README·`startup-guard.ts`·`instrumentation.ts` 주석을 "종료 코드 1 로 끝냄, Ready 이후 순서는 미확인, 보장은 설정 읽기·route 거부" 로 완화 | (문서) |
+| 질문 4 worker·DB 스크립트 | README·`.env.example` 에 "NODE_ENV=production 으로 실행하면 AUTH_MODE=oidc 필요" 명시 | 실측(DATABASE_URL=memory://): `NODE_ENV=production pnpm db:migrate` → exit 1 + AUTH_MODE 안내, `+AUTH_MODE=oidc` → 0 / `pnpm worker` prod+dev → 1, prod+oidc → 0 / `pnpm drill:mock` prod → 0(고정 설정, NODE_ENV 미사용) / `pnpm drill:restore` prod+oidc → 설정 통과 후 "허용 사용자 데이터 없음" exit 1(빈 메모리 DB 라 예상된 결과) / 평소 env: run-checks 의 DRILL·MIGRATE·DRILL_RESTORE 모두 0 |
+
+- 변경 파일(이번 라운드): `apps/web/app/api/auth/login/route.ts`, `packages/db/src/queries.ts`, `apps/web/lib/startup-guard.ts`, `apps/web/instrumentation.ts`(주석), `README_KO.md`, `docs/04_DATA_AND_API.md`, `.env.example`, 추가 `tests/integration/auth-rate-limit-concurrency.test.ts`. 기존 시험 변경 없음.
+- Actual commands and results:
+  - 3000·3999 LISTEN 없음 확인 후 `bash .handoffs/run-checks.sh FIX-T21P1A` → LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(59 files, 1437 passed), INTEG=0(39 files, 809 passed), DRILL=0, MIGRATE=0, DRILL_RESTORE=0(PASS). 재실행·worker 사망 없음.
+  - 수정 후 `vitest run --project integration --maxWorkers=1 tests/integration/auth-rate-limit-concurrency.test.ts` → 8 passed.
+- Known risks / not run:
+  - PGlite 는 연결 하나에서 트랜잭션을 하나씩만 실행하고(advisory 잠금은 같은 세션이라 즉시 획득) 직렬화는 PGlite 트랜잭션 뮤텍스가 한다. 여러 연결·프로세스 사이 직렬화(advisory 잠금의 실제 효과)는 Postgres 드라이버가 없어 미검증(G2/T21-P5).
+  - 잠금 안 쿼리 3회(마지막 성공·실패 수·최대 순번)는 `audit_events` 색인 없이 훑는다(단일 사용자 규모 가정, 측정 안 함). 모든 로그인 판정이 전역 잠금으로 줄을 선다(의도).
+  - 순번은 `version_or_hash` 에 둔다 — auth 행에서는 원래 비어 있던 열. 내보내기·복원 시 그대로 이동(복원 뒤 순번이 이어지는 것은 max+1 이라 문제 없음).
+  - 경합 시험의 결과(401/429 또는 401/200)는 잠금 획득 순서에 따라 정해지며 시험은 두 경우 모두 규칙대로인지 확인한다(어느 쪽이 나왔는지는 고정하지 않음).
+  - 운영 번들 시작과 동시에 로그인 요청을 보내는 경우는 재현하지 않음(not_run). 운영 번들의 상수 치환은 이전 라운드 실측(산출물에 `NODE_ENV:"production"`, NODE_ENV=development 우회 실패) 그대로.
+- Questions specifically for Codex:
+  1. 조기 검사(잠금 밖)·본문 읽기(잠금 밖)·재검사·판정·기록(잠금 안) 순서에서 남은 경합이 있는지.
+  2. 순번 혼합 규칙(둘 다 순번 → 순번, 아니면 시각 엄격)이 복원 데이터와 섞였을 때 우회 경로를 만드는지.
+
+
+### FIX round 1 — 오케스트레이터 기록
+- FIX HEAD: e57cfa5157da22ff2a499c433c6d66dfcddc5272 (code only). BASE b820278(+ docs 82eeef4).
+- checks-FIX-T21P1A: lint·typecheck·build 0 · unit 1437 · integration 39 파일 · 809 · drill:mock 0 · migrate 0 · drill:restore PASS. 재실행 없음.

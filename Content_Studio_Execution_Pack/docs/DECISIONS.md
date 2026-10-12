@@ -464,3 +464,4 @@
 - 불변: 키는 서버에만(대화·저장소·로그·브라우저·프롬프트에 값 없음). 예약 비용이 실제 비용의 상한이 되도록 `max_tokens` = 예약 출력 상한. 모델 출력은 승인을 만들지 않고, 허용 출처 밖 인용·미제공 1인칭 경험은 기존 규칙대로 막는다.
 - 거부 대체 모델(server-side fallback): 켜지 않는다(잠정) — 대체 모델 단가가 예약 계산 밖이라 월 상한 보장이 깨진다. 거부(`refusal`)는 실패로 기록하고 사용자 원문은 보존.
 - When to revisit: 2단계 실제 호출 뒤 실제 토큰 사용량으로 예약 추정식 교정.
+- **2단계 승인(2026-10-12, 사용자 "2단계 승인")**: 실제 Claude 호출 1회. 소재는 구현자가 만든 가상 소재(AI 자동화 주제, 실명·회사·수치 없음 — `docs/handoffs/LIVEL1_STAGE2_MATERIAL.md`). 설정: `LLM_MODE=live`·`LLM_PROVIDER=anthropic`·`LLM_MODEL=claude-opus-5-5`·단가 0.004/0.02·월 10·1회 0.5·출력 4096·`LLM_LIVE_MAX_RUNS=1`·`LLM_LIVE_APPROVAL_REF=D34-2`. 키는 사용자가 `.env.local` 에 직접 입력. 공유 범위: run 상태·오류 코드·예약액·실제액·tokens_in/out 만. 끝나면 `LLM_LIVE_APPROVAL_REF` 제거. 범위 밖: 두 번째 호출, 실제 사용자 원고, 채널 초안(variants) 실제 호출, 게시.

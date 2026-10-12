@@ -3,7 +3,7 @@
  * captures/assets 등 owner 소유 데이터를 다루는 함수는 모두 ownerId 를 받아 WHERE 에 넣는다.
  * 다른 owner 의 ID 를 넘기면 "없음(null)" 으로 응답한다(존재 여부를 구분해 드러내지 않음).
  */
-import { and, asc, count, desc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { isUuid } from '@cs/domain';
 import type { Db } from './client';
 import { assets, auditEvents, captures, sessions, users } from './schema';
@@ -299,39 +299,44 @@ export async function recordAudit(db: DbOrTx, e: AuditInput): Promise<void> {
  * T21-P1a: 로그인 시도 횟수 제한용 — 시간 창(windowStart < at <= now) 안의 실패한 로그인 수(전역, owner·식별자·IP 무관).
  * 실패 = `auth.login_denied` 중 details.reason 이 reasons 에 든 것. 창 안에 성공 로그인(`auth.login`)이 있으면 마지막 성공 **이후**의 실패만 센다.
  *
- * FIX-T21P1A(P2) 순서 규칙: "이후" 는 시각만이 아니라 로그인 순번(version_or_hash 의 10진 숫자, withLoginAttemptLock 이 잠금 안에서 붙임)으로 정한다.
+ * FIX2-T21P1A(P2): 마지막 성공 찾기와 실패 세기를 **SQL 한 문장**(상관 하위 질의)으로 한다 — Postgres·PGlite 모두 한 문장은 한 스냅숏을
+ * 보므로, 잠금 밖 조기 검사에서도 "성공 전 상태의 마지막 성공 + 성공 뒤 상태의 실패" 처럼 섞인 값이 나오지 않는다. 그래서 조기 검사의 429 는
+ * 그 시점 상태에 대해 잠금 안 판정과 같은 결론이다(그 시점에 이미 상한 이상이었음).
+ *
+ * 순서 규칙(FIX-T21P1A P2): "이후" 는 로그인 순번(version_or_hash 의 10진 숫자, withLoginAttemptLock 이 잠금 안에서 붙임)으로 정한다.
  * - 성공·실패 둘 다 순번이 있으면 순번이 큰 실패만 센다(같은 ms 여도 기록 순서대로).
- * - 어느 한쪽이라도 순번이 없으면(이 변경 전 기록·복원·직접 넣은 행) 시각이 성공보다 **엄격히** 뒤인 실패만 센다 — 같은 ms 면 성공 우선(세지 않음).
+ * - 어느 한쪽이라도 순번이 없으면(이 변경 전 기록·직접 넣은 행) 시각이 성공보다 **엄격히** 뒤인 실패만 센다 — 같은 ms 면 성공 우선(세지 않음).
  * - 마지막 성공 = 창 안 성공 중 (시각, 순번) 이 가장 큰 행.
+ * 알려진 한계(보수적으로 받아들인 규칙, FIX2 문서화):
+ * - 복원(add_missing)으로 다른 이력의 성공 행(순번·시각 보존)이 섞이면, 그 성공이 창 안이고 순번이 지금 실패들보다 크면 그 실패들을 세지
+ *   않는다(제한이 그 창 동안 느슨해짐). 창 15분이 지나면 사라진다. 다음 순번은 섞인 이력까지 포함한 최대 + 1 이라 이후 기록은 다시 앞선다.
+ *   (실패 행은 owner 가 없어 내보내기·복원 대상이 아니다.)
+ * - 시계가 뒤로 가면 창은 시각(at <= now)으로 자르므로, 지금보다 미래 시각이 된 기록(성공·실패 모두)은 시계가 따라잡을 때까지 무시된다 —
+ *   그동안은 창이 비워진 것처럼 느슨해진다(되돌린 폭 이하). 순번과 시각의 순서가 어긋나도 마지막 성공은 (시각, 순번) 최대로 고른다.
  */
 export async function countRecentLoginFailures(
   db: DbOrTx,
   opts: { now: Date; windowMs: number; reasons: readonly string[] },
 ): Promise<number> {
   if (opts.reasons.length === 0) return 0;
-  const windowStart = new Date(opts.now.getTime() - opts.windowMs);
-  const inWindow = and(gt(auditEvents.at, windowStart), lte(auditEvents.at, opts.now));
-  const [lastOk] = await db
-    .select({ at: auditEvents.at, seq: loginSeqExpr })
-    .from(auditEvents)
-    .where(and(eq(auditEvents.action, 'auth.login'), inWindow))
-    .orderBy(desc(auditEvents.at), sql`${loginSeqExpr} desc nulls last`)
-    .limit(1);
-  let afterLastOk = sql`true`;
-  if (lastOk) {
-    const okSeq = lastOk.seq === null ? null : Number(lastOk.seq);
-    afterLastOk =
-      okSeq === null
-        ? sql`${auditEvents.at} > ${lastOk.at}`
-        : sql`(case when ${loginSeqExpr} is not null then ${loginSeqExpr} > ${okSeq} else ${auditEvents.at} > ${lastOk.at} end)`;
-  }
+  const nowIso = opts.now.toISOString();
+  const startIso = new Date(opts.now.getTime() - opts.windowMs).toISOString();
+  const lastOk = sql`(select lo.at as ok_at, ${seqOf(sql.raw('lo.version_or_hash'))} as ok_seq
+      from ${auditEvents} lo
+      where lo.action = 'auth.login' and lo.at > ${startIso}::timestamptz and lo.at <= ${nowIso}::timestamptz
+      order by lo.at desc, ok_seq desc nulls last
+      limit 1)`;
+  const afterLastOk = sql`coalesce((select case when l.ok_seq is not null and ${loginSeqExpr} is not null
+        then ${loginSeqExpr} > l.ok_seq else ${auditEvents.at} > l.ok_at end
+      from ${lastOk} l), true)`;
   const [row] = await db
     .select({ n: count() })
     .from(auditEvents)
     .where(
       and(
         eq(auditEvents.action, 'auth.login_denied'),
-        inWindow,
+        sql`${auditEvents.at} > ${startIso}::timestamptz`,
+        sql`${auditEvents.at} <= ${nowIso}::timestamptz`,
         inArray(sql<string>`${auditEvents.sanitizedDetails}->>'reason'`, [...opts.reasons]),
         afterLastOk,
       ),
@@ -339,8 +344,12 @@ export async function countRecentLoginFailures(
   return row?.n ?? 0;
 }
 
-/** 로그인 순번: auth 행의 version_or_hash 가 10진 숫자(최대 15자리)일 때만 bigint, 아니면 null. */
-const loginSeqExpr = sql<string | null>`(case when ${auditEvents.versionOrHash} ~ '^[0-9]{1,15}$' then ${auditEvents.versionOrHash}::bigint end)`;
+/**
+ * 로그인 순번: version_or_hash 가 10진 숫자(1~30자리)일 때만 numeric, 아니면 null.
+ * FIX2-T21P1A: 15자리 제한(16자리부터 순번이 아닌 것으로 읽힘)과 JS Number 정밀도(2^53) 문제를 없애려고 numeric·문자열로 다룬다.
+ */
+const seqOf = (col: SQL) => sql`(case when ${col} ~ '^[0-9]{1,30}$' then ${col}::numeric end)`;
+const loginSeqExpr = seqOf(sql`${auditEvents.versionOrHash}`);
 
 /** 전역 로그인 판정 잠금 키(제한이 전역이므로 키도 하나). */
 export const LOGIN_ATTEMPT_LOCK_KEY = 'cs.auth.login';
@@ -350,14 +359,15 @@ export interface LoginAttemptContext {
   now: Date;
   /** now 기준 창 안 실패 수(잠금 안 재계산). */
   failures: number;
-  /** 이번 시도의 기록에 붙일 로그인 순번(기존 최대 + 1). auth 기록의 versionOrHash 로 String(seq) 를 넣는다. */
-  seq: number;
+  /** 이번 시도의 기록에 붙일 로그인 순번(기존 최대 + 1, 10진 문자열). auth 기록의 versionOrHash 로 그대로 넣는다. */
+  seq: string;
 }
 
 /**
  * FIX-T21P1A(P1): 로그인 시도의 "재검사 → 판정 → 성공·실패 기록" 을 한 트랜잭션·전역 advisory 잠금 안에서 직렬화한다.
- * fn 이 던지면 기록도 함께 되돌려진다 — 기록을 남겨야 하는 거부(401·400)는 fn 이 값으로 돌려주고 호출 측이 잠금 밖에서 던진다.
- * PGlite 는 연결 하나에서 트랜잭션을 이미 하나씩만 실행하고, Postgres 에서는 이 잠금이 프로세스·연결 사이를 직렬화한다.
+ * fn 이 던지면 기록(세션 포함)도 함께 되돌려진다 — 기록을 남겨야 하는 거부(401·400)는 fn 이 값으로 돌려주고 호출 측이 잠금 밖에서 던진다.
+ * PGlite 는 연결 하나에서 트랜잭션을 이미 하나씩만 실행한다. Postgres 에서는 이 잠금이 연결·프로세스 사이를 직렬화하도록 설계했지만
+ * Postgres 드라이버가 아직 없어(G2) 여러 연결에서의 동작은 검증하지 않았다.
  */
 export async function withLoginAttemptLock<T>(
   db: Db,
@@ -369,10 +379,9 @@ export async function withLoginAttemptLock<T>(
     const now = new Date();
     const failures = await countRecentLoginFailures(tx, { now, windowMs: opts.windowMs, reasons: opts.reasons });
     const [m] = await tx
-      .select({ max: sql<string | null>`max(${loginSeqExpr})` })
+      .select({ next: sql<string>`(coalesce(max(${loginSeqExpr}), 0) + 1)::text` })
       .from(auditEvents)
       .where(inArray(auditEvents.action, ['auth.login', 'auth.login_denied']));
-    const seq = (m?.max === null || m?.max === undefined ? 0 : Number(m.max)) + 1;
-    return fn(tx, { now, failures, seq });
+    return fn(tx, { now, failures, seq: m?.next ?? '1' });
   });
 }

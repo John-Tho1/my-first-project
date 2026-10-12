@@ -131,7 +131,7 @@ export async function POST(request: Request): Promise<Response> {
         action: 'auth.login',
         entity: 'session',
         entityId: session.id,
-        versionOrHash: String(seq),
+        versionOrHash: seq,
         details: { mode: config.AUTH_MODE },
         at: now,
       });
@@ -151,13 +151,13 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 /** 시각은 횟수 제한이 쓰는 시계(now)와 같게 명시한다. seq = 로그인 순번(잠금 안 판정 기록만, FIX-T21P1A P2). */
-function denied(reason: string, at: Date, seq?: number) {
+function denied(reason: string, at: Date, seq?: string) {
   return {
     ownerId: null,
     action: 'auth.login_denied' as const,
     entity: 'session',
     details: { reason },
     at,
-    ...(seq === undefined ? {} : { versionOrHash: String(seq) }),
+    ...(seq === undefined ? {} : { versionOrHash: seq }),
   };
 }

@@ -202,4 +202,4 @@ CHANGES_REQUESTED
 | FIX2-T21P1A | a448b78 | CHANGES_REQUESTED — P2 1(31자리 순번이 파서 밖 — 순번 재사용) |
 | FIX3-T21P1A | 6f7a2a7 | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P1a 종결 |
 | T21-P2 | b73fc65 | CHANGES_REQUESTED — P0 1(타이머 오류 로그 비밀 노출 가능), P1 3(일반 unblock 을 오래된 예약 확인으로 인정·배포 문서 앱 경로·실패 무시), P2 3(재설치 겹침·caddy validate 변수·시험 대기 조건) |
-| TEST-TIMEOUT | f71f7ad | 대기 |
+| TEST-TIMEOUT | f71f7ad | **PASS** — 지적 없음(gpt-6-astra · xhigh) |

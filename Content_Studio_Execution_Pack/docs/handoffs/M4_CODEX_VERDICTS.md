@@ -190,3 +190,4 @@ CHANGES_REQUESTED
 | FIX3-LIVEL1 | a4da041 | CHANGES_REQUESTED — P2 1(provider_unstorable 보고값 복원 무결성 검사 없음). P1 없음 |
 | FIX4-LIVEL1 | 2b05044 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVE-L1 종결 |
 | LIVEL1-H1 | 259f4f9 | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
+| LIVE-UI | a9898a6 | 대기 |

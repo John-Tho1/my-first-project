@@ -153,7 +153,9 @@ describe('FIX-T18 round 1 — HTML 선형 처리(P0 :248)', () => {
       min = Math.min(min, (d.user + d.system) / 1000);
     }
     expect(min).toBeLessThan(1000);
-  });
+    // 벽시계 제한만 늘린다(기본 5초): 전체 실행의 병렬 부하에서 2MB 입력 생성·4개 크기 계수가 5초를 넘어 판정 전에 끊겼다.
+    // 선형성 판정(걸음 수)과 CPU 시간 보조 확인(< 1초)은 그대로다.
+  }, 30_000);
 
   it('상한을 넘는 입력은 처리하지 않는다', () => {
     expect(() => htmlToText('a'.repeat(HTML_TO_TEXT_MAX_INPUT + 1))).toThrow(ImportInvalidError);

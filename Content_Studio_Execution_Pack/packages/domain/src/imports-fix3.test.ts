@@ -182,5 +182,6 @@ describe('FIX-T18 round 3 — 새 상태들의 선형성(걸음 수) · 계수�
       min = Math.min(min, (d.user + d.system) / 1000);
     }
     expect(min).toBeLessThan(1000);
-  });
+    // 벽시계 제한만 늘린다(기본 5초) — 판정(걸음 수·CPU 시간 < 1초)은 그대로. imports-fix1 과 같은 이유.
+  }, 30_000);
 });

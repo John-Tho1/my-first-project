@@ -192,3 +192,8 @@ CHANGES_REQUESTED
 | LIVEL1-H1 | 259f4f9 | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
 | LIVE-UI | a9898a6 | CHANGES_REQUESTED — P2 1(출처 불명 결과를 '실제 AI'로 표시) |
 | FIX-LIVEUI | 5bd62f3 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVE-UI 종결 |
+
+## T21 선행 작업(로컬, 2026-10-12~)
+| 라운드 | HEAD | 판정 |
+|---|---|---|
+| T21-P3 | 449da0f | 대기 |

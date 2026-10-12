@@ -66,7 +66,7 @@ codex exec --sandbox read-only --output-schema review/review.schema.json -o ../.
 ## 3. 화면 확인 체크리스트 (`corepack pnpm dev`, 식별자 `owner@example.local`)
 | # | 화면 | 확인 |
 | --- | --- | --- |
-| 1 | `/api/health` | modes mock/disabled/disabled, db.captures 10, worker inline |
+| 1 | `/api/health` · `/api/health/details` | 공개 health 는 `{status, app, time_utc, db_ok}` 만(T21-P3). 로그인 뒤 details 에서 modes·db·worker 확인 |
 | 2 | `/login` | 개발용 로그인 안내, 틀린 식별자 → 일반 오류 문구(허용 식별자 노출 없음) |
 | 3 | `/` 오늘 | 상단 배지 `LLM: 모의` `게시: 비활성` `수집: 비활성`, MSK 시각, 세션 만료, 이어 쓸 초안·추천 소재·확인 필요·최근 배포(M3 안내) |
 | 4 | 빠른 수집 | 텍스트 1건 저장 → `/captures/{id}?saved=1`에 `서버에 저장됨 ✓`; URL(`https://example.com/a?utm_source=x`) 저장 → 같은 URL 다른 utm 으로 재저장 시 `정확 중복` |

@@ -9,6 +9,8 @@ import {
   formatMsk,
   formatMskInline,
   instagramSpecProblemLabel,
+  isAllowedThreadsPermalink,
+  LIVE_THREADS_EXTERNAL_ID_RE,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
   scenarioApplies,
@@ -659,6 +661,23 @@ const LIVE_NOT_READY_CODES = new Set(['live_publish_not_ready', 'publish_disable
 /** 결과 불명(UNKNOWN) 실제 게시 항목 안내 — 자동으로 다시 게시하지 않으므로 사용자가 Threads 에서 직접 확인한다. */
 export const LIVE_UNKNOWN_GUIDANCE =
   '게시됐는지 확인하지 못했습니다. 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 없을 때만 새 배포 계획으로 다시 승인하세요(같은 글이 두 번 올라갈 수 있으니 먼저 확인).';
+
+/**
+ * FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 **확인 후보**(미확인) — 작업 이력의 가장 최근 후보(조회가 남긴 candidate_external_id·candidate_permalink).
+ * 이 작업의 게시물이라는 증거가 아니다. 화면은 "확인 후보(미확인)"로만 보이고 결과·VERIFIED 로 쓰지 않는다. 링크는 공식 Threads 주소만.
+ */
+export function liveCandidateFromEvents(events: ReadonlyArray<{ eventSeq: number; sanitizedDetails: Record<string, unknown> }>): { externalId: string; permalink: string | null } | null {
+  const sorted = [...events].sort((a, b) => b.eventSeq - a.eventSeq);
+  for (const e of sorted) {
+    const d = e.sanitizedDetails ?? {};
+    const id = d.candidate_external_id;
+    if (typeof id === 'string' && LIVE_THREADS_EXTERNAL_ID_RE.test(id)) {
+      return { externalId: id, permalink: isAllowedThreadsPermalink(d.candidate_permalink) ? d.candidate_permalink : null };
+    }
+  }
+  return null;
+}
+export const LIVE_CANDIDATE_LABEL = '확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)';
 
 /** 실제 게시 결과의 확인 상태(VERIFIED = 게시 뒤 원격 읽기로 ID·본문·링크 확인, UNVERIFIED = 게시 ID 는 받았지만 읽기 확인 못 함). */
 export function liveVerificationLabel(verification: string | null | undefined, permalink: string | null | undefined): string {

@@ -365,6 +365,11 @@ export interface ReconcileResult {
   published_parts?: number;
   /** LIVE-P1: 원격 읽기로 확인함(AdapterResult.verified 와 같은 뜻) */
   verified?: boolean;
+  /**
+   * FIX-LIVEP1(Codex P0): **확인 후보**(unknown 일 때만) — 이 작업의 게시물이라는 확정 증거 없이 본문·시각이 맞는 글. 결과(publication)·게시 단계·VERIFIED 를
+   * 만들지 않고 작업 이력에 후보로만 남겨 사용자가 직접 확인하게 한다. external_id 는 'threads:<숫자>', permalink 는 공식 Threads 링크만.
+   */
+  candidate?: { external_id: string; permalink?: string };
 }
 
 export interface CancelResult {
@@ -521,6 +526,11 @@ export interface RemoteStepsPort {
     received_bytes?: number;
     total_bytes?: number;
     resumed?: boolean;
+    /**
+     * FIX-LIVEP1(Codex 놓친 케이스 "기존 표식 반환 뒤 재전송"): true 면 새 행만 — 같은 (작업, 순서, 종류) 행이 이미 있으면 기존 행을 돌려주지 않고
+     * 409 remote_step_exists 를 던진다. 실제 Threads 의 게시 시도 표식(publish_attempt)이 쓴다: 두 실행이 겹쳐도 표식을 새로 만든 쪽만 게시한다.
+     */
+    createOnly?: boolean;
   }): Promise<RemoteStep>;
 }
 
@@ -833,6 +843,12 @@ export const WORKER_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const tickSchema = z.object({
   max_jobs: z.coerce.number().int().min(1).max(20).optional(),
   worker_id: z.string().regex(WORKER_ID_RE, 'worker_id 는 영문·숫자·_·- 1~32자입니다').optional(),
+  /** FIX-LIVEP1: 이 배포 계획의 작업만 처리(계획 화면 버튼). 없으면 이 owner 의 작업 전부(기존 동작). */
+  plan_id: z
+    .string()
+    .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/, 'plan_id 형식이 올바르지 않습니다')
+    .transform((v) => v.toLowerCase())
+    .optional(),
 });
 export type TickInput = z.infer<typeof tickSchema>;
 

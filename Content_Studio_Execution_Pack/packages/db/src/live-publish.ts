@@ -9,7 +9,7 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { AppError, isThreadsNumericId, isUuid, NotFoundError, TERMINAL_JOB_STATES } from '@cs/domain';
 import type { Db } from './client';
-import { setChannelAccountState } from './distribution';
+import { setChannelAccountStateTx } from './distribution';
 import { credentialGate } from './oauth';
 import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, distributionItems, jobs, sendIntents } from './schema';
@@ -59,36 +59,38 @@ export class LivePublishTargetError extends AppError {
 export async function setLivePublishTarget(db: Db, ownerId: string, accountId: string, enabled: boolean, now: Date = new Date()) {
   if (!isUuid(accountId)) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
   // 사용·사용 중지 모두 실제 Threads 계정만(모의 계정의 상태는 이 경로로 바꾸지 않는다). 사용은 묶임·쓸 수 있는 연결 정보까지 본다.
-  await db.transaction(async (tx) => {
+  // FIX-LIVEP1(Codex 답 5): 확인과 상태 변경을 **한 트랜잭션**에서 — 계정을 먼저 FOR UPDATE 로 잠가(연결 해제·갱신·확인도 같은 계정을 FOR UPDATE 로 잡는다)
+  // 그 사이 연결 정보가 철회돼 "해제된 연결 정보 + connected" 가 남지 않게 한다.
+  return db.transaction(async (tx) => {
     const rows = await tx
       .select()
       .from(channelAccounts)
       .where(and(eq(channelAccounts.id, accountId), eq(channelAccounts.ownerId, ownerId)))
-      .for('share')
+      .for('update')
       .limit(1);
     const acc = rows[0];
     if (!acc) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
     if (acc.kind !== 'live' || acc.platform !== 'threads') {
       throw new LivePublishTargetError('live_target_not_live_threads', '실제 Threads 계정만 실제 게시 계정으로 쓸 수 있습니다');
     }
-    if (!enabled) return;
-    if (!isThreadsNumericId(acc.externalAccountId)) {
+    if (enabled && !isThreadsNumericId(acc.externalAccountId)) {
       throw new LivePublishTargetError('live_target_unbound', '아직 Threads 프로필에 연결되지 않은 계정입니다. 먼저 실제 연결을 마치세요');
     }
-    const h = (await credentialGate(tx, ownerId, [acc.id], now)).get(acc.id);
-    if (!h || !h.usable) {
-      throw new LivePublishTargetError('live_target_credential_unusable', '연결 정보를 지금 쓸 수 없습니다(만료·해제·다시 연결 필요). 다시 연결한 뒤 사용하세요');
+    if (enabled) {
+      const h = (await credentialGate(tx, ownerId, [acc.id], now)).get(acc.id);
+      if (!h || !h.usable) {
+        throw new LivePublishTargetError('live_target_credential_unusable', '연결 정보를 지금 쓸 수 없습니다(만료·해제·다시 연결 필요). 다시 연결한 뒤 사용하세요');
+      }
     }
+    const r = await setChannelAccountStateTx(tx, ownerId, accountId, enabled ? 'connected' : 'disconnected', now);
+    await recordAudit(tx, {
+      ownerId,
+      action: 'channel_account.live_publish_target',
+      entity: 'channel_account',
+      entityId: accountId,
+      details: { enabled, state: r.account.state, revoked_approvals: r.revoked.length },
+      at: now,
+    });
+    return r;
   });
-  // 상태 변경·승인 철회는 계정 FOR UPDATE 아래에서(setChannelAccountState). 그 사이 연결 정보가 바뀌어도 실행·전송 게이트가 다시 막는다.
-  const r = await setChannelAccountState(db, ownerId, accountId, enabled ? 'connected' : 'disconnected', now);
-  await recordAudit(db, {
-    ownerId,
-    action: 'channel_account.live_publish_target',
-    entity: 'channel_account',
-    entityId: accountId,
-    details: { enabled, state: r.account.state, revoked_approvals: r.revoked.length },
-    at: now,
-  });
-  return r;
 }

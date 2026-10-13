@@ -13,7 +13,9 @@ import {
   ITEM_STATUS_LABEL,
   itemHeadline,
   jobStatusText,
+  LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
+  liveCandidateFromEvents,
   liveItemHeadline,
   liveStepLine,
   liveVerificationLabel,
@@ -352,6 +354,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     publishAt: providerMetadataOf(p).publish_at ?? null,
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
   };
+  // FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 확인 후보(미확인) — 결과로 쓰지 않고 안내만
+  const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateFromEvents(x.events) : null;
   const headline = live ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null }) : itemHeadline(headlineInput);
   // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
   // M4UI FIX1: PUBLISHED 는 기록 시각(created_at)이 예약 시각 전일 때만 "적용하지 않음" — 그 밖은 중립 문구
@@ -467,6 +471,21 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           {live && x.item.status === 'UNKNOWN' ? (
             <p className="notice" role="alert">
               {LIVE_UNKNOWN_GUIDANCE}
+            </p>
+          ) : null}
+          {live && candidate ? (
+            <p className="notice" role="note">
+              <span className="tag warn">미확인</span> {LIVE_CANDIDATE_LABEL}: <span className="hash">{candidate.externalId}</span>
+              {candidate.permalink ? (
+                <>
+                  {' '}
+                  ·{' '}
+                  <a href={candidate.permalink} rel="noopener noreferrer" target="_blank">
+                    {candidate.permalink}
+                  </a>
+                </>
+              ) : null}{' '}
+              — Threads 에서 직접 보고 판단하세요. 이 앱은 이 글을 게시 결과로 기록하지 않았습니다.
             </p>
           ) : null}
           <ul className="list">
@@ -733,8 +752,8 @@ export default async function PlanPage({
         </form>
         <p className="note">
           {hasLive
-            ? '작업 처리기를 한 번 돌립니다(내 작업 최대 5개). 실제 게시 항목은 실제 게시 조건이 모두 있을 때만 실제 Threads 로 보내고, 모의 항목은 모의 어댑터로 처리합니다. 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'
-            : '작업 처리기를 한 번 돌립니다(내 작업 최대 5개, 모의 어댑터 — 외부 호출 없음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'}
+            ? '작업 처리기를 한 번 돌립니다(이 계획의 작업만, 최대 5개). 실제 게시 항목은 실제 게시 조건이 모두 있을 때만 실제 Threads 로 보내고, 모의 항목은 모의 어댑터로 처리합니다. 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'
+            : '작업 처리기를 한 번 돌립니다(이 계획의 작업만, 최대 5개 — 이 계획은 모의 항목뿐이라 외부 호출 없음. 다른 계획의 작업은 처리하지 않음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'}
         </p>
       </section>
     </main>

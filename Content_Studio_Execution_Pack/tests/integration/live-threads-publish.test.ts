@@ -43,8 +43,10 @@ import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/rou
 import { POST as approvePOST } from '../../apps/web/app/api/distribution-plans/[id]/approve/route';
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
 import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id]/retry/route';
+import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
+import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
-import { liveItemHeadline } from '../../apps/web/lib/distribution';
+import { liveCandidateFromEvents, liveItemHeadline } from '../../apps/web/lib/distribution';
 import { jobCredentials } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
@@ -447,33 +449,62 @@ describe('모의 계정은 그대로(실제 게시 조건이 모두 있어도 MO
 });
 
 describe('결과 불명 — 맹목 재게시 없음(AGENTS 불변식)', () => {
-  it('게시 시간 초과 → RECONCILING → 목록에서 같은 본문 정확히 1개 → CONFIRMED(재게시 0)', async () => {
-    const TEXT = '시간 초과 뒤 목록으로 확인되는 글.';
+  // FIX-LIVEP1(Codex P0): 목록의 같은 본문은 확인 후보일 뿐 — 결과(publication)·게시 단계·VERIFIED 없이 UNKNOWN 으로 끝난다.
+  it('게시 시간 초과 → 목록에 같은 본문 1개 → 확인 후보만 이력에 남고 UNKNOWN(결과·게시 단계·VERIFIED 없음, 재게시 0) → 실제 재확인 POST route(연결 정보 전달)도 조회만', async () => {
+    const TEXT = '시간 초과 뒤 목록에 보이는 글.';
     const p = await planApproved([TEXT]);
     const config = fullCfg('D38-timeout-found', '2');
     expect((await execute(p.planId)).status).toBe(200);
-    const fx = publishFixture((ids) => {
-      const pth = P(ids);
-      return {
-        ...happy(TEXT)(ids),
-        [pth.publish]: timeoutErr(),
-        [pth.list]: () =>
-          jsonRes(200, {
-            data: [
-              { id: ids.media, text: TEXT, timestamp: new Date(Date.now() + vt).toISOString().replace(/\.\d+Z$/, '+0000'), permalink: permalinkOf(ids.media) },
-              { id: '18000000000999999', text: '다른 글', timestamp: new Date().toISOString().replace(/\.\d+Z$/, '+0000') },
-            ],
-          }),
-      };
-    });
+    const listRoute = (ids: { ct: string; media: string }) => () =>
+      jsonRes(200, {
+        data: [
+          { id: ids.media, text: TEXT, timestamp: new Date(Date.now() + vt).toISOString().replace(/\.\d+Z$/, '+0000'), permalink: permalinkOf(ids.media) },
+          { id: '18000000000999999', text: '다른 글', timestamp: new Date().toISOString().replace(/\.\d+Z$/, '+0000') },
+        ],
+      });
+    const fx = publishFixture((ids) => ({ ...happy(TEXT)(ids), [P(ids).publish]: timeoutErr(), [P(ids).list]: listRoute(ids) }));
     const reg = registryWith(fx.fetch, config);
     expect((await tick(reg, config)).results).toEqual({ RECONCILING: 1 });
     const item = p.items[0]!;
-    expect((await stepsOf(item.id)).map((s) => s.kind)).toEqual(['container', 'publish_attempt']);
-    expect((await tick(reg, config, 11_000)).results).toEqual({ CONFIRMED: 1 });
-    const [pub] = await pubsOf(item.id);
-    expect(pub).toMatchObject({ isMock: false, externalId: `threads:${fx.ids.media}`, verification: 'VERIFIED' });
+    let last: Record<string, number> = {};
+    for (let i = 0; i < 4 && !last.UNKNOWN; i++) last = (await tick(reg, config, 20 * MIN)).results;
+    expect(last).toEqual({ UNKNOWN: 1 });
+    expect((await itemOf(item.id)).status).toBe('UNKNOWN');
+    expect(await pubsOf(item.id)).toHaveLength(0);
+    expect((await stepsOf(item.id)).map((st) => st.kind)).toEqual(['container', 'publish_attempt']);
+    const job = await jobOf(item.id);
+    const events = await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job.id));
+    const withCandidate = events.filter((e) => e.sanitizedDetails.candidate_external_id === `threads:${fx.ids.media}`);
+    expect(withCandidate.length).toBeGreaterThan(0);
+    expect(withCandidate.at(-1)!.sanitizedDetails.candidate_permalink).toBe(permalinkOf(fx.ids.media));
+    // 화면: UNKNOWN 안내 + 확인 후보(미확인) — 결과로 쓰지 않음
+    const d = await getPlanDetail(db, owner, p.planId);
+    const x = d!.items[0]!;
+    expect(liveCandidateFromEvents(x.events)).toEqual({ externalId: `threads:${fx.ids.media}`, permalink: permalinkOf(fx.ids.media) });
+    expect(liveItemHeadline({ status: x.item.status, channel: 'threads', job: x.jobs.at(-1) ?? null, pub: null, blockReason: null })).toContain('결과 불명');
+
+    // 실제 재확인 POST route(앱 레지스트리 — 실제 어댑터는 호출 시점의 전역 fetch 를 쓴다): 전역 fetch 를 fixture 로 바꿔 경로 전체를 통과시킨다.
+    const routeCalls: Call[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        const url = new URL(input);
+        routeCalls.push({ method: init?.method ?? 'GET', url, body: new URLSearchParams(typeof init?.body === 'string' ? init.body : '') });
+        if ((init?.method ?? 'GET') === 'GET' && url.pathname === `/v1.0/${PROFILE_ID}/threads`) return listRoute(fx.ids)();
+        throw new Error(`fixture 없음: ${url.pathname}`);
+      }),
+    );
+    const rr = await rec(await reconcilePOST(post(`/api/distribution-items/${item.id}/reconcile`), ctx(item.id)));
+    expect(rr.status, await rr.clone().text()).toBe(200);
+    expect(await rr.json()).toMatchObject({ state: 'UNKNOWN', found: false, remote: 'unknown', outcome: 'applied' });
+    expect(routeCalls.map((c) => `${c.method} ${c.url.origin}${c.url.pathname}`)).toEqual([`GET https://graph.threads.net/v1.0/${PROFILE_ID}/threads`]);
+    expect(routeCalls[0]!.url.searchParams.get('access_token')).toBe(LONG); // 서버 안에서 봉인 해제한 연결 정보가 route 경로로 전달됨
+    expect((await itemOf(item.id)).status).toBe('UNKNOWN');
+    expect(await pubsOf(item.id)).toHaveLength(0);
+    vi.unstubAllGlobals();
     expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    // 응답·이력 어디에도 토큰 없음
+    expect(JSON.stringify({ seenResponses, events })).not.toContain(LONG);
   });
 
   it('게시 5xx → 목록에 없음 → 확인 3회 뒤 UNKNOWN(재게시 0), 사용자 재확인은 조회만, 재시도 409, 취소 409 — 화면 안내', async () => {
@@ -524,5 +555,78 @@ describe('결과 불명 — 맹목 재게시 없음(AGENTS 불변식)', () => {
     await tick(registryWith(fx.fetch, closed), closed, 11_000);
     expect(fx.calls.length).toBe(n);
     expect((await jobOf(p.items[0]!.id)).state).toBe('RECONCILING');
+  });
+});
+
+describe('FIX-LIVEP1: 계획 범위 작업 처리·동시 실행·실제 게시 계정 사용 확인', () => {
+  it('계획 화면 버튼(폼 plan_id)은 그 계획의 작업만 처리 — 다른 계획의 실제 게시 작업은 그대로(실제 호출 0)', async () => {
+    const live = await planApproved(['다른 계획의 실제 게시 글.']);
+    fullCfg('D38-scope', '3');
+    expect((await execute(live.planId)).status).toBe(200);
+    const mock = await planApproved(['모의 계획 글.'], mockAcc.threads, 'mock_publish');
+    expect((await execute(mock.planId)).status).toBe(200);
+    let globalCalls = 0;
+    vi.stubGlobal('fetch', async () => {
+      globalCalls++;
+      throw new Error('network forbidden');
+    });
+    const form = new Request(`${BASE}/api/worker/tick`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', origin: BASE, ...cookieHeader(token) },
+      body: new URLSearchParams({ plan_id: mock.planId, max_jobs: '5' }).toString(),
+    });
+    const r = await tickPOST(form);
+    expect(r.status).toBe(303);
+    expect(r.headers.get('location')).toBe(`/distribute/${mock.planId}?ticked=1`);
+    expect((await itemOf(mock.items[0]!.id)).status).toBe('CONFIRMED');
+    expect((await jobOf(live.items[0]!.id)).state).toBe('QUEUED');
+    expect(globalCalls).toBe(0);
+    vi.unstubAllGlobals();
+    const cn = await rec(await cancelPOST(post(`/api/distribution-items/${live.items[0]!.id}/cancel`), ctx(live.items[0]!.id)));
+    expect(await cn.json()).toMatchObject({ state: 'CANCELED' });
+  });
+
+  it('동시 실행(PGlite 한 연결): 같은 작업을 두 작업 처리기가 동시에 돌려도 threads_publish 1번', async () => {
+    const TEXT = '동시 실행 같은 작업 글.';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('D38-conc-same', '3');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture(happy(TEXT));
+    const reg = registryWith(fx.fetch, config);
+    const run = (w: string) =>
+      runJobsTick(db, reg, { workerId: w, config, ownerId: owner, clock: () => new Date(Date.now() + vt), random: () => 0.5, submitTimeoutMs: 5000, maxJobs: 5, credentials: jobCredentials(config, db) });
+    const [a, b] = await Promise.all([run('conc-a'), run('conc-b')]);
+    expect((a.results.CONFIRMED ?? 0) + (b.results.CONFIRMED ?? 0)).toBe(1);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+  });
+
+  it('동시 실행(PGlite 한 연결): PUBLISH_LIVE_MAX_POSTS=1 에서 두 작업을 두 작업 처리기가 동시에 처리해도 threads_publish 1번, 나머지는 보류(보내지 않음)', async () => {
+    const two = await planApproved(['동시 상한 첫째 글.', '동시 상한 둘째 글.']);
+    fullCfg('D38-conc-limit', '5'); // 실행 앞선 검사는 다른 계획의 진행 중 실제 작업도 보수적으로 센다
+    expect((await execute(two.planId)).status).toBe(200);
+    const one = fullCfg('D38-conc-limit', '1');
+    const fx = publishFixture(happy('동시 상한 첫째 글.'));
+    const reg = registryWith(fx.fetch, one);
+    const run = (w: string) =>
+      runJobsTick(db, reg, { workerId: w, config: one, ownerId: owner, clock: () => new Date(Date.now() + vt), random: () => 0.5, submitTimeoutMs: 5000, maxJobs: 1, credentials: jobCredentials(one, db) });
+    await Promise.all([run('lim-a'), run('lim-b')]);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    const codes = await Promise.all(two.items.map(async (i) => (await jobOf(i.id)).lastErrorCode));
+    expect(codes.filter((c) => c === 'live_publish_limit')).toHaveLength(1);
+    const blocked = two.items[codes.indexOf('live_publish_limit')]!;
+    expect(await intentsOf((await jobOf(blocked.id)).id)).toHaveLength(0);
+    const cn = await rec(await cancelPOST(post(`/api/distribution-items/${blocked.id}/cancel`), ctx(blocked.id)));
+    expect(await cn.json()).toMatchObject({ state: 'CANCELED' });
+  });
+
+  it('실제 게시 계정으로 사용: 연결 정보가 쓸 수 없으면(만료) 409 이고 상태는 그대로(확인·변경이 한 트랜잭션)', async () => {
+    const off = await rec(await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: false }), ctx(liveAccount)));
+    expect(off.status).toBe(200);
+    expect(await off.json()).toMatchObject({ state: 'disconnected' });
+    await db.update(schema.oauthCredentials).set({ expiresAt: new Date(Date.now() - MIN) }).where(eq(schema.oauthCredentials.channelAccountId, liveAccount));
+    const on = await rec(await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: true }), ctx(liveAccount)));
+    expect(on.status).toBe(409);
+    expect(((await on.json()) as { error: string }).error).toBe('live_target_credential_unusable');
+    expect((await db.select().from(schema.channelAccounts).where(eq(schema.channelAccounts.id, liveAccount)))[0]!.state).toBe('disconnected');
   });
 });

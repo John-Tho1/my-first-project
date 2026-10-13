@@ -62,6 +62,7 @@ function memSteps(opts: { failKind?: string } = {}): RemoteStepsPort & { rows: R
     record: async (s) => {
       if (opts.failKind === s.kind) throw new Error('db down');
       const ex = rows.find((r) => r.kind === s.kind && r.post_index === s.post_index);
+      if (ex && s.createOnly) throw Object.assign(new Error('remote_step_exists'), { code: 'remote_step_exists' });
       const now = NOW.toISOString(); // 작업 처리기의 시계(clock)와 같은 시각
       if (ex) {
         if (ex.remote_id !== s.remote_id) throw new Error('remote_step_conflict');
@@ -397,51 +398,62 @@ describe('게시(threads_publish) 중·뒤 결과 불명 — 다시 게시하지
     expect(seen).toHaveLength(0);
   });
 
-  it('조회: 시도 시각 뒤 같은 본문 정확히 1개 → found(게시 기록 남김, 공식 링크면 확인됨)', async () => {
-    const { a, seen } = adapterWith({
-      ...happyRoutes(),
-      [P.publish]: timeoutErr(),
-      [P.list]: listBody([
-        { id: '18000000000000999', text: '다른 글', timestamp: '2026-10-13T12:00:01+0000', permalink: PERMALINK },
-        { id: MEDIA, text: `  ${TEXT}\r\n`, timestamp: '2026-10-13T12:00:03+0000', permalink: PERMALINK },
-        { id: '18000000000000777', text: TEXT, timestamp: '2026-10-12T08:00:00+0000', permalink: PERMALINK }, // 시도 전(창 밖)
-      ]),
-    });
+  // FIX-LIVEP1(Codex P0 :504): 본문·시각만 맞는 글은 이 작업의 게시물이라는 증거가 아니다 — 게시 단계·외부 ID·VERIFIED 를 절대 만들지 않고
+  // UNKNOWN 을 유지한다. 목록이 끝까지 왔고 정확히 하나일 때만 "확인 후보"(미확인)로 돌려준다.
+  const noProof = (rc: Record<string, unknown>, steps: { rows: RemoteStep[] }) => {
+    expect(rc.status).toBe('unknown');
+    expect(rc).not.toHaveProperty('external_id');
+    expect(rc).not.toHaveProperty('verified');
+    expect(rc).not.toHaveProperty('permalink');
+    expect(steps.rows.some((s) => s.kind === 'publish')).toBe(false);
+  };
+  const reconcileAfterTimeout = async (items: Array<Record<string, unknown>>) => {
+    const fx = adapterWith({ ...happyRoutes(), [P.publish]: timeoutErr(), [P.list]: listBody(items) });
     const steps = memSteps();
     const c = ctxOf(steps);
-    await a.submit(await a.prepare(snapshot(), c), c);
-    const rc = await a.reconcile({ platform: 'threads', intent_key: 'job-1:1', external_id: null, provider_request_id: null }, ctxOf(steps, { now: new Date(NOW.getTime() + 60_000) }));
-    expect(rc).toEqual({
-      status: 'found',
-      result_kind: 'PUBLISHED',
-      remote_visibility: 'unknown',
-      external_id: `threads:${MEDIA}`,
-      verified: true,
-      permalink: PERMALINK,
-      published_parts: 1,
-      error_code: 'matched_by_list',
-    });
-    expect(steps.rows.map((s) => `${s.kind}:${s.remote_id}`)).toContain(`publish:threads:post:${MEDIA}`);
+    await fx.a.submit(await fx.a.prepare(snapshot(), c), c);
+    const rc = await fx.a.reconcile({ platform: 'threads', intent_key: 'job-1:1', external_id: null, provider_request_id: null }, ctxOf(steps, { now: new Date(NOW.getTime() + 60_000) }));
+    return { rc: rc as unknown as Record<string, unknown>, steps, seen: fx.seen };
+  };
+
+  it('조회: 시도 뒤 같은 본문 정확히 1개(목록 끝까지) → unknown + 확인 후보만(게시 단계·결과·VERIFIED 없음, 재게시 없음)', async () => {
+    const { rc, steps, seen } = await reconcileAfterTimeout([
+      { id: '18000000000000999', text: '다른 글', timestamp: '2026-10-13T12:00:01+0000', permalink: PERMALINK },
+      { id: MEDIA, text: `  ${TEXT}\r\n`, timestamp: '2026-10-13T12:00:03+0000', permalink: PERMALINK },
+    ]);
+    noProof(rc, steps);
+    expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_candidate', candidate: { external_id: `threads:${MEDIA}`, permalink: PERMALINK } });
     const listReq = seen.find((s) => s.method === 'GET' && s.url.pathname === `/v1.0/${USER_ID}/threads`)!;
-    expect(listReq.method).toBe('GET');
     expect(listReq.url.searchParams.get('fields')).toBe('id,permalink,text,timestamp,media_type');
     expect(listReq.url.searchParams.get('limit')).toBe('25');
-    // 조회는 절대 게시하지 않는다
     expect(seen.filter((s) => s.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
   });
 
+  it('Codex 재현: 시도 5분 전에 손으로 올린 같은 글 하나만 있음 → 확정 아님(후보도 아님 — 시도 전 글)', async () => {
+    const { rc, steps } = await reconcileAfterTimeout([{ id: '18000000000000555', text: TEXT, timestamp: '2026-10-13T11:55:00+0000', permalink: PERMALINK }]);
+    noProof(rc, steps);
+    expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_no_candidate' });
+  });
+
+  it('Codex 재현: 첫 25개 안에 하나 + 다음 쪽이 있을 수 있음(받은 수 = limit) → 후보 하나라고 말하지 않음', async () => {
+    const filler = Array.from({ length: 24 }, (_, k) => ({ id: `180000000001${String(k).padStart(5, '0')}`, text: `다른 글 ${k}`, timestamp: '2026-10-13T12:00:01+0000' }));
+    const { rc, steps } = await reconcileAfterTimeout([{ id: MEDIA, text: TEXT, timestamp: '2026-10-13T12:00:03+0000', permalink: PERMALINK }, ...filler]);
+    noProof(rc, steps);
+    expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' });
+  });
+
   it.each<[string, Array<Record<string, unknown>>, string]>([
-    ['맞는 글 없음', [{ id: '18000000000000999', text: '다른 글', timestamp: '2026-10-13T12:00:01+0000' }], 'publish_unmatched'],
+    ['맞는 글 없음', [{ id: '18000000000000999', text: '다른 글', timestamp: '2026-10-13T12:00:01+0000' }], 'publish_unconfirmed_no_candidate'],
     [
       '같은 본문 2개(구분 불가)',
       [
         { id: '18000000000000901', text: TEXT, timestamp: '2026-10-13T12:00:01+0000' },
         { id: '18000000000000902', text: TEXT, timestamp: '2026-10-13T12:00:02+0000' },
       ],
-      'publish_match_ambiguous',
+      'publish_unconfirmed_candidates_ambiguous',
     ],
-    ['시각이 창 밖(오래됨)', [{ id: '18000000000000901', text: TEXT, timestamp: '2026-10-01T00:00:00+0000' }], 'publish_unmatched'],
-    ['시각 형식 이상', [{ id: '18000000000000901', text: TEXT, timestamp: 'yesterday' }], 'publish_unmatched'],
+    ['시각이 창 밖(오래됨)', [{ id: '18000000000000901', text: TEXT, timestamp: '2026-10-01T00:00:00+0000' }], 'publish_unconfirmed_no_candidate'],
+    ['시각 형식 이상', [{ id: '18000000000000901', text: TEXT, timestamp: 'yesterday' }], 'publish_unconfirmed_no_candidate'],
   ])('조회: %s → unknown(%s) — 재게시 없음', async (_, items, code) => {
     const { a, seen } = adapterWith({ ...happyRoutes(), [P.publish]: timeoutErr(), [P.list]: listBody(items) });
     const steps = memSteps();
@@ -544,6 +556,50 @@ describe('비밀 위생: 토큰·URL·공급자 문구가 결과·오류·로그
     expect(dump).not.toContain('Invalid OAuth access token');
     expect(dump).not.toContain('access_token=');
     expect(logs.join('\n')).not.toContain(TOKEN);
+  });
+});
+
+describe('FIX-LIVEP1: 동시 실행·큰 응답', () => {
+  it('같은 작업의 submit 두 개가 겹쳐도 threads_publish 는 한 번(게시 시도 표식 createOnly — 늦은 쪽은 결과 불명, 재게시 없음)', async () => {
+    const { a, seen } = adapterWith(happyRoutes());
+    const steps = memSteps();
+    const c1 = ctxOf(steps);
+    const c2 = ctxOf(steps, { intentKey: 'job-1:2', attempt: 2 });
+    const [r1, r2] = await Promise.all([a.prepare(snapshot(), c1).then((p) => a.submit(p, c1)), a.prepare(snapshot(), c2).then((p) => a.submit(p, c2))]);
+    expect(seen.filter((s) => s.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    expect([r1.status, r2.status].sort()).toEqual(['accepted', 'ambiguous']);
+    expect([r1, r2].find((r) => r.status === 'ambiguous')).toMatchObject({ error_code: expect.stringMatching(/^publish_attempt_(exists|unresolved)$/) });
+  });
+
+  it('스트리밍 응답이 상한(512 KiB)을 넘으면 읽는 도중 취소(reader.cancel) — 전부 읽지 않음, 컨테이너 생성은 부작용 없는 실패', async () => {
+    let pulled = 0;
+    let canceled = false;
+    const big = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(ctl) {
+            pulled++;
+            ctl.enqueue(new Uint8Array(64 * 1024).fill(32));
+            if (pulled > 1000) ctl.close();
+          },
+          cancel() {
+            canceled = true;
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    const { a } = adapterWith({ [P.create]: big });
+    const steps = memSteps();
+    const c = ctxOf(steps);
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect' });
+    expect(canceled).toBe(true);
+    expect(pulled).toBeLessThan(20);
+    expect(steps.rows).toEqual([]);
+    // content-length 가 상한보다 크면 읽지 않고 거부
+    const declared = adapterWith({ [P.create]: () => new Response('{}', { status: 200, headers: { 'content-length': String(10 * 1024 * 1024) } }) });
+    const c2 = ctxOf(memSteps());
+    expect(await declared.a.submit(await declared.a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect' });
   });
 });
 

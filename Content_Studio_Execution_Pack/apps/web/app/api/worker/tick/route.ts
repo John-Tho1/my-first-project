@@ -33,7 +33,8 @@ export async function POST(request: Request): Promise<Response> {
     const owner = await requireOwner(request);
     const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
     if (body.kind === 'form' && body.data.plan_id && isUuid(body.data.plan_id)) back = `/distribute/${body.data.plan_id.toLowerCase()}`;
-    const input = body.kind === 'form' ? { max_jobs: body.data.max_jobs || undefined } : body.data;
+    // FIX-LIVEP1(Codex P1): 계획 화면의 버튼(폼 plan_id)은 그 계획의 작업만 처리한다 — 화면 안내(모의만·실제 게시 포함)와 실제 동작이 같게.
+    const input = body.kind === 'form' ? { max_jobs: body.data.max_jobs || undefined, plan_id: body.data.plan_id || undefined } : body.data;
     const parsed = tickSchema.safeParse(input);
     if (!parsed.success) throw validationError(parsed.error);
     const workerId = parsed.data.worker_id ? `api-${parsed.data.worker_id}`.slice(0, 40) : newWorkerId('api');
@@ -43,6 +44,7 @@ export async function POST(request: Request): Promise<Response> {
       workerId,
       config,
       ownerId: owner.ownerId,
+      planId: parsed.data.plan_id,
       maxJobs: parsed.data.max_jobs ?? 5,
       submitTimeoutMs: uiTickTimeoutMs(config, body.kind === 'form'),
       credentials: jobCredentials(config, owner.db),
@@ -53,7 +55,7 @@ export async function POST(request: Request): Promise<Response> {
       ownerId: owner.ownerId,
       action: 'worker.tick',
       entity: 'worker',
-      details: { leased: r.leased, recovered: r.recovered, mode: livePublishReadiness(config).ready ? 'MOCK_OR_LIVE' : 'MOCK' },
+      details: { leased: r.leased, recovered: r.recovered, mode: livePublishReadiness(config).ready ? 'MOCK_OR_LIVE' : 'MOCK', plan_scoped: !!parsed.data.plan_id },
     });
     if (html) return seeOther(`${back}?ticked=${r.leased}`);
     return json({ ...r, mode: livePublishReadiness(config).ready ? 'MOCK_OR_LIVE' : 'MOCK' });

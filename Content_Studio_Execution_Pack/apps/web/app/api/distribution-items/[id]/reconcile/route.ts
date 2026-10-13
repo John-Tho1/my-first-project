@@ -3,6 +3,7 @@ import { assertSameOrigin, reconcileSchema } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
 import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST, reconciledParam } from '../../../../../lib/distribution';
+import { jobCredentials } from '../../../../../lib/oauth';
 import { getChannelAdapters, getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
@@ -29,7 +30,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     if (body.kind === 'form' && body.data.plan_id) back = `/distribute/${encodeURIComponent(body.data.plan_id)}`;
     const parsed = reconcileSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
-    const r = await reconcileItem(owner.db, getChannelAdapters(config), owner.ownerId, id.toLowerCase(), { timeoutMs: config.JOB_SUBMIT_TIMEOUT_MS });
+    // FIX-LIVEP1(Codex P1): 연결 정보 의존성을 작업 처리기와 같게 넘긴다(키 묶음 — 실제 계정 조회는 서버 안에서 봉인 해제한 토큰으로만).
+    const r = await reconcileItem(owner.db, getChannelAdapters(config), owner.ownerId, id.toLowerCase(), { timeoutMs: config.JOB_SUBMIT_TIMEOUT_MS, credentials: jobCredentials(config, owner.db) });
     if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}reconciled=${r.outcome === 'stale_lookup' ? 'stale' : reconciledParam(r.remote)}`);
     return json(r);
   } catch (e) {

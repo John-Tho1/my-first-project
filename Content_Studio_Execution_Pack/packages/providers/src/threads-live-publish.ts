@@ -54,10 +54,13 @@ export const LIVE_PUBLISH_POLL_BUDGET = 3;
 export const LIVE_PUBLISH_POLL_INTERVAL_MS = 1500;
 /** 결과 불명 대조: 목록에서 볼 최근 글 수(문서 예시 limit 매개변수) */
 export const LIVE_PUBLISH_LIST_LIMIT = 25;
-/** 결과 불명 대조: 게시 시도 기록 시각 앞뒤 허용(시계 차이) */
-export const LIVE_PUBLISH_MATCH_SKEW_MS = 10 * 60_000;
-/** 응답 본문 상한(바이트 수 근사 — 문자 수) — 이상한 큰 응답을 메모리에 끝없이 올리지 않는다 */
-const MAX_RESPONSE_CHARS = 512 * 1024;
+/**
+ * 결과 불명 확인 후보: 게시 시도 기록 시각 앞뒤 허용(시계 차이). FIX-LIVEP1(Codex P0): 후보일 뿐 확인이 아니다 — 시도 전에 손으로 올린 같은 글을
+ * 덜 고르도록 좁게(2분) 둔다.
+ */
+export const LIVE_PUBLISH_MATCH_SKEW_MS = 2 * 60_000;
+/** FIX-LIVEP1(Codex 놓친 케이스 "큰 스트리밍 응답"): 응답 본문 상한(바이트) — 읽는 도중에 넘으면 읽기를 취소한다(전부 메모리에 올린 뒤 검사하지 않음) */
+export const MAX_RESPONSE_BYTES = 512 * 1024;
 
 /** 공식 게시 한도(문서: 24시간 이동 창 250 게시물, threads_publishing_limit 예시 quota_total 250·quota_duration 86400). */
 export const THREADS_LIVE_RATE_LIMIT: ChannelRateLimit = {
@@ -210,6 +213,44 @@ export function parseThreadsTimestamp(v: unknown): number | null {
   const off = m[3] === 'Z' ? 'Z' : `${m[3]!.slice(0, 3)}:${m[3]!.slice(-2)}`;
   const t = Date.parse(`${m[1]}${m[2] ?? ''}${off}`);
   return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * FIX-LIVEP1: 응답 본문을 조각으로 읽으며 바이트 상한을 지킨다 — 넘으면 읽기를 취소(reader.cancel)하고 body_too_large. 전체를 먼저 메모리에 올리지 않는다.
+ * 읽는 도중 끊김·중단은 전송 실패(timeout·network)로 본다.
+ */
+async function readCapped(res: Response, op: Op): Promise<string> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new LiveThreadsApiError({ op, httpStatus: res.status, malformed: true, reason: 'body_too_large' });
+  }
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new LiveThreadsApiError({ op, httpStatus: res.status, malformed: true, reason: 'body_too_large' });
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (e instanceof LiveThreadsApiError) throw e;
+    throw new LiveThreadsApiError({ op, httpStatus: res.status, transport: isAbort(e) ? 'timeout' : 'network', reason: 'body_unreadable' });
+  }
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    all.set(c, off);
+    off += c.byteLength;
+  }
+  return new TextDecoder('utf-8').decode(all);
 }
 
 type ContainerStatus = 'IN_PROGRESS' | 'FINISHED' | 'PUBLISHED' | 'ERROR' | 'EXPIRED';
@@ -392,7 +433,15 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     }
     // 게시: lease 확인 → 시도 표식(컨테이너마다 하나 — DB unique) → 바로 threads_publish. 표식 기록이 실패하면 게시하지 않는다(예외 → 조회).
     await this.#beforeWrite(ctx);
-    await steps.record({ kind: 'publish_attempt', post_index: 0, remote_id: liveThreadsStepId.publishAttempt(containerId), status: 'created' });
+    try {
+      // FIX-LIVEP1(Codex 놓친 케이스 "기존 표식 반환 뒤 재전송"): 새 표식을 만든 실행만 게시한다(createOnly — 이미 있으면 409, 기존 행을 돌려주지 않음).
+      await steps.record({ kind: 'publish_attempt', post_index: 0, remote_id: liveThreadsStepId.publishAttempt(containerId), status: 'created', createOnly: true });
+    } catch (e) {
+      if (e && typeof e === 'object' && (e as { code?: unknown }).code === 'remote_step_exists') {
+        return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'publish_attempt_exists' };
+      }
+      throw e;
+    }
     let mediaId: string;
     try {
       const body = await this.#call('publish', 'POST', `${THREADS_GRAPH_BASE}/${userId}/threads_publish`, token, ctx.signal, { creation_id: containerId });
@@ -427,7 +476,9 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
    * - 단계 없음 → not_found(게시는 기록된 컨테이너 + 시도 표식 뒤에만 한다 — 확실히 게시물 없음)
    * - 게시 기록 → found(읽어서 확인되면 verified)
    * - 시도 표식 없음: 컨테이너 FINISHED → resumable · IN_PROGRESS → processing · ERROR/EXPIRED → failed(게시물 없음) · PUBLISHED·읽기 실패 → unknown
-   * - 시도 표식 있음·게시 기록 없음: 최근 글 목록에서 "정확히 같은 본문 + 시도 시각 이후" 글이 정확히 하나면 기록하고 found, 아니면 unknown(재게시 없음)
+   * - 시도 표식 있음·게시 기록 없음: FIX-LIVEP1(Codex P0) — 컨테이너·시도와 미디어를 잇는 확정 증거가 없으므로 **항상 unknown**(게시 단계·결과·VERIFIED 를
+   *   만들지 않음, 재게시 없음). 최근 글 목록에서 같은 본문·시도 시각 ±2분 글이 정확히 하나이고 목록이 끝까지 왔을 때만(받은 수 < limit) 그 글을
+   *   **확인 후보**(candidate — 미확인)로 돌려준다. 사용자가 Threads 에서 직접 확인한다.
    */
   async reconcile(_reference: RemoteReference, ctx: AdapterContext): Promise<ReconcileResult> {
     this.calls.reconcile++;
@@ -480,7 +531,7 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       }
       return { status: 'unknown', error_code: 'container_published_without_attempt' };
     }
-    // 결과 불명 게시 시도 — 목록 대조(정확히 하나만 확인으로 인정)
+    // 결과 불명 게시 시도 — 목록은 확인 후보만 찾는다(확정 아님)
     const since = Date.parse(attempt.created_at) - LIVE_PUBLISH_MATCH_SKEW_MS;
     const until = ctx.now.getTime() + LIVE_PUBLISH_MATCH_SKEW_MS;
     let list: Record<string, unknown>;
@@ -501,21 +552,16 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       const at = parseThreadsTimestamp(o.timestamp);
       return isThreadsNumericId(o.id) && typeof o.text === 'string' && normalizeThreadsText(o.text) === want && at !== null && at >= since && at <= until;
     });
-    if (matches.length !== 1) return { status: 'unknown', error_code: matches.length === 0 ? 'publish_unmatched' : 'publish_match_ambiguous' };
+    if (matches.length === 0) return { status: 'unknown', error_code: 'publish_unconfirmed_no_candidate' };
+    if (matches.length > 1) return { status: 'unknown', error_code: 'publish_unconfirmed_candidates_ambiguous' };
+    // 목록이 한 쪽에 다 들어오지 않았으면(받은 수 = limit) 다음 쪽에 같은 글이 더 있을 수 있다 — 후보 하나라고 말하지 않는다.
+    if (data.length >= this.#listLimit) return { status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' };
     const m = matches[0]!;
-    const mediaId = m.id as string;
-    await ctx.steps.record({ kind: 'publish', post_index: 0, remote_id: liveThreadsStepId.publish(mediaId), status: 'published' });
     const permalink = isAllowedThreadsPermalink(m.permalink) ? m.permalink : undefined;
     return {
-      status: 'found',
-      result_kind: 'PUBLISHED',
-      remote_visibility: 'unknown',
-      external_id: liveThreadsExternalId(mediaId),
-      // 목록 대조로 찾은 글 — 본문·시각이 맞고 공식 링크가 있으면 확인(읽기로 확인한 결과)
-      verified: !!permalink,
-      ...(permalink ? { permalink } : {}),
-      published_parts: 1,
-      error_code: 'matched_by_list',
+      status: 'unknown',
+      error_code: 'publish_unconfirmed_candidate',
+      candidate: { external_id: liveThreadsExternalId(m.id as string), ...(permalink ? { permalink } : {}) },
     };
   }
 
@@ -560,13 +606,7 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       // 원 오류는 버린다(cause 에 URL — 질의의 토큰 — 이 있을 수 있다)
       throw new LiveThreadsApiError({ op, transport: isAbort(e) ? 'timeout' : 'network', reason: isAbort(e) ? 'timeout' : 'network' });
     }
-    let text: string;
-    try {
-      text = await res.text();
-    } catch (e) {
-      throw new LiveThreadsApiError({ op, httpStatus: res.status, transport: isAbort(e) ? 'timeout' : 'network', reason: 'body_unreadable' });
-    }
-    if (text.length > MAX_RESPONSE_CHARS) throw new LiveThreadsApiError({ op, httpStatus: res.status, malformed: true, reason: 'body_too_large' });
+    const text = await readCapped(res, op);
     let body: unknown;
     try {
       body = text ? JSON.parse(text) : null;

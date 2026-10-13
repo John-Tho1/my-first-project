@@ -87,6 +87,8 @@ export async function recordRemoteStep(
     receivedBytes?: number;
     totalBytes?: number;
     resumed?: boolean;
+    /** FIX-LIVEP1: 새 행만(있으면 409 remote_step_exists — 기존 행을 돌려주지 않는다) */
+    createOnly?: boolean;
   },
 ): Promise<RemoteStepRow> {
   return db.transaction(async (tx) => {
@@ -106,6 +108,10 @@ export async function recordRemoteStep(
       .for('update')
       .limit(1);
     const row = existing[0];
+    if (row && input.createOnly) {
+      // FIX-LIVEP1(Codex 놓친 케이스): 게시 시도 표식처럼 "새로 만든 쪽만 진행"해야 하는 단계 — 이미 있으면 진행하지 않게 알린다.
+      throw new AppError('conflict', 'remote_step_exists', '이미 기록된 원격 단계입니다(다시 진행하지 않음)', { kind: input.kind, post_index: input.postIndex });
+    }
     if (row) {
       if (row.remoteId !== input.remoteId) {
         throw new AppError('conflict', 'remote_step_conflict', '같은 게시물 단계에 다른 원격 ID 를 기록할 수 없습니다', { kind: input.kind, post_index: input.postIndex });
@@ -183,6 +189,7 @@ export function remoteStepsPort(db: Db, input: { ownerId: string; jobId: string;
           receivedBytes: step.received_bytes,
           totalBytes: step.total_bytes,
           resumed: step.resumed,
+          createOnly: step.createOnly,
         }),
       ),
   };

@@ -189,35 +189,42 @@ export function accountReady(a: Pick<ChannelAccountRow, 'kind' | 'state'>): bool
  */
 export async function setChannelAccountState(db: Db, ownerId: string, accountId: string, state: AccountState, now: Date = new Date()) {
   if (!isUuid(accountId)) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
-  return db.transaction(async (tx) => {
-    // 전역 잠금 순서의 첫 단계(계정 FOR UPDATE) — 승인·계획 생성·실행의 FOR SHARE 와 직렬화된 뒤 무효화 대상을 찾는다(FIX-T10 P1).
-    const rows = await tx
-      .select()
-      .from(channelAccounts)
-      .where(and(eq(channelAccounts.id, accountId), eq(channelAccounts.ownerId, ownerId)))
-      .for('update')
-      .limit(1);
-    const acc = rows[0];
-    if (!acc) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
-    if (acc.kind === 'mock' && state === 'connected') throw new BadRequestError('모의 계정은 연결(connected) 상태가 될 수 없습니다');
-    if (acc.kind === 'live' && state === 'mock_ready') throw new BadRequestError('실제 계정은 mock_ready 상태가 될 수 없습니다');
-    if (acc.state === state) return { account: acc, revoked: [] };
-    const updated = await tx
-      .update(channelAccounts)
-      .set({ state })
-      .where(and(eq(channelAccounts.id, acc.id), eq(channelAccounts.ownerId, ownerId)))
-      .returning();
-    const revoked = await invalidateApprovalsForAccount(tx, ownerId, acc.id, now);
-    await recordAudit(tx, {
-      ownerId,
-      action: 'channel_account.state',
-      entity: 'channel_account',
-      entityId: acc.id,
-      details: { platform: acc.platform, kind: acc.kind, from: acc.state, to: state, revoked_approvals: revoked.length },
-      at: now,
-    });
-    return { account: updated[0]!, revoked };
+  return db.transaction(async (tx) => setChannelAccountStateTx(tx, ownerId, accountId, state, now));
+}
+
+/**
+ * FIX-LIVEP1(Codex 답 5): 호출자의 트랜잭션 안에서 계정 상태를 바꾼다(계정 FOR UPDATE → 상태 변경 → 그 계정 활성 승인 철회 → 감사).
+ * "실제 게시 계정으로 사용"이 연결 정보 사용 가능 확인과 상태 변경을 **같은 트랜잭션**에서 하게 한다.
+ */
+export async function setChannelAccountStateTx(tx: DbOrTx, ownerId: string, accountId: string, state: AccountState, now: Date = new Date()) {
+  if (!isUuid(accountId)) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
+  // 전역 잠금 순서의 첫 단계(계정 FOR UPDATE) — 승인·계획 생성·실행의 FOR SHARE 와 직렬화된 뒤 무효화 대상을 찾는다(FIX-T10 P1).
+  const rows = await tx
+    .select()
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.id, accountId), eq(channelAccounts.ownerId, ownerId)))
+    .for('update')
+    .limit(1);
+  const acc = rows[0];
+  if (!acc) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
+  if (acc.kind === 'mock' && state === 'connected') throw new BadRequestError('모의 계정은 연결(connected) 상태가 될 수 없습니다');
+  if (acc.kind === 'live' && state === 'mock_ready') throw new BadRequestError('실제 계정은 mock_ready 상태가 될 수 없습니다');
+  if (acc.state === state) return { account: acc, revoked: [] };
+  const updated = await tx
+    .update(channelAccounts)
+    .set({ state })
+    .where(and(eq(channelAccounts.id, acc.id), eq(channelAccounts.ownerId, ownerId)))
+    .returning();
+  const revoked = await invalidateApprovalsForAccount(tx, ownerId, acc.id, now);
+  await recordAudit(tx, {
+    ownerId,
+    action: 'channel_account.state',
+    entity: 'channel_account',
+    entityId: acc.id,
+    details: { platform: acc.platform, kind: acc.kind, from: acc.state, to: state, revoked_approvals: revoked.length },
+    at: now,
   });
+  return { account: updated[0]!, revoked };
 }
 
 // ---- 스냅샷 ----

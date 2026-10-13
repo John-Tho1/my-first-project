@@ -113,6 +113,11 @@ export interface JobRunOptions {
   /** 한 owner 의 작업만(POST /api/worker/tick) */
   ownerId?: string;
   /**
+   * FIX-LIVEP1(Codex P1 distribute/[id]/page.tsx): 한 배포 계획의 작업만 lease 한다(계획 화면의 "작업 처리 실행" 버튼). 화면 안내(모의만·실제 게시 포함)가
+   * 그 계획의 항목과 맞게 — 다른 계획의 실제 게시 작업을 이 버튼이 처리하지 않는다. lease 만료 복구는 범위와 관계없이 그대로(외부 호출 없음).
+   */
+  planId?: string;
+  /**
    * T14(D26): 연결 정보가 필요한 어댑터(Threads 모의)용. keyring 이 없으면 process.env 의 마스터 키(@cs/domain requireSecretKeyring — 앱과 같은
    * 출처)를 쓰고, 키가 없으면 어댑터가 원격 호출 없이 auth 로 닫는다. check = 401(auth) 뒤 T13 연결 확인 경로(checkCredential)를 한 번 부른다.
    */
@@ -438,7 +443,7 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
  */
 export async function leaseJobs(
   db: Db,
-  opts: { workerId: string; now: Date; limit: number; leaseTtlMs?: number; ownerId?: string; excludeIds?: readonly string[] },
+  opts: { workerId: string; now: Date; limit: number; leaseTtlMs?: number; ownerId?: string; planId?: string; excludeIds?: readonly string[] },
 ): Promise<JobRow[]> {
   const { workerId, now } = opts;
   const limit = Math.min(Math.max(Math.floor(opts.limit), 1), 20);
@@ -450,6 +455,9 @@ export async function leaseJobs(
       .where(
         and(
           opts.ownerId ? eq(jobs.ownerId, opts.ownerId) : undefined,
+          opts.planId
+            ? sql`${jobs.itemId} in (select di.id from distribution_items di where di.plan_id = ${opts.planId}::uuid and di.owner_id = ${jobs.ownerId})`
+            : undefined,
           opts.excludeIds?.length ? sql`${jobs.id} <> all(${sql.param([...opts.excludeIds])}::uuid[])` : undefined,
           lte(jobs.nextRunAt, now),
           or(
@@ -1036,7 +1044,12 @@ async function applyReconcile(
 ): Promise<JobState> {
   const ownerId = job.ownerId;
   const intent = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt, true) : null;
-  const base = { attempt: job.attempt, reconcile: r.status, error_code: r.error_code ?? null, manual: opts.manual || undefined };
+  // FIX-LIVEP1(Codex P0): 확인 후보(미확인)는 작업 이력에만 남긴다 — 결과(publication)·게시 단계·VERIFIED 를 만들지 않는다. 형식이 맞는 값만(외부 ID threads:<숫자>, 공식 링크).
+  const candidate =
+    r.status === 'unknown' && r.candidate && LIVE_THREADS_EXTERNAL_ID_RE.test(r.candidate.external_id)
+      ? { candidate_external_id: r.candidate.external_id, ...(isAllowedThreadsPermalink(r.candidate.permalink) ? { candidate_permalink: r.candidate.permalink } : {}) }
+      : {};
+  const base = { attempt: job.attempt, reconcile: r.status, error_code: r.error_code ?? null, manual: opts.manual || undefined, ...candidate };
   const common = { ...CLEAR_LEASE };
   if (cancelResult?.status === 'canceled' && job.state === 'CANCEL_REQUESTED') {
     return settle(tx, ownerId, job, item, 'canceled', { ...base, remote_canceled: true }, now, common);
@@ -1252,7 +1265,7 @@ export async function runJobsTick(db: Db, registry: ChannelAdapterRegistry, opts
   const max = Math.min(Math.max(Math.floor(opts.maxJobs ?? 5), 1), 20);
   const done: string[] = [];
   for (let i = 0; i < max; i++) {
-    const [j] = await leaseJobs(db, { workerId: opts.workerId, now: clock(), limit: 1, leaseTtlMs: opts.leaseTtlMs, ownerId: opts.ownerId, excludeIds: done });
+    const [j] = await leaseJobs(db, { workerId: opts.workerId, now: clock(), limit: 1, leaseTtlMs: opts.leaseTtlMs, ownerId: opts.ownerId, planId: opts.planId, excludeIds: done });
     if (!j) break;
     done.push(j.id);
     const r = await processJob(db, registry, j, opts);

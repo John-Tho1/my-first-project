@@ -492,3 +492,4 @@
 ## D37 — 운영 배포(T21) 대기 (2026-10-13, 사용자 "4번은 아직 배포는 하지 않고 대기")
 - 로컬 선행 작업(P1a·P1b·P2·P3)은 Codex PASS 로 끝났지만 실제 배포는 하지 않는다. IdP·호스팅·도메인·서버 밖 백업 위치 결정과 배포 승인은 사용자가 다시 요청할 때.
 - **D35 재개 (2026-10-13)**: 사용자가 사용 위치(Anthropic 지원 지역)를 직접 확인하고 `LLM_LIVE_APPROVAL_REF` 를 다시 켰다(사용자 판단). 설정 D35 그대로(월 10 USD·1회 0.5 USD·호출 수 300).
+- **D31 2단계 결과 (2026-10-13 15:41 MSK)**: 실제 Threads OAuth 연결 **성공** — @yongho.tho, 권한 threads_basic·threads_content_publish 허락, 장기 토큰 만료 2026-12-12(자동 갱신 범위 밖 → 그 전에 재연결), 프로필 조회 1회. 게시 없음(PUBLISH_MODE disabled). 진행 중 조정: Meta 가 http://localhost redirect 를 거부("안전하지 않은 로그인 차단") → **외부 노출 없이** 로컬 HTTPS(자체 서명 인증서 `data/dev-certs`, git 제외, 30일)로 `https://localhost:3000/api/oauth/callback` 사용, dev 서버를 127.0.0.1 에만 바인드. 테스터 초대 수락 필요(오류 1349245) → 사용자 수락 후 성공. 발견: dev 로그에 콜백 query(code) 기록 → DEV-LOG 로 수정.

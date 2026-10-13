@@ -146,3 +146,8 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 
 ## 2026-10-13 낮 — T21 로컬 선행 작업 종결
 - P3(health)·P1a(dev 로그인 차단·제한)·P2(타이머·배포 파일)·P1b(OIDC) 모두 Codex PASS. 운영 배포에 남은 것은 **사용자 결정·승인**: IdP 선택·등록, 호스팅·도메인 선택(T21_DEPLOY_REVIEW §3), 서버 밖 백업 위치(P4/G5), D36(60분) 확인, D35 재개 여부(Anthropic 지원 지역), Threads 2단계(사용자 로그인 필요). 선택 과제: Postgres 드라이버(P5/G2).
+
+## 2026-10-13 오후 — D31 2단계 완료 · D35 재개 · D36 확정 · D37 배포 대기
+- Threads 실제 연결 성공(@yongho.tho, 만료 2026-12-12, 게시 없음). 로컬 HTTPS(`content-studio-dev-https`, 127.0.0.1 바인드)로 전환 — Meta 가 http redirect 거부.
+- D35 재개(사용자가 지원 지역 확인). D36(오래된 예약 60분) 확정. D37 운영 배포 대기.
+- DEV-LOG(콜백 query 로그 제외) Codex 대기.

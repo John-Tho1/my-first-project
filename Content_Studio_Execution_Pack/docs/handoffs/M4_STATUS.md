@@ -142,3 +142,7 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - T21-P1a(운영 빌드 dev 로그인 거부·로그인 실패 15분 10회 제한·판정 원자화): e70f7d4 → FIX1 e57cfa5 → FIX2 a448b78 → **FIX3 6f7a2a7 Codex PASS**. 검사 unit 1437·integration 816·drill·restore PASS. 남은 위험: Postgres 다중 연결 미검증(G2), 공격자의 전역 잠금으로 새 로그인 15분 차단 가능(기존 세션 유지), 순번 소진 시 관리자 정리 필요.
 - T21-P2(inline 주기 타이머·오래된 예약 60분 차단(D36 잠정)·deploy/ 예시와 스크립트): b73fc65 → FIX1 f351b7a → FIX2 69bf4b0 → FIX3 4e3490a → FIX4 47917f3 → **FIX5 e1025ba Codex PASS**. 앱 검사 unit 1466·integration 833 PASS, 배포 bash 시험 286(가짜 명령). 남은 위험: 배포 스크립트는 실제 Linux·root·flock·bind mount·PGlite 백업→복원→기동 미실행(서버 생긴 뒤 1회 확인 필요).
 - TEST-TIMEOUT(import 2MB 선형성 시험 벽시계 30초): f71f7ad Codex PASS.
+- T21-P1b(일반 OIDC 로그인 — openid-client 6.8.8, PKCE·state·nonce, 서명 검증 강제, 허용 이메일·sub, 가짜 IdP 시험): af9860c → FIX1 e75fa0c → **FIX2 1beee05 Codex PASS**. 검사 unit 1550·integration 878 PASS. migration 0043(auth_oidc_states). 남은 위험: 실제 IdP·프록시 뒤 callback URL 미확인(첫 배포 때 확인 — 불일치면 로그인 실패가 전역 제한에 누적), 미고지 JWKS 키 교체 후 최대 1분 실패, Postgres 다중 연결 미검증.
+
+## 2026-10-13 낮 — T21 로컬 선행 작업 종결
+- P3(health)·P1a(dev 로그인 차단·제한)·P2(타이머·배포 파일)·P1b(OIDC) 모두 Codex PASS. 운영 배포에 남은 것은 **사용자 결정·승인**: IdP 선택·등록, 호스팅·도메인 선택(T21_DEPLOY_REVIEW §3), 서버 밖 백업 위치(P4/G5), D36(60분) 확인, D35 재개 여부(Anthropic 지원 지역), Threads 2단계(사용자 로그인 필요). 선택 과제: Postgres 드라이버(P5/G2).

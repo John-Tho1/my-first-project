@@ -207,3 +207,4 @@ CHANGES_REQUESTED
 | FIX2-T21P2 | 69bf4b0 | CHANGES_REQUESTED — restore-data.sh P0 2(심볼릭 링크 data 복원·직전 사본 덮어쓰기), P1 1(교체 실패 후 재실행 불가), P2 1(pipefail+grep -q) |
 | FIX3-T21P2 | 4e3490a | CHANGES_REQUESTED — P0 2(root 시험이 운영 데이터 접근 가능·하위 마운트 삭제), P1 2(마운트 복구 소유자 미복원·백업과 복원 형식 불일치) |
 | FIX4-T21P2 | 47917f3 | CHANGES_REQUESTED — P0 1(현재 데이터·직전 사본 검증 없이 교체 시작), P1 2(백업 이름 검사 불일치·시험 경로 정규화) |
+| FIX5-T21P2 | e1025ba | 대기 |

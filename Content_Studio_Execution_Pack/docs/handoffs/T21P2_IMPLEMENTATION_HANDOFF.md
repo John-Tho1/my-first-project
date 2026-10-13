@@ -308,3 +308,47 @@
 ### FIX round 4 — 오케스트레이터 기록
 - FIX4 HEAD: 47917f38f7499b9f806587cb95c93770c8eda38e (deploy 스크립트·시험·README 만). BASE 4e3eb64(+ docs 7799e0d).
 - checks-FIX4-T21P2: 전부 0 — unit 1466 · integration 42 파일 · 833 · drill · migrate · restore PASS. 배포 bash 시험 248 통과·1 건너뜀(비 UTF-8 바이트 — Windows). 실제 root·flock 경합·chown 은 이 PC 에서 관찰 불가(스텁).
+
+
+---
+
+# FIX round 5 — Codex review-FIX4-T21P2(CHANGES_REQUESTED, 리뷰 대상 47917f3) 반영
+
+- 리뷰: `.handoffs/review-FIX4-T21P2.md`(P0 1 · P1 2). 방침: 최소 변경, 바꾸기 전 거부.
+- BASE_SHA: 0789616(47917f3 + docs). HEAD_SHA: **없음(미커밋)** — 커밋·`git add -A` 안 함. `.claude/`·docs/handoffs/*·DECISIONS.md 수정 없음. 앱 코드 변경 없음.
+
+## 재현(수정 전 스크립트에서 실패)
+새 `deploy/scripts/tests/test-fix5.sh` 를 **수정 전** 스크립트에 먼저 돌렸다 → 32 실패(로그 `.handoffs/fix5-t21p2-repro-deploy.log`): 지금 데이터에 하드링크(일반 폴더·마운트)·심볼릭 링크·줄바꿈 이름이 있어도 복원 진행, 직전 사본이 사본 검사를 통과하지 못해도(가짜 tar 로 `data/` 밖 항목이 든 사본) 교체, 데이터에 줄바꿈 이름이 있어도 백업 OK, 쓴 사본이 검사를 통과하지 못해도 백업 OK, `/tmp/../srv/content-studio`·상대 경로·루트 안 `..`·시험 루트 밖 임시 폴더·밖을 가리키는 중간 링크·CS_HARNESS_ROOT 없음을 시험 경로로 받아들임(앞의 셋은 다른 이유로 실패했을 뿐 경로 자체는 통과). 한국어 이름 왕복은 수정 전에도 일치(이 PC 로캘에서 백업·복원 모두 성공).
+
+## 지적 → 변경 → 시험
+| 지적 | 변경 | 시험(`test-fix5.sh`) |
+| --- | --- | --- |
+| **P0** restore-data.sh:89 지금 데이터·직전 사본 미검증 | 교체 방식 결정 직후(직전 사본·임시 폴더·이동 **전**) 지금 `$DATA` 에 `validate_tree`(특수 항목·하드링크 링크 수 > 1·이름 규칙) — 하위 마운트 검사는 기존대로 그 앞. 직전 사본을 만든 뒤 **들어오는 사본과 같은 `validate_archive`** 를 돌려 통과하지 못하면 그 사본을 지우고 거부(아무것도 바꾸기 전). 임시 폴더 확인도 같은 `validate_tree` | 지금 데이터 하드링크(일반 폴더·마운트 지점) → 거부·그대로·직전 사본 없음, 심볼릭 링크 → 거부, 줄바꿈 이름 → 거부, 직전 사본 검사 실패(가짜 tar 가 `data/` 밖 항목이 든 사본을 씀; 일반 폴더·마운트) → 거부·그대로·그 사본 지움 |
+| **P1** backup-data.sh:31 백업이 복원에서 거부될 이름을 허용 | 검사 하나로 통일(`lib/common.sh`): 폴더 쪽 `validate_tree`(= `refuse_special_tree` + 이름에 역슬래시·제어 문자(줄바꿈 포함)·UTF-8 아닌 바이트 거부 — `find -name`·`iconv`), 사본 쪽 `validate_archive`(restore-data 에 있던 목록 검사를 그대로 옮김). backup 은 만들기 전 `validate_tree`, 쓴 뒤 `validate_archive` — 실패하면 그 사본을 지우고 0 아닌 종료 | 데이터에 줄바꿈 이름 → 백업 거부·사본 없음, 쓴 사본이 검사 실패(가짜 tar) → 백업 실패·사본 지움, 한국어 이름 → 백업이 성공하면 복원도 성공(로캘 때문에 둘 다 거부되는 경우도 허용 — 서로 어긋나지만 않으면 됨; 이 PC 에서는 왕복 성공). 역슬래시 이름은 Windows 에서 만들 수 없어 시험하지 않음(같은 거부 분기) |
+| **P1** common.sh:101 시험 경로 정규화 | `cs_path`(시험 실행): 절대 경로·`..` 칸 없음·`CS_HARNESS_ROOT` 있음(정규 경로, 시스템 임시 폴더 아래)·`realpath -m`(기존 링크 모두 해석) 결과가 그 루트 **아래**여야 한다. 돌려주는 값은 검사를 통과한 원래 값(정규 경로를 돌려주면 데이터 루트 자체 링크 거부를 가리므로 — 아래 실행 결과의 회귀 참고). 이전의 운영 경로 문자열 차단 목록은 이 규칙에 포함되므로 삭제. `tests/lib.sh` 가 `CS_HARNESS_ROOT=$(realpath -e "$T_ROOT")` export | `/tmp/../srv/content-studio`·상대 경로·루트 안 `x/../parent`·시험 루트 밖 임시 폴더·루트 안 링크가 밖을 가리킴(데이터 부모·사본 폴더 각각, 밖에 폴더가 생기지 않음) → 모두 거부(메시지에 변수 이름), `CS_HARNESS_ROOT` 없음 → 거부, 정상 시험 경로 → 백업 성공(대조). FIX4 의 "운영 경로" 시험도 새 메시지("…시험 임시 루트 밖입니다(운영 경로 금지)")로 통과 |
+
+## 바뀐 파일(FIX5)
+- `deploy/scripts/lib/common.sh`(cs_path 정규화, `validate_archive` 이동, `validate_tree` 추가), `deploy/scripts/restore-data.sh`(목록 검사를 공용 함수 호출로, 지금 데이터 `validate_tree`, 직전 사본 `validate_archive`, 임시 폴더 `validate_tree`), `deploy/scripts/backup-data.sh`(`validate_tree` + 쓴 사본 `validate_archive`·실패 시 삭제)
+- 시험: 신규 `tests/test-fix5.sh`, `tests/lib.sh`(가짜 tar `STUB_TAR_BAD_OUT_GLOB`, `CS_HARNESS_ROOT` export)
+- 문서: `deploy/README_KO.md`(§2 데이터 안 금지 이름·같은 검사 함수, §8 표 2단계: 지금 데이터·직전 사본 검사)
+
+## 실행한 명령과 결과
+- 재현: 위 절(수정 전 스크립트 32 실패, `.handoffs/fix5-t21p2-repro-deploy.log`). 수정 후 `bash deploy/scripts/tests/test-fix5.sh` 38 passed.
+- 1차 `bash deploy/scripts/tests/run-all.sh`(`.handoffs/checks-FIX5-T21P2.deploy-tests.run1.log`): **test-fix3 2 실패** — `cs_path` 가 정규 경로를 돌려주자 check-env 가 데이터 루트 **자체가 링크**인지 볼 수 없게 됨(FIX3 회귀). 고침: `cs_path` 는 정규 경로로 **검사만** 하고 원래 값을 돌려준다(이후 `-L` 거부가 그대로 동작). 나머지 스위트는 1차에서도 통과.
+- 2차 `bash deploy/scripts/tests/run-all.sh` → `.handoffs/checks-FIX5-T21P2.deploy-tests.log`: test-check-env 46 · test-fix3 30 · test-fix4 63 · test-fix5 38 · test-restore-data 64 · test-service-state 45 = **286 passed, 0 failed, SKIP 1**(UTF-8 아닌 이름 — FIX4 와 같음), `DEPLOY-SCRIPT-TESTS: PASS`(exit 0).
+- `bash .handoffs/run-checks.sh FIX5-T21P2` → `.handoffs/checks-FIX5-T21P2.log`: LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(61 files / 1466 passed), **INTEG=0**(42 files / 833 passed, 재실행 불필요), DRILL=0(불변식 위반 0건), MIGRATE=0, DRILL_RESTORE=0(PASS), CHECKS-DONE. (이 검사는 cs_path 회귀 수정 **전**에 돌았지만 배포 셸 스크립트는 lint·typecheck·build·vitest 대상이 아니다 — 수정 뒤 셸 쪽은 2차 deploy 시험으로 확인.)
+
+## 남은 위험·미검증(FIX5)
+1. 실제 Linux·PGlite 데이터로 백업 → 복원 → 기동을 하지 않았다. PGlite 가 실제로 만드는 파일 구성이 이 제한(일반 파일·폴더만, 링크 수 1)을 만족하는지 미확인 — 만족하지 않으면 백업이 거부된다(fail closed).
+2. 이름 규칙의 로캘 의존: tar 가 C 로캘에서 비 ASCII 이름을 이스케이프하면 백업(쓴 사본 검사)과 복원이 **함께** 거부한다(어긋나지는 않음). `validate_tree` 의 `find -name '*[[:cntrl:]]*'` 도 로캘의 문자 분류에 따른다.
+3. 실제 root 실행 거부·UID 간 flock 경합·실제 bind 마운트 검출은 여전히 이 PC 에서 시험하지 못했다(FIX4 와 같음).
+
+## Codex 재검증 질문
+1. 지금 데이터 `validate_tree` → 직전 사본 생성 → `validate_archive(직전 사본)` → 임시 폴더 `unpack_verified` → 교체 순서에서 "바꾸기 전 거부"에 빠진 단계가 있는가?
+2. `validate_tree`(find·iconv 기반 이름 검사)와 `validate_archive`(tar 목록 기반 이름 검사)가 같은 입력에 같은 판정을 내리는가(특히 로캘·제어 문자 분류)?
+3. `cs_path` 의 시험 경로 규칙(절대·`..` 없음·정규 경로가 CS_HARNESS_ROOT 아래)이 운영 경로 접근을 충분히 막는가?
+
+
+### FIX round 5 — 오케스트레이터 기록
+- FIX5 HEAD: e1025ba6db9a22d02f09ba6395c260da1d87c75f (deploy 스크립트·시험·README 만). BASE 0789616(+ docs 15cf88c).
+- checks-FIX5-T21P2: 전부 0(앱 코드 변경 없음 — 셸 수정 전 실행). 배포 bash 시험 286 통과·1 건너뜀(최종 셸 기준).

@@ -140,3 +140,5 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - T21-P3(공개 health 생존 확인만·상세는 세션): 449da0f **Codex PASS**. 검사 unit 1411·integration 793·drill·restore PASS.
 - 진행 순서: P1a(운영 빌드 dev 로그인 차단·로그인 횟수 제한) → P2(tick 타이머·배포 설정 파일) → P1b(일반 OIDC, 가짜 IdP 시험).
 - T21-P1a(운영 빌드 dev 로그인 거부·로그인 실패 15분 10회 제한·판정 원자화): e70f7d4 → FIX1 e57cfa5 → FIX2 a448b78 → **FIX3 6f7a2a7 Codex PASS**. 검사 unit 1437·integration 816·drill·restore PASS. 남은 위험: Postgres 다중 연결 미검증(G2), 공격자의 전역 잠금으로 새 로그인 15분 차단 가능(기존 세션 유지), 순번 소진 시 관리자 정리 필요.
+- T21-P2(inline 주기 타이머·오래된 예약 60분 차단(D36 잠정)·deploy/ 예시와 스크립트): b73fc65 → FIX1 f351b7a → FIX2 69bf4b0 → FIX3 4e3490a → FIX4 47917f3 → **FIX5 e1025ba Codex PASS**. 앱 검사 unit 1466·integration 833 PASS, 배포 bash 시험 286(가짜 명령). 남은 위험: 배포 스크립트는 실제 Linux·root·flock·bind mount·PGlite 백업→복원→기동 미실행(서버 생긴 뒤 1회 확인 필요).
+- TEST-TIMEOUT(import 2MB 선형성 시험 벽시계 30초): f71f7ad Codex PASS.

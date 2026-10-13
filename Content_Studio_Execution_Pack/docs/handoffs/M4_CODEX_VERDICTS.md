@@ -211,4 +211,4 @@ CHANGES_REQUESTED
 | T21-P1b | af9860c | CHANGES_REQUESTED — P1 2(본문 전송 실패를 검증 실패로 집계·discovery 갱신이 진행 중 허용 호스트 제거), P2 3(결합 쿠키 삭제·state 상한 직렬화·미설정 로그 안내) |
 | FIX-T21P1B | e75fa0c | CHANGES_REQUESTED — P2 2(늦은 callback 응답이 새 흐름 결합 쿠키 삭제·timeout 뒤 도착 응답 본문 미취소) |
 | FIX2-T21P1B | 1beee05 | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P1b 종결 |
-| DEV-LOG | 4f0bc1d | 대기 |
+| DEV-LOG | 4f0bc1d | **PASS** — 지적 없음(gpt-6-astra · xhigh) |

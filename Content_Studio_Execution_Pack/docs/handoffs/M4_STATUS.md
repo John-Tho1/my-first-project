@@ -150,4 +150,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 ## 2026-10-13 오후 — D31 2단계 완료 · D35 재개 · D36 확정 · D37 배포 대기
 - Threads 실제 연결 성공(@yongho.tho, 만료 2026-12-12, 게시 없음). 로컬 HTTPS(`content-studio-dev-https`, 127.0.0.1 바인드)로 전환 — Meta 가 http redirect 거부.
 - D35 재개(사용자가 지원 지역 확인). D36(오래된 예약 60분) 확정. D37 운영 배포 대기.
-- DEV-LOG(콜백 query 로그 제외) Codex 대기.
+- DEV-LOG(콜백 query 로그 제외) 4f0bc1d **Codex PASS**.

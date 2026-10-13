@@ -205,4 +205,4 @@ CHANGES_REQUESTED
 | TEST-TIMEOUT | f71f7ad | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
 | FIX-T21P2 | f351b7a | CHANGES_REQUESTED — 코드 지적 해소, 배포 스크립트·문서 P1 4(상태 조회 실패를 정지로 취급·env 해석 불일치·경로 정규화·마운트 지점 되돌리기) |
 | FIX2-T21P2 | 69bf4b0 | CHANGES_REQUESTED — restore-data.sh P0 2(심볼릭 링크 data 복원·직전 사본 덮어쓰기), P1 1(교체 실패 후 재실행 불가), P2 1(pipefail+grep -q) |
-| FIX3-T21P2 | 4e3490a | 대기 |
+| FIX3-T21P2 | 4e3490a | CHANGES_REQUESTED — P0 2(root 시험이 운영 데이터 접근 가능·하위 마운트 삭제), P1 2(마운트 복구 소유자 미복원·백업과 복원 형식 불일치) |

@@ -196,3 +196,61 @@
 - FIX2 HEAD: 69bf4b01933163fcf778a5667e725b8c1cc08f20 (code only). BASE 8e1e8e4(+ docs eae0d1e).
 - checks-FIX2-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 파일 워커 exit 2147483651) → maxWorkers=2 재실행 42 파일 · 833 통과 · drill · migrate · restore PASS. 배포 스크립트 bash 시험 116/116(가짜 명령, 실제 Linux 미실행).
 - 오케스트레이터 추가: deploy/README_KO.md §8 에 "복원 도중 실패" 시 직전 tar 로 restore-data.sh 재실행 안내 1줄.
+
+
+---
+
+# FIX round 3 — Codex review-FIX2-T21P2(CHANGES_REQUESTED, 리뷰 대상 69bf4b0) 반영
+
+- 리뷰: `.handoffs/review-FIX2-T21P2.md`(P0 2 · P1 1 · P2 1 + 질문 답의 데이터 루트 링크·시험용 변수). 오케스트레이터 지시 6항목.
+- BASE_SHA: 9d107ab(69bf4b0 + docs). HEAD_SHA: **없음(미커밋)** — 커밋·`git add -A` 안 함. `.claude/`·docs/handoffs/*·DECISIONS.md 수정 없음. 앱 코드(TypeScript) 변경 없음 — 배포 스크립트·시험·README 만.
+
+## 재현(수정 전 스크립트에서 실패)
+새·고친 bash 시험을 **수정 전** 스크립트에 먼저 돌렸다 → `test-fix3.sh` 21 실패, `test-restore-data.sh` 19 실패(로그 `.handoffs/fix3-t21p2-repro-deploy.log`).
+- (4) 큰 unit 목록(20만 줄) 맨 앞에 `content-studio.service` 가 있어도 `--first-install` 이 **진행**됨 — `printf | awk | grep -Fqx` 가 pipefail 에서 SIGPIPE 로 실패해 "없음"이 됨(지적 그대로 재현).
+- (5) 데이터 루트·데이터 폴더가 링크여도 check-env OK, backup-data 가 링크만 담은 사본 생성, restore-data 가 링크 대상에 복원.
+- (6) 표식 없이 `CS_ENV_FILE`·`CS_ENV_OWNER_MODE`·`CS_TEST_SKIP_CHOWN`·`CS_SERVICE_USER` 등을 주면 그대로 적용(check-env OK, backup·restore 실행).
+- (1) 사본 안 심볼릭 링크(`data/link → 밖`)·최상위 `data` 링크·하드링크 항목을 복원함.
+- (3) 교체 도중 실패를 흉내 내도(가짜 mv) 성공으로 끝남(되돌림 없음), `--data-missing-ok` 없음.
+- (2) "같은 초 두 번" 시험은 수정 전에도 통과했다 — Git Bash 가 느려 두 실행이 다른 초에 걸렸기 때문(결정적 재현 아님). 새 코드는 시각과 무관하게 `mktemp` 로 보장.
+
+## 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+| --- | --- | --- |
+| **P0** restore-data.sh:31 링크·특수 항목 복원 | 재설계: ① `tar -tzf`(이름)·`tar -tvzf | cut -c1`(형식)을 받아 항목 수가 같은지 확인, 형식은 `-`·`d` 만(링크 `l`·하드링크 `h`·장치·FIFO 거부), 이름은 `data` 또는 `data/…`, 각 경로 칸이 비거나 `.`·`..` 이면 거부, 최상위 `data` 는 `d` — 아무것도 바꾸기 전. ② 같은 파일 시스템의 새 임시 폴더(`mktemp -d`: 일반 폴더면 데이터 부모 안, 마운트 지점이면 마운트 안)에 `--no-same-owner` 로 풀기. ③ 풀고 나서 `find ! -type f ! -type d` 0개·최상위는 실제 폴더 `data` 하나인지 다시 확인. ④ 소유자(`chown -R -h`)·700 은 이 확인 뒤에만. 데이터 폴더·부모가 링크면 시작 전에 거부 | `test-restore-data.sh`: 사본 안 심볼릭 링크 → 풀기 전 거부·링크 대상 권한·내용 그대로·임시 폴더 없음, 최상위 data 링크 → 거부, 하드링크 항목(이 PC 에서 `h` 항목 생성 확인) → 거부, `data/` 밖 경로·최상위가 data 아님 → 거부 |
+| **P0** restore-data.sh:45 직전 사본 덮어쓰기 | 직전 사본을 `mktemp --suffix=.tar.gz "$BACKUP_DIR/data-before-restore-<시각>.XXXXXX"` 로 **배타적 생성**(0600), 입력 사본과 정규 경로가 같으면 중단. backup-data 사본도 같은 방식(`data-<시각>-<SHA>.XXXXXX.tar.gz`). 사본에는 남은 임시 폴더(`data/.restore-stage.*`·`.restore-rollback.*`)를 넣지 않음 | 연속 두 번 → 직전 사본 2개, 첫 직전 사본을 입력으로 세 번째 실행 → 입력 파일 cksum 그대로·old 내용으로 복원·직전 사본 3개. backup-data 두 번 → 사본 2개 |
+| **P1** restore-data.sh:26 실패 후 재실행 불가 | 일반 폴더: `data` → `data.replaced-<시각>.<고유>/data`(mktemp -d 안) → 임시 `data` 를 `mv -T` 로 제자리. 둘째 단계 실패 시 **옮겨 둔 폴더를 되돌리고** 실패 종료(메시지 "되돌렸습니다"). 마운트 지점: 확인이 끝난 뒤에만 내용(임시 폴더 제외) 삭제 → 임시 `data` 내용 이동, 실패하면 **직전 사본을 임시 폴더에 풀고 검증한 뒤 자동 복구**("직전 사본으로 복구했습니다"). 데이터 폴더가 없는 상태는 `--data-missing-ok` 로만(폴더가 있으면 그 표시를 거부). 임시 폴더는 trap 으로 항상 정리. README §8 을 단계 표 + 실패 시 재실행·`--data-missing-ok` 절차로 다시 씀 | 가짜 mv(`STUB_MV_FAIL_ON=.restore-stage`)로 일반 폴더 교체 실패 → 이전 데이터로 되돌림·임시 폴더 정리, 마운트 지점 채우기 실패 → 직전 사본으로 복구·하위 폴더 복구, 데이터 폴더 없음 + 표시 없음 → 중단(안내에 `--data-missing-ok`), 표시 있음 → `mode=missing` 복원, 폴더가 있는데 표시 → 중단 |
+| **P2** common.sh:34 `grep -q` + pipefail | `list-unit-files` 출력 전체를 먼저 받아 그 명령의 종료 코드로 "조회 실패"(중단)를 가르고, 줄 맨 앞 정확 일치는 bash 패턴(`$'\n'"$list" == *$'\n'"$unit"[[:space:]]*`)으로 — 파이프 없음. ActiveState 조회만 실패해도 중단(기존 동작, 시험 추가) | `test-fix3.sh`: 20만 줄 목록 맨 앞에 있으면 중단("unit 파일이 있습니다"), 목록에 없으면 진행, LoadState 성공 + ActiveState 실패 → 중단 |
+| 데이터 루트 링크(Codex 질문 3) | check-env: 데이터 루트 자체가 링크면 거부. backup-data·restore-data: 데이터 폴더가 링크면 거부 | `test-fix3.sh`(5): check-env 링크 루트 거부 / 같은 내용 실제 폴더는 OK(대조), backup-data 거부·사본 없음, restore-data 거부·링크 대상 그대로 |
+| 시험용 변수(Codex 질문 5) | `lib/common.sh` `cs_test_mode`: `CS_DEPLOY_TEST_HARNESS=1`(정확히 1) **그리고** `$EUID ≠ 0`(bash 내장 — PATH 의 가짜 id 로 속일 수 없음)일 때만 `cs_opt` 가 `CS_*` 를 적용. 운영(표식 없음 또는 root)에서는 운영 기본값. `require_root` 도 같은 규칙(시험 실행에서만 건너뜀). 모든 스크립트의 `${CS_…:-…}` 를 `cs_opt` 로 바꿈(grep 으로 남은 것 0 확인). 표식은 `tests/lib.sh` 가 export | `test-fix3.sh`(6): 표식 있으면 check-env OK(대조) / 표식 없으면 `/etc/content-studio/env` 를 봄 / 표식 값 `yes` 도 무시 / backup-data·restore-data 표식 없으면 "root 로 실행"·사본 없음·데이터 그대로 / build-release 표식 없으면 운영 사용자 `content-studio` 요구 |
+
+## 바뀐 파일(FIX3)
+- `deploy/scripts/lib/common.sh`(cs_test_mode·cs_opt·require_root·make_backup_dir, 목록 검색), `deploy/scripts/restore-data.sh`(재작성), `deploy/scripts/backup-data.sh`(링크 거부·고유 이름·cs_opt), `deploy/scripts/check-env.sh`(common.sh 사용·cs_opt·루트 링크 거부), `deploy/scripts/build-release.sh`(cs_opt)
+- 시험: `deploy/scripts/tests/lib.sh`(표식 export, 가짜 mv·큰 목록·ActiveState 실패 옵션), `test-restore-data.sh`(재작성), 신규 `test-fix3.sh`
+- 문서: `deploy/README_KO.md`(§4 루트 링크, §7-2 사본 이름, §8 재작성)
+
+## 실행한 명령과 결과
+- 재현: 위 절(수정 전 스크립트 40 실패, `.handoffs/fix3-t21p2-repro-deploy.log`).
+- 개발 중: `bash deploy/scripts/tests/test-restore-data.sh` 64 passed, `bash deploy/scripts/tests/test-fix3.sh` 30 passed(심볼릭 링크·하드링크 시험 실제 실행 — SKIP 없음). 모든 스크립트 `bash -n` OK, 스크립트에 남은 `${CS_…}` 직접 참조 0(grep).
+- `bash deploy/scripts/tests/run-all.sh` → `.handoffs/checks-FIX3-T21P2.deploy-tests.log`: test-check-env 46 · test-fix3 30 · test-restore-data 64 · test-service-state 43 = **183 passed, 0 failed, SKIP 없음**, `DEPLOY-SCRIPT-TESTS: PASS`(exit 0).
+- `bash .handoffs/run-checks.sh FIX3-T21P2` → `.handoffs/checks-FIX3-T21P2.log`: LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(61 files / 1466 passed), **INTEG=1**(워커 종료 2147483651 — 미변경 `migration-0023.test.ts`·`secrets-cli.test.ts`, 40/42 files), DRILL=0(불변식 위반 0건), MIGRATE=0, DRILL_RESTORE=0(PASS), CHECKS-DONE.
+- 규칙대로 통합만 재실행: `corepack pnpm exec vitest run --project integration --maxWorkers=2` → **42 files / 833 passed, exit 0**(`.handoffs/checks-FIX3-T21P2.integ2.log`).
+
+## 남은 위험·미검증(FIX3)
+1. 실제 Linux·systemd·util-linux·GNU tar 에서 실행하지 않았다(가짜 systemctl·mountpoint·mv 와 Windows Git Bash 의 GNU tar/coreutils 로만). 장치·FIFO 항목 시험은 이 PC 에서 만들 수 없어 하지 않았다(형식 문자 검사로 거부하는 코드 경로는 링크·하드링크와 같다).
+2. 마운트 지점 복원은 내용 삭제 → 이동 사이에 전원이 끊기면 내용이 불완전할 수 있다(직전 사본은 남아 있음). 하위 마운트(마운트 안 또 다른 마운트)는 고려하지 않았다 — `find -exec rm -rf` 가 그 안도 지운다.
+3. 일반 폴더 교체의 두 `mv` 사이(아주 짧은 순간)에 프로세스가 죽으면 데이터 폴더가 없을 수 있다 — `data.replaced-*/data` 를 되돌리거나 `--data-missing-ok` 로 복원(README §8).
+4. `cs_test_mode` 는 `$EUID` 를 믿는다. 운영에서 서비스 사용자(비 root)로 도는 build-release 에 누군가 `CS_DEPLOY_TEST_HARNESS=1` 을 일부러 주면 바꿔치기가 적용된다(표식은 운영 문서·unit 에 없음).
+5. 이 PC 에서 deploy 시험 전체가 수 분 걸린다(Git Bash 프로세스 생성 비용).
+
+## Codex 재검증 질문
+1. 사본 검사(`tar -tv` 첫 글자 형식 + 이름 칸 검사 + 풀고 난 뒤 `find`)가 GNU tar 의 모든 항목 형식(예: sparse, 긴 이름 확장 헤더, `--` 로 시작하는 이름)에서 맞게 동작하는가? 이름과 형식 목록의 줄 수 일치 확인이 줄바꿈이 든 이름에서도 안전한가(tar 는 기본으로 이스케이프한다고 보았다)?
+2. 일반 폴더 교체(같은 파일 시스템의 `mv -T` 두 번 + 되돌림)와 마운트 지점 교체(삭제 → 이동, 실패 시 직전 사본 자동 복구)의 실패 처리에 빠진 분기가 있는가?
+3. `--data-missing-ok` 를 표시 방식(자동 감지 아님)으로 둔 선택이 적절한가?
+4. `cs_test_mode`(표식 + `$EUID ≠ 0`)가 운영 진입점에서 바꿔치기를 충분히 막는가, 아니면 시험 훅을 모두 PATH 가짜 명령으로 옮겨야 하는가?
+5. bash 패턴 기반 unit 목록 검색(`*$'\n'"$unit"[[:space:]]*`)이 실제 `systemctl list-unit-files --no-legend` 출력 형식과 맞는가?
+
+
+### FIX round 3 — 오케스트레이터 기록
+- FIX3 HEAD: 4e3490ac3d71b48ea94f1309f392e6a124c6e142 (deploy 스크립트·시험·README 만). BASE 9d107ab(+ docs e643d0e).
+- checks-FIX3-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 파일 워커 exit 2147483651) → maxWorkers=2 재실행 42 파일 · 833 · drill · migrate · restore PASS. 배포 bash 시험 183 통과(장치·FIFO 항목은 이 PC 에서 만들 수 없어 미실행).

@@ -2,7 +2,7 @@
 - Task ID / milestone: LIVE-P1 / M4 후속 — 사용자 "실제 게시 진행해보자"(D38). 1단계 = 실제 Threads 텍스트 게시 어댑터·게이트·DB·화면을 만들고 **기록된 응답(fixture)·주입 fetch 로만** 시험. 2단계(실제 1건 게시)는 별도 정확 범위 승인 대상 — 이 작업에서 하지 않음.
 - Purpose and changed behavior: 실제 계정 + Threads + 연결 정보가 있는 항목을 모든 게이트가 열렸을 때만 실제 Threads 텍스트 게시 어댑터(`live_threads`)로 보낸다(컨테이너 → 상태 FINISHED → 게시 시도 표식 → threads_publish → 원격 읽기 확인). 기본 설정(PUBLISH_MODE disabled·승인 기록 없음)에서는 실제 게시 경로가 열리지 않는다. 모의 계정 동작은 그대로.
 - BASE_SHA: a50ee58
-- HEAD_SHA: 320dadb20609c21e3a330b4a51847637bb07fb47 (LIVE-P1) · FIX-LIVEP1 HEAD 1a224348f4e720aadc2476a736513506c9d20deb
+- HEAD_SHA: 320dadb20609c21e3a330b4a51847637bb07fb47 (LIVE-P1) · FIX-LIVEP1 1a224348f4e720aadc2476a736513506c9d20deb · FIX2-LIVEP1 HEAD b8a7200d11d8720406a4aa66fc4acb00f67433e1
 - Clean tracked tree confirmed: 시작 시 yes(`?? .claude/` 만). 이 작업의 변경 외 추적 파일 변경 없음.
 - Relevant acceptance IDs: AGENTS Invariants(정확한 payload·계정·공개 범위 승인 없이 게시 금지, 편집 → 승인 무효, 결과 불명 → 조회 또는 UNKNOWN·맹목 재전송 금지, 모의 성공 ≠ 실제 게시, 비밀은 서버만), docs/03(승인 스냅샷·중복·재시도·ChannelAdapter 계약·VERIFIED 정의), A08·A10·A11·A20, D24·D26·D30·D31·D36.
 - External calls performed: **none**. 코드·시험 어디에서도 Threads/Meta 로 요청하지 않았다(어댑터 시험·통합 시험은 주입 fetch, 전역 fetch 는 막고 0회 확인 + setupFiles 네트워크 가드). 공식 문서 페이지만 읽기 전용으로 열람(WebFetch). `.env.local`·`./data` 열지 않음, db:migrate·drill:restore(둘 다 ./data 를 연다) 실행 안 함.
@@ -163,3 +163,44 @@
 1. "게시 시도 표식 뒤 확정은 threads_publish 응답의 미디어 ID 뿐, 목록은 이력의 확인 후보만"이 P0 를 닫는가? 후보를 이력(job_events)에 남기는 것 자체가 사용자 오해를 만들 위험은 화면 문구(미확인 배지·"게시 결과로 기록하지 않았습니다")로 충분한가?
 2. 계획 범위 tick(`plan_id`)이 버튼 경로만 좁히고, 주기 타이머·전사 목록 조회의 inline tick 은 owner 전체를 처리하는 것(그 경로들은 화면 안내 문구가 없음)이 받아들일 만한가?
 3. `createOnly` 를 게시 시도 표식에만 쓰고 컨테이너 기록은 기존 규칙(같은 remote_id 면 기존 행)으로 둔 것 — 두 실행이 같은 컨테이너 ID 를 받는 경우(원격이 같은 ID 를 줄 때)에도 게시는 표식 하나로 막히므로 충분한가?
+
+---
+
+# FIX2-LIVEP1 (Codex review-FIX-LIVEP1 — CHANGES_REQUESTED on 1a22434, P2 1)
+- 판정 원본: `.handoffs/review-FIX-LIVEP1.md`
+- BASE_SHA: 1a22434 · HEAD_SHA: uncommitted — orchestrator commits
+- 범위: 실제 Threads·Meta 요청 0(주입 fetch·전역 fetch stub 만), `.env.local`·`./data` 손대지 않음, db:migrate·drill:restore·dev 서버 없음, migration·의존성 추가 없음, 내가 띄운 프로세스만 다룸.
+
+## 지적 → 시험(재현) → 변경
+| 지적 | 재현(수정 전 코드로 먼저 실패) | 변경 |
+|---|---|---|
+| **[P2] threads-live-publish.ts:536** 후보 창 상한이 재확인 시각 + 2분 — 늦은 재확인일수록 넓어짐 | 단위(`checks-FIX2-LIVEP1.repro-unit.log`, 3 실패): **Codex 재현** — 표식 12:00, 재확인 60분 뒤, 같은 글이 시도 +50분 → 이전엔 후보 / 경계 표(60분 뒤 재확인): 시도 +2분·−2분 정확히 = 후보, +2분 +1ms = 이전엔 후보(실패), −2분 −1ms = 아님. 통합(`checks-FIX2-LIVEP1.repro-integ.log`, 1 실패): 목록 fixture 의 게시 시각을 재확인 시계와 분리 — 표식 시각(DB created_at) +30초 글과 +50분의 같은 글, 재확인은 20·40·60분 뒤 → 이전엔 두 글이 모두 창 안이라 후보 없음(기대한 +30초 후보가 사라짐) | 창의 두 끝을 표식 시각에 고정: `[attempt.created_at − 2분, attempt.created_at + 2분]`(경계 포함), 재확인 시각(ctx.now)과 무관. created_at 을 읽을 수 없으면 unknown(`publish_attempt_time_unreadable`) |
+| 놓친 케이스: 받은 수 < limit 인데 `paging.next` 있음 | 단위 1 실패(이전엔 후보) | `paging.next` 가 있으면(받은 수와 관계없이) 목록 불완전 → 후보 없음. `paging.cursors` 만 있는 문서 예시 모양은 받은 수 < limit 이면 완전으로 본다(시험으로 고정) |
+| 놓친 케이스: 낡은 후보 표시 | 웹 lib 단위(`checks-FIX2-LIVEP1.repro-ui.log`, 4 실패): 앞 재확인 = 후보, 다음 재확인 = 0개·2개·불완전·읽기 실패 → 이전엔 옛 후보를 계속 보임 | `liveCandidateFromEvents` 는 **가장 최근 재확인 이력**(details.reconcile 이 있는 사건)만 본다 — 그 재확인에 후보가 없으면 null(옛 후보 숨김). 재확인이 아닌 나중 사건은 판단을 바꾸지 않음, 형식 틀린 후보는 버림 |
+| 놓친 케이스: 응답 크기 경계·UTF-8 조각 경계 | 단위(수정 전에도 통과 — 기존 구현이 맞음을 고정): 정확히 512 KiB(64 KiB 조각) → 받음, +1바이트 → 부작용 없는 실패·단계 0. 한국어(3바이트)가 7바이트 조각 경계에서 잘린 읽기 응답 → 본문 일치·VERIFIED | 코드 변경 없음(`readCapped` 는 바이트를 모은 뒤 한 번에 UTF-8 디코딩) |
+| 놓친 케이스: 게시 성공 응답 뒤 게시 단계 저장 실패 | 단위에 이미 있음("게시 성공 뒤 게시 기록 실패 → 다음 submit 재게시 없음"). 통합 새 시험: 게시(publish) 단계 기록만 실패시키는 어댑터 하위 클래스로 작업 처리기 전체를 돌림 → RECONCILING → (표식만, 게시 기록 없음) → UNKNOWN, publication 0, threads_publish 1번, 재시도 409 | 코드 변경 없음(게시 시도 표식이 재게시를 막고 목록은 후보만) |
+
+## 바뀐 파일(FIX2-LIVEP1)
+- `packages/providers/src/threads-live-publish.ts` — 후보 창을 표식 시각 ±2분에 고정, `paging.next` 불완전 처리
+- `apps/web/lib/distribution.ts` — `liveCandidateFromEvents` 최신 재확인 기준
+- 시험: `packages/providers/src/threads-live-publish.test.ts`(+P2 재현 1·경계 4·paging.next 1·크기 경계 1·UTF-8 1), `apps/web/lib/distribution.test.ts`(+낡은 후보 6), `tests/integration/live-threads-publish.test.ts`(목록 시각을 표식 시각에 고정·+50분 같은 글 추가, +게시 단계 저장 실패 1)
+
+## 실행한 명령(FIX2-LIVEP1)
+(Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, dev 서버 꺼짐. ./data 를 여는 db:migrate·drill:restore 는 뺀 같은 순서 — 로그 `.handoffs/checks-FIX2-LIVEP1*.log`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project unit packages/providers/src/threads-live-publish.test.ts`(새 시험 + 수정 전 어댑터) | FAIL 3/66 — P2 재현·+2분 +1ms·paging.next(`repro-unit.log`) — 재현 |
+| `vitest run --project unit apps/web/lib/distribution.test.ts`(새 시험 + 수정 전 도우미) | FAIL 4/66 — 낡은 후보(`repro-ui.log`) — 재현 |
+| 위 두 파일(수정 뒤) | PASS 66/66 · 66/66 |
+| `vitest run --project integration tests/integration/live-threads-publish.test.ts`(창 상한만 옛 식으로 임시 되돌림) | FAIL 1/16(`repro-integ.log`) — 재현, 되돌림 확인 |
+| 같은 파일(수정 뒤) | PASS 16/16(1회차는 새 단계 저장 실패 시험이 tick 결과 합계를 단언해 다른 계획의 조회 작업과 섞여 실패 → 항목 상태로 판단하도록 시험 수정) |
+| `corepack pnpm lint` · `typecheck` · `build` | PASS · PASS · PASS |
+| `corepack pnpm test`(unit) | PASS — 67 files, 1630 tests |
+| `corepack pnpm test:integration` | PASS — 47 files, 895 tests(워커 충돌 없음) |
+| `corepack pnpm drill:mock` | PASS — "불변식 위반 0건" |
+| `db:migrate` · `drill:restore` | not_run(./data 금지) |
+
+## 남은 위험(FIX2-LIVEP1 기준)
+- 그대로: 결과 불명 실제 게시는 항상 UNKNOWN(사용자 확인), 실제 PostgreSQL 독립 연결 동시성·publish-target 과 연결 해제의 실제 동시 실행 미검증, GET 질의 토큰의 앱 밖 기록 미검증, 컨테이너 생성의 원격 자원 소비(게시물 아님)는 "부작용 없음"이 아니라 "게시 중복 없음"의 뜻.
+- 후보 창 ±2분은 표식 기록 시각(우리 서버 시계)과 Threads 시각의 차이가 2분을 넘으면 진짜 글도 후보로 안 보인다(확정에는 영향 없음).
+- 본문 수신 중 멈춤은 호출당 시간 제한(10초)·작업 중단 신호로 끊긴다(전송 실패로 분류) — 취소 자체가 실패하는 경우는 시험하지 않았다.

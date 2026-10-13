@@ -213,4 +213,5 @@ CHANGES_REQUESTED
 | FIX2-T21P1B | 1beee05 | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P1b 종결 |
 | DEV-LOG | 4f0bc1d | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
 | LIVE-P1 | 320dadb | CHANGES_REQUESTED — P0 1(목록 대조만으로 VERIFIED 확정), P1 2(재확인 route 연결 정보·tick 버튼 안내 범위) |
-| FIX-LIVEP1 | 1a22434 | 검토 대기 (gpt-6-astra · xhigh) |
+| FIX-LIVEP1 | 1a22434 | CHANGES_REQUESTED — P2 1(확인 후보 시간 범위가 재확인 시각 따라 넓어짐) |
+| FIX2-LIVEP1 | b8a7200 | 검토 대기 (gpt-6-astra · xhigh) |

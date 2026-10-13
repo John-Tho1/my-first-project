@@ -493,3 +493,10 @@
 - 로컬 선행 작업(P1a·P1b·P2·P3)은 Codex PASS 로 끝났지만 실제 배포는 하지 않는다. IdP·호스팅·도메인·서버 밖 백업 위치 결정과 배포 승인은 사용자가 다시 요청할 때.
 - **D35 재개 (2026-10-13)**: 사용자가 사용 위치(Anthropic 지원 지역)를 직접 확인하고 `LLM_LIVE_APPROVAL_REF` 를 다시 켰다(사용자 판단). 설정 D35 그대로(월 10 USD·1회 0.5 USD·호출 수 300).
 - **D31 2단계 결과 (2026-10-13 15:41 MSK)**: 실제 Threads OAuth 연결 **성공** — @yongho.tho, 권한 threads_basic·threads_content_publish 허락, 장기 토큰 만료 2026-12-12(자동 갱신 범위 밖 → 그 전에 재연결), 프로필 조회 1회. 게시 없음(PUBLISH_MODE disabled). 진행 중 조정: Meta 가 http://localhost redirect 를 거부("안전하지 않은 로그인 차단") → **외부 노출 없이** 로컬 HTTPS(자체 서명 인증서 `data/dev-certs`, git 제외, 30일)로 `https://localhost:3000/api/oauth/callback` 사용, dev 서버를 127.0.0.1 에만 바인드. 테스터 초대 수락 필요(오류 1349245) → 사용자 수락 후 성공. 발견: dev 로그에 콜백 query(code) 기록 → DEV-LOG 로 수정.
+
+## D38 — 실제 게시: Threads 글 1건 (2026-10-13)
+- 1단계(사용자 "실제 게시 진행해보자"): LIVE-P1(코드 320dadb) 실제 Threads 글 게시 어댑터 코드. 시험은 기록된 응답·가짜 fetch 만, 네트워크 0.
+- 2단계 승인(사용자 "본문 그대로 좋아, 진행해줘", 조건: LIVE-P1 Codex PASS 뒤): 계정 @yongho.tho, 글자만(첨부 없음), 승인 즉시 1건,
+  본문 정확히: "[테스트] Content Studio에서 보내는 첫 게시물입니다. 반복 업무 하나를 정해 AI 자동화로 줄여 보는 실험을 기록하려고 합니다."
+  공개 범위: 계정 공개 설정을 따름. PUBLISH_LIVE_MAX_POSTS=1. 삭제 API 권한 없음 → 필요 시 사용자가 Threads 앱에서 직접 삭제.
+  범위 밖: 두 번째 게시, 다른 계정·채널, 예약 게시, 이미지·링크, 배포. 끝나면 PUBLISH_LIVE_APPROVAL_REF 제거·PUBLISH_MODE=disabled 로 복귀.

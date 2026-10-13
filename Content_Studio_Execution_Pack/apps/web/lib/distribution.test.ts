@@ -16,6 +16,7 @@ import {
   instagramStepLine,
   itemHeadline,
   jobStatusText,
+  liveCandidateFromEvents,
   mockScenarioOptionsFor,
   planAccountLabel,
   planFormDefaults,
@@ -621,5 +622,29 @@ describe('T16(D29 제안) Instagram 모의 화면 문구', () => {
     expect(resultChoicesFor({ kind: 'mock', platform: 'instagram', credentialState: 'linked' })).toEqual(['mock_publish']);
     expect(mockScenarioOptionsFor('mock_instagram').every((o) => o.value === 'success' || o.value.startsWith('instagram_'))).toBe(true);
     expect(mockScenarioOptionsFor('mock_generic').some((o) => o.value.startsWith('instagram_'))).toBe(false);
+  });
+});
+
+// FIX2-LIVEP1(Codex 놓친 케이스): 확인 후보는 **가장 최근 재확인 이력**의 것만 — 나중 재확인이 0개·2개·불완전 목록이면 옛 후보를 보이지 않는다.
+describe('liveCandidateFromEvents — 최신 재확인 기준(오래된 후보 숨김)', () => {
+  const C1 = 'threads:18000000000000201';
+  const L1 = 'https://www.threads.com/@t/post/A1';
+  const ev = (eventSeq: number, details: Record<string, unknown>) => ({ eventSeq, sanitizedDetails: details });
+  const cand = (seq: number) => ev(seq, { event: 'reconcile_retry', reconcile: 'unknown', error_code: 'publish_unconfirmed_candidate', candidate_external_id: C1, candidate_permalink: L1 });
+  it('최신 재확인이 후보를 남겼으면 그 후보', () => {
+    expect(liveCandidateFromEvents([ev(1, { event: 'send_start' }), ev(2, { event: 'ambiguous' }), cand(3)])).toEqual({ externalId: C1, permalink: L1 });
+  });
+  it.each(['publish_unconfirmed_no_candidate', 'publish_unconfirmed_candidates_ambiguous', 'publish_unconfirmed_list_incomplete', 'list_unreadable'])(
+    '앞 재확인은 후보, 다음 재확인은 %s → 후보 없음',
+    (code) => {
+      expect(liveCandidateFromEvents([cand(3), ev(4, { event: 'reconcile_retry', reconcile: 'unknown', error_code: code })])).toBeNull();
+      // 순서가 섞여 와도(새 것부터) 같은 판단
+      expect(liveCandidateFromEvents([ev(4, { event: 'reconcile_unsupported', reconcile: 'unknown', error_code: code }), cand(3)])).toBeNull();
+    },
+  );
+  it('재확인이 아닌 나중 이력(예: 다른 사건)은 판단을 바꾸지 않는다, 형식 틀린 후보는 버린다', () => {
+    expect(liveCandidateFromEvents([cand(3), ev(4, { event: 'blocked' })])).toEqual({ externalId: C1, permalink: L1 });
+    expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: 'mock:threads:x' })])).toBeNull();
+    expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: C1, candidate_permalink: 'https://evil.example/x' })])).toEqual({ externalId: C1, permalink: null });
   });
 });

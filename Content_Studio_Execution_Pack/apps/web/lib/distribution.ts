@@ -667,15 +667,14 @@ export const LIVE_UNKNOWN_GUIDANCE =
  * 이 작업의 게시물이라는 증거가 아니다. 화면은 "확인 후보(미확인)"로만 보이고 결과·VERIFIED 로 쓰지 않는다. 링크는 공식 Threads 주소만.
  */
 export function liveCandidateFromEvents(events: ReadonlyArray<{ eventSeq: number; sanitizedDetails: Record<string, unknown> }>): { externalId: string; permalink: string | null } | null {
-  const sorted = [...events].sort((a, b) => b.eventSeq - a.eventSeq);
-  for (const e of sorted) {
-    const d = e.sanitizedDetails ?? {};
-    const id = d.candidate_external_id;
-    if (typeof id === 'string' && LIVE_THREADS_EXTERNAL_ID_RE.test(id)) {
-      return { externalId: id, permalink: isAllowedThreadsPermalink(d.candidate_permalink) ? d.candidate_permalink : null };
-    }
-  }
-  return null;
+  // FIX2-LIVEP1(Codex 놓친 케이스): **가장 최근 재확인 이력**(details.reconcile 이 있는 사건)만 본다 — 그 재확인이 후보를 남기지 않았으면(0개·2개·
+  // 불완전 목록·읽기 실패) 더 앞의 후보를 꺼내 보이지 않는다(낡은 후보).
+  const latest = [...events].sort((a, b) => b.eventSeq - a.eventSeq).find((e) => typeof (e.sanitizedDetails ?? {}).reconcile === 'string');
+  if (!latest) return null;
+  const d = latest.sanitizedDetails ?? {};
+  const id = d.candidate_external_id;
+  if (typeof id !== 'string' || !LIVE_THREADS_EXTERNAL_ID_RE.test(id)) return null;
+  return { externalId: id, permalink: isAllowedThreadsPermalink(d.candidate_permalink) ? d.candidate_permalink : null };
 }
 export const LIVE_CANDIDATE_LABEL = '확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)';
 

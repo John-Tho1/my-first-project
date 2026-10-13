@@ -56,7 +56,7 @@ export const LIVE_PUBLISH_POLL_INTERVAL_MS = 1500;
 export const LIVE_PUBLISH_LIST_LIMIT = 25;
 /**
  * 결과 불명 확인 후보: 게시 시도 기록 시각 앞뒤 허용(시계 차이). FIX-LIVEP1(Codex P0): 후보일 뿐 확인이 아니다 — 시도 전에 손으로 올린 같은 글을
- * 덜 고르도록 좁게(2분) 둔다.
+ * 덜 고르도록 좁게(2분) 둔다. FIX2-LIVEP1: 창 = [시도 −2분, 시도 +2분](재확인 시각과 무관).
  */
 export const LIVE_PUBLISH_MATCH_SKEW_MS = 2 * 60_000;
 /** FIX-LIVEP1(Codex 놓친 케이스 "큰 스트리밍 응답"): 응답 본문 상한(바이트) — 읽는 도중에 넘으면 읽기를 취소한다(전부 메모리에 올린 뒤 검사하지 않음) */
@@ -532,8 +532,11 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       return { status: 'unknown', error_code: 'container_published_without_attempt' };
     }
     // 결과 불명 게시 시도 — 목록은 확인 후보만 찾는다(확정 아님)
-    const since = Date.parse(attempt.created_at) - LIVE_PUBLISH_MATCH_SKEW_MS;
-    const until = ctx.now.getTime() + LIVE_PUBLISH_MATCH_SKEW_MS;
+    // FIX2-LIVEP1(Codex P2 :536): 창의 두 끝 모두 게시 시도 표식 시각에 고정한다 — [시도 −2분, 시도 +2분](경계 포함). 재확인이 늦어져도 넓어지지 않는다.
+    const attemptAt = Date.parse(attempt.created_at);
+    if (!Number.isFinite(attemptAt)) return { status: 'unknown', error_code: 'publish_attempt_time_unreadable' };
+    const since = attemptAt - LIVE_PUBLISH_MATCH_SKEW_MS;
+    const until = attemptAt + LIVE_PUBLISH_MATCH_SKEW_MS;
     let list: Record<string, unknown>;
     try {
       list = await this.#call('list', 'GET', `${THREADS_GRAPH_BASE}/${userId}/threads`, token, ctx.signal, {
@@ -555,7 +558,10 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     if (matches.length === 0) return { status: 'unknown', error_code: 'publish_unconfirmed_no_candidate' };
     if (matches.length > 1) return { status: 'unknown', error_code: 'publish_unconfirmed_candidates_ambiguous' };
     // 목록이 한 쪽에 다 들어오지 않았으면(받은 수 = limit) 다음 쪽에 같은 글이 더 있을 수 있다 — 후보 하나라고 말하지 않는다.
-    if (data.length >= this.#listLimit) return { status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' };
+    // FIX2-LIVEP1(Codex 놓친 케이스): 받은 수 < limit 이어도 paging.next 가 있으면 다음 쪽이 있다 — 불완전.
+    const paging = list.paging && typeof list.paging === 'object' ? (list.paging as Record<string, unknown>) : null;
+    const hasNext = !!paging && paging.next !== undefined && paging.next !== null && paging.next !== '';
+    if (data.length >= this.#listLimit || hasNext) return { status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' };
     const m = matches[0]!;
     const permalink = isAllowedThreadsPermalink(m.permalink) ? m.permalink : undefined;
     return {

@@ -455,19 +455,25 @@ describe('결과 불명 — 맹목 재게시 없음(AGENTS 불변식)', () => {
     const p = await planApproved([TEXT]);
     const config = fullCfg('D38-timeout-found', '2');
     expect((await execute(p.planId)).status).toBe(200);
+    // FIX2-LIVEP1(Codex P2): 목록의 게시 시각은 재확인 시계와 분리 — 게시 시도 표식 시각(DB created_at)에 고정한다. 시도 +30초의 글은 후보,
+    // 시도 +50분에 따로 올린 같은 글은(재확인이 1시간 뒤여도) 창 밖이라 후보 수에 들지 않는다.
+    let attemptAt = 0;
+    const ts = (ms: number) => new Date(ms).toISOString().replace('Z', '+0000');
     const listRoute = (ids: { ct: string; media: string }) => () =>
       jsonRes(200, {
         data: [
-          { id: ids.media, text: TEXT, timestamp: new Date(Date.now() + vt).toISOString().replace(/\.\d+Z$/, '+0000'), permalink: permalinkOf(ids.media) },
-          { id: '18000000000999999', text: '다른 글', timestamp: new Date().toISOString().replace(/\.\d+Z$/, '+0000') },
+          { id: ids.media, text: TEXT, timestamp: ts(attemptAt + 30_000), permalink: permalinkOf(ids.media) },
+          { id: '18000000000999998', text: TEXT, timestamp: ts(attemptAt + 50 * MIN), permalink: permalinkOf('18000000000999998') },
+          { id: '18000000000999999', text: '다른 글', timestamp: ts(attemptAt) },
         ],
       });
     const fx = publishFixture((ids) => ({ ...happy(TEXT)(ids), [P(ids).publish]: timeoutErr(), [P(ids).list]: listRoute(ids) }));
     const reg = registryWith(fx.fetch, config);
     expect((await tick(reg, config)).results).toEqual({ RECONCILING: 1 });
     const item = p.items[0]!;
+    attemptAt = (await stepsOf(item.id)).find((st) => st.kind === 'publish_attempt')!.createdAt.getTime();
     let last: Record<string, number> = {};
-    for (let i = 0; i < 4 && !last.UNKNOWN; i++) last = (await tick(reg, config, 20 * MIN)).results;
+    for (let i = 0; i < 4 && !last.UNKNOWN; i++) last = (await tick(reg, config, 20 * MIN)).results; // 재확인은 20·40·60분 뒤
     expect(last).toEqual({ UNKNOWN: 1 });
     expect((await itemOf(item.id)).status).toBe('UNKNOWN');
     expect(await pubsOf(item.id)).toHaveLength(0);
@@ -555,6 +561,39 @@ describe('결과 불명 — 맹목 재게시 없음(AGENTS 불변식)', () => {
     await tick(registryWith(fx.fetch, closed), closed, 11_000);
     expect(fx.calls.length).toBe(n);
     expect((await jobOf(p.items[0]!.id)).state).toBe('RECONCILING');
+  });
+});
+
+describe('FIX2-LIVEP1: 게시 성공 응답 뒤 게시 단계 저장 실패', () => {
+  it('threads_publish 성공 응답을 받았지만 게시 단계 기록이 실패 → 결과 불명(RECONCILING) → 표식만 있고 게시 기록 없음 → UNKNOWN, 재게시 0', async () => {
+    const TEXT = '게시 단계 저장 실패 시험 글.';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('D38-step-fail', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => ({ ...happy(TEXT)(ids), [P(ids).list]: () => jsonRes(200, { data: [] }) }));
+    const gate = () => livePublishReadiness(config);
+    /** 게시(publish) 단계 기록만 실패시키는 어댑터(작업 처리기의 단계 창구를 감싼다) — 그 밖은 실제 어댑터 그대로 */
+    class FailPublishStep extends LiveThreadsPublishAdapter {
+      override submit(prepared: Parameters<LiveThreadsPublishAdapter['submit']>[0], ctx: Parameters<LiveThreadsPublishAdapter['submit']>[1]) {
+        const steps = ctx.steps!;
+        return super.submit(prepared, {
+          ...ctx,
+          steps: { list: () => steps.list(), record: (st) => (st.kind === 'publish' ? Promise.reject(new Error('db down')) : steps.record(st)) },
+        });
+      }
+    }
+    const reg = new LiveCapableAdapterRegistry(createMockAdapterRegistry(), new FailPublishStep({ gate, fetch: fx.fetch, pollIntervalMs: 0 }), gate);
+    expect((await tick(reg, config)).results).toEqual({ RECONCILING: 1 });
+    const item = p.items[0]!;
+    expect((await stepsOf(item.id)).map((st) => st.kind)).toEqual(['container', 'publish_attempt']);
+    // (앞 시험이 남긴 다른 계획의 조회 작업도 같은 tick 에서 처리될 수 있어 항목 상태로 판단한다)
+    for (let i = 0; i < 4 && (await itemOf(item.id)).status !== 'UNKNOWN'; i++) await tick(reg, config, 20 * MIN);
+    expect((await itemOf(item.id)).status).toBe('UNKNOWN');
+    expect(await pubsOf(item.id)).toHaveLength(0);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    // 재시도도 막힌다(결과 불명) — 다시 게시하지 않는다
+    expect((await retryPOST(post(`/api/distribution-items/${item.id}/retry`), ctx(item.id))).status).toBe(409);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
   });
 });
 

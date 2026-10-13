@@ -25,6 +25,7 @@ import {
   classifyLivePublishError,
   LiveThreadsApiError,
   LiveThreadsPublishAdapter,
+  MAX_RESPONSE_BYTES,
   normalizeThreadsText,
   parseThreadsTimestamp,
   THREADS_GRAPH_BASE,
@@ -442,6 +443,50 @@ describe('게시(threads_publish) 중·뒤 결과 불명 — 다시 게시하지
     expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' });
   });
 
+  // FIX2-LIVEP1(Codex P2 :536): 후보 창은 게시 시도 표식 시각(created_at = NOW) ±2분에 고정 — 재확인이 늦어져도 넓어지지 않는다.
+  const reconcileLate = async (body: Record<string, unknown>, nowOffsetMs: number) => {
+    const fx = adapterWith({ ...happyRoutes(), [P.publish]: timeoutErr(), [P.list]: ok(body) });
+    const steps = memSteps();
+    const c = ctxOf(steps);
+    await fx.a.submit(await fx.a.prepare(snapshot(), c), c);
+    expect(steps.rows.find((s) => s.kind === 'publish_attempt')!.created_at).toBe(NOW.toISOString());
+    const rc = await fx.a.reconcile({ platform: 'threads', intent_key: 'job-1:1', external_id: null, provider_request_id: null }, ctxOf(steps, { now: new Date(NOW.getTime() + nowOffsetMs) }));
+    return { rc: rc as unknown as Record<string, unknown>, steps };
+  };
+  const at = (ms: number) => new Date(NOW.getTime() + ms).toISOString().replace('Z', '+0000');
+  const one = (ts: string) => ({ data: [{ id: MEDIA, text: TEXT, timestamp: ts, permalink: PERMALINK }] });
+  const MIN2 = 2 * 60_000;
+
+  it('Codex 재현(FIX2): 60분 뒤 재확인, 같은 글이 시도 +50분에 올라옴 → 후보 아님(창이 재확인 시각으로 넓어지지 않음)', async () => {
+    const { rc, steps } = await reconcileLate(one(at(50 * 60_000)), 60 * 60_000);
+    noProof(rc, steps);
+    expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_no_candidate' });
+  });
+
+  it.each<[string, number, boolean]>([
+    ['정확히 시도 +2분(경계 포함)', MIN2, true],
+    ['정확히 시도 −2분(경계 포함)', -MIN2, true],
+    ['시도 +2분 +1ms(밖)', MIN2 + 1, false],
+    ['시도 −2분 −1ms(밖)', -MIN2 - 1, false],
+  ])('후보 창 경계(60분 뒤 재확인): %s → 후보 %s', async (_, offset, isCandidate) => {
+    const { rc, steps } = await reconcileLate(one(at(offset)), 60 * 60_000);
+    noProof(rc, steps);
+    expect(rc).toEqual(
+      isCandidate
+        ? { status: 'unknown', error_code: 'publish_unconfirmed_candidate', candidate: { external_id: `threads:${MEDIA}`, permalink: PERMALINK } }
+        : { status: 'unknown', error_code: 'publish_unconfirmed_no_candidate' },
+    );
+  });
+
+  it('Codex 놓친 케이스(FIX2): 받은 수 < limit 이어도 paging.next 가 있으면 목록 불완전 → 후보 없음', async () => {
+    const { rc, steps } = await reconcileLate({ ...one(at(1000)), paging: { cursors: { before: 'a', after: 'b' }, next: 'https://graph.threads.net/v1.0/x/threads?after=b' } }, 60_000);
+    noProof(rc, steps);
+    expect(rc).toEqual({ status: 'unknown', error_code: 'publish_unconfirmed_list_incomplete' });
+    // next 없이 cursors 만 있으면(문서 예시 모양) 받은 수 < limit 이면 완전한 목록으로 본다
+    const ok2 = await reconcileLate({ ...one(at(1000)), paging: { cursors: { before: 'a', after: 'b' } } }, 60_000);
+    expect(ok2.rc.error_code).toBe('publish_unconfirmed_candidate');
+  });
+
   it.each<[string, Array<Record<string, unknown>>, string]>([
     ['맞는 글 없음', [{ id: '18000000000000999', text: '다른 글', timestamp: '2026-10-13T12:00:01+0000' }], 'publish_unconfirmed_no_candidate'],
     [
@@ -600,6 +645,45 @@ describe('FIX-LIVEP1: 동시 실행·큰 응답', () => {
     const declared = adapterWith({ [P.create]: () => new Response('{}', { status: 200, headers: { 'content-length': String(10 * 1024 * 1024) } }) });
     const c2 = ctxOf(memSteps());
     expect(await declared.a.submit(await declared.a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect' });
+  });
+});
+
+describe('FIX2-LIVEP1: 응답 크기 경계·조각 경계의 UTF-8', () => {
+  const sized = (n: number) => {
+    // 정확히 n 바이트인 JSON({ id, pad }) — 컨테이너 생성 응답
+    const head = `{"id":"${CT}","pad":"`;
+    const tail = '"}';
+    return head + 'x'.repeat(n - head.length - tail.length) + tail;
+  };
+  const chunked = (bytes: Uint8Array, size: number) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(ctl) {
+          for (let i = 0; i < bytes.length; i += size) ctl.enqueue(bytes.slice(i, i + size));
+          ctl.close();
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  it('정확히 512 KiB 응답은 받는다, 1바이트 넘으면 거부(조각으로 와도)', async () => {
+    const exact = new TextEncoder().encode(sized(MAX_RESPONSE_BYTES));
+    expect(exact.length).toBe(512 * 1024);
+    const a1 = adapterWith({ ...happyRoutes(), [P.create]: () => chunked(exact, 64 * 1024) });
+    const s1 = memSteps();
+    const c1 = ctxOf(s1);
+    expect(await a1.a.submit(await a1.a.prepare(snapshot(), c1), c1)).toMatchObject({ status: 'accepted', external_id: `threads:${MEDIA}` });
+    const over = new TextEncoder().encode(sized(MAX_RESPONSE_BYTES + 1));
+    const a2 = adapterWith({ ...happyRoutes(), [P.create]: () => chunked(over, 64 * 1024) });
+    const s2 = memSteps();
+    const c2 = ctxOf(s2);
+    expect(await a2.a.submit(await a2.a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'rejected', retry_class: 'transient_no_side_effect' });
+    expect(s2.rows).toEqual([]);
+  });
+  it('한국어(3바이트) 문자가 조각 경계에서 잘려 와도 그대로 읽는다(읽기 확인 VERIFIED)', async () => {
+    const body = new TextEncoder().encode(JSON.stringify({ id: MEDIA, permalink: PERMALINK, text: TEXT, timestamp: '2026-10-13T12:00:05+0000' }));
+    const { a } = adapterWith({ ...happyRoutes(), [P.read]: () => chunked(body, 7) }); // 7바이트 조각 — 3바이트 문자가 여러 번 잘린다
+    const c = ctxOf(memSteps());
+    expect(await a.submit(await a.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted', verified: true, permalink: PERMALINK });
   });
 });
 

@@ -112,7 +112,32 @@ cat >"$STUB_BIN/flock" <<'EOF'
 [[ "${STUB_FLOCK_HELD:-0}" == 1 ]] && exit 1
 exit 0
 EOF
-chmod +x "$STUB_BIN"/chown "$STUB_BIN"/install "$STUB_BIN"/flock
+# FIX5-T21P2: 가짜 tar — `-czf <출력>` 의 출력 경로가 STUB_TAR_BAD_OUT_GLOB 과 맞으면 진짜 tar 로 **형식은 맞지만 검사를 통과하지 못하는**
+# 사본(data/ 밖 항목 other/x)을 대신 만든다(사본 검사가 실제로 실행되고 실패하면 멈추는지 확인용). 그 밖은 진짜 tar.
+export REAL_TAR="$(command -v tar)"
+cat >"$STUB_BIN/tar" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${STUB_TAR_BAD_OUT_GLOB:-}" ]]; then
+  prev=""
+  for a in "$@"; do
+    # shellcheck disable=SC2053
+    if [[ "$prev" == "-czf" && "$a" == $STUB_TAR_BAD_OUT_GLOB ]]; then
+      d="$(mktemp -d)"
+      mkdir -p "$d/data" "$d/other"
+      echo x >"$d/other/x"
+      "$REAL_TAR" -C "$d" -czf "$a" data other
+      rc=$?
+      rm -rf "$d"
+      exit "$rc"
+    fi
+    prev="$a"
+  done
+fi
+exec "$REAL_TAR" "$@"
+EOF
+chmod +x "$STUB_BIN"/chown "$STUB_BIN"/install "$STUB_BIN"/flock "$STUB_BIN"/tar
+# FIX5-T21P2: 시험 경로는 이 임시 루트 아래만 허용된다(lib/common.sh cs_path). 정규 경로로 내보낸다.
+export CS_HARNESS_ROOT="$(realpath -e "$T_ROOT")"
 # 마운트 정보 기본 fixture: 루트 하나만(시험이 하위 마운트를 넣을 때는 CS_MOUNTINFO 로 다른 파일)
 MOUNTINFO_DEFAULT="$T_ROOT/mountinfo"
 echo "1 0 8:1 / / rw - ext4 /dev/sda1 rw" >"$MOUNTINFO_DEFAULT"

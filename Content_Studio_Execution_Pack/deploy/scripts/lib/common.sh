@@ -93,20 +93,27 @@ is_mountpoint() {
 
 # ---- FIX4-T21P2: 낯선 것은 처리하지 않고 바꾸기 전에 거부(fail closed) ----
 
-# cs_path <변수 이름> <운영 기본값> — 경로용 cs_opt. 시험 실행에서는 변수가 **반드시** 주어져야 하고 운영 경로(/srv/content-studio*,
-# /etc/content-studio, /run)이면 거부한다 — 시험이 운영 기본값으로 떨어지거나 운영 경로를 가리키지 않게(Codex review-FIX3-T21P2 P0 tests/lib.sh:7).
+# cs_path <변수 이름> <운영 기본값> — 경로용 cs_opt. 운영 실행에서는 기본값. 시험 실행에서는(FIX5-T21P2 Codex P1 common.sh:101)
+#  - 변수가 반드시 주어져야 하고, 절대 경로이며, `..` 칸이 없어야 하고,
+#  - 정규 경로(realpath -m — 기존 심볼릭 링크를 모두 해석)가 시험 임시 루트(CS_HARNESS_ROOT — tests/lib.sh 가 만든 정규 경로, 시스템 임시 폴더 아래)
+#    **아래**여야 한다. 그래서 `/tmp/../srv/…`·상대 경로·중간 링크로 밖(운영 경로 포함)을 가리키는 경로는 모두 거부된다.
+#  돌려주는 값은 검사를 통과한 **원래 값**이다 — 정규 경로를 돌려주면 데이터 루트·데이터 폴더 자체가 링크인지(이후 단계의 -L 거부)를 가리게 된다.
 cs_path() {
-  if cs_test_mode; then
-    [[ -n "${!1:-}" ]] || die "시험 실행에서는 $1 을(를) 시험 경로로 주어야 합니다(운영 기본값으로 떨어지지 않음)"
-    case "${!1}" in
-      /srv/content-studio | /srv/content-studio/* | /srv/content-studio-backup | /srv/content-studio-backup/* | /etc/content-studio | /etc/content-studio/* | /run | /run/*)
-        die "시험 실행에서 $1 이(가) 운영 경로입니다 — 진행하지 않습니다"
-        ;;
-    esac
-    printf '%s' "${!1}"
-  else
+  if ! cs_test_mode; then
     printf '%s' "$2"
+    return 0
   fi
+  local v="${!1:-}" root tmp canon
+  [[ -n "$v" ]] || die "시험 실행에서는 $1 을(를) 시험 경로로 주어야 합니다(운영 기본값으로 떨어지지 않음)"
+  [[ "$v" == /* ]] || die "시험 실행에서 $1 은(는) 절대 경로여야 합니다"
+  [[ "/$v/" != */../* ]] || die "시험 실행에서 $1 에 .. 가 있습니다"
+  [[ -n "${CS_HARNESS_ROOT:-}" ]] || die "시험 실행인데 CS_HARNESS_ROOT(시험 임시 루트)가 없습니다 — $1 을(를) 확인할 수 없어 진행하지 않습니다"
+  root="$(realpath -e -- "$CS_HARNESS_ROOT")" || die "CS_HARNESS_ROOT 를 해석하지 못했습니다"
+  tmp="$(realpath -e -- "${TMPDIR:-/tmp}")" || die "시스템 임시 폴더를 해석하지 못했습니다"
+  [[ "$root" == "$tmp"/* ]] || die "CS_HARNESS_ROOT 가 시스템 임시 폴더 아래가 아닙니다"
+  canon="$(realpath -m -- "$v")" || die "$1 을(를) 해석하지 못했습니다"
+  [[ "$canon" == "$root"/* ]] || die "시험 실행에서 $1 의 실제 위치가 시험 임시 루트 밖입니다(운영 경로 금지) — 진행하지 않습니다"
+  printf '%s' "$v"
 }
 
 # make_backup_dir <dir> — root 700 폴더
@@ -147,6 +154,41 @@ refuse_if_must_be_mount_but_not() {
   is_mountpoint "$2" || die "데이터 폴더는 마운트여야 하는데(.data-must-be-mount) 지금 마운트가 아닙니다: $2 — 볼륨을 먼저 마운트하세요"
 }
 
+# validate_archive <사본.tar.gz> — 들어오는 사본·직전 사본·새로 쓴 백업 사본이 모두 통과해야 하는 검사(FIX3~5). 실패하면 die.
+#  항목 이름: 역슬래시(tar 는 줄바꿈·제어 문자를 역슬래시 이스케이프로 보여 준다)·제어 문자·UTF-8 이 아닌 바이트 거부. 이런 이름이 없으면 두 목록이
+#  항목당 정확히 한 줄이라 줄 번호로 맞춰 볼 수 있다. 항목 형식은 일반 파일·폴더만, 경로는 data/ 아래(빈 칸·.·.. 거부), 최상위 data 는 폴더.
+validate_archive() {
+  local archive="$1" names types i ty n c has_top
+  local -a NAMES TYPES parts
+  names="$(tar --quoting-style=escape -tzf "$archive")" || die "사본을 읽지 못했습니다: $archive"
+  types="$(tar --quoting-style=escape -tvzf "$archive" | cut -c1)" || die "사본 목록(형식)을 읽지 못했습니다: $archive"
+  [[ -n "$names" ]] || die "사본이 비어 있습니다"
+  # 이름 제한: 역슬래시(줄바꿈·제어 문자는 tar 가 \n·\ooo 로 이스케이프한다)·제어 문자·UTF-8 이 아닌 바이트가 있으면 거부.
+  # 이런 이름이 없으면 두 목록 모두 항목당 정확히 한 줄이라 줄 번호로 맞춰 볼 수 있다.
+  [[ "$names" != *\\* ]] || die "사본 항목 이름에 줄바꿈·제어 문자·역슬래시가 있습니다 — 지원하지 않습니다"
+  if LC_ALL=C grep -q "[[:cntrl:]]" <<<"$names"; then die "사본 항목 이름에 제어 문자가 있습니다 — 지원하지 않습니다"; fi
+  iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 <<<"$names" || die "사본 항목 이름이 UTF-8 이 아닙니다 — 지원하지 않습니다"
+  mapfile -t NAMES <<<"$names"
+  mapfile -t TYPES <<<"$types"
+  [[ "${#NAMES[@]}" -eq "${#TYPES[@]}" ]] || die "사본 목록을 해석하지 못했습니다(항목 수 불일치)"
+  has_top=0
+  for i in "${!NAMES[@]}"; do
+    ty="${TYPES[$i]}"
+    [[ "$ty" == "-" || "$ty" == "d" ]] || die "사본에 일반 파일·폴더가 아닌 항목(형식 '$ty')이 있습니다 — 링크·하드링크·장치 등은 복원하지 않습니다"
+    n="${NAMES[$i]%/}"
+    [[ "$n" == data || "$n" == data/* ]] || die "사본에 data/ 밖 경로가 있습니다"
+    IFS=/ read -r -a parts <<<"$n"
+    for c in "${parts[@]}"; do
+      [[ -n "$c" && "$c" != "." && "$c" != ".." ]] || die "사본에 허용하지 않는 경로(빈 칸·. 또는 ..)가 있습니다"
+    done
+    if [[ "$n" == data ]]; then
+      [[ "$ty" == d ]] || die "사본 최상위 data 가 폴더가 아닙니다"
+      has_top=1
+    fi
+  done
+  [[ "$has_top" -eq 1 ]] || die "사본에 최상위 data 폴더 항목이 없습니다"
+}
+
 # refuse_special_tree <dir> — 일반 파일·폴더 밖의 항목(심볼릭 링크·소켓·FIFO·장치)이나 하드링크(링크 수 > 1)인 파일이 있으면 거부.
 # backup-data(만들기 전)와 restore-data(풀고 난 뒤)가 같은 기준을 쓴다 — 백업이 만든 사본은 복원이 받아들인다.
 refuse_special_tree() {
@@ -155,6 +197,16 @@ refuse_special_tree() {
   [[ -z "$odd" ]] || die "일반 파일·폴더가 아닌 항목(심볼릭 링크·소켓·FIFO·장치)이 있습니다 — 지원하지 않습니다"
   odd="$(find "$1" -type f -links +1 -print -quit)" || die "폴더를 검사하지 못했습니다: $1"
   [[ -z "$odd" ]] || die "하드링크(링크 수 > 1)인 파일이 있습니다 — 지원하지 않습니다"
+}
+
+# validate_tree <dir> — 폴더 쪽 검사(backup 은 만들기 전, restore 는 지금 데이터와 풀고 난 임시 폴더에): 특수 항목·하드링크(refuse_special_tree) +
+# validate_archive 와 같은 이름 규칙(역슬래시·제어 문자(줄바꿈 포함)·UTF-8 이 아닌 바이트 거부). 실패하면 die. (FIX5-T21P2 Codex P0 :89 · P1 :31)
+validate_tree() {
+  local odd
+  refuse_special_tree "$1"
+  odd="$(find "$1" \( -name '*\\*' -o -name "*[[:cntrl:]]*" \) -print -quit)" || die "폴더를 검사하지 못했습니다: $1"
+  [[ -z "$odd" ]] || die "항목 이름에 줄바꿈·제어 문자·역슬래시가 있습니다 — 지원하지 않습니다"
+  find "$1" -print | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "항목 이름이 UTF-8 이 아닙니다 — 지원하지 않습니다"
 }
 
 # apply_owner_perms <dir> <owner> — 소유자(-R --no-dereference)·폴더 700·파일 600 을 적용하고, 소유자를 확인한다. 실패하면 1.

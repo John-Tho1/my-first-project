@@ -40,40 +40,17 @@ DATA="$DATA_PARENT/data"
 [[ ! -L "$DATA" ]] || die "데이터 폴더가 심볼릭 링크입니다: $DATA — 실제 폴더(또는 마운트 지점)만 지원합니다"
 refuse_if_must_be_mount_but_not "$DATA_PARENT" "$DATA"
 
-# ---- 1. 사본 목록 검사(아무것도 바꾸기 전) ----
-names="$(tar --quoting-style=escape -tzf "$ARCHIVE")" || die "사본을 읽지 못했습니다: $ARCHIVE"
-types="$(tar --quoting-style=escape -tvzf "$ARCHIVE" | cut -c1)" || die "사본 목록(형식)을 읽지 못했습니다: $ARCHIVE"
-[[ -n "$names" ]] || die "사본이 비어 있습니다"
-# 이름 제한: 역슬래시(줄바꿈·제어 문자는 tar 가 \n·\ooo 로 이스케이프한다)·제어 문자·UTF-8 이 아닌 바이트가 있으면 거부.
-# 이런 이름이 없으면 두 목록 모두 항목당 정확히 한 줄이라 줄 번호로 맞춰 볼 수 있다.
-[[ "$names" != *\\* ]] || die "사본 항목 이름에 줄바꿈·제어 문자·역슬래시가 있습니다 — 지원하지 않습니다"
-if LC_ALL=C grep -q "[[:cntrl:]]" <<<"$names"; then die "사본 항목 이름에 제어 문자가 있습니다 — 지원하지 않습니다"; fi
-iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 <<<"$names" || die "사본 항목 이름이 UTF-8 이 아닙니다 — 지원하지 않습니다"
-mapfile -t NAMES <<<"$names"
-mapfile -t TYPES <<<"$types"
-[[ "${#NAMES[@]}" -eq "${#TYPES[@]}" ]] || die "사본 목록을 해석하지 못했습니다(항목 수 불일치)"
-has_top=0
-for i in "${!NAMES[@]}"; do
-  ty="${TYPES[$i]}"
-  [[ "$ty" == "-" || "$ty" == "d" ]] || die "사본에 일반 파일·폴더가 아닌 항목(형식 '$ty')이 있습니다 — 링크·하드링크·장치 등은 복원하지 않습니다"
-  n="${NAMES[$i]%/}"
-  [[ "$n" == data || "$n" == data/* ]] || die "사본에 data/ 밖 경로가 있습니다"
-  IFS=/ read -r -a parts <<<"$n"
-  for c in "${parts[@]}"; do
-    [[ -n "$c" && "$c" != "." && "$c" != ".." ]] || die "사본에 허용하지 않는 경로(빈 칸·. 또는 ..)가 있습니다"
-  done
-  if [[ "$n" == data ]]; then
-    [[ "$ty" == d ]] || die "사본 최상위 data 가 폴더가 아닙니다"
-    has_top=1
-  fi
-done
-[[ "$has_top" -eq 1 ]] || die "사본에 최상위 data 폴더 항목이 없습니다"
+# ---- 1. 사본 목록 검사(아무것도 바꾸기 전, lib/common.sh validate_archive — backup-data 와 같은 검사) ----
+validate_archive "$ARCHIVE"
 
 # ---- 방식 결정·하위 마운트 ----
 if [[ -e "$DATA" ]]; then
   [[ -d "$DATA" ]] || die "데이터 경로가 폴더가 아닙니다: $DATA"
   [[ "$MISSING_OK" -eq 0 ]] || die "데이터 폴더가 있습니다 — --data-missing-ok 없이 실행하세요"
   refuse_submounts "$DATA"
+  # FIX5-T21P2(Codex P0 :89): 지금 데이터도 같은 검사(특수 항목·하드링크·이름 규칙)를 통과해야 한다 — 통과하지 못하면 직전 사본으로
+  # 되돌릴 수 없거나(복구가 그 사본을 거부) 소유자 재적용이 하드링크로 밖의 파일을 바꿀 수 있으므로, 아무것도 바꾸기 전에 거부.
+  validate_tree "$DATA"
   if is_mountpoint "$DATA"; then MODE=mountpoint; else MODE=directory; fi
 else
   [[ "$MISSING_OK" -eq 1 ]] || die "데이터 폴더가 없습니다: $DATA — 이전 복원이 중단돼 폴더가 없는 상태라면 --data-missing-ok 로 다시 실행하세요(deploy/README_KO.md §8)"
@@ -90,7 +67,11 @@ if [[ "$MODE" != missing ]]; then
   [[ "$(realpath -e -- "$BEFORE")" != "$ARCHIVE_REAL" ]] || die "직전 사본 경로가 입력 사본과 같습니다 — 진행하지 않습니다"
   tar -C "$DATA_PARENT" --exclude='data/.restore-stage.*' --exclude='data/.restore-rollback.*' -czf "$BEFORE" data
   chmod 600 -- "$BEFORE"
-  tar -tzf "$BEFORE" >/dev/null || die "직전 사본을 다시 읽지 못했습니다: $BEFORE"
+  # FIX5-T21P2(Codex P0 :89): 직전 사본도 들어오는 사본과 **같은 검사**를 통과해야 교체를 시작한다(자동 복구가 그 사본을 쓸 수 있게).
+  if ! (validate_archive "$BEFORE"); then
+    rm -f -- "$BEFORE"
+    die "직전 사본이 사본 검사를 통과하지 못했습니다 — 되돌릴 수 없으므로 아무것도 바꾸지 않았습니다"
+  fi
 fi
 
 # ---- 3. 같은 파일 시스템의 임시 폴더에 풀고 다시 확인 ----
@@ -111,7 +92,7 @@ unpack_verified() {
   [[ -d "$root/data" && ! -L "$root/data" ]] || return 1
   top="$(find "$root" -mindepth 1 -maxdepth 1 ! -name data -print -quit)" || return 1
   [[ -z "$top" ]] || return 1
-  (refuse_special_tree "$root/data") || return 1
+  (validate_tree "$root/data") || return 1
   apply_owner_perms "$root/data" "$OWNER"
 }
 unpack_verified "$ARCHIVE" "$STAGE" || die "사본을 풀어 확인하지 못했습니다(특수 항목·구조·소유자 적용 실패) — 데이터는 바꾸지 않았습니다"

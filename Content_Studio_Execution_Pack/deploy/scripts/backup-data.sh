@@ -3,7 +3,8 @@
 # 사용(root, 서비스를 멈춘 뒤): sudo bash <앱 루트>/deploy/scripts/backup-data.sh <지금 배포된 SHA>
 # PGlite 폴더는 서버가 멈춘 상태에서만 일관된 사본이 된다. 사본은 root 전용(700 폴더, 600 파일). 서버 밖으로 옮기는 일은 사용자 몫(T21-P4).
 # 이 스크립트는 데이터 폴더를 옮기거나(mv) 지우지 않는다.
-# FIX4: restore-data.sh 가 받아들이는 형식만 만든다 — 데이터 안에 링크·하드링크·특수 파일·하위 마운트가 있으면 사본을 만들기 전에 실패.
+# FIX4·5: restore-data.sh 가 받아들이는 형식만 만든다 — 데이터 안에 링크·하드링크·특수 파일·하위 마운트·허용하지 않는 이름이 있으면 사본을 만들기 전에 실패,
+# 쓴 사본도 restore-data 와 같은 사본 검사(lib/common.sh validate_archive)를 통과해야 성공.
 set -euo pipefail
 umask 077
 CS_SCRIPT_TAG=backup-data
@@ -24,13 +25,18 @@ DATA="$DATA_PARENT/data"
 [[ -d "$DATA" ]] || die "데이터 폴더가 없습니다: $DATA"
 refuse_if_must_be_mount_but_not "$DATA_PARENT" "$DATA"
 refuse_submounts "$DATA"
-refuse_special_tree "$DATA"
+validate_tree "$DATA" # FIX5: restore-data 와 같은 검사(특수 항목·하드링크·이름 규칙)
 
 make_backup_dir "$BACKUP_DIR"
 OUT="$(mktemp --suffix=.tar.gz "$BACKUP_DIR/data-$(date -u +%Y%m%dT%H%M%SZ)-$LABEL.XXXXXX")" || die "사본 파일을 만들지 못했습니다"
-if ! tar -C "$DATA_PARENT" --exclude='data/.restore-stage.*' --exclude='data/.restore-rollback.*' -czf "$OUT" data || ! tar -tzf "$OUT" >/dev/null; then
+if ! tar -C "$DATA_PARENT" --exclude='data/.restore-stage.*' --exclude='data/.restore-rollback.*' -czf "$OUT" data; then
   rm -f -- "$OUT"
   die "사본을 만들지 못했습니다"
+fi
+# FIX5-T21P2(Codex P1 :31): 쓴 사본이 restore-data 의 사본 검사(같은 함수)를 통과해야 성공 — 아니면 지우고 실패
+if ! (validate_archive "$OUT"); then
+  rm -f -- "$OUT"
+  die "만든 사본이 복원 검사를 통과하지 못해 지웠습니다 — 백업 실패"
 fi
 chmod 600 -- "$OUT"
 echo "[backup-data] OK $OUT"

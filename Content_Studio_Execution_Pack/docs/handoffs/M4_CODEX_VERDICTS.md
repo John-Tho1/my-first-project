@@ -208,4 +208,4 @@ CHANGES_REQUESTED
 | FIX3-T21P2 | 4e3490a | CHANGES_REQUESTED — P0 2(root 시험이 운영 데이터 접근 가능·하위 마운트 삭제), P1 2(마운트 복구 소유자 미복원·백업과 복원 형식 불일치) |
 | FIX4-T21P2 | 47917f3 | CHANGES_REQUESTED — P0 1(현재 데이터·직전 사본 검증 없이 교체 시작), P1 2(백업 이름 검사 불일치·시험 경로 정규화) |
 | FIX5-T21P2 | e1025ba | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P2 종결 |
-| T21-P1b | af9860c | 대기 |
+| T21-P1b | af9860c | CHANGES_REQUESTED — P1 2(본문 전송 실패를 검증 실패로 집계·discovery 갱신이 진행 중 허용 호스트 제거), P2 3(결합 쿠키 삭제·state 상한 직렬화·미설정 로그 안내) |

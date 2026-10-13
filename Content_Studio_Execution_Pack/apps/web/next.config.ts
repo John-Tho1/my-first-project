@@ -22,6 +22,9 @@ const nextConfig: NextConfig = {
   // M3 화면 FIX(D9): 재시작·build 뒤 dev 서버가 동적·하위 경로를 404 로 돌려준 일(3회)이 Turbopack dev 파일 캐시(.next/dev·.next/cache)를
   // 지우면 사라졌다 — dev 파일 시스템 캐시를 끈다(첫 컴파일이 조금 느려질 수 있음). production build 에는 영향 없음.
   experimental: { turbopackFileSystemCacheForDev: false },
+  // D31 2단계 확인 중 발견: next dev 가 요청 줄을 로그에 쓰면서 OAuth/OIDC 콜백의 query(인가 code·state)까지 남겼다.
+  // 비밀·일회용 값이 로그에 남지 않게 콜백 경로는 요청 로그에서 뺀다(next start 는 요청 줄을 쓰지 않음).
+  logging: { incomingRequests: { ignore: [/\/api\/oauth\//, /\/api\/auth\/oidc\//] } },
 };
 
 export default nextConfig;

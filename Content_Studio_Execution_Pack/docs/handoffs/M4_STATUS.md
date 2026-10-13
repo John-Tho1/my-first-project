@@ -151,3 +151,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Threads 실제 연결 성공(@yongho.tho, 만료 2026-12-12, 게시 없음). 로컬 HTTPS(`content-studio-dev-https`, 127.0.0.1 바인드)로 전환 — Meta 가 http redirect 거부.
 - D35 재개(사용자가 지원 지역 확인). D36(오래된 예약 60분) 확정. D37 운영 배포 대기.
 - DEV-LOG(콜백 query 로그 제외) 4f0bc1d **Codex PASS**.
+- LIVE-P1(D38 1단계 — 실제 Threads 글 게시 어댑터, fixture 시험만): 320dadb → FIX1 1a22434 → **FIX2 b8a7200 Codex PASS**. 검사 unit 1630·integration 895 PASS. migration 0044 로컬 적용(백업 data/pglite.bak-20261013-pre0044). 남은 위험: 결과 불명 게시는 항상 UNKNOWN(사용자 확인), GET 질의 토큰의 앱 밖 기록 미검증, Postgres 독립 연결 동시성 미검증, 화면은 브라우저 미확인(2단계 때 확인).

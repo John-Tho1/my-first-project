@@ -500,3 +500,5 @@
   본문 정확히: "[테스트] Content Studio에서 보내는 첫 게시물입니다. 반복 업무 하나를 정해 AI 자동화로 줄여 보는 실험을 기록하려고 합니다."
   공개 범위: 계정 공개 설정을 따름. PUBLISH_LIVE_MAX_POSTS=1. 삭제 API 권한 없음 → 필요 시 사용자가 Threads 앱에서 직접 삭제.
   범위 밖: 두 번째 게시, 다른 계정·채널, 예약 게시, 이미지·링크, 배포. 끝나면 PUBLISH_LIVE_APPROVAL_REF 제거·PUBLISH_MODE=disabled 로 복귀.
+- **D38 1단계 결과 (2026-10-13 20:06 MSK)**: LIVE-P1 320dadb → FIX 1a22434 → **FIX2 b8a7200 Codex PASS**(gpt-6-astra · xhigh). 검사 unit 1630·integration 895·drill:mock 위반 0 PASS. 오케스트레이터가 `./data/pglite` 백업(`data/pglite.bak-20261013-pre0044`) 뒤 `db:migrate`(0044) 적용, `drill:restore` PASS. 실제 게시·외부 호출 없음(PUBLISH_MODE disabled 그대로).
+- 2단계 준비 값(사용자가 `.env.local` 에 직접): `PUBLISH_MODE=enabled`, `PUBLISH_LIVE_APPROVAL_REF=D38`, `PUBLISH_LIVE_MAX_POSTS=1`. 결과 불명이면 자동 재게시 없이 UNKNOWN — Threads 에서 직접 확인.

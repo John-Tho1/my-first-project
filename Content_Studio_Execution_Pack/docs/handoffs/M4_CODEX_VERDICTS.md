@@ -212,4 +212,5 @@ CHANGES_REQUESTED
 | FIX-T21P1B | e75fa0c | CHANGES_REQUESTED — P2 2(늦은 callback 응답이 새 흐름 결합 쿠키 삭제·timeout 뒤 도착 응답 본문 미취소) |
 | FIX2-T21P1B | 1beee05 | **PASS** — 지적 없음(gpt-6-astra · xhigh). T21-P1b 종결 |
 | DEV-LOG | 4f0bc1d | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
-| LIVE-P1 | 320dadb | 검토 대기 (gpt-6-astra · xhigh) |
+| LIVE-P1 | 320dadb | CHANGES_REQUESTED — P0 1(목록 대조만으로 VERIFIED 확정), P1 2(재확인 route 연결 정보·tick 버튼 안내 범위) |
+| FIX-LIVEP1 | 1a22434 | 검토 대기 (gpt-6-astra · xhigh) |

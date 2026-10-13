@@ -2,7 +2,7 @@
 - Task ID / milestone: LIVE-P1 / M4 후속 — 사용자 "실제 게시 진행해보자"(D38). 1단계 = 실제 Threads 텍스트 게시 어댑터·게이트·DB·화면을 만들고 **기록된 응답(fixture)·주입 fetch 로만** 시험. 2단계(실제 1건 게시)는 별도 정확 범위 승인 대상 — 이 작업에서 하지 않음.
 - Purpose and changed behavior: 실제 계정 + Threads + 연결 정보가 있는 항목을 모든 게이트가 열렸을 때만 실제 Threads 텍스트 게시 어댑터(`live_threads`)로 보낸다(컨테이너 → 상태 FINISHED → 게시 시도 표식 → threads_publish → 원격 읽기 확인). 기본 설정(PUBLISH_MODE disabled·승인 기록 없음)에서는 실제 게시 경로가 열리지 않는다. 모의 계정 동작은 그대로.
 - BASE_SHA: a50ee58
-- HEAD_SHA: 320dadb20609c21e3a330b4a51847637bb07fb47
+- HEAD_SHA: 320dadb20609c21e3a330b4a51847637bb07fb47 (LIVE-P1) · FIX-LIVEP1 HEAD 1a224348f4e720aadc2476a736513506c9d20deb
 - Clean tracked tree confirmed: 시작 시 yes(`?? .claude/` 만). 이 작업의 변경 외 추적 파일 변경 없음.
 - Relevant acceptance IDs: AGENTS Invariants(정확한 payload·계정·공개 범위 승인 없이 게시 금지, 편집 → 승인 무효, 결과 불명 → 조회 또는 UNKNOWN·맹목 재전송 금지, 모의 성공 ≠ 실제 게시, 비밀은 서버만), docs/03(승인 스냅샷·중복·재시도·ChannelAdapter 계약·VERIFIED 정의), A08·A10·A11·A20, D24·D26·D30·D31·D36.
 - External calls performed: **none**. 코드·시험 어디에서도 Threads/Meta 로 요청하지 않았다(어댑터 시험·통합 시험은 주입 fetch, 전역 fetch 는 막고 0회 확인 + setupFiles 네트워크 가드). 공식 문서 페이지만 읽기 전용으로 열람(WebFetch). `.env.local`·`./data` 열지 않음, db:migrate·drill:restore(둘 다 ./data 를 연다) 실행 안 함.
@@ -103,3 +103,63 @@
 
 ## Next authorized task
 - D38 2단계(실제 1건 게시)는 **별도 정확 범위 승인** 필요: 계정(@yongho.tho), 원고(가상/공개 소재 1건, 500자 이하 텍스트), 공개 범위(계정 설정), 호출 종류(컨테이너 생성·상태·게시·읽기, 결과 불명 시 목록 1회 이상), PUBLISH_LIVE_APPROVAL_REF 값, PUBLISH_LIVE_MAX_POSTS=1, 끝난 뒤 잠금 방법. 그 전에 오케스트레이터가 커밋·Codex 검증·`pnpm db:migrate`(dev 서버 끈 상태).
+
+---
+
+# FIX-LIVEP1 (Codex review-LIVEP1 — CHANGES_REQUESTED on 320dadb, gpt-6-astra/xhigh)
+- 판정 원본: `.handoffs/review-LIVEP1.md`
+- BASE_SHA: 320dadb · HEAD_SHA: uncommitted — orchestrator commits
+- 범위: 실제 Threads·Meta 요청 0(주입 fetch·전역 fetch stub 만), `.env.local`·`./data` 손대지 않음, db:migrate·drill:restore·dev 서버 실행 안 함, 새 의존성 없음, migration 추가 없음.
+
+## 지적 → 시험(재현) → 변경
+| 지적 | 재현(수정 전 코드로 먼저 실패 확인) | 변경 |
+|---|---|---|
+| **[P0] threads-live-publish.ts:504** 본문·시각만 맞는 글을 이 작업의 VERIFIED 결과로 확정 | 단위 `threads-live-publish.test.ts` 새 시험 3개 + 표 4행 — 수정 전 실행 9 실패(`.handoffs/checks-FIX-LIVEP1.repro-unit.log`): ① 같은 본문 1개 → 이전엔 `found`·`publish` 단계·`verified:true` ② **Codex 재현: 시도 5분 전 손으로 올린 같은 글** → 이전엔 found(창 −10분) ③ **Codex 재현: 첫 25개 안에 하나 + 다음 쪽 가능(받은 수 = limit)** → 이전엔 found. 통합: 시간 초과 시험이 이전엔 CONFIRMED·VERIFIED publication | 게시 시도 표식이 있고 게시 기록이 없으면 조회는 **항상 unknown** — `publish` 단계·external_id·permalink·VERIFIED 를 만들지 않는다(재게시도 없음 → 3회 뒤 UNKNOWN). 목록은 **확인 후보**만: 같은 본문(정규화)·시도 시각 ±2분(10분 → 2분으로 좁힘)·정확히 1개·목록이 한 쪽에 다 들어옴(받은 수 < limit)일 때만 `candidate {external_id, permalink}` 를 돌려주고, 작업 처리기는 이력(`candidate_external_id`·`candidate_permalink` — 형식 검사 뒤)에만 남긴다. 화면: UNKNOWN 안내 + `미확인` 배지 "확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)" + 공식 링크, "이 앱은 이 글을 게시 결과로 기록하지 않았습니다". 확정은 threads_publish 가 돌려준 미디어 ID(결정적 연결)뿐 |
+| **[P1] reconcile/route.ts:32** 수동 재확인에 실제 계정 연결 정보 전달 누락 | 통합 새 시험: **실제 POST route handler** 로 UNKNOWN 항목 재확인(앱 레지스트리 → 실제 어댑터 → 전역 fetch stub fixture). 수정 전 route 로도 통과함을 확인(`.handoffs/checks-FIX-LIVEP1.repro-route.log` — 15/15): `reconcileItem` → `makeContext` 가 `credentials` 가 없어도 `process.env` 키 묶음으로 서버 안 봉인 해제 창구를 만든다(지적의 "기본 주입 여부 미확인" → 기본 주입 있음으로 확인). | 그래도 작업 처리기와 같게 route 에서 `credentials: jobCredentials(config, owner.db)` 를 명시 전달. 시험이 GET 목록 요청의 access_token = 봉인 해제한 장기 토큰(서버 안), 응답 200 `{state: UNKNOWN, found: false, remote: unknown, outcome: applied}`, 결과·게시 0, 응답·이력에 토큰 없음을 확인 |
+| **[P1] distribute/[id]/page.tsx:732** 버튼 안내가 현재 계획만 보고 "외부 호출 없음" | 통합 새 시험: 다른 계획에 실제 게시 작업(QUEUED, 게이트 열림) + 모의 계획 → 모의 계획 화면 폼(`plan_id`)으로 tick. 수정 전(범위 없음)으로 돌리면 실패(`.handoffs/checks-FIX-LIVEP1.repro-tickscope.log`) | 버튼의 서버 실행 범위를 **그 계획으로 제한**: `tickSchema.plan_id`, 폼이 보낸 `plan_id` → `runJobsTick({planId})` → `leaseJobs` 가 그 계획 항목의 작업만 lease(만료 복구는 그대로 — 외부 호출 없음). JSON 호출은 plan_id 없으면 기존 동작. 화면 안내 "이 계획의 작업만, 최대 5개 … 다른 계획의 작업은 처리하지 않음". 시험: 모의 계획 CONFIRMED, 다른 계획 실제 작업 QUEUED 그대로, 전역 fetch 0 |
+| 답 5: publish-target 확인·변경 분리 | 통합 새 시험: 사용 중지 → 연결 정보 만료 → 사용 → 409 `live_target_credential_unusable`, 상태 disconnected 그대로 | `setChannelAccountStateTx`(호출자 트랜잭션) 분리, `setLivePublishTarget` 이 **한 트랜잭션**에서 계정 FOR UPDATE → 묶임·연결 정보 확인 → 상태 변경·승인 철회 → 감사 |
+| 놓친 케이스: 큰 스트리밍 응답 | 단위 새 시험: 64 KiB 조각을 끝없이 내는 스트림 → 수정 전엔 전부 읽음(실패), content-length 10 MiB | `readCapped`: 조각으로 읽으며 512 KiB(바이트) 넘으면 `reader.cancel()` 후 `body_too_large`, content-length 가 상한보다 크면 읽지 않고 취소. 시험: cancel 호출·읽은 조각 < 20·컨테이너 생성은 부작용 없는 실패 |
+| 놓친 케이스: 동시 실행 | 단위 새 시험(같은 단계 저장소로 submit 두 개 동시) — 수정 전 threads_publish 2번(실패) | `RemoteStepsPort.record({createOnly})` + `recordRemoteStep(createOnly)`: 이미 있으면 기존 행을 돌려주지 않고 409 `remote_step_exists`. 게시 시도 표식은 createOnly — 새로 만든 실행만 게시, 늦은 쪽은 `publish_attempt_exists`(결과 불명, 재게시 없음). DB 에서는 (작업·순서·종류) unique 가 동시 INSERT 를 막는다. 통합 새 시험 2개(PGlite 한 연결): 같은 작업을 두 작업 처리기가 동시에 → publish 1번; `PUBLISH_LIVE_MAX_POSTS=1` 두 작업을 두 작업 처리기가 동시에 → publish 1번·나머지 BLOCKED `live_publish_limit`(전송 의도 0). **실제 PostgreSQL 독립 연결 동시성은 미검증** |
+| 답 6: GET 질의 토큰 | — | 그대로 둔다(Bearer 공식 근거 없음). 확인한 사실: 우리 코드는 요청 URL·본문을 어디에도 기록하지 않는다(오류는 숫자·열거만, `console` 출력 없음 — 시험이 console spy 로 확인). Next 설정에 `logging.fetches` 가 없어 서버 fetch 로그를 쓰지 않고, `logging.incomingRequests` 는 들어오는 요청만(콜백 경로 제외). Next 16 의 fetch 는 기본 캐시하지 않는다(no-store 기본) — 다만 Next 내부 동작·APM·프록시·Threads 쪽 로그는 이 저장소에서 확인할 수 없다(미검증, 2단계 전 운영 경로 확인 필요) |
+
+## 바뀐 파일(FIX-LIVEP1)
+- `packages/providers/src/threads-live-publish.ts` — 목록 대조 = 확인 후보만(항상 unknown), 창 ±2분·목록 불완전 시 후보 없음, `createOnly` 게시 시도 표식·`publish_attempt_exists`, `readCapped`(스트리밍 바이트 상한·취소), `MAX_RESPONSE_BYTES` export
+- `packages/domain/src/jobs.ts` — `RemoteStepsPort.record.createOnly`, `ReconcileResult.candidate`, `tickSchema.plan_id`
+- `packages/db/src/remote-steps.ts` — `createOnly`(409 remote_step_exists)
+- `packages/db/src/jobs.ts` — 후보를 이력에만(`candidate_external_id`·`candidate_permalink`), `JobRunOptions.planId`·`leaseJobs` 계획 범위
+- `packages/db/src/distribution.ts` — `setChannelAccountStateTx` 분리
+- `packages/db/src/live-publish.ts` — 사용 확인·상태 변경 한 트랜잭션
+- `apps/web/app/api/distribution-items/[id]/reconcile/route.ts` — `credentials: jobCredentials(config, owner.db)`
+- `apps/web/app/api/worker/tick/route.ts` — 폼·JSON `plan_id` 범위
+- `apps/web/app/distribute/[id]/page.tsx` — 확인 후보(미확인) 표시, 버튼 안내 "이 계획의 작업만"
+- `apps/web/lib/distribution.ts` — `liveCandidateFromEvents`·`LIVE_CANDIDATE_LABEL`
+- 시험: `packages/providers/src/threads-live-publish.test.ts`(+5 시험, 표 4행 기대값을 새 규칙으로 — found → unknown), `tests/integration/live-threads-publish.test.ts`(시간 초과 시험을 "확인 후보 + UNKNOWN + 실제 재확인 route"로 바꿈, +4 시험)
+- 손대지 않음: DECISIONS·다른 인계·`.env.local`·`./data`. migration 추가 없음(0044 그대로).
+
+## 실행한 명령(FIX-LIVEP1)
+(Windows 10, Git Bash, `export PATH="/usr/bin:/mingw64/bin:$PATH"; source tools/env.sh`, Node 24.21.0, `corepack pnpm`, dev 서버 꺼짐. ./data 를 여는 db:migrate·drill:restore 는 뺀 같은 순서 — 로그 `.handoffs/checks-FIX-LIVEP1*.log`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project unit packages/providers/src/threads-live-publish.test.ts`(새 시험 + **수정 전 어댑터**) | FAIL 9/58 — P0 3·표 4·동시 submit 1·스트리밍 1(`checks-FIX-LIVEP1.repro-unit.log`) — 재현 |
+| 같은 파일(수정 뒤) | PASS 58/58 |
+| `vitest run --project integration tests/integration/live-threads-publish.test.ts`(tick route 의 planId 만 임시로 뺌) | FAIL 1/15 — 계획 범위 시험(`checks-FIX-LIVEP1.repro-tickscope.log`) — 재현, 되돌림 |
+| 같은 파일(reconcile route 의 credentials 만 임시로 뺌) | PASS 15/15(`checks-FIX-LIVEP1.repro-route.log`) — route 는 이미 기본 키 묶음으로 동작(지적은 실제 결함 아님, 명시 전달은 일관성용), 되돌림 |
+| 같은 파일(수정 뒤, 실행 앞선 검사 상한 1회 조정 — 다른 계획의 진행 중 작업을 보수적으로 세기 때문) | PASS 15/15 |
+| `corepack pnpm lint` · `typecheck` · `build` | PASS · PASS · PASS |
+| `corepack pnpm test`(unit) | PASS — 67 files, 1616 tests |
+| `corepack pnpm test:integration` | PASS — 47 files, 894 tests(워커 충돌 없음 — --maxWorkers=2 재실행 불필요) |
+| `corepack pnpm drill:mock` | PASS — "불변식 위반 0건" |
+| `db:migrate` · `drill:restore` | not_run(./data 금지) |
+- 이 라운드에서는 내가 띄운 프로세스만 다뤘다(전체 node 종료 명령 없음).
+
+## 남은 위험(FIX-LIVEP1 기준)
+1. 결과 불명 실제 게시는 이제 **항상** UNKNOWN 으로 끝난다(목록에 진짜 우리 글이 있어도) — 사용자가 Threads 에서 확인해야 한다. 컨테이너 ID ↔ 미디어 ID 를 잇는 공식 필드가 없어서다(문서 확인 2026-10-13). 2단계 실제 응답에서 컨테이너 GET 이 미디어 ID 를 주는지 확인되면 결정적 확인으로 바꿀 수 있다.
+2. 확인 후보 창 ±2분은 시계 차이가 크면 진짜 글을 후보로도 못 보일 수 있다(확정에는 영향 없음).
+3. 실제 PostgreSQL 독립 연결의 동시성(게시 수 잠금·createOnly unique)은 PGlite 한 연결로만 확인 — 미검증.
+4. GET 질의 토큰: Next 내부·APM·프록시·Threads 쪽 기록은 미검증.
+5. 그 밖의 1차 위험(run-all.sh 중단 원인 미확인, 화면 브라우저 미확인, 장기 토큰 자동 갱신 꺼짐) 그대로.
+
+## Codex 에게 묻는 것(FIX-LIVEP1)
+1. "게시 시도 표식 뒤 확정은 threads_publish 응답의 미디어 ID 뿐, 목록은 이력의 확인 후보만"이 P0 를 닫는가? 후보를 이력(job_events)에 남기는 것 자체가 사용자 오해를 만들 위험은 화면 문구(미확인 배지·"게시 결과로 기록하지 않았습니다")로 충분한가?
+2. 계획 범위 tick(`plan_id`)이 버튼 경로만 좁히고, 주기 타이머·전사 목록 조회의 inline tick 은 owner 전체를 처리하는 것(그 경로들은 화면 안내 문구가 없음)이 받아들일 만한가?
+3. `createOnly` 를 게시 시도 표식에만 쓰고 컨테이너 기록은 기존 규칙(같은 remote_id 면 기존 행)으로 둔 것 — 두 실행이 같은 컨테이너 ID 를 받는 경우(원격이 같은 ID 를 줄 때)에도 게시는 표식 하나로 막히므로 충분한가?

@@ -7,7 +7,7 @@
  * 시험이 바꿀 수 있는 동작(behavior): ID token 클레임 덮어쓰기(iss·aud·exp·nonce 등), 다른 키로 서명, token 응답 상태·지연·전송 실패, 메타데이터 덮어쓰기.
  * 서명은 node:crypto(RSASSA-PKCS1-v1_5/SHA-256) — 시험 픽스처일 뿐, 앱 코드의 검증은 openid-client 가 한다.
  */
-import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
 
 export const FAKE_ISSUER = 'https://idp.test';
 export const FAKE_CLIENT_ID = 'cs-test-client';
@@ -36,6 +36,8 @@ export interface FakeIdpBehavior {
   metadata?: Record<string, unknown>;
   /** ID token 을 빼고 응답. */
   omitIdToken?: boolean;
+  /** FIX-T21P1B: ID token 서명 방식 바꾸기 — none(서명 없음) · HS256(클라이언트 시크릿 HMAC). 기본 RS256. */
+  idTokenAlg?: 'none' | 'HS256';
 }
 
 interface IssuedCode {
@@ -61,16 +63,21 @@ export interface FakeIdp {
   authorize(authorizationUrl: string, user: FakeUser): string;
   /** 사용자가 IdP 에서 거부한 callback URL(error=access_denied). */
   deny(authorizationUrl: string): string;
+  /** FIX-T21P1B: 서명 키 교체(새 kid·새 키 — JWKS 도 새 키만 알린다). */
+  rotateKey(): void;
 }
 
-export function createFakeIdp(opts: { issuer?: string; clientId?: string; clientSecret?: string } = {}): FakeIdp {
+export function createFakeIdp(opts: { issuer?: string; clientId?: string; clientSecret?: string; jwksUri?: string } = {}): FakeIdp {
   const issuer = opts.issuer ?? FAKE_ISSUER;
+  // FIX-T21P1B: JWKS 를 issuer 와 다른 호스트에 둘 수 있다(예: https://keys.test/jwks)
+  const jwksUri = opts.jwksUri ?? `${issuer}/jwks`;
   const clientId = opts.clientId ?? FAKE_CLIENT_ID;
   const clientSecret = opts.clientSecret ?? FAKE_CLIENT_SECRET;
-  const kid = 'fake-key-1';
-  const keyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  let kid = 'fake-key-1';
+  let keyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const otherKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
-  const jwk = { ...(keyPair.publicKey.export({ format: 'jwk' }) as Record<string, unknown>), kid, alg: 'RS256', use: 'sig' };
+  const toJwk = () => ({ ...(keyPair.publicKey.export({ format: 'jwk' }) as Record<string, unknown>), kid, alg: 'RS256', use: 'sig' });
+  let jwk = toJwk();
   const codes = new Map<string, IssuedCode>();
   const behavior: FakeIdpBehavior = {};
   const calls: FakeIdp['calls'] = [];
@@ -80,7 +87,7 @@ export function createFakeIdp(opts: { issuer?: string; clientId?: string; client
     issuer,
     authorization_endpoint: `${issuer}/authorize`,
     token_endpoint: `${issuer}/token`,
-    jwks_uri: `${issuer}/jwks`,
+    jwks_uri: jwksUri,
     response_types_supported: ['code'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['RS256'],
@@ -91,8 +98,11 @@ export function createFakeIdp(opts: { issuer?: string; clientId?: string; client
   });
 
   const signJwt = (payload: Record<string, unknown>, key: KeyObject) => {
-    const header = b64u(JSON.stringify({ alg: 'RS256', kid, typ: 'JWT' }));
+    const alg = behavior.idTokenAlg ?? 'RS256';
+    const header = b64u(JSON.stringify(alg === 'RS256' ? { alg, kid, typ: 'JWT' } : { alg, typ: 'JWT' }));
     const body = b64u(JSON.stringify(payload));
+    if (alg === 'none') return `${header}.${body}.`;
+    if (alg === 'HS256') return `${header}.${body}.${b64u(createHmac('sha256', clientSecret).update(`${header}.${body}`).digest())}`;
     const sig = sign('sha256', Buffer.from(`${header}.${body}`), key);
     return `${header}.${body}.${b64u(sig)}`;
   };
@@ -173,12 +183,12 @@ export function createFakeIdp(opts: { issuer?: string; clientId?: string; client
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     const method = (init?.method ?? 'GET').toUpperCase();
     calls.push({ method, path: url.pathname });
+    if (method === 'GET' && url.href === jwksUri) return json(200, { keys: [jwk] });
     if (url.origin !== new URL(issuer).origin) throw new TypeError('fake idp: unknown host');
     if (method === 'GET' && url.pathname === `${new URL(issuer).pathname.replace(/\/$/, '')}/.well-known/openid-configuration`) {
       if (behavior.discoveryStatus) return json(behavior.discoveryStatus, { error: 'unavailable' });
       return json(200, metadata());
     }
-    if (method === 'GET' && url.href === `${issuer}/jwks`) return json(200, { keys: [jwk] });
     if (method === 'POST' && url.href === `${issuer}/token`) return token(init);
     return json(404, { error: 'not_found' });
   };
@@ -204,6 +214,11 @@ export function createFakeIdp(opts: { issuer?: string; clientId?: string; client
       cb.searchParams.set('code', code);
       cb.searchParams.set('state', p.get('state')!);
       return cb.href;
+    },
+    rotateKey() {
+      keyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
+      kid = `fake-key-${randomBytes(4).toString('hex')}`;
+      jwk = toJwk();
     },
     deny(authorizationUrl) {
       const p = parseAuthUrl(authorizationUrl);

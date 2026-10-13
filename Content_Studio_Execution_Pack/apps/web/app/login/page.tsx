@@ -1,6 +1,7 @@
 import { redirect } from 'next/navigation';
 import { isLocalhostBaseUrl, OIDC_START_PATH, oidcLoginReadiness } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { warnOidcNotConfigured } from '../../lib/oidc';
 import { getConfig } from '../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -32,7 +33,10 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const errorText = code ? (ERROR_TEXT[code] ?? ERROR_TEXT.denied) : null;
   const devAllowed = config.AUTH_MODE === 'dev' && isLocalhostBaseUrl(config.APP_BASE_URL);
   // T21-P1b: 준비 여부만 본다(빠진 설정 이름은 로그인 전 화면에 보여 주지 않는다 — 서버 로그·로그인 후 설정 화면).
-  const oidcReady = config.AUTH_MODE === 'oidc' && oidcLoginReadiness(config, process.env).ready;
+  const oidcReadiness = config.AUTH_MODE === 'oidc' ? oidcLoginReadiness(config, process.env) : null;
+  const oidcReady = oidcReadiness?.ready === true;
+  // FIX-T21P1B(P2): 화면이 안내하는 서버 로그를 실제로 남긴다(이름만, 프로세스당 1분에 한 번)
+  if (oidcReadiness && !oidcReadiness.ready) warnOidcNotConfigured(oidcReadiness.missing);
   const errorBlock = errorText ? (
     <p className="notice" role="alert">
       {errorText}

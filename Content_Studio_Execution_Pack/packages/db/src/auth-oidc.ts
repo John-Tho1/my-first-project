@@ -2,6 +2,7 @@
  * T21-P1b: OIDC 로그인 요청(auth_oidc_states) 저장·소비. 로그인 전 단계라 owner 가 없다.
  *
  * - 시작: 만료·사용된 행을 지우고, 진행 중인 행이 상한(OIDC_MAX_PENDING_STATES) 이상이면 가장 오래된 것부터 지운 뒤 넣는다
+ *   (FIX-T21P1B: 전용 트랜잭션 advisory 잠금 OIDC_STATE_LOCK_KEY 아래에서 — 여러 연결이어도 상한을 지키도록. Postgres 다중 연결은 미검증, G2)
  *   (인증 없는 시작 경로가 표를 끝없이 키우지 못하게). PKCE verifier·nonce 는 봉인해 둔다(AAD = 이 행 ID + 용도 oidc_login_state).
  * - 소비(callback): state 해시로 행을 잠그고(for update) 한 번만 쓰이게 한다.
  *   · 없음 → unknown. · 브라우저 결합 해시가 다르면 → browser_mismatch(행은 **그대로** — state 를 본 다른 브라우저가 주인의 진행 중 요청을 태우지 못하게, T13 oauth_states 와 같은 규칙).
@@ -9,7 +10,7 @@
  * - 값(state·결합 쿠키·verifier·nonce 원문)은 이 표에도 감사에도 남지 않는다(해시·봉인만).
  */
 import { randomUUID } from 'node:crypto';
-import { asc, count, eq, isNotNull, lte, or, inArray, isNull, gt, and } from 'drizzle-orm';
+import { and, asc, count, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import {
   hashOAuthState,
   hashOidcBrowserBinding,
@@ -29,6 +30,9 @@ export interface OidcPendingSecrets {
   codeVerifier: string;
   nonce: string;
 }
+
+/** FIX-T21P1B(P2 :54): 로그인 요청 생성(정리·개수·오래된 것 삭제·삽입)을 직렬화하는 트랜잭션 advisory 잠금 키. */
+export const OIDC_STATE_LOCK_KEY = 'cs.auth.oidc_state';
 
 const aad = (id: string): SecretAad => ({ ownerId: '', channelAccountId: '', purpose: 'oidc_login_state', scopeId: id });
 
@@ -50,6 +54,8 @@ export async function createOidcLoginState(
   const sealed = sealSecret(input.keyring, JSON.stringify({ v: input.secrets.codeVerifier, n: input.secrets.nonce }), aad(id));
   const expiresAt = new Date(now.getTime() + OIDC_STATE_TTL_MS);
   await db.transaction(async (tx) => {
+    // FIX-T21P1B(P2): 정리·개수·삭제·삽입 전체를 직렬화 — Postgres READ COMMITTED 에서 99개일 때 두 생성이 함께 넣어 101개가 되지 않게
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${OIDC_STATE_LOCK_KEY}))`);
     await tx.delete(authOidcStates).where(or(lte(authOidcStates.expiresAt, now), isNotNull(authOidcStates.usedAt)));
     const [c] = await tx
       .select({ n: count() })

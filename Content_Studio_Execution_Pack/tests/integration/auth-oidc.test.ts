@@ -107,7 +107,10 @@ async function expectDenied(res: Response, status: number, error: string, reason
   expect(res.status).toBe(status);
   expect((await res.json()).error).toBe(error);
   expect(res.headers.get('set-cookie') ?? '').not.toContain('cs_session=');
-  expect(res.headers.getSetCookie()).toContain('cs_oidc_flow=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0');
+  // FIX-T21P1B(P2 :172): 이 브라우저의 흐름으로 확인되지 않은 요청(state 없음·모름·다른 브라우저·redirect 불일치)은 결합 쿠키를 보존한다
+  const unbound = ['state_missing', 'state_unknown', 'state_browser_mismatch', 'redirect_mismatch'].includes(check);
+  const cleared = res.headers.getSetCookie().includes('cs_oidc_flow=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0');
+  expect(cleared).toBe(!unbound);
   const rows = await audits('auth.login_denied');
   expect(rows.at(-1)?.sanitizedDetails).toEqual({ reason, check, mode: 'oidc' });
   expect(rows.at(-1)?.ownerId).toBeNull();

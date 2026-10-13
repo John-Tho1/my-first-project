@@ -17,7 +17,7 @@ import {
 import { OidcLoginFailure } from '@cs/providers';
 import { errorResponse, seeOther, wantsHtml } from '../../../../../lib/api';
 import { withOAuthResponseHeaders } from '../../../../../lib/oauth';
-import { getOidcLoginClient } from '../../../../../lib/oidc';
+import { getOidcLoginClient, warnOidcNotConfigured } from '../../../../../lib/oidc';
 import { getAppDb, getConfig } from '../../../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -43,7 +43,7 @@ export async function GET(request: Request): Promise<Response> {
     const readiness = oidcLoginReadiness(config, process.env);
     if (!readiness.ready) {
       // 이름만(값 없음) 서버 로그에 — 로그인 전이라 화면에서는 볼 수 없으므로 운영자가 여기서 확인한다.
-      console.warn(`[auth] oidc_not_configured: ${readiness.missing.join(', ')}`);
+      warnOidcNotConfigured(readiness.missing); // FIX-T21P1B: 1분에 한 번(반복 요청이 로그를 채우지 않게)
       throw new OidcNotConfiguredError();
     }
     const { db } = await getAppDb(config);

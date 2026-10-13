@@ -8,6 +8,21 @@ import { OidcLoginClient } from '@cs/providers';
 
 let current: { fingerprint: string; client: OidcLoginClient } | null = null;
 
+/** FIX-T21P1B(P2 login/page.tsx:61): 준비 안 됨 로그의 프로세스당 간격(같은 이름 목록은 1분에 한 번). */
+export const OIDC_NOT_CONFIGURED_LOG_INTERVAL_MS = 60_000;
+let lastNotConfiguredLog: { key: string; at: number } | null = null;
+
+/**
+ * 빠진 설정 **이름**만 서버 로그에 남긴다(값 없음). 로그인 화면·시작 경로가 함께 쓴다. 같은 목록이면 1분에 한 번 — 인증 없는 경로의
+ * 반복 요청이 로그를 채우지 못하게. 목록이 바뀌면 바로 다시 남긴다.
+ */
+export function warnOidcNotConfigured(missing: readonly string[], now: number = Date.now()): void {
+  const key = missing.join(', ');
+  if (lastNotConfiguredLog && lastNotConfiguredLog.key === key && now - lastNotConfiguredLog.at < OIDC_NOT_CONFIGURED_LOG_INTERVAL_MS) return;
+  lastNotConfiguredLog = { key, at: now };
+  console.warn(`[auth] oidc_not_configured: ${key}`);
+}
+
 /** 준비된 설정의 클라이언트(준비 안 됐으면 OidcNotConfiguredError). */
 export function getOidcLoginClient(config: AppConfig, env: Record<string, string | undefined> = process.env): OidcLoginClient {
   const settings = oidcClientSettings(config, env);
@@ -19,6 +34,7 @@ export function getOidcLoginClient(config: AppConfig, env: Record<string, string
 /** 시험용: 보관한 클라이언트(discovery 캐시)를 버린다. */
 export function resetOidcLoginClientForTests(): void {
   current = null;
+  lastNotConfiguredLog = null;
 }
 
 /** 화면(설정)·health details 용 — 모드와 빠진 설정 이름만(값 없음). */

@@ -11,7 +11,13 @@
  * 네트워크(비밀 위생):
  * - 모든 IdP HTTP 는 이 클래스의 감싼 fetch 를 지난다 — 주입한 fetch(시험은 프로세스 안 가짜 IdP) 또는 호출 시점의 globalThis.fetch.
  * - https 만, 허용 호스트(issuer 호스트 + discovery 문서의 token_endpoint·jwks_uri 호스트)만. 리다이렉트는 따르지 않는다(manual).
- * - 요청마다 시간 제한(OIDC_HTTP_TIMEOUT_MS, 주입 가능) — 주입 fetch 가 signal 을 무시해도 경쟁(race)으로 끊는다.
+ * - 요청마다 시간 제한(OIDC_HTTP_TIMEOUT_MS, 주입 가능) — 헤더뿐 아니라 **본문 끝까지 받는 데까지** 포함(FIX-T21P1B P1 :252). 본문은 감싼 fetch 가
+ *   다 읽어(최대 1 MiB) 새 Response 로 넘긴다 — 본문 끊김·멈춤·초과는 전송 실패(unavailable), 다 받은 뒤의 형식·검증 실패만 invalid.
+ *   주입 fetch·본문 스트림이 signal 을 무시해도 경쟁(race)으로 끊는다.
+ * - 허용 호스트 집합과 감싼 fetch 는 **Configuration 마다 따로**(FIX-T21P1B P1 :199) — 새 discovery 가 끝나 완성된 뒤에만 캐시를 바꾸고,
+ *   진행 중인 callback 은 자기 Configuration 의 집합을 계속 쓴다. 동시 discovery 는 진행 중 요청 하나로 합친다.
+ * - ID token iat: 라이브러리는 존재·타입만 보므로 미래(허용 오차 30초 초과) iat 는 여기서 거부한다(FIX-T21P1B).
+ * - JWKS 키 교체: 모르는 kid 는 라이브러리가 JWKS 캐시가 60초 이상 됐을 때만 다시 받는다(재요청 폭주 방지 — 라이브러리 설계, 그대로 둠).
  * - 실패는 OidcLoginFailure(kind: invalid | unavailable, step)로만 바꾼다 — 원 오류(cause)·URL·IdP 응답 본문·토큰·code 를 버린다.
  *   unavailable = 전송 실패·시간 초과·5xx·허용 밖 호스트·discovery 실패(다시 시도할 일). invalid = 그 밖(검증 실패 — 로그인 실패로 센다).
  * discovery 결과(Configuration — JWKS 캐시 포함)는 OIDC_DISCOVERY_TTL_MS 동안 재사용한다(실패는 캐시하지 않음).
@@ -68,6 +74,13 @@ interface Cached {
   expiresAt: number;
 }
 
+/** 감싼 fetch 가 받는 응답 본문 상한. */
+export const OIDC_MAX_RESPONSE_BYTES = 1024 * 1024;
+/** ID token 시각 허용 오차(초) — 라이브러리 기본 clockTolerance 와 같다. */
+const CLOCK_TOLERANCE_SEC = 30;
+/** 본문이 없어야 하는 상태 */
+const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
+
 const transportStore = new AsyncLocalStorage<Transport>();
 
 const isHttpsUrl = (v: unknown): v is string => {
@@ -85,9 +98,9 @@ export class OidcLoginClient {
   readonly #timeoutMs: number;
   readonly #ttlMs: number;
   readonly #now: () => number;
-  /** 허용 호스트(host = 이름:포트) — discovery 전에는 issuer 호스트만. */
-  readonly #allowedHosts: Set<string>;
   #cached: Cached | null = null;
+  /** 진행 중인 discovery(동시 요청은 이것 하나를 기다린다). */
+  #inflight: Promise<oidc.Configuration> | null = null;
 
   constructor(settings: OidcClientSettings, options: OidcLoginClientOptions = {}) {
     this.#settings = { ...settings, scopes: [...settings.scopes] };
@@ -95,7 +108,6 @@ export class OidcLoginClient {
     this.#timeoutMs = options.timeoutMs ?? OIDC_HTTP_TIMEOUT_MS;
     this.#ttlMs = options.discoveryTtlMs ?? OIDC_DISCOVERY_TTL_MS;
     this.#now = options.now ?? Date.now;
-    this.#allowedHosts = new Set([new URL(settings.issuer).host]);
   }
 
   /** 같은 설정인지 비교하는 지문(비밀 포함 — 해시만, 밖으로 내보내지 않는다). */
@@ -156,13 +168,18 @@ export class OidcLoginClient {
         throw new OidcLoginFailure(this.#unavailable() ? 'unavailable' : 'invalid', 'token');
       }
       if (!claims || typeof claims.sub !== 'string' || !claims.sub) throw new OidcLoginFailure('invalid', 'claims');
+      // 라이브러리는 iat 의 존재·타입만 본다 — 허용 오차를 넘는 미래 발급은 거부(서버 시계 기준, 라이브러리와 같은 Date.now)
+      if (typeof claims.iat !== 'number' || claims.iat > Math.floor(Date.now() / 1000) + CLOCK_TOLERANCE_SEC) {
+        throw new OidcLoginFailure('invalid', 'claims');
+      }
       return { sub: claims.sub, email: claims.email, email_verified: claims.email_verified };
     });
   }
 
-  /** 시험·설정 변경용: 캐시를 버린다. */
+  /** 시험·설정 변경용: 캐시를 버린다(진행 중 discovery 는 끝나도 캐시에 넣지 않는다). */
   reset(): void {
     this.#cached = null;
+    this.#inflight = null;
   }
 
   async #run<T>(fn: () => Promise<T>): Promise<T> {
@@ -180,11 +197,33 @@ export class OidcLoginClient {
     return !!t && (t.failed || t.serverError || t.hostRejected);
   }
 
+  /** 캐시가 살아 있으면 그것, 아니면 진행 중 discovery 를 함께 기다리거나 새로 시작한다. 완성된 결과만 캐시에 넣는다(교체는 한 번에). */
   async #configuration(): Promise<oidc.Configuration> {
     const now = this.#now();
     if (this.#cached && this.#cached.expiresAt > now) return this.#cached.config;
-    this.#cached = null;
+    if (!this.#inflight) {
+      const p: Promise<oidc.Configuration> = this.#discover().then(
+        (config) => {
+          if (this.#inflight === p) {
+            this.#cached = { config, expiresAt: this.#now() + this.#ttlMs };
+            this.#inflight = null;
+          }
+          return config;
+        },
+        (e: unknown) => {
+          if (this.#inflight === p) this.#inflight = null;
+          throw e;
+        },
+      );
+      this.#inflight = p;
+    }
+    return this.#inflight;
+  }
+
+  /** discovery 한 번 — 이 Configuration 전용 허용 호스트 집합과 감싼 fetch 를 만든다(다른 Configuration 의 집합은 건드리지 않는다). */
+  async #discover(): Promise<oidc.Configuration> {
     const issuer = new URL(this.#settings.issuer);
+    const hosts = new Set<string>([issuer.host]);
     const secret = this.#settings.clientSecret;
     const basic = oidc.ClientSecretBasic(secret);
     const post = oidc.ClientSecretPost(secret);
@@ -195,11 +234,8 @@ export class OidcLoginClient {
     };
     let config: oidc.Configuration;
     try {
-      // 허용 호스트를 issuer 하나로 되돌린 뒤 discovery(이전 discovery 의 호스트를 남기지 않는다).
-      this.#allowedHosts.clear();
-      this.#allowedHosts.add(issuer.host);
       config = await oidc.discovery(issuer, this.#settings.clientId, undefined, auth, {
-        [oidc.customFetch]: this.#guardedFetch(),
+        [oidc.customFetch]: this.#guardedFetch(hosts),
         timeout: this.#timeoutMs / 1000,
         // 라이브러리 기본은 TLS 로 받은 ID token 의 서명 검사를 생략한다(OIDC Core 3.1.3.7 허용) — 서명(JWKS)도 검사하게 켠다.
         execute: [oidc.enableNonRepudiationChecks],
@@ -217,14 +253,18 @@ export class OidcLoginClient {
     ) {
       throw new OidcLoginFailure('unavailable', 'discovery');
     }
-    this.#allowedHosts.add(new URL(meta.token_endpoint).host);
-    this.#allowedHosts.add(new URL(meta.jwks_uri).host);
-    this.#cached = { config, expiresAt: now + this.#ttlMs };
+    // 아직 아무도 쓰지 않는(캐시 전) 이 Configuration 의 집합에만 더한다
+    hosts.add(new URL(meta.token_endpoint).host);
+    hosts.add(new URL(meta.jwks_uri).host);
     return config;
   }
 
-  /** https·허용 호스트만, 리다이렉트 안 따름, 시간 제한(경쟁), 전송 상태 기록. 던지는 오류에는 URL·본문을 넣지 않는다. */
-  #guardedFetch(): oidc.CustomFetch {
+  /**
+   * https·허용 호스트(이 Configuration 의 집합)만, 리다이렉트 안 따름, 전송 상태 기록. 시간 제한은 헤더 + 본문 끝까지(경쟁).
+   * 본문은 여기서 다 읽어(OIDC_MAX_RESPONSE_BYTES 상한) 새 Response 로 돌려준다 — 본문 단계의 끊김·멈춤·초과도 전송 실패(unavailable).
+   * 던지는 오류에는 URL·본문을 넣지 않는다.
+   */
+  #guardedFetch(hosts: ReadonlySet<string>): oidc.CustomFetch {
     return async (url, options) => {
       const t = transportStore.getStore();
       let u: URL;
@@ -234,7 +274,7 @@ export class OidcLoginClient {
         if (t) t.hostRejected = true;
         throw new Error('oidc: invalid request url');
       }
-      if (u.protocol !== 'https:' || !this.#allowedHosts.has(u.host)) {
+      if (u.protocol !== 'https:' || !hosts.has(u.host)) {
         if (t) t.hostRejected = true;
         throw new Error('oidc: request host not allowed');
       }
@@ -248,18 +288,57 @@ export class OidcLoginClient {
           reject(new Error('oidc: timeout'));
         }, this.#timeoutMs);
       });
+      const receive = async (): Promise<Response> => {
+        const res = await f(u.href, { ...options, redirect: 'manual', signal } as RequestInit);
+        const body = await readCapped(res, signal);
+        return new Response(NULL_BODY_STATUS.has(res.status) ? null : body, { status: res.status, statusText: res.statusText, headers: res.headers });
+      };
       try {
-        const res = await Promise.race([f(u.href, { ...options, redirect: 'manual', signal } as RequestInit), timeout]);
+        const res = await Promise.race([receive(), timeout]);
         if (res.status >= 500) {
           if (t) t.serverError = true;
         }
         return res;
       } catch {
         if (t) t.failed = true;
+        ctrl.abort();
         throw new Error('oidc: request failed');
       } finally {
         clearTimeout(timer);
       }
     };
   }
+}
+
+/** 본문을 끝까지 읽는다(상한 초과·스트림 오류·중단이면 던진다). 끝나지 않으면 바깥 경쟁의 시간 제한이 끊는다. */
+async function readCapped(res: Response, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
+  if (!res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const onAbort = () => void reader.cancel().catch(() => undefined);
+  signal.addEventListener('abort', onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > OIDC_MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error('oidc: response too large');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+  // 중단(시간 제한·라이브러리 signal)으로 끝난 읽기는 잘린 본문이다 — 정상 수신으로 넘기지 않는다
+  if (signal.aborted) throw new Error('oidc: response aborted');
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
 }

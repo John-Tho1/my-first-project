@@ -38,6 +38,8 @@ export interface FakeIdpBehavior {
   omitIdToken?: boolean;
   /** FIX-T21P1B: ID token 서명 방식 바꾸기 — none(서명 없음) · HS256(클라이언트 시크릿 HMAC). 기본 RS256. */
   idTokenAlg?: 'none' | 'HS256';
+  /** FIX2-T21P1B: 서명 전 ID token 본문(JSON 문자열)을 바꾼다 — JSON.stringify 로 만들 수 없는 값(예: 1e400 → 파싱하면 Infinity) 주입용. */
+  payloadJson?: (json: string) => string;
 }
 
 interface IssuedCode {
@@ -100,7 +102,8 @@ export function createFakeIdp(opts: { issuer?: string; clientId?: string; client
   const signJwt = (payload: Record<string, unknown>, key: KeyObject) => {
     const alg = behavior.idTokenAlg ?? 'RS256';
     const header = b64u(JSON.stringify(alg === 'RS256' ? { alg, kid, typ: 'JWT' } : { alg, typ: 'JWT' }));
-    const body = b64u(JSON.stringify(payload));
+    const payloadText = JSON.stringify(payload);
+    const body = b64u(behavior.payloadJson ? behavior.payloadJson(payloadText) : payloadText);
     if (alg === 'none') return `${header}.${body}.`;
     if (alg === 'HS256') return `${header}.${body}.${b64u(createHmac('sha256', clientSecret).update(`${header}.${body}`).digest())}`;
     const sig = sign('sha256', Buffer.from(`${header}.${body}`), key);

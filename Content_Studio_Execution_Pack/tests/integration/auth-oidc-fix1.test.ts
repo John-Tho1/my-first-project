@@ -100,8 +100,8 @@ describe('P2 callback:172 — 결합 쿠키는 확인된 흐름을 끝낼 때만
     expect(jar.flow).not.toBeNull();
     const resB = await callback(cbB, jar);
     expect(resB.status).toBe(200);
-    expect(flowCleared(resB)).toBe(true);
-    expect(jar.flow).toBeNull();
+    // FIX2-T21P1B: 성공도 지우지 않는다(600초 만료) — 재사용은 서버 1회용 state 가 막는다
+    expect(flowCleared(resB)).toBe(false);
   });
 
   it('관계없는 callback(state 없음·모르는 state·redirect 불일치)은 진행 중 흐름의 쿠키를 지우지 않는다', async () => {
@@ -127,12 +127,12 @@ describe('P2 callback:172 — 결합 쿠키는 확인된 흐름을 끝낼 때만
     expect(jar.flow).not.toBeNull();
   });
 
-  it('확인된 흐름의 실패(허용 신원 불일치·재사용)는 쿠키를 지운다', async () => {
+  it('FIX2-T21P1B: 확인된 흐름의 실패(허용 신원 불일치)도 쿠키를 지우지 않는다', async () => {
     const jar = new Jar();
     const auth = await start(jar);
     const res = await callback(idp.authorize(auth, { ...USER, email: 'x@example.local' }), jar);
     expect(res.status).toBe(403);
-    expect(flowCleared(res)).toBe(true);
+    expect(flowCleared(res)).toBe(false);
   });
 });
 

@@ -107,10 +107,8 @@ async function expectDenied(res: Response, status: number, error: string, reason
   expect(res.status).toBe(status);
   expect((await res.json()).error).toBe(error);
   expect(res.headers.get('set-cookie') ?? '').not.toContain('cs_session=');
-  // FIX-T21P1B(P2 :172): 이 브라우저의 흐름으로 확인되지 않은 요청(state 없음·모름·다른 브라우저·redirect 불일치)은 결합 쿠키를 보존한다
-  const unbound = ['state_missing', 'state_unknown', 'state_browser_mismatch', 'redirect_mismatch'].includes(check);
-  const cleared = res.headers.getSetCookie().includes('cs_oidc_flow=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0');
-  expect(cleared).toBe(!unbound);
+  // FIX2-T21P1B(P2 :178): callback 은 결합 쿠키를 지우지 않는다(어떤 거부에서도) — 600초 만료·서버 1회용 state 에 맡김
+  expect(res.headers.getSetCookie().some((c) => c.startsWith('cs_oidc_flow='))).toBe(false);
   const rows = await audits('auth.login_denied');
   expect(rows.at(-1)?.sanitizedDetails).toEqual({ reason, check, mode: 'oidc' });
   expect(rows.at(-1)?.ownerId).toBeNull();
@@ -144,7 +142,8 @@ describe('성공', () => {
     expect(body.ok).toBe(true);
     const token = sessionCookieValue(cb)!;
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(cb.headers.getSetCookie()).toContain('cs_oidc_flow=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0');
+    // FIX2-T21P1B: 성공도 결합 쿠키를 지우지 않는다(늦은 응답이 같은 브라우저의 새 흐름 쿠키를 지우지 않게)
+    expect(cb.headers.getSetCookie().some((c) => c.startsWith('cs_oidc_flow='))).toBe(false);
     expect(await sessionCount()).toBe(before + 1);
     const ok = await audits('auth.login');
     expect(ok.at(-1)?.sanitizedDetails).toEqual({ mode: 'oidc' });

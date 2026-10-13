@@ -16,7 +16,7 @@
  *   주입 fetch·본문 스트림이 signal 을 무시해도 경쟁(race)으로 끊는다.
  * - 허용 호스트 집합과 감싼 fetch 는 **Configuration 마다 따로**(FIX-T21P1B P1 :199) — 새 discovery 가 끝나 완성된 뒤에만 캐시를 바꾸고,
  *   진행 중인 callback 은 자기 Configuration 의 집합을 계속 쓴다. 동시 discovery 는 진행 중 요청 하나로 합친다.
- * - ID token iat: 라이브러리는 존재·타입만 보므로 미래(허용 오차 30초 초과) iat 는 여기서 거부한다(FIX-T21P1B).
+ * - ID token iat: 라이브러리는 존재·타입만 보므로 미래(허용 오차 30초 초과) iat 는 여기서 거부한다(FIX-T21P1B). 시각 클레임은 유한한 숫자만(FIX2).
  * - JWKS 키 교체: 모르는 kid 는 라이브러리가 JWKS 캐시가 60초 이상 됐을 때만 다시 받는다(재요청 폭주 방지 — 라이브러리 설계, 그대로 둠).
  * - 실패는 OidcLoginFailure(kind: invalid | unavailable, step)로만 바꾼다 — 원 오류(cause)·URL·IdP 응답 본문·토큰·code 를 버린다.
  *   unavailable = 전송 실패·시간 초과·5xx·허용 밖 호스트·discovery 실패(다시 시도할 일). invalid = 그 밖(검증 실패 — 로그인 실패로 센다).
@@ -172,6 +172,11 @@ export class OidcLoginClient {
       if (typeof claims.iat !== 'number' || claims.iat > Math.floor(Date.now() / 1000) + CLOCK_TOLERANCE_SEC) {
         throw new OidcLoginFailure('invalid', 'claims');
       }
+      // FIX2-T21P1B: 시각 클레임은 유한한 숫자만 — JSON 숫자 1e400 은 Infinity 로 파싱되고 라이브러리는 exp=Infinity 를 "만료 안 됨"으로 통과시킨다
+      for (const k of ['iat', 'exp', 'nbf', 'auth_time'] as const) {
+        const v = (claims as Record<string, unknown>)[k];
+        if ((k === 'iat' || k === 'exp' || v !== undefined) && !(typeof v === 'number' && Number.isFinite(v))) throw new OidcLoginFailure('invalid', 'claims');
+      }
       return { sub: claims.sub, email: claims.email, email_verified: claims.email_verified };
     });
   }
@@ -290,6 +295,11 @@ export class OidcLoginClient {
       });
       const receive = async (): Promise<Response> => {
         const res = await f(u.href, { ...options, redirect: 'manual', signal } as RequestInit);
+        // FIX2-T21P1B(P2 :318): signal 을 무시한 fetch 가 시간 제한 뒤에 응답했으면 본문을 바로 취소(완료를 기다리지 않음)하고 실패
+        if (signal.aborted) {
+          void res.body?.cancel().catch(() => undefined);
+          throw new Error('oidc: response after abort');
+        }
         const body = await readCapped(res, signal);
         return new Response(NULL_BODY_STATUS.has(res.status) ? null : body, { status: res.status, statusText: res.statusText, headers: res.headers });
       };
@@ -314,6 +324,11 @@ export class OidcLoginClient {
 async function readCapped(res: Response, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
   if (!res.body) return new Uint8Array(0);
   const reader = res.body.getReader();
+  // 이미 중단된 signal 의 abort 이벤트는 다시 오지 않는다 — 리더를 만든 직후에도 확인하고, 취소는 완료를 기다리지 않는다
+  if (signal.aborted) {
+    void reader.cancel().catch(() => undefined);
+    throw new Error('oidc: response aborted');
+  }
   const onAbort = () => void reader.cancel().catch(() => undefined);
   signal.addEventListener('abort', onAbort, { once: true });
   const chunks: Uint8Array[] = [];
@@ -324,7 +339,7 @@ async function readCapped(res: Response, signal: AbortSignal): Promise<Uint8Arra
       if (done) break;
       total += value.byteLength;
       if (total > OIDC_MAX_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined);
+        void reader.cancel().catch(() => undefined); // 취소 완료를 무기한 기다리지 않는다
         throw new Error('oidc: response too large');
       }
       chunks.push(value);

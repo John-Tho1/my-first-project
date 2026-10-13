@@ -2,7 +2,6 @@ import { consumeOidcLoginState, countRecentLoginFailures, createSession, ensureO
 import {
   AppError,
   assertLoginNotRateLimited,
-  buildClearedOidcFlowCookie,
   buildSessionCookie,
   checkOidcIdentity,
   generateSessionToken,
@@ -26,7 +25,6 @@ import {
   requestRedirectTarget,
   requireSecretKeyring,
   sessionTtlMs,
-  type AppConfig,
 } from '@cs/domain';
 import { OidcLoginFailure } from '@cs/providers';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
@@ -66,18 +64,17 @@ const fail = (reason: Failure['reason'], check: string): Failure => {
  * 5) IdP 의 error 파라미터면 취소 → 6) 라이브러리로 code 교환(PKCE)·ID token 검증(서명·iss·aud·exp·iat·nonce) → 7) 허용 신원(email+email_verified / sub)
  * 8) 전역 잠금 안(withLoginAttemptLock — T21-P1a 와 같은 판정 경로): 재검사(429) → 실패면 auth.login_denied(reason·check) 기록, 성공이면 owner 확인·세션·auth.login 기록.
  * 네트워크(6)는 잠금 밖에서 한다(느린 IdP 가 전역 잠금을 붙잡지 않게).
- * FIX-T21P1B(P2 :172): 결합 쿠키는 이 요청의 state 와 브라우저 결합이 **확인된** 흐름을 끝낼 때만 지운다(소비 결과 ok·used·expired·settings_changed·unreadable).
- * state 없음·모름·다른 브라우저·redirect 불일치·준비 안 됨·조기 429 에서는 보존한다 — 같은 브라우저의 다른 탭에서 진행 중인 흐름·관계없는 callback 방문이 현재 흐름을 깨지 않게.
+ * FIX2-T21P1B(P2 :178·:172): callback 은 결합 쿠키(cs_oidc_flow — 브라우저마다 하나, 마지막 시작이 덮어씀)를 **지우지 않는다**(성공·실패 모두).
+ * 요청 당시 결합을 확인해도, 그 응답이 늦게 도착하는 사이 같은 브라우저가 새 로그인을 시작했으면 지우는 Set-Cookie 가 새 흐름의 쿠키를 지운다.
+ * 쿠키는 Max-Age 600초로 스스로 사라지고, 끝난 흐름의 재사용은 서버의 1회용 state(used_at)가 막는다. 결합 검사(소비 때 쿠키 해시 = 행 해시) 자체는 그대로다.
+ * 흐름별 쿠키 이름(state 에서 나온 id)은 쓰지 않았다 — 같은 효과를 더 많은 쿠키·이름 규칙 없이 얻는다.
  * 응답: 브라우저는 303 / (성공) 또는 /login?error=<코드>, 그 밖은 200 {ok, expires_at} / JSON 오류. code·state·토큰·IdP 오류 본문은 응답·감사·로그에 없다.
  */
 export async function GET(request: Request): Promise<Response> {
   const html = wantsHtml(request);
-  let config: AppConfig | null = null;
   let res: Response;
-  /** 이 요청이 결합 쿠키의 흐름(state + 브라우저 결합 확인)을 끝냈는가 — 그때만 쿠키를 지운다. */
-  let endsBoundFlow = false;
   try {
-    config = getConfig();
+    const config = getConfig();
     if (!oidcLoginReadiness(config, process.env).ready) throw new OidcNotConfiguredError();
     const { db } = await getAppDb(config);
     const limit = { windowMs: LOGIN_FAILURE_WINDOW_MS, reasons: LOGIN_FAILURE_REASONS };
@@ -102,8 +99,6 @@ export async function GET(request: Request): Promise<Response> {
           settingsHash: oidcSettingsFingerprint(settings),
           keyring,
         });
-        // unknown·browser_mismatch 만 이 브라우저의 쿠키와 무관한 요청 — 그 밖은 결합이 확인된 흐름(이번 요청으로 끝남)
-        endsBoundFlow = consumed.status !== 'unknown' && consumed.status !== 'browser_mismatch';
         if (consumed.status !== 'ok') {
           failure = fail('oidc_invalid', `state_${consumed.status}`);
         } else if (params.has('error')) {
@@ -169,15 +164,9 @@ export async function GET(request: Request): Promise<Response> {
     }
     const headers = new Headers();
     headers.append('set-cookie', buildSessionCookie(outcome.token, config));
-    headers.append('set-cookie', buildClearedOidcFlowCookie(config)); // 성공 = 확인된 흐름의 끝
     res = html ? seeOther('/', headers) : json({ ok: true, expires_at: outcome.session.expiresAt.toISOString() }, { headers });
   } catch (e) {
     res = html ? seeOther(`/login?error=${callbackErrorCode(e)}`) : errorResponse(e, request);
-    if (config && endsBoundFlow) {
-      const h = new Headers(res.headers);
-      h.append('set-cookie', buildClearedOidcFlowCookie(config));
-      res = new Response(res.body, { status: res.status, headers: h });
-    }
   }
   return withOAuthResponseHeaders(res);
 }

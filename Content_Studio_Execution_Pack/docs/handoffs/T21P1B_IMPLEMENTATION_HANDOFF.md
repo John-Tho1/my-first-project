@@ -149,3 +149,54 @@
 ### FIX round 1 — 오케스트레이터 기록
 - FIX HEAD: e75fa0c0b22dbacdc7148970bc03fbaea4a4bc83 (code only). BASE 3094aa0(+ docs 4c4b876).
 - checks-FIX-T21P1B: lint·typecheck·build 0 · unit 65 파일 · 1543 · integration 1차 워커 exit 2147483651(단언 실패 없음) → maxWorkers=2 재실행 44 파일 · 875 · drill · migrate · restore PASS.
+
+---
+
+# FIX round 2 (Codex review-FIX-T21P1B — CHANGES_REQUESTED, P2 2건)
+- BASE_SHA: 1e4653f (docs; 코드 HEAD e75fa0c) — 판정 기록 bce6adc 위 작업 트리
+- HEAD_SHA: **미커밋**(오케스트레이터 커밋 예정)
+- 절차: e75fa0c 코드에서 실패 시험으로 먼저 재현 → 최소 수정.
+
+| 지적 | 재현(e75fa0c 에서 실패) | 수정(선택 이유) | 회귀 시험 |
+| --- | --- | --- | --- |
+| P2 callback/route.ts:178·:172 — 늦게 끝난 callback 이 새 흐름의 결합 쿠키 삭제 | `tests/integration/auth-oidc-fix2.test.ts`: A token 응답을 게이트로 지연 → 같은 쿠키 저장소로 B 시작(쿠키=B) → A 실패/성공 응답의 Set-Cookie 적용 → B callback 실패(A 응답에 `cs_oidc_flow=; Max-Age=0`). 3건 실패 | **callback 은 결합 쿠키를 지우지 않는다(성공·실패 모두)**. 쿠키는 Max-Age 600초로 사라지고, 끝난 흐름의 재사용은 서버의 1회용 state(`used_at`)가 막는다. 결합 검사(소비 때 쿠키 해시 = 행 해시)는 그대로. 흐름별 쿠키 이름(state 유래 id)보다 단순 — 쿠키 개수·이름 규칙·경로 문제 없이 같은 효과. 대가: 마지막 시작 하나만 유효(두 탭 중 먼저 시작한 쪽은 browser_mismatch — FIX1 과 같음), 쿠키가 최대 10분 남음(값은 난수, 단독으로는 아무것도 못 함) | 같은 파일 3건(A 실패·A 성공 뒤 B 성공, 쿠키가 남아도 재사용 400). 이전 라운드 기대값(`auth-oidc.test.ts` expectDenied·성공, `auth-oidc-fix1.test.ts` 2곳)을 "지우지 않음"으로 바꿈 |
+| P2 oidc-login.ts:318 — 시간 제한 뒤 도착한 응답 본문 미취소 | `oidc-login-fix2.test.ts`: signal 무시 fetch 가 timeout(200ms) 뒤 500ms 에 헤더 + 끝나지 않는 본문 → 실패는 unavailable 이지만 본문 `cancel` 이 호출되지 않음(token·JWKS 2건 실패) | fetch 반환 직후·reader 생성 직후 `signal.aborted` 확인 → 본문 취소는 **기다리지 않고**(`void …cancel().catch()`) 즉시 실패(unavailable). 상한 초과 때의 취소도 기다리지 않게 바꿈 | 같은 파일 3건(token·JWKS 늦은 응답 취소 확인, cancel 이 끝나지 않아도 3초 안에 실패) |
+
+### 놓친 경우(시험, 틀린 동작만 수정)
+| 경우 | 결과 | 조치 |
+| --- | --- | --- |
+| `iat` = 지금+30초 / +31초(시계 고정) | 통과 / invalid — 기대대로 | 시험만 |
+| `exp` = 1e400(JSON.parse → Infinity) | **통과(틀림)** — 라이브러리는 숫자 타입만 보고 Infinity 를 "만료 안 됨"으로 받음 | 시각 클레임 iat·exp(필수)·nbf·auth_time(있으면)은 `Number.isFinite` 아니면 invalid/claims |
+| `iat` = -1e400(-Infinity) | **통과(틀림)** | 같은 수정 |
+| `iat` = 1e400(Infinity) | invalid(미래 iat 검사로 이미 거부) | 시험만 |
+| NaN | JSON 으로 표현 불가(문법상 숫자 아님 — 파싱 실패로 invalid) | 문서만 |
+
+### 바뀐 파일(FIX round 2)
+`apps/web/app/api/auth/oidc/callback/route.ts`(쿠키 삭제 제거, `config` 를 try 안 const 로), `packages/providers/src/oidc-login.ts`(늦은 응답 취소·유한 클레임), `tests/helpers/fake-oidc-idp.ts`(`payloadJson` — 서명 전 본문 바꾸기), `tests/integration/auth-oidc.test.ts`·`auth-oidc-fix1.test.ts`(쿠키 기대값), `README_KO.md`·`docs/04_DATA_AND_API.md`(쿠키·클레임 한 줄씩). 새 파일: `packages/providers/src/oidc-login-fix2.test.ts`, `tests/integration/auth-oidc-fix2.test.ts`. migration 변경 없음.
+
+### 점검 결과(FIX round 2)
+시작 전 3000 포트 LISTEN 없음. 명령: `bash .handoffs/run-checks.sh FIX2-T21P1B` 1회 → 규칙대로 재실행 2건.
+
+| 단계 | 결과 |
+| --- | --- |
+| LINT / TYPECHECK / BUILD | 0 / 0 / 0 |
+| UNIT(run-checks) | 1 — 1551 중 1건: `oidc-login.test.ts` "discovery 실패…" 가 5초 시험 시간 초과(이번 라운드에서 손대지 않은 파일, 사례마다 RSA 키 생성 — 부하 시간 초과). 그 파일만 단독 재실행 `corepack pnpm exec vitest run --project unit packages/providers/src/oidc-login.test.ts` → **17/17 통과**(`.handoffs/checks-FIX2-T21P1B.unit-oidc-login-rerun.log`). 나머지 65 files / 1550 tests 통과 |
+| INTEG(run-checks) | 1 — 단언 실패 0, worker 종료 2147483651 8건(부하) |
+| INTEG `--maxWorkers=2` | **0 — 45 files / 878 tests 통과**(868s), worker 종료 0 — `.handoffs/checks-FIX2-T21P1B.integ-w2.log` |
+| DRILL / MIGRATE / DRILL_RESTORE | 0 / 0 / 0(불변식 위반 0건, 복원 PASS) |
+
+재현(수정 전 e75fa0c 코드): `oidc-login-fix2.test.ts` 8건 중 4건 실패(늦은 본문 취소 token·JWKS, exp=Infinity, iat=-Infinity), `auth-oidc-fix2.test.ts` 3건 모두 실패. 수정 후 개별 실행 전부 통과(provider 3 파일 45/45, OIDC 통합 3 파일 45/45 — 통합 개별 실행 중 1회 3 worker 가 모두 2147483651 로 종료해 `--maxWorkers=1` 로 다시 돌려 통과).
+
+### 남은 위험(변경분)
+- 결합 쿠키가 로그인 뒤에도 최대 10분 남는다(Path=/api/auth/oidc, HttpOnly — 서버의 1회용 state 와 같이 있어야만 의미가 있음).
+- 같은 브라우저의 여러 동시 로그인은 마지막 시작만 성공(흐름별 쿠키는 만들지 않음).
+- 앞 라운드 위험(프록시 뒤 request.url, 전역 잠김, Caddy Referrer-Policy, check-env, Postgres 다중 연결, JWKS 60초 창)은 그대로.
+
+### Codex 에게 묻는 것(FIX round 2)
+1. "callback 은 쿠키를 지우지 않음"이 결합 검사·1회용 state 와 함께 충분한가(남은 쿠키로 할 수 있는 일이 없는가).
+2. 늦은 응답 취소 위치(fetch 반환 직후·reader 생성 직후·abort 리스너) 외에 본문이 남는 경로가 있는가.
+
+
+### FIX round 2 — 오케스트레이터 기록
+- FIX2 HEAD: 1beee059b0db8bef6cfab57a9707067cbd21fa70 (code only). BASE 1e4653f(+ docs bce6adc).
+- checks-FIX2-T21P1B: lint·typecheck·build 0 · unit 1550/1551(손대지 않은 oidc-login.test.ts 5초 로드 시간 초과 — 단독 17/17) · integration 워커 exit 2147483651 8건(단언 실패 없음) → maxWorkers=2 재실행 878 통과 · drill · migrate · restore PASS.

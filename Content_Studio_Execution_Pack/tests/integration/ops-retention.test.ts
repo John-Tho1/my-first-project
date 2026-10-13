@@ -382,7 +382,7 @@ const JOB_KEYS = ['blocked', 'leased', 'queued', 'reconciling', 'retry_wait', 'u
 /** D30-3·T21-P3(G4): 공개 /api/health 가 가질 수 있는 키 전부(생존 여부만) */
 const HEALTH_KEYS = ['app', 'db_ok', 'status', 'time_utc'];
 /** T21-P3: 로그인 뒤 GET /api/health/details 의 키(모드·준비 상태·DB·worker — 운영 숫자 없음) */
-const DETAIL_KEYS = ['app', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
+const DETAIL_KEYS = ['app', 'auth', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
 
 describe('D23(e) 운영 숫자는 로그인 뒤로: 공개 /api/health 에 ops 없음, GET /api/ops/summary 는 owner 범위', () => {
   it('공개 /api/health 는 ops 와 그 숫자 키를 내보내지 않는다', async () => {

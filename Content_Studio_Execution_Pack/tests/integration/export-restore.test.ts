@@ -217,6 +217,7 @@ describe('M1 게이트: 입력 → 검색 → 원고 수정 → export → 빈 D
     expect(paths.some((p) => /session/i.test(p))).toBe(false);
     expect(Object.keys(exported.manifest.tables)).not.toContain('sessions');
     expect(exported.manifest.excluded_tables).toEqual([
+      'auth_oidc_states', // T21-P1b: OIDC 로그인 요청(인증 임시 상태)
       'export_runs',
       'oauth_credentials',
       'oauth_pending_tokens',

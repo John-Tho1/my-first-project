@@ -19,8 +19,8 @@ import {
 import {
   DevLoginNotAllowedError,
   DevLoginRefusedInProductionError,
+  IdentityLoginDisabledError,
   LoginRateLimitedError,
-  OidcNotConfiguredError,
 } from './errors';
 
 describe('isDevAuthAllowedForNodeEnv', () => {
@@ -54,10 +54,10 @@ describe('loadConfig — 운영 빌드 + AUTH_MODE=dev', () => {
   it('NODE_ENV=staging 같은 다른 값도 거부(fail closed)', () => {
     expect(() => loadConfig({ NODE_ENV: 'staging' })).toThrow(ConfigError);
   });
-  it('NODE_ENV=production + AUTH_MODE=oidc → 설정은 읽힌다(로그인은 oidc 미구현으로 거부)', () => {
+  it('NODE_ENV=production + AUTH_MODE=oidc → 설정은 읽힌다(T21-P1b: 식별자 입력 로그인은 거부, OIDC 로그인은 /api/auth/oidc/start)', () => {
     const c = loadConfig({ NODE_ENV: 'production', AUTH_MODE: 'oidc' });
     expect(c.AUTH_MODE).toBe('oidc');
-    expect(() => assertLoginAvailable(c, 'production')).toThrow(OidcNotConfiguredError);
+    expect(() => assertLoginAvailable(c, 'production')).toThrow(IdentityLoginDisabledError);
   });
   it.each([undefined, 'development', 'test'])('NODE_ENV=%s + dev → 허용(기존 동작)', (NODE_ENV) => {
     expect(loadConfig({ NODE_ENV }).AUTH_MODE).toBe('dev');
@@ -102,10 +102,10 @@ describe('assertLoginAvailable — 두 번째 방어선(설정 객체가 NODE_EN
 });
 
 describe('assertLoginNotRateLimited', () => {
-  it('상수: 15분 창, 10회, 실패 사유 2종', () => {
+  it('상수: 15분 창, 10회, 실패 사유 4종(T21-P1b: OIDC 검증 실패·허용 신원 불일치 추가)', () => {
     expect(LOGIN_FAILURE_WINDOW_MS).toBe(15 * 60 * 1000);
     expect(LOGIN_MAX_FAILURES).toBe(10);
-    expect([...LOGIN_FAILURE_REASONS]).toEqual(['identity_mismatch', 'invalid_request']);
+    expect([...LOGIN_FAILURE_REASONS]).toEqual(['identity_mismatch', 'invalid_request', 'oidc_invalid', 'oidc_identity_mismatch']);
   });
   it('상한 미만은 통과, 상한 이상은 429(login_rate_limited)', () => {
     expect(() => assertLoginNotRateLimited(0)).not.toThrow();

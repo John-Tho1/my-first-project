@@ -76,7 +76,9 @@ export type AppErrorKind =
   /** T08: 의도적으로 지운 자료(원음 삭제 등) → 410 */
   | 'gone'
   /** T21-P1a: 로그인 시도 횟수 제한 → 429 */
-  | 'too_many_requests';
+  | 'too_many_requests'
+  /** T21-P1b: 외부 인증 공급자(IdP) 통신 실패·시간 초과·5xx → 502 */
+  | 'upstream_failed';
 
 export class AppError extends Error {
   readonly kind: AppErrorKind;
@@ -163,9 +165,20 @@ export class DevLoginNotAllowedError extends AppError {
   }
 }
 
+/**
+ * T21-P1b: OIDC 로그인 설정이 준비되지 않음(oidcLoginReadiness) — 503. 응답에는 빠진 설정 이름도 넣지 않는다(인증 없는 경로).
+ * 이름은 서버 로그(시작 경로의 경고)·로그인 후 설정 화면·GET /api/health/details 에서.
+ */
 export class OidcNotConfiguredError extends AppError {
   constructor() {
-    super('service_unavailable', 'oidc_not_configured', '운영 인증 공급자는 아직 설정되지 않았습니다(T13)');
+    super('service_unavailable', 'oidc_not_configured', 'OIDC 로그인 설정이 준비되지 않았습니다. 서버 설정을 확인하세요.');
+  }
+}
+
+/** T21-P1b: AUTH_MODE=oidc 인데 식별자 입력(개발용) 로그인을 시도함 — 403. */
+export class IdentityLoginDisabledError extends AppError {
+  constructor() {
+    super('forbidden', 'identity_login_disabled', '이 서버는 OIDC 로그인만 허용합니다. 로그인 화면의 "OIDC로 로그인"을 쓰세요.');
   }
 }
 

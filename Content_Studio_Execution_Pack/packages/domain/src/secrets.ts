@@ -47,7 +47,8 @@ export interface SecretAad {
   scopeId?: string;
 }
 
-export type SecretPurpose = 'oauth_token' | 'pkce_verifier' | 'oauth_pending_token';
+/** T21-P1b: oidc_login_state = OIDC 로그인 요청(auth_oidc_states)의 PKCE verifier·nonce. owner·계정이 없는 단계라 ownerId·channelAccountId 는 '' 이고 scopeId 가 그 행 ID. */
+export type SecretPurpose = 'oauth_token' | 'pkce_verifier' | 'oauth_pending_token' | 'oidc_login_state';
 
 export class SecretsNotConfiguredError extends AppError {
   readonly problems: string[];

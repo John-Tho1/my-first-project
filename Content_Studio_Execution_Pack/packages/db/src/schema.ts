@@ -775,6 +775,32 @@ export const sessions = pgTable(
 );
 
 /**
+ * T21-P1b: 진행 중인 OIDC 로그인 요청(로그인 전 단계 — owner 없음). state 원문은 저장하지 않고 SHA-256 만(state_hash),
+ * 시작한 브라우저의 결합 쿠키도 해시만(browser_hash). PKCE verifier·nonce 는 봉인(encrypted_payload — AAD 에 이 행 ID, 용도 oidc_login_state).
+ * 한 번만 쓰임(used_at — callback 이 찾으면 결과와 관계없이 사용 처리), TTL 10분, settings_hash = 시작 때의 issuer·client_id·redirect·scope 지문.
+ * 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES — 10분짜리 인증 임시 상태).
+ */
+export const authOidcStates = pgTable(
+  'auth_oidc_states',
+  {
+    id: id(),
+    stateHash: text('state_hash').notNull(),
+    browserHash: text('browser_hash').notNull(),
+    encryptedPayload: text('encrypted_payload').notNull(),
+    keyVersion: integer('key_version').notNull(),
+    settingsHash: text('settings_hash').notNull(),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('auth_oidc_states_hash_uq').on(t.stateHash),
+    check('auth_oidc_states_sealed_chk', sql`${t.encryptedPayload} like 'csk1:%'`),
+    index('auth_oidc_states_created_idx').on(t.createdAt),
+  ],
+);
+
+/**
  * 내보내기 실행 기록(T05). path 는 워크스페이스 루트 기준 상대 경로(루트 밖이면 파일 이름만) — 비밀·절대 경로를 넣지 않는다.
  * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES) — 환경마다 다른 운영 기록이다.
  */

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_MIN_MAX_OUTPUT_TOKENS } from './llm-live';
+import { isPlainRedirectUri } from './oauth';
+import { isValidOidcClientId, isValidOidcIssuerUrl, isValidOidcScopes, OIDC_DEFAULT_SCOPES } from './oidc-format';
 
 /**
  * 환경변수 계약(docs/04 "환경변수 계약").
@@ -37,6 +39,11 @@ const LABELS: Record<string, string> = {
   AUTH_MODE: 'AUTH_MODE(인증 방식)',
   AUTH_SESSION_TTL_MINUTES: 'AUTH_SESSION_TTL_MINUTES(세션 유효 시간, 분)',
   AUTH_COOKIE_SECURE: 'AUTH_COOKIE_SECURE(쿠키 Secure 속성)',
+  AUTH_ALLOWED_SUBJECT: 'AUTH_ALLOWED_SUBJECT(허용 OIDC sub)',
+  OIDC_ISSUER_URL: 'OIDC_ISSUER_URL(OIDC 발급자 URL, https)',
+  OIDC_CLIENT_ID: 'OIDC_CLIENT_ID(OIDC 클라이언트 ID)',
+  OIDC_REDIRECT_URI: 'OIDC_REDIRECT_URI(OIDC redirect URI)',
+  OIDC_SCOPES: 'OIDC_SCOPES(OIDC scope, openid 포함)',
   STORAGE_DRIVER: 'STORAGE_DRIVER(파일 저장소)',
   STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
   EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
@@ -155,7 +162,7 @@ export const configSchema = z.object({
       .default(0),
   ),
   AUTH_ALLOWED_IDENTITY: opt(z.string().min(3).default('owner@example.local')),
-  /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T13, 미구현 → 로그인 거부). */
+  /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T21-P1b — 일반 OpenID Connect, 아래 OIDC_* 와 oidc.ts). */
   AUTH_MODE: opt(z.enum(['dev', 'oidc']).default('dev')),
   /** 세션 유효 시간(분). 5분 ~ 30일. */
   AUTH_SESSION_TTL_MINUTES: opt(
@@ -168,6 +175,21 @@ export const configSchema = z.object({
   ),
   /** auto: APP_BASE_URL 이 http://localhost·127.0.0.1 이면 Secure 없이, 그 외에는 Secure. */
   AUTH_COOKIE_SECURE: opt(z.enum(['auto', 'true', 'false']).default('auto')),
+  /**
+   * T21-P1b: OIDC 로그인에서 허용할 ID token 의 sub(선택). 설정하면 sub 가 정확히 같아야 한다. AUTH_ALLOWED_IDENTITY 를 환경에 명시하면
+   * email(+ email_verified=true) 도 맞아야 한다. 둘 중 하나는 있어야 OIDC 로그인이 준비된다(oidc.ts oidcLoginReadiness). 값은 화면·로그에 내보내지 않는다.
+   */
+  AUTH_ALLOWED_SUBJECT: opt(z.string().min(1).max(255).regex(/^\S+$/).optional()),
+  /**
+   * T21-P1b: OIDC 발급자(issuer) URL — https 만, query·fragment·사용자 정보 없음. discovery 는 이 값 + /.well-known/openid-configuration.
+   * IdP 를 정하지 않는다(Google 등은 사용자가 고른다). 클라이언트 시크릿(OIDC_CLIENT_SECRET)은 이 스키마에 없다 — 서버 환경에서만 읽고 값은 내보내지 않는다.
+   */
+  OIDC_ISSUER_URL: opt(z.string().refine(isValidOidcIssuerUrl).optional()),
+  OIDC_CLIENT_ID: opt(z.string().refine(isValidOidcClientId).optional()),
+  /** T21-P1b: IdP 에 등록한 redirect URI. APP_BASE_URL 의 origin + /api/auth/oidc/callback 과 정확히 같아야 준비된다(oidcLoginReadiness). */
+  OIDC_REDIRECT_URI: opt(z.string().refine(isPlainRedirectUri).optional()),
+  /** T21-P1b: 요청 scope(공백 구분, openid 필수). 기본 "openid email". */
+  OIDC_SCOPES: opt(z.string().refine(isValidOidcScopes).default(OIDC_DEFAULT_SCOPES)),
   STORAGE_DRIVER: opt(z.enum(['local', 'object']).default('local')),
   STORAGE_LOCAL_DIR: opt(z.string().min(1).default('./data/assets')),
   /** T05: 내보내기 묶음(<id>/ 폴더 + <id>.zip)을 두는 곳. 개인 원문이 들어 있으므로 gitignore 된 data/ 아래를 쓴다. */

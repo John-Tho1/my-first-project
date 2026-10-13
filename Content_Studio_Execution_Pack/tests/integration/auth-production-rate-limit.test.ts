@@ -87,12 +87,12 @@ describe('운영 빌드(NODE_ENV=production) + AUTH_MODE=dev → 로그인 거�
     err.mockRestore();
   });
 
-  it('NODE_ENV=production + AUTH_MODE=oidc → 기존처럼 503 oidc_not_configured(운영 인증 미구현, T21-P1b)', async () => {
+  it('NODE_ENV=production + AUTH_MODE=oidc → 식별자 입력 로그인은 403 identity_login_disabled(T21-P1b — OIDC 로그인은 auth-oidc.test.ts)', async () => {
     vi.stubEnv('NODE_ENV', 'production');
     vi.stubEnv('AUTH_MODE', 'oidc');
     const res = await loginJson(OWNER);
-    expect(res.status).toBe(503);
-    expect((await res.json()).error).toBe('oidc_not_configured');
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('identity_login_disabled');
   });
 
   it('NODE_ENV=test(현재)·development + dev → 허용(기존 동작)', async () => {

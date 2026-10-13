@@ -30,7 +30,7 @@ const FORBIDDEN = [
   'jobs', 'uploads', 'captures', 'attention_plans', 'ops', 'queued', 'sessions', 'bytes',
 ];
 /** 로그인 뒤 GET /api/health/details 의 키 */
-const DETAIL_KEYS = ['app', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
+const DETAIL_KEYS = ['app', 'auth', 'db', 'llm', 'modes', 'status', 'stt', 'time_msk', 'time_utc', 'timezone', 'version', 'worker'];
 
 function expectPublicOnly(body: Record<string, unknown>) {
   expect(Object.keys(body).sort()).toEqual(PUBLIC_KEYS);
@@ -213,6 +213,10 @@ describe('GET /api/health/details (로그인한 owner 만)', () => {
     });
     expect(Object.keys(body.db).sort()).toEqual(['driver', 'migrated', 'ok']);
     expect(Object.keys(body.worker).sort()).toEqual(['last_tick_utc', 'mode']);
+    // T21-P1b: 로그인 방식·OIDC 준비 상태(이름만)
+    expect(Object.keys(body.auth).sort()).toEqual(['missing', 'mode', 'oidc_ready']);
+    expect(body.auth).toMatchObject({ mode: 'dev', oidc_ready: false });
+    expect(body.auth.missing).toContain('AUTH_MODE=oidc');
     expect(body.time_msk).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \(MSK\)$/);
     expect(typeof body.version).toBe('string');
     // 앞 시험의 로그인한 처리 경로가 tick 을 돌렸다 — details 는 그 시각을 보여 준다(자기가 tick 을 돌리지는 않음)

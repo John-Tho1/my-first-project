@@ -1,6 +1,6 @@
 # Content Studio 운영 배포 절차(초안, T21-P2 · FIX1)
 
-> **지금은 배포할 수 없다.** 운영 로그인(OIDC, T21-P1b)이 아직 구현되지 않았다. 운영 빌드에서는 `AUTH_MODE=dev` 가 거부되고(T21-P1a), `AUTH_MODE=oidc` 는 모든 로그인을 거부한다. 이 폴더의 파일로 서버를 띄우면 생존 확인(`/api/health`)만 되고 아무도 로그인할 수 없다.
+> **운영 로그인(OIDC)은 코드가 생겼지만(T21-P1b) 실제 IdP 와 연결해 본 적이 없다(not_run).** 운영 빌드에서는 `AUTH_MODE=dev` 가 거부되고(T21-P1a), `AUTH_MODE=oidc` 는 아래 "4.1 OIDC 로그인 설정"의 값이 모두 준비됐을 때만 로그인할 수 있다. IdP 선택·IdP 콘솔에서 클라이언트 만들기·실제 로그인 확인은 **사용자 단계이며 별도 승인 범위**다(외부 계정·외부 연결). 그 전에는 이 폴더의 파일로 서버를 띄워도 생존 확인(`/api/health`)만 되고 아무도 로그인할 수 없다.
 >
 > 이 폴더는 **파일만** 있다. 실제 서버·도메인·인증서·systemd·Caddy 에서 실행해 본 적이 없다(not_run). 스크립트는 `bash -n`(문법)과 인수 검사만 로컬에서 확인했다. 공급자 가입·결제·DNS·외부 연결은 사용자 승인 범위(docs/handoffs/T21_DEPLOY_REVIEW.md §4.2)를 받은 뒤에만 한다.
 
@@ -77,6 +77,14 @@ sudo bash "$APP_ROOT/deploy/scripts/check-env.sh"           # 파일 존재·roo
 - 환경 파일이 없으면 systemd 가 서비스를 시작하지 않는다(`EnvironmentFile=` 에 `-` 를 붙이지 않았다).
 - `WORKER_INLINE_INTERVAL_SECONDS`: 0(끔) 또는 5~600 초. 0 이면 예약 작업·업로드 24시간 만료 정리·`RETENTION_SWEEP_MODE=auto`·주기 수집이 로그인한 요청이 있을 때만 진행되고, 서버 시작 로그에 경고가 남는다.
 
+### 4.1 OIDC 로그인 설정(T21-P1b — 사용자 단계, 별도 승인 필요)
+앱은 IdP 를 정하지 않는다(일반 OpenID Connect, 라이브러리 `openid-client` 6.8.8). 아래는 **사용자가 승인한 뒤** 사용자가 직접 한다 — IdP 계정·콘솔 작업과 실제 로그인은 외부 연결이다.
+1. IdP 를 고른다(예: Google). IdP 콘솔에서 "웹 애플리케이션" OAuth/OIDC 클라이언트를 만들고 **승인된 redirect URI** 에 `https://<도메인>/api/auth/oidc/callback` 을 글자 그대로 넣는다(끝의 `/`·대소문자·포트까지 같아야 한다).
+2. `/etc/content-studio/env` 에 넣는다(값은 이 파일에만): `OIDC_ISSUER_URL`(IdP 의 issuer, https — 예: Google 은 `https://accounts.google.com`), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI=https://<도메인>/api/auth/oidc/callback`(= `APP_BASE_URL` + 이 경로), `OIDC_SCOPES=openid email`(기본값), 허용 신원 `AUTH_ALLOWED_IDENTITY=<본인 이메일>`(ID token 의 email 이 같고 IdP 가 `email_verified=true` 로 보내야 함) — 선택으로 `AUTH_ALLOWED_SUBJECT=<IdP 의 sub>`(이메일 재할당에 강함, 둘 다 넣으면 둘 다 맞아야 함). `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION` 도 필요하다(로그인 요청의 PKCE verifier·nonce 를 10분 봉인).
+3. 서비스를 다시 시작하고 `/login` 의 **OIDC로 로그인** 을 누른다. 설정이 빠졌으면 화면에는 "설정이 준비되지 않았습니다"만 나오고, 빠진 **이름**은 `journalctl -u content-studio` 의 `[auth] oidc_not_configured: …` 한 줄에 있다(값 없음). 로그인 후에는 설정 화면 "로그인(인증)"·`/api/health/details` 의 `auth` 에서도 본다.
+- `check-env.sh` 는 OIDC_* 값을 아직 검사하지 않는다(앱이 시작·로그인 때 이름만 알려 준다).
+- 로그인 실패(state 오류·검증 실패·허용 신원 불일치)는 식별자 로그인과 같은 전역 15분·10회 창에서 센다. 막히면 15분 동안 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로) — 프록시 수준 요청 제한은 여전히 없다.
+
 ## 5. 서비스 시작·확인
 ```sh
 set -eu
@@ -109,11 +117,11 @@ sudo systemctl restart caddy
 ```
 - DNS A 레코드가 서버 IP 를 가리킨 뒤에 인증서가 발급된다.
 - 확인: `curl -fsSI https://<도메인>/api/health`(200, `strict-transport-security`·`x-content-type-options` 헤더, `server`·`x-powered-by` 없음), `curl -sI http://<도메인>/` 가 https 로 넘어감, 외부에서 `:3000` 접속 불가.
-- 로그인: P1b 전에는 거부되는 것이 정상이다.
+- 로그인: 4.1 의 OIDC 설정(사용자 단계·별도 승인)을 마치기 전에는 거부되는 것이 정상이다.
 
 ## 7. 업그레이드(새 SHA)
 migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적용, down migration 없음). 그래서 업그레이드 전에 반드시 백업한다. 각 단계는 앞 단계가 성공했을 때만 한다.
-1. **앱 export ZIP(정본 백업)** — 화면 `/ops` 또는 `POST /api/exports`(로그인 필요 — P1b 이후). 만든 ZIP 을 서버 밖(사용자 PC 등, T21-P4 에서 정한 위치)으로 옮긴다.
+1. **앱 export ZIP(정본 백업)** — 화면 `/ops` 또는 `POST /api/exports`(로그인 필요 — 4.1 OIDC 설정 이후). 만든 ZIP 을 서버 밖(사용자 PC 등, T21-P4 에서 정한 위치)으로 옮긴다.
    - 로그인할 수 없으면 CLI(서비스를 멈춘 뒤 — PGlite 잠금):
      ```sh
      set -eu
@@ -172,6 +180,7 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 
 ## 10. 하지 않은 것·남은 위험
 - 실제 서버·Caddy·systemd·인증서·방화벽에서 한 번도 실행하지 않았다. 스크립트는 `deploy/scripts/tests/run-all.sh`(가짜 systemctl·mountpoint·id 로 동작 확인, pnpm 불필요)로만 시험했다. unit 의 보호 설정(`ProtectSystem=strict`·`ReadWritePaths`)이 PGlite·Next 와 맞는지 실측하지 않았다 — 처음 시작 때 `journalctl` 로 확인한다. `SystemCallFilter` 는 넣지 않았다. shellcheck 는 이 PC 에 없어 돌리지 않았다(bash -n 만).
+- OIDC 로그인은 프로세스 안 가짜 IdP 로만 시험했다 — 실제 IdP(discovery 문서·키 교체·시계 오차·email_verified 표기)와의 동작은 확인하지 않았다(not_run).
 - CSP 헤더 없음(Next 인라인 스크립트 nonce 필요). 프록시 수준 요청 제한(rate limit) 없음 — 로그인 횟수 제한은 앱(T21-P1a/b)에 있다.
 - 주기 처리는 웹 요청과 같은 프로세스에서 돈다. 부하에서의 응답 지연은 측정하지 않았다(T21_DEPLOY_REVIEW §5-5).
 - 서버 밖 백업 위치는 아직 정하지 않았다(T21-P4).

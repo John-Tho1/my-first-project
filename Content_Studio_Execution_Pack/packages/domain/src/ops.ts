@@ -68,6 +68,8 @@ export const RETENTION_PROTECTED_TABLES = [
   'oauth_credentials',
   'oauth_states',
   'oauth_pending_tokens',
+  // T21-P1b: OIDC 로그인 요청 — 보존 정리 대상 아님(만료·사용된 요청은 로그인 시작이 스스로 지운다, 진행 중 최대 100개)
+  'auth_oidc_states',
 ] as const;
 
 const HOUR = 3600_000;

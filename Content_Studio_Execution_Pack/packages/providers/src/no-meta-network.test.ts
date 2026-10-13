@@ -194,6 +194,24 @@ describe('Meta 호스트 차단 — 경로별', () => {
     expect(guard().attempts.length).toBe(before);
   });
 
+  it('T21-P1b: OIDC IdP 도메인과 .test(가짜 IdP 호스트)도 막는다 — 비슷한 이름은 통과', async () => {
+    const before = guard().attempts.length;
+    await expect(fetch('https://accounts.google.com/.well-known/openid-configuration')).rejects.toThrow(BLOCKED);
+    await expect(fetch('https://oauth2.googleapis.com/token')).rejects.toThrow(BLOCKED);
+    await expect(fetch('https://login.microsoftonline.com/x')).rejects.toThrow(BLOCKED);
+    await expect(fetch('https://dev-1.okta.com/')).rejects.toThrow(BLOCKED);
+    await expect(fetch('https://IDP.TEST./.well-known/openid-configuration')).rejects.toThrow(BLOCKED);
+    expect(() => https.request('https://idp.test/token')).toThrow(BLOCKED);
+    expect(guard().attempts.slice(before)).toEqual(['accounts.google.com', 'oauth2.googleapis.com', 'login.microsoftonline.com', 'dev-1.okta.com', 'idp.test', 'idp.test']);
+    // 비슷하지만 다른 이름(판정만, 로컬 주소로): google.com.example · contest
+    for (const servername of ['google.com.example', 'contest']) {
+      const sock = tls.connect({ host: '127.0.0.1', port: (server.address() as AddressInfo).port, servername });
+      sock.on('error', () => undefined);
+      sock.destroy();
+    }
+    expect(guard().attempts.length).toBe(before + 6);
+  });
+
   it('기록을 비운다(의도한 시도)', () => {
     expect(guard().attempts.length).toBeGreaterThanOrEqual(35);
     guard().attempts.length = 0;

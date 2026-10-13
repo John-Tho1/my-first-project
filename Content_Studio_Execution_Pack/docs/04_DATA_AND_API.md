@@ -20,6 +20,7 @@
 | variant_assets | variant_version_id, asset_id, order, role |
 | channel_accounts | owner_id, platform, external_account_id, display_name, state, capability_snapshot |
 | oauth_credentials | channel_account_id, encrypted_token, key_version, expiry, scopes, revoked_at |
+| auth_oidc_states | (T21-P1b, owner 없음 — 로그인 전) state_hash, browser_hash, encrypted_payload(PKCE verifier·nonce 봉인), key_version, settings_hash, expires_at(10분), used_at — export/restore 제외 |
 | distribution_plans | owner_id, target_summary, status, created_at |
 | distribution_items | plan_id, account_id, variant_version_id, payload_json, payload_hash, requested_result, schedule_utc, timezone |
 | approvals | owner_id, distribution_item_id, payload_hash, approved_at, revoked_at, purpose |
@@ -65,9 +66,11 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |
 | 복원 미리보기 | POST /api/restores/preview | 버전·checksum·충돌 검사 |
-| 로그인(공개 예외) | POST /api/auth/login | 같은 출처(CSRF) 필수. AUTH_MODE=dev(D3): 허용 식별자 1개, localhost 전용, **운영 빌드(NODE_ENV 가 development·test·없음 이외)에서는 서버 시작·설정 읽기·로그인 모두 거부**(503 `dev_login_refused_in_production`, T21-P1a/G1a). 시도 횟수 제한: 최근 15분 실패(식별자 불일치·잘못된 본문) 전체 10회 이상이면 식별자와 무관하게 429 `login_rate_limited`(IP 미사용, 마지막 성공 이전 실패는 세지 않음, `auth.login_denied` 감사 기록으로 셈. 재검사·판정·기록은 전역 advisory 잠금 한 트랜잭션에서 직렬화, 순서는 로그인 순번 `version_or_hash` — FIX-T21P1A). AUTH_MODE=oidc 는 운영 인증 미구현으로 503(T21-P1b) |
+| 로그인(공개 예외) | POST /api/auth/login | 같은 출처(CSRF) 필수. AUTH_MODE=dev(D3): 허용 식별자 1개, localhost 전용, **운영 빌드(NODE_ENV 가 development·test·없음 이외)에서는 서버 시작·설정 읽기·로그인 모두 거부**(503 `dev_login_refused_in_production`, T21-P1a/G1a). 시도 횟수 제한: 최근 15분 실패(식별자 불일치·잘못된 본문) 전체 10회 이상이면 식별자와 무관하게 429 `login_rate_limited`(IP 미사용, 마지막 성공 이전 실패는 세지 않음, `auth.login_denied` 감사 기록으로 셈. 재검사·판정·기록은 전역 advisory 잠금 한 트랜잭션에서 직렬화, 순서는 로그인 순번 `version_or_hash` — FIX-T21P1A). AUTH_MODE=oidc 이면 403 `identity_login_disabled`(T21-P1b — 아래 OIDC 로그인) |
+| OIDC 로그인 시작(공개 예외) | GET /api/auth/oidc/start | T21-P1b. AUTH_MODE=oidc·준비 상태(아니면 503 `oidc_not_configured`, 빠진 이름은 서버 로그에만) · `Sec-Fetch-Site` 가 있으면 same-origin·none 만(아니면 403 `csrf`) · 전역 시도 제한(429) · discovery(캐시 1시간, 실패 502 `oidc_provider_unavailable`) → `auth_oidc_states` 행(state·결합 쿠키 sha256, PKCE verifier·nonce 봉인, 10분, 1회용, 진행 중 최대 100개 — 넘으면 오래된 것부터 삭제) → 303 IdP 인증 URL(response_type=code, PKCE S256, state, nonce, scope, redirect_uri) + `cs_oidc_flow` 쿠키. 응답에 `Referrer-Policy: no-referrer`·`Cache-Control: no-store` |
+| OIDC 로그인 완료(공개 예외) | GET /api/auth/oidc/callback | T21-P1b. 전역 시도 제한 조기 검사(429, state 소비 없음·감사 없음) → 요청 origin+path = `OIDC_REDIRECT_URI` 정확 일치 → state 1회용 소비(같은 브라우저 결합 쿠키·10분·설정 지문 — 다른 브라우저면 소비하지 않음) → IdP `error` 면 401 `oidc_cancelled` → openid-client 로 code 교환(PKCE)·ID token 검증(서명 JWKS·iss·aud·exp·iat·nonce) → 허용 신원(`AUTH_ALLOWED_IDENTITY` 명시 시 email+email_verified=true, `AUTH_ALLOWED_SUBJECT` 시 sub) → `withLoginAttemptLock`(T21-P1a 와 같은 전역 잠금·순번) 안에서 재검사 후 세션+`auth.login`{mode:'oidc'} 또는 `auth.login_denied`{reason,check,mode}. reason `oidc_invalid`·`oidc_identity_mismatch` 는 실패 횟수에 포함, `oidc_provider_error`·`oidc_cancelled` 는 제외. 오류: 400 `oidc_state_invalid` · 401 `oidc_login_invalid` · 403 `oidc_identity_denied` · 502 `oidc_provider_unavailable` · 503 `oidc_not_configured`. 브라우저는 303 `/` 또는 `/login?error=<코드>`. 결합 쿠키는 항상 지움 |
 | 생존 확인(공개 예외) | GET /api/health | 로그인 없음. 응답은 정확히 `{status:'ok'\|'degraded', app, time_utc, db_ok}`(ok 200, degraded 503). 부작용 없음(worker tick 안 돎). 모드·준비 상태·버전·DB 드라이버·worker 정보 없음(T21-P3) |
-| 자세한 상태 | GET /api/health/details | 로그인한 owner 만(없으면 401). 모드·llm/stt 준비 상태(빠진 조건 이름만)·DB 드라이버/migrated·worker 모드/마지막 tick. 읽기 전용(tick 없음). 운영 숫자는 GET /api/ops/summary |
+| 자세한 상태 | GET /api/health/details | 로그인한 owner 만(없으면 401). 모드·llm/stt 준비 상태(빠진 조건 이름만)·`auth`{mode, oidc_ready, missing(이름만) — T21-P1b}·DB 드라이버/migrated·worker 모드/마지막 tick. 읽기 전용(tick 없음). 운영 숫자는 GET /api/ops/summary |
 | 작업 처리 실행 | POST /api/worker/tick | 로그인·같은 출처(CSRF) 필수, 이 owner 의 작업만(모의 어댑터). 세션 없음 401 — 아무 작업도 건드리지 않음 |
 
 런타임 입력·출력 validation은 M0/M1에서 이 계약에 맞춰 구현한다.
@@ -78,7 +81,8 @@ claim의 source_ref는 실제 허용 source_version 목록에 포함되어야 �
 HTML·코드·외부 명령은 자료로만 저장하고 실행하지 않는다. structured output은 출처 진위나 공개 승인 증거가 아니다.
 
 ## 환경변수 계약(실제 키 없음)
-APP_BASE_URL, APP_TIMEZONE=Europe/Moscow, DATABASE_URL, AUTH_*(AUTH_MODE=dev 는 NODE_ENV=production 등 운영 빌드에서 설정 오류 — T21-P1a),
+APP_BASE_URL, APP_TIMEZONE=Europe/Moscow, DATABASE_URL, AUTH_*(AUTH_MODE=dev 는 NODE_ENV=production 등 운영 빌드에서 설정 오류 — T21-P1a; AUTH_ALLOWED_SUBJECT 선택 — T21-P1b),
+OIDC_ISSUER_URL(https), OIDC_CLIENT_ID, OIDC_CLIENT_SECRET(서버 환경만, 설정 스키마 밖), OIDC_REDIRECT_URI(= APP_BASE_URL origin + /api/auth/oidc/callback), OIDC_SCOPES(기본 "openid email") — T21-P1b,
 STORAGE_DRIVER=local|object, STORAGE_*, ENCRYPTION_KEY_REF,
 LLM_MODE=mock|live, LLM_PROVIDER, LLM_MODEL, LLM_BUDGET_*,
 PUBLISH_MODE=disabled|enabled, COLLECTOR_MODE=disabled|enabled,

@@ -17,7 +17,7 @@ import {
   shouldTouchSession,
 } from './auth';
 import { loadConfig } from './config';
-import { CsrfError, DevLoginNotAllowedError, OidcNotConfiguredError } from './errors';
+import { CsrfError, DevLoginNotAllowedError, IdentityLoginDisabledError } from './errors';
 
 describe('assertDevLoginAllowed (localhost 전용)', () => {
   it.each(['http://localhost:3000', 'http://127.0.0.1:3000', 'https://localhost', 'http://localhost'])('%s 허용', (url) => {
@@ -32,9 +32,9 @@ describe('assertDevLoginAllowed (localhost 전용)', () => {
   ])('%s 거부', (url) => {
     expect(() => assertDevLoginAllowed({ APP_BASE_URL: url })).toThrow(DevLoginNotAllowedError);
   });
-  it('oidc 는 항상 OidcNotConfiguredError(T13)', () => {
-    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow(OidcNotConfiguredError);
-    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow('운영 인증 공급자는 아직 설정되지 않았습니다(T13)');
+  it('oidc 에서는 식별자 입력 로그인을 거부(T21-P1b — OIDC 로그인은 별도 경로)', () => {
+    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow(IdentityLoginDisabledError);
+    expect(() => assertLoginAvailable(loadConfig({ AUTH_MODE: 'oidc' }), 'test')).toThrow('이 서버는 OIDC 로그인만 허용합니다');
     expect(() => assertLoginAvailable(loadConfig({}), 'test')).not.toThrow();
     expect(() => assertLoginAvailable(loadConfig({ APP_BASE_URL: 'https://example.com' }), 'test')).toThrow(DevLoginNotAllowedError);
   });

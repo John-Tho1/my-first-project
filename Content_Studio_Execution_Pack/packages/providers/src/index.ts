@@ -9,6 +9,7 @@ export * from './collector';
 export * from './llm';
 export * from './llm-anthropic';
 export * from './oauth';
+export * from './oidc-login';
 export * from './threads-live-oauth';
 export * from './publisher';
 export * from './storage';

@@ -14,13 +14,13 @@ import {
   hashSessionToken,
   hashUserAgent,
   identityMatches,
+  IdentityLoginDisabledError,
   LOGIN_FAILURE_REASONS,
   LOGIN_FAILURE_WINDOW_MS,
   LoginDeniedError,
   loginInputSchema,
   LoginRateLimitedError,
   LoginSequenceExhaustedError,
-  OidcNotConfiguredError,
   sessionTtlMs,
 } from '@cs/domain';
 import { errorResponse, json, readBodyCapped, seeOther, wantsHtml } from '../../../../lib/api';
@@ -56,7 +56,7 @@ async function parseIdentity(request: Request): Promise<string> {
 /** 폼 제출 실패 시 /login?error=<코드>. 페이지는 코드별 고정 문구만 보여 준다(입력값을 되돌려 보여 주지 않음). */
 function loginErrorCode(e: unknown): string {
   if (e instanceof LoginDeniedError) return 'denied';
-  if (e instanceof OidcNotConfiguredError) return 'unavailable';
+  if (e instanceof IdentityLoginDisabledError) return 'identity_login_disabled';
   if (e instanceof DevLoginNotAllowedError) return 'not_allowed';
   if (e instanceof DevLoginRefusedInProductionError) return 'production_dev';
   if (e instanceof LoginRateLimitedError) return 'rate_limited';
@@ -69,6 +69,7 @@ function loginErrorCode(e: unknown): string {
 /**
  * POST /api/auth/login — AUTH_MODE=dev(D3): 허용 식별자 1개와 일치하면 세션을 만든다. 비밀번호 없음, localhost 전용.
  * T21-P1a: 운영 빌드에서는 dev 로그인 503(dev_login_refused_in_production), 최근 15분 실패 10회 이상이면 429(login_rate_limited).
+ * T21-P1b: AUTH_MODE=oidc 이면 403 identity_login_disabled(OIDC 로그인은 GET /api/auth/oidc/start → callback). 실패 횟수는 OIDC callback 실패와 함께 센다.
  * 응답: JSON 클라이언트는 200 {ok, expires_at} / 401 / 403 / 429 / 503, 브라우저 폼은 303(/ 또는 /login?error=…).
  * GET 등 다른 메서드는 정의하지 않는다(Next 가 405).
  */

@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.128.0",
-    "@cs/domain": "workspace:*"
+    "@cs/domain": "workspace:*",
+    "openid-client": "6.8.8"
   }
 }

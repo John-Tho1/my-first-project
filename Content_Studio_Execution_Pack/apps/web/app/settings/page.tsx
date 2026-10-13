@@ -5,6 +5,7 @@ import { budgetPolicy, CHANNEL_LABEL, formatMsk, fromMicro, LIVE_SETTLEMENT_POLI
 import { getSession } from '../../lib/auth';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
+import { oidcReadinessView } from '../../lib/oidc';
 import { revokeNotice } from '../../lib/revoke-view';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -45,6 +46,8 @@ export default async function SettingsPage({
   // T13: 계정 연결 상태(토큰·암호문 없음 — 상태·만료·scope 이름만)
   const accounts = await listAccountHealth(db, session.ownerId);
   const oauth = oauthReadinessView(config);
+  // T21-P1b: 로그인(인증) 방식·OIDC 준비 상태 — 설정 이름만(값 없음)
+  const authView = oidcReadinessView(config);
   const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
   // M4UI FIX1: 연결 해제 결과는 revokeNotice — 끝나지 않은 해제(revoke=incomplete&revoke_code=허용 코드)는 경고로, "해제했습니다"라고 하지 않는다
   const revokeMsg = revokeNotice({ revoked: str(q.revoked), revoke: str(q.revoke), code: str(q.revoke_code) });
@@ -71,6 +74,17 @@ export default async function SettingsPage({
           {err}
         </p>
       ) : null}
+
+      <section className="card archive" aria-labelledby="auth-title">
+        <h3 id="auth-title">로그인(인증)</h3>
+        <p className="meta">
+          <span className="tag">방식: {authView.mode === 'oidc' ? 'OpenID Connect(OIDC)' : '개발용(localhost 전용, 비밀번호 없음)'}</span>
+        </p>
+        <p className="notice" role="note">
+          {authView.ready ? 'OIDC 로그인 준비됨.' : `OIDC 로그인 준비 안 됨: ${authView.missing.join(', ')}`}
+        </p>
+        <p className="note">IdP·클라이언트 ID·시크릿·허용 계정 값은 이 화면에 보이지 않습니다(설정 이름만).</p>
+      </section>
 
       <section className="card archive" aria-labelledby="ai-title">
         <h3 id="ai-title">AI 모드·비용</h3>

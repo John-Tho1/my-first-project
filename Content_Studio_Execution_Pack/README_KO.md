@@ -137,7 +137,7 @@ pnpm dev                                  # http://localhost:3000 , 생존: http
 dev 서버는 Turbopack 파일 시스템 캐시를 끈 채 뜬다(`apps/web/next.config.ts`의 `experimental.turbopackFileSystemCacheForDev: false`, 결정 D21). 재시작·`pnpm build` 뒤 동적 경로(`/distribute/{id}` 등)가 404 로 나오던 문제(M3 화면 확인 D9) 때문이다. 그래도 404 가 나오면 dev 서버를 끄고 `apps/web/.next/dev`·`apps/web/.next/cache`를 지운 뒤 다시 띄운다. `pnpm build`는 dev 서버를 끈 상태에서 실행한다.
 
 ### 로그인 (M1, T02)
-M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`AUTH_MODE=dev`)** 만 제공한다(결정 D3, `docs/DECISIONS.md`). 비밀번호 없이 허용된 식별자 1개(`AUTH_ALLOWED_IDENTITY`)만 접속할 수 있고, `APP_BASE_URL` 이 `localhost`/`127.0.0.1` 일 때만 동작한다.
+로그인 수단은 둘이다. 로컬 개발은 **개발용 로그인(`AUTH_MODE=dev`)**(결정 D3, `docs/DECISIONS.md`), 운영은 **OpenID Connect 로그인(`AUTH_MODE=oidc`, T21-P1b — 아래 "운영 로그인(OIDC)")**. 개발용 로그인은 비밀번호 없이 허용된 식별자 1개(`AUTH_ALLOWED_IDENTITY`)만 접속할 수 있고, `APP_BASE_URL` 이 `localhost`/`127.0.0.1` 일 때만 동작한다.
 
 1. `.env.local` 에서 `AUTH_ALLOWED_IDENTITY` 를 본인이 쓸 식별자로 바꾼다(기본 placeholder: `owner@example.local`).
 2. `pnpm dev` 후 http://localhost:3000 을 열면 `/login` 으로 이동한다. 식별자를 입력하면 `/`(오늘)로 돌아간다.
@@ -145,7 +145,7 @@ M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`A
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용, **운영 빌드에서는 거부** — 아래 T21-P1a). `oidc` = 운영 인증(T21-P1b 예정, 미구현) — 지금은 모든 로그인을 `운영 인증 공급자는 아직 설정되지 않았습니다(T13)` 로 거부 |
+| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용, **운영 빌드에서는 거부** — 아래 T21-P1a). `oidc` = OpenID Connect 로그인(T21-P1b, 아래). oidc 에서는 식별자 입력 로그인(`POST /api/auth/login`)을 403 `identity_login_disabled` 로 거부 |
 | `AUTH_ALLOWED_IDENTITY` | `owner@example.local` | 로그인 가능한 유일한 식별자. 바꾸면 기존 세션도 무효 |
 | `AUTH_SESSION_TTL_MINUTES` | `720` | 세션 유효 시간(분, 5~43200). 연장(sliding) 없음 |
 | `AUTH_COOKIE_SECURE` | `auto` | `auto` = `http://localhost`·`127.0.0.1` 이면 Secure 끔, 그 외 켬 |
@@ -154,7 +154,14 @@ M1에는 운영 인증 공급자(OIDC)가 아직 없어 **개발용 로그인(`A
 - 세션: 쿠키 `cs_session`(HttpOnly, SameSite=Lax, Path=/). 토큰 원문은 쿠키에만 있고 DB(`sessions`)에는 sha256 해시만 저장한다. 로그아웃은 POST 로만 가능하다.
 - 상태를 바꾸는 요청(로그인·로그아웃·업로드)은 `Origin`(없으면 `Referer`)이 `APP_BASE_URL` 과 같아야 한다. 그래서 `APP_BASE_URL=http://localhost:3000` 이면 `http://127.0.0.1:3000` 으로 열었을 때 403 이 난다 — 주소창 주소를 `APP_BASE_URL` 과 맞춘다.
 - 다른 사용자의 capture·파일 ID 로는 조회·다운로드할 수 없다(항상 404).
-- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영 인증(OIDC)은 아직 없다(T21-P1b, `docs/handoffs/T21_DEPLOY_REVIEW.md` G1).
+- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영은 `AUTH_MODE=oidc`(아래).
+- **운영 로그인(OIDC, T21-P1b — `docs/handoffs/T21_DEPLOY_REVIEW.md` G1)**: 검증된 라이브러리 `openid-client`(panva, **6.8.8 고정**, 2026-09-05 공개 — 전이 의존성 `jose` 6.2.12·`oauth4webapi` 3.8.8 도 2026-09-05)로 일반 OpenID Connect 를 쓴다. IdP 는 정하지 않았다(Google 등은 사용자가 고른다). 자체 비밀번호·자체 JWT 검증은 없다.
+  - 설정(값은 서버 환경에만 — 저장소·화면·로그에 값 없음): `AUTH_MODE=oidc` · `OIDC_ISSUER_URL`(https 만) · `OIDC_CLIENT_ID` · `OIDC_CLIENT_SECRET`(서버 환경 변수로만 읽음, 설정 스키마 밖) · `OIDC_REDIRECT_URI`(= `APP_BASE_URL` 의 origin + `/api/auth/oidc/callback`, 글자까지 같아야 함 — IdP 에도 이 값을 등록) · `OIDC_SCOPES`(기본 `openid email`, openid 필수) · 허용 신원 · `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(로그인 요청의 PKCE verifier·nonce 를 10분 봉인).
+  - 허용 신원(결정): `AUTH_ALLOWED_IDENTITY` 를 **환경에 명시**하면 ID token 의 `email` 이 그 값과 같고(대소문자 무시) `email_verified` 가 불리언 `true` 여야 한다. `AUTH_ALLOWED_SUBJECT` 를 설정하면 `sub` 가 정확히 같아야 한다(issuer 가 하나라 issuer+sub 고정 — 이메일 재할당에 강함). 둘 다 설정하면 둘 다 맞아야 한다. 둘 다 없으면(기본값 `owner@example.local` 뿐이면) 준비 안 됨. 다른 사용자는 만들지 않는다 — owner 는 언제나 `AUTH_ALLOWED_IDENTITY`(기본값 포함)의 행이라 dev 로 쓰던 자료가 그대로 이어진다.
+  - 흐름: `/login` 의 **OIDC로 로그인** → `GET /api/auth/oidc/start`(다른 사이트에서 연 요청 거부 · 준비 상태 · 시도 제한 · discovery(1시간 캐시, 요청당 10초 제한) · state·nonce·PKCE S256 난수 → 로그인 요청 행 `auth_oidc_states`(state·브라우저 결합 쿠키는 해시만, verifier·nonce 봉인, 10분, 1회용, 진행 중 최대 100개) · 결합 쿠키 `cs_oidc_flow`(HttpOnly·SameSite=Lax·Path=/api/auth/oidc)) → IdP → `GET /api/auth/oidc/callback`(요청 주소 = `OIDC_REDIRECT_URI` 정확 일치 · state 1회용 소비(같은 브라우저·10분·설정 지문) · 라이브러리가 code 교환(PKCE)과 ID token 검증(서명 JWKS·iss·aud·exp·iat·nonce) · 허용 신원 → **T21-P1a 와 같은 전역 잠금 판정(`withLoginAttemptLock`)** 에서 세션 생성·`auth.login`(mode oidc) 또는 `auth.login_denied`(reason·check)).
+  - 실패: 코드별 고정 한국어 문구(`/login?error=<코드>`, JSON 은 `error`) — `oidc_not_configured`(503) · `oidc_state_invalid`(400) · `oidc_login_invalid`(401) · `oidc_identity_denied`(403) · `oidc_provider_unavailable`(502 — IdP 5xx·시간 초과·discovery 실패) · `oidc_cancelled`(401 — IdP 에서 거부) · `login_rate_limited`(429). **state 오류·검증 실패(`oidc_invalid`)·허용 신원 불일치(`oidc_identity_mismatch`)는 식별자 로그인 실패와 같은 전역 15분·10회 창에서 센다**(IdP 장애·취소는 세지 않음). 막힌 동안은 맞는 callback 도 429(state 를 소비하지 않음). code·state·토큰·IdP 오류 본문·이메일 값은 응답·감사·로그에 남기지 않는다.
+  - 준비 상태(빠진 설정 이름만): 로그인 후 설정 화면 "로그인(인증)"·`GET /api/health/details` 의 `auth`. 로그인 전에는 서버 로그 `[auth] oidc_not_configured: <이름들>`.
+  - 시험: 프로세스 안 가짜 IdP(`tests/helpers/fake-oidc-idp.ts` — discovery·JWKS·token endpoint, 생성한 RSA 키로 서명)만 쓴다. 실제 IdP 연결은 하지 않았다(**not_run**) — IdP 콘솔에서 클라이언트를 만들고 실제로 로그인해 보는 일은 사용자 단계이며 별도 승인 범위다(`deploy/README_KO.md`).
 - **운영 빌드에서 dev 로그인 거부(T21-P1a, G1a)**: `NODE_ENV` 가 없음·빈 값·`development`·`test` 가 아니면(운영 빌드 `pnpm build`/`pnpm start` 는 `production`) `AUTH_MODE=dev`(또는 미설정)를 세 곳에서 거부한다 — ① 서버 시작(`apps/web/instrumentation.ts`: 한국어 안내 후 종료 코드 1 로 프로세스를 끝냄 — 다만 Next 가 "Ready" 를 먼저 출력하므로 종료 직전 짧은 순간의 요청 처리 여부는 확인하지 않았다. **보장은 ②·③ 이다**) ② 설정 읽기(`loadConfig` 가 `AUTH_MODE(인증 방식)` 이름만 담은 설정 오류 — 화면·API 가 열리지 않고 공개 `/api/health` 는 `degraded` 503) ③ 로그인 요청(`POST /api/auth/login` 503 `dev_login_refused_in_production`, 폼은 `/login?error=production_dev`). web 은 Next 빌드가 고정한 `NODE_ENV` 를 쓰므로 `pnpm start` 때 `NODE_ENV` 를 바꿔도 풀리지 않는다. **탈출구 없음**: 운영 빌드를 로컬에서 dev 로그인으로 돌리는 설정은 두지 않았다 — Next route handler 는 소켓의 실제 원격 주소를 주지 않고 Host·Origin·X-Forwarded-* 는 위조할 수 있어 "loopback 요청만"을 믿고 가릴 수 없기 때문이다. 로컬 사용·확인은 `pnpm dev` 로 한다. **worker·DB 스크립트도 같은 설정 검사를 쓴다**: `pnpm worker`·`pnpm db:migrate`·`pnpm db:seed`·`pnpm export`·`pnpm restore:*`·`pnpm drill:restore`·`pnpm secrets:rotate` 등을 `NODE_ENV=production` 으로 실행하려면 `AUTH_MODE=oidc` 도 함께 줘야 한다(아니면 같은 안내로 exit 1). 평소처럼 `NODE_ENV` 없이 실행하면 영향 없음(`pnpm drill:mock`·`drill:restore`·`db:migrate` 그대로 동작. `drill:mock` 은 NODE_ENV 를 넘기지 않는 고정 설정이라 운영 환경변수에서도 영향 없음).
 - **로그인 시도 횟수 제한(T21-P1a)**: 최근 15분 동안 실패한 로그인(식별자 불일치·잘못된 요청 본문)이 **전체 합계 10회**가 되면 그 뒤 시도는 식별자가 맞든 틀리든 같은 429 `login_rate_limited`(폼은 `/login?error=rate_limited`)로 거부한다. IP 는 프록시 헤더로 위조할 수 있어 쓰지 않고(전역 창), 식별자 존재 여부도 드러내지 않는다. 마지막 성공 로그인 이전의 실패는 세지 않는다. 실패 기록은 기존 감사 기록(`auth.login_denied`)을 그대로 세므로 별도 표·migration 이 없고 서버를 다시 켜도 유지된다. 429 자체는 감사 기록을 남기지 않는다. 대가: 막힌 동안(가장 오래된 실패가 15분을 넘을 때까지)은 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로). 동시 요청: 본문을 읽기 전 값싼 조기 검사 뒤, **재검사(잠금을 얻은 뒤의 시각)·판정·성공·실패 기록을 전역 advisory 잠금(`cs.auth.login`) 한 트랜잭션에서 직렬화**하므로 창 안 실패가 10회를 넘지 않는다(FIX-T21P1A). 본문이 늦게 와도 판정·기록 시각은 잠금 안 시각이다. 판정 기록에는 로그인 순번(감사 행 `version_or_hash`)을 붙여 같은 ms 의 성공·실패도 기록 순서로 가린다(순번 없는 예전·복원 기록끼리는 시각 비교, 같은 ms 면 성공 우선). 마지막 성공 찾기와 실패 세기는 SQL 한 문장(한 스냅숏)이라 잠금 밖 조기 검사도 섞인 상태를 세지 않는다(FIX2). 알려진 느슨함: 복원(add_missing)으로 다른 이력의 성공 행이 창 안에 섞이거나 시계가 뒤로 가면 그 창(최대 15분·되돌린 폭) 동안 실패를 덜 셀 수 있다.
 
@@ -522,7 +529,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm test:integration` | vitest 통합 테스트(`tests/integration`, PGlite 메모리 DB) | exit 0 |
 | `pnpm test:e2e` | Playwright E2E — M0에서는 실행하지 않음 | **exit 2 = NOT_RUN** (통과 아님) |
 | `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
-| `pnpm start` | 빌드 결과 실행(포트 3000). T21-P1a: 운영 빌드이므로 `AUTH_MODE=dev`(기본값)이면 시작을 거부한다(종료 코드 1). `AUTH_MODE=oidc` 면 시작하지만 운영 인증이 아직 없어 로그인할 수 없다(T21-P1b) — 로컬 사용은 `pnpm dev` | dev 설정: exit 1 + 한국어 안내 / oidc 설정: `/api/health` 200 |
+| `pnpm start` | 빌드 결과 실행(포트 3000). T21-P1a: 운영 빌드이므로 `AUTH_MODE=dev`(기본값)이면 시작을 거부한다(종료 코드 1). `AUTH_MODE=oidc` 면 시작하고 OIDC 설정이 모두 준비됐을 때만 OIDC 로 로그인할 수 있다(T21-P1b) — 로컬 사용은 `pnpm dev` | dev 설정: exit 1 + 한국어 안내 / oidc 설정: `/api/health` 200 |
 | `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표 + T16 Instagram 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
@@ -533,7 +540,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 ### PGlite 단일 연결 주의
 - 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.
 - PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline` — 로그인한 "작업 처리 실행"·전사 목록 조회 때 tick, `WORKER_INLINE_INTERVAL_SECONDS` > 0 이면 web 안 타이머로도 주기 tick(T21-P2). 공개 `/api/health` 는 tick 을 돌리지 않는다).
-- 운영 배포 파일(T21-P2, 파일만 — 배포한 적 없음, 운영 로그인 T21-P1b 전에는 배포 불가): `deploy/Caddyfile`·`deploy/content-studio.service`·`deploy/content-studio.env.example`·`deploy/scripts/`(build-release·check-env·backup-data — 실패 즉시 중단)·`deploy/README_KO.md`(저장소 루트와 앱 루트 `Content_Studio_Execution_Pack/` 구분, 설치·확인·업그레이드 전 백업·되돌리기).
+- 운영 배포 파일(T21-P2, 파일만 — 배포한 적 없음. 운영 로그인은 T21-P1b 로 코드가 생겼지만 실제 IdP 연결은 사용자 단계·별도 승인): `deploy/Caddyfile`·`deploy/content-studio.service`·`deploy/content-studio.env.example`·`deploy/scripts/`(build-release·check-env·backup-data — 실패 즉시 중단)·`deploy/README_KO.md`(저장소 루트와 앱 루트 `Content_Studio_Execution_Pack/` 구분, 설치·확인·업그레이드 전 백업·되돌리기).
 - `pnpm dev`/`pnpm start`가 켜져 있는 동안 `pnpm db:seed`·`pnpm db:migrate`·`pnpm worker`는 잠금 파일(`data/pglite/.content-studio.lock`) 때문에 한국어 안내와 함께 exit 1로 거부된다. 서버를 끄고 실행한다.
 - `WORKER_MODE=separate`는 `DB_DRIVER=postgres`(M3 예정, 아직 미구현)에서만 허용된다.
 

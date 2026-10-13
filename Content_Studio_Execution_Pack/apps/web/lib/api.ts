@@ -31,6 +31,7 @@ const STATUS: Record<AppErrorKind, number> = {
   budget_exceeded: 429,
   gone: 410,
   too_many_requests: 429,
+  upstream_failed: 502,
 };
 
 export function statusForError(e: AppError): number {

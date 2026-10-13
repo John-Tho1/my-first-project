@@ -1,5 +1,5 @@
 /**
- * LIVE-T1(D31 1단계 — 실제 호출 0)·LIVE-L1(D34 1단계): 모든 시험(unit·integration)의 setupFiles. Threads·Meta·Anthropic 호스트
+ * LIVE-T1(D31 1단계 — 실제 호출 0)·LIVE-L1(D34 1단계)·T21-P1b(OIDC IdP 도메인·.test — 아래 IDP_HOSTS): 모든 시험(unit·integration)의 setupFiles. Threads·Meta·Anthropic 호스트
  * (*.threads.com · *.threads.net · *.facebook.com · *.instagram.com · *.fbcdn.net · *.anthropic.com — 대소문자·끝의 점 "graph.threads.net." 정규화)로 가는 요청을
  * **연결·DNS 조회 전에** 거부하고 시도를 기록한다. 파일이 끝날 때(afterAll) 거부된 시도가 하나라도 있으면 그 시험 파일을 실패시킨다.
  *
@@ -24,7 +24,33 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 const require = createRequire(import.meta.url);
 
 // LIVE-L1(D34 1단계 — 실제 Claude 호출 0): *.anthropic.com(api.anthropic.com)도 같은 경로들에서 막는다.
-const BLOCKED = /(^|\.)(threads\.com|threads\.net|facebook\.com|instagram\.com|fbcdn\.net|anthropic\.com)$/;
+// T21-P1b(OIDC 로그인 — 실제 IdP 호출 0): 널리 쓰는 OIDC IdP 도메인과 예약 TLD .test(시험의 가짜 IdP 호스트 idp.test — 가짜 fetch 를
+// 거치지 않고 실제로 나가려 하면 여기서 막혀 시험 파일이 실패한다)도 막는다. 자체 호스팅 IdP(임의 도메인)는 이름으로 막을 수 없다 —
+// 앱 코드의 OIDC 요청은 모두 주입·교체 가능한 fetch(@cs/providers oidc-login.ts)를 지나고, 시험은 프로세스 안 가짜 IdP 만 넣는다.
+const IDP_HOSTS = [
+  'google\\.com',
+  'googleapis\\.com',
+  'microsoftonline\\.com',
+  'microsoft\\.com',
+  'live\\.com',
+  'okta\\.com',
+  'oktapreview\\.com',
+  'auth0\\.com',
+  'apple\\.com',
+  'amazoncognito\\.com',
+  'onelogin\\.com',
+  'pingidentity\\.com',
+  'gitlab\\.com',
+  'github\\.com',
+  'yahoo\\.com',
+  'line\\.me',
+  'kakao\\.com',
+  'naver\\.com',
+  'test',
+];
+const BLOCKED = new RegExp(
+  `(^|\\.)(threads\\.com|threads\\.net|facebook\\.com|instagram\\.com|fbcdn\\.net|anthropic\\.com|${IDP_HOSTS.join('|')})$`,
+);
 const DISPATCHER = Symbol.for('undici.globalDispatcher.1');
 
 export interface GuardState {

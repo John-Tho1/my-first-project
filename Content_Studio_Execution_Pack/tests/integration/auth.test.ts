@@ -126,14 +126,14 @@ describe('POST /api/auth/login (AUTH_MODE=dev)', () => {
 });
 
 describe('AUTH_MODE 가드', () => {
-  it('AUTH_MODE=oidc → 503 + 한국어 안내(T13), 세션 없음', async () => {
+  it('AUTH_MODE=oidc → 식별자 입력 로그인은 403 + 한국어 안내(T21-P1b — OIDC 로그인은 /api/auth/oidc/start), 세션 없음', async () => {
     vi.stubEnv('AUTH_MODE', 'oidc');
     const before = await sessionCount();
     const res = await loginRoute.POST(jsonPost('/api/auth/login', { identity: OWNER }));
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
-      error: 'oidc_not_configured',
-      message: '운영 인증 공급자는 아직 설정되지 않았습니다(T13)',
+      error: 'identity_login_disabled',
+      message: '이 서버는 OIDC 로그인만 허용합니다. 로그인 화면의 "OIDC로 로그인"을 쓰세요.',
     });
     expect(await sessionCount()).toBe(before);
   });

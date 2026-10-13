@@ -23,6 +23,8 @@ export * from './jobs';
 export * from './ops';
 export * from './secrets';
 export * from './oauth';
+export * from './oidc';
+export * from './oidc-format';
 export * from './instagram';
 export * from './imports';
 export * from './collector';

@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { CONTENT_LIFECYCLES } from './content';
 import { canonicalPayloadProblems, MOCK_EXTERNAL_PREFIX, payloadHash, PLAN_STATUSES } from './distribution';
 import { AppError } from './errors';
+import { isAllowedThreadsPermalink, LIVE_THREADS_EXTERNAL_ID_RE, LIVE_THREADS_STEP_ID_RE } from './live-publish';
 import { extensionForMime, isValidStorageKey } from './media';
 import { formatMsk } from './time';
 import type { ZipEntry } from './zip';
@@ -591,9 +592,11 @@ export const ROW_SCHEMAS = {
     item_id: uuid,
     step_index: int.min(0),
     // T16(D29 제안): Instagram 미디어 컨테이너·게시 단계
-    kind: z.enum(['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request']),
+    // LIVE-P1(D38, 0044): publish_attempt(실제 Threads 게시 시도 표식)
+    kind: z.enum(['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request', 'publish_attempt']),
     post_index: int.min(0),
-    remote_id: z.string().regex(/^mock/),
+    // LIVE-P1(D38, 0044): 모의 ID 또는 실제 Threads 단계 ID(threads:ct|pa|post:<숫자>)
+    remote_id: z.string().refine((v) => /^mock/.test(v) || LIVE_THREADS_STEP_ID_RE.test(v)),
     status: z.enum(['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed']),
     // T15(0032): 업로드 진행 열 — 0032 이전 묶음에는 없다(기본값). 세션 URI 는 내보낼 때 가린다(mock-redacted:…).
     received_bytes: z.number().int().min(0).nullable().default(null),
@@ -1561,12 +1564,26 @@ function checkDistributionIntegrity(
     if (p.is_mock && (!p.external_id.startsWith(MOCK_EXTERNAL_PREFIX) || (p.permalink !== null && !p.permalink.startsWith('mock://')))) {
       problems.push('publications: 모의 결과는 mock: 외부 ID·mock:// 링크');
     }
+    // LIVE-P1(D38, 0044): 실제 결과는 'threads:<숫자>'·공식 Threads 링크·VERIFIED 는 verified_at, 그리고 결과 종류(모의·실제)는 항목 계정 kind 와 같다.
+    if (!p.is_mock && (!LIVE_THREADS_EXTERNAL_ID_RE.test(p.external_id) || (p.permalink !== null && !isAllowedThreadsPermalink(p.permalink)))) {
+      problems.push('publications: 실제 결과는 threads:<숫자> 외부 ID·공식 Threads 링크');
+    }
+    if (p.verification === 'VERIFIED' && p.verified_at === null) problems.push('publications: VERIFIED 는 verified_at 필요');
+    const pubAcc = accountById.get(itemById.get(p.item_id)?.channel_account_id ?? '');
+    if (pubAcc && p.is_mock !== (pubAcc.kind === 'mock')) problems.push('publications: 모의·실제 결과 ⇔ 항목 계정 kind');
   }
   for (const m of t.mock_scenarios) need('mock_scenarios', 'distribution_item_id', m.distribution_item_id, 'distribution_items');
   for (const r of t.remote_steps) {
     need('remote_steps', 'job_id', r.job_id, 'jobs');
     need('remote_steps', 'intent_id', r.intent_id, 'send_intents');
     need('remote_steps', 'item_id', r.item_id, 'distribution_items');
+    // LIVE-P1(D38, 0044): 실제 단계 ID ⇔ 실제 Threads 계정 항목, 모의 ID ⇔ 모의 계정 항목(DB 트리거 remote_steps_account_guard 와 같은 규칙)
+    const stepAcc = accountById.get(itemById.get(r.item_id)?.channel_account_id ?? '');
+    const liveId = LIVE_THREADS_STEP_ID_RE.test(r.remote_id);
+    if (stepAcc && (liveId ? !(stepAcc.kind === 'live' && stepAcc.platform === 'threads') : stepAcc.kind !== 'mock')) {
+      problems.push('remote_steps: 모의·실제 단계 ID ⇔ 항목 계정 kind');
+    }
+    if (r.kind === 'publish_attempt' && !liveId) problems.push('remote_steps: publish_attempt 는 실제 단계 ID 만');
   }
 }
 

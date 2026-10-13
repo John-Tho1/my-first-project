@@ -34,3 +34,4 @@ export * from './remote-steps';
 export * from './media-spec';
 export * from './imports';
 export * from './collector';
+export * from './live-publish';

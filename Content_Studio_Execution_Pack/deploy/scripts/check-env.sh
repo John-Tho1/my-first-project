@@ -122,7 +122,8 @@ else
     echo "[check-env] 경고: WORKER_INLINE_INTERVAL_SECONDS=0 — 주기 처리가 꺼져 있습니다" >&2
   fi
 fi
-for k in ANTHROPIC_API_KEY THREADS_APP_ID THREADS_APP_SECRET LLM_LIVE_APPROVAL_REF OAUTH_LIVE_APPROVAL_REF; do
+# LIVE-P1(D38): 실제 게시 승인 기록·게시 수 상한도 이 단계(운영 배포 대기 — D37)에서는 비어 있어야 한다
+for k in ANTHROPIC_API_KEY THREADS_APP_ID THREADS_APP_SECRET LLM_LIVE_APPROVAL_REF OAUTH_LIVE_APPROVAL_REF PUBLISH_LIVE_APPROVAL_REF PUBLISH_LIVE_MAX_POSTS; do
   [[ -z "$(value_of "$k")" ]] || bad "$k 은(는) 이 단계에서 비어 있어야 합니다(별도 승인)"
 done
 

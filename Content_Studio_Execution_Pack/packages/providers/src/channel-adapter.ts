@@ -20,8 +20,12 @@
 import { randomUUID } from 'node:crypto';
 import {
   adapterIdFor,
+  LIVE_THREADS_ADAPTER_ID,
   LiveChannelNotConfiguredError,
+  LivePublishNotReadyError,
+  livePublishReadiness,
   MOCK_SCENARIO_VALUES,
+  type AppConfig,
   type AdapterAccount,
   type AdapterCapabilities,
   type AdapterContext,
@@ -38,6 +42,7 @@ import {
   type ResultKind,
 } from '@cs/domain';
 import { InstagramMockChannelAdapter } from './instagram-mock';
+import { LiveThreadsPublishAdapter, type LivePublishGate, type LiveThreadsPublishOptions } from './threads-live-publish';
 import { ThreadsMockChannelAdapter } from './threads-mock';
 import { YouTubeMockChannelAdapter } from './youtube-mock';
 
@@ -422,4 +427,45 @@ export function createMockAdapterRegistry(): MockChannelAdapterRegistry {
 /** 테스트용: 프로세스 싱글턴을 버린다("재시작" 흉내 — 모의 원격 지도도 사라진다). */
 export function resetMockAdapterRegistry(): void {
   globalForAdapters.__contentStudioMockAdapters = undefined;
+}
+
+/**
+ * LIVE-P1(D38 1단계): 모의 레지스트리 + 실제 Threads 텍스트 게시 어댑터. 선택 규칙은 그대로 @cs/domain adapterIdFor 한 곳 —
+ * 'live_threads'(실제 계정 + threads + 연결 정보를 쓴 적 있음)일 때만 실제 어댑터를 보고, 그것도 **실제 게시 환경 조건**
+ * (livePublishReadiness: PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS)이 모두 있을 때만 돌려준다(아니면 LivePublishNotReadyError).
+ * 그 밖의 실제 계정(YouTube·Instagram·블로그·연결 전 Threads)은 지금처럼 LiveChannelNotConfiguredError, 모의 계정은 모의 레지스트리 그대로.
+ * getAdapterById('live_threads')(조회 — 보낸 어댑터로)는 실제 어댑터를 돌려주지만 그 어댑터의 reconcile 이 같은 환경 조건을 다시 보고
+ * 없으면 네트워크 없이 unknown 이다.
+ */
+export class LiveCapableAdapterRegistry implements ChannelAdapterRegistry {
+  constructor(
+    readonly mock: MockChannelAdapterRegistry,
+    readonly live: LiveThreadsPublishAdapter,
+    private readonly gate: LivePublishGate,
+  ) {}
+  getAdapterFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): ChannelAdapter {
+    if (account.kind === 'live') {
+      if (adapterIdFor(account) !== LIVE_THREADS_ADAPTER_ID) throw new LiveChannelNotConfiguredError();
+      const g = this.gate();
+      if (!g.ready) throw new LivePublishNotReadyError(g.missing);
+      return this.live;
+    }
+    return this.mock.getAdapterFor(account);
+  }
+  getAdapterById(id: string): ChannelAdapter | null {
+    if (id === LIVE_THREADS_ADAPTER_ID) return this.live;
+    return this.mock.getAdapterById(id);
+  }
+}
+
+/**
+ * web·worker 가 쓰는 레지스트리: 프로세스 싱글턴 모의 레지스트리 + 이 설정의 게이트를 가진 실제 Threads 게시 어댑터.
+ * opts.fetch 는 시험 주입용(기본 = 호출 시점의 globalThis.fetch). 실제 어댑터는 상태가 없어(토큰은 prepare 결과마다 WeakMap) 매번 새로 만들어도 된다.
+ */
+export function createChannelAdapterRegistry(
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>,
+  opts: Omit<LiveThreadsPublishOptions, 'gate'> = {},
+): LiveCapableAdapterRegistry {
+  const gate: LivePublishGate = () => livePublishReadiness(config);
+  return new LiveCapableAdapterRegistry(createMockAdapterRegistry(), new LiveThreadsPublishAdapter({ ...opts, gate }), gate);
 }

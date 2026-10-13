@@ -1367,6 +1367,9 @@ export const sendIntents = pgTable(
  * 원격 결과(docs/04 publications, T11 D18). CONFIRMED 라고 public 은 아니다 — result_kind·remote_visibility·verification 을 함께 본다.
  * 모의 결과: is_mock = (verification = 'MOCK'), external_id 는 'mock:' 접두어, permalink 는 null 이거나 'mock://' — 실제 발행 실적이 아님(DB CHECK).
  * 트리거 publications_guard: DELETE 거부, UPDATE 는 verification·verified_at·remote_visibility 만(재확인 결과).
+ * LIVE-P1(D38, migration 0044): 실제 결과(is_mock=false)는 external_id 'threads:<숫자>'·permalink 는 null 이거나 https://(www.)threads.com|net/…,
+ * VERIFIED 는 verified_at 필수. 트리거 publications_kind_guard: INSERT 때 is_mock 이 항목 계정의 kind(mock ⇔ is_mock)와 맞아야 한다 —
+ * 모의 계정 작업은 실제 결과를, 실제 계정 작업은 모의 결과를 남길 수 없다.
  */
 export const publications = pgTable(
   'publications',
@@ -1396,6 +1399,9 @@ export const publications = pgTable(
     check('publications_mock_external_chk', sql`not ${t.isMock} or ${t.externalId} like 'mock:%'`),
     check('publications_mock_permalink_chk', sql`not ${t.isMock} or ${t.permalink} is null or ${t.permalink} like 'mock://%'`),
     check('publications_real_not_mock_chk', sql`${t.isMock} or ${t.externalId} not like 'mock:%'`),
+    check('publications_real_external_chk', sql`${t.isMock} or ${t.externalId} ~ '^threads:[0-9]{1,30}$'`),
+    check('publications_real_permalink_chk', sql`${t.isMock} or ${t.permalink} is null or ${t.permalink} ~ '^https://(www[.])?threads[.](com|net)/'`),
+    check('publications_verified_at_chk', sql`${t.verification} <> 'VERIFIED' or ${t.verifiedAt} is not null`),
     foreignKey({
       name: 'publications_item_same_owner_fk',
       columns: [t.itemId, t.ownerId],
@@ -1491,17 +1497,22 @@ export const remoteSteps = pgTable(
     unique('remote_steps_job_post_kind_uq').on(t.jobId, t.postIndex, t.kind),
     unique('remote_steps_remote_id_uq').on(t.remoteId),
     index('remote_steps_item_idx').on(t.itemId),
-    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request')`),
+    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request', 'publish_attempt')`),
     check('remote_steps_status_chk', sql`${t.status} in ('created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed')`),
     check(
       'remote_steps_kind_status_chk',
-      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published') or (${t.kind} = 'ig_parent_request' and ${t.status} = 'created')`,
+      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published') or (${t.kind} = 'ig_parent_request' and ${t.status} = 'created') or (${t.kind} = 'publish_attempt' and ${t.status} = 'created')`,
     ),
     check('remote_steps_bytes_chk', sql`(${t.receivedBytes} is null or ${t.receivedBytes} >= 0) and (${t.totalBytes} is null or ${t.totalBytes} > 0) and (${t.receivedBytes} is null or ${t.totalBytes} is null or ${t.receivedBytes} <= ${t.totalBytes})`),
     check('remote_steps_resume_count_chk', sql`${t.resumeCount} >= 0`),
     check('remote_steps_post_index_chk', sql`${t.postIndex} >= 0`),
     check('remote_steps_step_index_chk', sql`${t.stepIndex} >= 0`),
-    check('remote_steps_mock_id_chk', sql`${t.remoteId} like 'mock%'`),
+    // LIVE-P1(D38, 0044): 모의 ID(mock…) 또는 실제 Threads 단계 ID(종류별 접두 + 숫자). publish_attempt 는 실제 형식만.
+    // 실제 ID 는 실제(live) Threads 계정의 작업에만, 모의 ID 는 모의 계정의 작업에만 — remote_steps_guard 트리거가 INSERT 때 계정으로 확인한다.
+    check(
+      'remote_steps_remote_id_chk',
+      sql`(${t.remoteId} like 'mock%' and ${t.kind} <> 'publish_attempt') or (${t.kind} = 'container' and ${t.remoteId} ~ '^threads:ct:[0-9]{1,30}$') or (${t.kind} = 'publish_attempt' and ${t.remoteId} ~ '^threads:pa:[0-9]{1,30}$') or (${t.kind} = 'publish' and ${t.remoteId} ~ '^threads:post:[0-9]{1,30}$')`,
+    ),
     foreignKey({
       name: 'remote_steps_job_same_owner_fk',
       columns: [t.jobId, t.ownerId],

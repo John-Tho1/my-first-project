@@ -217,9 +217,14 @@ export function accountHealthView(account: AccountRow, cred: OAuthCredentialRow 
     pending_count: pending?.count ?? 0,
     notice: mock
       ? 'MOCK — 모의 연결입니다. 실제 Threads 계정 연결이 아니며 실제 게시에 쓰이지 않습니다.'
-      : `실제 계정 — 연결·프로필 조회만(D31). 실제 게시는 하지 않습니다(${LIVE_THREADS_PUBLISH_MARKER}).`,
+      : account.state === 'connected'
+        ? '실제 계정 — 실제 게시 계정으로 사용 중. 승인한 글만, 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 모두 있을 때만 실제로 게시합니다(D38).'
+        : `실제 계정 — 연결·프로필 조회만. 실제 게시 계정으로 사용하지 않음(${LIVE_THREADS_PUBLISH_MARKER}).`,
     /** LIVE-T1: 실제 계정이 아직 Threads 프로필 ID 에 묶이지 않음(첫 연결 전) */
     live_unbound: !mock && isUnboundLiveExternalId(account.externalAccountId),
+    /** LIVE-P1(D38): 계정 상태(connected = 실제 게시 계정으로 사용 중 — 배포 계획에 고를 수 있음) */
+    account_state: account.state,
+    live_publish_target: !mock && account.state === 'connected',
   };
 }
 

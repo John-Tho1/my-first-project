@@ -51,8 +51,12 @@ export default async function SettingsPage({
   const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
   // M4UI FIX1: 연결 해제 결과는 revokeNotice — 끝나지 않은 해제(revoke=incomplete&revoke_code=허용 코드)는 경고로, "해제했습니다"라고 하지 않는다
   const revokeMsg = revokeNotice({ revoked: str(q.revoked), revoke: str(q.revoke), code: str(q.revoke_code) });
-  const accountDone = q.connected === 'live'
-    ? '실제 Threads 계정을 연결했습니다(연결·프로필 조회만 — 실제 게시는 하지 않습니다, D31).'
+  const accountDone = q.live_target === 'on'
+    ? '실제 게시 계정으로 사용합니다. 이제 이 계정을 배포 계획에 고를 수 있습니다 — 실제 게시는 승인한 글만, 실제 게시 조건이 모두 있을 때만 일어납니다.'
+    : q.live_target === 'off'
+      ? '실제 게시 계정 사용을 멈췄습니다(이 계정의 활성 승인은 철회됨).'
+      : q.connected === 'live'
+    ? '실제 Threads 계정을 연결했습니다(연결·프로필 조회만 — 실제 게시 계정으로 쓰려면 "실제 게시 계정으로 사용"을 누르세요).'
     : q.connected
       ? '계정을 연결했습니다(MOCK).'
       : q.live_account
@@ -153,7 +157,9 @@ export default async function SettingsPage({
           연결 필요&quot;가 됩니다.
         </p>
         <p className="note">
-          실제 Threads 계정(D31): 연결(인증 창 → 코드 교환 → 장기 토큰)과 프로필 조회만 합니다. 실제 게시·자동 갱신은 하지 않습니다. Threads 에는 토큰 철회 API 가 없어
+          실제 Threads 계정(D31): 연결(인증 창 → 코드 교환 → 장기 토큰)과 프로필 조회를 합니다. 자동 갱신은 하지 않습니다. 실제 게시(D38)는 &quot;실제 게시 계정으로
+          사용&quot;을 누른 계정만 배포 계획에 고를 수 있고, 승인한 텍스트 글 1개를 실제 게시 조건(아래 &quot;실제 게시 준비&quot;)이 모두 있을 때만 게시합니다.
+          게시물의 공개 범위는 Threads 계정 공개 설정을 따릅니다. Threads 에는 토큰 철회 API 가 없어
           &quot;연결 해제&quot;는 이 앱의 연결 정보만 지웁니다 — Threads 쪽 권한까지 지우려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 삭제하세요(메뉴 이름은 Threads 앱 버전에 따라 다를 수 있음).
         </p>
         <p className="meta">
@@ -177,9 +183,16 @@ export default async function SettingsPage({
             실제 Threads 연결 준비 안 됨: {oauth.live.missing.join(', ')}
           </p>
         )}
-        <p className="notice" role="note">
-          실제 게시 준비 안 됨: {oauth.livePublish.missing.join(', ')}
-        </p>
+        {oauth.livePublish.ready ? (
+          <p className="notice" role="note">
+            <span className="tag warn">실제 게시 준비됨</span> 실제 게시 계정으로 사용 중인 Threads 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(텍스트만, 승인
+            기록당 게시 수 상한 안에서, 되돌리기 없음).
+          </p>
+        ) : (
+          <p className="notice" role="note">
+            실제 게시 준비 안 됨(실제로 게시하지 않음): {oauth.livePublish.missing.join(', ')}
+          </p>
+        )}
         <form className="form inline" method="post" action="/api/channel-accounts">
           <input type="hidden" name="platform" value="threads" />
           <input type="hidden" name="kind" value="live" />
@@ -211,7 +224,7 @@ export default async function SettingsPage({
                       <td>
                         {a.mock ? <span className="tag warn">MOCK</span> : <span className="tag warn">실제 계정</span>} {a.display_name} ·{' '}
                         {CHANNEL_LABEL[a.platform as Channel] ?? a.platform}
-                        {!a.mock ? ' · 게시 안 함(D31 범위 밖)' : ''}
+                        {!a.mock ? (a.live_publish_target ? ' · 실제 게시 계정으로 사용 중(D38)' : ' · 실제 게시 계정 아님(게시 안 함)') : ''}
                       </td>
                       <td>
                         <span className={a.usable_for_execution ? 'tag' : 'tag warn'}>{a.status_label}</span>
@@ -267,6 +280,15 @@ export default async function SettingsPage({
                               </button>
                             </form>
                           </>
+                        ) : null}
+                        {/* LIVE-P1(D38): 실제 Threads 계정 — 실제 게시 계정으로 사용(connected)/사용 중지(disconnected). 외부 호출 없음. */}
+                        {liveThreads && !a.live_unbound ? (
+                          <form method="post" action={`/api/channel-accounts/${a.account_id}/publish-target`}>
+                            <input type="hidden" name="enabled" value={a.live_publish_target ? 'false' : 'true'} />
+                            <button type="submit" className="link-button" disabled={!a.live_publish_target && !a.usable_for_execution}>
+                              {a.live_publish_target ? '실제 게시 계정 사용 중지' : '실제 게시 계정으로 사용'}
+                            </button>
+                          </form>
                         ) : null}
                       </td>
                     </tr>

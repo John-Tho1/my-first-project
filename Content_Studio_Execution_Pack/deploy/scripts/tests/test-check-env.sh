@@ -120,6 +120,28 @@ write_env "  # comment"
 run_capture r check
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "지원하지 않는 줄"
+echo "check-env.sh 실제 게시 설정(LIVE-P1 D38 — 운영 배포 대기 단계에서는 비어 있어야 함)"
+t "PUBLISH_LIVE_APPROVAL_REF 빈 값 → 허용"
+write_env "PUBLISH_LIVE_APPROVAL_REF=" "PUBLISH_LIVE_MAX_POSTS="
+run_capture r check
+expect_rc 0 "$r_rc" "$r_out"
+t "PUBLISH_LIVE_APPROVAL_REF 값 있음 → 거부(값 출력 없음)"
+write_env "PUBLISH_LIVE_APPROVAL_REF=D38-secret-ref-xyz"
+run_capture r check
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "PUBLISH_LIVE_APPROVAL_REF 은(는) 이 단계에서 비어 있어야 합니다"
+expect_not_contains "$r_out" "D38-secret-ref-xyz"
+t "PUBLISH_LIVE_MAX_POSTS 값 있음 → 거부"
+write_env "PUBLISH_LIVE_MAX_POSTS=1"
+run_capture r check
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "PUBLISH_LIVE_MAX_POSTS 은(는) 이 단계에서 비어 있어야 합니다"
+t "PUBLISH_MODE=enabled → 거부(실제 게시 설정과 함께여도)"
+base_env | sed "s#^PUBLISH_MODE=.*#PUBLISH_MODE=enabled#" >"$ENV_FILE"
+run_capture r check
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "PUBLISH_MODE 은(는) disabled 여야 합니다"
+
 t "거부 메시지에 값이 나오지 않는다"
 write_env "EXTRA_SECRET=\"s3cr3t-value\""
 run_capture r check

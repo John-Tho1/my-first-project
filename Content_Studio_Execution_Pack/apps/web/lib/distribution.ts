@@ -95,7 +95,15 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
   invalid: '입력값을 확인하세요.',
   conflict: '다른 곳에서 먼저 바뀌었습니다. 새로 고친 뒤 다시 시도하세요.',
-  live_blocked: '실제 채널 게시는 허용·구현되지 않았습니다(외부로 아무것도 보내지 않음).',
+  live_blocked:
+    '실제 게시 조건이 갖춰지지 않았습니다(외부로 아무것도 보내지 않음). 실제 게시는 Threads 텍스트만 지원하고, PUBLISH_MODE=enabled·게시 승인 기록(PUBLISH_LIVE_APPROVAL_REF)·게시 수 상한(PUBLISH_LIVE_MAX_POSTS)이 모두 필요합니다(설정 화면에서 빠진 이름 확인).',
+  // LIVE-P1(D38): 실제 Threads 게시 계획 규칙
+  live_threads_public_publish_only: '실제 Threads 계정은 실제 게시(public_publish)만 계획할 수 있습니다(비공개 업로드 없음 — Threads 계정 공개 설정을 따름).',
+  live_threads_visibility_public_only: '실제 Threads 게시는 공개 범위 public 만 정할 수 있습니다(실제 공개 범위는 Threads 계정 공개 설정을 따름).',
+  live_threads_text_only: '실제 Threads 게시는 텍스트만 지원합니다(첨부를 빼세요).',
+  live_threads_single_post_only: '실제 Threads 게시는 글 1개만 지원합니다(이어지는 글 없음 — 문단을 합치거나 줄이세요).',
+  live_threads_text_too_long: '실제 Threads 게시 글은 비어 있지 않고 500자 이하여야 합니다(이모지는 UTF-8 바이트 수로 셉니다).',
+  live_publish_limit: '승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 모두 써서 실행하지 않았습니다(아무것도 대기열에 넣지 않음). 새 승인 기록 뒤에만 다시 게시할 수 있습니다.',
   // FIX1-M4DEV1: 재시작 뒤 모의 연결 정보 다시 불러오기 실패(일시) — 작업은 처리하지 않았고 연결 상태도 그대로
   mock_rehydration_unavailable: '모의 연결 정보를 아직 다시 불러오지 못해 이번에는 작업을 처리하지 않았습니다(연결 상태는 그대로). 잠시 뒤 다시 실행하세요.',
   not_cancellable: '이미 끝났거나 실행 전인 항목은 취소할 수 없습니다.',
@@ -202,8 +210,14 @@ export function resultChoicesFor(acc: { kind: string; platform: string; credenti
   return adapter === 'mock_youtube' ? ['upload_private', 'public_publish', 'scheduled_publish'] : ['mock_publish'];
 }
 
+/** LIVE-P1(D38): 실제 Threads 계정(실제 게시 계정으로 사용 중이어야 목록에 나온다 — accountReady). 요청 결과는 서버 기본값 public_publish 고정. */
+export const isLiveThreadsAccount = (acc: { kind: string; platform: string }) => acc.kind === 'live' && acc.platform === 'threads';
+export const LIVE_PLAN_ACCOUNT_NOTE =
+  '실제 게시 계정: 승인한 뒤 실행하면 실제 Threads 에 게시됩니다(되돌리기 없음). 텍스트 글 1개·500자 이하·첨부 없음만 지원합니다. 공개 범위는 public 만 정할 수 있고, 실제 공개 범위는 Threads 계정 공개 설정을 따릅니다.';
+
 /** 계정 선택 목록의 한 줄(MOCK · 고를 수 있는 요청 결과). */
 export function planAccountLabel(acc: { displayName: string; kind: string; platform: string; credentialState: string }): string {
+  if (isLiveThreadsAccount(acc)) return `${acc.displayName} (실제 계정) · 실제 게시 — Threads 텍스트 1개, 되돌리기 없음`;
   const choices = resultChoicesFor(acc);
   const instagramLinked = acc.kind === 'mock' && adapterIdFor({ kind: 'mock', platform: acc.platform, credential_state: acc.credentialState }) === 'mock_instagram';
   // T16(D29 제안): 모의 연결 Instagram 은 MOCK 실행만 + 공개 범위 public 만
@@ -229,6 +243,8 @@ export interface PlanResultSelect {
   choices: PlanResultChoice[];
   /** 예약 공개 날짜·시각 입력을 보인다 */
   scheduledAllowed: boolean;
+  /** LIVE-P1: 실제 Threads 계정이 있다(그 계정의 요청 결과는 서버 기본값 = 실제 게시) */
+  live: boolean;
 }
 
 export function planResultSelect(accs: ReadonlyArray<{ kind: string; platform: string; credentialState: string }>): PlanResultSelect {
@@ -236,7 +252,7 @@ export function planResultSelect(accs: ReadonlyArray<{ kind: string; platform: s
   const order: PlanResultChoice[] = ['upload_private', 'public_publish', 'scheduled_publish', 'mock_publish'];
   const choices = order.filter((c) => all.has(c));
   const fixed = choices.length <= 1 && (choices[0] ?? 'mock_publish') === 'mock_publish';
-  return { fixed, accountDefault: !fixed && all.has('mock_publish'), choices, scheduledAllowed: all.has('scheduled_publish') };
+  return { fixed, accountDefault: !fixed && all.has('mock_publish'), choices, scheduledAllowed: all.has('scheduled_publish'), live: accs.some(isLiveThreadsAccount) };
 }
 
 /**
@@ -636,6 +652,61 @@ export function itemHeadline(x: ItemHeadlineInput): string {
   }
 }
 
+// ---- LIVE-P1(D38): 실제 Threads 게시 항목 문구(MOCK 문구와 섞지 않는다) ----
+
+const LIVE_NOT_READY_CODES = new Set(['live_publish_not_ready', 'publish_disabled', 'live_channel_not_configured', 'approval_required', 'adapter_kind_mismatch']);
+
+/** 결과 불명(UNKNOWN) 실제 게시 항목 안내 — 자동으로 다시 게시하지 않으므로 사용자가 Threads 에서 직접 확인한다. */
+export const LIVE_UNKNOWN_GUIDANCE =
+  '게시됐는지 확인하지 못했습니다. 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 없을 때만 새 배포 계획으로 다시 승인하세요(같은 글이 두 번 올라갈 수 있으니 먼저 확인).';
+
+/** 실제 게시 결과의 확인 상태(VERIFIED = 게시 뒤 원격 읽기로 ID·본문·링크 확인, UNVERIFIED = 게시 ID 는 받았지만 읽기 확인 못 함). */
+export function liveVerificationLabel(verification: string | null | undefined, permalink: string | null | undefined): string {
+  if (verification === 'VERIFIED') return '확인됨(게시 뒤 원격 조회로 본문·링크 확인)';
+  return permalink ? '미확인(링크는 있으나 본문·ID 확인 못 함)' : '미확인(링크 확인 못 함 — Threads 에서 직접 확인)';
+}
+
+/** 실제 Threads 게시 항목 상태 한 줄. MOCK 이라는 말·모의 문구를 쓰지 않고, 실제 게시가 일어났는지·모르는지를 구분한다. */
+export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string | null }): string {
+  const job = x.job;
+  const reason = x.blockReason ?? job?.lastErrorCode ?? '';
+  switch (x.status) {
+    case 'QUEUED':
+      return '실제 게시 대기 중(QUEUED) — 작업 처리기가 처리하면 실제로 게시됩니다';
+    case 'SENDING':
+      return '실제 게시 전송 중';
+    case 'REMOTE_PROCESSING':
+      return 'Threads 컨테이너 처리 중 — 아직 게시하지 않음(처리가 끝나면 같은 컨테이너로 게시)';
+    case 'RECONCILING':
+      return '게시 결과 확인 중 — 다시 게시하지 않고 조회만 합니다';
+    case 'UNKNOWN':
+      if (reason === 'thread_partial_canceled') return '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음). Threads 에서 직접 확인하세요';
+      return `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
+    case 'CONFIRMED':
+      return `실제 게시됨 — ${liveVerificationLabel(x.verification, x.pub?.permalink)}`;
+    case 'FAILED':
+      return `실패${job?.lastErrorCode ? ` (${job.lastErrorCode})` : ''} — 게시되지 않음이 확인된 실패만 여기에 옵니다. 자동 재시도 안 함`;
+    case 'BLOCKED':
+      if (reason === 'live_publish_limit' || job?.lastErrorCode === 'live_publish_limit') return '보류 — 승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 다 씀(보내지 않음)';
+      if (reason === 'execution_not_allowed' || LIVE_NOT_READY_CODES.has(job?.lastErrorCode ?? '')) return '보류 — 실제 게시 조건이 갖춰지지 않음(보내지 않음). 설정 화면의 "실제 게시 준비"를 확인한 뒤 재시도';
+      return itemHeadline(x);
+    default:
+      return itemHeadline(x);
+  }
+}
+
+/** 실제 게시 단계 한 줄(실제 ID — 토큰·본문 없음). */
+export const LIVE_STEP_LABEL: Record<string, string> = {
+  'container:created': '컨테이너 생성됨',
+  'container:finished': '컨테이너 준비됨(FINISHED)',
+  'container:error': '컨테이너 실패·만료(게시 안 됨)',
+  'publish_attempt:created': '게시 시도함(이 컨테이너로는 다시 게시하지 않음)',
+  'publish:published': '실제 게시됨',
+};
+export function liveStepLine(step: { kind: string; status: string; remoteId: string }): string {
+  return `${LIVE_STEP_LABEL[`${step.kind}:${step.status}`] ?? `${step.kind} ${step.status}`} · ${step.remoteId}`;
+}
+
 // ---- M3 화면 FIX(D8): 수동 재확인 결과 4종 ----
 
 export type ReconciledKind = 'found' | 'not_found' | 'unsupported' | 'unknown' | 'stale' | 'resumable';
@@ -810,8 +881,8 @@ export interface StepsPanelInput {
 }
 
 export interface StepsPanelView {
-  /** 보일 단계 패널(없으면 null) */
-  panel: 'threads' | 'youtube' | 'instagram' | null;
+  /** 보일 단계 패널(없으면 null). LIVE-P1: live_threads = 실제 Threads 게시 단계(실제 ID) */
+  panel: 'threads' | 'youtube' | 'instagram' | 'live_threads' | null;
   /** 패널을 고른 어댑터(기록을 읽을 수 없으면 null) */
   adapter: AdapterId | null;
   /** intent = 전송 의도에 기록된 어댑터, current = 아직 보낸 적 없어 현재 선택, none = 계정 없음 */
@@ -842,6 +913,8 @@ export function stepsPanelView(x: StepsPanelInput): StepsPanelView {
     adapter = x.currentAdapter;
     source = x.currentAdapter ? 'current' : 'none';
   }
+  // LIVE-P1(D38): 실제 Threads 어댑터(기록·현재 선택) 또는 실제 단계 ID 가 있으면 실제 게시 패널 — 모의 패널·MOCK 문구를 쓰지 않는다
+  if (adapter === 'live_threads' || hasSteps(['publish_attempt'])) return { panel: 'live_threads', adapter, source, note: null };
   const panel: StepsPanelView['panel'] =
     adapter === 'mock_threads' || threadsSteps
       ? 'threads'

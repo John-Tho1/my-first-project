@@ -235,6 +235,7 @@ export interface AuditInput {
     | 'channel_account.state'
     // LIVE-T1(D31): 실제 Threads 계정 행(연결 전) 생성 — 외부 호출 없음
     | 'channel_account.live_created'
+    | 'channel_account.live_publish_target'
     | 'plan.create'
     | 'plan.execute'
     | 'approval.grant'

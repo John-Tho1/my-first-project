@@ -31,6 +31,8 @@ const LABELS: Record<string, string> = {
   STT_LIVE_APPROVAL_REF: 'STT_LIVE_APPROVAL_REF(실제 음성 전사 승인 기록)',
   STT_PRICE_PER_MINUTE: 'STT_PRICE_PER_MINUTE(음성 1분 가격)',
   PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
+  PUBLISH_LIVE_APPROVAL_REF: 'PUBLISH_LIVE_APPROVAL_REF(실제 게시 승인 기록)',
+  PUBLISH_LIVE_MAX_POSTS: 'PUBLISH_LIVE_MAX_POSTS(승인 기록당 실제 게시 수, 1~1000)',
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   COLLECTOR_SCHEDULER: 'COLLECTOR_SCHEDULER(주기 수집 실행)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
@@ -136,6 +138,25 @@ export const configSchema = z.object({
   STT_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
   STT_PRICE_PER_MINUTE: opt(decimalString.optional()),
   PUBLISH_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
+  /**
+   * LIVE-P1(D38 1단계): 실제 게시(현재 Threads 텍스트만) 승인 기록 참조(예: 결정 ID). 사용자가 정확한 범위를 승인한 뒤에만 설정한다.
+   * 없으면 PUBLISH_MODE=enabled 여도 실제 게시는 막힌다(fail closed). 값 자체는 비밀이 아니지만 화면·로그에는 "설정됨/없음"만 보인다.
+   * 전송 의도(send_intents.sanitized_details.live_approval_ref)에 남겨 아래 게시 수를 센다.
+   */
+  PUBLISH_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /**
+   * LIVE-P1(D38 1단계): 같은 승인 기록(PUBLISH_LIVE_APPROVAL_REF)으로 허용하는 실제 게시 수(1 ~ 1000). 없으면 실제 게시는 막힌다(fail closed —
+   * LLM_LIVE_MAX_RUNS 와 달리 "없음 = 제한 없음"이 아니다). 세는 단위 = 이 승인 기록으로 전송 의도를 하나라도 만든(원격에 닿았을 수 있는) 실제 게시
+   * 작업 수 — 같은 작업의 재시도·이어 보내기는 새로 세지 않는다. 전송 직전(beginSend) 승인 기록별 advisory 잠금 아래에서 센다.
+   */
+  PUBLISH_LIVE_MAX_POSTS: opt(
+    z
+      .string()
+      .regex(/^\d{1,4}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(1000))
+      .optional(),
+  ),
   /**
    * 수집. disabled(기본) = 꺼짐. mock(T19, D33 제안) = 모의 수집기만(메모리 고정 자료, 실제 웹 요청 0). enabled = 실제 수집 요청 —
    * 실제 수집기가 없어 T03 추출은 501, T19 수집은 준비 안 됨(503 collector_live_not_ready). 어떤 값에서도 네트워크 요청은 없다.

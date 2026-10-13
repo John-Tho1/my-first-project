@@ -2,14 +2,14 @@
 import { getDb, resolveFromRoot, uploadStoreFor, type DbHandle, type UploadStore } from '@cs/db';
 import { assertLiveLlmAllowed, loadConfig, type AppConfig } from '@cs/domain';
 import {
-  createMockAdapterRegistry,
+  createChannelAdapterRegistry,
   createStorage,
   LiveTranscriber,
   MockLlmProvider,
   MockTranscriber,
   resolveLiveLlmProvider,
   type LlmProvider,
-  type MockChannelAdapterRegistry,
+  type LiveCapableAdapterRegistry,
   type StorageAdapter,
   type Transcriber,
 } from '@cs/providers';
@@ -69,9 +69,11 @@ export function getWorkerTranscriber(): Transcriber {
 }
 
 /**
- * T11: 배포 채널 어댑터 — 모의만(프로세스 싱글턴, web 과 inline worker 가 같은 모의 "원격"을 공유). 실제 채널 어댑터는 없다(M4).
+ * T11: 배포 채널 어댑터 — 모의 어댑터(프로세스 싱글턴, web 과 inline worker 가 같은 모의 "원격"을 공유).
  * 모의 결과 시나리오는 개발·테스트에서만 MOCK_CHANNEL_SCENARIO 로 바꿀 수 있다(운영 빌드에서는 무시).
+ * LIVE-P1(D38 1단계): + 실제 Threads 텍스트 게시 어댑터. 실제 계정 + 실제 게시 환경 조건(PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·
+ * PUBLISH_LIVE_MAX_POSTS)이 모두 있을 때만 선택된다(@cs/providers LiveCapableAdapterRegistry). 기본 설정에서는 실제 호출 경로가 열리지 않는다.
  */
-export function getChannelAdapters(): MockChannelAdapterRegistry {
-  return createMockAdapterRegistry();
+export function getChannelAdapters(config: AppConfig = getConfig()): LiveCapableAdapterRegistry {
+  return createChannelAdapterRegistry(config);
 }

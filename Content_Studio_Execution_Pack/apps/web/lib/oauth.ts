@@ -118,6 +118,10 @@ export function oauthReadinessView(config: AppConfig, env: Record<string, string
 }
 
 export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
+  // LIVE-P1(D38): "실제 게시 계정으로 사용" 조건
+  live_target_not_live_threads: '실제 Threads 계정만 실제 게시 계정으로 쓸 수 있습니다.',
+  live_target_unbound: '아직 Threads 프로필에 연결되지 않은 계정입니다. 먼저 실제 연결을 마치세요.',
+  live_target_credential_unusable: '연결 정보를 지금 쓸 수 없습니다(만료·해제·다시 연결 필요). 다시 연결한 뒤 실제 게시 계정으로 사용하세요.',
   secrets_not_configured: '서버 비밀 암호화 키(SECRETS_MASTER_KEY·SECRETS_KEY_VERSION)가 설정되지 않아 계정을 연결할 수 없습니다. 다른 기능은 그대로 쓸 수 있습니다.',
   oauth_not_supported: 'Threads·YouTube·Instagram 모의 계정과 실제 Threads 계정만 연결할 수 있습니다.',
   live_oauth_not_configured: '실제 계정 연결 준비가 끝나지 않았습니다(설정 화면의 "준비 안 됨" 이름을 확인하세요). 외부로 아무것도 보내지 않았습니다.',

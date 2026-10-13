@@ -12,7 +12,8 @@ export const runtime = 'nodejs';
 type Ctx = { params: Promise<{ id: string }> };
 
 /**
- * POST /api/distribution-plans/{id}/execute — { command_key(8~64), item_ids? } → 200 { plan_id, queued: [{ item_id, job_id, mode: 'MOCK' }], mode: 'MOCK', notice, idempotent_replay }.
+ * POST /api/distribution-plans/{id}/execute — { command_key(8~64), item_ids? } → 200 { plan_id, queued: [{ item_id, job_id, mode: 'MOCK'|'LIVE' }], mode, notice, idempotent_replay }.
+ * LIVE-P1(D38): 실제 Threads 항목은 실제 게시 게이트(PUBLISH_MODE·승인 기록·게시 수 상한·정확한 계정)를 모두 통과할 때만 mode LIVE 로 대기열에 들어간다(아니면 전체 거부 503/429).
  * 승인 없음 403 approval_required(아무것도 넣지 않음), 스냅샷 변경 409 snapshot_stale(승인 철회), 이미 실행 409 already_executed.
  * 같은 command_key 재호출 → 저장된 결과(idempotent_replay: true). 실제 게시가 아니다 — 작업은 QUEUED 로만 생기고 T11 이 처리한다.
  */

@@ -61,6 +61,7 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 작업 조회 | GET /api/jobs/{id} | 비밀 제거, 실제 상태 반환 |
 | 계정 연결 | POST /api/channel-accounts/{id}/connect, GET /api/oauth/callback | state 1회용·PKCE·redirect 정확 일치, 토큰은 서버 암호화 저장(D24·D25) |
 | 연결 상태·갱신·철회 | GET /api/channel-accounts/{id}/health, POST …/refresh·/check·/revoke | 비밀 제거, 다른 owner 404, 철회 시 해당 계정 승인 무효. 실제 Threads 는 철회 API 없음 → remote_revoke=unsupported + 로컬 삭제(LIVE-T1) |
+| 실제 게시 계정 사용(LIVE-P1, D38) | POST /api/channel-accounts/{id}/publish-target { enabled } | 실제 Threads 계정만(묶임·쓸 수 있는 연결 정보일 때 connected, 사용 중지는 disconnected + 그 계정 활성 승인 철회). 외부 호출 없음. 실제 게시는 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS·서버 승인(hash)이 모두 있을 때만 |
 | 실제 Threads 계정 행(연결 전) | POST /api/channel-accounts (platform=threads, kind=live) | LIVE-T1(D31): owner 범위·같은 출처·멱등, external_account_id `pending:<uuid>` → 첫 실제 연결이 프로필 ID 로 묶음, state disconnected(게시 불가), 외부 호출 없음 |
 | 원격 재확인 | POST /api/distribution-items/{id}/reconcile | 기존 결과 조회만 수행 |
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |

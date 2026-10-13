@@ -146,9 +146,19 @@ describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 �
     expect([isValidThreadsAppSecret(' abc '), isValidThreadsAppSecret('a b'), isValidThreadsAppSecret('  '), isValidThreadsAppSecret(undefined)]).toEqual([true, false, false, false]);
     expect([threadsAppSecretState({}), threadsAppSecretState({ THREADS_APP_SECRET: ' ' }), threadsAppSecretState({ THREADS_APP_SECRET: 'a b' }), threadsAppSecretState({ THREADS_APP_SECRET: 'ab' })]).toEqual(['missing', 'missing', 'invalid', 'ok']);
   });
-  it('게시 준비: PUBLISH_MODE 와 관계없이 항상 준비 안 됨 + LIVE_THREADS_PUBLISH(D31 범위 밖)', () => {
-    expect(livePublishReadiness(loadConfig({}))).toEqual({ ready: false, missing: ['PUBLISH_MODE=enabled', LIVE_THREADS_PUBLISH_MARKER] });
-    expect(livePublishReadiness(loadConfig({ PUBLISH_MODE: 'enabled' }))).toEqual({ ready: false, missing: [LIVE_THREADS_PUBLISH_MARKER] });
+  // LIVE-P1(D38 1단계 — 의도한 동작 변경): "항상 준비 안 됨(D31 범위 밖)" 대신 실제 게시 환경 조건 세 가지(이름만)를 본다. 기본값은 준비 안 됨(fail closed).
+  it('게시 준비: PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS 가 모두 있어야 준비됨(하나씩 빠지면 그 이름)', () => {
+    expect(livePublishReadiness(loadConfig({}))).toEqual({ ready: false, missing: ['PUBLISH_MODE=enabled', 'PUBLISH_LIVE_APPROVAL_REF', 'PUBLISH_LIVE_MAX_POSTS'] });
+    expect(livePublishReadiness(loadConfig({ PUBLISH_MODE: 'enabled' }))).toEqual({ ready: false, missing: ['PUBLISH_LIVE_APPROVAL_REF', 'PUBLISH_LIVE_MAX_POSTS'] });
+    const full = { PUBLISH_MODE: 'enabled', PUBLISH_LIVE_APPROVAL_REF: 'D38-2', PUBLISH_LIVE_MAX_POSTS: '1' };
+    expect(livePublishReadiness(loadConfig(full))).toEqual({ ready: true, missing: [] });
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_MODE: 'disabled' })).missing).toEqual(['PUBLISH_MODE=enabled']);
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_LIVE_APPROVAL_REF: '' })).missing).toEqual(['PUBLISH_LIVE_APPROVAL_REF']);
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: '' })).missing).toEqual(['PUBLISH_LIVE_MAX_POSTS']);
+    // 형식: 1 ~ 1000 정수만(0·음수·소수·1001 은 설정 오류)
+    for (const bad of ['0', '-1', '1.5', '1001', 'abc']) expect(() => loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: bad })).toThrow(/PUBLISH_LIVE_MAX_POSTS/);
+    expect(loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: '1000' }).PUBLISH_LIVE_MAX_POSTS).toBe(1000);
+    // 표식 상수는 실제 게시 계정이 아닐 때의 연결 상태 안내에만 남는다
     expect(LIVE_THREADS_PUBLISH_MARKER).toBe('LIVE_THREADS_PUBLISH(D31 범위 밖)');
   });
   it('연결 전 실제 계정 ID 접두(pending:)는 mock: 과 겹치지 않는다', () => {

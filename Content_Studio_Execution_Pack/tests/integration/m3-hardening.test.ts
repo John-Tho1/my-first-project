@@ -189,12 +189,13 @@ describe('모의 시나리오 API(개발용) — 승인 스냅샷 밖', () => {
     as(other.identity);
     expect((await put(x.itemId, { scenario: 'success' }, other.token)).status).toBe(404);
     as(o.identity);
-    // live 계정 항목(연결된 실제 계정 행을 직접 넣어 흉내 — 외부 호출 없음)
+    // live 계정 항목(연결된 실제 계정 행을 직접 넣어 흉내 — 외부 호출 없음). LIVE-P1(D38): 실제 Threads 는 이제 텍스트 1개·public_publish 만 계획할 수 있어
+    // (이 시험의 여러 문단 본문·upload_private 와 맞지 않음) 실제 어댑터가 없는 블로그 실제 계정으로 바꿨다 — 요지(실제 계정 항목에는 모의 시나리오 없음)는 그대로.
     const [live] = await db
       .insert(schema.channelAccounts)
-      .values({ ownerId: o.id, platform: 'threads', kind: 'live', externalAccountId: `threads-live-${randomUUID()}`, displayName: '실제 계정(시험 행)', state: 'connected' })
+      .values({ ownerId: o.id, platform: 'blog', kind: 'live', externalAccountId: `blog-live-${randomUUID()}`, displayName: '실제 계정(시험 행)', state: 'connected' })
       .returning();
-    const v = await reviewVariant(o, 'threads');
+    const v = await reviewVariant(o, 'blog');
     const { items } = await createPlan(db, o.id, { items: [{ variant_id: v.variantId, channel_account_id: live!.id, requested_result: 'upload_private', visibility: 'private' }] });
     const res = await put(items[0]!.id, { scenario: 'success' });
     expect(res.status).toBe(400);

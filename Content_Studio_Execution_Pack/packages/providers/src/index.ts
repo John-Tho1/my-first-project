@@ -11,6 +11,7 @@ export * from './llm-anthropic';
 export * from './oauth';
 export * from './oidc-login';
 export * from './threads-live-oauth';
+export * from './threads-live-publish';
 export * from './publisher';
 export * from './storage';
 export * from './stt';

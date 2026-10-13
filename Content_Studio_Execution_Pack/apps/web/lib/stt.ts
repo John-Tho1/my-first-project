@@ -29,7 +29,7 @@ export async function runInlineWorker(config: AppConfig, db: Db): Promise<Worker
     db,
     transcriber: getWorkerTranscriber(),
     files: getStorage(config),
-    channelAdapters: credWork ? getChannelAdapters() : undefined,
+    channelAdapters: credWork ? getChannelAdapters(config) : undefined,
     maxJobs: 5,
     credentialRefresh,
     jobCredentials: jobCredentials(config, db),

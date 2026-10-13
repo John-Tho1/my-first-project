@@ -327,7 +327,9 @@ describe('FIX-T14(Codex review-T14): 기록된 어댑터 해석·처리 지연 �
     expect(recordedAdapterIdOf({ mode: 'MOCK' })).toEqual({ id: 'mock_generic', legacy: true });
     expect(recordedAdapterIdOf({ adapter_id: null })).toEqual({ id: 'mock_generic', legacy: true });
     expect(recordedAdapterIdOf({ adapter_id: 'mock_threads' })).toEqual({ id: 'mock_threads', legacy: false });
-    expect(recordedAdapterIdOf({ adapter_id: 'live_threads' })).toMatchObject({ id: null });
+    // LIVE-P1(D38): live_threads 는 이제 아는 어댑터(실제 Threads 게시) — 모르는 값의 예는 live_youtube 로 바꿨다(단언 의미 그대로)
+    expect(recordedAdapterIdOf({ adapter_id: 'live_threads' })).toEqual({ id: 'live_threads', legacy: false });
+    expect(recordedAdapterIdOf({ adapter_id: 'live_youtube' })).toMatchObject({ id: null });
     expect(recordedAdapterIdOf({ adapter_id: 7 })).toMatchObject({ id: null });
   });
   it('센 시도 = attempt − resume_count(음수 없음), 상한 상수', () => {

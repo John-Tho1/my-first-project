@@ -325,6 +325,11 @@ export interface AdapterResult {
    * received_bytes 는 원격이 확인한 값이며 이번 실행 전보다 커야 한다(진행 없는 양보는 쓰지 않는다).
    */
   upload_yield?: { received_bytes: number; total_bytes: number };
+  /**
+   * LIVE-P1(D38): 실제 어댑터가 게시 뒤 원격 읽기(GET 미디어)로 ID·본문·링크를 확인했는가. true 일 때만 publication.verification = VERIFIED
+   * (docs/03 "실제 상태 조회로 확인한 결과만 VERIFIED"). 모의 어댑터는 쓰지 않는다(항상 MOCK).
+   */
+  verified?: boolean;
 }
 
 /**
@@ -358,6 +363,8 @@ export interface ReconcileResult {
   provider_request_id?: string;
   error_code?: string;
   published_parts?: number;
+  /** LIVE-P1: 원격 읽기로 확인함(AdapterResult.verified 와 같은 뜻) */
+  verified?: boolean;
 }
 
 export interface CancelResult {
@@ -387,7 +394,8 @@ export interface AdapterCapabilities {
 export interface ChannelTextLimits {
   max_post_chars: number;
   max_posts: number;
-  unit: 'code_point';
+  /** code_point = 코드 포인트 수, threads_text_unit = LIVE-P1 threadsTextUnits(이모지는 UTF-8 바이트 수) */
+  unit: 'code_point' | 'threads_text_unit';
   checked_at: string | null;
   api_version: string | null;
   source: string;
@@ -411,8 +419,8 @@ export interface AdapterAccount {
   credential_state?: string;
 }
 
-/** T14(D26)·T15(D27): 어댑터 식별자. */
-export const ADAPTER_IDS = ['mock_generic', 'mock_threads', 'mock_youtube', 'mock_instagram'] as const;
+/** T14(D26)·T15(D27): 어댑터 식별자. LIVE-P1(D38): live_threads = 실제 Threads 텍스트 게시 어댑터. */
+export const ADAPTER_IDS = ['mock_generic', 'mock_threads', 'mock_youtube', 'mock_instagram', 'live_threads'] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
 
 /**
@@ -424,8 +432,11 @@ export type AdapterId = (typeof ADAPTER_IDS)[number];
  * Meta 형 모의 OAuth 연결 정보 사용). 연결한 적 없는 seed Instagram 계정은 그대로 mock_generic(M3 동작).
  */
 export function adapterIdFor(account: Pick<AdapterAccount, 'kind' | 'platform' | 'credential_state'>): AdapterId | null {
-  if (account.kind !== 'mock') return null;
   const linked = account.credential_state !== undefined && account.credential_state !== 'none';
+  // LIVE-P1(D38): 실제 계정 + threads + 연결 정보를 쓴 적 있음 → live_threads. 이 ID 는 "어느 어댑터인가"일 뿐 허용이 아니다 —
+  // 레지스트리(getAdapterFor)는 실제 게시 환경 조건이 모두 있을 때만 돌려주고, 실행 게이트(assertExecutionAllowed·beginSend)가 따로 막는다.
+  // 그 밖의 실제 계정(YouTube·Instagram·블로그·연결 전 Threads) → null(어댑터 없음 — LiveChannelNotConfiguredError).
+  if (account.kind !== 'mock') return account.platform === 'threads' && linked ? 'live_threads' : null;
   if (account.platform === 'threads' && linked) return 'mock_threads';
   if (account.platform === 'youtube' && linked) return 'mock_youtube';
   if (account.platform === 'instagram' && linked) return 'mock_instagram';
@@ -456,7 +467,12 @@ export function recordedAdapterIdOf(sanitizedDetails: Record<string, unknown> | 
  * FIX-T16(P1, migration 0037): ig_parent_request(post_index 0, created) — 캐러셀 부모 생성 **요청 표식**. 부모를 만드는 원격 호출 전에 남기고
  * (remote_id = 이 앱이 만든 모의 상관 값 mockig_req_…, 원격 ID 아님), 부모 ID 를 잃으면 조회가 자식으로 부모를 찾게 한다.
  */
-export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request'] as const;
+/**
+ * LIVE-P1(D38, migration 0044): publish_attempt(post_index 0, created) — 실제 Threads 의 threads_publish 를 부르기 **직전**에 남기는 표식
+ * (remote_id 'threads:pa:<컨테이너 ID>' — 컨테이너마다 하나, 전역 unique). 이 표식이 있고 게시 기록이 없으면 결과 불명 — 같은 컨테이너로
+ * 다시 게시하지 않고 조회(목록 대조)만 한다. 실제 단계 ID 는 'threads:ct:'·'threads:pa:'·'threads:post:' 접두 + 숫자(실제 계정 작업만 — DB 트리거).
+ */
+export const REMOTE_STEP_KINDS = ['container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request', 'publish_attempt'] as const;
 export type RemoteStepKind = (typeof REMOTE_STEP_KINDS)[number];
 export const REMOTE_STEP_STATUSES = ['created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed'] as const;
 export type RemoteStepStatus = (typeof REMOTE_STEP_STATUSES)[number];
@@ -469,6 +485,7 @@ export const REMOTE_STEP_KIND_STATUSES: Readonly<Record<RemoteStepKind, readonly
   ig_container: ['created', 'finished', 'error'],
   ig_publish: ['published'],
   ig_parent_request: ['created'],
+  publish_attempt: ['created'],
 };
 
 export interface RemoteStep {
@@ -639,6 +656,8 @@ export const INSTAGRAM_MOCK_SCENARIOS = MOCK_SCENARIO_VALUES.filter((s) => s.sta
 export const isInstagramMockScenario = (s: string): boolean => s.startsWith('instagram_');
 /** 어댑터에 맞는 시나리오인가(API 가 다르면 400 scenario_not_applicable). */
 export function scenarioApplies(adapter: AdapterId, scenario: string): boolean {
+  // LIVE-P1: 실제 어댑터에는 모의 시나리오가 없다(어떤 값도 적용하지 않음).
+  if (adapter === 'live_threads') return false;
   if (scenario === 'success') return true;
   if (adapter === 'mock_threads') return isThreadsMockScenario(scenario);
   if (adapter === 'mock_youtube') return isYouTubeMockScenario(scenario);

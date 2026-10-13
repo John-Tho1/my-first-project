@@ -12,6 +12,8 @@ import {
   LiveLlmNotAllowedError,
   PublishDisabledError,
 } from './errors';
+import { LivePublishNotReadyError } from './live-publish';
+import { livePublishReadiness } from './oauth';
 
 /** 게시 의도(외부 게시 경로). approvalId·payloadHash 는 입력일 뿐 승인으로 인정하지 않는다. */
 export interface PublishIntent {
@@ -34,20 +36,29 @@ export interface ExecutionContext {
   /** 실행할 항목의 저장된 payload hash */
   payloadHash: string;
   approval: ServerApproval | null;
+  /** LIVE-P1: 계정 플랫폼(live 는 'threads' 만 실제 어댑터가 있다). 없으면 live 는 LiveChannelNotConfiguredError. */
+  platform?: string;
 }
 
+export type ExecutionMode = 'MOCK' | 'LIVE';
+
 /**
- * T10(결정 D17): 배포 실행 허용 여부.
+ * T10(결정 D17)·LIVE-P1(D38 1단계): 배포 실행 허용 여부.
  * - mock 계정: PUBLISH_MODE 와 무관하게 `{ mode: 'MOCK' }` — 모의 실행은 프로세스 밖으로 나가지 않고 결과는 반드시 MOCK 이다.
- * - live 계정: PUBLISH_MODE=enabled 가 아니면 PublishDisabledError, 서버가 읽은 활성 승인(hash 일치)이 없으면 ApprovalRequiredError,
- *   둘 다 있어도 M3 에는 live 채널 어댑터가 없으므로 LiveChannelNotConfiguredError(503).
+ * - live 계정(순서대로, 하나라도 아니면 거부): PUBLISH_MODE=enabled(PublishDisabledError) → 서버가 읽은 활성 승인(hash 일치, ApprovalRequiredError)
+ *   → 플랫폼 threads(그 밖 — YouTube·Instagram·블로그 — 은 LiveChannelNotConfiguredError, 실제 어댑터 없음) → 실제 게시 환경 조건
+ *   (livePublishReadiness: PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS — LivePublishNotReadyError) → `{ mode: 'LIVE' }`.
+ *   계정 상태·연결 정보·게시 수 상한·계정 정체(승인 스냅샷의 provider_account_id)는 DB 를 보는 호출자(executePlan·beginSend)가 따로 검사한다.
  */
-export function assertExecutionAllowed(config: AppConfig, ctx: ExecutionContext): { mode: 'MOCK' } {
+export function assertExecutionAllowed(config: AppConfig, ctx: ExecutionContext): { mode: ExecutionMode } {
   if (ctx.accountKind === 'mock') return { mode: 'MOCK' };
   if (config.PUBLISH_MODE !== 'enabled') throw new PublishDisabledError();
   const a = ctx.approval;
   if (!a || a.revokedAt !== null || a.payloadHash !== ctx.payloadHash) throw new ApprovalRequiredError();
-  throw new LiveChannelNotConfiguredError();
+  if (ctx.platform !== 'threads') throw new LiveChannelNotConfiguredError();
+  const ready = livePublishReadiness(config);
+  if (!ready.ready) throw new LivePublishNotReadyError(ready.missing);
+  return { mode: 'LIVE' };
 }
 
 /**

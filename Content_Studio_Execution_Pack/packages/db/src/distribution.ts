@@ -33,9 +33,14 @@ import {
   CHANNELS,
   GoneError,
   HashMismatchError,
+  isThreadsNumericId,
   isUuid,
+  LIVE_EXECUTE_NOTICE,
+  LivePublishLimitError,
   MOCK_EXECUTE_NOTICE,
   MOCK_EXTERNAL_PREFIX,
+  THREADS_LIVE_TEXT_MAX,
+  threadsTextUnits,
   NotFoundError,
   payloadHash,
   providerMetadataOf,
@@ -73,6 +78,7 @@ import type { Db } from './client';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
 import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
 import { credentialGate, getAccountHealth, type AccountHealthView } from './oauth';
+import { liveApprovalUsage, pendingLiveJobs } from './live-publish';
 import { listRemoteStepsForItems, remoteStepView, type RemoteStepRow } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import {
@@ -400,6 +406,12 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       } else if (acc.kind === 'mock') {
         requested = it.requested_result ?? 'mock_publish';
         if (requested !== 'mock_publish') throw new AppError('bad_request', 'mock_only', '모의(MOCK) 계정은 모의 실행(mock_publish)만 할 수 있습니다');
+      } else if (acc.platform === 'threads') {
+        // LIVE-P1(D38): 실제 Threads 계정 — 텍스트 공개 게시(public_publish)만. Threads 게시물에는 비공개 업로드가 없다(계정 공개 설정을 따름).
+        requested = it.requested_result ?? 'public_publish';
+        if (requested !== 'public_publish') {
+          throw new AppError('bad_request', 'live_threads_public_publish_only', '실제 Threads 계정은 실제 게시(public_publish)만 계획할 수 있습니다(비공개 업로드 없음 — 계정 공개 설정을 따름)');
+        }
       } else {
         if (!it.requested_result || it.requested_result === 'mock_publish') throw new AppError('bad_request', 'requested_result_required', '실제 계정은 upload_private 또는 public_publish 를 지정해야 합니다');
         requested = it.requested_result;
@@ -407,9 +419,14 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       // T16(D29 제안): 모의 연결(Meta 형 OAuth)한 Instagram 계정 — 요청 결과는 위의 모의 규칙대로 mock_publish 만(결과 PUBLISHED, MOCK).
       // Instagram 게시물은 비공개·원격 예약 결과가 없다(계정 공개 범위를 따름) → 공개 범위는 public 만(생략 시 public). 승인 스냅샷이 실제와 다른 범위를 말하지 않게.
       const instagramLinked = adapterIdFor({ kind: acc.kind === 'mock' ? 'mock' : 'live', platform: acc.platform, credential_state: acc.credentialState }) === 'mock_instagram';
-      const visibility: Visibility = it.visibility ?? (instagramLinked ? 'public' : 'private');
+      const liveThreads = acc.kind === 'live' && acc.platform === 'threads';
+      const visibility: Visibility = it.visibility ?? (instagramLinked || liveThreads ? 'public' : 'private');
       if (instagramLinked && visibility !== 'public') {
         throw new AppError('bad_request', 'instagram_visibility_public_only', '모의 연결한 Instagram 계정은 공개 범위 public 만 정할 수 있습니다(Instagram 게시물은 비공개·예약 결과가 없음 — 결과는 MOCK)');
+      }
+      // LIVE-P1(D38): 실제 Threads 게시물의 실제 공개 범위는 Threads 계정 공개 설정을 따른다 — 승인 스냅샷에는 public("게시")만 둔다(다른 값은 실제와 다른 말).
+      if (liveThreads && visibility !== 'public') {
+        throw new AppError('bad_request', 'live_threads_visibility_public_only', '실제 Threads 게시는 공개 범위 public 만 정할 수 있습니다(실제 공개 범위는 Threads 계정 공개 설정을 따름)');
       }
       if (requested === 'upload_private' && visibility !== 'private') throw new AppError('bad_request', 'visibility_mismatch', '비공개 업로드는 공개 범위가 private 이어야 합니다');
       const scheduledAtUtc = it.schedule ? scheduleFromMsk(it.schedule.date, it.schedule.time, now) : null;
@@ -452,6 +469,17 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
         timezone: SCHEDULE_TIMEZONE,
         providerMetadata: publishAtUtc ? { publish_at: publishAtUtc.toISOString() } : null,
       });
+      if (liveThreads) {
+        // LIVE-P1(D38): 실제 Threads 는 텍스트 게시물 1개만(첨부·이어지는 글 없음 — 답글 권한 threads_manage_replies 를 요청하지 않았다), 글자 수 500(이모지 = UTF-8 바이트).
+        // 어댑터 validate 도 같은 규칙으로 다시 막는다(보내기 직전).
+        const posts = Array.isArray(payload.text.posts) ? (payload.text.posts as unknown[]) : [];
+        if (payload.assets.length > 0) throw new AppError('bad_request', 'live_threads_text_only', '실제 Threads 게시는 텍스트만 지원합니다(첨부를 빼세요)');
+        if (posts.length !== 1) throw new AppError('bad_request', 'live_threads_single_post_only', '실제 Threads 게시는 글 1개만 지원합니다(이어지는 글 없음 — 문단을 합치거나 줄이세요)');
+        const text = typeof posts[0] === 'string' ? posts[0] : '';
+        if (text.trim() === '' || threadsTextUnits(text) > THREADS_LIVE_TEXT_MAX) {
+          throw new AppError('bad_request', 'live_threads_text_too_long', `실제 Threads 게시 글은 비어 있지 않고 ${THREADS_LIVE_TEXT_MAX}자 이하여야 합니다(이모지는 UTF-8 바이트 수로 셉니다)`);
+        }
+      }
       channels.push(variant.channel);
       prepared.push({
         ownerId,
@@ -828,8 +856,10 @@ export async function revokeApproval(db: Db, ownerId: string, approvalId: string
 
 export interface ExecuteResult {
   plan_id: string;
-  queued: Array<{ item_id: string; job_id: string; mode: 'MOCK' }>;
-  mode: 'MOCK';
+  /** LIVE-P1(D38): 항목마다 MOCK(모의 계정) 또는 LIVE(실제 Threads 게시 — 모든 게이트 통과) */
+  queued: Array<{ item_id: string; job_id: string; mode: 'MOCK' | 'LIVE' }>;
+  /** 하나라도 LIVE 면 LIVE(실제 게시가 대기열에 들어감) */
+  mode: 'MOCK' | 'LIVE';
   notice: string;
   idempotent_replay: boolean;
 }
@@ -873,7 +903,7 @@ export async function executePlan(
   ownerId: string,
   planId: string,
   input: { commandKey: string; itemIds?: readonly string[] },
-  config: Pick<AppConfig, 'PUBLISH_MODE'>,
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>,
   now: Date = new Date(),
 ): Promise<ExecuteResult> {
   if (!isUuid(planId)) throw new NotFoundError(PLAN_NOT_FOUND);
@@ -948,18 +978,40 @@ export async function executePlan(
       });
       if (credBlocked.length) throw new AccountCredentialBlockedError(credBlocked);
       const queued: ExecuteResult['queued'] = [];
+      // LIVE-P1(D38): 실제 게시 항목은 먼저 모두 게이트를 통과해야 한다(하나라도 아니면 전체 거부 — 아무것도 대기열에 넣지 않음).
+      const modes = new Map<string, 'MOCK' | 'LIVE'>();
       for (const item of selected) {
         const approval = active.get(item.id)!;
         const accRows = await tx
-          .select({ kind: channelAccounts.kind })
+          .select({ kind: channelAccounts.kind, platform: channelAccounts.platform, externalAccountId: channelAccounts.externalAccountId })
           .from(channelAccounts)
           .where(and(eq(channelAccounts.id, item.channelAccountId), eq(channelAccounts.ownerId, ownerId)))
           .limit(1);
+        const acc = accRows[0];
         const { mode } = assertExecutionAllowed(config as AppConfig, {
-          accountKind: accRows[0]?.kind === 'mock' ? 'mock' : 'live',
+          accountKind: acc?.kind === 'mock' ? 'mock' : 'live',
           payloadHash: item.payloadHash,
           approval: { id: approval.id, payloadHash: approval.payloadHash, revokedAt: approval.revokedAt },
+          platform: acc?.platform,
         });
+        // 실제 계정은 승인 스냅샷의 정확한 계정(provider_account_id = 묶인 Threads 프로필 ID)이어야 한다(스냅샷 재검사도 보지만 한 번 더).
+        if (mode === 'LIVE' && (!acc || !isThreadsNumericId(acc.externalAccountId) || item.payloadJson.provider_account_id !== acc.externalAccountId)) {
+          throw new SnapshotStaleError([{ item_id: item.id, reasons: ['account_changed'] }]);
+        }
+        modes.set(item.id, mode);
+      }
+      const liveCount = [...modes.values()].filter((m) => m === 'LIVE').length;
+      if (liveCount > 0) {
+        // 앞선 검사(권위 있는 검사는 전송 직전 beginSend — 승인 기록별 잠금 아래). 이미 쓴 수 + 대기 중인 실제 게시 + 이번 항목 > 상한이면 전체 거부.
+        const ref = config.PUBLISH_LIVE_APPROVAL_REF!;
+        const max = config.PUBLISH_LIVE_MAX_POSTS!;
+        const used = (await liveApprovalUsage(tx, ref, null)).otherJobs;
+        const pending = await pendingLiveJobs(tx, ref);
+        if (used + pending + liveCount > max) throw new LivePublishLimitError({ limit: max, used: used + pending });
+      }
+      for (const item of selected) {
+        const approval = active.get(item.id)!;
+        const mode = modes.get(item.id)!;
         const jobRows = await tx
           .insert(jobs)
           .values({
@@ -994,7 +1046,8 @@ export async function executePlan(
         queued.push({ item_id: item.id, job_id: job.id, mode });
       }
       await recomputePlanStatus(tx, ownerId, plan.id, now);
-      const stored: StoredExecute = { plan_id: plan.id, queued, mode: 'MOCK', notice: MOCK_EXECUTE_NOTICE };
+      const anyLive = queued.some((q) => q.mode === 'LIVE');
+      const stored: StoredExecute = { plan_id: plan.id, queued, mode: anyLive ? 'LIVE' : 'MOCK', notice: anyLive ? LIVE_EXECUTE_NOTICE : MOCK_EXECUTE_NOTICE };
       await tx.insert(executeCommands).values({
         ownerId,
         planId: plan.id,
@@ -1008,7 +1061,7 @@ export async function executePlan(
         entity: 'distribution_plan',
         entityId: plan.id,
         versionOrHash: commandHash(input.commandKey),
-        details: { command_key_sha256: commandHash(input.commandKey), queued: queued.length, mode: 'MOCK' },
+        details: { command_key_sha256: commandHash(input.commandKey), queued: queued.length, mode: stored.mode, live: queued.filter((q) => q.mode === 'LIVE').length },
         at: now,
       });
       return { result: { ...stored, idempotent_replay: false } };

@@ -29,7 +29,7 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     if (body.kind === 'form' && body.data.plan_id) back = `/distribute/${encodeURIComponent(body.data.plan_id)}`;
     const parsed = reconcileSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
-    const r = await reconcileItem(owner.db, getChannelAdapters(), owner.ownerId, id.toLowerCase(), { timeoutMs: config.JOB_SUBMIT_TIMEOUT_MS });
+    const r = await reconcileItem(owner.db, getChannelAdapters(config), owner.ownerId, id.toLowerCase(), { timeoutMs: config.JOB_SUBMIT_TIMEOUT_MS });
     if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}reconciled=${r.outcome === 'stale_lookup' ? 'stale' : reconciledParam(r.remote)}`);
     return json(r);
   } catch (e) {

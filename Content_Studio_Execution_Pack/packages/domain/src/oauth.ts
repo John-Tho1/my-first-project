@@ -3,7 +3,7 @@
  *
  * - T13 은 모의 공급자(Threads 형태, 프로세스 안, 네트워크 없음)만 있다. 실제 Meta OAuth 왕복·토큰 발급은 하지 않는다.
  *   LIVE-T1(D31): 실제 Threads 연결 공급자(@cs/providers LiveThreadsOAuthProvider)가 생겼다 — 준비 상태(liveOAuthReadiness)가 모두 갖춰진
- *   실제(live) Threads 계정만. 실제 게시는 범위 밖(livePublishReadiness — LIVE_THREADS_PUBLISH(D31 범위 밖)).
+ *   실제(live) Threads 계정만. LIVE-P1(D38 1단계): 실제 게시의 환경 조건은 livePublishReadiness(PUBLISH_MODE·승인 기록·게시 수 상한).
  * - state: 32바이트 난수(base64url). 서버에는 SHA-256 만 저장, 한 번만 쓰임, owner + 로그인 세션 + 계정에 묶임, TTL 10분.
  * - PKCE: S256(verifier 32바이트 난수 base64url → SHA-256 → base64url). verifier 는 서버에 암호화해 둔다(브라우저로 나가지 않음).
  * - scope: 게시에 필요한 최소(Threads 기본 + 게시). reply·insights 는 기본으로 요청하지 않는다(docs/03). 실제 이름은 T14 에서 공식 문서로 재확인.
@@ -407,7 +407,10 @@ export interface LiveOAuthReadiness {
   missing: string[];
 }
 
-/** LIVE-T1(D31): 실제 게시는 승인 범위 밖 — 이 표식은 3단계 승인 전까지 항상 남는다. */
+/**
+ * LIVE-T1(D31): 실제 게시는 승인 범위 밖이라는 표식. LIVE-P1(D38): 게시 준비 판정(livePublishReadiness)에서는 빠졌고, 실제 계정이
+ * "실제 게시 계정으로 사용"(connected)이 아닐 때의 연결 상태 안내(db accountHealthView notice)에만 남는다.
+ */
 export const LIVE_THREADS_PUBLISH_MARKER = 'LIVE_THREADS_PUBLISH(D31 범위 밖)';
 
 /**
@@ -460,14 +463,19 @@ export function liveOAuthReadinessFromEnv(
 }
 
 /**
- * LIVE-T1(D31): 실제 게시 준비 상태 — D31 승인 범위 밖이므로 항상 ready=false, LIVE_THREADS_PUBLISH(D31 범위 밖) 가 남는다.
- * (게시 경로 자체도 PUBLISH_MODE·어댑터 선택(LiveChannelNotConfiguredError)·live 계정 state 로 막혀 있다 — 이 함수는 화면 표시용 이름 목록.)
+ * LIVE-P1(D38 1단계, LIVE-T1 의 "항상 준비 안 됨"을 대체): 실제 게시의 **환경** 조건(이름만, 값 없음). 모두 있어야 ready.
+ * PUBLISH_MODE=enabled · PUBLISH_LIVE_APPROVAL_REF · PUBLISH_LIVE_MAX_POSTS. 기본값(disabled·없음)이면 준비 안 됨(fail closed).
+ * 이것만으로 게시되지 않는다 — 서버 승인(정확한 payload hash)·실제 Threads 계정(게시 계정으로 사용 — connected)·쓸 수 있는 연결 정보·
+ * 승인 기록별 게시 수 상한은 실행(assertExecutionAllowed)·전송 직전(beginSend)이 따로 검사한다. 화면 표시와 서버 게이트가 같은 함수를 쓴다.
  */
-export function livePublishReadiness(config: Pick<AppConfig, 'PUBLISH_MODE'>): { ready: false; missing: string[] } {
+export function livePublishReadiness(
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>,
+): { ready: boolean; missing: string[] } {
   const missing: string[] = [];
   if (config.PUBLISH_MODE !== 'enabled') missing.push('PUBLISH_MODE=enabled');
-  missing.push(LIVE_THREADS_PUBLISH_MARKER);
-  return { ready: false, missing };
+  if (!config.PUBLISH_LIVE_APPROVAL_REF) missing.push('PUBLISH_LIVE_APPROVAL_REF');
+  if (config.PUBLISH_LIVE_MAX_POSTS === undefined || config.PUBLISH_LIVE_MAX_POSTS === null) missing.push('PUBLISH_LIVE_MAX_POSTS');
+  return { ready: missing.length === 0, missing };
 }
 
 /**

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
-import { adapterIdFor, CHANNEL_LABEL, formatMsk, providerMetadataOf, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
+import { adapterIdFor, CHANNEL_LABEL, formatMsk, LIVE_THREADS_VISIBILITY_TEXT, providerMetadataOf, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
   bannersFromState,
@@ -13,6 +13,10 @@ import {
   ITEM_STATUS_LABEL,
   itemHeadline,
   jobStatusText,
+  LIVE_UNKNOWN_GUIDANCE,
+  liveItemHeadline,
+  liveStepLine,
+  liveVerificationLabel,
   mockScenarioOptionsFor,
   PLAN_STATUS_LABEL,
   problemLabel,
@@ -111,6 +115,7 @@ function StepsPanel({ x }: { x: PlanItemDetail }) {
     remoteStepKinds: x.remoteSteps.map((r) => r.kind),
   });
   if (!v.panel) return null;
+  if (v.panel === 'live_threads') return <LiveThreadsSteps x={x} />;
   if (v.note) {
     return (
       <>
@@ -173,6 +178,45 @@ function InstagramSteps({ x }: { x: PlanItemDetail }) {
       <p className="note">
         컨테이너·미디어 ID 는 모의 ID 입니다(mockig_…). 이미지는 모의 공개 URL(mock://public-media/…)로만 모의 원격에 전달되고 바로 철회됩니다 — 실제로 공개된
         파일은 없습니다. 실제 Instagram 으로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.
+      </p>
+    </>
+  );
+}
+
+/**
+ * LIVE-P1(D38): 실제 Threads 게시 단계(컨테이너 → 게시 시도 → 게시, 실제 ID)와 연결 상태 한 줄. MOCK 문구·모의 ID 안내를 쓰지 않는다.
+ * 게시 시도 표식이 있으면 이 컨테이너로는 다시 게시하지 않는다(결과 불명이면 조회만).
+ */
+function LiveThreadsSteps({ x }: { x: PlanItemDetail }) {
+  const latest = x.jobs.at(-1) ?? null;
+  const steps = latest ? x.remoteSteps.filter((r) => r.jobId === latest.id) : [];
+  return (
+    <>
+      <h4>
+        Threads 실제 게시 단계 <span className="tag warn">실제 게시</span>
+      </h4>
+      {x.connection ? (
+        <p className="meta" role="status">
+          계정 연결(실제): <strong>{x.connection.status_label}</strong>
+          {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
+        </p>
+      ) : null}
+      {steps.length ? (
+        <ol className="list">
+          {[...steps]
+            .sort((a, b) => a.stepIndex - b.stepIndex)
+            .map((st) => (
+              <li key={st.id} className="hash">
+                {liveStepLine({ kind: st.kind, status: st.status, remoteId: st.remoteId })}
+              </li>
+            ))}
+        </ol>
+      ) : (
+        <p className="empty-text">아직 원격 단계 없음(실행하면 컨테이너 생성 → 준비 확인 → 게시 순서로 진행, 텍스트 1개)</p>
+      )}
+      <p className="note">
+        실제 Threads ID 입니다. 공개 범위: {LIVE_THREADS_VISIBILITY_TEXT}. 결과를 모르는 게시 시도는 자동으로 다시 게시하지 않고, 이 계정의 최근 글 목록에서 같은 본문을
+        찾을 때만 확인으로 바꿉니다.
       </p>
     </>
   );
@@ -294,7 +338,9 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const latest = x.jobs.at(-1) ?? null;
   const latestPub = latest ? (x.publications.find((q) => q.jobId === latest.id) ?? x.publications.at(-1) ?? null) : (x.publications.at(-1) ?? null);
   const block = blockInfoOfItem(x);
-  const headline = itemHeadline({
+  // LIVE-P1(D38): 실제 계정 항목 — 실제 게시 문구(MOCK 문구와 섞지 않음)
+  const live = x.account?.kind === 'live';
+  const headlineInput = {
     status: x.item.status,
     channel,
     job: latest,
@@ -305,7 +351,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     needsNewPlan: x.problems.length > 0,
     publishAt: providerMetadataOf(p).publish_at ?? null,
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
-  });
+  };
+  const headline = live ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null }) : itemHeadline(headlineInput);
   // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
   // M4UI FIX1: PUBLISHED 는 기록 시각(created_at)이 예약 시각 전일 때만 "적용하지 않음" — 그 밖은 중립 문구
   const publishAt = publishAtView({
@@ -320,26 +367,43 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       <h3>
         {CHANNEL_LABEL[channel as Channel] ?? channel} — {x.account?.displayName ?? '(계정 없음)'}{' '}
         {x.account?.kind === 'mock' ? <span className="tag warn">MOCK</span> : null}
+        {live ? <span className="tag warn">실제 게시 — 실제 계정</span> : null}
       </h3>
+      {live ? (
+        <p className="notice" role="note">
+          실제 게시 항목: 승인하고 실행하면 이 내용 그대로 실제 Threads 계정 <strong>{x.account?.displayName}</strong> 에 게시됩니다(되돌리기 없음). 공개 범위:{' '}
+          {LIVE_THREADS_VISIBILITY_TEXT}.
+        </p>
+      ) : null}
       <p className="status-line" role="status">
         <strong>{headline}</strong>
-        {x.item.status === 'CONFIRMED' ? (
+        {x.item.status === 'CONFIRMED' && !live ? (
           <>
             {' '}
             <span className="tag warn">MOCK</span> <strong>실제 발행 실적 아님</strong>
+          </>
+        ) : null}
+        {x.item.status === 'CONFIRMED' && live && latestPub?.permalink ? (
+          <>
+            {' '}
+            <a href={latestPub.permalink} rel="noopener noreferrer" target="_blank">
+              Threads 에서 보기
+            </a>
           </>
         ) : null}
       </p>
       <p className="meta">
         <span className="tag">{ITEM_STATUS_LABEL[x.item.status] ?? x.item.status}</span>
         {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
-        <span>공개 범위: {VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility}</span>
+        <span>공개 범위: {live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)` : (VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility)}</span>
         <span>
           일정: {scheduled ? `${formatMsk(scheduled)} (UTC ${scheduled.toISOString()})` : '즉시(실행 후 대기열)'}
         </span>
         <span>
           요청 결과:{' '}
-          {x.item.requestedResult === 'mock_publish'
+          {live
+            ? '실제 게시(public_publish — Threads 텍스트 1개)'
+            : x.item.requestedResult === 'mock_publish'
             ? 'MOCK 실행(실제 게시 아님)'
             : x.item.requestedResult === 'upload_private'
               ? `비공개 업로드(upload_private${x.account?.kind === 'mock' ? ' — MOCK' : ''})`
@@ -370,7 +434,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       <p className="hash">payload hash: {x.item.payloadHash.slice(0, 16)}…</p>
       {approvable ? (
         <label className="choice">
-          <input type="checkbox" name={`item_${x.item.id}`} form="approve-form" />이 항목 승인(선택)
+          <input type="checkbox" name={`item_${x.item.id}`} form="approve-form" />
+          {live ? '이 항목 승인(선택) — 실제 Threads 게시 승인' : '이 항목 승인(선택)'}
         </label>
       ) : null}
       {x.approvals.length ? (
@@ -398,7 +463,12 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       ) : null}
       {x.jobs.length ? (
         <>
-          <h4>작업(MOCK — 모의 어댑터)</h4>
+          <h4>{live ? '작업(실제 게시 — 실제 Threads 어댑터)' : '작업(MOCK — 모의 어댑터)'}</h4>
+          {live && x.item.status === 'UNKNOWN' ? (
+            <p className="notice" role="alert">
+              {LIVE_UNKNOWN_GUIDANCE}
+            </p>
+          ) : null}
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
@@ -444,14 +514,30 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         <>
           <h4>원격 결과</h4>
           <ul className="list">
-            {x.publications.map((p) => (
-              <li key={p.id}>
-                {p.isMock ? <span className="tag warn">MOCK</span> : null} {RESULT_KIND_LABEL[p.resultKind] ?? p.resultKind} · 원격 공개 범위 {p.remoteVisibility} · 확인{' '}
-                {p.verification} · <span className="hash">{p.externalId}</span>
-                {p.permalink ? <span className="hash"> · {p.permalink}</span> : null}
-                {p.isMock ? <strong> — 실제 발행 실적 아님</strong> : null}
-              </li>
-            ))}
+            {x.publications.map((p) =>
+              p.isMock ? (
+                <li key={p.id}>
+                  <span className="tag warn">MOCK</span> {RESULT_KIND_LABEL[p.resultKind] ?? p.resultKind} · 원격 공개 범위 {p.remoteVisibility} · 확인 {p.verification} ·{' '}
+                  <span className="hash">{p.externalId}</span>
+                  {p.permalink ? <span className="hash"> · {p.permalink}</span> : null}
+                  <strong> — 실제 발행 실적 아님</strong>
+                </li>
+              ) : (
+                <li key={p.id}>
+                  <span className="tag warn">실제 게시</span> 실제 Threads 게시물 · 공개 범위 {LIVE_THREADS_VISIBILITY_TEXT} · 확인: {liveVerificationLabel(p.verification, p.permalink)} ·{' '}
+                  <span className="hash">{p.externalId}</span>
+                  {p.permalink ? (
+                    <>
+                      {' '}
+                      ·{' '}
+                      <a href={p.permalink} rel="noopener noreferrer" target="_blank">
+                        {p.permalink}
+                      </a>
+                    </>
+                  ) : null}
+                </li>
+              ),
+            )}
           </ul>
         </>
       ) : null}
@@ -501,21 +587,35 @@ export default async function PlanPage({
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
   const banners = bannersFromState(q, d);
-  const reconciled = reconciledNotice(q.reconciled);
+  // LIVE-P1(D38): 실제 계정 항목이 있는 계획 — 실제 게시 안내(모의 항목은 그대로 MOCK)
+  const hasLive = d.items.some((x) => x.account?.kind === 'live');
+  const hasMock = d.items.some((x) => x.account?.kind !== 'live');
+  const reconciledRaw = reconciledNotice(q.reconciled);
+  const reconciled =
+    hasLive && q.reconciled === 'found' ? '원격에서 결과를 찾았습니다. 실제 게시 항목의 확인 상태는 아래 항목 카드에서 보세요(모의 항목은 MOCK).' : reconciledRaw;
 
   return (
     <main className="container">
       <h2 className="screen-title">배포 계획 — {d.plan.targetSummary || '이름 없음'}</h2>
       <p className="meta">
-        <span className="tag warn">MOCK</span>
-        <span className="tag">{PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status}</span>
+        {hasMock ? <span className="tag warn">MOCK</span> : null}
+        {hasLive ? <span className="tag warn">실제 게시 포함</span> : null}
+        <span className="tag">{hasLive ? (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status).replace(/\(MOCK[^)]*\)/, '') : (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status)}</span>
         <time dateTime={d.plan.createdAt.toISOString()}>만든 시각 {formatMsk(d.plan.createdAt)}</time>
         <Link href="/distribute">배포함</Link>
       </p>
-      <p className="notice" role="note">
-        MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 실행하면 작업 대기열(QUEUED)에 들어가고, 작업 처리기가 모의 어댑터로
-        처리합니다. 확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.
-      </p>
+      {hasLive ? (
+        <p className="notice" role="alert">
+          실제 게시 — 이 계획에는 실제 Threads 계정 항목이 있습니다. 그 항목을 승인하고 실행하면 작업 처리기가 승인된 내용 그대로 <strong>실제로 게시</strong>합니다(텍스트 1개,
+          되돌리기 없음). 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다. 결과를 모르면 자동으로 다시 게시하지 않습니다.
+          {hasMock ? ' 모의 계정 항목은 MOCK 입니다(실제 발행 실적 아님).' : ''}
+        </p>
+      ) : (
+        <p className="notice" role="note">
+          MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 실행하면 작업 대기열(QUEUED)에 들어가고, 작업 처리기가 모의 어댑터로
+          처리합니다. 확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.
+        </p>
+      )}
       {q.created === '1' ? (
         <p className="saved" role="status">
           배포 계획을 만들었습니다(MOCK — 아직 승인 전). 아래 내용을 확인한 뒤 승인할 항목을 고르세요.
@@ -523,12 +623,16 @@ export default async function PlanPage({
       ) : null}
       {banners.approved !== null ? (
         <p className="saved" role="status">
-          승인됨: 이 계획에서 지금 승인된 항목 {banners.approved}개(MOCK 계정 — 실제 게시 아님).
+          {hasLive
+            ? `승인됨: 이 계획에서 지금 승인된 항목 ${banners.approved}개(실제 게시 항목은 실행하면 실제로 게시됩니다).`
+            : `승인됨: 이 계획에서 지금 승인된 항목 ${banners.approved}개(MOCK 계정 — 실제 게시 아님).`}
         </p>
       ) : null}
       {banners.executed ? (
         <p className="saved" role="status">
-          MOCK 실행: 작업이 만들어진 항목 {banners.executed.items}개(작업 {banners.executed.jobs}개){banners.executed.replay ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — 아래 &quot;작업 처리 실행(모의 1회)&quot;을 누르거나 작업 처리기가 처리합니다.
+          {hasLive
+            ? `실행: 작업이 만들어진 항목 ${banners.executed.items}개(작업 ${banners.executed.jobs}개)${banners.executed.replay ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 항목은 작업 처리기가 처리할 때 실제로 게시됩니다.`
+            : `MOCK 실행: 작업이 만들어진 항목 ${banners.executed.items}개(작업 ${banners.executed.jobs}개)${banners.executed.replay ? '(같은 실행 요청 — 기존 결과)' : ''}. 실제 게시 아님 — 아래 "작업 처리 실행(모의 1회)"을 누르거나 작업 처리기가 처리합니다.`}
         </p>
       ) : null}
       {q.revoked === '1' ? (
@@ -538,7 +642,9 @@ export default async function PlanPage({
       ) : null}
       {str(q.ticked) !== undefined ? (
         <p className="saved" role="status">
-          작업 처리기(모의)를 한 번 실행했습니다: 작업 {Number(str(q.ticked) ?? 0)}개 처리. 외부로 아무것도 보내지 않았습니다(MOCK).
+          {hasLive
+            ? `작업 처리기를 한 번 실행했습니다: 작업 ${Number(str(q.ticked) ?? 0)}개 처리. 실제 게시 항목은 조건이 모두 있을 때만 실제로 보냈습니다 — 아래 항목 상태를 확인하세요.`
+            : `작업 처리기(모의)를 한 번 실행했습니다: 작업 ${Number(str(q.ticked) ?? 0)}개 처리. 외부로 아무것도 보내지 않았습니다(MOCK).`}
         </p>
       ) : null}
       {banners.canceled ? (
@@ -588,6 +694,12 @@ export default async function PlanPage({
               <input key={`p-${x.item.id}`} type="hidden" name={`purpose_${x.item.id}`} value={x.item.requestedResult} />
             ))}
             <p className="note">위 항목 카드에서 승인할 항목을 직접 고르세요(기본 선택 없음). 고른 항목의 위 내용 그대로(hash)만 승인됩니다.</p>
+            {approvable.some((x) => x.account?.kind === 'live') ? (
+              <p className="notice" role="alert">
+                <span className="tag warn">실제 게시 승인</span> 실제 Threads 계정 항목을 승인하면, 실행 뒤 그 내용 그대로 실제 계정에 게시됩니다(계정·본문·공개 범위{' '}
+                {LIVE_THREADS_VISIBILITY_TEXT}). 승인 뒤 내용·계정이 바뀌면 승인은 무효가 됩니다.
+              </p>
+            ) : null}
             {new Set(approvable.map((x) => x.item.requestedResult)).size > 1 ? (
               <p className="note">
                 이 계획에는 요청 결과가 다른 항목이 섞여 있습니다. 고른 항목은 각자 카드에 보인 요청 결과(
@@ -606,20 +718,24 @@ export default async function PlanPage({
       </section>
 
       <section className="card archive" aria-labelledby="execute-title">
-        <h3 id="execute-title">실행(MOCK)</h3>
+        <h3 id="execute-title">{hasLive ? '실행(실제 게시 포함)' : '실행(MOCK)'}</h3>
         <form className="form inline" method="post" action={`/api/distribution-plans/${d.plan.id}/execute`}>
           <input type="hidden" name="command_key" value={randomUUID()} />
           <button type="submit" disabled={!executable}>
-            지금 실행(MOCK — 대기열에 넣기)
+            {hasLive ? '지금 실행(대기열에 넣기 — 실제 게시 항목 포함)' : '지금 실행(MOCK — 대기열에 넣기)'}
           </button>
         </form>
         <p className="note">승인된 항목만 대기열에 들어갑니다. 두 번 눌러도 작업은 하나만 생깁니다.</p>
         <form className="form inline" method="post" action="/api/worker/tick">
           <input type="hidden" name="plan_id" value={d.plan.id} />
           <input type="hidden" name="max_jobs" value="5" />
-          <button type="submit">작업 처리 실행(모의 1회)</button>
+          <button type="submit">{hasLive ? '작업 처리 실행(1회 — 실제 게시 항목은 실제로 게시)' : '작업 처리 실행(모의 1회)'}</button>
         </form>
-        <p className="note">작업 처리기를 한 번 돌립니다(내 작업 최대 5개, 모의 어댑터 — 외부 호출 없음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.</p>
+        <p className="note">
+          {hasLive
+            ? '작업 처리기를 한 번 돌립니다(내 작업 최대 5개). 실제 게시 항목은 실제 게시 조건이 모두 있을 때만 실제 Threads 로 보내고, 모의 항목은 모의 어댑터로 처리합니다. 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'
+            : '작업 처리기를 한 번 돌립니다(내 작업 최대 5개, 모의 어댑터 — 외부 호출 없음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'}
+        </p>
       </section>
     </main>
   );

@@ -30,7 +30,9 @@ import {
   decideRetryAt,
   DEFAULT_LEASE_TTL_MS,
   FREE_RESUME_MAX,
+  isAllowedThreadsPermalink,
   isScheduleStale,
+  LIVE_THREADS_EXTERNAL_ID_RE,
   staleScheduleConfirmedBy,
   LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
@@ -84,6 +86,7 @@ import {
 } from './approval-invalidation';
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
+import { liveApprovalUsage } from './live-publish';
 import { mediaPortFor } from './media-spec';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
@@ -99,7 +102,8 @@ const ITEM_NOT_FOUND = '배포 항목을 찾을 수 없습니다';
 export interface JobRunOptions {
   /** lease 소유자 표시(호스트 이름을 넣지 않는다 — 예: 'cli-1a2b3c4d') */
   workerId: string;
-  config: Pick<AppConfig, 'PUBLISH_MODE'>;
+  /** LIVE-P1(D38): 실제 게시 환경 조건(PUBLISH_LIVE_*)도 여기서 읽는다(없으면 실제 게시 차단). */
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>;
   /** 시계(테스트 주입). 기본 new Date() */
   clock?: () => Date;
   leaseTtlMs?: number;
@@ -274,18 +278,25 @@ async function settle(
 
 const CLEAR_LEASE = { leaseOwner: null, leaseUntil: null } as const;
 
-/** 원격 결과 기록(추가 전용). 모의 어댑터 결과는 is_mock=true·verification=MOCK — 실제 발행 실적이 아니다(DB CHECK 로도 강제). */
+/**
+ * 원격 결과 기록(추가 전용). 모의 어댑터 결과는 is_mock=true·verification=MOCK — 실제 발행 실적이 아니다(DB CHECK 로도 강제).
+ * LIVE-P1(D38): 실제 결과는 원격 읽기로 확인했을 때만(r.verified) VERIFIED + verified_at, 아니면 UNVERIFIED. 형식(threads:<숫자>·공식 링크)은
+ * 여기서 한 번 더 보고(DB CHECK 0044 와 같은 규칙) 맞지 않는 링크는 저장하지 않는다(꾸며낸 URL 금지).
+ */
 async function insertPublication(
   tx: DbOrTx,
   ownerId: string,
   item: DistributionItemRow,
   jobId: string,
   isMock: boolean,
-  r: Pick<AdapterResult, 'external_id' | 'permalink' | 'result_kind' | 'remote_visibility'>,
+  r: Pick<AdapterResult, 'external_id' | 'permalink' | 'result_kind' | 'remote_visibility' | 'verified'>,
   now: Date,
 ): Promise<string | null> {
   if (!r.external_id) return null;
   if (isMock && !r.external_id.startsWith('mock:')) throw new AppError('conflict', 'mock_id_invalid', '모의 결과의 외부 ID 는 mock: 로 시작해야 합니다');
+  if (!isMock && !LIVE_THREADS_EXTERNAL_ID_RE.test(r.external_id)) throw new AppError('conflict', 'live_id_invalid', '실제 결과의 외부 ID 형식이 올바르지 않습니다');
+  const permalink = isMock ? (r.permalink ?? null) : isAllowedThreadsPermalink(r.permalink) ? r.permalink : null;
+  const verified = !isMock && r.verified === true && permalink !== null;
   const visibility = r.remote_visibility ?? 'unknown';
   const kind = r.result_kind ?? (visibility === 'private' ? 'UPLOADED_PRIVATE' : 'PUBLISHED');
   const rows = await tx
@@ -295,12 +306,12 @@ async function insertPublication(
       itemId: item.id,
       jobId,
       externalId: r.external_id,
-      permalink: r.permalink ?? null,
+      permalink,
       resultKind: kind,
       remoteVisibility: visibility,
-      verification: isMock ? 'MOCK' : 'UNVERIFIED',
+      verification: isMock ? 'MOCK' : verified ? 'VERIFIED' : 'UNVERIFIED',
       isMock,
-      verifiedAt: null,
+      verifiedAt: verified ? now : null,
       createdAt: now,
     })
     .onConflictDoNothing()
@@ -332,6 +343,9 @@ async function fillIntent(
         error_code: r.error_code ?? null,
         retry_class: r.retry_class ?? null,
         ...(typeof intent.sanitizedDetails?.adapter_id === 'string' ? { adapter_id: intent.sanitizedDetails.adapter_id } : {}),
+        // LIVE-P1: 실제 게시 승인 기록·모드도 남긴다(게시 수 상한을 세는 근거 — 결과를 채운 뒤에도 사라지지 않게).
+        ...(typeof intent.sanitizedDetails?.live_approval_ref === 'string' ? { live_approval_ref: intent.sanitizedDetails.live_approval_ref } : {}),
+        ...(typeof intent.sanitizedDetails?.mode === 'string' ? { mode: intent.sanitizedDetails.mode } : {}),
       },
     })
     .where(and(eq(sendIntents.id, intent.id), eq(sendIntents.ownerId, ownerId), eq(sendIntents.outcome, 'pending')));
@@ -705,15 +719,19 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         lastErrorCode: code,
       });
     }
-    let mode: 'MOCK';
+    let mode: 'MOCK' | 'LIVE';
     let adapter: ChannelAdapter;
     try {
+      // LIVE-P1(D38): 실제 계정은 PUBLISH_MODE·서버 승인(hash)·플랫폼 threads·승인 기록·게시 수 상한 설정이 모두 있어야 LIVE(아니면 보내지 않고 BLOCKED).
       mode = assertExecutionAllowed(opts.config as AppConfig, {
         accountKind: acc.kind === 'mock' ? 'mock' : 'live',
         payloadHash: item.payloadHash,
         approval: { id: approval.id, payloadHash: approval.payloadHash, revokedAt: approval.revokedAt },
+        platform: acc.platform,
       }).mode;
       adapter = registry.getAdapterFor(adapterAccount(acc));
+      // 실제 계정에 모의 어댑터(또는 그 반대)가 붙으면 보내지 않는다(레지스트리 잘못 구성 방어).
+      if ((mode === 'LIVE') !== (adapter.kind === 'live')) throw new AppError('conflict', 'adapter_kind_mismatch', '계정과 어댑터 종류가 다릅니다');
     } catch (e) {
       const code = e instanceof Error && 'code' in e ? String((e as { code: unknown }).code).toLowerCase() : 'execution_not_allowed';
       return settle(tx, ownerId, job, item, 'blocked', { reason: 'execution_not_allowed', code }, now, { ...CLEAR_LEASE, lastErrorCode: code });
@@ -813,6 +831,30 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         }
       }
     }
+    // LIVE-P1(D38): 승인 기록(PUBLISH_LIVE_APPROVAL_REF)별 실제 게시 수 상한(PUBLISH_LIVE_MAX_POSTS). 승인 기록별 advisory 잠금(배타, 트랜잭션 끝까지) 아래에서
+    // 이 승인 기록으로 전송 의도를 만든 **다른** 실제 게시 작업 수를 센다 — 이 작업이 이미 그 기록으로 보낸 적 있으면(재시도·이어 게시) 새 게시가 아니다.
+    // 잠금 순서: 계정(공유) → 항목 → 작업 → 요청 제한 잠금 → 이 잠금(이 잠금을 잡는 곳은 여기뿐).
+    let liveApprovalRef: string | null = null;
+    if (mode === 'LIVE') {
+      const ref = opts.config.PUBLISH_LIVE_APPROVAL_REF;
+      const max = opts.config.PUBLISH_LIVE_MAX_POSTS;
+      if (!ref || max === undefined || max === null) {
+        // assertExecutionAllowed 가 이미 막는다 — 두 번째 방어선
+        return settle(tx, ownerId, job, item, 'blocked', { reason: 'execution_not_allowed', code: 'live_publish_not_ready', not_sent: true }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: 'live_publish_not_ready',
+        });
+      }
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs_live_publish:${ref}`}))`);
+      const usage = await liveApprovalUsage(tx, ref, job.id);
+      if (!usage.thisJobCounted && usage.otherJobs >= max) {
+        return settle(tx, ownerId, job, item, 'blocked', { reason: 'live_publish_limit', not_sent: true, used: usage.otherJobs, limit: max }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: 'live_publish_limit',
+        });
+      }
+      liveApprovalRef = ref;
+    }
     const attempt = job.attempt + 1;
     const intentKey = `${job.id}:${attempt}`;
     await transitionJob(tx, ownerId, job, 'send_start', { attempt, intent_key: intentKey, mode, approval_id: approval.id, adapter_id: adapter.id ?? null }, now, { attempt });
@@ -824,7 +866,14 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       intentKey,
       createdAt: now,
       outcome: 'pending',
-      sanitizedDetails: { mode, approval_id: approval.id, adapter: adapter.kind, adapter_id: adapter.id ?? null },
+      sanitizedDetails: {
+        mode,
+        approval_id: approval.id,
+        adapter: adapter.kind,
+        adapter_id: adapter.id ?? null,
+        // LIVE-P1: 이 시도가 쓴 실제 게시 승인 기록(게시 수 상한을 세는 근거). 모의 시도에는 없다.
+        ...(liveApprovalRef ? { live_approval_ref: liveApprovalRef } : {}),
+      },
     });
     await recomputePlanStatus(tx, ownerId, item.planId, now);
     return { adapter, snapshot, intentKey, job: { ...job, state: 'SENDING', attempt }, mockScenario, rateUnitsReserved } satisfies SendPlan;
@@ -960,7 +1009,9 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
   // T14(D26): 연결 정보를 쓰는 계정의 401(auth) → 작업은 BLOCKED(자동 재시도 없음). T13 의 확인 경로(checkCredential — 공급자에 한 번 묻고
   // 무효면 연결 정보 error → 실행 게이트가 막음)를 한 번 부른다. 실패해도 작업 결과는 그대로(오류 이름만 남긴다).
   const credState = begun.snapshot.account.credential_state;
-  if (final === 'BLOCKED' && result.retry_class === 'auth' && credState && credState !== 'none' && opts.credentials?.check) {
+  // LIVE-P1(D38): 실제 계정은 자동 연결 확인(실제 프로필 조회 = 외부 호출)을 하지 않는다 — 게시 승인 범위 밖의 호출을 늘리지 않게.
+  // 보류(BLOCKED) 뒤 사용자가 설정 화면의 "연결 확인(프로필 조회)"으로 직접 확인한다.
+  if (final === 'BLOCKED' && result.retry_class === 'auth' && begun.adapter.kind === 'mock' && credState && credState !== 'none' && opts.credentials?.check) {
     try {
       await opts.credentials.check(begun.job.ownerId, begun.snapshot.account.id, clock());
     } catch (e) {
@@ -1250,8 +1301,11 @@ export async function cancelItem(db: Db, ownerId: string, itemId: string, now: D
         // FIX-T14(Codex review-T14 missed case): 스레드 일부가 이미 원격에 게시됐으면(이전 시도 — 2번째 이후 게시물에서 401·429·재개 대기 등)
         // "보내지 않음"·취소 성공이라고 하지 않는다(A11). 남은 게시물은 보내지 않고 UNKNOWN(thread_partial_canceled) — 단계 목록이 게시된 범위를 보여 준다.
         const parts = await publishedStepCount(tx, ownerId, job.id, ['publish', 'video']);
-        if (parts > 0) {
-          await settle(tx, ownerId, job, item, 'cancel_partial', { cause: 'user', not_sent: false, published_parts: parts }, now, {
+        // LIVE-P1(D38): 실제 Threads 의 게시 시도 표식(publish_attempt) — 결과를 모르는 게시 시도가 있으면 "보내지 않음"이라고 하지 않는다.
+        const attempts = await publishedStepCount(tx, ownerId, job.id, ['publish_attempt']);
+        if (parts > 0 || attempts > 0) {
+          const live = attempts > 0;
+          await settle(tx, ownerId, job, item, 'cancel_partial', { cause: 'user', not_sent: false, published_parts: parts, publish_attempts: attempts }, now, {
             ...CLEAR_LEASE,
             cancelRequestedAt: now,
             lastErrorCode: 'thread_partial_canceled',
@@ -1263,7 +1317,9 @@ export async function cancelItem(db: Db, ownerId: string, itemId: string, now: D
             cancel_requested: false,
             state: 'UNKNOWN',
             published_parts: parts,
-            message: `남은 부분은 보내지 않습니다. 이미 게시된 ${parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
+            message: live
+              ? '더 보내지 않습니다. 이 글은 실제 Threads 에 이미 게시됐거나 게시됐을 수 있습니다(취소로 되돌리지 않음 — Threads 에서 직접 확인하세요).'
+              : `남은 부분은 보내지 않습니다. 이미 게시된 ${parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
           };
           break;
         }
@@ -1429,6 +1485,7 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
       lastRetryClass: null,
       reconcileCount: 0,
     });
+    const live = (await accountOf(tx, ownerId, item.channelAccountId))?.kind === 'live';
     await recordAudit(tx, {
       ownerId,
       action: 'item.retry',
@@ -1438,12 +1495,19 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
         job_id: job.id,
         previous_error: job.lastErrorCode,
         attempt_next: job.attempt + 1,
-        mode: 'MOCK',
+        mode: live ? 'LIVE' : 'MOCK',
         ...(job.lastErrorCode === 'schedule_stale' ? { stale_schedule_confirmed: true } : {}),
       },
       at: now,
     });
-    return { item_id: item.id, job_id: job.id, state: 'QUEUED' as const, attempt_next: job.attempt + 1, message: '다시 대기열에 넣었습니다(MOCK — 새 시도·새 전송 의도)' };
+    return {
+      item_id: item.id,
+      job_id: job.id,
+      state: 'QUEUED' as const,
+      attempt_next: job.attempt + 1,
+      // LIVE-P1: 실제 계정 재시도도 이미 게시 시도한 컨테이너는 다시 게시하지 않는다(어댑터 규칙) — 결과 불명이면 조회만.
+      message: live ? '다시 대기열에 넣었습니다(실제 게시 — 새 시도. 이미 게시를 시도한 글은 다시 게시하지 않고 확인만 합니다)' : '다시 대기열에 넣었습니다(MOCK — 새 시도·새 전송 의도)',
+    };
   });
 }
 

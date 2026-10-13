@@ -5,6 +5,8 @@ import { adapterIdFor, CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from 
 import { getSession } from '../../../lib/auth';
 import {
   DISTRIBUTE_ERROR_TEXT,
+  isLiveThreadsAccount,
+  LIVE_PLAN_ACCOUNT_NOTE,
   planAccountLabel,
   planFormDefaults,
   planResultSelect,
@@ -27,10 +29,21 @@ export const dynamic = 'force-dynamic';
  */
 function defaultVisibilityFor(a: { kind: string; platform: string; credentialState: string } | undefined): 'public' | 'private' {
   if (!a) return 'private';
+  // LIVE-P1(D38): 실제 Threads 계정은 public 만(실제 공개 범위는 Threads 계정 공개 설정)
+  if (isLiveThreadsAccount(a)) return 'public';
   return adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram' ? 'public' : 'private';
 }
 
 function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; prev: PlanFormDefaults }) {
+  if (sel.fixed && sel.live) {
+    // LIVE-P1(D38): 실제 Threads 계정 = 실제 게시(public_publish) 고정, 모의 계정 = MOCK 실행(서버가 계정마다 정함)
+    return (
+      <p className="meta">
+        요청 결과: <span className="tag warn">실제 게시</span> 실제 Threads 계정은 <strong>실제 게시(public_publish)</strong>
+        {sel.choices.length ? ', 모의 계정은 MOCK 실행(실제 게시 아님)' : ''} — 계정에 따라 서버가 정합니다.
+      </p>
+    );
+  }
   if (sel.fixed) {
     return (
       <p className="meta">
@@ -102,9 +115,16 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
   return (
     <main className="container">
       <h2 className="screen-title">배포 계획 만들기 — {content.title}</h2>
-      <p className="notice" role="note">
-        MOCK — 모의 계정으로만 계획합니다. 계획을 만들어도 승인·게시되지 않습니다. 다음 화면에서 채널별로 나갈 내용을 확인하고 직접 승인해야 합니다.
-      </p>
+      {accounts.some(isLiveThreadsAccount) ? (
+        <p className="notice" role="note">
+          <span className="tag warn">실제 게시 계정 있음</span> 실제 Threads 계정(실제 게시 계정으로 사용 중)을 고르면 승인·실행 뒤 <strong>실제로 게시</strong>됩니다. 모의 계정은
+          MOCK 입니다. 계획을 만들어도 승인·게시되지 않습니다 — 다음 화면에서 채널별로 나갈 내용을 확인하고 직접 승인해야 합니다.
+        </p>
+      ) : (
+        <p className="notice" role="note">
+          MOCK — 모의 계정으로만 계획합니다. 계획을 만들어도 승인·게시되지 않습니다. 다음 화면에서 채널별로 나갈 내용을 확인하고 직접 승인해야 합니다.
+        </p>
+      )}
       {err ? (
         <p className="notice" role="alert">
           {err}
@@ -160,6 +180,11 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                       규격(JPEG·8MiB 이하·가로세로 4:5~1.91:1·가로 320px 이상, 캐러셀 2~10장)을 승인 전에 검사합니다 — 공식 규격 재확인 전 값.
                     </p>
                   ) : null}
+                  {accs.some(isLiveThreadsAccount) ? (
+                    <p className="note">
+                      <span className="tag warn">실제 게시</span> {LIVE_PLAN_ACCOUNT_NOTE}
+                    </p>
+                  ) : null}
                   <ResultFields vid={v.id} sel={planResultSelect(accs)} prev={prev} />
                 </>
               )}
@@ -167,7 +192,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
           ))}
           <label htmlFor="target_summary">계획 이름(선택)</label>
           <input id="target_summary" type="text" name="target_summary" maxLength={200} defaultValue={prev.name} />
-          <button type="submit">배포 계획 만들기(MOCK — 승인 전)</button>
+          <button type="submit">{accounts.some(isLiveThreadsAccount) ? '배포 계획 만들기(승인 전 — 아직 게시하지 않음)' : '배포 계획 만들기(MOCK — 승인 전)'}</button>
         </form>
       )}
     </main>

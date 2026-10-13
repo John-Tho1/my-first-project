@@ -270,17 +270,25 @@ describe('M4UI(G1·G2) — 승인 폼 항목별 목적, 계획 폼 요청 결과
     expect(resultChoicesFor(ytSeed)).toEqual(['mock_publish']);
     expect(resultChoicesFor(thrLinked)).toEqual(['mock_publish']);
     expect(resultChoicesFor({ ...ytLinked, credentialState: 'needs_reconnect' })).toEqual(['upload_private', 'public_publish', 'scheduled_publish']);
-    expect(planResultSelect([thrLinked])).toEqual({ fixed: true, accountDefault: false, choices: ['mock_publish'], scheduledAllowed: false });
-    expect(planResultSelect([ytLinked])).toEqual({ fixed: false, accountDefault: false, choices: ['upload_private', 'public_publish', 'scheduled_publish'], scheduledAllowed: true });
+    expect(planResultSelect([thrLinked])).toEqual({ fixed: true, accountDefault: false, choices: ['mock_publish'], scheduledAllowed: false, live: false });
+    expect(planResultSelect([ytLinked])).toEqual({ fixed: false, accountDefault: false, choices: ['upload_private', 'public_publish', 'scheduled_publish'], scheduledAllowed: true, live: false });
     expect(planResultSelect([ytSeed, ytLinked])).toEqual({
       fixed: false,
       accountDefault: true,
       choices: ['upload_private', 'public_publish', 'scheduled_publish', 'mock_publish'],
       scheduledAllowed: true,
+      live: false,
     });
     expect(planAccountLabel(ytLinked)).toBe('YT (MOCK) · 모의 연결 — 비공개 업로드·공개 게시·예약 공개');
     expect(planAccountLabel(thrLinked)).toBe('TH (MOCK) · MOCK 실행만');
     for (const l of Object.values(RESULT_CHOICE_LABEL)) expect(l).toContain('MOCK');
+    // LIVE-P1(D38): 실제 Threads 계정(실제 게시 계정으로 사용 중) — MOCK 이라고 하지 않고 실제 게시라고 말한다, 요청 결과는 서버 기본값
+    const liveThr = { kind: 'live', platform: 'threads', credentialState: 'linked', displayName: '@tester' };
+    expect(resultChoicesFor(liveThr)).toEqual([]);
+    expect(planAccountLabel(liveThr)).toBe('@tester (실제 계정) · 실제 게시 — Threads 텍스트 1개, 되돌리기 없음');
+    expect(planAccountLabel(liveThr)).not.toContain('MOCK');
+    expect(planResultSelect([liveThr])).toEqual({ fixed: true, accountDefault: false, choices: [], scheduledAllowed: false, live: true });
+    expect(planResultSelect([thrLinked, liveThr])).toMatchObject({ fixed: true, live: true, choices: ['mock_publish'] });
   });
   it('planFormEcho·planFormDefaults: 요청 결과·예약 공개 날짜·시각 왕복(목록 밖 값·형식 틀린 값은 버림)', () => {
     const W = '99999999-2222-4333-8444-555555555555';
@@ -431,7 +439,8 @@ describe('stepsPanelView — M4 화면 FIX(S1): 단계 패널은 기록된 어�
   });
 
   it('모르는 adapter_id → 확인 불가 안내(진행 안내 아님)', () => {
-    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: 'live_threads' } } });
+    // LIVE-P1(D38): live_threads 는 이제 아는 어댑터 — 모르는 값의 예는 live_youtube(단언 의미 그대로)
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: 'live_youtube' } } });
     expect(v).toMatchObject({ panel: 'threads', adapter: null, source: 'intent' });
     expect(v.note).toBe('전송 의도에 기록된 어댑터를 확인할 수 없음 — Threads 단계 표시 안 함(MOCK)');
   });

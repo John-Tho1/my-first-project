@@ -475,7 +475,10 @@ describe('어댑터 선택 규칙(D26)', () => {
     expect(adapterIdFor({ kind: 'mock', platform: 'threads' })).toBe('mock_generic');
     // T16: 연결한 Instagram 은 mock_instagram 이 됐다 — 연결 공급자가 없는 채널(블로그)은 연결 상태와 관계없이 mock_generic(같은 단언)
     expect(adapterIdFor({ kind: 'mock', platform: 'blog', credential_state: 'linked' })).toBe('mock_generic');
-    expect(adapterIdFor({ kind: 'live', platform: 'threads', credential_state: 'linked' })).toBeNull();
+    // LIVE-P1(D38): 실제 Threads(연결함) → live_threads(선택만 — 허용은 레지스트리·실행 게이트), 그 밖의 실제 계정 → 없음
+    expect(adapterIdFor({ kind: 'live', platform: 'threads', credential_state: 'linked' })).toBe('live_threads');
+    expect(adapterIdFor({ kind: 'live', platform: 'threads', credential_state: 'none' })).toBeNull();
+    expect(adapterIdFor({ kind: 'live', platform: 'youtube', credential_state: 'linked' })).toBeNull();
     const reg = new MockChannelAdapterRegistry(new MockChannelAdapter({ readEnv: false }), new ThreadsMockChannelAdapter({ api: new ThreadsMockApi({ tokenCheck }) }));
     expect(reg.getAdapterFor({ kind: 'mock', platform: 'threads', credential_state: 'linked' })).toBe(reg.threads);
     expect(reg.getAdapterFor({ kind: 'mock', platform: 'threads', credential_state: 'none' })).toBe(reg.mock);

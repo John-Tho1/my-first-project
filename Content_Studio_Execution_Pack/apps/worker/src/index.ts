@@ -33,7 +33,7 @@ import {
   type RetentionResult,
   type TranscriberLike,
 } from '@cs/db';
-import type { AppConfig, ChannelAdapterRegistry, CollectorAdapter, MediaReader } from '@cs/domain';
+import { livePublishReadiness, type AppConfig, type ChannelAdapterRegistry, type CollectorAdapter, type MediaReader } from '@cs/domain';
 
 export interface WorkerTick {
   ranAt: string;
@@ -158,7 +158,11 @@ export async function runWorkerTick(input: WorkerTickInput): Promise<WorkerTick>
     note:
       (transcriber
         ? `T08: 업로드 만료 정리 + 전사 job 진행(${transcriber.mode === 'mock' ? '모의 전사기, 외부 호출 없음' : 'live'})`
-        : 'T08: 업로드 만료 정리만(전사기 없음), 외부 호출 없음') + (jobs ? ' · T11: 배포 작업(모의 어댑터, MOCK — 외부 호출 없음)' : ''),
+        : 'T08: 업로드 만료 정리만(전사기 없음), 외부 호출 없음') + (jobs
+          ? livePublishReadiness(config).ready
+            ? ' · T11: 배포 작업(모의 어댑터 + LIVE-P1 실제 Threads 게시 조건 충족 — 승인된 실제 계정 항목은 실제로 게시)'
+            : ' · T11: 배포 작업(모의 어댑터, MOCK — 외부 호출 없음)'
+          : ''),
   };
   globalForWorker.__contentStudioLastTick = tick;
   return tick;

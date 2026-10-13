@@ -92,3 +92,60 @@
 ## 오케스트레이터 기록
 - checks-T21P1B(2회차): lint·typecheck·build 0 · unit 63 파일 · 1521 · integration 1차 워커 exit 2147483651 2건(단언 실패 없음) → maxWorkers=2 재실행 43 파일 · 869 통과 · drill · migrate · restore PASS.
 - migration 0043 포함 — 로컬 DB 는 다음 기동 때 앞으로만 적용된다.
+
+---
+
+# FIX round 1 (Codex review-T21P1B — CHANGES_REQUESTED)
+- BASE_SHA: 3094aa0 (docs; 코드 HEAD af9860c) — 판정 기록 4c4b876 위 작업 트리
+- HEAD_SHA: **미커밋**(오케스트레이터 커밋 예정)
+- 절차: 각 지적을 af9860c 코드에서 **먼저 실패하는 시험으로 재현**한 뒤 고쳤다(아래 "재현" 열). 시험 삭제·약화·인증 기능 끔 없음.
+
+| 지적 | 재현(af9860c 에서 실패) | 수정 | 회귀 시험 |
+| --- | --- | --- | --- |
+| P1 oidc-login.ts:252 본문 실패가 invalid 로 집계 | token·JWKS 각각 "200 헤더 뒤 본문 끊김"→`invalid`(기대 unavailable), "본문 멈춤(signal 무시)"→10초 시험 시간 초과, 1 MiB 초과 본문, 같은 Configuration 의 동시 callback 분류 — 6건 실패 | 감싼 fetch 가 **본문을 끝까지 읽어**(상한 `OIDC_MAX_RESPONSE_BYTES` 1 MiB) 새 Response 로 넘긴다. 헤더+본문 전체가 시간 제한 race 안. 스트림 오류·멈춤·초과·중단(signal aborted 로 끝난 읽기 포함)은 `Transport.failed` → `unavailable`. 다 받은 뒤의 형식·검증 실패만 `invalid` | `packages/providers/src/oidc-login-fix1.test.ts` "P1 :252" 6건(+ 완전한 비JSON 본문은 invalid) |
+| P1 :199 discovery 갱신이 진행 중 callback 의 허용 호스트 제거 | 별도 JWKS 호스트(`https://keys.test/jwks`), A 의 token 요청 중 캐시 만료 → B discovery(게이트) → A 의 JWKS 요청 거부로 실패. 동시 discovery 3번 → 3회 요청 | 허용 호스트 집합·감싼 fetch 를 **Configuration 마다** 만든다(`#discover`). 완성된 Configuration 만 캐시에 넣고(한 번에 교체), 진행 중 Configuration 의 집합은 그대로. 동시 discovery 는 `#inflight` 하나로 합치고, 실패면 비운다(캐시 안 함) | 같은 파일 "P1 :199" 3건 |
+| P2 callback/route.ts:172 무관한 실패가 결합 쿠키 삭제 | 실제 쿠키 저장소(Jar) 두 탭: A 시작→B 시작→A callback 이 B 쿠키를 지워 B 실패. state 없음·모름·redirect 불일치·조기 429 도 쿠키 삭제 — 3건 실패 | 소비 결과가 unknown·browser_mismatch 가 아닐 때(= state 와 브라우저 결합 확인)와 성공 때만 지운다. 준비 안 됨·조기 429·redirect 불일치·state 형식 오류는 보존 | `tests/integration/auth-oidc-fix1.test.ts` 쿠키 4건, `auth-oidc.test.ts` 의 `expectDenied` 를 새 규칙(무관한 거부는 보존)으로 조정 |
+| P2 auth-oidc.ts:54 다중 연결 상한 | 실행 SQL 확인 시험: 생성 트랜잭션에 잠금 없음 → 실패. **경합 자체는 PGlite(연결 하나, 트랜잭션 직렬)에서 재현 불가** — 99개+동시 5건은 수정 전에도 100개(통과) | 생성 트랜잭션 맨 앞에 `pg_advisory_xact_lock(hashtext('cs.auth.oidc_state'))`(`OIDC_STATE_LOCK_KEY`) | 같은 통합 파일 2건(잠금 SQL 이 첫 문장, 99+5 → 100). **Postgres 다중 연결 미검증(G2)** |
+| P2 login/page.tsx:61 안내한 로그가 안 남음 | `/login` 렌더(준비 안 됨) → `console.warn` 0회 | `warnOidcNotConfigured`(apps/web/lib/oidc.ts) — 이름만, 같은 목록은 프로세스당 1분에 한 번, 목록이 바뀌면 즉시. 로그인 화면·시작 경로가 함께 씀 | `apps/web/lib/oidc.test.ts` 2건(렌더 → 정확한 이름 줄, 1분 안 반복 1회, 61초 뒤 다시, 값 미포함 / dev 는 무로그) |
+
+### 놓친 경우(시험 추가, 동작이 틀린 것만 수정)
+| 경우 | 결과 | 조치 |
+| --- | --- | --- |
+| `iat` 1시간 미래 | **통과(틀림)** — 라이브러리는 iat 존재·타입만 본다 | `completeAuthorization` 에서 `iat > now+30초` 또는 숫자 아님 → invalid/claims |
+| `iat` 없음·문자열, `exp` 문자열 | 라이브러리가 거부(invalid) | 시험만 |
+| `exp` 경계: -31초 거부 / -25초 통과(허용 오차 30초) | 기대대로 | 시험만 |
+| 허용 밖 alg `none`·`HS256`(메타데이터가 알려도) | 라이브러리가 거부(비대칭만 지원) | 시험만 — alg 허용목록을 따로 고정하지 않음 |
+| JWKS 키 교체(모르는 kid) | 라이브러리는 JWKS 캐시가 **60초 이상** 됐을 때만 다시 받는다(재요청 폭주 방지 설계) — 60초 안이면 invalid, 지나면 재요청 후 통과 | 동작 유지(문서화). 위험: IdP 가 키를 미리 게시하지 않고 바로 바꾸면 그 60초 동안의 로그인은 실패로 셈 |
+
+### 바뀐 파일(FIX round 1)
+`packages/providers/src/oidc-login.ts`, `packages/db/src/auth-oidc.ts`, `apps/web/app/api/auth/oidc/callback/route.ts`, `apps/web/app/api/auth/oidc/start/route.ts`, `apps/web/app/login/page.tsx`, `apps/web/lib/oidc.ts`, `tests/helpers/fake-oidc-idp.ts`(별도 JWKS 호스트·alg 바꾸기·키 교체), `tests/integration/auth-oidc.test.ts`(expectDenied 쿠키 규칙), `README_KO.md`(한 문단). 새 파일: `packages/providers/src/oidc-login-fix1.test.ts`, `tests/integration/auth-oidc-fix1.test.ts`, `apps/web/lib/oidc.test.ts`. migration 변경 없음.
+
+### 점검 결과(FIX round 1)
+시작 전 3000 포트 LISTEN 없음. 명령: `bash .handoffs/run-checks.sh FIX-T21P1B`(2회), 그다음 `corepack pnpm exec vitest run --project integration --maxWorkers=2`.
+
+| 단계 | 1회차(`.handoffs/FIX-T21P1B-run1/`) | 2회차(최종, `.handoffs/checks-FIX-T21P1B.*.log`) |
+| --- | --- | --- |
+| LINT / TYPECHECK / BUILD | 0 / 0 / 0 | 0 / 0 / 0 |
+| UNIT | 1 — 새 `apps/web/lib/oidc.test.ts` 의 beforeEach 안 동적 import 가 전체 부하에서 훅 시간 제한 10초 초과(이 라운드에서 만든 시험) → 정적 import 로 바꿈 | **0 — 65 files / 1543 tests pass** |
+| INTEG | 1 — 단언 실패 0, worker 종료 2147483651 4건(variants·instagram·jobs·writing — 손대지 않은 파일) | 1 — 단언 실패 0, worker 종료 2147483651 1건 |
+| INTEG `--maxWorkers=2` | — | **0 — 44 files / 875 tests pass**(1026s) — `.handoffs/checks-FIX-T21P1B.integ-w2.log` |
+| DRILL / MIGRATE / DRILL_RESTORE | 0 / 0 / 0 | 0 / 0 / 0(불변식 위반 0건, 복원 PASS) |
+
+재현 실행(수정 전, af9860c 코드): `oidc-login-fix1.test.ts` 20건 중 10건 실패(P1 :252 6건·P1 :199 2건·iat 미래·키 교체), `auth-oidc-fix1.test.ts` 6건 중 4건 실패(쿠키 3·잠금 SQL 1 — 99+5 동시 생성은 PGlite 에서 수정 전에도 통과), `apps/web/lib/oidc.test.ts` 1건 실패(warn 0회). 수정 후 각각 전부 통과, 기존 `oidc-login.test.ts`·`auth-oidc.test.ts`(쿠키 규칙만 조정)도 통과.
+
+### 남은 위험(추가·변경)
+- advisory 잠금의 다중 연결 효과는 Postgres 드라이버가 없어(G2) 미검증. PGlite 는 연결 하나라 경합이 원래 생기지 않는다.
+- 응답 본문을 메모리에 다 올린다(최대 1 MiB/요청).
+- JWKS 키 교체 60초 창(위 표).
+- 앞 라운드의 위험 1~8 중 2(프록시 뒤 request.url)·3(전역 잠김)·5(Caddy Referrer-Policy)·6(check-env)은 그대로. 7(본문 상한)은 해소.
+
+### Codex 에게 묻는 것(FIX round 1)
+1. 본문을 감싼 fetch 에서 다 읽어 새 Response 로 넘기는 방식이 라이브러리의 응답 처리(content-type 검사·JSON 파싱·JWKS)와 어긋나는 곳이 있는가(헤더는 그대로 복사).
+2. 결합 쿠키 보존 조건(unknown·browser_mismatch·형식 오류·redirect 불일치·429·준비 안 됨)에 빠진 경우가 있는가. 여러 흐름을 state 별 쿠키로 나누는 것은 하지 않았다(마지막 시작만 유효 — 두 탭 중 먼저 시작한 쪽은 실패, 나중 쪽은 성공).
+3. `#inflight` 합치기에서 `reset()` 뒤 끝난 discovery 를 버리는 처리, 실패 시 비우는 처리가 충분한가.
+4. 미래 iat 허용 오차 30초(라이브러리 clockTolerance 기본과 같음)가 적절한가.
+
+
+### FIX round 1 — 오케스트레이터 기록
+- FIX HEAD: e75fa0c0b22dbacdc7148970bc03fbaea4a4bc83 (code only). BASE 3094aa0(+ docs 4c4b876).
+- checks-FIX-T21P1B: lint·typecheck·build 0 · unit 65 파일 · 1543 · integration 1차 워커 exit 2147483651(단언 실패 없음) → maxWorkers=2 재실행 44 파일 · 875 · drill · migrate · restore PASS.

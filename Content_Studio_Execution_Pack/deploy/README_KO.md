@@ -69,7 +69,7 @@ sudo bash "$APP_ROOT/deploy/scripts/check-env.sh"           # 파일 존재·roo
 ```
 - 예시 파일은 placeholder 뿐이다. 실제 도메인·키는 이 파일에만 둔다(저장소·대화·로그 금지).
 - 고정 설정(게시·수집·OAuth live·LLM live 끔, `AUTH_MODE=oidc`)은 승인 없이 바꾸지 않는다. `check-env.sh` 가 어긋나면 종료 코드 1 이다.
-- 환경 파일 문법은 좁게 제한한다(FIX2 — 검사기와 systemd 가 다르게 읽지 않게): 빈 줄, `#` 로 시작하는 주석 줄, `KEY=값`(대문자 KEY, 줄 맨 앞, `=` 주변 공백 없음, 값에 따옴표·역슬래시·`$`·앞뒤 공백 없음) 뿐이고 같은 KEY 는 한 번만. `export`·앞 공백·연속 행(줄 끝 ``)·CRLF 는 `check-env.sh` 가 거부한다. 데이터 경로는 `..`·심볼릭 링크를 해석한 실제 위치가 `/srv/content-studio/data` 아래여야 한다.
+- 환경 파일 문법은 좁게 제한한다(FIX2 — 검사기와 systemd 가 다르게 읽지 않게): 빈 줄, `#` 로 시작하는 주석 줄, `KEY=값`(대문자 KEY, 줄 맨 앞, `=` 주변 공백 없음, 값에 따옴표·역슬래시·`$`·앞뒤 공백 없음) 뿐이고 같은 KEY 는 한 번만. `export`·앞 공백·연속 행(줄 끝 ``)·CRLF 는 `check-env.sh` 가 거부한다. 데이터 경로는 `..`·심볼릭 링크를 해석한 실제 위치가 `/srv/content-studio/data` 아래여야 하고, 데이터 루트 자체가 심볼릭 링크면 거부한다(FIX3 — 백업 tar 가 링크만 담게 되므로).
 - 환경 파일이 없으면 systemd 가 서비스를 시작하지 않는다(`EnvironmentFile=` 에 `-` 를 붙이지 않았다).
 - `WORKER_INLINE_INTERVAL_SECONDS`: 0(끔) 또는 5~600 초. 0 이면 예약 작업·업로드 24시간 만료 정리·`RETENTION_SWEEP_MODE=auto`·주기 수집이 로그인한 요청이 있을 때만 진행되고, 서버 시작 로그에 경고가 남는다.
 
@@ -124,7 +124,7 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
    sudo systemctl stop content-studio
    sudo bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/backup-data.sh "$(sudo -u content-studio git -C /srv/content-studio/repo rev-parse HEAD)"
    ```
-   스크립트는 root 확인 → 서비스 정지 확인 → `/srv/content-studio-backup`(root 700) 생성 → `data-<UTC 시각>-<SHA>.tar.gz`(600) → 다시 읽기 확인. 이 사본도 서버 밖으로 옮겨야 디스크 고장에 대비된다(G5·T21-P4).
+   스크립트는 root 확인 → 서비스 정지 확인 → `/srv/content-studio-backup`(root 700) 생성 → `data-<UTC 시각>-<SHA>.<고유>.tar.gz`(600, mktemp 로 배타적 생성 — 덮어쓰지 않음, 데이터 폴더가 심볼릭 링크면 거부) → 다시 읽기 확인. 이 사본도 서버 밖으로 옮겨야 디스크 고장에 대비된다(G5·T21-P4).
 3. 코드 갱신·빌드: §3 `build-release.sh <새 SHA>`(서비스 정지 상태). 종료 코드가 0 이 아니면 4 로 가지 않는다 — §8 로 되돌린다.
 4. `sudo bash $APP_ROOT/deploy/scripts/check-env.sh` → `sudo systemctl start content-studio` → §5 확인(health·로그). 첫 연결에서 migration 이 적용된다.
 5. 결과(이전·새 SHA, 명령, pass/fail)를 기록한다.
@@ -132,22 +132,34 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 ## 8. 되돌리기
 - **코드만 되돌리지 않는다.** 새 migration 이 이미 적용된 DB 를 이전 코드로 열면 안 된다(지원하지 않음).
 - 순서: 서비스 정지 → `build-release.sh <이전 SHA>` → 데이터를 §7-2 사본으로 되돌림 → `check-env.sh` → 시작 → §5 확인.
-- 데이터 되돌리기는 `deploy/scripts/restore-data.sh` 로 한다. FIX2(Codex P1 README:132): `/srv/content-studio/data` 가 **볼륨 마운트 지점**이면 `mv` 가 "Device or resource busy" 로 실패하므로 스크립트가 `mountpoint -q` 로 먼저 구분한다.
-
-| 데이터 폴더 | 스크립트 동작 |
-| --- | --- |
-| 일반 폴더(같은 디스크) | 지금 폴더를 `data.replaced-<UTC 시각>` 으로 옮긴 뒤(mv) 사본을 푼다 |
-| 마운트 지점(볼륨) | 폴더(마운트)는 그대로 두고 **안의 내용만** 지운 뒤 사본을 같은 자리에 푼다 — mv 하지 않음 |
-| 공통 | root·서비스 정지 확인(조회 실패면 중단) → 사본 안 경로가 모두 `data/` 아래인지 확인 → 바꾸기 전 지금 내용을 `/srv/content-studio-backup/data-before-restore-<시각>.tar.gz`(600)로 남김 → 풀기 → 소유자 `content-studio`·700. `mountpoint` 명령이 없거나 오류면 중단(일반 폴더로 가정하지 않음) |
+- 데이터 되돌리기는 `deploy/scripts/restore-data.sh` 로 한다(FIX3 — 임시 폴더에 먼저 풀고 검증한 뒤 교체, 실패하면 되돌림).
 
   ```sh
   set -eu
   sudo systemctl stop content-studio
   sudo bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/restore-data.sh /srv/content-studio-backup/<사본 파일 이름>.tar.gz
   ```
-- **복원 도중 실패하면**(풀기 중 디스크 부족 등): 서비스는 정지 상태 그대로 둔다. 스크립트가 바꾸기 전에 남긴 `/srv/content-studio-backup/data-before-restore-<시각>.tar.gz` 를 인자로 `restore-data.sh` 를 다시 실행하면 복원 직전 상태로 돌아간다. 그 뒤 원인(공간·권한)을 해결하고 원하는 사본으로 다시 시도한다.
+
+| 단계 | 내용 |
+| --- | --- |
+| 실행 조건 | root, 서비스 정지 확인(조회 실패면 중단), 데이터 폴더·부모 폴더가 심볼릭 링크가 아님, `mountpoint` 로 마운트 여부 확인(명령이 없거나 오류면 중단 — 일반 폴더로 가정하지 않음) |
+| 1. 사본 검사(아무것도 바꾸기 전) | `tar -tv` 로 항목 형식을 본다 — **일반 파일·폴더만** 허용(심볼릭 링크·하드링크·장치·FIFO 거부), 경로는 모두 `data/` 아래(절대 경로·`.`·`..`·빈 칸 거부), 최상위 `data` 는 폴더 |
+| 2. 직전 사본 | 지금 데이터를 `/srv/content-studio-backup/data-before-restore-<UTC 시각>.<고유>.tar.gz`(600)로 남긴다 — `mktemp` 로 **배타적으로 만든 고유 이름**이라 같은 초에 두 번 실행해도, 직전 사본을 입력으로 다시 실행해도 덮어쓰지 않는다(입력과 같은 파일이면 중단) |
+| 3. 임시 폴더에 풀기 | 같은 파일 시스템의 새 임시 폴더(`mktemp -d`) — 일반 폴더면 `/srv/content-studio/.restore-stage.*`, 마운트 지점이면 마운트 안 `data/.restore-stage.*`. 풀고 나서 다시 확인(일반 파일·폴더 밖 항목 0, 최상위는 실제 폴더 `data` 하나). 소유자 `content-studio`·700 은 이 확인 뒤에만(링크를 따라가지 않음) |
+| 4a. 일반 폴더 | 지금 `data` 를 `data.replaced-<시각>.<고유>/data` 로 옮긴 뒤 임시 `data` 를 제자리로. 둘째 단계가 실패하면 **옮겨 둔 폴더를 되돌리고** 실패로 끝낸다 |
+| 4b. 마운트 지점 | 폴더(마운트)는 그대로(mv 하지 않음). 안의 내용(임시 폴더 제외)을 지우고 임시 `data` 의 내용을 옮긴다. 실패하면 2 의 직전 사본을 같은 방식(임시 폴더에 풀고 검증 → 채우기)으로 **자동 복구**하고 실패로 끝낸다 |
+| 5. 정리 | 임시 폴더는 성공·실패와 관계없이 지운다. 일반 폴더의 `data.replaced-*` 와 직전 사본은 남긴다(확인 뒤 사용자가 정리) |
+
+- **복원이 실패로 끝났을 때**: 서비스는 정지 상태 그대로 둔다. 위 4a·4b 의 되돌림이 성공했으면 데이터는 복원 직전 상태다 — 원인(공간·권한)을 해결하고 같은 명령을 다시 실행한다.
+- **되돌림까지 실패해 데이터 폴더가 없는 상태**(일반 폴더 4a 에서 이전 폴더를 되돌리지도 못한 경우 — 메시지가 `data.replaced-*/data` 위치와 직전 사본을 알려 준다): 원인을 해결한 뒤 `--data-missing-ok` 로 직전 사본(또는 원하는 사본)을 복원한다. 이 표시는 데이터 폴더가 **없을 때만** 받아들인다(있으면 중단).
+  ```sh
+  sudo bash /srv/content-studio/repo/Content_Studio_Execution_Pack/deploy/scripts/restore-data.sh --data-missing-ok /srv/content-studio-backup/data-before-restore-<시각>.<고유>.tar.gz
+  ```
+  (또는 `data.replaced-*/data` 를 직접 `/srv/content-studio/data` 로 되돌려도 된다 — 같은 파일 시스템 안의 이름 바꾸기)
+- 마운트 지점에서 자동 복구까지 실패하면 데이터 폴더(마운트)는 남아 있지만 내용이 불완전하다. 원인을 해결한 뒤 직전 사본으로 같은 명령(표시 없이)을 다시 실행한다.
 - **공급자 볼륨 스냅숏**으로 되돌릴 때(마운트 구성에서 선택): 서비스 정지 → 공급자 화면·CLI 로 데이터 볼륨을 업그레이드 전 스냅숏으로 복구(볼륨 분리·재연결이 필요하면 그 절차대로, 마운트 경로는 `/srv/content-studio/data` 유지) → `findmnt /srv/content-studio/data` 로 마운트 확인 → 시작. 스냅숏은 서비스가 멈춘 상태에서 만든 것만 쓴다(실행 중 스냅숏은 PGlite 일관성 미보장). 공급자 절차는 공급자를 정한 뒤 기록한다(미정).
 - 정지 상태 사본이 없으면: 이전 SHA + 빈 데이터 폴더로 시작 → export ZIP 을 복원(`/ops` 복원 미리보기 → `empty_only` 확정). 원격 SNS 게시물은 없다(게시 disabled).
+- 스크립트의 `CS_*` 환경변수(경로·systemctl 바꿔치기 등)는 시험 실행기(`deploy/scripts/tests/`)용이며, 시험 표식이 없거나 root 로 실행하면 무시된다 — 운영에서는 설정하지 않는다.
 
 ## 9. 운영 중 확인
 - `journalctl -u content-studio` 의 `[inline-worker] 주기 처리 실패: <오류 이름(코드)>` — 이름·코드는 허용 목록에 있는 것만 남고 나머지는 `UnknownError`/`NonErrorThrown`. 메시지·값은 남기지 않는다. 실패해도 서버는 계속 돌고 다음 주기에 다시 시도한다.

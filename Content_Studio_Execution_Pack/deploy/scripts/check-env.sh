@@ -12,17 +12,18 @@
 #   데이터 루트(정규 경로) **아래**여야 하고, 아직 없는 경로는 가장 가까운 기존 부모의 정규 경로도 데이터 루트 아래여야 한다.
 set -euo pipefail
 
-ENV_FILE="${CS_ENV_FILE:-/etc/content-studio/env}"
-DATA_ROOT="${CS_DATA_ROOT:-/srv/content-studio/data}"
-OWNER_MODE_EXPECTED="${CS_ENV_OWNER_MODE:-root:root 600}" # 시험 전용 바꿔치기(운영에서는 설정하지 않는다)
+CS_SCRIPT_TAG=check-env
+# shellcheck source=lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# FIX3-T21P2: CS_* 바꿔치기는 시험 표식 + 실제 root 아님일 때만(lib/common.sh cs_opt). 운영에서는 아래 기본값만 쓴다.
+ENV_FILE="$(cs_opt CS_ENV_FILE /etc/content-studio/env)"
+DATA_ROOT="$(cs_opt CS_DATA_ROOT /srv/content-studio/data)"
+OWNER_MODE_EXPECTED="$(cs_opt CS_ENV_OWNER_MODE 'root:root 600')"
 fail=0
 bad() {
   echo "[check-env] 문제: $*" >&2
   fail=1
-}
-die() {
-  echo "[check-env] 실패: $*" >&2
-  exit 1
 }
 
 [[ -f "$ENV_FILE" ]] || die "환경 파일이 없습니다: $ENV_FILE"
@@ -76,7 +77,10 @@ expect_eq STT_MODE mock
 
 # ---- 데이터 경로(정규 경로) ----
 root_real=""
-if ! root_real="$(realpath -e -- "$DATA_ROOT" 2>/dev/null)" || [[ ! -d "$root_real" ]]; then
+# FIX3-T21P2(Codex 질문 3): 데이터 루트 자체가 심볼릭 링크면 거부 — backup-data 의 tar 가 링크만 담게 되므로 백업·복원과 판정이 어긋난다
+if [[ -L "${DATA_ROOT%/}" ]]; then
+  bad "데이터 루트가 심볼릭 링크입니다: $DATA_ROOT — 실제 폴더(또는 마운트 지점)만 지원합니다"
+elif ! root_real="$(realpath -e -- "$DATA_ROOT" 2>/dev/null)" || [[ ! -d "$root_real" ]]; then
   bad "데이터 루트가 없거나 폴더가 아닙니다: $DATA_ROOT"
   root_real=""
 fi

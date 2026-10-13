@@ -21,9 +21,9 @@ fi
 SHA="$1"
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || die "SHA 는 40자리 소문자 16진수여야 합니다(짧은 SHA·브랜치 이름 금지)"
 
-REPO_ROOT="${CS_REPO_ROOT:-/srv/content-studio/repo}"
+REPO_ROOT="$(cs_opt CS_REPO_ROOT /srv/content-studio/repo)"
 APP_ROOT="$REPO_ROOT/Content_Studio_Execution_Pack"
-SERVICE_USER="${CS_SERVICE_USER:-content-studio}"
+SERVICE_USER="$(cs_opt CS_SERVICE_USER content-studio)" # FIX3: CS_* 는 시험 표식이 있을 때만(lib/common.sh)
 
 [[ "$(id -un)" == "$SERVICE_USER" ]] || die "서비스 사용자($SERVICE_USER)로 실행하세요"
 # FIX2-T21P2: systemd 가 멈춤(inactive/failed)을 확인해 줄 때만 진행 — 조회 실패·systemctl 없음·activating 등은 중단(lib/common.sh)

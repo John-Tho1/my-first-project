@@ -254,3 +254,57 @@
 ### FIX round 3 — 오케스트레이터 기록
 - FIX3 HEAD: 4e3490ac3d71b48ea94f1309f392e6a124c6e142 (deploy 스크립트·시험·README 만). BASE 9d107ab(+ docs e643d0e).
 - checks-FIX3-T21P2: lint·typecheck·build 0 · unit 1466 · integration 1회차 1(손대지 않은 파일 워커 exit 2147483651) → maxWorkers=2 재실행 42 파일 · 833 · drill · migrate · restore PASS. 배포 bash 시험 183 통과(장치·FIFO 항목은 이 PC 에서 만들 수 없어 미실행).
+
+
+---
+
+# FIX round 4 — Codex review-FIX3-T21P2(CHANGES_REQUESTED, 리뷰 대상 4e3490a) 반영
+
+- 리뷰: `.handoffs/review-FIX3-T21P2.md`(P0 2 · P1 2 + 질문 답·놓친 케이스). 오케스트레이터 방침: **낯선 것은 처리하지 말고 바꾸기 전에 거부(fail closed), 코드는 작게.**
+- BASE_SHA: 4e3eb64(4e3490a + docs). HEAD_SHA: **없음(미커밋)** — 커밋·`git add -A` 안 함. `.claude/`·docs/handoffs/*·DECISIONS.md 수정 없음. 앱 코드(TypeScript) 변경 없음.
+
+## 재현(수정 전 스크립트에서 실패)
+새 `deploy/scripts/tests/test-fix4.sh` 를 **수정 전** 스크립트에 먼저 돌렸다 → 40 실패(로그 `.handoffs/fix4-t21p2-repro-deploy.log`): 시험 실행에서 운영 경로·경로 미지정 허용, 하위 bind 마운트·마운트 정보 못 읽음에도 복원·백업 진행, 되돌림 뒤 소유자 재적용 없음(chown 기록 없음), 데이터 안 링크·하드링크를 백업이 그대로 담음, 줄바꿈 이름 사본 복원, 잠금 없음(이미 잡힌 잠금·잠금 파일 없음 무시), `.data-must-be-mount` 무시. guard 순서 시험은 run-all.sh 의 `set -u` 를 셈에 넣은 시험 쪽 잘못이라 시험을 고쳤다.
+
+## 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+| --- | --- | --- |
+| **P0** tests/lib.sh:7 root 로 시험 실행 시 운영 데이터 | 새 `tests/guard.sh` `cs_harness_refuse_root "$EUID"` — `lib.sh`·`run-all.sh` 의 첫 명령(`set -u` 다음). root 면 종료 코드 2. 스크립트 쪽 `cs_path`(lib/common.sh): 시험 실행에서는 경로 변수(CS_DATA_PARENT·CS_BACKUP_DIR·CS_DATA_ROOT·CS_ENV_FILE·CS_REPO_ROOT·CS_LOCK_FILE·CS_MOUNTINFO)가 **반드시** 주어져야 하고 `/srv/content-studio*`·`/etc/content-studio*`·`/run*` 이면 거부 — 운영 기본값으로 떨어지지 않음 | `test-fix4.sh` (1): guard 함수에 0 → 종료 2·이후 명령 실행 안 됨, 1000 → 통과. lib.sh·run-all.sh 첫 명령이 guard 인지 정적 확인. 시험 실행 + 데이터 경로 운영 → 거부, 경로 미지정 → "CS_DATA_PARENT" 로 거부, 사본 폴더 운영 → 거부·데이터 그대로. **실제 root 실행 자체는 시험 불가**(`$EUID` 는 읽기 전용이고 이 PC 에서 root 가 될 수 없음) — 같은 함수에 0 을 넣는 방식으로 대신 확인 |
+| **P0** restore-data.sh:122 하위 마운트 | `refuse_submounts`: `/proc/self/mountinfo`(시험은 fixture) 다섯째 칸이 데이터 폴더 정규 경로 **아래**인 마운트가 하나라도 있으면 바꾸기 전에 거부(같은 장치 bind 포함 — 장치 비교 안 함). 못 읽거나 비어 있으면 거부. 데이터 경로에 공백·역슬래시가 있으면 거부(이스케이프 비교 회피). restore·backup 둘 다 | (2): 하위 bind 마운트 → 거부·하위 내용 그대로, 데이터 폴더 자체 마운트·이름이 비슷한 형제(`data2`) 마운트 → 진행, mountinfo 없음 → 거부, backup 하위 마운트 → 거부 |
+| **P1** restore-data.sh:149 복구 시 소유자 | `apply_owner_perms`: `chown -R --no-dereference owner:owner` + 폴더 700·파일 600 + `find ! -user owner` 확인(실패하면 1). 정상 복원(임시 data), 마운트 채우기 뒤(데이터 전체), **자동 복구(직전 사본도 정상 복원과 같은 `unpack_verified` → 채우기)**, 일반 폴더 되돌림 뒤(되돌린 폴더) 모두 적용·확인. 실패하면 명시 메시지로 0 아닌 종료. 복구용 압축 풀기도 정상 복원과 같은 검사(구조·특수 항목·하드링크) | (3): 마운트에서 **일부 항목을 옮긴 뒤** 실패(가짜 mv 를 glob `*/.restore-stage.*/data/sub` 로) → 직전 사본으로 복구, 먼저 옮긴 new.txt 도 없음, chown 기록에 복구 트리 `-R --no-dereference -- <사용자>:<사용자> …/.restore-rollback.*`, 결과 트리 전부 서비스 사용자 소유(`find ! -user`). 일반 폴더 실패 → 되돌린 폴더 chown 기록. 정상 복원 chown 기록. (시험에서 서비스 사용자 = 현재 사용자, chown 은 가짜 명령이 인수만 기록 — 실제 UID 변경은 이 PC 에서 불가) |
+| **P1** backup-data.sh:28 백업 ≠ 복원 형식 | `refuse_special_tree`(backup 은 만들기 전, restore 는 풀고 난 뒤 같은 함수): 일반 파일·폴더 밖 항목(링크·소켓·FIFO·장치) 또는 링크 수 > 1 인 파일이 있으면 거부. backup 은 하위 마운트·`.data-must-be-mount` 도 같은 기준. tar 실패 시 만든 파일 삭제 | (4): **실제 backup-data 사본 → restore-data 왕복** 성공·내용 일치, 데이터 안 심볼릭 링크 → backup 실패·사본 없음, 하드링크(링크 수 2) → backup 실패·사본 없음 |
+| 이름 견고성(지시 5) | `tar --quoting-style=escape` 목록에서 역슬래시(줄바꿈·제어 문자는 tar 가 `\n`·`\ooo` 로 표시)·제어 문자·UTF-8 아닌 바이트(`iconv`)가 있으면 거부. 이런 이름이 없으면 두 목록이 항목당 정확히 한 줄이라 줄 번호 대응이 맞다. 풀기 `--no-same-owner --no-same-permissions --no-overwrite-dir`. 풀고 난 뒤 `find` 확인이 권위 있는 확인(링크는 목록 단계에서 이미 거부되므로 무엇도 링크를 거쳐 쓰이지 않음) | (5): 줄바꿈 이름 → 거부·그대로, PAX 형식 긴 이름(경로 160자대) → 허용·복원. UTF-8 아닌 이름은 **SKIP**(Cygwin 이 0xFF 를 UTF-8 `ÿ` 로 바꿔 저장해 만들 수 없음 — 시험이 이를 감지해 SKIP 표시) |
+| 동시 실행(지시 6) | `cs_lock`: `/srv/content-studio/deploy.lock`(README §2 에서 서비스 사용자 소유 644 로 미리 만듦 — 서비스 사용자로 도는 build-release 도 열 수 있게 읽기로 연다)에 `flock -n`. flock 없음·잠금 파일 없음 → 거부. build-release·backup-data·restore-data 모두 서비스 확인보다 먼저 | (6): 세 스크립트 모두 "잠금이 이미 잡힌" 경우 거부, 잠금 파일 없음 → 거부. **진짜 flock 배타성은 이 PC 에 flock 이 없어 가짜 flock 으로만**(STUB_FLOCK_HELD) — 실제 두 프로세스 경합은 not_run |
+| `--data-missing-ok`(지시 7) | `<데이터 부모>/.data-must-be-mount` 표시 파일(README §2)이 있으면 데이터 폴더가 지금 마운트여야 한다 — 폴더 없음·마운트 아님이면 restore(표시 유무 무관)·backup 거부 | (7): 표시 + 마운트 아님 → restore 거부·그대로, 표시 + 폴더 없음 + `--data-missing-ok` → 거부·만들지 않음, 표시 + 마운트 아님 → backup 거부, 표시 + 마운트 → 진행(대조) |
+
+- 시험용 우회 변수 정리: `CS_TEST_SKIP_CHOWN` **삭제** — root 전용 명령(`chown`·`install -o root`)은 시험 실행기의 PATH 가짜 명령이 받는다(`tests/lib.sh`: chown 은 인수 기록, install 은 `-d` 만 mkdir). 남은 시험 훅은 경로(`cs_path`)·`CS_SYSTEMCTL`·`CS_MOUNTPOINT_CMD`·`CS_SERVICE_USER`·`CS_ENV_OWNER_MODE` 뿐이고 모두 표식 + 비 root 에서만.
+- **시험 표식은 보안 경계가 아니다(Codex 질문 4 답에 동의).** 이 스크립트들은 운영에서 root(sudo) 또는 서비스 사용자로 사람이 직접 돌리며, 위협 모델은 "실수로 잘못 실행"이다. 표식 + 비 root 조건은 운영 실행이 시험 값에 끌려가지 않게 하는 안전장치이고, 권한 있는 사용자가 일부러 표식을 주는 경우를 막지는 않는다(그 사용자는 어차피 데이터를 직접 바꿀 수 있다). 시험 실행기는 root 를 거부하고, 시험 실행의 경로는 운영 경로를 가리킬 수 없다.
+
+## 바뀐 파일(FIX4)
+- `deploy/scripts/lib/common.sh`(cs_path·cs_lock·refuse_submounts·refuse_if_must_be_mount_but_not·refuse_special_tree·apply_owner_perms, make_backup_dir 단순화), `deploy/scripts/restore-data.sh`(이름 검사·잠금·하위 마운트·마운트 표시·unpack_verified·소유자 재적용), `deploy/scripts/backup-data.sh`(잠금·하위 마운트·특수 항목·마운트 표시·실패 시 파일 삭제), `deploy/scripts/build-release.sh`(잠금·cs_path), `deploy/scripts/check-env.sh`(cs_path)
+- 시험: 신규 `tests/guard.sh`·`tests/test-fix4.sh`, `tests/lib.sh`(guard·가짜 chown/install/flock·mountinfo·잠금 기본값·mv glob), `tests/run-all.sh`(guard), `test-restore-data.sh`·`test-fix3.sh`(CS_TEST_SKIP_CHOWN 제거, mv 패턴 glob), `test-service-state.sh`(systemctl 없음 시험을 시험 환경으로 돌리고 메시지 단언 추가)
+- 문서: `deploy/README_KO.md`(§2 잠금 파일·`.data-must-be-mount`·데이터 안 금지 항목·하위 마운트 금지, §8 표: 실행 조건·이름 검사·풀기 옵션·되돌림/복구 소유자 재적용)
+
+## 실행한 명령과 결과
+- 재현: 위 절(수정 전 스크립트 40 실패, `.handoffs/fix4-t21p2-repro-deploy.log`).
+- 개발 중: `bash deploy/scripts/tests/test-fix4.sh` → 첫 실행 63 passed / 2 failed(UTF-8 아닌 이름 — Cygwin 이 바이트를 UTF-8 로 바꿔 저장해 시험 자체가 성립하지 않음 → 감지해 SKIP 하도록 시험 수정, 스크립트 변경 없음).
+- `bash deploy/scripts/tests/run-all.sh` → `.handoffs/checks-FIX4-T21P2.deploy-tests.log`: bash -n 전부 ok, test-check-env 46 · test-fix3 30 · test-fix4 63 · test-restore-data 64 · test-service-state 45 = **248 passed, 0 failed, SKIP 1**(UTF-8 아닌 이름), `DEPLOY-SCRIPT-TESTS: PASS`(exit 0).
+- `bash .handoffs/run-checks.sh FIX4-T21P2` → `.handoffs/checks-FIX4-T21P2.log`: LINT=0, TYPECHECK=0, BUILD=0, UNIT=0(61 files / 1466 passed), **INTEG=0**(42 files / 833 passed — 이번에는 워커 종료 없음, 재실행 불필요), DRILL=0(불변식 위반 0건), MIGRATE=0, DRILL_RESTORE=0(PASS), CHECKS-DONE.
+
+## 남은 위험·미검증(FIX4)
+1. 실제 Linux(systemd·util-linux `flock`·`mountpoint`·`/proc/self/mountinfo`·GNU tar·실제 UID chown)에서 실행하지 않았다. flock 배타성, 실제 bind 마운트 검출, 실제 서비스 사용자 소유는 가짜 명령·fixture 로만 확인했다.
+2. 비 ASCII(한국어 등) 파일 이름은 tar 가 C 로캘에서 `\ooo` 로 이스케이프해 **거부될 수 있다**(fail closed). 앱 데이터 폴더 이름은 PGlite 파일·UUID 라 영향이 없다고 보았으나 확인하지 않았다.
+3. 마운트 지점 교체는 내용 삭제 → 이동 사이에 전원이 끊기면 내용이 불완전할 수 있다(직전 사본은 남음, README §8).
+4. UTF-8 아닌 이름·장치·FIFO 항목 시험은 이 PC 에서 만들 수 없어 하지 않았다(코드 경로는 같은 거부 분기).
+5. 이 PC 에서 deploy 시험 전체가 약 10분 이상 걸린다.
+
+## Codex 재검증 질문
+1. 거부 목록(하위 마운트·특수 항목·하드링크·이름 문자·마운트 표시·잠금)이 남은 놓친 케이스를 모두 "바꾸기 전 거부"로 덮는가? 거부가 너무 넓어 정상 운영(예: PGlite 가 만드는 파일 형식)을 막을 가능성이 있는가?
+2. `apply_owner_perms`(폴더 700·파일 600 일괄)가 PGlite 데이터 폴더에 적절한가?
+3. `cs_lock` 의 잠금 파일 위치(`/srv/content-studio/deploy.lock`, 서비스 사용자 소유 644, 읽기로 열어 flock)가 root·서비스 사용자 모두에게 맞는가?
+4. 표식은 보안 경계가 아니라는 위 정리가 받아들일 만한가?
+
+
+### FIX round 4 — 오케스트레이터 기록
+- FIX4 HEAD: 47917f38f7499b9f806587cb95c93770c8eda38e (deploy 스크립트·시험·README 만). BASE 4e3eb64(+ docs 7799e0d).
+- checks-FIX4-T21P2: 전부 0 — unit 1466 · integration 42 파일 · 833 · drill · migrate · restore PASS. 배포 bash 시험 248 통과·1 건너뜀(비 UTF-8 바이트 — Windows). 실제 root·flock 경합·chown 은 이 PC 에서 관찰 불가(스텁).

@@ -20,7 +20,7 @@ mk_case() { # mk_case <name> → 데이터 부모 폴더(현재 내용 old.txt)�
 restore() { # restore <case-dir> [env...] — 인수는 RESTORE_ARGS(기본: 사본 파일)
   local p="$1"
   shift
-  stub_env CS_DATA_PARENT="$p/parent" CS_BACKUP_DIR="$p/bk" CS_TEST_SKIP_CHOWN=1 "$@" bash "$SCRIPT" "${RESTORE_ARGS[@]:-$p/backup.tar.gz}"
+  stub_env CS_DATA_PARENT="$p/parent" CS_BACKUP_DIR="$p/bk" "$@" bash "$SCRIPT" "${RESTORE_ARGS[@]:-$p/backup.tar.gz}"
 }
 unchanged() { [[ -f "$1/parent/data/old.txt" && ! -e "$1/parent/data/new.txt" ]]; }
 no_stage_left() { ! ls -d "$1/parent"/.restore-stage.* "$1/parent/data"/.restore-stage.* "$1/parent/data"/.restore-rollback.* >/dev/null 2>&1; }
@@ -159,14 +159,14 @@ n="$(ls "$P/bk"/data-before-restore-*.tar.gz | wc -l)"
 echo "restore-data.sh — 교체 실패 되돌림(P1 :26)"
 t "일반 폴더: 새 폴더를 제자리에 옮기다 실패 → 옮겨 둔 이전 폴더를 되돌린다"
 P="$(mk_case swapfail)"
-run_capture r restore "$P" STUB_MV_FAIL_ON=.restore-stage
+run_capture r restore "$P" STUB_MV_FAIL_ON='*.restore-stage*'
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "되돌렸습니다"
 unchanged "$P" && ok "이전 데이터로 되돌림" || ng "되돌리지 못함"
 no_stage_left "$P" && ok "임시 폴더 정리" || ng "임시 폴더가 남았다"
 t "마운트 지점: 내용 채우기 실패 → 직전 사본으로 자동 복구"
 P="$(mk_case mountfail)"
-run_capture r restore "$P" STUB_MOUNTPOINT="$P/parent/data" STUB_MV_FAIL_ON=.restore-stage
+run_capture r restore "$P" STUB_MOUNTPOINT="$P/parent/data" STUB_MV_FAIL_ON='*.restore-stage*'
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "직전 사본으로 복구했습니다"
 unchanged "$P" && ok "이전 데이터로 복구" || ng "복구하지 못함"
@@ -196,11 +196,11 @@ expect_nonzero "$r_rc" "$r_out"
 echo "backup-data.sh"
 t "정지 확인 뒤 사본(고유 이름)을 만들고 데이터 폴더는 그대로(마운트 지점이어도 옮기지 않음)"
 P="$(mk_case backup)"
-run_capture r stub_env CS_DATA_PARENT="$P/parent" CS_BACKUP_DIR="$P/bk" CS_TEST_SKIP_CHOWN=1 STUB_MOUNTPOINT="$P/parent/data" bash "$SCRIPTS_DIR/backup-data.sh" 0123456
+run_capture r stub_env CS_DATA_PARENT="$P/parent" CS_BACKUP_DIR="$P/bk" STUB_MOUNTPOINT="$P/parent/data" bash "$SCRIPTS_DIR/backup-data.sh" 0123456
 expect_rc 0 "$r_rc" "$r_out"
 ls "$P/bk"/data-*-0123456.*tar.gz >/dev/null 2>&1 && ok "사본 있음" || ng "사본 없음"
 [[ -f "$P/parent/data/old.txt" ]] && ok "데이터 그대로" || ng "데이터가 바뀌었다"
-run_capture r2 stub_env CS_DATA_PARENT="$P/parent" CS_BACKUP_DIR="$P/bk" CS_TEST_SKIP_CHOWN=1 bash "$SCRIPTS_DIR/backup-data.sh" 0123456
+run_capture r2 stub_env CS_DATA_PARENT="$P/parent" CS_BACKUP_DIR="$P/bk" bash "$SCRIPTS_DIR/backup-data.sh" 0123456
 expect_rc 0 "$r2_rc" "$r2_out"
 n="$(ls "$P/bk"/data-*-0123456.*tar.gz 2>/dev/null | wc -l)"
 [[ "$n" -eq 2 ]] && ok "같은 초 두 번 → 사본 2개" || ng "사본 $n 개"

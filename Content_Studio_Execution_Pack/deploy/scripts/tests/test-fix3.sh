@@ -59,7 +59,7 @@ if can_symlink; then
   mkdir -p "$PARENT"
   mklink "$REAL" "$PARENT/data"
   t "backup-data: 데이터 폴더가 링크 → 거부(링크만 담긴 사본을 만들지 않음)"
-  run_capture r stub_env CS_DATA_PARENT="$PARENT" CS_BACKUP_DIR="$T_ROOT/bk5" CS_TEST_SKIP_CHOWN=1 bash "$SCRIPTS_DIR/backup-data.sh" 0123456
+  run_capture r stub_env CS_DATA_PARENT="$PARENT" CS_BACKUP_DIR="$T_ROOT/bk5" bash "$SCRIPTS_DIR/backup-data.sh" 0123456
   expect_nonzero "$r_rc" "$r_out"
   expect_contains "$r_out" "심볼릭 링크"
   if ls "$T_ROOT/bk5"/data-*.tar.gz >/dev/null 2>&1; then ng "사본이 만들어졌다"; else ok "사본 없음"; fi
@@ -67,7 +67,7 @@ if can_symlink; then
   mkdir -p "$T_ROOT/src5/data"
   echo n >"$T_ROOT/src5/data/n.txt"
   tar -C "$T_ROOT/src5" -czf "$T_ROOT/a5.tar.gz" data
-  run_capture r stub_env CS_DATA_PARENT="$PARENT" CS_BACKUP_DIR="$T_ROOT/bk5" CS_TEST_SKIP_CHOWN=1 bash "$SCRIPTS_DIR/restore-data.sh" "$T_ROOT/a5.tar.gz"
+  run_capture r stub_env CS_DATA_PARENT="$PARENT" CS_BACKUP_DIR="$T_ROOT/bk5" bash "$SCRIPTS_DIR/restore-data.sh" "$T_ROOT/a5.tar.gz"
   expect_nonzero "$r_rc" "$r_out"
   expect_contains "$r_out" "심볼릭 링크"
   [[ -f "$REAL/pglite" || -d "$REAL/pglite" ]] && [[ ! -e "$REAL/n.txt" ]] && ok "링크 대상 그대로" || ng "링크 대상이 바뀌었다"
@@ -104,7 +104,7 @@ P6="$T_ROOT/p6"
 mkdir -p "$P6/data"
 echo old >"$P6/data/old.txt"
 t "backup-data: 표식 없으면 root 요구·CS_TEST_SKIP_CHOWN·경로 바꿔치기 무시"
-run_capture r env -u CS_DEPLOY_TEST_HARNESS PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_DATA_PARENT="$P6" CS_BACKUP_DIR="$T_ROOT/bk6" CS_TEST_SKIP_CHOWN=1 \
+run_capture r env -u CS_DEPLOY_TEST_HARNESS PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_DATA_PARENT="$P6" CS_BACKUP_DIR="$T_ROOT/bk6" \
   bash "$SCRIPTS_DIR/backup-data.sh" 0123456
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "root 로 실행"
@@ -113,7 +113,7 @@ t "restore-data: 표식 없으면 root 요구·바꿔치기 무시"
 mkdir -p "$T_ROOT/s6/data"
 echo new >"$T_ROOT/s6/data/new.txt"
 tar -C "$T_ROOT/s6" -czf "$T_ROOT/a6.tar.gz" data
-run_capture r env -u CS_DEPLOY_TEST_HARNESS PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_MOUNTPOINT_CMD="$STUB_BIN/mountpoint" CS_DATA_PARENT="$P6" CS_BACKUP_DIR="$T_ROOT/bk6" CS_TEST_SKIP_CHOWN=1 \
+run_capture r env -u CS_DEPLOY_TEST_HARNESS PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_MOUNTPOINT_CMD="$STUB_BIN/mountpoint" CS_DATA_PARENT="$P6" CS_BACKUP_DIR="$T_ROOT/bk6" \
   bash "$SCRIPTS_DIR/restore-data.sh" "$T_ROOT/a6.tar.gz"
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "root 로 실행"

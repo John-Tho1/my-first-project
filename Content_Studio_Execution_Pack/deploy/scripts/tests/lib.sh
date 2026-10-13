@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# FIX4-T21P2: 무엇보다 먼저 root 실행을 거부한다(guard.sh).
+# shellcheck source=guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
+cs_harness_refuse_root "$EUID"
 # deploy/scripts 시험 공용(FIX2-T21P2). 일반 bash 만 쓴다(pnpm·node 불필요). 각 시험 파일이 source 한다.
 # 외부 명령(systemctl·mountpoint·id)은 임시 폴더의 가짜 명령(stub)으로 바꾼다 — 실제 서비스·마운트·root 권한을 건드리지 않는다.
 set -u
@@ -66,13 +70,14 @@ cat >"$STUB_BIN/id" <<EOF
 if [[ "\${1:-}" == "-u" ]]; then echo 0; exit 0; fi
 exec "$REAL_ID" "\$@"
 EOF
-# 가짜 mv: 인수 중 하나가 STUB_MV_FAIL_ON(부분 문자열)을 포함하면 실패(교체 도중 실패 흉내), 그 밖은 진짜 mv(REAL_MV)
+# 가짜 mv: 인수 중 하나가 STUB_MV_FAIL_ON(glob 패턴, 예 '*.restore-stage*')과 맞으면 실패(교체 도중 실패 흉내), 그 밖은 진짜 mv(REAL_MV)
 export REAL_MV="$(command -v mv)"
 cat >"$STUB_BIN/mv" <<'EOF'
 #!/usr/bin/env bash
 if [[ -n "${STUB_MV_FAIL_ON:-}" ]]; then
   for a in "$@"; do
-    if [[ "$a" == *"$STUB_MV_FAIL_ON"* ]]; then
+    # shellcheck disable=SC2053
+    if [[ "$a" == $STUB_MV_FAIL_ON ]]; then
       echo "mv: 시험용 실패" >&2
       exit 1
     fi
@@ -83,9 +88,44 @@ EOF
 chmod +x "$STUB_BIN"/*
 
 # stub 이 PATH 앞에 오는 실행 환경. 스크립트가 지원하면 CS_SYSTEMCTL 등으로도 같은 stub 을 가리킨다.
+# FIX4-T21P2: 가짜 chown(진짜로 바꾸지 않고 인수만 기록 — Windows 에는 서비스 사용자가 없다), 가짜 install(-d 폴더 만들기만, 소유자 지정 무시),
+# 가짜 flock(STUB_FLOCK_HELD=1 이면 다른 실행이 잠금을 쥔 것처럼 실패). 진짜 flock 의 배타성 자체는 이 PC 에 flock 이 없어 시험하지 못한다.
+export CHOWN_LOG="$T_ROOT/chown.log"
+: >"$CHOWN_LOG"
+cat >"$STUB_BIN/chown" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$CHOWN_LOG"
+exit 0
+EOF
+cat >"$STUB_BIN/install" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-d" ]]; then
+  target="${!#}"
+  mkdir -p -- "$target"
+  exit $?
+fi
+echo "stub install: 지원하지 않는 사용" >&2
+exit 1
+EOF
+cat >"$STUB_BIN/flock" <<'EOF'
+#!/usr/bin/env bash
+[[ "${STUB_FLOCK_HELD:-0}" == 1 ]] && exit 1
+exit 0
+EOF
+chmod +x "$STUB_BIN"/chown "$STUB_BIN"/install "$STUB_BIN"/flock
+# 마운트 정보 기본 fixture: 루트 하나만(시험이 하위 마운트를 넣을 때는 CS_MOUNTINFO 로 다른 파일)
+MOUNTINFO_DEFAULT="$T_ROOT/mountinfo"
+echo "1 0 8:1 / / rw - ext4 /dev/sda1 rw" >"$MOUNTINFO_DEFAULT"
+LOCK_DEFAULT="$T_ROOT/deploy.lock"
+: >"$LOCK_DEFAULT"
+
+# stub 이 PATH 앞에 오는 실행 환경 + 시험 경로 기본값(시험 실행에서 경로 변수는 반드시 주어져야 한다 — 운영 경로로 떨어지지 않게).
+# 뒤에 오는 인수(시험별 값)가 같은 변수를 다시 주면 그 값이 이긴다(env 는 마지막 할당을 쓴다).
 stub_env() {
-  env PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_MOUNTPOINT_CMD="$STUB_BIN/mountpoint" "$@"
+  env PATH="$STUB_BIN:$PATH" CS_SYSTEMCTL="$STUB_BIN/systemctl" CS_MOUNTPOINT_CMD="$STUB_BIN/mountpoint" \
+    CS_SERVICE_USER="$(id -un)" CS_LOCK_FILE="$LOCK_DEFAULT" CS_MOUNTINFO="$MOUNTINFO_DEFAULT" "$@"
 }
+
 
 # run_capture <out-var-prefix> cmd... : 종료 코드·stdout+stderr 저장
 run_capture() {

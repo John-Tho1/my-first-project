@@ -17,8 +17,8 @@ CS_SCRIPT_TAG=check-env
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 # FIX3-T21P2: CS_* 바꿔치기는 시험 표식 + 실제 root 아님일 때만(lib/common.sh cs_opt). 운영에서는 아래 기본값만 쓴다.
-ENV_FILE="$(cs_opt CS_ENV_FILE /etc/content-studio/env)"
-DATA_ROOT="$(cs_opt CS_DATA_ROOT /srv/content-studio/data)"
+ENV_FILE="$(cs_path CS_ENV_FILE /etc/content-studio/env)" || exit 1
+DATA_ROOT="$(cs_path CS_DATA_ROOT /srv/content-studio/data)" || exit 1
 OWNER_MODE_EXPECTED="$(cs_opt CS_ENV_OWNER_MODE 'root:root 600')"
 fail=0
 bad() {

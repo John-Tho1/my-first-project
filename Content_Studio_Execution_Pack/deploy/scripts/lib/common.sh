@@ -2,7 +2,7 @@
 # deploy/scripts 공용 함수(FIX2·FIX3-T21P2). 각 스크립트가 source 한다. 실제 서버에서 실행한 적 없음(로컬 stub 시험만 — deploy/scripts/tests).
 #
 # FIX3-T21P2(Codex review-FIX2-T21P2 질문 5): 시험용 바꿔치기 변수(CS_SYSTEMCTL·CS_MOUNTPOINT_CMD·CS_DATA_PARENT·CS_BACKUP_DIR·CS_DATA_ROOT·
-# CS_ENV_FILE·CS_ENV_OWNER_MODE·CS_REPO_ROOT·CS_SERVICE_USER·CS_TEST_SKIP_CHOWN)는 **시험 표식**(CS_DEPLOY_TEST_HARNESS=1 — tests/lib.sh 가 설정)이
+# CS_ENV_FILE·CS_ENV_OWNER_MODE·CS_REPO_ROOT·CS_SERVICE_USER·CS_LOCK_FILE·CS_MOUNTINFO)는 **시험 표식**(CS_DEPLOY_TEST_HARNESS=1 — tests/lib.sh 가 설정)이
 # 있고 실제 root 가 아닐 때($EUID ≠ 0 — PATH 의 가짜 id 로 속일 수 없음)만 적용된다. 운영 실행(표식 없음, 또는 root)에서는 무시하고 운영 기본값을 쓴다.
 
 # die <메시지> — 호출한 스크립트 이름(CS_SCRIPT_TAG)을 붙여 stderr 에 쓰고 종료 코드 1.
@@ -25,7 +25,7 @@ cs_opt() {
   fi
 }
 
-# root 요구(시험 실행에서는 실제 root 가 아니므로 건너뜀 — 대신 CS_TEST_SKIP_CHOWN 등으로 root 전용 동작을 빼야 한다)
+# root 요구(시험 실행에서는 실제 root 가 아니므로 건너뜀 — root 전용 명령(chown·install -o)은 시험 실행기의 PATH 가짜 명령이 받는다)
 require_root() {
   cs_test_mode && return 0
   [[ "$EUID" -eq 0 ]] || die "root 로 실행하세요"
@@ -91,12 +91,79 @@ is_mountpoint() {
   esac
 }
 
-# make_backup_dir <dir> — root 700 폴더(시험 실행 + CS_TEST_SKIP_CHOWN=1 이면 소유자 지정 없이 mkdir+chmod)
-make_backup_dir() {
-  if [[ "$(cs_opt CS_TEST_SKIP_CHOWN 0)" == 1 ]]; then
-    mkdir -p -- "$1" && chmod 700 -- "$1" # 시험 전용(root 소유자를 만들 수 없는 환경 — Windows Git Bash 의 install -m 은 실패한다)
+# ---- FIX4-T21P2: 낯선 것은 처리하지 않고 바꾸기 전에 거부(fail closed) ----
+
+# cs_path <변수 이름> <운영 기본값> — 경로용 cs_opt. 시험 실행에서는 변수가 **반드시** 주어져야 하고 운영 경로(/srv/content-studio*,
+# /etc/content-studio, /run)이면 거부한다 — 시험이 운영 기본값으로 떨어지거나 운영 경로를 가리키지 않게(Codex review-FIX3-T21P2 P0 tests/lib.sh:7).
+cs_path() {
+  if cs_test_mode; then
+    [[ -n "${!1:-}" ]] || die "시험 실행에서는 $1 을(를) 시험 경로로 주어야 합니다(운영 기본값으로 떨어지지 않음)"
+    case "${!1}" in
+      /srv/content-studio | /srv/content-studio/* | /srv/content-studio-backup | /srv/content-studio-backup/* | /etc/content-studio | /etc/content-studio/* | /run | /run/*)
+        die "시험 실행에서 $1 이(가) 운영 경로입니다 — 진행하지 않습니다"
+        ;;
+    esac
+    printf '%s' "${!1}"
   else
-    install -d -o root -g root -m 700 -- "$1"
+    printf '%s' "$2"
   fi
+}
+
+# make_backup_dir <dir> — root 700 폴더
+make_backup_dir() {
+  install -d -o root -g root -m 700 -- "$1" || die "사본 폴더를 만들지 못했습니다: $1"
   [[ -d "$1" && ! -L "$1" ]] || die "사본 폴더가 폴더가 아니거나 심볼릭 링크입니다: $1"
+}
+
+# cs_lock — 배포 스크립트끼리 동시 실행 금지(flock, 기다리지 않음). 잠금 파일은 README §2 에서 미리 만든다(서비스 사용자·root 모두 읽기로 연다).
+cs_lock() {
+  local lock
+  lock="$(cs_path CS_LOCK_FILE /srv/content-studio/deploy.lock)" || exit 1
+  command -v flock >/dev/null 2>&1 || die "flock 명령이 없습니다(util-linux) — 동시 실행을 막을 수 없어 진행하지 않습니다"
+  [[ -f "$lock" && ! -L "$lock" ]] || die "잠금 파일이 없습니다: $lock (deploy/README_KO.md §2 에서 만든다)"
+  exec 9<"$lock" || die "잠금 파일을 열지 못했습니다: $lock"
+  flock -n 9 || die "다른 배포 스크립트가 실행 중입니다(잠금 $lock) — 진행하지 않습니다"
+}
+
+# refuse_submounts <dir> — <dir> 아래(엄격히 하위)에 마운트가 하나라도 있으면 거부(같은 파일 시스템 bind 포함). 마운트 정보를 못 읽으면 거부.
+# /proc/self/mountinfo 의 다섯째 칸(마운트 지점, 공백 등은 \040 처럼 이스케이프)을 본다. 데이터 경로에 공백·역슬래시가 있으면 비교가 어긋나므로 거부.
+refuse_submounts() {
+  local dir="$1" real info content mp
+  real="$(realpath -e -- "$dir")" || die "경로를 해석하지 못했습니다: $dir"
+  [[ "$real" != *[[:space:]\\]* ]] || die "데이터 경로에 공백·역슬래시가 있으면 지원하지 않습니다: $real"
+  info="$(cs_path CS_MOUNTINFO /proc/self/mountinfo)" || exit 1
+  content="$(cat -- "$info" 2>/dev/null)" || die "마운트 정보를 읽지 못했습니다($info) — 진행하지 않습니다"
+  [[ -n "$content" ]] || die "마운트 정보가 비어 있습니다($info) — 진행하지 않습니다"
+  while read -r _ _ _ _ mp _; do
+    [[ "$mp" != "$real"/* ]] || die "데이터 폴더 아래에 하위 마운트가 있습니다($mp) — 지원하지 않는 구성이라 진행하지 않습니다"
+  done <<<"$content"
+}
+
+# refuse_if_must_be_mount_but_not <데이터 부모> <데이터 폴더> — <부모>/.data-must-be-mount 표시가 있으면 데이터 폴더가 지금 마운트 지점이어야 한다
+# (볼륨이 빠진 채 빈 폴더를 백업·복원하지 않게). 폴더가 없으면 마운트가 아니므로 거부.
+refuse_if_must_be_mount_but_not() {
+  [[ -e "$1/.data-must-be-mount" ]] || return 0
+  [[ -d "$2" ]] || die "데이터 폴더는 마운트여야 하는데(.data-must-be-mount) 폴더가 없습니다: $2 — 볼륨을 먼저 마운트하세요"
+  is_mountpoint "$2" || die "데이터 폴더는 마운트여야 하는데(.data-must-be-mount) 지금 마운트가 아닙니다: $2 — 볼륨을 먼저 마운트하세요"
+}
+
+# refuse_special_tree <dir> — 일반 파일·폴더 밖의 항목(심볼릭 링크·소켓·FIFO·장치)이나 하드링크(링크 수 > 1)인 파일이 있으면 거부.
+# backup-data(만들기 전)와 restore-data(풀고 난 뒤)가 같은 기준을 쓴다 — 백업이 만든 사본은 복원이 받아들인다.
+refuse_special_tree() {
+  local odd
+  odd="$(find "$1" \( ! -type f ! -type d \) -print -quit)" || die "폴더를 검사하지 못했습니다: $1"
+  [[ -z "$odd" ]] || die "일반 파일·폴더가 아닌 항목(심볼릭 링크·소켓·FIFO·장치)이 있습니다 — 지원하지 않습니다"
+  odd="$(find "$1" -type f -links +1 -print -quit)" || die "폴더를 검사하지 못했습니다: $1"
+  [[ -z "$odd" ]] || die "하드링크(링크 수 > 1)인 파일이 있습니다 — 지원하지 않습니다"
+}
+
+# apply_owner_perms <dir> <owner> — 소유자(-R --no-dereference)·폴더 700·파일 600 을 적용하고, 소유자를 확인한다. 실패하면 1.
+# 이름이 .restore-* 인 임시 폴더는 건너뛴다(마운트 지점 안 작업 폴더).
+apply_owner_perms() {
+  local dir="$1" owner="$2" left
+  chown -R --no-dereference -- "$owner:$owner" "$dir" || return 1
+  find "$dir" -path "$dir/.restore-*" -prune -o -type d -exec chmod 700 -- {} + || return 1
+  find "$dir" -path "$dir/.restore-*" -prune -o -type f -exec chmod 600 -- {} + || return 1
+  left="$(find "$dir" -path "$dir/.restore-*" -prune -o ! -user "$owner" -print -quit)" || return 1
+  [[ -z "$left" ]]
 }

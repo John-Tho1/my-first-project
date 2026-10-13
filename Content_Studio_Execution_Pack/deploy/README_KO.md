@@ -37,10 +37,14 @@ sudo install -d -o content-studio -g content-studio -m 755 /srv/content-studio /
 sudo install -d -o content-studio -g content-studio -m 700 /srv/content-studio/data
 sudo install -d -o root -g root -m 700 /srv/content-studio-backup
 sudo install -d -o root -g root -m 755 /etc/content-studio
+sudo install -o content-studio -g content-studio -m 644 /dev/null /srv/content-studio/deploy.lock   # 배포 스크립트 동시 실행 금지용 잠금 파일(flock)
 sudo -u content-studio -H git clone <저장소 URL> /srv/content-studio/repo
 test -f /srv/content-studio/repo/Content_Studio_Execution_Pack/pnpm-workspace.yaml   # 앱 루트 확인
 ```
 - `/srv/content-studio/data` 는 재시작·재배포·서버 재생성 뒤에도 남는 디스크여야 한다(공급자 볼륨을 쓰면 여기에 마운트).
+- FIX4: 데이터를 **볼륨 마운트**로 둘 때는 `sudo touch /srv/content-studio/.data-must-be-mount` 로 표시한다 — 백업·복원 스크립트가 데이터 폴더가 지금 마운트가 아니면(볼륨이 빠진 채 빈 폴더) 거부한다. 데이터 폴더 **아래**에 또 다른 마운트(bind 포함)를 두지 않는다 — 두면 백업·복원이 거부한다.
+- 데이터 폴더 안에는 일반 파일·폴더만 둔다(심볼릭 링크·하드링크·소켓·FIFO·장치가 있으면 백업이 거부한다 — 복원이 받아들이는 형식과 같게).
+- 배포 스크립트(`build-release.sh`·`backup-data.sh`·`restore-data.sh`)는 `/srv/content-studio/deploy.lock` 에 `flock` 을 잡는다 — 둘을 동시에 돌리면 뒤의 것이 거부된다. `flock`·`mountpoint` 는 util-linux 에 있다.
 - 방화벽: 22 = 사용자 IP 만, 80·443 공개. **3000 은 열지 않는다**(web 은 127.0.0.1 에서만 듣는다).
 
 ## 3. 빌드(지정 SHA)
@@ -142,12 +146,12 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 
 | 단계 | 내용 |
 | --- | --- |
-| 실행 조건 | root, 서비스 정지 확인(조회 실패면 중단), 데이터 폴더·부모 폴더가 심볼릭 링크가 아님, `mountpoint` 로 마운트 여부 확인(명령이 없거나 오류면 중단 — 일반 폴더로 가정하지 않음) |
-| 1. 사본 검사(아무것도 바꾸기 전) | `tar -tv` 로 항목 형식을 본다 — **일반 파일·폴더만** 허용(심볼릭 링크·하드링크·장치·FIFO 거부), 경로는 모두 `data/` 아래(절대 경로·`.`·`..`·빈 칸 거부), 최상위 `data` 는 폴더 |
+| 실행 조건 | 잠금(flock — 다른 배포 스크립트 실행 중이면 거부), root, 서비스 정지 확인(조회 실패면 중단), 데이터 폴더 **아래 하위 마운트(bind 포함)가 있으면 거부**(`/proc/self/mountinfo` — 못 읽으면 거부), `.data-must-be-mount` 표시가 있으면 지금 마운트여야 함, 데이터 폴더·부모 폴더가 심볼릭 링크가 아님, `mountpoint` 로 마운트 여부 확인(명령이 없거나 오류면 중단 — 일반 폴더로 가정하지 않음) |
+| 1. 사본 검사(아무것도 바꾸기 전) | 항목 이름에 줄바꿈·제어 문자·역슬래시·UTF-8 이 아닌 바이트가 있으면 거부(PAX 긴 이름은 허용). `tar -tv` 로 항목 형식을 본다 — **일반 파일·폴더만** 허용(심볼릭 링크·하드링크·장치·FIFO 거부), 경로는 모두 `data/` 아래(절대 경로·`.`·`..`·빈 칸 거부), 최상위 `data` 는 폴더 |
 | 2. 직전 사본 | 지금 데이터를 `/srv/content-studio-backup/data-before-restore-<UTC 시각>.<고유>.tar.gz`(600)로 남긴다 — `mktemp` 로 **배타적으로 만든 고유 이름**이라 같은 초에 두 번 실행해도, 직전 사본을 입력으로 다시 실행해도 덮어쓰지 않는다(입력과 같은 파일이면 중단) |
-| 3. 임시 폴더에 풀기 | 같은 파일 시스템의 새 임시 폴더(`mktemp -d`) — 일반 폴더면 `/srv/content-studio/.restore-stage.*`, 마운트 지점이면 마운트 안 `data/.restore-stage.*`. 풀고 나서 다시 확인(일반 파일·폴더 밖 항목 0, 최상위는 실제 폴더 `data` 하나). 소유자 `content-studio`·700 은 이 확인 뒤에만(링크를 따라가지 않음) |
-| 4a. 일반 폴더 | 지금 `data` 를 `data.replaced-<시각>.<고유>/data` 로 옮긴 뒤 임시 `data` 를 제자리로. 둘째 단계가 실패하면 **옮겨 둔 폴더를 되돌리고** 실패로 끝낸다 |
-| 4b. 마운트 지점 | 폴더(마운트)는 그대로(mv 하지 않음). 안의 내용(임시 폴더 제외)을 지우고 임시 `data` 의 내용을 옮긴다. 실패하면 2 의 직전 사본을 같은 방식(임시 폴더에 풀고 검증 → 채우기)으로 **자동 복구**하고 실패로 끝낸다 |
+| 3. 임시 폴더에 풀기 | `--no-same-owner --no-same-permissions --no-overwrite-dir` 로, 같은 파일 시스템의 새 임시 폴더(`mktemp -d`) — 일반 폴더면 `/srv/content-studio/.restore-stage.*`, 마운트 지점이면 마운트 안 `data/.restore-stage.*`. 풀고 나서 다시 확인(일반 파일·폴더 밖 항목 0, 최상위는 실제 폴더 `data` 하나). 소유자 `content-studio`·700 은 이 확인 뒤에만(링크를 따라가지 않음) |
+| 4a. 일반 폴더 | 지금 `data` 를 `data.replaced-<시각>.<고유>/data` 로 옮긴 뒤 임시 `data` 를 제자리로. 둘째 단계가 실패하면 **옮겨 둔 폴더를 되돌리고 서비스 사용자 소유·폴더 700·파일 600 을 다시 적용·확인한 뒤** 실패로 끝낸다 |
+| 4b. 마운트 지점 | 폴더(마운트)는 그대로(mv 하지 않음). 안의 내용(임시 폴더 제외)을 지우고 임시 `data` 의 내용을 옮긴다. 실패하면 2 의 직전 사본을 (임시 폴더에 풀기·확인·소유자 적용까지 정상 복원과 같은 절차로) 같은 방식(임시 폴더에 풀고 검증 → 채우기)으로 **자동 복구**하고 실패로 끝낸다 |
 | 5. 정리 | 임시 폴더는 성공·실패와 관계없이 지운다. 일반 폴더의 `data.replaced-*` 와 직전 사본은 남긴다(확인 뒤 사용자가 정리) |
 
 - **복원이 실패로 끝났을 때**: 서비스는 정지 상태 그대로 둔다. 위 4a·4b 의 되돌림이 성공했으면 데이터는 복원 직전 상태다 — 원인(공간·권한)을 해결하고 같은 명령을 다시 실행한다.

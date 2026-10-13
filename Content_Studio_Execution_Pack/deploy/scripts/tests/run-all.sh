@@ -3,6 +3,10 @@
 #   bash deploy/scripts/tests/run-all.sh
 # 먼저 모든 스크립트의 문법(bash -n)을 확인하고, test-*.sh 를 차례로 실행한다. 하나라도 실패하면 종료 코드 1.
 set -u
+# FIX4-T21P2: 무엇보다 먼저 root 실행을 거부한다(guard.sh)
+# shellcheck source=guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
+cs_harness_refuse_root "$EUID"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$(cd "$DIR/.." && pwd)"
 rc=0

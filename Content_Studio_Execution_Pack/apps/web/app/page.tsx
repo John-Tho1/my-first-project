@@ -7,6 +7,7 @@ import { getSession } from '../lib/auth';
 import { LIFECYCLE_LABEL } from '../lib/contents';
 import { PLAN_STATUS_LABEL } from '../lib/distribution';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
+import { planRowTag, planStatusText } from '../lib/record-labels';
 import { getAppDb, getConfig } from '../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -212,8 +213,9 @@ export default async function TodayPage({
                       <Link href={`/distribute/${e.plan.id}`}>{e.plan.targetSummary || '배포 계획'}</Link>
                     </p>
                     <p className="meta">
-                      {e.mock ? <span className="tag warn">MOCK</span> : null}
-                      <span className="tag">{PLAN_STATUS_LABEL[e.plan.status] ?? e.plan.status}</span>
+                      {/* FIX-UICLEAN: 실제/MOCK 은 그 계획 항목의 기록(계정 kind)으로 */}
+                      {planRowTag(e) ? <span className={planRowTag(e)!.className}>{planRowTag(e)!.text}</span> : null}
+                      <span className="tag">{planStatusText(PLAN_STATUS_LABEL[e.plan.status] ?? e.plan.status, e.mock && e.itemCount > 0)}</span>
                       <span>{e.channels.map((ch) => CHANNEL_LABEL[ch as Channel] ?? ch).join(' · ')}</span>
                       <time dateTime={e.plan.createdAt.toISOString()}>{formatMsk(e.plan.createdAt)}</time>
                     </p>

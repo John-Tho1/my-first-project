@@ -50,6 +50,7 @@ import {
   youtubeProgressLine,
   youtubeSessionNote,
 } from '../../../lib/distribution';
+import { mixedResultSuffix, planCreatedBanner, retriedBanner } from '../../../lib/record-labels';
 import { getAppDb, getConfig, getStorage } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -695,13 +696,10 @@ export default async function PlanPage({
             실제 게시 — 실제 Threads 계정 항목은 승인·실행하면 승인된 내용 그대로 <strong>실제로 게시</strong>됩니다(되돌리기 없음).
             <br />
             결과를 모르면 자동으로 다시 게시하지 않습니다.{hasMock ? ' 모의 계정 항목은 MOCK 입니다(실제 발행 실적 아님).' : ''}
+            <br />
+            {/* FIX-UICLEAN: 보류 조건은 접지 않고 한 줄로 */}
+            실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다.
           </p>
-          <details className="more">
-            <summary>자세히</summary>
-            <p>
-              작업 처리기가 텍스트 1개를 게시합니다. 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다.
-            </p>
-          </details>
         </>
       ) : (
         <>
@@ -718,7 +716,7 @@ export default async function PlanPage({
       )}
       {q.created === '1' ? (
         <p className="saved" role="status">
-          배포 계획을 만들었습니다(MOCK — 아직 승인 전). 아래 내용을 확인한 뒤 승인할 항목을 고르세요.
+          {planCreatedBanner(hasLive)}
         </p>
       ) : null}
       {banners.approved !== null ? (
@@ -759,7 +757,7 @@ export default async function PlanPage({
       ) : null}
       {banners.retried ? (
         <p className="saved" role="status">
-          보류된 작업을 다시 대기열에 넣었습니다(MOCK — 새 시도). &quot;작업 처리 실행(모의 1회)&quot;을 누르면 처리합니다.
+          {retriedBanner(hasLive)}
         </p>
       ) : null}
       {/* LIVEP1-USERCONFIRM: 배너는 저장된 사용자 확인 결과가 있을 때만(쿼리만으로 주장하지 않음) */}
@@ -809,7 +807,7 @@ export default async function PlanPage({
             {new Set(approvable.map((x) => x.item.requestedResult)).size > 1 ? (
               <p className="note">
                 이 계획에는 요청 결과가 다른 항목이 섞여 있습니다. 고른 항목은 각자 카드에 보인 요청 결과(
-                {[...new Set(approvable.map((x) => x.item.requestedResult))].map((r) => REQUESTED_RESULT_LABEL[r] ?? r).join(' · ')})로 승인됩니다(MOCK — 실제 게시 아님).
+                {[...new Set(approvable.map((x) => x.item.requestedResult))].map((r) => REQUESTED_RESULT_LABEL[r] ?? r).join(' · ')})로 승인됩니다{mixedResultSuffix(approvable.map((x) => ({ live: x.account?.kind === 'live' })))}.
               </p>
             ) : null}
             <label className="choice">

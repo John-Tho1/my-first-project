@@ -152,7 +152,8 @@ export type CrumbTarget =
   | { page: 'distribute' }
   | { page: 'plan'; targetSummary: string | null }
   | { page: 'settings' }
-  | { page: 'restore' }
+  /** FIX-UICLEAN(Codex P2): 복원 상태 — 완료면 "복원 완료", 아니면 "복원 미리보기" */
+  | { page: 'restore'; committed: boolean }
   | { page: 'brand' }
   | { page: 'ops' }
   | { page: 'search' };
@@ -217,7 +218,7 @@ export function crumbsFor(t: CrumbTarget): Crumb[] {
     case 'settings':
       return trail(MANAGE, { label: '설정' });
     case 'restore':
-      return trail(MANAGE, { label: '설정', href: '/settings' }, { label: '복원 미리보기' });
+      return trail(MANAGE, { label: '설정', href: '/settings' }, { label: t.committed ? '복원 완료' : '복원 미리보기' });
     case 'brand':
       return trail(MANAGE, { label: '브랜드 프로필' });
     case 'ops':

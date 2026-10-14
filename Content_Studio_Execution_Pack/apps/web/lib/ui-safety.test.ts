@@ -60,6 +60,12 @@ const REQUIRED: Record<string, string[]> = {
     '복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요',
     '내용을 확인했습니다',
     '재확인(조회만 — 다시 보내지 않음)',
+    // FIX-UICLEAN(Codex 질문 1 답·coordinator): 실제 게시 보류 조건은 접지 않고 한 줄로 보인다
+    '실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다.',
+    // FIX-UICLEAN: 계획 기록 기준 문구(페이지 수준 계정 상태가 아님)
+    'mixedResultSuffix(',
+    'planCreatedBanner(hasLive)',
+    'retriedBanner(hasLive)',
   ],
   'distribute/new/page.tsx': [
     '<strong>실제로 게시</strong>',
@@ -70,7 +76,15 @@ const REQUIRED: Record<string, string[]> = {
     '배포 조건을 채우지 못했습니다',
     "'배포 계획 만들기(승인 전 — 아직 게시하지 않음)'",
   ],
-  'distribute/page.tsx': [MOCK_TAG, '<strong>실제로 게시</strong>', 'MOCK(실제 발행 실적 아님)입니다.', '그 결과와 원격 ID 는 MOCK(실제 발행 실적 아님)입니다.'],
+  'distribute/page.tsx': [
+    MOCK_TAG,
+    'accountModeOf(accounts)',
+    'planRowTag(e)',
+    '실제 게시 대상 미지정',
+    '<strong>실제로 게시</strong>',
+    'MOCK(실제 발행 실적 아님)',
+    '실제/MOCK 표시는 각 계획',
+  ],
   'settings/page.tsx': [
     '실제 게시 준비 안 됨(실제로 게시하지 않음): {oauth.livePublish.missing.join',
     '<span className="tag warn">실제 게시 준비됨</span>',
@@ -108,7 +122,7 @@ const REQUIRED: Record<string, string[]> = {
     "'(MOCK — 승인은 계획 화면에서 직접)'",
     '자동 게시 아님 — 파일을 받는 것은 승인이나 게시가 아닙니다.',
   ],
-  'page.tsx': [MOCK_TAG, "b.live ? 'badge live' : 'badge'"],
+  'page.tsx': ['planRowTag(e)', "b.live ? 'badge live' : 'badge'"],
   'ops/page.tsx': [
     'AI live 준비 안 됨: {live.missing',
     '음성 전사 live 준비 안 됨: {sttLive.missing',
@@ -116,6 +130,8 @@ const REQUIRED: Record<string, string[]> = {
     '실제 게시 준비 안 됨: {oauth.livePublish.missing.join',
     '{LIVE_SETTLEMENT_POLICY_TEXT}',
     '원문 소재·출처·원고 버전은 지우지 않습니다.',
+    'opsAccountsNote(accountModeOf(accounts))',
+    'opsJobsTag(s.jobs.byKind)',
   ],
   'record/page.tsx': ['모의(실제 음성 인식 아님)', 'live 준비 안 됨: {live.missing.join'],
 };
@@ -185,5 +201,29 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
       expect({ p, crumbs: src.includes('<Breadcrumbs at={{') }).toEqual({ p, crumbs: true });
       expect({ p, back: src.includes('←') }).toEqual({ p, back: false });
     }
+  });
+});
+
+/**
+ * FIX-UICLEAN(Codex review-UI-CLEAN P1·P2 + 오래된 MOCK 문구): 지금 계정 상태나 화면 수준 값으로 기록의 실제/MOCK 을 단정하던 고정 문구가 남아 있지 않다.
+ * 문구 선택은 lib/record-labels.ts(단위 시험 record-labels.test.ts, 배포함 렌더 시험 distribute-list-render.test.ts)가 한다.
+ */
+describe('FIX-UICLEAN — 고정 MOCK 단정 문구 없음', () => {
+  const FORBIDDEN: Record<string, string[]> = {
+    'ops/page.tsx': ['현재 연결은 모두 모의(MOCK)입니다', '배포 작업(MOCK)'],
+    'distribute/[id]/page.tsx': ['(MOCK — 실제 게시 아님)', '배포 계획을 만들었습니다(MOCK', '(MOCK — 새 시도)'],
+    'distribute/page.tsx': ['결과와 원격 ID 는', '모의(MOCK) 계정만 있습니다', 'e.mock ? <span'],
+    'page.tsx': ['e.mock ? <span'],
+    'contents/[id]/variants-panel.tsx': ["'(MOCK)'}"],
+  };
+  for (const [file, literals] of Object.entries(FORBIDDEN)) {
+    it(file, () => {
+      const src = read(file);
+      expect(literals.filter((t) => src.includes(t))).toEqual([]);
+    });
+  }
+
+  it('복원 화면의 현재 위치는 복원 상태(미리보기/완료)를 넘긴다', () => {
+    expect(read('settings/restores/[id]/page.tsx')).toContain("page: 'restore', committed: Boolean(committed)");
   });
 });

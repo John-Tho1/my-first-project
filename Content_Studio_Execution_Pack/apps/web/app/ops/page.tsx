@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { DRILL_PARTIAL_LABEL, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
+import { DRILL_PARTIAL_LABEL, listAccountHealth, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
 import {
   CHANNEL_LABEL,
   CREDENTIAL_STATUS_LABEL,
@@ -19,6 +19,7 @@ import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { exportsDir } from '../../lib/backup';
 import { oauthReadinessView } from '../../lib/oauth';
 import { OPS_ERROR_TEXT } from '../../lib/ops';
+import { accountModeOf, opsAccountsNote, opsJobsTag } from '../../lib/record-labels';
 import { getAppDb, getConfig } from '../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -54,6 +55,9 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const { db } = await getAppDb(config);
   const now = new Date();
   const s = await opsSnapshot(db, session.ownerId, config, now);
+  // FIX-UICLEAN: 계정 안내는 지금 계정 상태로, 작업 제목 태그는 작업 기록으로
+  const accounts = await listAccountHealth(db, session.ownerId);
+  const jobsTag = opsJobsTag(s.jobs.byKind);
   const plan = await planRetention(db, session.ownerId, config, exportsDir(config), now);
   const err = str(q.error) ? (OPS_ERROR_TEXT[str(q.error)!] ?? OPS_ERROR_TEXT.server) : undefined;
   const live = liveLlmReadiness(config, process.env);
@@ -144,7 +148,16 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
       </section>
 
       <section className="card archive" aria-labelledby="jobs-title">
-        <h3 id="jobs-title">배포 작업(MOCK)</h3>
+        {/* FIX-UICLEAN: 제목 태그는 작업 기록(항목 계정 kind) 기준 — 지금 계정 상태로 MOCK 이라고 단정하지 않는다 */}
+        <h3 id="jobs-title">
+          배포 작업
+          {jobsTag ? (
+            <>
+              {' '}
+              <span className={jobsTag.warn ? 'tag warn' : 'tag'}>{jobsTag.text}</span>
+            </>
+          ) : null}
+        </h3>
         {states.length ? (
           <p className="meta">
             {states.map(([k, n]) => (
@@ -222,8 +235,9 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           ))}
         </ul>
         <p className="note">
-          만료·해제·다시 연결 필요인 계정은 그 계정의 배포 실행이 차단됩니다. 자세한 상태·연결은 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>. 현재
-          연결은 모두 모의(MOCK)입니다.
+          만료·해제·다시 연결 필요인 계정은 그 계정의 배포 실행이 차단됩니다. 자세한 상태·연결은 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>.{' '}
+          {/* FIX-UICLEAN: 지금 계정 상태(모의만 · 실제 게시 대상 미지정 · 실제 게시 대상 있음 · 없음)에 맞춘 한 줄 */}
+          {opsAccountsNote(accountModeOf(accounts))}
         </p>
       </section>
 

@@ -182,7 +182,9 @@ describe('crumbsFor — 화면별 현재 위치', () => {
     expect(crumbsFor({ page: 'plan', targetSummary: '10월 Threads' })).toEqual([{ label: '배포' }, { label: '배포함', href: '/distribute' }, { label: '10월 Threads' }]);
     expect(labels({ page: 'plan', targetSummary: '' })[2]).toBe('이름 없음');
     expect(labels({ page: 'plan', targetSummary: null })[2]).toBe('이름 없음');
-    expect(crumbsFor({ page: 'restore' })).toEqual([{ label: '관리' }, { label: '설정', href: '/settings' }, { label: '복원 미리보기' }]);
+    // FIX-UICLEAN(Codex P2): 복원 상태에 따라 마지막 조각이 다르다(미리보기 / 완료)
+    expect(crumbsFor({ page: 'restore', committed: false })).toEqual([{ label: '관리' }, { label: '설정', href: '/settings' }, { label: '복원 미리보기' }]);
+    expect(crumbsFor({ page: 'restore', committed: true })).toEqual([{ label: '관리' }, { label: '설정', href: '/settings' }, { label: '복원 완료' }]);
   });
 
   it('제목은 40자(코드 포인트)로 자르고 말줄임, 공백 정리, 비었으면 "(제목 없음)"', () => {
@@ -220,7 +222,8 @@ describe('crumbsFor — 화면별 현재 위치', () => {
       { page: 'distribute' },
       { page: 'plan', targetSummary: 's' },
       { page: 'settings' },
-      { page: 'restore' },
+      { page: 'restore', committed: false },
+      { page: 'restore', committed: true },
       { page: 'brand' },
       { page: 'ops' },
       { page: 'search' },

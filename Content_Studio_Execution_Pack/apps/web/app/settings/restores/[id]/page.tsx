@@ -61,7 +61,7 @@ export default async function RestorePage({
 
   return (
     <main className="container">
-      <Breadcrumbs at={{ page: 'restore' }} />
+      <Breadcrumbs at={{ page: 'restore', committed: Boolean(committed) }} />
       <h2 className="screen-title">{committed ? '복원 완료: 표별 건수' : '복원 미리보기'}</h2>
       {err ? (
         <p className="notice" role="alert">

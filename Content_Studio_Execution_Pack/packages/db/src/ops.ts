@@ -16,7 +16,7 @@ type JobStateCounts = Awaited<ReturnType<typeof jobStateCounts>>;
 import { credentialHealthCounts } from './oauth';
 import { resolveFromRoot } from './paths';
 import { latestRestoreDrill, type RestoreDrillRow } from './restore-drill';
-import { assets, auditEvents, distributionItems, distributionPlans, exportRuns, jobs, sendIntents, uploadSessions, variants } from './schema';
+import { assets, auditEvents, channelAccounts, distributionItems, distributionPlans, exportRuns, jobs, sendIntents, uploadSessions, variants } from './schema';
 
 // ---- 파일 용량 ----
 
@@ -279,6 +279,8 @@ export interface OpsSnapshot {
   measuredAt: Date;
   jobs: {
     byState: Record<string, number>;
+    /** FIX-UICLEAN: 작업 기록의 계정 종류별 개수(모의 계정 / 그 밖 = 실제 계정) */
+    byKind: { mock: number; live: number };
     total: number;
     /** 처리할 때가 된 QUEUED 중 가장 오래 기다린 시간(시간). 없으면 null */
     oldestQueuedHours: number | null;
@@ -322,6 +324,19 @@ export async function opsSnapshot(
     .groupBy(jobs.state)
     .orderBy(asc(jobs.state));
   const byState = Object.fromEntries(states.map((s) => [s.state, Number(s.n)]));
+  // FIX-UICLEAN: 작업 기록의 계정 종류별 개수(항목 계정 kind — publications.is_mock 과 DB 트리거로 같은 값). 화면 제목의 실제/MOCK 표시는 이것만 본다.
+  const kinds = await db
+    .select({ kind: channelAccounts.kind, n: sql<number>`count(*)::int` })
+    .from(jobs)
+    .innerJoin(distributionItems, and(eq(distributionItems.id, jobs.itemId), eq(distributionItems.ownerId, jobs.ownerId)))
+    .innerJoin(channelAccounts, and(eq(channelAccounts.id, distributionItems.channelAccountId), eq(channelAccounts.ownerId, distributionItems.ownerId)))
+    .where(eq(jobs.ownerId, ownerId))
+    .groupBy(channelAccounts.kind);
+  const byKind = { mock: 0, live: 0 };
+  for (const k of kinds) {
+    if (k.kind === 'mock') byKind.mock += Number(k.n);
+    else byKind.live += Number(k.n);
+  }
   const [queued] = await db
     .select({ oldest: sql<string | null>`min(${jobs.nextRunAt})::text` })
     .from(jobs)
@@ -376,6 +391,7 @@ export async function opsSnapshot(
     measuredAt: now,
     jobs: {
       byState,
+      byKind,
       total: Object.values(byState).reduce((a, b) => a + b, 0),
       oldestQueuedHours: queued?.oldest ? ageHours(new Date(queued.oldest), now) : null,
       nextRetryAt: retry?.next ? new Date(retry.next) : null,

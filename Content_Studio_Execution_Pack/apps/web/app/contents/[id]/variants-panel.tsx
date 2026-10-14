@@ -153,7 +153,9 @@ export function VariantsPanel({
                 {s.variant.lifecycle === 'approved' ? (
                   <p className="note">
                     <span className="tag">승인됨</span> 배포 승인이 있는 초안입니다
-                    {livePlatforms?.has(s.variant.channel) ? '(실제 게시 계정 승인일 수 있음 — 계획에서 확인)' : '(MOCK)'}. 수정·첨부 변경은 승인을 무효로 합니다.{' '}
+                    {/* FIX-UICLEAN(Codex 질문 3): 지금 계정 목록으로 그 승인의 실제/MOCK 을 단정하지 않는다 — 승인 기록은 계획 화면에서 */}
+                    {livePlatforms?.has(s.variant.channel) ? '(실제 게시 계정 승인일 수 있음 — 계획에서 확인)' : '(게시 유형은 계획에서 확인)'}. 수정·첨부 변경은 승인을 무효로
+                    합니다.{' '}
                     {planByVariant.get(s.variant.id) ? <a href={`/distribute/${planByVariant.get(s.variant.id)}`}>배포 계획 보기</a> : null}
                   </p>
                 ) : (

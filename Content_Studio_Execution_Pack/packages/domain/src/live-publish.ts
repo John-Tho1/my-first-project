@@ -95,6 +95,11 @@ export const LIVE_THREADS_VISIBILITY_TEXT = 'Threads 계정 공개 설정을 따
 export const LIVE_SUBMIT_BUDGET_MS = 60_000;
 /** 게시 시도 표식을 쓰기 전에 남아 있어야 하는 여유(게시 호출 시간 제한에 더함, ms) */
 export const LIVE_PUBLISH_BUDGET_MARGIN_MS = 2_000;
+/**
+ * FIX-LIVEP1-TIMEOUT(Codex P1): 게시 시도 표식 저장(짧은 DB 트랜잭션)에 쓸 수 있는 몫(ms). 표식 전 검사는 게시 호출 + 이 몫 + 여유를 요구하고,
+ * 저장이 이 몫 안에 끝나지 않으면 그 실행은 게시하지 않는다(표식이 저장되기 전에는 절대 게시 요청을 보내지 않음).
+ */
+export const LIVE_PUBLISH_MARKER_ALLOWANCE_MS = 3_000;
 
 /** 실제 게시 실행 안내(실행 명령 결과·감사). */
 export const LIVE_EXECUTE_NOTICE = '실제 게시 — 작업 처리기가 승인된 내용 그대로 실제 Threads 계정에 게시합니다(되돌리기 없음).';

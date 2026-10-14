@@ -781,6 +781,67 @@ describe('LIVEP1-TIMEOUT: 실제 지연에서도 한 번의 폼 tick 안에 끝�
   });
 });
 
+// FIX-LIVEP1-TIMEOUT(Codex review-LIVEP1-TIMEOUT P1): 남은 시간 검사 뒤의 lease 확인(heartbeat)·표식 저장 지연 — 작업 처리기 전체 경로(실제 DB 단계 기록).
+describe('FIX-LIVEP1-TIMEOUT: heartbeat·표식 저장 지연이 게시 호출 몫을 먹지 않음(작업 처리기 전체)', () => {
+  const PUB_MS = 300; // 시험용 게시 호출 시간 제한(실제 10초) — 여유 2초·표식 몫 200ms 와 합쳐 필요 2.5초
+  /** 컨테이너가 FINISHED 로 기록된 뒤의 heartbeat 를 늦추거나 게시 시도 표식 저장을 멈추게 하는 실제 어댑터(그 밖은 그대로). */
+  class SlowAdapter extends LiveThreadsPublishAdapter {
+    constructor(fetch: (input: string, init?: RequestInit) => Promise<Response>, config: AppConfig, private readonly mode: { heartbeatMs?: number; markerHang?: boolean }) {
+      super({ gate: () => livePublishReadiness(config), fetch, pollIntervalMs: 0, timeoutMs: PUB_MS, markerAllowanceMs: 200 } as ConstructorParameters<typeof LiveThreadsPublishAdapter>[0]);
+    }
+    override submit(prepared: Parameters<LiveThreadsPublishAdapter['submit']>[0], ctx: Parameters<LiveThreadsPublishAdapter['submit']>[1]) {
+      const steps = ctx.steps!;
+      let finished = false;
+      return super.submit(prepared, {
+        ...ctx,
+        heartbeat: async () => {
+          if (finished && this.mode.heartbeatMs) await new Promise((r) => setTimeout(r, this.mode.heartbeatMs));
+          return ctx.heartbeat();
+        },
+        steps: {
+          list: () => steps.list(),
+          record: (s) => {
+            if (s.kind === 'container' && s.status === 'finished') finished = true;
+            if (s.kind === 'publish_attempt' && this.mode.markerHang) return new Promise(() => undefined);
+            return steps.record(s);
+          },
+        },
+      });
+    }
+  }
+  const slowRegistry = (fetch: (input: string, init?: RequestInit) => Promise<Response>, config: AppConfig, mode: { heartbeatMs?: number; markerHang?: boolean }) => {
+    const gate = () => livePublishReadiness(config);
+    return new LiveCapableAdapterRegistry(createMockAdapterRegistry(), new SlowAdapter(fetch, config, mode), gate);
+  };
+
+  it.each([
+    ['heartbeat 800ms(남은 시간 약 2.2초 < 2.5초)', { heartbeatMs: 800 }, 'publish_budget_insufficient'],
+    ['게시 시도 표식 저장이 멈춤(끝나지 않음)', { markerHang: true }, 'publish_marker_slow'],
+  ] as const)('%s → 표식·게시 없이 RETRY_WAIT(결과 불명 아님, threads_publish 0번) → 다음 시도가 같은 컨테이너로 게시', async (_, mode, code) => {
+    const TEXT = `표식 전 지연 시험 글 ${code}.`;
+    const p = await planApproved([TEXT]);
+    const config = fullCfg(`D38-fix-timeout-${code}`, '3');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture(happy(TEXT));
+    const run = (reg: LiveCapableAdapterRegistry, budget: number) =>
+      runJobsTick(db, reg, { workerId: 'fixto-w', config, ownerId: owner, planId: p.planId, clock: () => new Date(Date.now() + vt), random: () => 0.5, submitTimeoutMs: 1000, liveSubmitTimeoutMs: budget, maxJobs: 5, credentials: jobCredentials(config, db) });
+    // 예산 3초(= max(호출자 1초, 실제 3초)): 컨테이너·상태는 바로 끝나 처음 검사(필요 2.5초)는 통과 — 그 뒤의 지연이 몫을 먹는다
+    expect((await run(slowRegistry(fx.fetch, config, mode), 3_000)).results).toEqual({ RETRY_WAIT: 1 });
+    const item = p.items[0]!;
+    const job = await jobOf(item.id);
+    expect(job.lastErrorCode).toBe(code);
+    expect(job.state).toBe('RETRY_WAIT');
+    expect((await stepsOf(item.id)).map((st) => `${st.kind}:${st.status}`)).toEqual(['container:finished']);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(0);
+    // 다음 시도(재시도 시각 뒤, 지연 없음) — 같은 컨테이너로 게시(새 컨테이너 없음)
+    vt += 20 * MIN;
+    expect((await run(registryWith(fx.fetch, config), 60_000)).results).toEqual({ CONFIRMED: 1 });
+    expect(fx.calls.filter((c) => c.method === 'POST' && c.url.pathname === `/v1.0/${PROFILE_ID}/threads`)).toHaveLength(1);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    expect((await pubsOf(item.id))[0]).toMatchObject({ verification: 'VERIFIED', externalId: `threads:${fx.ids.media}` });
+  });
+});
+
 describe('FIX-LIVEP1: 계획 범위 작업 처리·동시 실행·실제 게시 계정 사용 확인', () => {
   it('계획 화면 버튼(폼 plan_id)은 그 계획의 작업만 처리 — 다른 계획의 실제 게시 작업은 그대로(실제 호출 0)', async () => {
     const live = await planApproved(['다른 계획의 실제 게시 글.']);

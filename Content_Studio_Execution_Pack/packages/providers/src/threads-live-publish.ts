@@ -25,6 +25,7 @@ import {
   isThreadsNumericId,
   LeaseLostError,
   LIVE_PUBLISH_BUDGET_MARGIN_MS,
+  LIVE_PUBLISH_MARKER_ALLOWANCE_MS,
   LIVE_THREADS_ADAPTER_ID,
   liveThreadsExternalId,
   liveThreadsStepId,
@@ -88,6 +89,10 @@ export interface LiveThreadsPublishOptions {
   pollBudget?: number;
   pollIntervalMs?: number;
   listLimit?: number;
+  /** FIX-LIVEP1-TIMEOUT: 게시 시도 표식 저장 몫(ms, 기본 LIVE_PUBLISH_MARKER_ALLOWANCE_MS) — 시험이 줄여 쓴다 */
+  markerAllowanceMs?: number;
+  /** FIX-LIVEP1-TIMEOUT: 남은 시간 판단용 시계(ms, 기본 Date.now — ctx.deadline 과 같은 실제 시계). 시험 경계값용 */
+  nowMs?: () => number;
 }
 
 /**
@@ -287,6 +292,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
   readonly #pollBudget: number;
   readonly #pollIntervalMs: number;
   readonly #listLimit: number;
+  readonly #markerAllowanceMs: number;
+  readonly #nowMs: () => number;
   readonly #tokens = new WeakMap<PreparedSubmission, string>();
   /** 호출 수(시험 관찰) — 토큰·URL 없음 */
   readonly calls = { prepare: 0, submit: 0, reconcile: 0, cancel: 0, http: 0 };
@@ -298,6 +305,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     this.#pollBudget = Math.max(1, opts.pollBudget ?? LIVE_PUBLISH_POLL_BUDGET);
     this.#pollIntervalMs = Math.max(0, opts.pollIntervalMs ?? LIVE_PUBLISH_POLL_INTERVAL_MS);
     this.#listLimit = Math.min(Math.max(1, opts.listLimit ?? LIVE_PUBLISH_LIST_LIMIT), 100);
+    this.#markerAllowanceMs = Math.max(1, opts.markerAllowanceMs ?? LIVE_PUBLISH_MARKER_ALLOWANCE_MS);
+    this.#nowMs = opts.nowMs ?? (() => Date.now());
   }
 
   toJSON(): Record<string, unknown> {
@@ -450,22 +459,45 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       }
       await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'finished' });
     }
-    // LIVEP1-TIMEOUT: 표식을 쓰기 전에 남은 시간 확인 — 게시 호출 시간 제한 + 여유보다 적으면 표식·게시 없이 멈춘다(보내지 않음 → 재시도 시
-    // 같은 컨테이너로 이어 게시). 마감이 표식과 threads_publish 사이에서 터져 결과 불명이 되는 것을 앞 단계 지연 때문에 만들지 않는다.
-    if (ctx.deadline !== undefined && ctx.deadline - Date.now() < this.#timeoutMs + LIVE_PUBLISH_BUDGET_MARGIN_MS) {
-      return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' };
-    }
-    // 게시: lease 확인 → 시도 표식(컨테이너마다 하나 — DB unique) → 바로 threads_publish. 표식 기록이 실패하면 게시하지 않는다(예외 → 조회).
+    // LIVEP1-TIMEOUT + FIX-LIVEP1-TIMEOUT(Codex P1 :455): 표식을 쓰기 전에 남은 시간 확인 — 게시 호출 시간 제한 + 표식 저장 몫 + 여유보다 적으면
+    // 표식·게시 없이 멈춘다(보내지 않음 → 재시도 시 같은 컨테이너로 이어 게시). 검사는 두 번: lease 확인(heartbeat) 전과 **뒤**(heartbeat 지연이
+    // 게시 호출 몫을 먹지 않게). 표식 저장은 몫 안에서만 기다리고, 넘으면 이 실행은 게시하지 않는다.
+    // 보장 범위(좁힘): 앞 단계·heartbeat·표식 저장 지연 때문에 "표식은 썼는데 마감이 게시 호출 중에 터지는" 일은 생기지 않는다 — 단, 게시 호출 자체가
+    // 호출 시간 제한(기본 10초) 가까이 걸린 뒤의 처리(응답 본문·게시 기록)나 타이머 지연(이벤트 루프 막힘)은 여유(2초)로만 덮는다.
+    // 표식 저장이 몫을 넘긴 뒤 늦게 커밋되면 표식은 남고 게시는 없다 — 다음 시도는 기존 규칙대로 같은 컨테이너로 재게시하지 않고 조회(결과 불명 → 사용자 확인)로 간다.
+    const need = this.#timeoutMs + this.#markerAllowanceMs + LIVE_PUBLISH_BUDGET_MARGIN_MS;
+    const budgetShort = () => ctx.deadline !== undefined && ctx.deadline - this.#nowMs() < need;
+    const insufficient: AdapterResult = { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' };
+    if (budgetShort()) return insufficient;
+    // 게시: lease 확인 → 다시 남은 시간 → 시도 표식(컨테이너마다 하나 — DB unique, 몫 안에서) → 바로 threads_publish. 표식 기록이 실패하면 게시하지 않는다(예외 → 조회).
     await this.#beforeWrite(ctx);
+    if (budgetShort()) return insufficient;
+    let marker: 'saved' | 'exists' | 'slow';
+    let allowanceTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // FIX-LIVEP1(Codex 놓친 케이스 "기존 표식 반환 뒤 재전송"): 새 표식을 만든 실행만 게시한다(createOnly — 이미 있으면 409, 기존 행을 돌려주지 않음).
-      await steps.record({ kind: 'publish_attempt', post_index: 0, remote_id: liveThreadsStepId.publishAttempt(containerId), status: 'created', createOnly: true });
-    } catch (e) {
-      if (e && typeof e === 'object' && (e as { code?: unknown }).code === 'remote_step_exists') {
-        return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'publish_attempt_exists' };
-      }
-      throw e;
+      const save = steps
+        .record({ kind: 'publish_attempt', post_index: 0, remote_id: liveThreadsStepId.publishAttempt(containerId), status: 'created', createOnly: true })
+        .then(
+          () => 'saved' as const,
+          (e: unknown) => {
+            if (e && typeof e === 'object' && (e as { code?: unknown }).code === 'remote_step_exists') return 'exists' as const;
+            throw e;
+          },
+        );
+      // 몫이 지나면 저장을 더 기다리지 않는다(저장 자체는 취소할 수 없다 — 늦게 끝나도 이 실행은 게시하지 않음). 늦은 저장의 실패는 삼킨다(처리되지 않은 거부 방지).
+      const slow = new Promise<'slow'>((resolve) => {
+        allowanceTimer = setTimeout(() => resolve('slow'), this.#markerAllowanceMs);
+      });
+      marker = await Promise.race([save, slow]);
+      if (marker === 'slow') save.catch(() => undefined);
+    } finally {
+      if (allowanceTimer) clearTimeout(allowanceTimer);
     }
+    if (marker === 'exists') return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'publish_attempt_exists' };
+    if (marker === 'slow') return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_marker_slow' };
+    // 표식은 저장됐다(이 아래에서만 게시 요청). 중단(lease 상실·마감)됐으면 보내지 않는다 — 표식이 있으므로 이후는 기존 규칙(조회만).
+    if (ctx.signal.aborted) throw abortError();
     let mediaId: string;
     try {
       const body = await this.#call('publish', 'POST', `${THREADS_GRAPH_BASE}/${userId}/threads_publish`, token, ctx.signal, { creation_id: containerId });

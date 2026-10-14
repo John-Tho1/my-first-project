@@ -767,6 +767,137 @@ describe('LIVEP1-TIMEOUT: 게시 시도 표식 전 남은 시간 확인', () => 
   });
 });
 
+// FIX-LIVEP1-TIMEOUT(Codex review-LIVEP1-TIMEOUT P1 :455): 남은 시간 검사 뒤의 lease 확인(heartbeat)·표식 저장이 게시 호출 몫의 시간을 먹으면
+// 게시 뒤 마감 → 결과 불명이 다시 생길 수 있었다. heartbeat 뒤 표식 직전에 다시 보고(게시 호출 + 표식 저장 몫 + 여유), 표식 저장은 몫 안에서만 기다린다.
+describe('FIX-LIVEP1-TIMEOUT: lease 확인·표식 저장 지연이 게시 호출 몫을 먹지 않게', () => {
+  const PUB_MS = 300; // 시험용 게시 호출 시간 제한(실제 10초)
+  const MARKER_MS = 200; // 시험용 표식 저장 몫(실제 LIVE_PUBLISH_MARKER_ALLOWANCE_MS)
+  const finishedSteps = () => {
+    const s = memSteps();
+    s.rows.push({ kind: 'container', post_index: 0, remote_id: liveThreadsStepId.container(CT), status: 'finished', received_bytes: null, total_bytes: null, resume_count: 0, step_index: 0, created_at: NOW.toISOString(), updated_at: NOW.toISOString() });
+    return s;
+  };
+  const adapter = (extra: Record<string, unknown> = {}) => {
+    const f = fixtureFetch(happyRoutes());
+    const a = new LiveThreadsPublishAdapter({ gate: READY, fetch: f.fetch, pollBudget: 2, pollIntervalMs: 0, timeoutMs: PUB_MS, markerAllowanceMs: MARKER_MS, ...extra } as ConstructorParameters<typeof LiveThreadsPublishAdapter>[0]);
+    return { a, ...f };
+  };
+  const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const publishes = (seen: Seen[]) => seen.filter((s) => s.url.pathname.endsWith('threads_publish')).length;
+  // 남은 시간 2800ms: 옛 검사(게시 300 + 여유 2000 = 2300)도 새 검사(300 + 표식 200 + 여유 2000 = 2500)도 처음엔 통과한다.
+  const DEADLINE_AHEAD = 2800;
+
+  it('heartbeat(표식 전 lease 확인)가 600ms 걸려 남은 시간이 게시 호출 + 표식 몫 + 여유보다 적어지면 표식 전에 멈춘다 → 다음 시도는 같은 컨테이너로 게시', async () => {
+    const { a, seen } = adapter();
+    const steps = finishedSteps();
+    const c = ctxOf(steps, { deadline: Date.now() + DEADLINE_AHEAD, heartbeat: () => sleepMs(600) });
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' });
+    expect(classifyOutcome(r).event).toBe('transient_failure');
+    expect(publishes(seen)).toBe(0);
+    expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']); // 표식 없음
+    const c2 = ctxOf(steps, { deadline: Date.now() + 60_000, intentKey: 'job-1:2', attempt: 2 });
+    expect(await a.submit(await a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'accepted', external_id: `threads:${MEDIA}` });
+    expect(publishes(seen)).toBe(1);
+    expect(seen.filter((s) => s.method === 'POST' && s.url.pathname === `/v1.0/${USER_ID}/threads`)).toHaveLength(0); // 새 컨테이너 없음
+  });
+
+  it('표식 저장이 몫(200ms)을 넘겨 600ms 뒤에야 끝나면 게시하지 않는다(publish_marker_slow) — 늦게 저장된 표식은 다음 시도를 조회로 돌린다(재게시 없음)', async () => {
+    const { a, seen } = adapter();
+    const steps = finishedSteps();
+    const record = steps.record;
+    let markerDone = false;
+    const slow: RemoteStepsPort = {
+      list: steps.list,
+      record: async (s) => {
+        if (s.kind === 'publish_attempt') {
+          await sleepMs(600);
+          const row = await record(s);
+          markerDone = true;
+          return row;
+        }
+        return record(s);
+      },
+    };
+    const c = ctxOf(slow, { deadline: Date.now() + DEADLINE_AHEAD });
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_marker_slow' });
+    expect(publishes(seen)).toBe(0);
+    await sleepMs(700);
+    expect(markerDone).toBe(true);
+    expect(publishes(seen)).toBe(0); // 표식이 늦게 저장돼도 이 실행은 게시하지 않았다
+    // 다음 시도: 표식이 있으므로 같은 컨테이너로 다시 게시하지 않는다(조회·사용자 확인 — 좁힌 보장)
+    const c2 = ctxOf(steps, { deadline: Date.now() + 60_000, intentKey: 'job-1:2', attempt: 2 });
+    expect(await a.submit(await a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'ambiguous', error_code: 'publish_attempt_unresolved' });
+    expect(publishes(seen)).toBe(0);
+  });
+
+  it('표식 저장이 끝나지 않으면(멈춤) 몫이 지나 게시 없이 돌아온다 — 마감까지 기다리지 않음(결과 불명 아님)', async () => {
+    const { a, seen } = adapter();
+    const steps = finishedSteps();
+    const hang: RemoteStepsPort = { list: steps.list, record: (s) => (s.kind === 'publish_attempt' ? new Promise(() => undefined) : steps.record(s)) };
+    const c = ctxOf(hang, { deadline: Date.now() + DEADLINE_AHEAD });
+    const started = Date.now();
+    const r = await Promise.race([a.submit(await a.prepare(snapshot(), c), c), sleepMs(DEADLINE_AHEAD + 500).then(() => 'still_waiting' as const)]);
+    expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_marker_slow' });
+    expect(Date.now() - started).toBeLessThan(DEADLINE_AHEAD - PUB_MS);
+    expect(publishes(seen)).toBe(0);
+    expect(steps.rows.map((s) => s.kind)).toEqual(['container']);
+  });
+
+  it('표식 저장이 몫 안(50ms)에 끝나면 그대로 게시(표식이 저장된 뒤에만 게시 요청)', async () => {
+    const { a, seen } = adapter();
+    const steps = finishedSteps();
+    let markerAtPublish = false;
+    const f = fixtureFetch({
+      ...happyRoutes(),
+      [P.publish]: () => {
+        markerAtPublish = steps.rows.some((s) => s.kind === 'publish_attempt');
+        return new Response(JSON.stringify({ id: MEDIA }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    const a2 = new LiveThreadsPublishAdapter({ gate: READY, fetch: f.fetch, pollIntervalMs: 0, timeoutMs: PUB_MS, markerAllowanceMs: MARKER_MS } as ConstructorParameters<typeof LiveThreadsPublishAdapter>[0]);
+    const quick: RemoteStepsPort = { list: steps.list, record: async (s) => (s.kind === 'publish_attempt' ? (await sleepMs(50), steps.record(s)) : steps.record(s)) };
+    const c = ctxOf(quick, { deadline: Date.now() + DEADLINE_AHEAD });
+    expect(await a2.submit(await a2.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted' });
+    expect(markerAtPublish).toBe(true);
+    expect(f.seen.filter((s) => s.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    expect(publishes(seen)).toBe(0); // 첫 adapter 는 쓰지 않음
+    void a;
+  });
+
+  it('표식 저장 실패(예외)는 게시하지 않는다(기존 규칙 그대로 — 예외)', async () => {
+    const { a, seen } = adapter();
+    const steps = finishedSteps();
+    const failing: RemoteStepsPort = { list: steps.list, record: (s) => (s.kind === 'publish_attempt' ? Promise.reject(new Error('db down')) : steps.record(s)) };
+    const c = ctxOf(failing, { deadline: Date.now() + DEADLINE_AHEAD });
+    await expect(a.submit(await a.prepare(snapshot(), c), c)).rejects.toThrow('db down');
+    expect(publishes(seen)).toBe(0);
+  });
+
+  it('경계(시계 주입): 남은 시간 = 게시 호출 + 표식 몫 + 여유 정확히 → 게시, 1ms 모자라면 멈춤 · heartbeat 가 시계를 1ms 넘게 밀면 표식 전에 멈춤', async () => {
+    const need = PUB_MS + MARKER_MS + 2_000;
+    for (const [ahead, hbMs, expectPub] of [
+      [need, 0, true],
+      [need - 1, 0, false],
+      [need + 5, 5, true],
+      [need + 5, 6, false],
+    ] as const) {
+      let t = 1_000_000;
+      const { a, seen } = adapter({ nowMs: () => t });
+      const c = ctxOf(finishedSteps(), {
+        deadline: t + ahead,
+        heartbeat: async () => {
+          t += hbMs;
+        },
+      });
+      const r = await a.submit(await a.prepare(snapshot(), c), c);
+      expect(publishes(seen), `${ahead}/${hbMs}`).toBe(expectPub ? 1 : 0);
+      if (!expectPub) expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' });
+    }
+  });
+});
+
 describe('보조 함수', () => {
   it('Threads 시각(+0000) 읽기, 본문 정규화', () => {
     expect(parseThreadsTimestamp('2023-10-17T05:42:03+0000')).toBe(Date.parse('2023-10-17T05:42:03Z'));

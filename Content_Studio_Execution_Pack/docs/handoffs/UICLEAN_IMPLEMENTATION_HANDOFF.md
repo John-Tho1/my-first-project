@@ -150,3 +150,46 @@ orchestrator 결정(커밋 → Codex 검증).
 2. `/distribute/[id]` 항목 카드·배너의 렌더 경로 전체(UNKNOWN·확인 후보·사용자 확인 등 조건별)는 여전히 소스 토큰 시험 + 순수 함수 시험이고 실제 렌더 시험은 배포함(`/distribute`)만.
 3. 375px·다크 모드 브라우저 확인은 여전히 하지 않음(개발 서버 금지).
 4. `opsSnapshot` 에 쿼리 1개 추가(작업 수만큼 join, owner 범위) — 운영 화면 전용.
+
+---
+
+# FIX2-UICLEAN (coordinator 브라우저 확인: 실제 Threads 항목 상태 태그 "CONFIRMED · MOCK 확인(실제 발행 아님)")
+- **BASE_SHA:** 254ee5e (FIX-UICLEAN, Codex PASS) → 작업 트리는 5ada6dd(docs 전용) 위. **HEAD_SHA:** uncommitted — orchestrator commits.
+- 절차: 실패 시험 먼저 — `.handoffs/checks-FIX2-UICLEAN.red.log`(10 실패: 렌더 4 — 실제 카드에 MOCK 태그 재현, 단위 6) → 수정 → green(`…green.log` 47 passed).
+
+## 원인과 수정
+| 문구(실제 Threads 항목에 보일 수 있던 것) | 위치 | 수정 |
+|---|---|---|
+| 항목 상태 태그 `ITEM_STATUS_LABEL.CONFIRMED` "CONFIRMED · MOCK 확인(실제 발행 아님)" | `distribute/[id]/page.tsx` 항목 카드 메타 | `itemStatusText(status, { live, verification })` — `live = itemIsLive({ accountKind, pub: latestPub })`(결과 기록 is_mock 이 있으면 그것, 없으면 항목 계정 kind). 실제 CONFIRMED → "CONFIRMED · 실제 게시 완료 · 앱 확인(VERIFIED) / 사용자 확인 / 확인 전". 모의 CONFIRMED·다른 상태는 ITEM_STATUS_LABEL 그대로(글자 그대로) |
+| 작업 한 줄 `jobStatusText` CONFIRMED 에 그 작업 결과 기록이 없으면 "MOCK 결과 확인" | 같은 카드 작업 목록 | `jobStatusTextFor(…, live)` — 실제 항목이고 결과 기록이 없을 때만 "CONFIRMED · 실제 게시(이 작업의 결과 기록 없음 — …)", 그 밖은 jobStatusText 그대로 |
+| 승인 철회 배너 `revocationNotice` "승인을 철회했습니다(MOCK)." | 계획 상단 배너 | `revocationNoticeFor(text, hasLive)` — 실제 계정 항목이 있는 계획만 "(MOCK)" 제거 |
+| 요청 결과 혼합 안내의 `REQUESTED_RESULT_LABEL.public_publish` "공개 게시 계획(MOCK)" | 선택 승인 카드 | `requestedResultLabel(r, live)` — 실제 계정 항목은 "실제 게시(public_publish)" |
+| 계획 상태 태그 정규식 `.replace(/\(MOCK[^)]*\)/, '')`("부분 성공" 의 뜻까지 지움) | 계획 메타 | FIX 의 `planStatusText(label, !hasLive)` 로 통일 |
+
+- 점검했지만 바꾸지 않은 것(실제 Threads 항목에 보이지 않음): `distribution.ts:671` `itemHeadline` default 는 실제 항목이면 `liveItemHeadline` 이 CONFIRMED·SENDING·UNKNOWN 등을 먼저 처리하고, 위임하는 PLANNED·RETRY_WAIT·CANCEL_REQUESTED·CANCELED·BLOCKED(기타) 문구엔 MOCK 이 없음. `RECONCILED_TEXT.found` 는 화면이 이미 hasLive 분기. 단계 패널은 실제 어댑터면 LiveThreadsSteps(MOCK 문구 없음). 원격 결과 목록은 `p.isMock` 분기. `publishAtView` 는 `isMock` 기록 기준. YouTube·Instagram·`video:processed`·`ig_publish` 등 MOCK 문구는 모의 전용 어댑터 경로.
+- `lib/distribution.ts` 문자열은 바꾸지 않음(기존 시험 단언 그대로). 새 함수는 `apps/web/lib/record-labels.ts` 에 추가(이제 `./distribution` 을 import).
+
+## 시험(추가만, 약화 없음)
+- `apps/web/lib/plan-detail-render.test.ts`(새, 실제 `/distribute/[id]` 렌더 — DB·세션 가짜): 실제 USER_CONFIRMED 카드 태그 = "CONFIRMED · 실제 게시 완료 · 사용자 확인" 이고 카드 전체에 "MOCK" 없음(사용자 확인 태그·실제 게시 태그는 그대로), VERIFIED = "앱 확인(VERIFIED)", 결과 기록 없는 실제 CONFIRMED = "확인 전" + 카드에 MOCK 없음, 모의 카드 = "CONFIRMED · MOCK 확인(실제 발행 아님)" + MOCK 태그 + 실제 발행 실적 아님, 섞인 계획에서 서로 섞이지 않음, 철회 배너(실제 계획 MOCK 없음 / 모의 계획 그대로), 계획 상태 태그(실제 "처리 끝" / 모의 "처리 끝(MOCK — 실제 발행 아님)").
+- `record-labels.test.ts`: itemStatusText(4가지 확인 종류, 모의·다른 상태는 ITEM_STATUS_LABEL 과 같음), itemIsLive, jobStatusTextFor(모의는 jobStatusText 와 같음), requestedResultLabel, revocationNoticeFor.
+- `ui-safety.test.ts`: 계획 화면이 새 함수를 쓰는지 + 고정 표 직접 사용(`ITEM_STATUS_LABEL[x.item.status]`, `{jobStatusText(j`, `{revocationNotice(revocationCountParam`, `REQUESTED_RESULT_LABEL[r]`, `.replace(/\(MOCK`) 금지.
+
+## Changed files (FIX2)
+`apps/web/app/distribute/[id]/page.tsx`, `apps/web/lib/record-labels.ts`, `apps/web/lib/record-labels.test.ts`, `apps/web/lib/ui-safety.test.ts`, 새 `apps/web/lib/plan-detail-render.test.ts`. DB·마이그레이션·의존성 변경 없음.
+
+## Commands (FIX2) — `.handoffs/run-checks-FIX2-UICLEAN.sh`, 요약 `.handoffs/checks-FIX2-UICLEAN.log`
+| 명령 | 결과 |
+|---|---|
+| red(대상 2파일) / green(대상 4파일) | 10 실패 / 47 passed |
+| lint · typecheck | PASS · PASS |
+| unit | PASS — 75 files · 1800 tests |
+| integration `--maxWorkers=2` | PASS — 50 files · 917 tests |
+| 포트 3000 비어 있음 확인 → build | PASS |
+| drill:mock | PASS — 불변식 위반 0건 |
+| db:migrate · drill:restore | not_run(지시) |
+외부 호출 없음, 남은 vitest·drill·next 프로세스 없이 시작, 아무것도 종료하지 않음.
+
+## Remaining risks (FIX2)
+1. 렌더 시험의 PlanItemDetail 은 손으로 만든 고정 자료(실제 getPlanDetail 결과 아님) — 필드가 늘거나 바뀌면 시험을 같이 고쳐야 함.
+2. 실제 Threads 의 PARTIAL·thread_partial 경로 등 드문 상태 조합은 렌더 시험에 없음(문구 점검만).
+3. 브라우저 재확인은 coordinator 쪽에서 필요(이 세션은 개발 서버 금지).

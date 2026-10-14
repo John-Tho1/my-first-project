@@ -2,7 +2,7 @@
 - Task ID / milestone: LIVEP1-DIAG / M4 D38 후속. 배경: D38 2단계 실제 실행에서 작업 c94807f5 가 컨테이너 생성 단계 `container_permission_denied`(확정 실패)로 끝났다 — 게시물 없음. 어댑터가 판정 외 정보를 모두 버려 원인을 볼 수 없었다.
 - Purpose and changed behavior:
   1. 실제 Threads 호출 실패(create·status·publish·read·list 모든 단계)에 **허용 목록 진단**(http_status·code·error_subcode·error_type(`…Exception` 형식만)·is_transient·fbtrace_id(`[A-Za-z0-9_-]{1,64}`)·transport·op)을 만들어 작업 이력(job_events.sanitized_details.provider_diag)·전송 의도(send_intents.sanitized_details.provider_diag)에 남기고, 배포 계획 항목 카드에 "Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10 · subcode … · OAuthException · is_transient=false · fbtrace …" 로 보인다. 작업 API(GET /api/jobs/{id})의 events 에도 같은 값. message·error_user_msg·error_user_title·URL·토큰·본문은 저장하지 않는다(만들 때·DB 쓰기 직전·화면 출력 때 세 번 걸러짐).
-- HEAD_SHA: 722e58cbfd88b4a23e643bf2f6eb5bd44fbef800
+- HEAD_SHA: 722e58cbfd88b4a23e643bf2f6eb5bd44fbef800 (LIVEP1-DIAG) · FIX-LIVEP1-DIAG HEAD 8701cf5576b2c31c71b4554b0b5f28c69604b6d1
 - BASE_SHA: 9cf1338
 - HEAD_SHA: uncommitted — orchestrator commits
 - Clean tracked tree confirmed: 시작 시 yes(`?? .claude/` 만).
@@ -49,3 +49,36 @@
 1. 진단 허용 목록(필드·형식)과 세 번 거르기(어댑터 생성·DB 쓰기 직전·화면)가 "문구·토큰 미저장"을 보장하는가? fbtrace_id 를 화면에 보이는 것이 적절한가?
 2. 실패한 시도도 승인 기록의 게시 수를 쓰는 기존 규칙(D38-3) 때문에 사용자가 새 승인 기록을 넣어야 하는 흐름이 의도와 맞는가(규칙은 바꾸지 않음)?
 3. mode 를 계정 kind 로만 정하는 표시(게이트 아님)가 오해를 만들 여지(예: 실제 계정이지만 게이트 닫힘)가 있는가?
+
+---
+
+# FIX-LIVEP1-DIAG (Codex review-LIVEP1-DIAG — CHANGES_REQUESTED on 722e58c, P1 1)
+- 판정 원본: `.handoffs/review-LIVEP1-DIAG.md`
+- BASE_SHA: 722e58c · HEAD_SHA: uncommitted — orchestrator commits
+- 범위: 네트워크 0, `.env.local`·`./data` 손대지 않음, dev 서버·db:migrate·drill:restore 없음, 내가 띄운 프로세스만, migration 없음.
+
+## 지적 → 시험(재현) → 변경
+| 지적 | 재현(수정 전 코드로 먼저 실패) | 변경 |
+|---|---|---|
+| **[P1] live-publish.ts:96** 이미 사용 중(connected)이던 실제 계정(예: 사용자의 @yongho.tho)은 publish-target 을 다시 누르기 전까지 옛 D31 표시("연결·프로필 조회만, 게시 안 함") | 통합 새 시험 `FIX-LIVEP1-DIAG: 이미 사용 중이던 실제 계정의 표시(다시 누르지 않음)`: 옛 D31 snapshot 그대로 connected 인 실제 Threads 계정을 직접 넣고(토글 없음) GET /api/channel-accounts → 수정 전 `capability_snapshot` 이 D31(실패, `.handoffs/checks-FIX-LIVEP1DIAG.repro-integ.log`) | 표시값을 **화면·API 계층에서 계산**: `displayedCapability(a)` — 실제 Threads 계정은 kind·platform·state 로(connected = D38 실제 텍스트 게시 `live_text_D38`·external_writes true, 그 밖 = D31 연결만), 다른 계정은 저장값 그대로. `channelAccountView.capability_snapshot` = 계산값, 저장값은 `capability_snapshot_stored` 로 함께(이력). **저장 행은 바꾸지 않음**(내보내기·형식 그대로 — 시험이 DB 행 불변 확인). 설정 화면의 연결 상태 안내(accountHealthView notice·live_publish_target)는 원래 state 기준이라 이미 맞았음 — 같은 시험이 확인. disconnected 이면 저장값이 D38 이어도 D31 표시(시험). 게이트는 이 값을 읽지 않는다(변경 없음) |
+| Codex 답 3(안내 문구에 조건 명시) | — | 원고 화면 링크 문구: "실제 게시 조건이 모두 갖춰졌을 때만 실제로 게시" |
+
+## 바뀐 파일(FIX-LIVEP1-DIAG)
+- `packages/db/src/distribution.ts` — `displayedCapability`, `channelAccountView`(capability_snapshot 계산값 + capability_snapshot_stored)
+- `apps/web/app/contents/[id]/variants-panel.tsx` — 조건 문구
+- `tests/integration/live-threads-publish.test.ts` — 회귀 시험 1
+
+## 실행한 명령(FIX-LIVEP1-DIAG — 로그 `.handoffs/checks-FIX-LIVEP1DIAG*.log`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project integration tests/integration/live-threads-publish.test.ts`(새 시험 + 수정 전 코드) | FAIL 1/18 — 재현 |
+| 같은 파일(수정 뒤, 시험의 GET 호출 인자 1곳 타입 수정) | PASS 18/18 |
+| `corepack pnpm lint` · `typecheck` · `build` | PASS · PASS · PASS |
+| `corepack pnpm test`(unit) | PASS — 68 files, 1647 tests |
+| `corepack pnpm test:integration` | PASS — 47 files, 897 tests |
+| `corepack pnpm drill:mock` | PASS — "불변식 위반 0건" |
+| `db:migrate` · `drill:restore` | not_run(./data 금지) |
+
+## 남은 위험·미반영(Codex 놓친 케이스 중 이번 범위 밖)
+- fbtrace_id 정규식을 통과하는 토큰 모양 문자열은 그대로 저장·표시될 수 있다(공급자가 그런 값을 줄지는 미확인) — 사용 중 토큰과의 일치 검사 등은 하지 않았다.
+- 재확인 중 status·read·list 실패 진단의 이력·전송 의도 동시 기록 통합 시험, MIXED 계획·게이트 닫힌 실제 계정의 mode 표시 경계, 성공한 재확인 뒤 과거 진단 표시 구분은 추가하지 않았다(다음 라운드 후보).

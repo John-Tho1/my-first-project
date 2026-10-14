@@ -16,6 +16,7 @@ import {
   createVariantDraft,
   getDb,
   getPlanDetail,
+  listAccountHealth,
   listChannelAccounts,
   reconcileItem,
   runJobsTick,
@@ -35,7 +36,7 @@ import {
   THREADS_ME_URL,
   THREADS_TOKEN_URL,
 } from '@cs/providers';
-import { POST as accountsPOST } from '../../apps/web/app/api/channel-accounts/route';
+import { GET as accountsGET, POST as accountsPOST } from '../../apps/web/app/api/channel-accounts/route';
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
 import { POST as targetPOST } from '../../apps/web/app/api/channel-accounts/[id]/publish-target/route';
 import { GET as callbackGET } from '../../apps/web/app/api/oauth/callback/route';
@@ -683,6 +684,36 @@ describe('FIX2-LIVEP1: 게시 성공 응답 뒤 게시 단계 저장 실패', ()
     // 재시도도 막힌다(결과 불명) — 다시 게시하지 않는다
     expect((await retryPOST(post(`/api/distribution-items/${item.id}/retry`), ctx(item.id))).status).toBe(409);
     expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+  });
+});
+
+// FIX-LIVEP1-DIAG(Codex P1 live-publish.ts:96): 이 변경 전에 이미 "실제 게시 계정으로 사용"(connected)이 된 실제 계정은 저장된 표시용 snapshot 이
+// 옛 D31 값 그대로다. 다시 누르지 않아도 화면·API 는 지금 상태(kind·platform·state)로 계산한 D38 표시를 보여야 한다(저장값은 이력으로 그대로).
+describe('FIX-LIVEP1-DIAG: 이미 사용 중이던 실제 계정의 표시(다시 누르지 않음)', () => {
+  it('connected + 옛 D31 snapshot 그대로인 실제 Threads 계정 → 계정 API·설정 화면 데이터는 D38 실제 텍스트 게시, 저장값은 그대로', async () => {
+    const OLD = { mock: false, external_writes: false, publish: 'out_of_scope_D31', note: '실제 계정 — 연결·프로필 조회만(D31), 게시 안 함' };
+    const [acc] = await db
+      .insert(schema.channelAccounts)
+      .values({ ownerId: owner, platform: 'threads', kind: 'live', externalAccountId: '17841400000000099', displayName: '@legacy', state: 'connected', credentialState: 'linked', capabilitySnapshot: OLD })
+      .returning();
+    const list = (await (await accountsGET(new Request(`${BASE}/api/channel-accounts`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), undefined)).json()) as {
+      items: Array<{ id: string; capability_snapshot: Record<string, unknown>; capability_snapshot_stored: Record<string, unknown> }>;
+    };
+    const v = list.items.find((x) => x.id === acc!.id)!;
+    expect(v.capability_snapshot).toMatchObject({ mock: false, external_writes: true, publish: 'live_text_D38' });
+    expect(v.capability_snapshot_stored).toEqual(OLD);
+    // 설정 화면(같은 데이터): 연결 상태 안내도 "실제 게시 계정으로 사용 중"
+    const health = (await listAccountHealth(db, owner)).find((h) => h.account_id === acc!.id)!;
+    expect(health.notice).toContain('실제 게시 계정으로 사용 중');
+    expect(health.live_publish_target).toBe(true);
+    // 저장된 행은 바꾸지 않았다(내보내기·이력 형식 그대로)
+    expect((await db.select().from(schema.channelAccounts).where(eq(schema.channelAccounts.id, acc!.id)))[0]!.capabilitySnapshot).toEqual(OLD);
+    // 사용 안 함(disconnected)이면 저장값이 무엇이든 D31(연결만) 표시
+    await db.update(schema.channelAccounts).set({ state: 'disconnected', capabilitySnapshot: { mock: false, external_writes: true, publish: 'live_text_D38' } }).where(eq(schema.channelAccounts.id, acc!.id));
+    const list2 = (await (await accountsGET(new Request(`${BASE}/api/channel-accounts`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), undefined)).json()) as {
+      items: Array<{ id: string; capability_snapshot: Record<string, unknown> }>;
+    };
+    expect(list2.items.find((x) => x.id === acc!.id)!.capability_snapshot).toEqual(OLD);
   });
 });
 

@@ -162,7 +162,7 @@ export function VariantsPanel({
                   <p className="note">
                     <a href={`/distribute/new?content_id=${contentId}`}>배포 계획 만들기</a>{' '}
                     {livePlatforms?.has(s.variant.channel)
-                      ? '(실제 게시 계정 있음 — 계획에서 실제 계정을 고르면 승인·실행 뒤 실제로 게시, 모의 계정은 MOCK. 계획 뒤에 채널별 내용을 확인하고 직접 승인)'
+                      ? '(실제 게시 계정 있음 — 계획에서 실제 계정을 고르면 승인·실행 뒤 실제 게시 조건이 모두 갖춰졌을 때만 실제로 게시, 모의 계정은 MOCK. 계획 뒤에 채널별 내용을 확인하고 직접 승인)'
                       : '(MOCK — 계획 뒤에 채널별 내용을 확인하고 직접 승인)'}
                     {planByVariant.get(s.variant.id) ? (
                       <>

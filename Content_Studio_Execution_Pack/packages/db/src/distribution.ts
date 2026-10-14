@@ -77,8 +77,8 @@ import {
 import type { Db } from './client';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
 import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
-import { credentialGate, getAccountHealth, type AccountHealthView } from './oauth';
-import { liveApprovalUsage, pendingLiveJobs } from './live-publish';
+import { credentialGate, getAccountHealth, LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY, type AccountHealthView } from './oauth';
+import { LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET, liveApprovalUsage, pendingLiveJobs } from './live-publish';
 import { listRemoteStepsForItems, remoteStepView, type RemoteStepRow } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import {
@@ -1106,6 +1106,18 @@ export async function executePlan(
 
 // ---- 응답 모양 ----
 
+/**
+ * FIX-LIVEP1-DIAG(Codex P1): 화면·API 에 보이는 계정 능력(표시용 — 게이트 아님). 실제 Threads 계정은 저장된 snapshot 이 아니라 **지금 상태**로 계산한다
+ * (connected = D38 실제 텍스트 게시, 그 밖 = D31 연결만) — 이 변경 전에 이미 사용 중이던 계정(옛 D31 snapshot)도 다시 누르지 않고 맞게 보인다.
+ * 그 밖의 계정은 저장값 그대로. 저장된 snapshot 은 이력·내보내기용으로 바꾸지 않는다(capability_snapshot_stored 로 함께 보임).
+ */
+export function displayedCapability(a: Pick<ChannelAccountRow, 'kind' | 'platform' | 'state' | 'capabilitySnapshot'>): Record<string, unknown> {
+  if (a.kind === 'live' && a.platform === 'threads') {
+    return a.state === 'connected' ? { ...LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET } : { ...LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY };
+  }
+  return a.capabilitySnapshot;
+}
+
 export function channelAccountView(a: ChannelAccountRow) {
   return {
     id: a.id,
@@ -1117,7 +1129,9 @@ export function channelAccountView(a: ChannelAccountRow) {
     state: a.state,
     ready: accountReady(a),
     credential_state: a.credentialState,
-    capability_snapshot: a.capabilitySnapshot,
+    capability_snapshot: displayedCapability(a),
+    /** 저장된 값(이력·내보내기 — 표시는 위 계산값) */
+    capability_snapshot_stored: a.capabilitySnapshot,
     created_at: a.createdAt.toISOString(),
   };
 }

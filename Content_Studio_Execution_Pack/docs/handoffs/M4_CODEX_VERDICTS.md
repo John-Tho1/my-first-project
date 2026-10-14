@@ -221,3 +221,4 @@ CHANGES_REQUESTED
 | LIVEP1-USERCONFIRM | a67f462 | CHANGES_REQUESTED — P2 1(표시 이력 10개 밖으로 후보가 밀리면 버튼 사라짐) |
 | FIX-LIVEP1-TIMEOUT | e708106 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-TIMEOUT 종결 |
 | FIX-LIVEP1-USERCONFIRM | 2af529b | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-USERCONFIRM 종결 |
+| UI-CLEAN | fdb6aea | 검토 대기 (gpt-6-astra · xhigh) |

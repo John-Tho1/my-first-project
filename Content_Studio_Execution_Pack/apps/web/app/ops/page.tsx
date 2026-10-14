@@ -15,6 +15,7 @@ import {
   type Channel,
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { exportsDir } from '../../lib/backup';
 import { oauthReadinessView } from '../../lib/oauth';
 import { OPS_ERROR_TEXT } from '../../lib/ops';
@@ -70,11 +71,13 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'ops' }} />
       <h2 className="screen-title">운영</h2>
-      <p className="note">
-        측정 시각 {formatMsk(s.measuredAt)}. 숫자는 모두 이 앱의 DB 기록과 파일에서 센 값입니다. 기록이 없으면 &quot;측정 없음&quot;으로 표시하며, 외부
-        알림(이메일·메시지)은 보내지 않습니다.
-      </p>
+      <p className="note">측정 시각 {formatMsk(s.measuredAt)} · 이 앱의 DB 기록과 파일에서 센 값입니다.</p>
+      <details className="more">
+        <summary>자세히</summary>
+        <p>기록이 없으면 &quot;측정 없음&quot;으로 표시하며, 외부 알림(이메일·메시지)은 보내지 않습니다 — 이 화면이 알림입니다.</p>
+      </details>
       {err ? (
         <p className="notice" role="alert">
           {err}
@@ -131,10 +134,13 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <form className="form inline" method="post" action="/api/ops/restore-drill">
           <button type="submit">복원 훈련 실행(임시 내보내기 → 빈 메모리 DB 에 복원 → 비교)</button>
         </form>
-        <p className="note">
-          훈련용 묶음은 내보내기 기록에 남지 않고 끝나면 지웁니다(백업으로 세지 않음). 운영 DB 는 읽기만 합니다. 서버를 끈 상태에서는{' '}
-          <code>pnpm drill:restore</code> 로도 실행할 수 있습니다. <Link href="/settings">설정 — 내보내기·복원</Link>
-        </p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            훈련용 묶음은 내보내기 기록에 남지 않고 끝나면 지웁니다(백업으로 세지 않음). 운영 DB 는 읽기만 합니다. 서버를 끈 상태에서는{' '}
+            <code>pnpm drill:restore</code> 로도 실행할 수 있습니다. <Link href="/settings">설정 — 내보내기·복원</Link>
+          </p>
+        </details>
       </section>
 
       <section className="card archive" aria-labelledby="jobs-title">
@@ -279,10 +285,15 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
       <section className="card archive" id="retention" aria-labelledby="retention-title">
         <h3 id="retention-title">보존 정리</h3>
         <p className="note">
-          정책: 끝난 배포 작업의 이력 {plan.policy.jobEventsDays}일(지우기 전 JSONL 로 보관) · 배포 파일 {plan.policy.packagesDays}일 · 내보내기 ZIP 최근{' '}
-          {plan.policy.exportsKeep}개 · 업로드 세션 24시간(기존 자동 정리). 원문 소재·출처·원고 버전은 지우지 않습니다. 실행 방식:{' '}
-          {config.RETENTION_SWEEP_MODE === 'auto' ? '자동(작업 처리기가 한 시간에 한 번)' : '수동(아래에서 확인 후 적용)'}.
+          원문 소재·출처·원고 버전은 지우지 않습니다. 실행 방식: {config.RETENTION_SWEEP_MODE === 'auto' ? '자동(작업 처리기가 한 시간에 한 번)' : '수동(아래에서 확인 후 적용)'}.
         </p>
+        <details className="more">
+          <summary>자세히(정책)</summary>
+          <p>
+            끝난 배포 작업의 이력 {plan.policy.jobEventsDays}일(지우기 전 JSONL 로 보관) · 배포 파일 {plan.policy.packagesDays}일 · 내보내기 ZIP 최근{' '}
+            {plan.policy.exportsKeep}개 · 업로드 세션 24시간(기존 자동 정리).
+          </p>
+        </details>
         {q.retention === 'applied' ? (
           <p className="saved" role="status">
             보존 정리를 적용했습니다. 아래 &quot;마지막 정리&quot;가 저장된 결과입니다.

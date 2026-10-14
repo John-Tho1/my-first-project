@@ -3,6 +3,7 @@ import { notFound, redirect } from 'next/navigation';
 import { getContentVersion } from '@cs/db';
 import { formatMsk } from '@cs/domain';
 import { getSession } from '../../../../../lib/auth';
+import { Breadcrumbs } from '../../../../../lib/breadcrumbs';
 import { getAppDb, getConfig } from '../../../../../lib/server';
 import { MOCK_WARNING } from '@cs/providers';
 import { versionAuthorLabel } from '../../../../../lib/writing';
@@ -22,9 +23,7 @@ export default async function VersionPage({ params }: { params: Promise<{ id: st
   const isCurrent = c.currentVersionId === v.id;
   return (
     <main className="container">
-      <p className="now">
-        <Link href={`/contents/${c.id}`}>← 작성실</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'content-version', id: c.id, title: c.title, version: v.version }} />
       <h2 className="screen-title">
         {c.title} · 버전 {v.version}
         {isCurrent ? ' (현재)' : ''}

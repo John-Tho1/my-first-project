@@ -1,6 +1,7 @@
 import { redirect } from 'next/navigation';
 import { ALLOWED_MEDIA_MIME, sttLiveReadiness } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { getConfig } from '../../lib/server';
 import RecordClient from './RecordClient';
 
@@ -18,15 +19,21 @@ export default async function RecordPage() {
   const live = sttLiveReadiness(config);
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'record' }} />
       <h2 className="screen-title">음성 전사</h2>
       <p className="notice" role="note">
-        전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 아님 — 자리표시 문장)' : '실제(live) — 준비 안 됨, 요청이 거부됩니다'}. 외부 전사 공급자 연결은 별도 승인
-        뒤에만 합니다(결정 D9). live 준비 안 됨: {live.missing.join(', ')}
+        전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 아님)' : '실제(live) — 준비 안 됨, 요청이 거부됩니다'} · live 준비 안 됨: {live.missing.join(', ')}
       </p>
-      <p className="note">
-        올릴 수 있는 형식: {ALLOWED_MEDIA_MIME.join(', ')} · 음성 최대 200MB, 영상 최대 2GB · 조각 8MiB · 업로드 세션은 24시간 뒤 만료됩니다.
-        서버 확인(VERIFIED)은 형식 서명·크기·checksum 만 확인하며 재생 가능 여부는 확인하지 않습니다.
-      </p>
+      <details className="more">
+        <summary>자세히(형식·제한)</summary>
+        <p>
+          {config.STT_MODE === 'mock' ? '모의 전사는 자리표시 문장을 돌려줍니다. ' : ''}외부 전사 공급자 연결은 별도 승인 뒤에만 합니다(결정 D9).
+        </p>
+        <p>
+          올릴 수 있는 형식: {ALLOWED_MEDIA_MIME.join(', ')} · 음성 최대 200MB, 영상 최대 2GB · 조각 8MiB · 업로드 세션은 24시간 뒤 만료됩니다. 서버
+          확인(VERIFIED)은 형식 서명·크기·checksum 만 확인하며 재생 가능 여부는 확인하지 않습니다.
+        </p>
+      </details>
       <RecordClient />
     </main>
   );

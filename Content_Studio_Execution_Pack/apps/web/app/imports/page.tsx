@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { listImportRuns } from '@cs/db';
 import { formatMsk, IMPORT_KIND_LABEL, type ImportSourceKind } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { formatBytes } from '../../lib/backup';
 import { IMPORT_ERROR_TEXT, IMPORT_STATUS_LABEL } from '../../lib/imports';
 import { getAppDb, getConfig } from '../../lib/server';
@@ -28,6 +29,7 @@ export default async function ImportsPage({ searchParams }: { searchParams: Prom
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'imports' }} />
       <h2 className="screen-title">가져오기 — Notion·Drive 선택 가져오기</h2>
       {err ? (
         <p className="notice" role="alert">

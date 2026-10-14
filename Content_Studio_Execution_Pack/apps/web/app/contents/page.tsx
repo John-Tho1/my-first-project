@@ -11,6 +11,7 @@ import {
   MAX_CONTENT_TITLE,
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../lib/contents';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -48,7 +49,8 @@ export default async function ContentsPage({
 
   return (
     <main className="container">
-      <h2 className="screen-title">아카이브</h2>
+      <Breadcrumbs at={{ page: 'contents' }} />
+      <h2 className="screen-title">원고</h2>
       {params.missing === '1' ? (
         <p className="notice" role="alert">
           원고를 찾을 수 없습니다.

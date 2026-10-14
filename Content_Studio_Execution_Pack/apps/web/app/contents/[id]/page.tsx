@@ -22,6 +22,7 @@ import {
   MAX_VERSION_NOTE,
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { normalizeRunParam, selectRun, VARIANT_EDIT_ERROR_CODES, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
 import { WritingPanel, type ProposalView } from './writing-panel';
@@ -93,9 +94,7 @@ export default async function ContentPage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/contents">← 아카이브</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'content', id: c.id, title: c.title }} />
       <h2 className="screen-title">작성실 · {c.title}</h2>
       {str(q.saved) === '1' ? (
         <p className="saved" role="status">
@@ -134,7 +133,9 @@ export default async function ContentPage({
         <span>현재 버전 {current.version}</span>
         <span>최근 수정 {formatMsk(c.updatedAt)}</span>
       </p>
-      <p className="note">배포(게시) 상태는 여기서 관리하지 않습니다. 채널별 배포 기록은 배포함(<Link href="/distribute">/distribute</Link>)에서 봅니다.</p>
+      <p className="note">
+        배포 상태는 <Link href="/distribute">배포함</Link>에서 봅니다.
+      </p>
 
       <div className="cols">
         <section className="card archive" aria-labelledby="editor-title">
@@ -154,9 +155,10 @@ export default async function ContentPage({
             <input id="note" name="note" type="text" maxLength={MAX_VERSION_NOTE} />
             <button type="submit">새 버전으로 저장</button>
           </form>
-          <p className="note">
-            저장하면 이전 버전은 그대로 두고 새 버전을 추가합니다. 그 사이 다른 곳에서 저장했다면 두 본문을 나란히 비교하는 화면으로 갑니다.
-          </p>
+          <details className="more">
+            <summary>자세히</summary>
+            <p>저장하면 이전 버전은 그대로 두고 새 버전을 추가합니다. 그 사이 다른 곳에서 저장했다면 두 본문을 나란히 비교하는 화면으로 갑니다.</p>
+          </details>
         </section>
 
         <div>
@@ -246,28 +248,31 @@ export default async function ContentPage({
 
           <section className="card archive" aria-labelledby="meta-title">
             <h3 id="meta-title">원고 정보</h3>
-            <form className="form" method="post" action={`/api/contents/${c.id}`}>
-              <input type="hidden" name="_method" value="PATCH" />
-              <input type="hidden" name="expected_revision" value={c.revision} />
-              <label htmlFor="title">제목</label>
-              <input id="title" name="title" type="text" maxLength={MAX_CONTENT_TITLE} required defaultValue={c.title} />
-              <label htmlFor="series">연재</label>
-              <input id="series" name="series" type="text" maxLength={100} defaultValue={c.series ?? ''} />
-              <label htmlFor="audience">독자</label>
-              <input id="audience" name="audience" type="text" maxLength={500} defaultValue={c.audience ?? ''} />
-              <label htmlFor="tags">태그(쉼표로 구분)</label>
-              <input id="tags" name="tags" type="text" defaultValue={c.tags.join(', ')} />
-              <label htmlFor="lifecycle">상태</label>
-              <select id="lifecycle" name="lifecycle" defaultValue={c.lifecycle}>
-                {options.map((o) => (
-                  <option key={o} value={o}>
-                    {o === c.lifecycle ? `${LIFECYCLE_LABEL[o]} (현재)` : `→ ${LIFECYCLE_LABEL[o]}`}
-                  </option>
-                ))}
-              </select>
-              <button type="submit">정보 저장</button>
-            </form>
-            <p className="note">상태는 초안 → 검토 중 → 준비됨 → 보관 순서로 바꾸며, 한 단계씩 되돌릴 수 있습니다.</p>
+            <details>
+              <summary>원고 정보 편집(제목·연재·독자·태그·상태)</summary>
+              <form className="form" method="post" action={`/api/contents/${c.id}`}>
+                <input type="hidden" name="_method" value="PATCH" />
+                <input type="hidden" name="expected_revision" value={c.revision} />
+                <label htmlFor="title">제목</label>
+                <input id="title" name="title" type="text" maxLength={MAX_CONTENT_TITLE} required defaultValue={c.title} />
+                <label htmlFor="series">연재</label>
+                <input id="series" name="series" type="text" maxLength={100} defaultValue={c.series ?? ''} />
+                <label htmlFor="audience">독자</label>
+                <input id="audience" name="audience" type="text" maxLength={500} defaultValue={c.audience ?? ''} />
+                <label htmlFor="tags">태그(쉼표로 구분)</label>
+                <input id="tags" name="tags" type="text" defaultValue={c.tags.join(', ')} />
+                <label htmlFor="lifecycle">상태</label>
+                <select id="lifecycle" name="lifecycle" defaultValue={c.lifecycle}>
+                  {options.map((o) => (
+                    <option key={o} value={o}>
+                      {o === c.lifecycle ? `${LIFECYCLE_LABEL[o]} (현재)` : `→ ${LIFECYCLE_LABEL[o]}`}
+                    </option>
+                  ))}
+                </select>
+                <button type="submit">정보 저장</button>
+              </form>
+              <p className="note">상태는 초안 → 검토 중 → 준비됨 → 보관 순서로 바꾸며, 한 단계씩 되돌릴 수 있습니다.</p>
+            </details>
           </section>
         </div>
       </div>

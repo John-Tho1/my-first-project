@@ -13,6 +13,7 @@ import {
   type CollectorRunStatus,
 } from '@cs/domain';
 import { getSession } from '../../../../lib/auth';
+import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { COLLECT_ERROR_TEXT, runErrorText } from '../../../../lib/collector';
 import { getAppDb, getConfig } from '../../../../lib/server';
 
@@ -42,9 +43,7 @@ export default async function CollectRunPage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/collect">← 수집</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'collect-run', label: source?.label ?? null, host: source?.host ?? null }} />
       <h2 className="screen-title">수집 미리보기 — {source?.label ?? source?.host ?? '소스'}</h2>
       {err ? (
         <p className="notice" role="alert">

@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
 import {
@@ -15,6 +14,7 @@ import {
   type Channel,
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import {
   bannersFromState,
   blockInfoOf,
@@ -192,10 +192,14 @@ function InstagramSteps({ x }: { x: PlanItemDetail }) {
         </p>
       )}
       {pub?.permalink ? <p className="note">모의 링크: {pub.permalink} (실제 Instagram 주소가 아님)</p> : null}
-      <p className="note">
-        컨테이너·미디어 ID 는 모의 ID 입니다(mockig_…). 이미지는 모의 공개 URL(mock://public-media/…)로만 모의 원격에 전달되고 바로 철회됩니다 — 실제로 공개된
-        파일은 없습니다. 실제 Instagram 으로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.
-      </p>
+      <p className="note">모의 ID(mockig_…)입니다. 실제 Instagram 으로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.</p>
+      <details className="more">
+        <summary>자세히</summary>
+        <p>
+          이미지는 모의 공개 URL(mock://public-media/…)로만 모의 원격에 전달되고 바로 철회됩니다 — 실제로 공개된 파일은 없습니다. 컨테이너·미디어 ID 는 모두
+          모의 ID 입니다.
+        </p>
+      </details>
     </>
   );
 }
@@ -232,9 +236,15 @@ function LiveThreadsSteps({ x }: { x: PlanItemDetail }) {
         <p className="empty-text">아직 원격 단계 없음(실행하면 컨테이너 생성 → 준비 확인 → 게시 순서로 진행, 텍스트 1개)</p>
       )}
       <p className="note">
-        실제 Threads ID 입니다. 공개 범위: {LIVE_THREADS_VISIBILITY_TEXT}. 결과를 모르는 게시 시도는 자동으로 다시 게시하지 않고 결과 불명(UNKNOWN)으로 남깁니다 — 최근 글
-        목록에서 같은 본문이 보여도 확인이 아니라 &quot;확인 후보(미확인)&quot;로만 보이니 Threads 에서 직접 확인하세요.
+        실제 Threads ID 입니다. 공개 범위: {LIVE_THREADS_VISIBILITY_TEXT}. 결과를 모르면 자동으로 다시 게시하지 않고 결과 불명(UNKNOWN)으로 남깁니다.
       </p>
+      <details className="more">
+        <summary>자세히</summary>
+        <p>
+          최근 글 목록에서 같은 본문이 보여도 확인이 아니라 &quot;확인 후보(미확인)&quot;로만 보이니 Threads 에서 직접 확인하세요. 게시 시도 표식이 있는 컨테이너로는
+          다시 게시하지 않습니다(결과 불명이면 조회만).
+        </p>
+      </details>
     </>
   );
 }
@@ -326,25 +336,29 @@ function ScenarioForm({ x }: { x: PlanItemDetail }) {
   if (x.account?.kind !== 'mock' || FINISHED.includes(x.item.status)) return null;
   const options = mockScenarioOptionsFor(adapterOf(x) ?? 'mock_generic');
   const current = x.mockScenario?.scenario ?? '';
+  // UI-CLEAN: 개발용 폼은 접어 둔다(모의 계정 항목에만 나온다)
   return (
-    <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/mock-scenario`} aria-label="모의 시나리오">
-      <input type="hidden" name="plan_id" value={x.item.planId} />
-      <label>
-        모의 시나리오 <span className="note">개발용 · 모의 결과 선택 (실제 채널 없음)</span>{' '}
-        <select name="scenario" defaultValue={current || 'success'}>
-          {options.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        지연(ms) <input type="number" name="delay_ms" min={0} max={5000} step={100} defaultValue={x.mockScenario?.delayMs ?? 0} />
-      </label>
-      <button type="submit">모의 시나리오 저장</button>
-      <span className="note">{current ? `현재: ${current}` : '현재: 기본값(success)'}</span>
-    </form>
+    <details className="more">
+      <summary>개발용: 모의 시나리오</summary>
+      <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/mock-scenario`} aria-label="모의 시나리오">
+        <input type="hidden" name="plan_id" value={x.item.planId} />
+        <label>
+          모의 시나리오 <span className="note">모의 결과 선택(실제 채널 없음)</span>{' '}
+          <select name="scenario" defaultValue={current || 'success'}>
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          지연(ms) <input type="number" name="delay_ms" min={0} max={5000} step={100} defaultValue={x.mockScenario?.delayMs ?? 0} />
+        </label>
+        <button type="submit">모의 시나리오 저장</button>
+        <span className="note">{current ? `현재: ${current}` : '현재: 기본값(success)'}</span>
+      </form>
+    </details>
   );
 }
 
@@ -565,8 +579,11 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               </form>
             ) : null}
           </div>
-          <p className="note">취소는 아직 보내지 않은 작업만 바로 확정됩니다. 전송 중이면 &quot;취소 확인 중&quot;으로 남고, 원격이 이미 받았으면 취소할 수 없습니다.</p>
-          {retryable ? <p className="note">재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
+          <details className="more">
+            <summary>자세히(취소{retryable ? '·재시도' : ''})</summary>
+            <p>취소는 아직 보내지 않은 작업만 바로 확정됩니다. 전송 중이면 &quot;취소 확인 중&quot;으로 남고, 원격이 이미 받았으면 취소할 수 없습니다.</p>
+            {retryable ? <p>재시도는 보류된 같은 작업을 다시 대기열에 넣습니다(승인·내용이 그대로일 때만, 새 시도·새 전송 의도). 성공한 다른 채널은 다시 보내지 않습니다.</p> : null}
+          </details>
         </>
       ) : null}
       <StepsPanel x={x} />
@@ -664,25 +681,40 @@ export default async function PlanPage({
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'plan', targetSummary: d.plan.targetSummary }} />
       <h2 className="screen-title">배포 계획 — {d.plan.targetSummary || '이름 없음'}</h2>
       <p className="meta">
         {hasMock ? <span className="tag warn">MOCK</span> : null}
         {hasLive ? <span className="tag warn">실제 게시 포함</span> : null}
         <span className="tag">{hasLive ? (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status).replace(/\(MOCK[^)]*\)/, '') : (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status)}</span>
         <time dateTime={d.plan.createdAt.toISOString()}>만든 시각 {formatMsk(d.plan.createdAt)}</time>
-        <Link href="/distribute">배포함</Link>
       </p>
       {hasLive ? (
-        <p className="notice" role="alert">
-          실제 게시 — 이 계획에는 실제 Threads 계정 항목이 있습니다. 그 항목을 승인하고 실행하면 작업 처리기가 승인된 내용 그대로 <strong>실제로 게시</strong>합니다(텍스트 1개,
-          되돌리기 없음). 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다. 결과를 모르면 자동으로 다시 게시하지 않습니다.
-          {hasMock ? ' 모의 계정 항목은 MOCK 입니다(실제 발행 실적 아님).' : ''}
-        </p>
+        <>
+          <p className="notice" role="alert">
+            실제 게시 — 실제 Threads 계정 항목은 승인·실행하면 승인된 내용 그대로 <strong>실제로 게시</strong>됩니다(되돌리기 없음).
+            <br />
+            결과를 모르면 자동으로 다시 게시하지 않습니다.{hasMock ? ' 모의 계정 항목은 MOCK 입니다(실제 발행 실적 아님).' : ''}
+          </p>
+          <details className="more">
+            <summary>자세히</summary>
+            <p>
+              작업 처리기가 텍스트 1개를 게시합니다. 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다.
+            </p>
+          </details>
+        </>
       ) : (
-        <p className="notice" role="note">
-          MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다. 실행하면 작업 대기열(QUEUED)에 들어가고, 작업 처리기가 모의 어댑터로
-          처리합니다. 확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.
-        </p>
+        <>
+          <p className="notice" role="note">
+            MOCK — 모의 계정입니다. 승인·실행해도 실제 채널로 아무것도 보내지 않습니다.
+            <br />
+            확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.
+          </p>
+          <details className="more">
+            <summary>자세히</summary>
+            <p>실행하면 작업 대기열(QUEUED)에 들어가고, 작업 처리기가 모의 어댑터로 처리합니다.</p>
+          </details>
+        </>
       )}
       {q.created === '1' ? (
         <p className="saved" role="status">
@@ -796,20 +828,24 @@ export default async function PlanPage({
         <form className="form inline" method="post" action={`/api/distribution-plans/${d.plan.id}/execute`}>
           <input type="hidden" name="command_key" value={randomUUID()} />
           <button type="submit" disabled={!executable}>
-            {hasLive ? '지금 실행(대기열에 넣기 — 실제 게시 항목 포함)' : '지금 실행(MOCK — 대기열에 넣기)'}
+            {hasLive ? '지금 실행(대기열 — 실제 게시 항목 포함)' : '지금 실행(MOCK — 대기열)'}
           </button>
         </form>
-        <p className="note">승인된 항목만 대기열에 들어갑니다. 두 번 눌러도 작업은 하나만 생깁니다.</p>
+        <p className="note">승인된 항목만 대기열에 들어갑니다(두 번 눌러도 작업은 하나).</p>
         <form className="form inline" method="post" action="/api/worker/tick">
           <input type="hidden" name="plan_id" value={d.plan.id} />
           <input type="hidden" name="max_jobs" value="5" />
           <button type="submit">{hasLive ? '작업 처리 실행(1회 — 실제 게시 항목은 실제로 게시)' : '작업 처리 실행(모의 1회)'}</button>
         </form>
         <p className="note">
-          {hasLive
-            ? '작업 처리기를 한 번 돌립니다(이 계획의 작업만, 최대 5개). 실제 게시 항목은 실제 게시 조건이 모두 있을 때만 실제 Threads 로 보내고, 모의 항목은 모의 어댑터로 처리합니다. 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'
-            : '작업 처리기를 한 번 돌립니다(이 계획의 작업만, 최대 5개 — 이 계획은 모의 항목뿐이라 외부 호출 없음. 다른 계획의 작업은 처리하지 않음). 재시도 대기 작업은 다음 시각이 되어야 처리됩니다.'}
+          {hasLive ? '이 계획의 작업만 최대 5개 처리합니다. 실제 게시 항목은 실제 게시 조건이 모두 있을 때만 실제 Threads 로 보냅니다.' : '이 계획의 작업만 최대 5개 처리합니다(모의 항목뿐 — 외부 호출 없음).'}
         </p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            {hasLive ? '모의 항목은 모의 어댑터로 처리합니다. ' : '다른 계획의 작업은 처리하지 않습니다. '}재시도 대기 작업은 다음 시각이 되어야 처리됩니다.
+          </p>
+        </details>
       </section>
     </main>
   );

@@ -140,10 +140,13 @@ export default async function TodayPage({
           <input id="title" name="title" type="text" maxLength={MAX_TITLE} />
           <button type="submit">서버에 저장</button>
         </form>
-        <p className="note">
-          URL 을 넣으면 URL 수집으로 저장합니다(원문 추출은 M5 전까지 하지 않음). 저장 결과는 서버 확인 후 다음 화면에 표시됩니다.
-        </p>
-        <p className="note">이 화면은 서버 저장만 표시합니다. 기기 임시 저장(오프라인)은 아직 지원하지 않습니다.</p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            URL 을 넣으면 URL 수집으로 저장합니다(원문 추출은 M5 전까지 하지 않음). 저장 결과는 서버 확인 후 다음 화면에 표시됩니다. 이 화면은 서버 저장만
+            표시합니다 — 기기 임시 저장(오프라인)은 아직 지원하지 않습니다.
+          </p>
+        </details>
       </section>
 
       {captures.length === 0 ? (

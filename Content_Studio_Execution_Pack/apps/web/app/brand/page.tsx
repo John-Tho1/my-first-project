@@ -1,8 +1,8 @@
-import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { listBrandProfiles } from '@cs/db';
 import { BRAND_TONE_LABEL, BRAND_TONES, formatMsk, MAX_BRAND_TEXT, type BrandTone } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { getAppDb, getConfig } from '../../lib/server';
 import { WRITING_ERROR_TEXT } from '../../lib/writing';
 
@@ -30,10 +30,8 @@ export default async function BrandPage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/settings">← 설정</Link>
-      </p>
-      <h2 className="screen-title">Brand Profile</h2>
+      <Breadcrumbs at={{ page: 'brand' }} />
+      <h2 className="screen-title">브랜드 프로필(Brand Profile)</h2>
       {saved && current && String(current.version) === saved ? (
         <p className="saved" role="status">
           {`새 버전 저장됨 ✓ (버전 ${current.version}, ${formatMsk(current.createdAt)})`}

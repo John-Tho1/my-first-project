@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { listAccountHealth, listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
 import { budgetPolicy, CHANNEL_LABEL, formatMsk, fromMicro, LIVE_SETTLEMENT_POLICY_TEXT, liveLlmReadiness, sttBudgetPolicy, sttLiveReadiness, type Channel } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { oidcReadinessView } from '../../lib/oidc';
@@ -66,6 +67,7 @@ export default async function SettingsPage({
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'settings' }} />
       <h2 className="screen-title">설정</h2>
       {exported ? (
         <p className="saved" role="status">
@@ -121,7 +123,10 @@ export default async function SettingsPage({
             ? `실제 AI(Claude) 준비됨 — 작성 보조 요청마다 실제 호출·과금이 일어납니다(1회 출력 상한 ${policy.liveMaxOutputTokens ?? '-'} 토큰${policy.liveMaxRuns !== undefined ? `, 승인당 호출 ${policy.liveMaxRuns}회` : ''}). ${LIVE_SETTLEMENT_POLICY_TEXT}`
             : `live 준비 안 됨: ${live.missing.join(', ')}`}
         </p>
-        <p className="note">실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D13·D34). 설정 값·키는 이 화면에 보이지 않습니다.</p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D13·D34). 설정 값·키는 이 화면에 보이지 않습니다.</p>
+        </details>
         <p className="meta">
           <span className={config.STT_MODE === 'live' ? 'tag warn' : 'tag'}>음성 전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 없음)' : '실제(live)'}</span>
           <span>{stt.pricing ? `1분 가격 설정됨(${stt.currency})` : '1분 가격 미설정(모의는 0 으로 기록)'}</span>
@@ -150,18 +155,24 @@ export default async function SettingsPage({
           </p>
         ) : null}
         <p className="note">
-          지금은 Threads·YouTube·Instagram 모의(MOCK) 계정만 연결할 수 있습니다(YouTube 는 Google 형 모의 OAuth — scope 이름은 자리 표시 `youtube.upload(mock)`, Instagram 은
-          Meta 형 모의 OAuth — 자리 표시 `instagram_basic(mock)`·`instagram_content_publish(mock)`, 공식 이름은 live 전 재확인, 모의 사용자는 비즈니스·크리에이터 계정으로 가정).
-          모의 연결은 앱 안에서만 동작하며 실제 Threads·Google·Instagram 계정 연결이 아니고, 실제 게시에 쓰이지 않습니다. YouTube 모의 연결의 만료는 refresh token
-          기준이며 1시간짜리 access token 은 보내기 전에 자동 갱신합니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을 복원하면 연결했던 계정은 &quot;다시
-          연결 필요&quot;가 됩니다.
+          모의 연결은 실제 게시에 쓰이지 않습니다. 실제 게시는 &quot;실제 게시 계정으로 사용&quot;한 Threads 계정의 승인 글만 합니다.
         </p>
-        <p className="note">
-          실제 Threads 계정(D31): 연결(인증 창 → 코드 교환 → 장기 토큰)과 프로필 조회를 합니다. 자동 갱신은 하지 않습니다. 실제 게시(D38)는 &quot;실제 게시 계정으로
-          사용&quot;을 누른 계정만 배포 계획에 고를 수 있고, 승인한 텍스트 글 1개를 실제 게시 조건(아래 &quot;실제 게시 준비&quot;)이 모두 있을 때만 게시합니다.
-          게시물의 공개 범위는 Threads 계정 공개 설정을 따릅니다. Threads 에는 토큰 철회 API 가 없어
-          &quot;연결 해제&quot;는 이 앱의 연결 정보만 지웁니다 — Threads 쪽 권한까지 지우려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 삭제하세요(메뉴 이름은 Threads 앱 버전에 따라 다를 수 있음).
-        </p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            모의(MOCK) 계정은 Threads·YouTube·Instagram 을 연결할 수 있습니다(YouTube 는 Google 형 모의 OAuth — scope 이름은 자리 표시 `youtube.upload(mock)`, Instagram 은
+            Meta 형 모의 OAuth — 자리 표시 `instagram_basic(mock)`·`instagram_content_publish(mock)`, 공식 이름은 live 전 재확인, 모의 사용자는 비즈니스·크리에이터 계정으로
+            가정). 모의 연결은 앱 안에서만 동작하며 실제 Threads·Google·Instagram 계정 연결이 아닙니다. YouTube 모의 연결의 만료는 refresh token 기준이며 1시간짜리
+            access token 은 보내기 전에 자동 갱신합니다. 연결 정보(토큰)는 서버에서 암호화해 저장하며 이 화면·내보내기·로그에는 나오지 않습니다. 내보내기 파일을
+            복원하면 연결했던 계정은 &quot;다시 연결 필요&quot;가 됩니다.
+          </p>
+          <p>
+            실제 Threads 계정(D31): 연결(인증 창 → 코드 교환 → 장기 토큰)과 프로필 조회를 합니다. 자동 갱신은 하지 않습니다. 실제 게시(D38)는 &quot;실제 게시 계정으로
+            사용&quot;을 누른 계정만 배포 계획에 고를 수 있고, 승인한 텍스트 글 1개를 실제 게시 조건(아래 &quot;실제 게시 준비&quot;)이 모두 있을 때만 게시합니다.
+            게시물의 공개 범위는 Threads 계정 공개 설정을 따릅니다. Threads 에는 토큰 철회 API 가 없어 &quot;연결 해제&quot;는 이 앱의 연결 정보만 지웁니다 — Threads 쪽
+            권한까지 지우려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 삭제하세요(메뉴 이름은 Threads 앱 버전에 따라 다를 수 있음).
+          </p>
+        </details>
         <p className="meta">
           <span className={oauth.secrets.configured ? 'tag' : 'tag warn'}>
             서버 암호화 키: {oauth.secrets.configured ? `설정됨(키 버전 ${oauth.secrets.currentVersion}${oauth.secrets.hasPrevious ? ', 이전 키 있음' : ''})` : '설정 안 됨'}
@@ -302,23 +313,16 @@ export default async function SettingsPage({
         )}
       </section>
 
-      <section className="card archive" aria-labelledby="brand-title">
-        <h3 id="brand-title">Brand Profile</h3>
-        <p className="note">필명·독자·연재 축·말투·피할 표현·CTA 원칙·직접 쓴 예문. 저장할 때마다 새 버전이 추가됩니다.</p>
-        <p>
-          <Link href="/brand">Brand Profile 보기·새 버전 저장</Link>
-        </p>
-      </section>
-
       <section className="card archive" aria-labelledby="export-title">
         <h3 id="export-title">내보내기</h3>
-        <p className="note">
-          백업 나이·복원 훈련 결과·보존 정리는 <Link href="/ops">운영</Link> 화면에서 봅니다.
-        </p>
-        <p className="note">
-          소재·수정 이력·출처·카드·원고(모든 버전)·원문 관계·첨부 파일을 Markdown + JSON + 파일 + checksum manifest 로 묶은 ZIP 을 만듭니다.
-          로그인 세션·인증 비밀은 넣지 않습니다. 개인 원문이 들어 있으니 파일을 보관할 곳을 직접 정하세요.
-        </p>
+        <p className="note">개인 원문이 들어 있으니 파일을 보관할 곳을 직접 정하세요.</p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            소재·수정 이력·출처·카드·원고(모든 버전)·원문 관계·첨부 파일을 Markdown + JSON + 파일 + checksum manifest 로 묶은 ZIP 을 만듭니다. 로그인 세션·인증
+            비밀은 넣지 않습니다. 백업 나이·복원 훈련 결과·보존 정리는 <Link href="/ops">운영</Link> 화면에서 봅니다.
+          </p>
+        </details>
         <form className="form inline" method="post" action="/api/exports">
           <button type="submit">지금 내보내기</button>
         </form>
@@ -365,10 +369,14 @@ export default async function SettingsPage({
 
       <section className="card archive" aria-labelledby="restore-title">
         <h3 id="restore-title">복원</h3>
-        <p className="note">
-          내보내기 ZIP(최대 256MB)을 올리면 먼저 &quot;복원 미리보기&quot;를 만듭니다. 이 단계에서는 데이터가 바뀌지 않습니다.
-          모든 파일의 sha256 을 manifest 와 대조하고, 표별로 새로 추가·동일·충돌 건수를 보여 줍니다.
-        </p>
+        <p className="note">미리보기 단계에서는 데이터가 바뀌지 않습니다.</p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            내보내기 ZIP(최대 256MB)을 올리면 먼저 &quot;복원 미리보기&quot;를 만듭니다. 모든 파일의 sha256 을 manifest 와 대조하고, 표별로 새로 추가·동일·충돌 건수를
+            보여 줍니다.
+          </p>
+        </details>
         <form className="form" method="post" action="/api/restores/preview" encType="multipart/form-data">
           <label htmlFor="restore-file">내보내기 ZIP 파일</label>
           <input id="restore-file" name="file" type="file" accept=".zip,application/zip" required />

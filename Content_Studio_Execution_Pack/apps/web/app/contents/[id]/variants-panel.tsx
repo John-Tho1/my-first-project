@@ -49,10 +49,14 @@ export function VariantsPanel({
   return (
     <section className="card archive" id="variants" aria-labelledby="variants-title">
       <h3 id="variants-title">채널 초안</h3>
-      <p className="note">
-        원고(버전 {coreVersion})에서 채널별 초안을 만듭니다. 원고가 바뀌면 초안에 &quot;원문이 바뀜 — 재검토 필요&quot;가 표시되고, AI 가 자동으로 다시 만들지
-        않습니다. 게시는 하지 않습니다(자동 게시 없음).
-      </p>
+      <p className="note">채널별 초안 — 자동 게시 없음(원고 버전 {coreVersion} 기준).</p>
+      <details className="more">
+        <summary>자세히</summary>
+        <p>
+          원고가 바뀌면 초안에 &quot;원문이 바뀜 — 재검토 필요&quot;가 표시되고, AI 가 자동으로 다시 만들지 않습니다. 초안 화면에서는 게시하지 않습니다 — 검토 중
+          초안에서 배포 계획을 만들고 계획 화면에서 직접 승인해야 합니다.
+        </p>
+      </details>
       {savedChannel ? (
         <p className="saved" role="status">
           {`${CHANNEL_LABEL[savedChannel as Channel] ?? savedChannel} 초안 저장됨 ✓`}
@@ -148,7 +152,8 @@ export function VariantsPanel({
                 </details>
                 {s.variant.lifecycle === 'approved' ? (
                   <p className="note">
-                    <span className="tag">승인됨</span> 배포 승인이 있는 초안입니다(MOCK). 수정·첨부 변경은 승인을 무효로 합니다.{' '}
+                    <span className="tag">승인됨</span> 배포 승인이 있는 초안입니다
+                    {livePlatforms?.has(s.variant.channel) ? '(실제 게시 계정 승인일 수 있음 — 계획에서 확인)' : '(MOCK)'}. 수정·첨부 변경은 승인을 무효로 합니다.{' '}
                     {planByVariant.get(s.variant.id) ? <a href={`/distribute/${planByVariant.get(s.variant.id)}`}>배포 계획 보기</a> : null}
                   </p>
                 ) : (
@@ -162,8 +167,8 @@ export function VariantsPanel({
                   <p className="note">
                     <a href={`/distribute/new?content_id=${contentId}`}>배포 계획 만들기</a>{' '}
                     {livePlatforms?.has(s.variant.channel)
-                      ? '(실제 게시 계정 있음 — 계획에서 실제 계정을 고르면 승인·실행 뒤 실제 게시 조건이 모두 갖춰졌을 때만 실제로 게시, 모의 계정은 MOCK. 계획 뒤에 채널별 내용을 확인하고 직접 승인)'
-                      : '(MOCK — 계획 뒤에 채널별 내용을 확인하고 직접 승인)'}
+                      ? '(실제 게시 계정 있음 — 실제 계정을 골라 승인·실행하면 실제로 게시, 모의 계정은 MOCK. 승인은 계획 화면에서 직접)'
+                      : '(MOCK — 승인은 계획 화면에서 직접)'}
                     {planByVariant.get(s.variant.id) ? (
                       <>
                         {' · '}

@@ -185,12 +185,17 @@ export function WritingPanel({
           </form>
         ) : null}
         <p className="note">
-          입력은 현재 본문(버전 {current.version})·Brand Profile·저장된 답변 {answers.length}개·연결된 소재의 출처 {state.allowedSources.length}개로
-          고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있습니다. 서버가 자동으로 거부하는 것(제안 전체를 저장하지 않음, 실패로
-          기록, 본문 그대로): 글 속 URL·도메인·IP 주소 모양 표기, 범위 밖 번호 인용, AI 가 허용 목록 밖 출처로 적었다가 버려진 문구. 그 밖의 일반 문헌
-          제목·기관명(예: &quot;OO연구소 보고서에 따르면&quot;)은 <strong>자동으로 검증되지 않습니다</strong> — 아래 주장에 &quot;출처 미검증 · 사용자 확인
-          필요&quot;로 표시되니 직접 확인하세요. 본문에 URL 이 있으면 제안이 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
+          입력: 현재 본문(버전 {current.version})·Brand Profile·답변 {answers.length}개·출처 {state.allowedSources.length}개.
         </p>
+        <details className="more">
+          <summary>자세히(입력·자동 거부)</summary>
+          <p>
+            입력은 위 항목으로 고정됩니다. AI 는 출처를 번호 [n] 과 허용 출처 id 로만 표시할 수 있습니다. 서버가 자동으로 거부하는 것(제안 전체를 저장하지 않음, 실패로
+            기록, 본문 그대로): 글 속 URL·도메인·IP 주소 모양 표기, 범위 밖 번호 인용, AI 가 허용 목록 밖 출처로 적었다가 버려진 문구. 그 밖의 일반 문헌
+            제목·기관명(예: &quot;OO연구소 보고서에 따르면&quot;)은 <strong>자동으로 검증되지 않습니다</strong> — 아래 주장에 &quot;출처 미검증 · 사용자 확인
+            필요&quot;로 표시되니 직접 확인하세요. 본문에 URL 이 있으면 제안이 실패할 수 있습니다. 출처 표시 &quot;[출처 n]&quot;은 서버가 허용 목록에서 만듭니다.
+          </p>
+        </details>
 
         {run ? (
           <div className="assist-run">
@@ -327,11 +332,15 @@ export function WritingPanel({
                     );
                   })}
                 </ul>
-                <p className="note">
-                  실제 경험이면 &quot;내 경험이 맞음&quot;, 사실이 아니면 본문에서 그 문장을 빼거나 고쳐 저장한 뒤 &quot;본문에서 뺐음&quot;을 누르세요. 둘 중 하나로
-                  해결하기 전에는 &quot;준비됨&quot;으로 바꿀 수 없습니다. 제외는 문장이 현재 본문에 없을 때만 되고(공백·문장부호 차이는 무시), 다시 넣으면 다시 확인이
-                  필요합니다. 제안 문장을 채택하지 않고 직접 복사해 붙인 경우는 추적하지 않습니다.
-                </p>
+                <p className="note">확인하거나 본문에서 빼기 전에는 &quot;준비됨&quot;으로 바꿀 수 없습니다.</p>
+                <details className="more">
+                  <summary>자세히</summary>
+                  <p>
+                    실제 경험이면 &quot;내 경험이 맞음&quot;, 사실이 아니면 본문에서 그 문장을 빼거나 고쳐 저장한 뒤 &quot;본문에서 뺐음&quot;을 누르세요. 제외는 문장이 현재
+                    본문에 없을 때만 되고(공백·문장부호 차이는 무시), 다시 넣으면 다시 확인이 필요합니다. 제안 문장을 채택하지 않고 직접 복사해 붙인 경우는 추적하지
+                    않습니다.
+                  </p>
+                </details>
               </>
             ) : null}
             {outputList(run, 'followup_questions').length > 0 ? (

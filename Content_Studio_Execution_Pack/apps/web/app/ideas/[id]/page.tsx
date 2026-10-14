@@ -3,6 +3,7 @@ import { notFound, redirect } from 'next/navigation';
 import { getIdea } from '@cs/db';
 import { formatMsk, formatMskInline, MAX_IDEA } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { preview, RISK_LABEL } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -40,9 +41,7 @@ export default async function IdeaPage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/ideas">← 카드 목록</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'idea', idea: i.idea }} />
       <h2 className="screen-title">콘텐츠 카드</h2>
       {str(q.saved) === '1' ? (
         <p className="saved" role="status">

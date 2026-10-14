@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { listIdeas } from '@cs/db';
 import { decodeCaptureCursor, encodeCaptureCursor, formatMsk, MAX_IDEA } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT } from '../../lib/contents';
 import { preview, RISK_LABEL } from '../../lib/labels';
 import { getAppDb, getConfig } from '../../lib/server';
@@ -27,6 +28,7 @@ export default async function IdeasPage({
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'ideas' }} />
       <h2 className="screen-title">콘텐츠 카드</h2>
       {params.missing === '1' ? (
         <p className="notice" role="alert">

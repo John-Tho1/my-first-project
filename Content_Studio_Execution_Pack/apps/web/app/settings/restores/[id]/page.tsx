@@ -1,8 +1,8 @@
-import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getRestoreRun, type CommitResult, type RestorePreview } from '@cs/db';
 import { EXPORTED_TABLES, formatMsk } from '@cs/domain';
 import { getSession } from '../../../../lib/auth';
+import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT } from '../../../../lib/backup';
 import { reconnectNotice } from '../../../../lib/restore-view';
 import { getAppDb, getConfig } from '../../../../lib/server';
@@ -61,9 +61,7 @@ export default async function RestorePage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/settings">← 설정</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'restore' }} />
       <h2 className="screen-title">{committed ? '복원 완료: 표별 건수' : '복원 미리보기'}</h2>
       {err ? (
         <p className="notice" role="alert">

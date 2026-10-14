@@ -12,6 +12,7 @@ import {
   type CollectorSourceKind,
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { COLLECT_ERROR_TEXT, runErrorText } from '../../lib/collector';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -38,6 +39,7 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'collect' }} />
       <h2 className="screen-title">수집 — 허용한 소스만</h2>
       {err ? (
         <p className="notice" role="alert">

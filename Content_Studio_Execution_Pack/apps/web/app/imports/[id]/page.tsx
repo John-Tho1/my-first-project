@@ -13,6 +13,7 @@ import {
   type ImportSourceKind,
 } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { formatBytes } from '../../../lib/backup';
 import { IMPORT_ERROR_TEXT, IMPORT_STATUS_LABEL } from '../../../lib/imports';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -55,9 +56,7 @@ export default async function ImportRunPage({
 
   return (
     <main className="container">
-      <p className="now">
-        <Link href="/imports">← 가져오기</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'import', label: `${IMPORT_KIND_LABEL[run.sourceKind as ImportSourceKind] ?? run.sourceKind} ${formatMsk(run.createdAt)}` }} />
       <h2 className="screen-title">{preview ? '가져오기 미리보기' : `가져오기 — ${IMPORT_STATUS_LABEL[run.status] ?? run.status}`}</h2>
       {err ? (
         <p className="notice" role="alert">

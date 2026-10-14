@@ -1,8 +1,8 @@
-import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getContentRow, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
 import { adapterIdFor, CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import {
   DISTRIBUTE_ERROR_TEXT,
   isLiveThreadsAccount,
@@ -64,15 +64,24 @@ function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; 
           </option>
         ))}
       </select>
-      <p className="note">
-        비공개 업로드 = 공개 범위 비공개(private). 공개 게시 = 공개 범위 공개·일부 공개. 예약 공개 = 공개 범위 비공개(private)로 두고 아래 예약 공개 시각을 넣습니다.
-        {sel.accountDefault ? ' 계정 이름 옆에 그 계정이 고를 수 있는 결과가 있습니다(맞지 않으면 서버가 거부합니다).' : ''}
-      </p>
+      <details className="more">
+        <summary>자세히(요청 결과)</summary>
+        <p>
+          비공개 업로드 = 공개 범위 비공개(private). 공개 게시 = 공개 범위 공개·일부 공개. 예약 공개 = 공개 범위 비공개(private)로 두고 아래 예약 공개 시각을 넣습니다.
+          {sel.accountDefault ? ' 계정 이름 옆에 그 계정이 고를 수 있는 결과가 있습니다(맞지 않으면 서버가 거부합니다).' : ''}
+        </p>
+        {sel.scheduledAllowed ? (
+          <p>
+            예약 공개 날짜·시각은 요청 결과가 예약 공개일 때만 보냅니다. 모스크바 시각으로 받아 서버가 UTC 로 저장합니다(원격 publishAt — MOCK). 실행 예약이 있으면 그보다
+            뒤여야 합니다.
+          </p>
+        ) : null}
+      </details>
       {sel.scheduledAllowed ? (
         <>
-          <label htmlFor={`pdate-${vid}`}>예약 공개 날짜(모스크바, 예약 공개일 때만 — 다른 요청 결과면 보내지 않음)</label>
+          <label htmlFor={`pdate-${vid}`}>예약 공개 날짜(모스크바 — 예약 공개일 때만)</label>
           <input id={`pdate-${vid}`} type="date" name={`publish_date_${vid}`} defaultValue={prev.publishDate[vid] ?? ''} />
-          <label htmlFor={`ptime-${vid}`}>예약 공개 시각(모스크바, HH:mm, 예약 공개일 때만 — 다른 요청 결과면 보내지 않음)</label>
+          <label htmlFor={`ptime-${vid}`}>예약 공개 시각(모스크바·HH:mm — 예약 공개일 때만)</label>
           <input
             id={`ptime-${vid}`}
             type="text"
@@ -82,7 +91,6 @@ function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; 
             pattern="[0-2][0-9]:[0-5][0-9]"
             maxLength={5}
           />
-          <p className="note">예약 공개 시각은 모스크바 시각으로 받아 서버가 UTC 로 저장합니다(원격 publishAt — MOCK). 실행 예약이 있으면 그보다 뒤여야 합니다.</p>
         </>
       ) : null}
     </>
@@ -114,25 +122,30 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'distribute-new', contentId: content.id, title: content.title }} />
       <h2 className="screen-title">배포 계획 만들기 — {content.title}</h2>
       {accounts.some(isLiveThreadsAccount) ? (
         <p className="notice" role="note">
-          <span className="tag warn">실제 게시 계정 있음</span> 실제 Threads 계정(실제 게시 계정으로 사용 중)을 고르면 승인·실행 뒤 <strong>실제로 게시</strong>됩니다. 모의 계정은
-          MOCK 입니다. 계획을 만들어도 승인·게시되지 않습니다 — 다음 화면에서 채널별로 나갈 내용을 확인하고 직접 승인해야 합니다.
+          <span className="tag warn">실제 게시 계정 있음</span> 실제 계정을 고르고 승인·실행하면 <strong>실제로 게시</strong>됩니다(모의 계정은 MOCK). 계획 생성만으로는 승인·게시되지
+          않습니다.
         </p>
       ) : (
         <p className="notice" role="note">
-          MOCK — 모의 계정으로만 계획합니다. 계획을 만들어도 승인·게시되지 않습니다. 다음 화면에서 채널별로 나갈 내용을 확인하고 직접 승인해야 합니다.
+          MOCK — 계획을 만들어도 승인·게시되지 않습니다.
         </p>
       )}
+      <details className="more">
+        <summary>자세히</summary>
+        <p>
+          {accounts.some(isLiveThreadsAccount) ? '실제 게시 계정은 "실제 게시 계정으로 사용" 중인 실제 Threads 계정입니다. ' : '모의 계정으로만 계획합니다. '}다음 화면에서
+          채널별로 나갈 내용을 확인하고 직접 승인해야 합니다. 일정을 비우면 승인·실행 뒤 바로 대기열에 들어갑니다(모스크바 시각으로 받아 서버가 UTC 로 저장).
+        </p>
+      </details>
       {err ? (
         <p className="notice" role="alert">
           {err}
         </p>
       ) : null}
-      <p>
-        <Link href={`/contents/${content.id}#variants`}>← 원고로 돌아가기</Link>
-      </p>
       {rows.length === 0 ? (
         <p className="empty-text">검토 중인 채널 초안이 없습니다. 원고 화면에서 채널 초안을 &quot;검토로&quot; 보내세요.</p>
       ) : (
@@ -170,15 +183,22 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                       </option>
                     ))}
                   </select>
-                  <label htmlFor={`date-${v.id}`}>실행 예약 날짜(모스크바, 선택 — 비우면 즉시)</label>
+                  <label htmlFor={`date-${v.id}`}>실행 예약 날짜(모스크바·선택 — 비우면 즉시)</label>
                   <input id={`date-${v.id}`} type="date" name={`date_${v.id}`} defaultValue={prev.date[v.id] ?? ''} />
-                  <label htmlFor={`time-${v.id}`}>실행 예약 시각(모스크바, HH:mm, 선택)</label>
+                  <label htmlFor={`time-${v.id}`}>실행 예약 시각(모스크바·HH:mm·선택)</label>
                   <input id={`time-${v.id}`} type="text" name={`time_${v.id}`} placeholder="예: 12:00" defaultValue={prev.time[v.id] ?? ''} pattern="[0-2][0-9]:[0-5][0-9]" maxLength={5} />
                   {v.channel === 'instagram' && accs.some((a) => adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram') ? (
-                    <p className="note">
-                      <span className="tag warn">MOCK</span> 모의 연결 Instagram 계정: 결과는 MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다(비공개·예약 결과 없음). 이미지는 잠정
-                      규격(JPEG·8MiB 이하·가로세로 4:5~1.91:1·가로 320px 이상, 캐러셀 2~10장)을 승인 전에 검사합니다 — 공식 규격 재확인 전 값.
-                    </p>
+                    <>
+                      <p className="note">
+                        <span className="tag warn">MOCK</span> 모의 연결 Instagram 계정: MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다(비공개·예약 결과 없음).
+                      </p>
+                      <details className="more">
+                        <summary>자세히(이미지 규격)</summary>
+                        <p>
+                          이미지는 잠정 규격(JPEG·8MiB 이하·가로세로 4:5~1.91:1·가로 320px 이상, 캐러셀 2~10장)을 승인 전에 검사합니다 — 공식 규격 재확인 전 값.
+                        </p>
+                      </details>
+                    </>
                   ) : null}
                   {accs.some(isLiveThreadsAccount) ? (
                     <p className="note">

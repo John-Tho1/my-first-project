@@ -3,6 +3,7 @@ import { notFound, redirect } from 'next/navigation';
 import { computeDuplicates, getCaptureDetail, getCapturesByIds, getCollectedOriginForCapture, getImportOriginForCapture, listCaptureDerivations } from '@cs/db';
 import { formatMsk, formatMskInline, ideaSeedFromCapture, IMPORT_KIND_LABEL, isFetchableUrl, MAX_IDEA, MAX_TITLE, MAX_USER_NOTE, type ImportSourceKind } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
+import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -81,13 +82,7 @@ export default async function CaptureDetailPage({
 
   return (
     <main className="container">
-      <header className="header">
-        <h1>Content Studio</h1>
-        <p className="now">
-          <Link href="/">← 오늘</Link> · <Link href="/captures">소재함</Link>
-        </p>
-      </header>
-
+      <Breadcrumbs at={{ page: 'capture', title: c.title, rawText: c.rawText }} />
       <h2 className="screen-title">{c.title ?? '소재'}</h2>
 
       {saved === '1' ? (

@@ -11,6 +11,7 @@ import {
   searchTerms,
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { LIFECYCLE_LABEL } from '../../lib/contents';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -126,6 +127,7 @@ export default async function SearchPage({
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'search' }} />
       <h2 className="screen-title">검색</h2>
       <section className="card archive" aria-labelledby="search-form">
         <h3 id="search-form">검색 조건</h3>

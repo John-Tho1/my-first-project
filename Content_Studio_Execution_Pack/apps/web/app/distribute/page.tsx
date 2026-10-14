@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { listAccountHealth, listPlans } from '@cs/db';
 import { CHANNEL_LABEL, decodeCaptureCursor, encodeCaptureCursor, formatMsk, type Channel } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { accountHealthLine, PLAN_STATUS_LABEL } from '../../lib/distribution';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -23,13 +24,24 @@ export default async function DistributePage({ searchParams }: { searchParams: P
     listAccountHealth(db, session.ownerId),
   ]);
   const next = page.next ? `/distribute?cursor=${encodeCaptureCursor(page.next.at, page.next.id)}` : null;
+  // UI-CLEAN: 안내는 실제 계정 유무에 맞춘다(실제 게시 계정 = 실제 Threads 계정 중 "실제 게시 계정으로 사용" 중인 것)
+  const liveTarget = accounts.some((a) => !a.mock && a.live_publish_target);
+  const allMock = accounts.every((a) => a.mock);
 
   return (
     <main className="container">
+      <Breadcrumbs at={{ page: 'distribute' }} />
       <h2 className="screen-title">배포함</h2>
-      <p className="notice" role="note">
-        MOCK — 지금 단계(M4)는 모의 어댑터(일반·Threads·YouTube 모의)와 모의 계정 연결만 씁니다. 승인·실행해도 실제 채널로 아무것도 보내지 않으며, 결과와 원격 ID 는 모두 MOCK(실제 발행 실적 아님)입니다.
-      </p>
+      {liveTarget ? (
+        <p className="notice" role="note">
+          <span className="tag warn">실제 게시 계정 있음</span> 실제 게시 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(되돌리기 없음). 모의 계정 결과는
+          MOCK(실제 발행 실적 아님)입니다.
+        </p>
+      ) : (
+        <p className="notice" role="note">
+          MOCK — 지금은 실제 게시 계정이 없습니다. 승인·실행해도 실제 채널로 보내지 않으며, 그 결과와 원격 ID 는 MOCK(실제 발행 실적 아님)입니다.
+        </p>
+      )}
       {q.missing === '1' ? (
         <p className="notice" role="alert">
           배포 계획을 찾을 수 없습니다.
@@ -64,9 +76,15 @@ export default async function DistributePage({ searchParams }: { searchParams: P
       <section className="card archive" aria-labelledby="accounts-title">
         <h3 id="accounts-title">배포 계정</h3>
         <p className="note">
-          모의(MOCK) 계정만 있습니다. 연결 상태는 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>과 같은 판정이며, 연결·갱신·해제도 그 화면에서 합니다.
-          Threads·YouTube 단계(T14·T15)는 모의로만 구현되어 있고, 실제 계정 연결·실제 게시는 별도 승인(D24) 전까지 없습니다. 모의 연결 정보로는 실제 게시가 일어나지 않습니다.
+          {allMock ? '모의(MOCK) 계정만 있습니다. ' : ''}연결·갱신·해제는 <Link href="/settings#accounts">설정 → 배포 계정 연결</Link>에서 합니다.
         </p>
+        <details className="more">
+          <summary>자세히</summary>
+          <p>
+            연결 상태는 설정 화면과 같은 판정입니다. 모의 연결 정보로는 실제 게시가 일어나지 않습니다. 실제 게시는 실제 Threads 계정 중 &quot;실제 게시 계정으로
+            사용&quot;을 누른 계정의 승인된 글만, 실제 게시 조건이 모두 있을 때만 일어납니다.
+          </p>
+        </details>
         <ul className="list">
           {accounts.map((a) => {
             const h = accountHealthLine(a);

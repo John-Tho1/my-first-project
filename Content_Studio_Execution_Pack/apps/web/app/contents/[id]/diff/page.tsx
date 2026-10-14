@@ -1,8 +1,8 @@
-import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getContentVersion } from '@cs/db';
 import { diffLines, formatMsk } from '@cs/domain';
 import { getSession } from '../../../../lib/auth';
+import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { DiffView } from '../../../../lib/diff-view';
 import { getAppDb, getConfig } from '../../../../lib/server';
 
@@ -31,9 +31,7 @@ export default async function DiffPage({
   if (!a || !b) notFound();
   return (
     <main className="container">
-      <p className="now">
-        <Link href={`/contents/${a.content.id}`}>← 작성실</Link>
-      </p>
+      <Breadcrumbs at={{ page: 'content-diff', id: a.content.id, title: a.content.title, from, to }} />
       <h2 className="screen-title">
         {a.content.title} · 버전 {from} → {to}
       </h2>

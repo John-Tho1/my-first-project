@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { exactDuplicateIds, listArchiveRecommendations, listCapturesPage } from '@cs/db';
 import { decodeCaptureCursor, encodeCaptureCursor, formatMsk } from '@cs/domain';
 import { getSession } from '../../lib/auth';
+import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../lib/labels';
 import { getAppDb, getConfig } from '../../lib/server';
 
@@ -34,12 +35,7 @@ export default async function CapturesPage({
 
   return (
     <main className="container">
-      <header className="header">
-        <h1>Content Studio</h1>
-        <p className="now">
-          <Link href="/">← 오늘</Link>
-        </p>
-      </header>
+      <Breadcrumbs at={{ page: 'captures' }} />
       <h2 className="screen-title">소재함</h2>
       {params.missing === '1' ? (
         <p className="notice" role="alert">

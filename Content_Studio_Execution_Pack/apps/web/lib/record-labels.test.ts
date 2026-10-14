@@ -11,7 +11,13 @@ import {
   planRowTag,
   planStatusText,
   retriedBanner,
+  itemIsLive,
+  itemStatusText,
+  jobStatusTextFor,
+  requestedResultLabel,
+  revocationNoticeFor,
 } from './record-labels';
+import { ITEM_STATUS_LABEL, jobStatusText, REQUESTED_RESULT_LABEL, revocationNotice } from './distribution';
 
 describe('accountModeOf — 지금 계정 상태', () => {
   it('없음 · 모의만 · 실제 계정(대상 미지정) · 실제 게시 대상 있음', () => {
@@ -72,5 +78,59 @@ describe('planStatusText — 계획 상태 문구의 MOCK 꼬리표는 그 계�
     expect(planStatusText('처리 중(MOCK)', false)).toBe('처리 중');
     expect(planStatusText('부분 성공(MOCK — 성공한 항목은 다시 보내지 않음)', false)).toBe('부분 성공(성공한 항목은 다시 보내지 않음)');
     expect(planStatusText('승인됨(실행 전)', false)).toBe('승인됨(실행 전)');
+  });
+});
+
+/**
+ * FIX2-UICLEAN(브라우저 확인): 실제 Threads 항목(USER_CONFIRMED, is_mock=false)의 상태 태그가 "CONFIRMED · MOCK 확인(실제 발행 아님)" 이었다.
+ * 항목·작업·요청 결과·철회 문구도 그 항목 기록(계정 kind·publications.is_mock)으로 고른다. 모의 문구는 한 글자도 바꾸지 않는다.
+ */
+describe('FIX2 — 항목·작업 상태 문구를 그 항목 기록으로', () => {
+  it('itemStatusText: 실제 CONFIRMED = "CONFIRMED · 실제 게시 완료" + 확인 종류, MOCK 없음', () => {
+    expect(itemStatusText('CONFIRMED', { live: true, verification: 'VERIFIED' })).toBe('CONFIRMED · 실제 게시 완료 · 앱 확인(VERIFIED)');
+    expect(itemStatusText('CONFIRMED', { live: true, verification: 'USER_CONFIRMED' })).toBe('CONFIRMED · 실제 게시 완료 · 사용자 확인');
+    expect(itemStatusText('CONFIRMED', { live: true, verification: 'UNVERIFIED' })).toBe('CONFIRMED · 실제 게시 완료 · 확인 전');
+    expect(itemStatusText('CONFIRMED', { live: true, verification: null })).toBe('CONFIRMED · 실제 게시 완료 · 확인 전');
+    for (const v of ['VERIFIED', 'USER_CONFIRMED', 'UNVERIFIED', null]) expect(itemStatusText('CONFIRMED', { live: true, verification: v })).not.toContain('MOCK');
+  });
+  it('itemStatusText: 모의 항목은 기존 문구 그대로(ITEM_STATUS_LABEL), 다른 상태도 그대로', () => {
+    expect(itemStatusText('CONFIRMED', { live: false, verification: 'MOCK' })).toBe('CONFIRMED · MOCK 확인(실제 발행 아님)');
+    expect(itemStatusText('CONFIRMED', { live: false })).toBe(ITEM_STATUS_LABEL.CONFIRMED);
+    for (const s of Object.keys(ITEM_STATUS_LABEL).filter((k) => k !== 'CONFIRMED')) {
+      expect(itemStatusText(s, { live: true })).toBe(ITEM_STATUS_LABEL[s]);
+      expect(itemStatusText(s, { live: true })).not.toContain('MOCK');
+      expect(itemStatusText(s, { live: false })).toBe(ITEM_STATUS_LABEL[s]);
+    }
+    expect(itemStatusText('WHATEVER', { live: true })).toBe('WHATEVER');
+  });
+  it('itemIsLive: 결과 기록(is_mock)이 있으면 그것, 없으면 항목 계정 kind', () => {
+    expect(itemIsLive({ accountKind: 'live', pub: null })).toBe(true);
+    expect(itemIsLive({ accountKind: 'mock', pub: null })).toBe(false);
+    expect(itemIsLive({ accountKind: null, pub: { isMock: false } })).toBe(true);
+    expect(itemIsLive({ accountKind: 'live', pub: { isMock: false } })).toBe(true);
+    expect(itemIsLive({ accountKind: 'mock', pub: { isMock: true } })).toBe(false);
+  });
+  it('jobStatusTextFor: 실제 작업이 CONFIRMED 인데 그 작업의 결과 기록이 없으면 MOCK 이라고 하지 않는다(모의는 기존 그대로)', () => {
+    const job = { state: 'CONFIRMED', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: null } as never;
+    expect(jobStatusText(job, null)).toContain('MOCK');
+    expect(jobStatusTextFor(job, null, null, 'threads', false)).toBe(jobStatusText(job, null, null, 'threads'));
+    const live = jobStatusTextFor(job, null, null, 'threads', true);
+    expect(live).not.toContain('MOCK');
+    expect(live).toContain('CONFIRMED · 실제 게시');
+    const pub = { isMock: false, resultKind: 'PUBLISHED', verification: 'VERIFIED', permalink: 'https://www.threads.com/@x/post/1' } as never;
+    expect(jobStatusTextFor(job, pub, null, 'threads', true)).toBe(jobStatusText(job, pub, null, 'threads'));
+    expect(jobStatusTextFor(job, pub, null, 'threads', true)).not.toContain('MOCK');
+  });
+  it('requestedResultLabel: 실제 계정 항목은 "실제 게시(public_publish)", 모의는 REQUESTED_RESULT_LABEL 그대로', () => {
+    expect(requestedResultLabel('public_publish', true)).toBe('실제 게시(public_publish)');
+    expect(requestedResultLabel('public_publish', false)).toBe(REQUESTED_RESULT_LABEL.public_publish);
+    expect(requestedResultLabel('mock_publish', false)).toBe(REQUESTED_RESULT_LABEL.mock_publish);
+  });
+  it('revocationNoticeFor: 실제 계정 항목이 있는 계획이면 "(MOCK)" 을 떼고, 모의 계획은 그대로', () => {
+    const t = revocationNotice(1, 0);
+    expect(revocationNoticeFor(t, false)).toBe(t);
+    expect(revocationNoticeFor(t, true)).not.toContain('MOCK');
+    expect(revocationNoticeFor(t, true)).toContain('승인을 철회했습니다.');
+    expect(revocationNoticeFor(t, true)).toContain('보류(BLOCKED) — 다음 전송이 차단');
   });
 });

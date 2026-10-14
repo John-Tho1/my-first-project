@@ -4,6 +4,7 @@
  * - 결과·작업의 실제/MOCK 표시는 페이지 수준 계정 상태가 아니라 그 기록(항목 계정 kind·publications.is_mock — DB 트리거로 서로 같음)에서 고른다.
  *   그래서 지금 계정 상태만으로 "결과가 모두 MOCK" 이라고 말하지 않는다.
  */
+import { ITEM_STATUS_LABEL, jobStatusText, REQUESTED_RESULT_LABEL } from './distribution';
 
 export type AccountMode = 'none' | 'mock_only' | 'live_no_target' | 'live_target';
 
@@ -92,4 +93,43 @@ export function planStatusText(label: string, mock: boolean): string {
     .replace('(MOCK)', '')
     .replace('(MOCK — ', '(')
     .trim();
+}
+
+// ---- FIX2-UICLEAN(브라우저 확인): 항목·작업 상태 문구도 그 항목 기록으로 ----
+
+/** 실제 항목인가: 결과 기록(publications.is_mock)이 있으면 그것, 없으면 항목 계정 kind(둘은 DB 트리거 publications_kind_guard 로 같은 값). */
+export function itemIsLive(x: { accountKind: string | null | undefined; pub: { isMock: boolean } | null | undefined }): boolean {
+  if (x.pub) return !x.pub.isMock;
+  return x.accountKind === 'live';
+}
+
+const LIVE_VERIFICATION_SHORT: Record<string, string> = { VERIFIED: '앱 확인(VERIFIED)', USER_CONFIRMED: '사용자 확인' };
+
+/**
+ * 항목 상태 태그. 실제 항목의 CONFIRMED 만 "CONFIRMED · 실제 게시 완료 · {앱 확인(VERIFIED) | 사용자 확인 | 확인 전}" 으로 바꾸고,
+ * 모의 항목·다른 상태는 ITEM_STATUS_LABEL 그대로(모의 CONFIRMED = "CONFIRMED · MOCK 확인(실제 발행 아님)").
+ */
+export function itemStatusText(status: string, rec: { live: boolean; verification?: string | null }): string {
+  if (status === 'CONFIRMED' && rec.live) return `CONFIRMED · 실제 게시 완료 · ${LIVE_VERIFICATION_SHORT[rec.verification ?? ''] ?? '확인 전'}`;
+  return ITEM_STATUS_LABEL[status] ?? status;
+}
+
+/**
+ * 작업 한 줄. jobStatusText 는 결과 기록이 없는 CONFIRMED 를 "MOCK 결과 확인" 으로 쓴다 — 실제 항목이면 그 대신 실제 게시라고만 말한다.
+ * 결과 기록이 있으면 그 기록(is_mock)대로 jobStatusText 그대로.
+ */
+export function jobStatusTextFor(job: Parameters<typeof jobStatusText>[0], pub: Parameters<typeof jobStatusText>[1], reason: string | null | undefined, channel: string | undefined, live: boolean): string {
+  if (live && job.state === 'CONFIRMED' && !pub) return 'CONFIRMED · 실제 게시(이 작업의 결과 기록 없음 — 항목 상태·원격 결과에서 확인)';
+  return jobStatusText(job, pub, reason, channel);
+}
+
+/** 승인 화면의 요청 결과 이름 — 실제 계정 항목은 실제 게시(public_publish), 모의는 REQUESTED_RESULT_LABEL 그대로. */
+export function requestedResultLabel(requested: string, live: boolean): string {
+  if (live) return '실제 게시(public_publish)';
+  return REQUESTED_RESULT_LABEL[requested] ?? requested;
+}
+
+/** 승인 철회 배너 — 실제 계정 항목이 있는 계획이면 첫 문장의 "(MOCK)" 만 뗀다(나머지 그대로). */
+export function revocationNoticeFor(text: string, hasLive: boolean): string {
+  return hasLive ? text.replace('승인을 철회했습니다(MOCK).', '승인을 철회했습니다.') : text;
 }

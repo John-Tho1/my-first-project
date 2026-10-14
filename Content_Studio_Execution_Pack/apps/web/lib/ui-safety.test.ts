@@ -66,6 +66,11 @@ const REQUIRED: Record<string, string[]> = {
     'mixedResultSuffix(',
     'planCreatedBanner(hasLive)',
     'retriedBanner(hasLive)',
+    // FIX2-UICLEAN: 항목 상태 태그·작업 줄·철회 배너는 그 항목·계획 기록으로
+    'itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub })',
+    'jobStatusTextFor(j, pub, reason, channel, live)',
+    'revocationNoticeFor(',
+    'requestedResultLabel(x.item.requestedResult',
   ],
   'distribute/new/page.tsx': [
     '<strong>실제로 게시</strong>',
@@ -211,7 +216,17 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
 describe('FIX-UICLEAN — 고정 MOCK 단정 문구 없음', () => {
   const FORBIDDEN: Record<string, string[]> = {
     'ops/page.tsx': ['현재 연결은 모두 모의(MOCK)입니다', '배포 작업(MOCK)'],
-    'distribute/[id]/page.tsx': ['(MOCK — 실제 게시 아님)', '배포 계획을 만들었습니다(MOCK', '(MOCK — 새 시도)'],
+    'distribute/[id]/page.tsx': [
+      '(MOCK — 실제 게시 아님)',
+      '배포 계획을 만들었습니다(MOCK',
+      '(MOCK — 새 시도)',
+      // FIX2-UICLEAN: 항목 상태 태그·작업 줄·철회 배너·요청 결과 이름을 고정 표(모의 문구)로 바로 쓰지 않는다
+      'ITEM_STATUS_LABEL[x.item.status]',
+      '{jobStatusText(j',
+      '{revocationNotice(revocationCountParam',
+      'REQUESTED_RESULT_LABEL[r]',
+      '.replace(/\\(MOCK',
+    ],
     'distribute/page.tsx': ['결과와 원격 ID 는', '모의(MOCK) 계정만 있습니다', 'e.mock ? <span'],
     'page.tsx': ['e.mock ? <span'],
     'contents/[id]/variants-panel.tsx': ["'(MOCK)'}"],

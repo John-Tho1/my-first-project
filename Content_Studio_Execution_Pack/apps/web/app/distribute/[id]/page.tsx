@@ -21,9 +21,7 @@ import {
   DISTRIBUTE_ERROR_TEXT,
   instagramProgressLine,
   instagramStepLine,
-  ITEM_STATUS_LABEL,
   itemHeadline,
-  jobStatusText,
   LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
   latestThreadsDiag,
@@ -38,7 +36,6 @@ import {
   publishAtView,
   reconciledNotice,
   remoteStepLine,
-  REQUESTED_RESULT_LABEL,
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
@@ -50,7 +47,17 @@ import {
   youtubeProgressLine,
   youtubeSessionNote,
 } from '../../../lib/distribution';
-import { mixedResultSuffix, planCreatedBanner, retriedBanner } from '../../../lib/record-labels';
+import {
+  itemIsLive,
+  itemStatusText,
+  jobStatusTextFor,
+  mixedResultSuffix,
+  planCreatedBanner,
+  planStatusText,
+  requestedResultLabel,
+  retriedBanner,
+  revocationNoticeFor,
+} from '../../../lib/record-labels';
 import { getAppDb, getConfig, getStorage } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -439,7 +446,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         ) : null}
       </p>
       <p className="meta">
-        <span className="tag">{ITEM_STATUS_LABEL[x.item.status] ?? x.item.status}</span>
+        {/* FIX2-UICLEAN: 상태 태그는 이 항목 기록(결과 is_mock · 계정 kind)으로 — 실제 CONFIRMED 는 "실제 게시 완료" */}
+        <span className="tag">{itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub }), verification: latestPub?.verification ?? null })}</span>
         {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
         <span>공개 범위: {live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)` : (VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility)}</span>
         <span>
@@ -551,7 +559,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               const reason = block.code;
               return (
                 <li key={j.id} className="hash">
-                  <strong>{jobStatusText(j, pub, reason, channel)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
+                  <strong>{jobStatusTextFor(j, pub, reason, channel, live)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
                   {j.state === 'QUEUED' ? ` · 예정 ${formatMsk(j.nextRunAt)}` : ''}
                   {j.cancelRequestedAt && j.state === 'CONFIRMED' ? (channel === 'youtube' ? ' · 취소 불가 — 업로드됨, 삭제는 별도 동작(범위 밖)' : ' · 취소 불가(이미 전송됨)') : ''} ·{' '}
                   <a href={`/api/jobs/${j.id}`}>작업 JSON</a>
@@ -687,7 +695,7 @@ export default async function PlanPage({
       <p className="meta">
         {hasMock ? <span className="tag warn">MOCK</span> : null}
         {hasLive ? <span className="tag warn">실제 게시 포함</span> : null}
-        <span className="tag">{hasLive ? (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status).replace(/\(MOCK[^)]*\)/, '') : (PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status)}</span>
+        <span className="tag">{planStatusText(PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status, !hasLive)}</span>
         <time dateTime={d.plan.createdAt.toISOString()}>만든 시각 {formatMsk(d.plan.createdAt)}</time>
       </p>
       {hasLive ? (
@@ -735,7 +743,7 @@ export default async function PlanPage({
       ) : null}
       {q.revoked === '1' ? (
         <p className="saved" role="status">
-          {revocationNotice(revocationCountParam(q.revoked_blocked), revocationCountParam(q.revoked_cancel))}
+          {revocationNoticeFor(revocationNotice(revocationCountParam(q.revoked_blocked), revocationCountParam(q.revoked_cancel)), hasLive)}
         </p>
       ) : null}
       {str(q.ticked) !== undefined ? (
@@ -807,7 +815,7 @@ export default async function PlanPage({
             {new Set(approvable.map((x) => x.item.requestedResult)).size > 1 ? (
               <p className="note">
                 이 계획에는 요청 결과가 다른 항목이 섞여 있습니다. 고른 항목은 각자 카드에 보인 요청 결과(
-                {[...new Set(approvable.map((x) => x.item.requestedResult))].map((r) => REQUESTED_RESULT_LABEL[r] ?? r).join(' · ')})로 승인됩니다{mixedResultSuffix(approvable.map((x) => ({ live: x.account?.kind === 'live' })))}.
+                {[...new Set(approvable.map((x) => requestedResultLabel(x.item.requestedResult, x.account?.kind === 'live')))].join(' · ')})로 승인됩니다{mixedResultSuffix(approvable.map((x) => ({ live: x.account?.kind === 'live' })))}.
               </p>
             ) : null}
             <label className="choice">

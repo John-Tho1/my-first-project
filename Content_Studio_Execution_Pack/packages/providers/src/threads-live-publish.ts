@@ -24,6 +24,7 @@ import {
   isAllowedThreadsPermalink,
   isThreadsNumericId,
   LeaseLostError,
+  LIVE_PUBLISH_BUDGET_MARGIN_MS,
   LIVE_THREADS_ADAPTER_ID,
   liveThreadsExternalId,
   liveThreadsStepId,
@@ -448,6 +449,11 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
         return { status: 'rejected', retry_class: 'permanent', error_code: status === 'ERROR' ? 'container_error' : 'container_expired' };
       }
       await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'finished' });
+    }
+    // LIVEP1-TIMEOUT: 표식을 쓰기 전에 남은 시간 확인 — 게시 호출 시간 제한 + 여유보다 적으면 표식·게시 없이 멈춘다(보내지 않음 → 재시도 시
+    // 같은 컨테이너로 이어 게시). 마감이 표식과 threads_publish 사이에서 터져 결과 불명이 되는 것을 앞 단계 지연 때문에 만들지 않는다.
+    if (ctx.deadline !== undefined && ctx.deadline - Date.now() < this.#timeoutMs + LIVE_PUBLISH_BUDGET_MARGIN_MS) {
+      return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' };
     }
     // 게시: lease 확인 → 시도 표식(컨테이너마다 하나 — DB unique) → 바로 threads_publish. 표식 기록이 실패하면 게시하지 않는다(예외 → 조회).
     await this.#beforeWrite(ctx);

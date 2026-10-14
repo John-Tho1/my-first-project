@@ -742,6 +742,31 @@ describe('LIVEP1-DIAG: 실패 진단(허용 목록 숫자·짧은 열거만)', (
   });
 });
 
+describe('LIVEP1-TIMEOUT: 게시 시도 표식 전 남은 시간 확인', () => {
+  it('남은 시간이 게시 호출 시간 제한 + 여유보다 적으면 표식 전에 멈춘다(보내지 않음 — 부작용 없는 일시 오류, threads_publish 0번)', async () => {
+    const { a, seen } = adapterWith(happyRoutes());
+    const steps = memSteps();
+    const c = ctxOf(steps, { deadline: Date.now() + 5_000 }); // 호출당 10초 + 여유 2초보다 적음
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' });
+    expect(classifyOutcome(r).event).toBe('transient_failure');
+    expect(seen.some((s) => s.url.pathname.endsWith('threads_publish'))).toBe(false);
+    expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']); // 표식 없음 — 다음 시도가 같은 컨테이너로 게시
+    // 다음 시도(시간 충분) — 같은 컨테이너로 게시(새 컨테이너 없음)
+    const c2 = ctxOf(steps, { deadline: Date.now() + 60_000, intentKey: 'job-1:2', attempt: 2 });
+    expect(await a.submit(await a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'accepted', external_id: `threads:${MEDIA}` });
+    expect(seen.filter((s) => s.url.pathname === `/v1.0/${USER_ID}/threads` && s.method === 'POST')).toHaveLength(1);
+  });
+  it('남은 시간이 충분하거나 마감이 없으면 그대로 게시', async () => {
+    for (const deadline of [Date.now() + 60_000, undefined]) {
+      const { a, seen } = adapterWith(happyRoutes());
+      const c = ctxOf(memSteps(), deadline === undefined ? {} : { deadline });
+      expect(await a.submit(await a.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted' });
+      expect(seen.filter((s) => s.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    }
+  });
+});
+
 describe('보조 함수', () => {
   it('Threads 시각(+0000) 읽기, 본문 정규화', () => {
     expect(parseThreadsTimestamp('2023-10-17T05:42:03+0000')).toBe(Date.parse('2023-10-17T05:42:03Z'));

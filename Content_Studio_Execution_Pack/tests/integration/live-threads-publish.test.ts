@@ -86,7 +86,7 @@ const jsonRes = (status: number, body: unknown, headers: Record<string, string> 
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 
 // ---- 실제 게시 fixture(주입 fetch) ----
-type Reply = (() => Response) | Error;
+type Reply = (() => Response | Promise<Response>) | Error; // LIVEP1-TIMEOUT: 지연 응답(Promise)도
 interface Call {
   method: string;
   url: URL;
@@ -714,6 +714,70 @@ describe('FIX-LIVEP1-DIAG: 이미 사용 중이던 실제 계정의 표시(다�
       items: Array<{ id: string; capability_snapshot: Record<string, unknown> }>;
     };
     expect(list2.items.find((x) => x.id === acc!.id)!.capability_snapshot).toEqual(OLD);
+  });
+});
+
+// LIVEP1-TIMEOUT(D38 2단계 실제 실행: 폼 tick 10초 예산 안에서 컨테이너 ~5초 + 상태 ~1.5초 + 게시 뒤 시간 초과 → 게시됐는데 UNKNOWN).
+// 실제 Threads 작업은 실제 지연에 맞는 전송 예산(기본 60초)을 쓰고, 표식 전에 남은 시간이 모자라면 보내지 않고 멈춘다.
+const delayed = (ms: number, make: () => Response) => () => new Promise<Response>((resolve) => setTimeout(() => resolve(make()), ms));
+describe('LIVEP1-TIMEOUT: 실제 지연에서도 한 번의 폼 tick 안에 끝남', () => {
+  it('화면 버튼(폼 tick, 10초 예산): 컨테이너 5초 + 상태 1.5초 + 게시 3초 + 읽기 1초 → 한 번에 CONFIRMED(결과 불명 아님)', async () => {
+    const TEXT = '지연 시험 글.';
+    const p = await planApproved([TEXT]);
+    fullCfg('D38-latency', '3');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => {
+      const h = happy(TEXT)(ids);
+      const pth = P(ids);
+      return {
+        [pth.create]: delayed(5000, h[pth.create] as () => Response),
+        [pth.status]: delayed(1500, h[pth.status] as () => Response),
+        [pth.publish]: delayed(3000, h[pth.publish] as () => Response),
+        [pth.read]: delayed(1000, h[pth.read] as () => Response),
+      };
+    });
+    vi.stubGlobal('fetch', fx.fetch);
+    const form = new Request(`${BASE}/api/worker/tick`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', origin: BASE, ...cookieHeader(token) },
+      body: new URLSearchParams({ plan_id: p.planId, max_jobs: '5' }).toString(),
+    });
+    const started = Date.now();
+    const r = await tickPOST(form);
+    expect(r.status).toBe(303);
+    expect(Date.now() - started).toBeGreaterThan(10_000); // 폼 예산(10초)을 넘는 실제 지연이었다
+    vi.unstubAllGlobals();
+    const item = p.items[0]!;
+    expect((await itemOf(item.id)).status).toBe('CONFIRMED');
+    expect((await pubsOf(item.id))[0]).toMatchObject({ isMock: false, externalId: `threads:${fx.ids.media}`, verification: 'VERIFIED' });
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+  });
+
+  it('남은 예산이 게시 호출 시간 제한 + 여유보다 적으면 표식 전에 멈춤(보내지 않음 → RETRY_WAIT, threads_publish 0번) → 다음 시도가 같은 컨테이너로 게시', async () => {
+    const TEXT = '예산 부족 시험 글.';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('D38-budget', '3');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => {
+      const h = happy(TEXT)(ids);
+      const pth = P(ids);
+      return { ...h, [pth.create]: delayed(5000, h[pth.create] as () => Response) };
+    });
+    const reg = registryWith(fx.fetch, config);
+    const run = (budget: number) =>
+      runJobsTick(db, reg, { workerId: 'budget-w', config, ownerId: owner, planId: p.planId, clock: () => new Date(Date.now() + vt), random: () => 0.5, submitTimeoutMs: 5000, liveSubmitTimeoutMs: budget, maxJobs: 5, credentials: jobCredentials(config, db) });
+    // 예산 13초: 컨테이너 5초 뒤 남은 약 8초 < 게시 호출 10초 + 여유 2초 → 표식 전에 멈춤
+    expect((await run(13_000)).results).toEqual({ RETRY_WAIT: 1 });
+    const item = p.items[0]!;
+    const job = await jobOf(item.id);
+    expect(job.lastErrorCode).toBe('publish_budget_insufficient');
+    expect((await stepsOf(item.id)).map((st) => `${st.kind}:${st.status}`)).toEqual(['container:finished']);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(0);
+    // 다음 시도(재시도 시각 뒤, 기본 예산) — 같은 컨테이너로 게시
+    vt += 20 * MIN;
+    expect((await run(60_000)).results).toEqual({ CONFIRMED: 1 });
+    expect(fx.calls.filter((c) => c.method === 'POST' && c.url.pathname === `/v1.0/${PROFILE_ID}/threads`)).toHaveLength(1);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
   });
 });
 

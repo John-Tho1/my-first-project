@@ -88,6 +88,14 @@ export function isAllowedThreadsPermalink(v: unknown): v is string {
 /** 화면 문구: 실제 Threads 게시물의 공개 범위(API 가 게시물별 공개 범위를 주지 않는다 — 문서 확인 2026-10-13). */
 export const LIVE_THREADS_VISIBILITY_TEXT = 'Threads 계정 공개 설정을 따름';
 
+/**
+ * LIVEP1-TIMEOUT(D38 2단계 실제 실행): 실제 Threads 작업 한 번의 전송 예산(ms). 실제 지연(컨테이너 생성 ~5초·상태 ~1.5초·게시·읽기)이 화면 tick 의
+ * 10초 예산을 넘어 게시 뒤 시간 초과 → 결과 불명이 됐다. 실제 어댑터 작업은 max(호출자 예산, 이 값)을 쓴다(호출당 시간 제한 10초는 그대로).
+ */
+export const LIVE_SUBMIT_BUDGET_MS = 60_000;
+/** 게시 시도 표식을 쓰기 전에 남아 있어야 하는 여유(게시 호출 시간 제한에 더함, ms) */
+export const LIVE_PUBLISH_BUDGET_MARGIN_MS = 2_000;
+
 /** 실제 게시 실행 안내(실행 명령 결과·감사). */
 export const LIVE_EXECUTE_NOTICE = '실제 게시 — 작업 처리기가 승인된 내용 그대로 실제 Threads 계정에 게시합니다(되돌리기 없음).';
 

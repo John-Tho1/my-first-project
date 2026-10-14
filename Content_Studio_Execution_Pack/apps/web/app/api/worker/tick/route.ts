@@ -14,7 +14,8 @@ export const runtime = 'nodejs';
  * POST /api/worker/tick — { max_jobs?(1~20, 기본 5), worker_id? } → 200 { worker_id, recovered, leased, results }.
  * 로그인한 owner 의 배포 작업만 한 번 처리한다(lease 만료 복구 → lease → 모의 어댑터 전송·조회). 화면의 "작업 처리 실행(모의 1회)".
  * 외부 호출 없음(모의 어댑터만). CSRF(같은 출처) 검사.
- * 화면 폼(버튼)은 작업당 전송 시간 제한을 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS)(기본 10초)로 줄인다(화면 확인 D7) —
+ * 화면 폼(버튼)은 작업당 전송 시간 제한을 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS)(기본 10초)로 줄인다(화면 확인 D7, 모의 작업) —
+ * LIVEP1-TIMEOUT: 실제 Threads 작업은 실제 지연에 맞게 max(이 값, LIVE_SUBMIT_BUDGET_MS 60초)를 쓴다(작업 처리기 budgetFor — 호출당 10초 제한은 그대로).
  * 넘으면 기존 시간 초과 → RECONCILING(다시 보내지 않고 조회). JSON 호출은 JOB_SUBMIT_TIMEOUT_MS 그대로.
  * FIX-T15(Codex review-T15 P1, docs/02 "웹 요청 안에서 전체 영상 처리 금지"): 영상 업로드는 작업당 조각 1개(WEB_TICK_UPLOAD_SLICE — 5초 상한)만
  * 보내고 받은 바이트를 기록한 뒤 양보한다(RETRY_WAIT 즉시, upload_yield). 다음 tick 이 같은 세션으로 이어 올린다.

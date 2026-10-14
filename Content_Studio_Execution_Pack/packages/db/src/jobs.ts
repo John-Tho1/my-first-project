@@ -35,6 +35,7 @@ import {
   type ThreadsDiag,
   isScheduleStale,
   LIVE_THREADS_EXTERNAL_ID_RE,
+  LIVE_SUBMIT_BUDGET_MS,
   staleScheduleConfirmedBy,
   LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
@@ -114,6 +115,11 @@ export interface JobRunOptions {
   random?: () => number;
   /** 한 owner 의 작업만(POST /api/worker/tick) */
   ownerId?: string;
+  /**
+   * LIVEP1-TIMEOUT: 실제(live) 어댑터 작업의 전송·조회 예산(ms). 실제 작업은 max(submitTimeoutMs, 이 값 — 기본 LIVE_SUBMIT_BUDGET_MS 60초)을 쓴다.
+   * 모의 작업은 submitTimeoutMs 그대로(모의 시간 시험 불변). 시험만 이 값을 줄여 "표식 전 예산 부족"을 재현한다.
+   */
+  liveSubmitTimeoutMs?: number;
   /**
    * FIX-LIVEP1(Codex P1 distribute/[id]/page.tsx): 한 배포 계획의 작업만 lease 한다(계획 화면의 "작업 처리 실행" 버튼). 화면 안내(모의만·실제 게시 포함)가
    * 그 계획의 항목과 맞게 — 다른 계획의 실제 게시 작업을 이 버튼이 처리하지 않는다. lease 만료 복구는 범위와 관계없이 그대로(외부 호출 없음).
@@ -525,7 +531,7 @@ function makeContext(
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
   onLeaseLost?: () => void,
-  extra?: { snapshot: PublishSnapshot; rateUnitsReserved?: number },
+  extra?: { snapshot: PublishSnapshot; rateUnitsReserved?: number; deadline?: number },
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
   const snapshot = extra?.snapshot;
@@ -571,7 +577,13 @@ function makeContext(
     },
     ...(opts.uploadSlice ? { uploadSlice: { ...opts.uploadSlice } } : {}),
     ...(extra?.rateUnitsReserved !== undefined ? { rateUnitsReserved: extra.rateUnitsReserved } : {}),
+    ...(extra?.deadline !== undefined ? { deadline: extra.deadline } : {}),
   };
+}
+
+/** LIVEP1-TIMEOUT: 어댑터 종류별 전송·조회 예산 — 실제 어댑터는 max(호출자 예산, 실제 예산), 모의는 호출자 예산 그대로. */
+function budgetFor(adapter: Pick<ChannelAdapter, 'kind'>, opts: { submitTimeoutMs?: number; liveSubmitTimeoutMs?: number }, base: number = opts.submitTimeoutMs ?? 30_000): number {
+  return adapter.kind === 'live' ? Math.max(base, opts.liveSubmitTimeoutMs ?? LIVE_SUBMIT_BUDGET_MS) : base;
 }
 
 async function withTimeout<T>(ms: number, fn: (signal: AbortSignal) => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; reason: 'timeout' | 'error' }> {
@@ -1001,7 +1013,8 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
   const begun = await beginSend(db, registry, leased, opts, clock());
   if (typeof begun === 'string') return begun;
   // 2단계: DB 잠금 없이 외부(모의) 호출. 시간 초과·예외 = 결과 불명(보냈을 수도 있음).
-  const timeoutMs = opts.submitTimeoutMs ?? 30_000;
+  const timeoutMs = budgetFor(begun.adapter, opts);
+  const deadline = Date.now() + timeoutMs;
   const r = await withTimeout(timeoutMs, async (timeoutSignal) => {
     // FIX-T11(P0): 시간 초과 또는 lease 상실(heartbeat 실패) 중 먼저 온 것으로 중단한다.
     const lease = new AbortController();
@@ -1009,6 +1022,7 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
     const ctx = makeContext(db, begun.job, begun.intentKey, opts, signal, begun.mockScenario, () => lease.abort(), {
       snapshot: begun.snapshot,
       rateUnitsReserved: begun.rateUnitsReserved,
+      deadline,
     });
     let prepared;
     try {
@@ -1152,7 +1166,7 @@ async function remoteCheck(
   job: JobRow,
   item: DistributionItemRow,
   signalMs: number,
-  opts: { workerId: string; clock?: () => Date; leaseTtlMs?: number; tryCancel: boolean; credentials?: JobRunOptions['credentials'] },
+  opts: { workerId: string; clock?: () => Date; leaseTtlMs?: number; tryCancel: boolean; credentials?: JobRunOptions['credentials']; liveSubmitTimeoutMs?: number },
 ): Promise<{ r: ReconcileResult; caps: { definitive_not_found: boolean; mock: boolean }; cancel: CancelResult | null }> {
   const ownerId = job.ownerId;
   const acc = await accountOf(db, ownerId, item.channelAccountId);
@@ -1192,7 +1206,8 @@ async function remoteCheck(
     provider_request_id: intent.providerRequestId,
   };
   let cancel: CancelResult | null = null;
-  const res = await withTimeout(signalMs, async (signal) => {
+  // LIVEP1-TIMEOUT: 실제 어댑터 조회도 실제 지연에 맞는 예산(목록·상태 읽기)
+  const res = await withTimeout(budgetFor(adapter, opts, signalMs), async (signal) => {
     const ctx = makeContext(db as Db, job, intent.intentKey, opts, signal, mockScenario, undefined, { snapshot });
     if (opts.tryCancel && caps.cancel && ref.external_id) {
       cancel = await adapter.cancel(ref, ctx);

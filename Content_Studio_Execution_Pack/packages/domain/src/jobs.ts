@@ -718,6 +718,11 @@ export interface AdapterContext {
    * 다음 시도가 요청 제한 검사를 다시 거친다.
    */
   rateUnitsReserved?: number;
+  /**
+   * LIVEP1-TIMEOUT: 이번 전송 실행의 마감 시각(epoch ms, 실제 시계). 작업 처리기가 넣는다. 실제 Threads 어댑터는 게시 시도 표식을 쓰기 전에
+   * 남은 시간이 게시 호출 시간 제한 + 여유보다 적으면 보내지 않고 멈춘다(부작용 없는 일시 오류 — 표식 뒤 마감으로 결과 불명이 되지 않게).
+   */
+  deadline?: number;
 }
 
 export interface ChannelAdapter {

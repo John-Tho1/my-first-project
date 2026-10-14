@@ -217,4 +217,5 @@ CHANGES_REQUESTED
 | FIX2-LIVEP1 | b8a7200 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVE-P1 종결 |
 | LIVEP1-DIAG | 722e58c | CHANGES_REQUESTED — P1 1(기존 활성 실제 계정의 옛 D31 표시) |
 | FIX-LIVEP1-DIAG | 8701cf5 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-DIAG 종결 |
-| LIVEP1-TIMEOUT | 98f11cd | 검토 대기 (gpt-6-astra · xhigh) |
+| LIVEP1-TIMEOUT | 98f11cd | CHANGES_REQUESTED — P1 1(예산 검사 뒤 표식 기록·heartbeat 시간 미예약) |
+| LIVEP1-USERCONFIRM | a67f462 | 검토 대기 (gpt-6-astra · xhigh) |

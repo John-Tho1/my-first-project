@@ -43,7 +43,7 @@ PLANNED → QUEUED → PREPARING → SENDING → REMOTE_PROCESSING → CONFIRMED
 원격 결과: UPLOADED_PRIVATE / SCHEDULED_REMOTE / PUBLISHED / MANUAL_REPORTED.
 CONFIRMED라고 해서 public인 것은 아니다. verified remote visibility/result_kind를 함께 표시한다.
 여러 채널 중 일부만 성공하면 parent plan은 PARTIAL. 성공한 child는 다시 보내지 않는다.
-수동 URL 입력은 MANUAL_REPORTED(사용자 기록), 실제 상태 조회로 확인한 결과만 VERIFIED.
+수동 URL 입력은 MANUAL_REPORTED(사용자 기록), 실제 상태 조회로 확인한 결과만 VERIFIED. 결과 불명 실제 게시에서 앱이 찾은 확인 후보를 사용자가 원격에서 직접 보고 기록하면 USER_CONFIRMED(사용자 확인 — VERIFIED 아님, D38 LIVEP1-USERCONFIRM).
 세부 상태 전이는 domain 함수 한 곳에서 관리하고 이력은 append-only 기록.
 
 ~~~mermaid

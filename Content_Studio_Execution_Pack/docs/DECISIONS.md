@@ -502,3 +502,5 @@
   범위 밖: 두 번째 게시, 다른 계정·채널, 예약 게시, 이미지·링크, 배포. 끝나면 PUBLISH_LIVE_APPROVAL_REF 제거·PUBLISH_MODE=disabled 로 복귀.
 - **D38 1단계 결과 (2026-10-13 20:06 MSK)**: LIVE-P1 320dadb → FIX 1a22434 → **FIX2 b8a7200 Codex PASS**(gpt-6-astra · xhigh). 검사 unit 1630·integration 895·drill:mock 위반 0 PASS. 오케스트레이터가 `./data/pglite` 백업(`data/pglite.bak-20261013-pre0044`) 뒤 `db:migrate`(0044) 적용, `drill:restore` PASS. 실제 게시·외부 호출 없음(PUBLISH_MODE disabled 그대로).
 - 2단계 준비 값(사용자가 `.env.local` 에 직접): `PUBLISH_MODE=enabled`, `PUBLISH_LIVE_APPROVAL_REF=D38`, `PUBLISH_LIVE_MAX_POSTS=1`. 결과 불명이면 자동 재게시 없이 UNKNOWN — Threads 에서 직접 확인.
+- **D38 2단계 1차 실행 (2026-10-14 12:21 MSK)**: 계획 9aabb159 → 작업 c94807f5 가 컨테이너 생성에서 `container_permission_denied`(영구)로 실패 — **게시 없음**(publish 요청 안 보냄). 사용자 확인: Meta 사용 사례·Threads 앱 양쪽에 threads_content_publish 허용됨. 원인 숫자 코드는 당시 저장하지 않아 미상 → LIVEP1-DIAG(숫자 진단만 저장).
+- **추가 승인 (2026-10-14, 사용자 "나머지 진행해줘")**: 같은 본문·같은 계정으로 시도 1회 추가(실제 게시는 여전히 최대 1건), 진단 기록 추가, 위치 경로·메뉴·UI 정리. 실패 시도가 기존 승인 기록(D38)의 한도 1을 썼으므로 재시도는 새 승인 기록 `PUBLISH_LIVE_APPROVAL_REF=D38-3`, `PUBLISH_LIVE_MAX_POSTS=1` 로, 새 계획(같은 초안)으로 한다.

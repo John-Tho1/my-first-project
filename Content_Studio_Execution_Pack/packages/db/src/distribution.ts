@@ -81,6 +81,7 @@ import { credentialGate, getAccountHealth, LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY, t
 import { LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET, liveApprovalUsage, pendingLiveJobs } from './live-publish';
 import { listRemoteStepsForItems, remoteStepView, type RemoteStepRow } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
+import { latestReconcileEvent } from './user-confirm';
 import {
   approvals,
   assets,
@@ -568,6 +569,11 @@ export interface PlanItemDetail {
    * (@cs/domain recordedAdapterIdOf)로 고르게 한다. 읽기 전용 — 판정·실행에는 쓰지 않는다.
    */
   latestIntent: { attempt: number; sanitizedDetails: Record<string, unknown> } | null;
+  /**
+   * FIX-LIVEP1-USERCONFIRM(Codex P2): 가장 최근 작업의 가장 최근 재확인 이력(없으면 null) — 사용자 확인 route 와 같은 조회(latestReconcileEvent).
+   * 화면 이력(events, 최근 10개)과 따로 읽어 카드의 확인 후보·"Threads에서 확인함" 버튼이 서버 판정과 어긋나지 않게 한다. 읽기 전용.
+   */
+  latestReconcileEvent: { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null;
 }
 
 export interface PlanDetail {
@@ -659,6 +665,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       remoteSteps: allSteps.filter((r) => r.itemId === item.id),
       connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
       latestIntent: intentRows[0] ?? null,
+      latestReconcileEvent: latestJob ? await latestReconcileEvent(db, ownerId, latestJob.id) : null,
     });
   }
   return { plan, items: out };

@@ -49,7 +49,7 @@ import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
 import { POST as userConfirmPOST } from '../../apps/web/app/api/distribution-items/[id]/user-confirm/route';
-import { liveItemHeadline, liveVerificationLabel, userConfirmCandidateForCard } from '../../apps/web/lib/distribution';
+import { liveCandidateForCard, liveItemHeadline, liveVerificationLabel, userConfirmCandidateForCard } from '../../apps/web/lib/distribution';
 import { jobCredentials } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
@@ -402,6 +402,48 @@ describe('Threads에서 확인함 — 성공', () => {
     const r = await runRestoreDrill(db, new LocalStorageAdapter(path.join(tmp, 'assets')), owner, { trigger: 'test', tmpRoot: tmp });
     expect(r.mismatches).toEqual([]);
     expect(r.result).toBe('pass');
+  });
+});
+
+// FIX-LIVEP1-USERCONFIRM(Codex review-LIVEP1-USERCONFIRM P2 lib/distribution.ts:741): 화면 이력은 최근 10개만 — 후보를 남긴 재확인 이력이 그 밖으로
+// 밀려나도 카드의 후보·버튼은 서버(route)와 같은 조회(가장 최근 작업의 가장 최근 재확인 이력)로 정해야 한다.
+describe('FIX-LIVEP1-USERCONFIRM: 후보 이력이 화면 이력(최근 10개) 밖으로 밀려나도 카드와 서버가 같은 판단', () => {
+  /** 재확인이 아닌 이력(details.reconcile 없음)을 n 개 덧붙인다 — 상태는 그대로. */
+  async function addOrdinaryEvents(itemId: string, n: number) {
+    const job = await jobOf(itemId);
+    const seq = (await db.select({ n: sql<number>`coalesce(max(${schema.jobEvents.eventSeq}), 0)::int` }).from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job.id)))[0]!.n;
+    for (let i = 1; i <= n; i++) {
+      await db.insert(schema.jobEvents).values({ ownerId: owner, jobId: job.id, eventSeq: seq + i, stateBefore: job.state, stateAfter: job.state, sanitizedDetails: { event: 'note', note: i } });
+    }
+  }
+
+  it('후보 재확인 뒤 일반 이력 12개 → 카드에 후보·버튼이 그대로 보이고, 서버도 허용(200)', async () => {
+    const s = await ambiguousLivePost('후보 이력이 밀려나는 시험 글.', 'UC-scroll', { candidate: true, until: 'UNKNOWN' });
+    await addOrdinaryEvents(s.itemId, 12);
+    const d = (await getPlanDetail(db, owner, s.planId))!.items[0]!;
+    expect(d.events.some((e) => typeof e.sanitizedDetails.reconcile === 'string')).toBe(false); // 화면 이력(최근 10개)에는 재확인 이력이 없다
+    expect(userConfirmCandidateForCard(d)).toEqual({ external_id: s.candidateId, permalink: s.permalink });
+    expect(liveCandidateForCard(d)).toEqual({ externalId: s.candidateId, permalink: s.permalink });
+    const r = await confirmJson(s.itemId, s.candidateId);
+    expect(r.res.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.fetchCalls).toBe(0);
+    expect((await pubsOf(s.itemId))[0]).toMatchObject({ verification: 'USER_CONFIRMED', externalId: s.candidateId });
+  });
+
+  it('가장 최근 재확인에 후보가 없으면(그 뒤 일반 이력 12개) 카드에도 후보·버튼 없음, 서버도 409 user_confirm_no_candidate', async () => {
+    const s = await ambiguousLivePost('최근 재확인에 후보가 없는 시험 글.', 'UC-scroll-none', { candidate: true, until: 'UNKNOWN' });
+    // 후보를 남긴 재확인 뒤에 후보 없는 재확인(예: 목록에 같은 글 0개)이 왔다
+    const job = await jobOf(s.itemId);
+    const seq = (await db.select({ n: sql<number>`coalesce(max(${schema.jobEvents.eventSeq}), 0)::int` }).from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job.id)))[0]!.n;
+    await db.insert(schema.jobEvents).values({ ownerId: owner, jobId: job.id, eventSeq: seq + 1, stateBefore: 'UNKNOWN', stateAfter: 'UNKNOWN', sanitizedDetails: { event: 'reconcile_retry', reconcile: 'unknown', manual: true } });
+    await addOrdinaryEvents(s.itemId, 12);
+    const d = (await getPlanDetail(db, owner, s.planId))!.items[0]!;
+    expect(liveCandidateForCard(d)).toBeNull();
+    expect(userConfirmCandidateForCard(d)).toBeNull();
+    const r = await confirmJson(s.itemId, s.candidateId);
+    expect(r.res.status).toBe(409);
+    expect(r.body.error).toBe('user_confirm_no_candidate');
+    expect(await pubsOf(s.itemId)).toHaveLength(0);
   });
 });
 

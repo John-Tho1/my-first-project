@@ -724,9 +724,21 @@ export function latestThreadsDiag(events: ReadonlyArray<{ eventSeq: number; sani
 
 export const LIVE_CANDIDATE_LABEL = '확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)';
 
+/** FIX-LIVEP1-USERCONFIRM: 가장 최근 작업의 가장 최근 재확인 이력(@cs/db latestReconcileEvent — 사용자 확인 route 와 같은 조회). */
+type LatestReconcileEvent = { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null;
+
+/**
+ * FIX-LIVEP1-USERCONFIRM(Codex P2): 카드에 보일 확인 후보(미확인) — 화면 이력(최근 10개)이 아니라 서버와 같은 조회의 가장 최근 재확인 이력에서.
+ * 그 재확인이 후보를 남기지 않았으면 null(낡은 후보를 보이지 않음 — liveCandidateFromEvents 규칙 그대로). 링크 없는 후보는 ID 만 보인다(버튼은 없음).
+ */
+export function liveCandidateForCard(x: { latestReconcileEvent: LatestReconcileEvent }): { externalId: string; permalink: string | null } | null {
+  return liveCandidateFromEvents(x.latestReconcileEvent ? [x.latestReconcileEvent] : []);
+}
+
 /**
  * LIVEP1-USERCONFIRM: 항목 카드의 "Threads에서 확인함" 버튼을 보일 후보(아니면 null). 서버(userConfirmItem)와 같은 도메인 판정(userConfirmProblem)을
- * 화면 데이터(계정·가장 최근 작업·단계 기록·결과·최근 이력)로 돌린다 — 버튼을 눌러도 서버가 잠금 안에서 다시 판정한다(이 값은 표시용).
+ * 화면 데이터(계정·가장 최근 작업·단계 기록·결과)와 **서버와 같은 조회의 가장 최근 재확인 이력**(PlanItemDetail.latestReconcileEvent — FIX-LIVEP1-USERCONFIRM,
+ * 화면 이력 10개 제한과 무관)으로 돌린다. 버튼을 눌러도 서버가 잠금 안에서 다시 판정한다(이 값은 표시용).
  * 모의 계정 항목은 언제나 null(모의 결과는 사용자 확인이 될 수 없음).
  */
 export function userConfirmCandidateForCard(x: {
@@ -734,11 +746,11 @@ export function userConfirmCandidateForCard(x: {
   jobs: ReadonlyArray<{ id: string; state: string; restoredNeedsReview?: boolean }>;
   remoteSteps: ReadonlyArray<{ jobId: string; kind: string }>;
   publications: ReadonlyArray<unknown>;
-  events: ReadonlyArray<{ eventSeq: number; sanitizedDetails: Record<string, unknown> }>;
+  latestReconcileEvent: LatestReconcileEvent;
 }): UserConfirmCandidate | null {
   const job = x.jobs.at(-1) ?? null;
   const steps = job ? x.remoteSteps.filter((s) => s.jobId === job.id) : [];
-  const candidate = userConfirmCandidateFromEvents(x.events);
+  const candidate = userConfirmCandidateFromEvents(x.latestReconcileEvent ? [x.latestReconcileEvent] : []);
   const problem = userConfirmProblem(
     {
       account: x.account,

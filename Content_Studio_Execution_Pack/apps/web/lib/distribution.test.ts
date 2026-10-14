@@ -17,6 +17,7 @@ import {
   itemHeadline,
   jobStatusText,
   latestThreadsDiag,
+  liveCandidateForCard,
   liveCandidateFromEvents,
   liveItemHeadline,
   liveVerificationLabel,
@@ -691,7 +692,8 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
       { jobId: 'j1', kind: 'publish_attempt' },
     ],
     publications: [] as unknown[],
-    events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } as Record<string, unknown> }],
+    // FIX-LIVEP1-USERCONFIRM: 서버와 같은 조회의 가장 최근 재확인 이력(화면 이력 10개와 무관)
+    latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } as Record<string, unknown> } as { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null,
     ...over,
   });
   it('조건이 모두 맞으면 후보(버튼), RECONCILING 도', () => {
@@ -706,10 +708,23 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
     ['게시 시도 표식 없음', { remoteSteps: [{ jobId: 'j1', kind: 'container' }] }],
     ['다른 작업의 표식만', { remoteSteps: [{ jobId: 'j0', kind: 'publish_attempt' }] }],
     ['게시 기록 있음', { remoteSteps: [{ jobId: 'j1', kind: 'publish_attempt' }, { jobId: 'j1', kind: 'publish' }] }],
-    ['링크 없는 후보', { events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } }] }],
-    ['최근 재확인에 후보 없음(낡은 후보)', { events: [{ eventSeq: 5, sanitizedDetails: { reconcile: 'unknown' } }, { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } }] }],
+    ['링크 없는 후보', { latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } } }],
+    ['최근 재확인에 후보 없음(낡은 후보는 조회가 고르지 않음)', { latestReconcileEvent: { eventSeq: 5, sanitizedDetails: { reconcile: 'unknown' } } }],
+    ['재확인 이력 없음', { latestReconcileEvent: null }],
   ])('%s → 버튼 없음', (_, over) => {
     expect(userConfirmCandidateForCard(card(over))).toBeNull();
+  });
+  it('FIX-LIVEP1-USERCONFIRM: 후보 표시·버튼은 화면 이력(events)이 아니라 latestReconcileEvent 로 — 화면 이력에 재확인이 없어도 보이고, 화면 이력의 낡은 후보는 무시', () => {
+    const ordinary = Array.from({ length: 10 }, (_, i) => ({ eventSeq: 20 - i, sanitizedDetails: { event: 'note' } as Record<string, unknown> }));
+    const x = { ...card(), events: ordinary };
+    expect(userConfirmCandidateForCard(x)).toEqual({ external_id: ID, permalink: LINK });
+    expect(liveCandidateForCard(x)).toEqual({ externalId: ID, permalink: LINK });
+    const stale = { ...card({ latestReconcileEvent: { eventSeq: 30, sanitizedDetails: { reconcile: 'unknown' } } }), events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } }] };
+    expect(userConfirmCandidateForCard(stale)).toBeNull();
+    expect(liveCandidateForCard(stale)).toBeNull();
+    // 링크 없는 후보: 표시는 ID 만(버튼은 없음 — 위 표)
+    expect(liveCandidateForCard({ latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } } })).toEqual({ externalId: ID, permalink: null });
+    expect(liveCandidateForCard({ latestReconcileEvent: null })).toBeNull();
   });
   it('결과 문구·배지: 사용자 확인은 VERIFIED 와 다른 문구·다른 색, 그 밖은 배지 없음', () => {
     expect(liveVerificationLabel('USER_CONFIRMED', LINK)).toContain('사용자 확인');

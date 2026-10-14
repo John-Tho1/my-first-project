@@ -21,7 +21,7 @@ import {
 import { lockItemsInOrder, recomputePlanStatus, syncItemStatus, transitionJob } from './approval-invalidation';
 import type { Db } from './client';
 import { publishedStepCount } from './remote-steps';
-import { recordAudit } from './queries';
+import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, jobEvents, jobs, publications } from './schema';
 
 const ITEM_NOT_FOUND = '배포 항목을 찾을 수 없습니다';
@@ -39,6 +39,20 @@ export interface UserConfirmOutcome {
   confirmed_at: string;
   mode: 'LIVE';
   message: string;
+}
+
+/**
+ * 작업의 **가장 최근 재확인 이력**(details.reconcile 이 문자열인 사건, event_seq 최대) 하나 — 없으면 null. 사용자 확인 route(userConfirmItem)와
+ * 배포 계획 화면(getPlanDetail → 카드의 후보·버튼)이 같은 조회를 쓴다. FIX-LIVEP1-USERCONFIRM(Codex P2): 화면 이력(최근 10개)에 기대지 않는다.
+ */
+export async function latestReconcileEvent(tx: DbOrTx, ownerId: string, jobId: string): Promise<{ eventSeq: number; sanitizedDetails: Record<string, unknown> } | null> {
+  const rows = await tx
+    .select({ eventSeq: jobEvents.eventSeq, sanitizedDetails: jobEvents.sanitizedDetails })
+    .from(jobEvents)
+    .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, jobId), sql`jsonb_typeof(${jobEvents.sanitizedDetails}->'reconcile') = 'string'`))
+    .orderBy(desc(jobEvents.eventSeq))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 export async function userConfirmItem(db: Db, ownerId: string, itemId: string, input: UserConfirmInput, now: Date = new Date()): Promise<UserConfirmOutcome> {
@@ -64,15 +78,8 @@ export async function userConfirmItem(db: Db, ownerId: string, itemId: string, i
       .from(publications)
       .where(and(eq(publications.ownerId, ownerId), eq(publications.itemId, item.id)));
     // 가장 최근 재확인 이력(details.reconcile 이 문자열) 하나 — 후보 판정은 도메인 함수(화면과 같은 규칙)
-    const reconcileRows = job
-      ? await tx
-          .select({ eventSeq: jobEvents.eventSeq, sanitizedDetails: jobEvents.sanitizedDetails })
-          .from(jobEvents)
-          .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, job.id), sql`jsonb_typeof(${jobEvents.sanitizedDetails}->'reconcile') = 'string'`))
-          .orderBy(desc(jobEvents.eventSeq))
-          .limit(1)
-      : [];
-    const candidate = userConfirmCandidateFromEvents(reconcileRows);
+    const latestReconcile = job ? await latestReconcileEvent(tx, ownerId, job.id) : null;
+    const candidate = userConfirmCandidateFromEvents(latestReconcile ? [latestReconcile] : []);
     const problem = userConfirmProblem(
       {
         account: accRows[0] ?? null,

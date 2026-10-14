@@ -27,7 +27,7 @@ import {
   LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
   latestThreadsDiag,
-  liveCandidateFromEvents,
+  liveCandidateForCard,
   liveItemHeadline,
   liveStepLine,
   liveVerificationLabel,
@@ -370,7 +370,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
   };
   // FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 확인 후보(미확인) — 결과로 쓰지 않고 안내만
-  const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateFromEvents(x.events) : null;
+  // FIX-LIVEP1-USERCONFIRM(Codex P2): 후보는 화면 이력(최근 10개)이 아니라 서버(user-confirm route)와 같은 조회의 가장 최근 재확인 이력에서
+  const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateForCard(x) : null;
   // LIVEP1-USERCONFIRM: "Threads에서 확인함" — 서버와 같은 판정으로 버튼을 보일 후보(모의 항목은 항상 null)
   const confirmable = live && candidate ? userConfirmCandidateForCard(x) : null;
   const pubTag = live ? liveVerificationTag(latestPub?.verification) : null;

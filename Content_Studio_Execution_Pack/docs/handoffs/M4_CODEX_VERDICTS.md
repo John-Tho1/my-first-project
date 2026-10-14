@@ -221,4 +221,5 @@ CHANGES_REQUESTED
 | LIVEP1-USERCONFIRM | a67f462 | CHANGES_REQUESTED — P2 1(표시 이력 10개 밖으로 후보가 밀리면 버튼 사라짐) |
 | FIX-LIVEP1-TIMEOUT | e708106 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-TIMEOUT 종결 |
 | FIX-LIVEP1-USERCONFIRM | 2af529b | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-USERCONFIRM 종결 |
-| UI-CLEAN | fdb6aea | 검토 대기 (gpt-6-astra · xhigh) |
+| UI-CLEAN | fdb6aea | CHANGES_REQUESTED — P1 1(실제 계정 있으나 게시 대상 없을 때 MOCK 단정), P2 1(복원 완료 위치 경로) |
+| FIX-UICLEAN | 254ee5e | 검토 대기 (gpt-6-astra · xhigh) |

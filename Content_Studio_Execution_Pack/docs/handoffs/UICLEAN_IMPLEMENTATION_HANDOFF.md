@@ -104,3 +104,49 @@
 
 ## Next authorized task
 orchestrator 결정(커밋 → Codex 검증).
+
+---
+
+# FIX-UICLEAN (Codex review-UI-CLEAN CHANGES_REQUESTED)
+- **BASE_SHA:** fdb6aea (UI-CLEAN 코드 커밋; docs aed2e7e 위). **HEAD_SHA:** uncommitted — orchestrator commits.
+- 절차: prompts/CLAUDE_FIX.md — 실패 시험을 먼저 쓰고 실행(red: `.handoffs/checks-FIX-UICLEAN.red.log` 17건 실패, `.red-integ.log` 2건 실패) → 수정 → green.
+
+## Finding → 변경 → 시험
+| Finding | 변경 | 회귀 시험 |
+|---|---|---|
+| **P1** `distribute/page.tsx:42` 실제 게시 대상이 없다는 것만으로 결과·원격 ID 를 MOCK 으로 단정 | 새 `apps/web/lib/record-labels.ts` `accountModeOf()` 로 지금 계정 상태 4가지 구분: 모의만(MOCK 안내) · 실제 계정 있으나 대상 없음("실제 게시 대상 미지정") · 실제 게시 대상 있음(실제 게시 안내) · 계정 없음. 안내는 어느 상태에서도 기존 결과를 MOCK 이라고 하지 않고 "실제/MOCK 표시는 각 계획·결과의 기록 기준" 을 덧붙인다. 계획 한 줄의 태그·상태 문구는 그 계획 항목의 기록(`PlanListEntry.mock` = 항목 계정 kind, publications.is_mock 과 DB 트리거 `publications_kind_guard` 로 같은 값)으로: `planRowTag`(MOCK / 실제 게시 포함 / 항목 없으면 없음), `planStatusText`(실제 계정 계획이면 PLAN_STATUS_LABEL 의 "(MOCK…)" 꼬리표만 뗌 — lib/distribution.ts 문구는 안 바꿈). 홈 「최근 배포」도 같은 함수. 계정 목록 안내 "모의(MOCK) 계정만 있습니다" 고정 문구 → 상태 태그 | `lib/distribute-list-render.test.ts`(실제 `/distribute` 컴포넌트 렌더, DB·세션 가짜): (a)(b)(c)·계정 0개, 모든 상태에서 "모두 MOCK"·"결과와 원격 ID 는" 없음, **지난 실제 계획 + 지금 모의만** → 그 줄은 "실제 게시 포함"·MOCK 없음·"처리 끝", 모의 계획 줄은 MOCK·"처리 끝(MOCK — 실제 발행 아님)", 실제 대상 있어도 모의 계획은 MOCK, 빈 계획은 태그 없음. `lib/record-labels.test.ts` 단위 |
+| **P2** `settings/restores/[id]/page.tsx:64` 완료 뒤에도 위치가 "복원 미리보기" | `CrumbTarget` `{ page: 'restore'; committed: boolean }` → "복원 완료"/"복원 미리보기", 화면은 `committed: Boolean(committed)` 를 넘김 | `nav.test.ts` 두 상태, `ui-safety.test.ts` 화면이 상태를 넘기는지 |
+| 오래된 문구 `/ops` "현재 연결은 모두 모의(MOCK)입니다" | `listAccountHealth` 로 지금 계정 상태 → `opsAccountsNote()`(모의만일 때만 그 문장, 대상 미지정·대상 있음·없음 각각) | `record-labels.test.ts`, `ui-safety.test.ts`(고정 문구 없음 + 함수 사용) |
+| 오래된 제목 `/ops` "배포 작업(MOCK)" | `packages/db/src/ops.ts` `opsSnapshot().jobs.byKind {mock, live}`(작업 → 항목 → 계정 kind, owner 범위) 추가, 제목은 "배포 작업" + `opsJobsTag()`(실제 계정 작업이 있으면 "실제 게시 작업 n개 포함", 모의만이면 MOCK, 없으면 태그 없음) | 새 통합 시험 `tests/integration/ops-job-kind.test.ts`(0/0 → 모의 작업 1 → 실제 블로그 계정 항목의 끝난 작업 1 = {1,1}, 다른 owner 0), `record-labels.test.ts` |
+| 오래된 문구 `/distribute/[id]` 요청 결과 혼합 안내 "(MOCK — 실제 게시 아님)" | `mixedResultSuffix()` — 고를 수 있는 항목의 계정 kind 기록으로(모두 모의 / 모두 실제 / 섞임) | `record-labels.test.ts`, `ui-safety.test.ts` |
+| 같은 문제(추가 발견) `/distribute/[id]` 계획 생성 배너 "(MOCK — 아직 승인 전)"·재시도 배너 "(MOCK — 새 시도)" | `planCreatedBanner(hasLive)`·`retriedBanner(hasLive)` — hasLive = 이 계획 항목의 계정 kind 기록 | 같음 |
+| Codex 질문 3 답: variants-panel 승인됨 "(MOCK)" 을 livePlatforms 부재로 확정 | "(게시 유형은 계획에서 확인)" 로(양성 분기는 그대로) | `ui-safety.test.ts` 고정 `'(MOCK)'` 없음 |
+| Coordinator: 실제 게시 보류 조건 문장 | `/distribute/[id]` 실제 게시 안내 셋째 줄로 보이게(자세히 밖, 접힘 블록 삭제) | `ui-safety.test.ts` 토큰 추가 |
+
+- Codex 질문 1 답의 "연결 해제는 Threads 권한 철회가 아님": 실제 계정 버튼 문구 "연결 해제(로컬 삭제 — Threads 철회 API 없음)" 가 이미 버튼에 보임 — 바꾸지 않음.
+- 제목 변경 2건(원고·브랜드 프로필)은 지시대로 유지.
+
+## Changed files (FIX)
+- 새: `apps/web/lib/record-labels.ts`, `apps/web/lib/record-labels.test.ts`, `apps/web/lib/distribute-list-render.test.ts`, `tests/integration/ops-job-kind.test.ts`
+- 수정: `apps/web/app/distribute/page.tsx`, `apps/web/app/distribute/[id]/page.tsx`, `apps/web/app/ops/page.tsx`, `apps/web/app/page.tsx`, `apps/web/app/settings/restores/[id]/page.tsx`, `apps/web/app/contents/[id]/variants-panel.tsx`, `apps/web/lib/nav.ts`, `apps/web/lib/nav.test.ts`(restore 대상에 상태 추가 — 기존 단언은 미리보기 쪽으로 그대로, 완료 쪽 추가), `apps/web/lib/ui-safety.test.ts`(토큰 추가 + 고정 MOCK 단정 문구 금지 블록; 배포함·홈의 `MOCK_TAG` 소스 토큰은 `planRowTag(e)` 로 대체 — 렌더 시험이 MOCK 표시를 직접 확인), `packages/db/src/ops.ts`(`jobs.byKind` 필드 추가만, 기존 필드 불변)
+- 마이그레이션 없음. 새 의존성 없음.
+
+## Commands (FIX) — `.handoffs/run-checks-FIX-UICLEAN.sh`, 요약 `.handoffs/checks-FIX-UICLEAN.log`
+| 명령 | 결과 |
+|---|---|
+| red: 대상 단위 4파일 / 새 통합 1파일 | 17 실패 / 2 실패(수정 전 기대대로) |
+| green: 대상 단위 5파일 / 새 통합 1파일 | 81 passed / 2 passed |
+| `corepack pnpm lint` | PASS |
+| `corepack pnpm typecheck` | PASS |
+| `vitest run --project unit` | PASS — 74 files · 1788 tests |
+| `vitest run --project integration --maxWorkers=2` | PASS — 50 files · 917 tests |
+| 포트 3000 비어 있음 확인 → `corepack pnpm build` | PASS |
+| `corepack pnpm drill:mock` | PASS — 불변식 위반 0건 |
+| db:migrate · drill:restore | not_run(지시) |
+외부 호출 없음. 시작 전 남은 vitest·drill·next 프로세스 0개 확인, 어떤 프로세스도 종료하지 않음.
+
+## Remaining risks (FIX)
+1. 배포함 목록의 실제/MOCK 은 `PlanListEntry.mock`(모든 항목이 모의 계정) 기준 — 섞인 계획은 "실제 게시 포함" 하나로 표시(항목별 수는 상세 화면). publications.is_mock 은 DB 트리거로 항목 계정 kind 와 같아 같은 판정이지만, 목록이 publications 를 직접 읽지는 않음.
+2. `/distribute/[id]` 항목 카드·배너의 렌더 경로 전체(UNKNOWN·확인 후보·사용자 확인 등 조건별)는 여전히 소스 토큰 시험 + 순수 함수 시험이고 실제 렌더 시험은 배포함(`/distribute`)만.
+3. 375px·다크 모드 브라우저 확인은 여전히 하지 않음(개발 서버 금지).
+4. `opsSnapshot` 에 쿼리 1개 추가(작업 수만큼 join, owner 범위) — 운영 화면 전용.

@@ -570,10 +570,13 @@ export const ROW_SCHEMAS = {
     permalink: nstr,
     result_kind: z.enum(['UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED', 'MANUAL_REPORTED']),
     remote_visibility: z.enum(['private', 'unlisted', 'public', 'unknown']),
-    verification: z.enum(['MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED']),
+    verification: z.enum(['MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED', 'USER_CONFIRMED']),
     is_mock: z.boolean(),
     verified_at: ts.nullable(),
     created_at: ts,
+    // LIVEP1-USERCONFIRM(0045): 사용자 확인한 사람('owner' 만)·시각 — 0045 이전 묶음에는 없다(null).
+    confirmed_by: z.literal('owner').nullable().default(null),
+    confirmed_at: ts.nullable().default(null),
   }),
   // T12(0018)
   mock_scenarios: z.strictObject({
@@ -1569,6 +1572,13 @@ function checkDistributionIntegrity(
       problems.push('publications: 실제 결과는 threads:<숫자> 외부 ID·공식 Threads 링크');
     }
     if (p.verification === 'VERIFIED' && p.verified_at === null) problems.push('publications: VERIFIED 는 verified_at 필요');
+    // LIVEP1-USERCONFIRM(0045, DB CHECK publications_user_confirmed_chk·_shape_chk 와 같은 규칙): 사용자 확인 ⇔ 확인자·시각, 실제·공식 링크·PUBLISHED·verified_at 없음
+    if ((p.verification === 'USER_CONFIRMED') !== (p.confirmed_by !== null) || (p.confirmed_by === null) !== (p.confirmed_at === null)) {
+      problems.push('publications: USER_CONFIRMED ⇔ confirmed_by·confirmed_at');
+    }
+    if (p.verification === 'USER_CONFIRMED' && (p.is_mock || p.verified_at !== null || p.permalink === null || p.result_kind !== 'PUBLISHED')) {
+      problems.push('publications: USER_CONFIRMED 는 실제 결과·공식 링크·PUBLISHED, verified_at 없음');
+    }
     const pubAcc = accountById.get(itemById.get(p.item_id)?.channel_account_id ?? '');
     if (pubAcc && p.is_mock !== (pubAcc.kind === 'mock')) problems.push('publications: 모의·실제 결과 ⇔ 항목 계정 kind');
   }

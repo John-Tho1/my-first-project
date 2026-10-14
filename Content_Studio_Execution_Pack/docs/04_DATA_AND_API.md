@@ -64,6 +64,7 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 실제 게시 계정 사용(LIVE-P1, D38) | POST /api/channel-accounts/{id}/publish-target { enabled } | 실제 Threads 계정만(묶임·쓸 수 있는 연결 정보일 때 connected, 사용 중지는 disconnected + 그 계정 활성 승인 철회). 외부 호출 없음. 실제 게시는 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS·서버 승인(hash)이 모두 있을 때만 |
 | 실제 Threads 계정 행(연결 전) | POST /api/channel-accounts (platform=threads, kind=live) | LIVE-T1(D31): owner 범위·같은 출처·멱등, external_account_id `pending:<uuid>` → 첫 실제 연결이 프로필 ID 로 묶음, state disconnected(게시 불가), 외부 호출 없음 |
 | 원격 재확인 | POST /api/distribution-items/{id}/reconcile | 기존 결과 조회만 수행 |
+| Threads에서 확인함(LIVEP1-USERCONFIRM) | POST /api/distribution-items/{id}/user-confirm { candidate_external_id } | 결과 불명 실제 Threads 게시(UNKNOWN·RECONCILING, 게시 시도 표식 있음, 결과 없음)의 가장 최근 재확인 후보를 사용자가 직접 확인했다는 기록 — 요청 ID = 그 후보일 때만. 결과 verification USER_CONFIRMED(앱 검증 VERIFIED 아님)·confirmed_by owner·confirmed_at, 작업 CONFIRMED. 외부 호출·재게시 없음, 아니면 409 user_confirm_* |
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |
 | 복원 미리보기 | POST /api/restores/preview | 버전·checksum·충돌 검사 |

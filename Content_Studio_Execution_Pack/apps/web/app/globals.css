@@ -10,6 +10,11 @@
   --badge-bg: #eef1f6;
   --live-bg: #fde8e8;
   --live-text: #9b1c1c;
+  /* LIVEP1-USERCONFIRM: 결과 확인 배지 — 앱 검증(VERIFIED)과 사용자 확인(USER_CONFIRMED)을 다른 색으로 */
+  --verified-bg: #e3f4e8;
+  --verified-text: #1d6b35;
+  --userconf-bg: #ece6fb;
+  --userconf-text: #5b3aa8;
   --radius: 10px;
   color-scheme: light dark;
 }
@@ -27,6 +32,10 @@
     --badge-bg: #2a2f37;
     --live-bg: #4a1f1f;
     --live-text: #ffb4b4;
+    --verified-bg: #16351f;
+    --verified-text: #9be0b0;
+    --userconf-bg: #2c2346;
+    --userconf-text: #cdb9ff;
   }
 }
 
@@ -158,6 +167,16 @@ body {
   background: var(--badge-bg);
   border-radius: 6px;
   padding: 0 8px;
+}
+
+.tag.verified {
+  background: var(--verified-bg);
+  color: var(--verified-text);
+}
+
+.tag.user-confirmed {
+  background: var(--userconf-bg);
+  color: var(--userconf-text);
 }
 
 .tag.warn {

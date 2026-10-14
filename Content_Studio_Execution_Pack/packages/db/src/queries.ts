@@ -245,6 +245,8 @@ export interface AuditInput {
     | 'item.cancel'
     | 'item.reconcile'
     | 'item.retry'
+    // LIVEP1-USERCONFIRM: 결과 불명 실제 게시를 사용자가 "Threads에서 확인함"으로 기록(외부 호출 없음)
+    | 'item.user_confirm'
     | 'item.mock_scenario'
     | 'worker.tick'
     | 'restore_drill.run'

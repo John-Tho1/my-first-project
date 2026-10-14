@@ -14,6 +14,10 @@ import {
   sanitizeThreadsDiag,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
+  USER_CONFIRMED_LABEL,
+  userConfirmCandidateFromEvents,
+  userConfirmProblem,
+  type UserConfirmCandidate,
   scenarioApplies,
   type AdapterId,
   type CredentialStatus,
@@ -115,6 +119,15 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   not_retryable: '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.',
   attempts_exhausted: '시도 한도에 이르렀습니다. 새 배포 계획을 만드세요.',
   outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
+  // LIVEP1-USERCONFIRM: "Threads에서 확인함" 거절(아무것도 기록하지 않음·외부 호출 없음)
+  user_confirm_not_live: '실제 Threads 계정 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(모의 결과는 해당 없음).',
+  user_confirm_already_published: '이미 결과가 기록된 항목입니다(다시 기록하지 않았습니다).',
+  user_confirm_not_pending: '결과 불명·확인 중 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(지금 상태에서는 기록하지 않았습니다).',
+  user_confirm_restored: '복원한 작업은 이 환경에서 사용자 확인으로 기록하지 않습니다. 새 배포 계획을 만드세요.',
+  user_confirm_no_attempt: '게시를 시도한 기록이 없는 작업이라 사용자 확인으로 기록하지 않았습니다.',
+  user_confirm_publish_recorded: '게시 기록(미디어 ID)이 이미 있습니다 — 재확인으로 결과를 확정하세요.',
+  user_confirm_no_candidate: '가장 최근 재확인에 확인 후보 링크가 없어 기록하지 않았습니다. 재확인하거나 Threads 에서 직접 확인하세요.',
+  user_confirm_candidate_mismatch: '화면의 확인 후보가 지금 기록된 후보와 달라 기록하지 않았습니다. 새로 고친 뒤 다시 확인하세요.',
   not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
   item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
   scenario_not_applicable:
@@ -333,6 +346,8 @@ interface PubLike {
   permalink: string | null;
   resultKind: string;
   isMock: boolean;
+  /** LIVEP1-USERCONFIRM: 있으면 USER_CONFIRMED 를 "사용자 확인"으로(앱 검증 문구와 구분) */
+  verification?: string;
 }
 
 /**
@@ -367,6 +382,8 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
     case 'BLOCKED':
       return `BLOCKED · ${BLOCK_REASON_LABEL[blockReason ?? job.lastErrorCode ?? ''] ?? '보류'}`;
     case 'CONFIRMED': {
+      // LIVEP1-USERCONFIRM: 사용자가 Threads 에서 확인해 기록한 결과 — "확인"(앱 조회)으로 읽히지 않게
+      if (pub && !pub.isMock && pub.verification === 'USER_CONFIRMED') return `CONFIRMED · ${USER_CONFIRMED_LABEL}(Threads 에서 직접 확인함 — 앱 검증 아님)${pub.permalink ? ` (${pub.permalink})` : ''}`;
       const kind = pub ? (RESULT_KIND_LABEL[pub.resultKind] ?? pub.resultKind) : '결과';
       const mock = !pub || pub.isMock ? 'MOCK ' : '';
       return `CONFIRMED · ${mock}${kind} 확인${pub?.permalink ? ` (${pub.permalink})` : ''}`;
@@ -707,9 +724,50 @@ export function latestThreadsDiag(events: ReadonlyArray<{ eventSeq: number; sani
 
 export const LIVE_CANDIDATE_LABEL = '확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)';
 
+/**
+ * LIVEP1-USERCONFIRM: 항목 카드의 "Threads에서 확인함" 버튼을 보일 후보(아니면 null). 서버(userConfirmItem)와 같은 도메인 판정(userConfirmProblem)을
+ * 화면 데이터(계정·가장 최근 작업·단계 기록·결과·최근 이력)로 돌린다 — 버튼을 눌러도 서버가 잠금 안에서 다시 판정한다(이 값은 표시용).
+ * 모의 계정 항목은 언제나 null(모의 결과는 사용자 확인이 될 수 없음).
+ */
+export function userConfirmCandidateForCard(x: {
+  account: { kind: string; platform: string } | null;
+  jobs: ReadonlyArray<{ id: string; state: string; restoredNeedsReview?: boolean }>;
+  remoteSteps: ReadonlyArray<{ jobId: string; kind: string }>;
+  publications: ReadonlyArray<unknown>;
+  events: ReadonlyArray<{ eventSeq: number; sanitizedDetails: Record<string, unknown> }>;
+}): UserConfirmCandidate | null {
+  const job = x.jobs.at(-1) ?? null;
+  const steps = job ? x.remoteSteps.filter((s) => s.jobId === job.id) : [];
+  const candidate = userConfirmCandidateFromEvents(x.events);
+  const problem = userConfirmProblem(
+    {
+      account: x.account,
+      jobState: job?.state ?? null,
+      restored: !!job?.restoredNeedsReview,
+      publishAttempts: steps.filter((s) => s.kind === 'publish_attempt').length,
+      publishSteps: steps.filter((s) => s.kind === 'publish').length,
+      publications: x.publications.length,
+      candidate,
+    },
+    candidate?.external_id ?? null,
+  );
+  return problem ? null : candidate;
+}
+
+/** LIVEP1-USERCONFIRM: 실제 결과 확인 상태 배지(문구·색 — VERIFIED 와 USER_CONFIRMED 는 다른 색). */
+export function liveVerificationTag(verification: string | null | undefined): { text: string; className: string } | null {
+  if (verification === 'VERIFIED') return { text: '확인됨(VERIFIED)', className: 'tag verified' };
+  if (verification === 'USER_CONFIRMED') return { text: USER_CONFIRMED_LABEL, className: 'tag user-confirmed' };
+  return null;
+}
+
+export const USER_CONFIRMED_NOTICE = 'Threads에서 확인함으로 기록했습니다(사용자 확인 — 앱이 검증한 것은 아님). 다시 게시하지 않았습니다.';
+
 /** 실제 게시 결과의 확인 상태(VERIFIED = 게시 뒤 원격 읽기로 ID·본문·링크 확인, UNVERIFIED = 게시 ID 는 받았지만 읽기 확인 못 함). */
 export function liveVerificationLabel(verification: string | null | undefined, permalink: string | null | undefined): string {
   if (verification === 'VERIFIED') return '확인됨(게시 뒤 원격 조회로 본문·링크 확인)';
+  // LIVEP1-USERCONFIRM: 사용자 확인 — 앱이 검증하지 않았음을 같이 말한다
+  if (verification === 'USER_CONFIRMED') return `${USER_CONFIRMED_LABEL}(Threads 에서 직접 확인함 — 앱이 검증한 것은 아님)`;
   return permalink ? '미확인(링크는 있으나 본문·ID 확인 못 함)' : '미확인(링크 확인 못 함 — Threads 에서 직접 확인)';
 }
 

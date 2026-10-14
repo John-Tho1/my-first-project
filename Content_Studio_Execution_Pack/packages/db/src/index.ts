@@ -35,3 +35,4 @@ export * from './media-spec';
 export * from './imports';
 export * from './collector';
 export * from './live-publish';
+export * from './user-confirm';

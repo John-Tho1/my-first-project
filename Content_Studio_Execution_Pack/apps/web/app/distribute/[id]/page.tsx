@@ -2,7 +2,18 @@ import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getPlanDetail, type PlanItemDetail } from '@cs/db';
-import { adapterIdFor, CHANNEL_LABEL, formatMsk, LIVE_THREADS_VISIBILITY_TEXT, providerMetadataOf, type AdapterId, type CanonicalPayload, type Channel } from '@cs/domain';
+import {
+  adapterIdFor,
+  CHANNEL_LABEL,
+  formatMsk,
+  LIVE_THREADS_VISIBILITY_TEXT,
+  providerMetadataOf,
+  USER_CONFIRM_BUTTON,
+  USER_CONFIRM_WARNING,
+  type AdapterId,
+  type CanonicalPayload,
+  type Channel,
+} from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import {
   bannersFromState,
@@ -20,6 +31,7 @@ import {
   liveItemHeadline,
   liveStepLine,
   liveVerificationLabel,
+  liveVerificationTag,
   mockScenarioOptionsFor,
   PLAN_STATUS_LABEL,
   problemLabel,
@@ -31,6 +43,8 @@ import {
   revocationCountParam,
   revocationNotice,
   stepsPanelView,
+  USER_CONFIRMED_NOTICE,
+  userConfirmCandidateForCard,
   VISIBILITY_LABEL,
   YOUTUBE_STEP_LABEL,
   youtubeProgressLine,
@@ -357,6 +371,9 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   };
   // FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 확인 후보(미확인) — 결과로 쓰지 않고 안내만
   const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateFromEvents(x.events) : null;
+  // LIVEP1-USERCONFIRM: "Threads에서 확인함" — 서버와 같은 판정으로 버튼을 보일 후보(모의 항목은 항상 null)
+  const confirmable = live && candidate ? userConfirmCandidateForCard(x) : null;
+  const pubTag = live ? liveVerificationTag(latestPub?.verification) : null;
   // LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 숫자만) — 판정 코드만으로는 원인을 알 수 없을 때
   const diagLine = live ? latestThreadsDiag(x.events) : null;
   const headline = live ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null }) : itemHeadline(headlineInput);
@@ -388,6 +405,12 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           <>
             {' '}
             <span className="tag warn">MOCK</span> <strong>실제 발행 실적 아님</strong>
+          </>
+        ) : null}
+        {x.item.status === 'CONFIRMED' && live && pubTag ? (
+          <>
+            {' '}
+            <span className={pubTag.className}>{pubTag.text}</span>
           </>
         ) : null}
         {x.item.status === 'CONFIRMED' && live && latestPub?.permalink ? (
@@ -496,6 +519,16 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               — Threads 에서 직접 보고 판단하세요. 이 앱은 이 글을 게시 결과로 기록하지 않았습니다.
             </p>
           ) : null}
+          {live && candidate && confirmable && confirmable.external_id === candidate.externalId ? (
+            <form className="form inline" method="post" action={`/api/distribution-items/${x.item.id}/user-confirm`}>
+              <input type="hidden" name="plan_id" value={x.item.planId} />
+              <input type="hidden" name="candidate_external_id" value={confirmable.external_id} />
+              <button type="submit">{USER_CONFIRM_BUTTON}</button>
+              <span className="note" role="note">
+                {USER_CONFIRM_WARNING} (기록만 합니다 — 다시 게시하지 않음)
+              </span>
+            </form>
+          ) : null}
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
@@ -551,7 +584,14 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
                 </li>
               ) : (
                 <li key={p.id}>
-                  <span className="tag warn">실제 게시</span> 실제 Threads 게시물 · 공개 범위 {LIVE_THREADS_VISIBILITY_TEXT} · 확인: {liveVerificationLabel(p.verification, p.permalink)} ·{' '}
+                  <span className="tag warn">실제 게시</span>{' '}
+                  {liveVerificationTag(p.verification) ? (
+                    <>
+                      <span className={liveVerificationTag(p.verification)!.className}>{liveVerificationTag(p.verification)!.text}</span>{' '}
+                    </>
+                  ) : null}
+                  실제 Threads 게시물 · 공개 범위 {LIVE_THREADS_VISIBILITY_TEXT} · 확인: {liveVerificationLabel(p.verification, p.permalink)}
+                  {p.verification === 'USER_CONFIRMED' && p.confirmedAt ? ` (${formatMsk(p.confirmedAt)} 사용자 기록)` : ''} ·{' '}
                   <span className="hash">{p.externalId}</span>
                   {p.permalink ? (
                     <>
@@ -687,6 +727,12 @@ export default async function PlanPage({
       {banners.retried ? (
         <p className="saved" role="status">
           보류된 작업을 다시 대기열에 넣었습니다(MOCK — 새 시도). &quot;작업 처리 실행(모의 1회)&quot;을 누르면 처리합니다.
+        </p>
+      ) : null}
+      {/* LIVEP1-USERCONFIRM: 배너는 저장된 사용자 확인 결과가 있을 때만(쿼리만으로 주장하지 않음) */}
+      {q.user_confirmed === '1' && d.items.some((x) => x.publications.some((p) => !p.isMock && p.verification === 'USER_CONFIRMED')) ? (
+        <p className="saved" role="status">
+          {USER_CONFIRMED_NOTICE}
         </p>
       ) : null}
       {q.scenario_saved === '1' ? (

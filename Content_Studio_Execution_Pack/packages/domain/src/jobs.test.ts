@@ -63,7 +63,9 @@ describe('작업 상태 기계(JOB_TRANSITIONS)', () => {
   });
 
   it('A08: UNKNOWN 에서 전송(lease)·재시도 대기로 가는 전이는 없다 — 찾음/처리 중/확인 기록만', () => {
-    expect(Object.keys(JOB_TRANSITIONS.UNKNOWN).sort()).toEqual(['reconcile_retry', 'reconciled_found', 'remote_accepted']);
+    // LIVEP1-USERCONFIRM: 사용자 확인(user_confirmed → CONFIRMED, 외부 호출 없음)이 더해졌다 — 전송(lease)·재시도 대기 전이는 여전히 없다.
+    expect(Object.keys(JOB_TRANSITIONS.UNKNOWN).sort()).toEqual(['reconcile_retry', 'reconciled_found', 'remote_accepted', 'user_confirmed']);
+    expect(JOB_TRANSITIONS.UNKNOWN.user_confirmed).toBe('CONFIRMED');
     expect(canTransitionJob('UNKNOWN', 'lease')).toBe(false);
     expect(canTransitionJob('UNKNOWN', 'reconciled_not_found')).toBe(false);
   });

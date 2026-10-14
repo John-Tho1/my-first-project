@@ -4,7 +4,7 @@
  * - 작업 상태 전이는 이 파일의 JOB_TRANSITIONS 한 곳에서만 정의한다(docs/03 "세부 상태 전이는 domain 함수 한 곳").
  *   DB 계층(@cs/db jobs.ts)은 transitionJobState 로만 다음 상태를 얻고, 표에 없는 전이는 IllegalJobTransitionError 로 막힌다.
  * - 원격 결과가 불명확하면 RECONCILING → (확인 불가) UNKNOWN 으로 남기고 자동 재전송하지 않는다(A08). UNKNOWN 에서 나가는 전이는
- *   "원격에서 찾음"(reconciled_found/remote_accepted)과 확인 기록(reconcile_retry)뿐이다 — 재전송(lease) 전이는 없다.
+ *   "원격에서 찾음"(reconciled_found/remote_accepted)과 확인 기록(reconcile_retry), 사용자 확인(user_confirmed — LIVEP1-USERCONFIRM, 외부 호출 없음)뿐이다 — 재전송(lease) 전이는 없다.
  * - 재시도 숫자(30초 기준 지수, 15분 상한, ±20% jitter, 5회, Retry-After 1시간 상한)는 잠정값이다(D18). 실제 채널 한도는 M4 에서 확인.
  */
 import { z } from 'zod';
@@ -72,6 +72,9 @@ export const JOB_EVENTS = [
   // 늘린 뒤 남은 조각을 다음 실행으로 넘긴다. 세션은 살아 있고 결과 불명이 아니다 → RETRY_WAIT(즉시), 다음 시도가 같은 세션으로 이어 올린다.
   // 진행이 있어야만 쓰이므로(받은 바이트 단조 증가) 시도 한도에 넣지 않는다(resume_count + 1).
   'upload_yield',
+  // LIVEP1-USERCONFIRM: 결과 불명 실제 게시를 사용자가 Threads 에서 직접 확인하고 기록함(user-confirm.ts). 외부 호출·재전송 없음 —
+  // UNKNOWN·RECONCILING → CONFIRMED 만(결과 verification = USER_CONFIRMED, VERIFIED 아님).
+  'user_confirmed',
 ] as const;
 export type JobEvent = (typeof JOB_EVENTS)[number];
 
@@ -130,8 +133,9 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, Readonly<Partial<Record<
     permanent_failure: 'FAILED',
     cancel_requested: 'CANCEL_REQUESTED',
     resume: 'RETRY_WAIT',
+    user_confirmed: 'CONFIRMED',
   },
-  UNKNOWN: { reconciled_found: 'CONFIRMED', remote_accepted: 'REMOTE_PROCESSING', reconcile_retry: 'UNKNOWN' },
+  UNKNOWN: { reconciled_found: 'CONFIRMED', remote_accepted: 'REMOTE_PROCESSING', reconcile_retry: 'UNKNOWN', user_confirmed: 'CONFIRMED' },
   CANCEL_REQUESTED: {
     cancel_too_late: 'CONFIRMED',
     canceled: 'CANCELED',
@@ -299,7 +303,8 @@ export const RESULT_KINDS = ['UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED'
 export type ResultKind = (typeof RESULT_KINDS)[number];
 export const REMOTE_VISIBILITIES = ['private', 'unlisted', 'public', 'unknown'] as const;
 export type RemoteVisibility = (typeof REMOTE_VISIBILITIES)[number];
-export const PUBLICATION_VERIFICATIONS = ['MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED'] as const;
+/** LIVEP1-USERCONFIRM(0045): USER_CONFIRMED = 사용자가 Threads 에서 직접 확인함(앱 검증 아님 — VERIFIED 와 구분, 실제 결과만). */
+export const PUBLICATION_VERIFICATIONS = ['MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED', 'USER_CONFIRMED'] as const;
 export type PublicationVerification = (typeof PUBLICATION_VERIFICATIONS)[number];
 export const INTENT_OUTCOMES = ['pending', 'accepted', 'rejected', 'ambiguous'] as const;
 export type IntentOutcome = (typeof INTENT_OUTCOMES)[number];

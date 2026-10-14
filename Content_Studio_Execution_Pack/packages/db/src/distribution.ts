@@ -120,7 +120,10 @@ export function publicationViewOf(p: PublicationRow) {
     is_mock: p.isMock,
     verified_at: p.verifiedAt ? p.verifiedAt.toISOString() : null,
     created_at: p.createdAt.toISOString(),
-    notice: p.isMock ? 'MOCK — 실제 발행 실적 아님' : null,
+    // LIVEP1-USERCONFIRM(0045): 사용자 확인(USER_CONFIRMED)한 사람·시각 — 앱 검증(VERIFIED)이 아님
+    confirmed_by: p.confirmedBy,
+    confirmed_at: p.confirmedAt ? p.confirmedAt.toISOString() : null,
+    notice: p.isMock ? 'MOCK — 실제 발행 실적 아님' : p.verification === 'USER_CONFIRMED' ? '사용자 확인 — Threads 에서 직접 확인함(앱이 검증하지 않음)' : null,
   };
 }
 export type { ApprovalRow, DistributionItemRow, JobRow };

@@ -30,3 +30,4 @@ export * from './imports';
 export * from './collector';
 export * from './recommend';
 export * from './live-publish';
+export * from './user-confirm';

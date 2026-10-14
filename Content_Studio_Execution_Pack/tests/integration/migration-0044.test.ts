@@ -2,6 +2,7 @@
  * LIVE-P1(결정 D38 1단계) migration 0044: (1) 0043 까지의 DB 에 기존 모양의 모의 결과·모의 단계가 있어도 0044 가 적용된다(기존 행 그대로).
  * (2) 실제 Threads 단계 ID·publish_attempt·실제 결과 형식 CHECK, (3) INSERT 트리거 remote_steps_account_guard·publications_account_guard
  * (모의 ⇔ 모의 계정, 실제 ⇔ 실제 Threads 계정). migration-0033 과 같은 방식(태그별 SQL 직접 적용). 외부 호출 없음, 실제 토큰 없음.
+ * LIVEP1-USERCONFIRM: 0043 상태의 모의 결과는 작업 처리기 대신 SQL 로 넣는다(현재 처리기는 0045 열을 쓴다).
  */
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -15,13 +16,11 @@ import {
   createVariantDraft,
   executePlan,
   migrationsFolder,
-  runJobsTick,
   seed,
   setVariantLifecycle,
   type DbHandle,
 } from '@cs/db';
 import { loadConfig } from '@cs/domain';
-import { MockChannelAdapter, MockChannelAdapterRegistry } from '@cs/providers';
 
 type PGlite = DbHandle['client'];
 
@@ -61,10 +60,21 @@ describe('0044 migration: 실제 Threads 게시 결과·단계', () => {
     const mockItem = mockPlan.items[0]!;
     await approveItems(db, owner, mockPlan.plan.id, { item_ids: [mockItem.id], expected_hashes: { [mockItem.id]: mockItem.payloadHash }, confirm: true, purpose: 'mock_publish' });
     await executePlan(db, owner, mockPlan.plan.id, { commandKey: `m44-${randomUUID()}` }, loadConfig({}));
-    const tick = await runJobsTick(db, new MockChannelAdapterRegistry(new MockChannelAdapter({ readEnv: false })), { workerId: 'm44', config: loadConfig({}), ownerId: owner });
-    expect(tick.results).toEqual({ CONFIRMED: 1 });
+    // LIVEP1-USERCONFIRM(0045): 작업 처리기(현재 코드)는 0045 의 publications 열(confirmed_by·confirmed_at)을 쓰므로 0043 상태 DB 에서는 돌릴 수 없다 —
+    // 처리기가 남기던 것과 같은 모양의 모의 결과(CONFIRMED 작업·accepted 전송 의도·MOCK 결과)를 SQL 로 직접 넣는다(0033 시험과 같은 방식).
     const mockJob = (await q<{ id: string }>(`select id from jobs where item_id = $1`, [mockItem.id]))[0]!.id;
-    const mockIntent = (await q<{ id: string }>(`select id from send_intents where job_id = $1`, [mockJob]))[0]!.id;
+    await client.query(`update jobs set state = 'CONFIRMED', attempt = 1, done_at = now() where id = $1`, [mockJob]);
+    const mockIntent = (
+      await q<{ id: string }>(
+        `insert into send_intents (owner_id, job_id, attempt, intent_key, outcome, submitted_at, remote_external_id, sanitized_details) values ($1, $2, 1, $3, 'accepted', now(), $4, '{"adapter_id":"mock_generic"}'::jsonb) returning id`,
+        [owner, mockJob, `${mockJob}:1`, `mock:threads:${randomUUID()}`],
+      )
+    )[0]!.id;
+    await client.query(
+      `insert into publications (owner_id, item_id, job_id, external_id, permalink, result_kind, remote_visibility, verification, is_mock) values ($1, $2, $3, $4, null, 'PUBLISHED', 'unknown', 'MOCK', true)`,
+      [owner, mockItem.id, mockJob, `mock:threads:${randomUUID()}`],
+    );
+    expect((await q<{ state: string }>(`select state from jobs where id = $1`, [mockJob]))[0]!.state).toBe('CONFIRMED');
     const step = (kind: string, idx: number, remoteId: string, status: string, job = mockJob, intent = mockIntent, item = mockItem.id, postIndex = 0) =>
       client.query(
         `insert into remote_steps (owner_id, job_id, intent_id, item_id, step_index, kind, post_index, remote_id, status) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,

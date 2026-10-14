@@ -1370,6 +1370,9 @@ export const sendIntents = pgTable(
  * LIVE-P1(D38, migration 0044): 실제 결과(is_mock=false)는 external_id 'threads:<숫자>'·permalink 는 null 이거나 https://(www.)threads.com|net/…,
  * VERIFIED 는 verified_at 필수. 트리거 publications_kind_guard: INSERT 때 is_mock 이 항목 계정의 kind(mock ⇔ is_mock)와 맞아야 한다 —
  * 모의 계정 작업은 실제 결과를, 실제 계정 작업은 모의 결과를 남길 수 없다.
+ * LIVEP1-USERCONFIRM(migration 0045): verification USER_CONFIRMED = 사용자가 확인 후보를 Threads 에서 직접 확인하고 기록함(앱 검증 아님) —
+ * confirmed_by 'owner'·confirmed_at 필수, verified_at 없음, 실제 결과·공식 링크·PUBLISHED 만. publications_guard 는 confirmed_by·confirmed_at 변경과
+ * USER_CONFIRMED 로/에서의 verification 변경을 거부한다(사용자 확인을 나중에 VERIFIED 로 바꾸거나 되돌리지 않음).
  */
 export const publications = pgTable(
   'publications',
@@ -1388,13 +1391,26 @@ export const publications = pgTable(
     isMock: boolean('is_mock').notNull(),
     verifiedAt: ts('verified_at'),
     createdAt: ts('created_at').notNull().defaultNow(),
+    /** LIVEP1-USERCONFIRM(0045): 사용자 확인(USER_CONFIRMED)한 사람 — 'owner' 만(다른 값 없음). 그 밖의 확인 상태는 null. */
+    confirmedBy: text('confirmed_by'),
+    /** LIVEP1-USERCONFIRM(0045): 사용자 확인 시각(USER_CONFIRMED 일 때만). */
+    confirmedAt: ts('confirmed_at'),
   },
   (t) => [
     unique('publications_item_external_uq').on(t.itemId, t.externalId),
     index('publications_item_idx').on(t.itemId),
     check('publications_result_kind_chk', sql`${t.resultKind} in ('UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED', 'MANUAL_REPORTED')`),
     check('publications_visibility_chk', sql`${t.remoteVisibility} in ('private', 'unlisted', 'public', 'unknown')`),
-    check('publications_verification_chk', sql`${t.verification} in ('MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED')`),
+    check('publications_verification_chk', sql`${t.verification} in ('MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED', 'USER_CONFIRMED')`),
+    // LIVEP1-USERCONFIRM(0045): USER_CONFIRMED ⇔ 확인자('owner')·확인 시각이 있음. 사용자 확인은 실제 결과·공식 링크·PUBLISHED 만이고 verified_at 은 없다(VERIFIED 로 보이지 않게).
+    check(
+      'publications_user_confirmed_chk',
+      sql`(${t.verification} = 'USER_CONFIRMED') = (${t.confirmedBy} is not null) and (${t.confirmedBy} is null) = (${t.confirmedAt} is null) and (${t.confirmedBy} is null or ${t.confirmedBy} = 'owner')`,
+    ),
+    check(
+      'publications_user_confirmed_shape_chk',
+      sql`${t.verification} <> 'USER_CONFIRMED' or (not ${t.isMock} and ${t.verifiedAt} is null and ${t.permalink} is not null and ${t.resultKind} = 'PUBLISHED')`,
+    ),
     check('publications_mock_verification_chk', sql`${t.isMock} = (${t.verification} = 'MOCK')`),
     check('publications_mock_external_chk', sql`not ${t.isMock} or ${t.externalId} like 'mock:%'`),
     check('publications_mock_permalink_chk', sql`not ${t.isMock} or ${t.permalink} is null or ${t.permalink} like 'mock://%'`),

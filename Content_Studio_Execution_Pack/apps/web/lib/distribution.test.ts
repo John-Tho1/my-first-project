@@ -18,6 +18,10 @@ import {
   jobStatusText,
   latestThreadsDiag,
   liveCandidateFromEvents,
+  liveItemHeadline,
+  liveVerificationLabel,
+  liveVerificationTag,
+  userConfirmCandidateForCard,
   threadsDiagLine,
   mockScenarioOptionsFor,
   planAccountLabel,
@@ -672,5 +676,67 @@ describe('threadsDiagLine·latestThreadsDiag', () => {
       'Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10',
     );
     expect(latestThreadsDiag([ev(1, { event: 'x' })])).toBeNull();
+  });
+});
+
+// ---- LIVEP1-USERCONFIRM: "Threads에서 확인함" 버튼·결과 표시 ----
+describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', () => {
+  const ID = 'threads:18000000000123456';
+  const LINK = 'https://www.threads.com/@t/post/DeeRJ-LjgdA';
+  const card = (over: Record<string, unknown> = {}) => ({
+    account: { kind: 'live', platform: 'threads' },
+    jobs: [{ id: 'j1', state: 'UNKNOWN', restoredNeedsReview: false }],
+    remoteSteps: [
+      { jobId: 'j1', kind: 'container' },
+      { jobId: 'j1', kind: 'publish_attempt' },
+    ],
+    publications: [] as unknown[],
+    events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } as Record<string, unknown> }],
+    ...over,
+  });
+  it('조건이 모두 맞으면 후보(버튼), RECONCILING 도', () => {
+    expect(userConfirmCandidateForCard(card())).toEqual({ external_id: ID, permalink: LINK });
+    expect(userConfirmCandidateForCard(card({ jobs: [{ id: 'j1', state: 'RECONCILING' }] }))).toEqual({ external_id: ID, permalink: LINK });
+  });
+  it.each<[string, Record<string, unknown>]>([
+    ['모의 계정(MOCK 은 절대 아님)', { account: { kind: 'mock', platform: 'threads' } }],
+    ['결과 있음', { publications: [{}] }],
+    ['CONFIRMED', { jobs: [{ id: 'j1', state: 'CONFIRMED' }] }],
+    ['복원 이력', { jobs: [{ id: 'j1', state: 'UNKNOWN', restoredNeedsReview: true }] }],
+    ['게시 시도 표식 없음', { remoteSteps: [{ jobId: 'j1', kind: 'container' }] }],
+    ['다른 작업의 표식만', { remoteSteps: [{ jobId: 'j0', kind: 'publish_attempt' }] }],
+    ['게시 기록 있음', { remoteSteps: [{ jobId: 'j1', kind: 'publish_attempt' }, { jobId: 'j1', kind: 'publish' }] }],
+    ['링크 없는 후보', { events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } }] }],
+    ['최근 재확인에 후보 없음(낡은 후보)', { events: [{ eventSeq: 5, sanitizedDetails: { reconcile: 'unknown' } }, { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } }] }],
+  ])('%s → 버튼 없음', (_, over) => {
+    expect(userConfirmCandidateForCard(card(over))).toBeNull();
+  });
+  it('결과 문구·배지: 사용자 확인은 VERIFIED 와 다른 문구·다른 색, 그 밖은 배지 없음', () => {
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).toContain('사용자 확인');
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).toContain('앱이 검증한 것은 아님');
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).not.toBe(liveVerificationLabel('VERIFIED', LINK));
+    const v = liveVerificationTag('VERIFIED')!;
+    const u = liveVerificationTag('USER_CONFIRMED')!;
+    expect(u.text).toBe('사용자 확인');
+    expect(v.text).toBe('확인됨(VERIFIED)');
+    expect(u.className).not.toBe(v.className);
+    expect(u.className).not.toContain('warn');
+    expect(liveVerificationTag('UNVERIFIED')).toBeNull();
+    expect(liveVerificationTag('MOCK')).toBeNull();
+    const headline = liveItemHeadline({ status: 'CONFIRMED', channel: 'threads', job: null, pub: { permalink: LINK, resultKind: 'PUBLISHED', isMock: false }, blockReason: null, verification: 'USER_CONFIRMED' });
+    expect(headline).toContain('사용자 확인');
+    expect(headline).not.toContain('MOCK');
+  });
+  it('작업 줄: 사용자 확인 결과는 "사용자 확인", 모의 결과는 그대로 MOCK', () => {
+    const job = { state: 'CONFIRMED', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: 'submit_timeout' };
+    const uc = jobStatusText(job, { permalink: LINK, resultKind: 'PUBLISHED', isMock: false, verification: 'USER_CONFIRMED' });
+    expect(uc).toContain('사용자 확인');
+    expect(uc).not.toContain('MOCK');
+    expect(jobStatusText(job, { permalink: null, resultKind: 'PUBLISHED', isMock: true, verification: 'MOCK' })).toContain('MOCK');
+  });
+  it('거절 코드마다 화면 문구가 있다(폼 오류가 "서버 오류"로 뭉개지지 않음)', () => {
+    for (const code of ['user_confirm_not_live', 'user_confirm_already_published', 'user_confirm_not_pending', 'user_confirm_restored', 'user_confirm_no_attempt', 'user_confirm_publish_recorded', 'user_confirm_no_candidate', 'user_confirm_candidate_mismatch']) {
+      expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
+    }
   });
 });

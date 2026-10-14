@@ -220,3 +220,4 @@ CHANGES_REQUESTED
 | LIVEP1-TIMEOUT | 98f11cd | CHANGES_REQUESTED — P1 1(예산 검사 뒤 표식 기록·heartbeat 시간 미예약) |
 | LIVEP1-USERCONFIRM | a67f462 | CHANGES_REQUESTED — P2 1(표시 이력 10개 밖으로 후보가 밀리면 버튼 사라짐) |
 | FIX-LIVEP1-TIMEOUT | e708106 | **PASS** — 지적 없음(gpt-6-astra · xhigh). LIVEP1-TIMEOUT 종결 |
+| FIX-LIVEP1-USERCONFIRM | 2af529b | 검토 대기 (gpt-6-astra · xhigh) |

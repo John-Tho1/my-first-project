@@ -7,7 +7,7 @@
   4. 동시 두 번 제출: 항목 행 FOR UPDATE 로 직렬화 → 늦은 쪽 409(already_published). (항목, 외부 ID) unique + ON CONFLICT DO NOTHING 이 한 번 더 막음.
   5. 화면(항목 카드): 확인 후보(미확인) 줄 아래, 서버와 같은 판정(`userConfirmCandidateForCard` → `userConfirmProblem`)일 때만 버튼 "Threads에서 확인함" + 경고 "후보 링크를 열어 내 글인지 직접 확인한 뒤 누르세요. 앱이 검증한 것은 아닙니다 (기록만 합니다 — 다시 게시하지 않음)". 결과는 배지 "사용자 확인"(보라 `tag user-confirmed`) — "확인됨(VERIFIED)"(초록 `tag verified`)와 다른 색, 머리줄·작업 줄·결과 목록 문구도 "사용자 확인(… 앱이 검증한 것은 아님)". 배너는 저장된 USER_CONFIRMED 결과가 있을 때만. 모의 항목은 판정상 언제나 버튼 없음(DB CHECK 로도 MOCK ≠ USER_CONFIRMED).
 - BASE_SHA: f96aefc
-- HEAD_SHA: a67f462c31b6125de55adf316ce8831fc7d6b0d9
+- HEAD_SHA: a67f462c31b6125de55adf316ce8831fc7d6b0d9 (LIVEP1-USERCONFIRM) · FIX-LIVEP1-USERCONFIRM HEAD 2af529bd33d4090a6a5d7d12530cfd2d6b9c37b9
 - Clean tracked tree confirmed: 시작 시 yes(`?? .claude/` 만).
 - Relevant acceptance IDs: AGENTS Invariants(결과 불명 → 조회 또는 UNKNOWN·맹목 재전송 금지, 모의 성공 ≠ 실제 게시, 실제 확인 상태 표시), docs/03(수동 기록 ≠ VERIFIED, 상태 전이는 domain 한 곳), A08·A16(취지 — 사용자 기록과 API 검증 구분)·A20, D38.
 
@@ -75,3 +75,41 @@
 
 ## Next authorized task
 - 오케스트레이터: 커밋 → Codex 검증(BASE f96aefc) → dev 서버 끄고 `pnpm db:migrate`(0045) → 사용자가 6e236a8f 를 "Threads에서 확인함"으로 기록(외부 호출 없음).
+
+---
+
+# FIX-LIVEP1-USERCONFIRM (Codex review-LIVEP1-USERCONFIRM — CHANGES_REQUESTED on a67f462, P2 1)
+- 판정 원본: `.handoffs/review-LIVEP1-USERCONFIRM.md`
+- BASE_SHA: a67f462 (작업 트리는 cbfb2d2 위) · HEAD_SHA: uncommitted — orchestrator commits
+- 범위: 외부 호출 0, `.env.local`·`./data` 손대지 않음, db:migrate·drill:restore·dev 서버 없음, migration·의존성 추가 없음, 내가 띄운 프로세스만 다룸.
+
+## 지적 → 시험(재현) → 변경
+| 지적 | 재현(수정 전 코드로 먼저 실패) | 변경 |
+|---|---|---|
+| **[P2] apps/web/lib/distribution.ts:741** 카드가 화면 이력(최근 10개)에서 후보를 찾아, 후보 재확인 이력이 밀려나면 서버는 허용하는데 버튼이 사라짐 | 통합(`checks-FIX-LIVEP1USERCONFIRM.repro-integ.log`): 실제 흐름으로 UNKNOWN + 후보 → 재확인 아닌 이력 12개 덧붙임 → 화면 이력에 재확인 없음 확인 → 수정 전 `userConfirmCandidateForCard(d)` = null(실패, 서버는 200). 짝 시험(후보 뒤 후보 없는 재확인 + 일반 이력 12개)은 새 도우미가 없어 실패 | `@cs/db` `latestReconcileEvent(tx, owner, jobId)`(가장 최근 작업의 가장 최근 재확인 이력 1행 — `jsonb_typeof(details->'reconcile') = 'string'`, event_seq 최대)를 **route(`userConfirmItem`)와 `getPlanDetail` 이 같이** 쓴다. `PlanItemDetail.latestReconcileEvent` 새 필드(읽기 전용). 웹: `userConfirmCandidateForCard` 는 `events` 대신 `latestReconcileEvent` 로 같은 도메인 판정(`userConfirmCandidateFromEvents`·`userConfirmProblem`), 새 `liveCandidateForCard`(후보 표시 — 링크 없는 후보는 ID 만, 기존 `liveCandidateFromEvents` 규칙)로 화면의 후보 줄과 버튼이 같은 데이터를 쓴다. "가장 최근 재확인에 후보 없음 → 아무것도 보이지 않음"은 그대로(시험) |
+
+## 바뀐 파일(FIX-LIVEP1-USERCONFIRM)
+- `packages/db/src/user-confirm.ts` — `latestReconcileEvent` export, `userConfirmItem` 이 그것을 사용(동작 같음)
+- `packages/db/src/distribution.ts` — `PlanItemDetail.latestReconcileEvent`, `getPlanDetail` 이 채움
+- `apps/web/lib/distribution.ts` — `liveCandidateForCard`, `userConfirmCandidateForCard` 입력을 `latestReconcileEvent` 로
+- `apps/web/app/distribute/[id]/page.tsx` — 후보 표시를 `liveCandidateForCard(x)` 로(버튼은 이미 `userConfirmCandidateForCard(x)`)
+- 시험: `tests/integration/live-user-confirm.test.ts`(+2 — 후보 뒤 일반 이력 12개: 카드 후보·버튼 + 서버 200 / 후보 없는 최근 재확인 + 일반 이력 12개: 카드 없음 + 서버 409 no_candidate), `apps/web/lib/distribution.test.ts`(카드 fixture 를 `latestReconcileEvent` 로 — 같은 판정 표, "재확인 이력 없음" 행 추가, 화면 이력 무시·낡은 후보 무시·링크 없는 후보 표시 +1)
+
+## 실행한 명령(FIX-LIVEP1-USERCONFIRM)
+(Windows 10, Git Bash, `export PATH="/usr/bin:/mingw64/bin:$PATH"; source tools/env.sh`, Node 24.21.0, `corepack pnpm`, dev 서버 시작 안 함. ./data 를 여는 db:migrate·drill:restore 는 뺐다 — 로그 `.handoffs/checks-FIX-LIVEP1USERCONFIRM*.log`)
+| 명령 | 결과 |
+|---|---|
+| `vitest run --project integration tests/integration/live-user-confirm.test.ts`(새 시험 + 수정 전 코드) | FAIL 2/13 — `expected null to deeply equal {…}`(버튼 사라짐) · 새 도우미 없음(`repro-integ.log`) — 재현 |
+| 같은 파일 · `apps/web/lib/distribution.test.ts`(수정 뒤) | PASS 13/13 · 84/84 |
+| `corepack pnpm lint` · `typecheck` · `build` | PASS · PASS · PASS |
+| `corepack pnpm exec vitest run --project unit` | PASS — 69 files, 1707 tests |
+| `corepack pnpm exec vitest run --project integration`(1회차, 기본 3 워커) | FAIL 2/915 — 이 변경과 무관한 파일: `jobs.test.ts` "재시작 보존"(파일 DB, 60초 시간 초과)·`ops-retention.test.ts` 복원 훈련 `drill_error`(code "Error") — 부하로 보임(`integ.log`) |
+| 그 두 파일만 다시 | PASS 104/104(`integ-rerun2files.log`) |
+| `vitest run --project integration --maxWorkers=2`(전체 다시) | PASS — 49 files, 915 tests(`integ2.log`) |
+| `corepack pnpm drill:mock` | PASS — "불변식 위반 0건" |
+| `db:migrate` · `drill:restore` | not_run(./data 금지) |
+- 1회차 통합 실패 2건은 원인을 확정하지 못했다(단독·2 워커 재실행 PASS — 부하성 불안정으로 판단, 미확인).
+
+## 남은 위험(이번 범위 밖 — 리뷰의 "놓친 케이스" 중)
+- 작업 처리기 조회(RECONCILING lease)가 진행 중일 때 사용자 확인이 먼저 커밋되는 경우의 통합 시험(조회 응답 지연) — 아직 없음(코드상 lease·상태·attempt 재검사로 버려짐).
+- 실제 PostgreSQL 독립 연결 동시 제출, 다른 owner 의 실존 항목 404, 복원 작업·publish 단계 작업의 route 수준 거절, 0045 이전 묶음의 실제 파싱·복원 — 시험 없음(도메인·묶음 기본값으로만).

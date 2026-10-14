@@ -111,3 +111,73 @@ export class LivePublishLimitError extends AppError {
     );
   }
 }
+
+// ---- LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 — 숫자·짧은 열거만) ----
+
+/** 진단을 남기는 단계(어댑터 호출 종류) */
+export const THREADS_DIAG_OPS = ['create', 'status', 'publish', 'read', 'list'] as const;
+export type ThreadsDiagOp = (typeof THREADS_DIAG_OPS)[number];
+
+/**
+ * 실제 Threads 호출이 실패했을 때 남기는 작은 진단 기록. **허용 목록의 필드만, 형식이 맞을 때만** — 공급자 문구(message·error_user_msg·
+ * error_user_title)·URL·토큰·본문은 절대 넣지 않는다. 작업 이력(job_events)·전송 의도(sanitized_details)·화면·API 에 그대로 나갈 수 있는 값만.
+ * - http_status: 100~599 정수 · code / error_subcode: 0 이상 정수(9자리까지) · error_type: /^[A-Za-z]{1,40}Exception$/(예: OAuthException) 만 ·
+ *   is_transient: 불리언 · fbtrace_id: /^[A-Za-z0-9_-]{1,64}$/ · transport: 응답 없음(network·timeout) · op: 단계
+ */
+export interface ThreadsDiag {
+  op?: ThreadsDiagOp;
+  http_status?: number;
+  code?: number;
+  error_subcode?: number;
+  error_type?: string;
+  is_transient?: boolean;
+  fbtrace_id?: string;
+  transport?: 'network' | 'timeout';
+}
+
+export const THREADS_DIAG_ERROR_TYPE_RE = /^[A-Za-z]{1,40}Exception$/;
+export const THREADS_DIAG_FBTRACE_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const diagInt = (v: unknown, max: number): number | undefined => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= max ? v : undefined);
+
+/**
+ * 어떤 값이 와도 허용 목록·형식에 맞는 필드만 남긴다(다른 키·긴 문자열·문구는 버림). 남는 필드가 없으면 null.
+ * 어댑터가 만들 때와 DB 에 쓰기 직전(작업 처리기) 두 번 거친다.
+ */
+export function sanitizeThreadsDiag(x: unknown): ThreadsDiag | null {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
+  const o = x as Record<string, unknown>;
+  const out: ThreadsDiag = {};
+  if (typeof o.op === 'string' && (THREADS_DIAG_OPS as readonly string[]).includes(o.op)) out.op = o.op as ThreadsDiagOp;
+  const hs = diagInt(o.http_status, 599);
+  if (hs !== undefined && hs >= 100) out.http_status = hs;
+  const code = diagInt(o.code, 999_999_999);
+  if (code !== undefined) out.code = code;
+  const sub = diagInt(o.error_subcode, 999_999_999);
+  if (sub !== undefined) out.error_subcode = sub;
+  if (typeof o.error_type === 'string' && THREADS_DIAG_ERROR_TYPE_RE.test(o.error_type)) out.error_type = o.error_type;
+  if (typeof o.is_transient === 'boolean') out.is_transient = o.is_transient;
+  if (typeof o.fbtrace_id === 'string' && THREADS_DIAG_FBTRACE_RE.test(o.fbtrace_id)) out.fbtrace_id = o.fbtrace_id;
+  if (o.transport === 'network' || o.transport === 'timeout') out.transport = o.transport;
+  const keys = Object.keys(out).filter((k) => k !== 'op');
+  return keys.length ? out : null;
+}
+
+/**
+ * 공급자 오류 본문(Graph 형식 { error: { code, error_subcode, type, fbtrace_id, is_transient, message… } } 또는 평면 형식)에서 진단 필드만 뽑는다.
+ * 문구 필드는 읽지 않는다. 최상위·중첩 error 객체 모두 본다(중첩이 우선).
+ */
+export function threadsDiagFromBody(op: ThreadsDiagOp, httpStatus: number | null, body: unknown): ThreadsDiag | null {
+  const top = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  const nested = top.error && typeof top.error === 'object' && !Array.isArray(top.error) ? (top.error as Record<string, unknown>) : {};
+  const pick = (k: string) => (nested[k] !== undefined ? nested[k] : top[k]);
+  const num = (v: unknown) => (typeof v === 'string' && /^\d{1,9}$/.test(v) ? Number(v) : v);
+  return sanitizeThreadsDiag({
+    op,
+    http_status: httpStatus ?? undefined,
+    code: num(pick('code') ?? pick('error_code')),
+    error_subcode: num(pick('error_subcode')),
+    error_type: pick('type') ?? pick('error_type'),
+    is_transient: pick('is_transient'),
+    fbtrace_id: pick('fbtrace_id'),
+  });
+}

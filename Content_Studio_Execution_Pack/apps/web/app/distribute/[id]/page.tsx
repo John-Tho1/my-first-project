@@ -15,6 +15,7 @@ import {
   jobStatusText,
   LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
+  latestThreadsDiag,
   liveCandidateFromEvents,
   liveItemHeadline,
   liveStepLine,
@@ -217,8 +218,8 @@ function LiveThreadsSteps({ x }: { x: PlanItemDetail }) {
         <p className="empty-text">아직 원격 단계 없음(실행하면 컨테이너 생성 → 준비 확인 → 게시 순서로 진행, 텍스트 1개)</p>
       )}
       <p className="note">
-        실제 Threads ID 입니다. 공개 범위: {LIVE_THREADS_VISIBILITY_TEXT}. 결과를 모르는 게시 시도는 자동으로 다시 게시하지 않고, 이 계정의 최근 글 목록에서 같은 본문을
-        찾을 때만 확인으로 바꿉니다.
+        실제 Threads ID 입니다. 공개 범위: {LIVE_THREADS_VISIBILITY_TEXT}. 결과를 모르는 게시 시도는 자동으로 다시 게시하지 않고 결과 불명(UNKNOWN)으로 남깁니다 — 최근 글
+        목록에서 같은 본문이 보여도 확인이 아니라 &quot;확인 후보(미확인)&quot;로만 보이니 Threads 에서 직접 확인하세요.
       </p>
     </>
   );
@@ -356,6 +357,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   };
   // FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 확인 후보(미확인) — 결과로 쓰지 않고 안내만
   const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateFromEvents(x.events) : null;
+  // LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 숫자만) — 판정 코드만으로는 원인을 알 수 없을 때
+  const diagLine = live ? latestThreadsDiag(x.events) : null;
   const headline = live ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null }) : itemHeadline(headlineInput);
   // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
   // M4UI FIX1: PUBLISHED 는 기록 시각(created_at)이 예약 시각 전일 때만 "적용하지 않음" — 그 밖은 중립 문구
@@ -471,6 +474,11 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           {live && x.item.status === 'UNKNOWN' ? (
             <p className="notice" role="alert">
               {LIVE_UNKNOWN_GUIDANCE}
+            </p>
+          ) : null}
+          {diagLine ? (
+            <p className="meta" role="status">
+              <span className="hash">{diagLine}</span> <span className="note">(Threads 가 돌려준 숫자만 — 문구·토큰은 저장하지 않음)</span>
             </p>
           ) : null}
           {live && candidate ? (

@@ -29,7 +29,10 @@ import {
   liveThreadsStepId,
   liveThreadsStepRaw,
   THREADS_LIVE_TEXT_MAX,
+  sanitizeThreadsDiag,
+  threadsDiagFromBody,
   threadsTextUnits,
+  type ThreadsDiag,
   type AdapterAccount,
   type AdapterCapabilities,
   type AdapterContext,
@@ -99,8 +102,11 @@ export class LiveThreadsApiError extends Error {
   readonly rateLimited: boolean;
   readonly retryAfterSec: number | undefined;
   readonly malformed: boolean;
+  /** LIVEP1-DIAG: 허용 목록 진단(숫자·짧은 열거만 — 문구·URL·토큰 없음). 결과·작업 이력으로 나간다. */
+  readonly diag: ThreadsDiag | null;
   constructor(init: {
     op: Op;
+    diag?: ThreadsDiag | null;
     httpStatus?: number | null;
     transport?: 'network' | 'timeout' | null;
     codes?: number[];
@@ -120,10 +126,14 @@ export class LiveThreadsApiError extends Error {
     this.rateLimited = init.rateLimited ?? false;
     this.retryAfterSec = init.retryAfterSec;
     this.malformed = init.malformed ?? false;
+    this.diag =
+      init.diag !== undefined
+        ? sanitizeThreadsDiag(init.diag)
+        : sanitizeThreadsDiag({ op: init.op, http_status: init.httpStatus ?? undefined, transport: init.transport ?? undefined, code: init.codes?.length === 1 ? init.codes[0] : undefined });
   }
   /** 직렬화해도 숫자·열거만 */
   toJSON(): Record<string, unknown> {
-    return { name: this.name, op: this.op, httpStatus: this.httpStatus, transport: this.transport, codes: this.codes, transient: this.transient };
+    return { name: this.name, op: this.op, httpStatus: this.httpStatus, transport: this.transport, codes: this.codes, transient: this.transient, diag: this.diag };
   }
 }
 
@@ -155,26 +165,33 @@ export function classifyLivePublishError(e: unknown, op: 'create' | 'publish'): 
   }
   const v = liveErrorVerdict(e);
   const prefix = op === 'create' ? 'container' : 'publish';
-  if (v === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: `${prefix}_auth_invalid_token` };
-  if (v === 'permission') return { status: 'rejected', retry_class: 'permanent', error_code: `${prefix}_permission_denied` };
-  if (v === 'invalid') return { status: 'rejected', retry_class: 'permanent', error_code: `${prefix}_invalid_parameter` };
+  // LIVEP1-DIAG: 판정만 남기면 원인을 알 수 없다(D38 2단계 container_permission_denied) — 허용 목록 진단을 결과에 함께 싣는다.
+  const d = e.diag ? { provider_diag: e.diag } : {};
+  if (v === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: `${prefix}_auth_invalid_token`, ...d };
+  if (v === 'permission') return { status: 'rejected', retry_class: 'permanent', error_code: `${prefix}_permission_denied`, ...d };
+  if (v === 'invalid') return { status: 'rejected', retry_class: 'permanent', error_code: `${prefix}_invalid_parameter`, ...d };
   if (op === 'create') {
     if (v === 'unknown' && e.httpStatus !== null && e.httpStatus >= 400 && e.httpStatus < 500) {
-      return { status: 'rejected', retry_class: 'permanent', error_code: 'container_rejected' };
+      return { status: 'rejected', retry_class: 'permanent', error_code: 'container_rejected', ...d };
     }
     return {
       status: 'rejected',
       retry_class: 'transient_no_side_effect',
       error_code: v === 'rate_limited' ? 'container_rate_limited' : e.transport ? `container_${e.transport}` : 'container_server_error',
       ...(v === 'rate_limited' ? { retry_after_sec: e.retryAfterSec ?? 60 } : {}),
+      ...d,
     };
   }
   return {
     status: 'ambiguous',
     retry_class: 'transient_unknown_side_effect',
     error_code: e.transport ? `publish_${e.transport}` : v === 'rate_limited' ? 'publish_rate_limited' : v === 'transient' ? 'publish_server_error' : 'publish_unknown_error',
+    ...d,
   };
 }
+
+/** LIVEP1-DIAG: 오류에서 진단만 꺼낸다(우리 오류가 아니면 없음). */
+const diagOf = (e: unknown): { provider_diag?: ThreadsDiag } => (e instanceof LiveThreadsApiError && e.diag ? { provider_diag: e.diag } : {});
 
 const isAbort = (e: unknown): boolean =>
   !!e && typeof e === 'object' && ((e as { name?: unknown }).name === 'TimeoutError' || (e as { name?: unknown }).name === 'AbortError');
@@ -414,8 +431,9 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
         } catch (e) {
           if (e instanceof LeaseLostError) throw e;
           // 읽기 실패는 부작용이 없다 — 인증만 그대로(BLOCKED), 나머지는 조회로(컨테이너 참조는 남아 있고 게시 시도 표식은 없다).
-          if (e instanceof LiveThreadsApiError && liveErrorVerdict(e) === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: 'status_auth_invalid_token' };
-          return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_status_unreadable' };
+          const d = diagOf(e);
+          if (e instanceof LiveThreadsApiError && liveErrorVerdict(e) === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: 'status_auth_invalid_token', ...d };
+          return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_status_unreadable', ...d };
         }
         if (status !== 'IN_PROGRESS') break;
       }
@@ -467,7 +485,7 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       return { ...base, ...(permalink ? { permalink } : {}), verified: body.id === mediaId && sameText && !!permalink };
     } catch (e) {
       if (e instanceof LeaseLostError) throw e;
-      return { ...base, error_code: 'readback_failed' };
+      return { ...base, error_code: 'readback_failed', ...diagOf(e) };
     }
   }
 
@@ -517,8 +535,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       let status: ContainerStatus;
       try {
         status = await this.#containerStatus(containerId, token, ctx.signal);
-      } catch {
-        return { status: 'unknown', error_code: 'container_status_unreadable' };
+      } catch (e) {
+        return { status: 'unknown', error_code: 'container_status_unreadable', ...diagOf(e) };
       }
       if (status === 'FINISHED') {
         if (ct.status === 'created') await ctx.steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'finished' });
@@ -543,8 +561,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
         fields: 'id,permalink,text,timestamp,media_type',
         limit: String(this.#listLimit),
       });
-    } catch {
-      return { status: 'unknown', error_code: 'list_unreadable' };
+    } catch (e) {
+      return { status: 'unknown', error_code: 'list_unreadable', ...diagOf(e) };
     }
     const data = Array.isArray(list.data) ? (list.data as unknown[]) : null;
     if (!data) return { status: 'unknown', error_code: 'list_malformed' };
@@ -630,6 +648,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
       throw new LiveThreadsApiError({
         op,
         httpStatus: res.status,
+        // LIVEP1-DIAG: 본문에서 허용 목록 필드만(문구 필드는 읽지 않음)
+        diag: threadsDiagFromBody(op, res.status, body),
         codes,
         transient: transientCodes.length > 0 || n?.isTransientFlag === true,
         rateLimited,

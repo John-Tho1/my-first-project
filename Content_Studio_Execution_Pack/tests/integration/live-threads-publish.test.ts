@@ -46,7 +46,9 @@ import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
-import { liveCandidateFromEvents, liveItemHeadline } from '../../apps/web/lib/distribution';
+import { latestThreadsDiag, liveCandidateFromEvents, liveItemHeadline } from '../../apps/web/lib/distribution';
+import { GET as planGET } from '../../apps/web/app/api/distribution-plans/[id]/route';
+import { GET as jobGET } from '../../apps/web/app/api/jobs/[id]/route';
 import { jobCredentials } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login } from './helpers';
 
@@ -445,6 +447,93 @@ describe('모의 계정은 그대로(실제 게시 조건이 모두 있어도 MO
     expect(fx.calls).toHaveLength(0);
     const [intent] = await intentsOf((await jobOf(p.items[0]!.id)).id);
     expect(intent!.sanitizedDetails.live_approval_ref).toBeUndefined();
+    // LIVEP1-DIAG: 모의 계획 API 의 mode 는 그대로 MOCK
+    const g = (await (await planGET(new Request(`${BASE}/api/distribution-plans/${p.planId}`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), ctx(p.planId))).json()) as {
+      mode: string;
+      items: Array<{ mode: string; jobs: Array<{ mode: string }> }>;
+    };
+    expect(g.mode).toBe('MOCK');
+    expect(g.items[0]!.mode).toBe('MOCK');
+    expect(g.items[0]!.jobs.map((j) => j.mode)).toEqual(['MOCK']);
+  });
+});
+
+describe('LIVEP1-DIAG: 실제 실패 진단 · mode 표시 · 실패 뒤 다시 게시하는 길', () => {
+  it('컨테이너 생성 403(code 10) → FAILED + 허용 목록 진단(이력·전송 의도·작업 API·화면 줄), 문구·토큰 없음 · 계획/작업 API mode LIVE · 재시도 409 → 같은 파생본 새 계획: 같은 승인 기록·상한 1 이면 429, 새 승인 기록이면 게시', async () => {
+    const TEXT = '진단 시험 글.';
+    const p = await planApproved([TEXT]);
+    const item = p.items[0]!;
+    const config = fullCfg('D38-diag', '1');
+    expect((await execute(p.planId)).status).toBe(200);
+    const USER_MSG = `이 작업을 할 권한이 없습니다 ${LONG}`;
+    const fx = publishFixture((ids) => ({
+      [P(ids).create]: () =>
+        jsonRes(403, {
+          error: {
+            message: `(#10) Application does not have permission for this action access_token=${LONG}`,
+            type: 'OAuthException',
+            code: 10,
+            error_subcode: 2207051,
+            is_transient: false,
+            error_user_title: USER_MSG,
+            error_user_msg: USER_MSG,
+            fbtrace_id: 'AbCdEf_123-x',
+          },
+        }),
+    }));
+    expect((await tick(registryWith(fx.fetch, config), config)).results).toEqual({ FAILED: 1 });
+    const job = await jobOf(item.id);
+    expect(job.lastErrorCode).toBe('container_permission_denied');
+    const DIAG = { op: 'create', http_status: 403, code: 10, error_subcode: 2207051, error_type: 'OAuthException', is_transient: false, fbtrace_id: 'AbCdEf_123-x' };
+    const events = await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job.id));
+    expect(events.find((e) => e.sanitizedDetails.provider_diag)!.sanitizedDetails.provider_diag).toEqual(DIAG);
+    const [intent] = await intentsOf(job.id);
+    expect(intent!.sanitizedDetails.provider_diag).toEqual(DIAG);
+    // 작업 API(GET /api/jobs/{id}) — 진단 숫자는 보이고 문구·토큰은 없다, mode LIVE
+    const jr = await rec(await jobGET(new Request(`${BASE}/api/jobs/${job.id}`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), ctx(job.id)));
+    const jText = await jr.clone().text();
+    const jBody = (await jr.json()) as { job: { mode: string }; events: Array<{ details: Record<string, unknown> }> };
+    expect(jBody.job.mode).toBe('LIVE');
+    expect(jBody.events.map((e) => e.details.provider_diag).filter(Boolean)).toContainEqual(DIAG);
+    // 계획 API — 실제 항목은 mode LIVE(계획·항목·작업)
+    const pr = await rec(await planGET(new Request(`${BASE}/api/distribution-plans/${p.planId}`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), ctx(p.planId)));
+    const pText = await pr.clone().text();
+    const pBody = (await pr.json()) as { mode: string; items: Array<{ mode: string; jobs: Array<{ mode: string }>; account: { capability_snapshot: Record<string, unknown> } }> };
+    expect(pBody.mode).toBe('LIVE');
+    expect(pBody.items[0]!.mode).toBe('LIVE');
+    expect(pBody.items[0]!.jobs.map((j) => j.mode)).toEqual(['LIVE']);
+    // capability_snapshot(표시용): 실제 게시 계정으로 사용 중 → D38 실제 텍스트 게시
+    expect(pBody.items[0]!.account.capability_snapshot).toMatchObject({ mock: false, external_writes: true, publish: 'live_text_D38' });
+    // 화면 줄(카드와 같은 도우미)
+    const d = await getPlanDetail(db, owner, p.planId);
+    const line = latestThreadsDiag(d!.items[0]!.events);
+    expect(line).toBe('Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10 · subcode 2207051 · OAuthException · is_transient=false · fbtrace AbCdEf_123-x');
+    // 문구·사용자 문구·토큰이 이력·의도·API·화면 어디에도 없다
+    const dump = JSON.stringify({ events, intent, jText, pText, line, seenResponses });
+    for (const s of [LONG, 'Application does not have permission', '권한이 없습니다', 'access_token']) expect(dump).not.toContain(s);
+
+    // 3) FAILED(컨테이너 단계 확정 실패, 게시 시도 없음)는 재시도 대상이 아니다(보류 BLOCKED 만) — 409
+    expect((await rec(await retryPOST(post(`/api/distribution-items/${item.id}/retry`), ctx(item.id)))).status).toBe(409);
+    expect(await stepsOf(item.id)).toEqual([]); // 컨테이너도 기록되지 않음(생성 실패)
+    // 같은 파생본으로 새 계획 — 승인된 파생본도 계획 가능
+    const variantId = (await itemOf(item.id)).variantId;
+    const created = await rec(await plansPOST(post('/api/distribution-plans', { items: [{ variant_id: variantId, channel_account_id: liveAccount }] })));
+    expect(created.status, await created.clone().text()).toBe(201);
+    const np = (await created.json()) as { plan: { id: string }; items: Array<{ id: string; payload_hash: string }> };
+    const ni = np.items[0]!;
+    expect(
+      (await approvePOST(post(`/api/distribution-plans/${np.plan.id}/approve`, { item_ids: [ni.id], expected_hashes: { [ni.id]: ni.payload_hash }, confirm: true, purpose: 'public_publish' }), ctx(np.plan.id))).status,
+    ).toBe(200);
+    // 실패한 시도도 그 승인 기록의 게시 수를 썼다(전송 의도가 생김) — 같은 승인 기록·상한 1 이면 실행 거부(429, 작업 없음)
+    const sameRef = await execute(np.plan.id);
+    expect(sameRef.status).toBe(429);
+    expect(await sameRef.json()).toMatchObject({ error: 'live_publish_limit', limit: 1, used: 1 });
+    // 새 승인 기록(사용자가 새로 승인) — 실행·게시
+    const cfg2 = fullCfg('D38-diag-retry', '1');
+    expect((await execute(np.plan.id)).status).toBe(200);
+    const fx2 = publishFixture(happy(TEXT));
+    expect((await tick(registryWith(fx2.fetch, cfg2), cfg2)).results).toEqual({ CONFIRMED: 1 });
+    expect(await pubsOf(ni.id)).toHaveLength(1);
   });
 });
 
@@ -662,6 +751,13 @@ describe('FIX-LIVEP1: 계획 범위 작업 처리·동시 실행·실제 게시 
     const off = await rec(await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: false }), ctx(liveAccount)));
     expect(off.status).toBe(200);
     expect(await off.json()).toMatchObject({ state: 'disconnected' });
+    // LIVEP1-DIAG: 사용 중지 → capability_snapshot 은 D31(연결만)로 되돌린다(표시용 — 게이트 아님)
+    expect((await db.select().from(schema.channelAccounts).where(eq(schema.channelAccounts.id, liveAccount)))[0]!.capabilitySnapshot).toEqual({
+      mock: false,
+      external_writes: false,
+      publish: 'out_of_scope_D31',
+      note: '실제 계정 — 연결·프로필 조회만(D31), 게시 안 함',
+    });
     await db.update(schema.oauthCredentials).set({ expiresAt: new Date(Date.now() - MIN) }).where(eq(schema.oauthCredentials.channelAccountId, liveAccount));
     const on = await rec(await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: true }), ctx(liveAccount)));
     expect(on.status).toBe(409);

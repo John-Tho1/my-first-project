@@ -11,6 +11,7 @@ import {
   instagramSpecProblemLabel,
   isAllowedThreadsPermalink,
   LIVE_THREADS_EXTERNAL_ID_RE,
+  sanitizeThreadsDiag,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
   scenarioApplies,
@@ -676,6 +677,34 @@ export function liveCandidateFromEvents(events: ReadonlyArray<{ eventSeq: number
   if (typeof id !== 'string' || !LIVE_THREADS_EXTERNAL_ID_RE.test(id)) return null;
   return { externalId: id, permalink: isAllowedThreadsPermalink(d.candidate_permalink) ? d.candidate_permalink : null };
 }
+/** LIVEP1-DIAG: 진단 단계 이름(화면) */
+const DIAG_OP_LABEL: Record<string, string> = { create: '컨테이너 생성', status: '컨테이너 상태', publish: '게시', read: '게시물 읽기', list: '최근 글 목록' };
+
+/**
+ * LIVEP1-DIAG: 실제 Threads 오류 진단 한 줄(허용 목록 필드만 — 이력의 provider_diag 를 다시 걸러 쓴다).
+ * 예: "Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10 · subcode 2207051 · OAuthException · is_transient=false · fbtrace AbC_1".
+ */
+export function threadsDiagLine(diag: unknown): string | null {
+  const d = sanitizeThreadsDiag(diag);
+  if (!d) return null;
+  const parts: string[] = [];
+  if (d.op) parts.push(DIAG_OP_LABEL[d.op] ?? d.op);
+  if (d.transport) parts.push(d.transport === 'timeout' ? '응답 시간 초과(응답 없음)' : '연결 실패(응답 없음)');
+  if (d.http_status !== undefined) parts.push(`HTTP ${d.http_status}`);
+  if (d.code !== undefined) parts.push(`code ${d.code}`);
+  if (d.error_subcode !== undefined) parts.push(`subcode ${d.error_subcode}`);
+  if (d.error_type) parts.push(d.error_type);
+  if (d.is_transient !== undefined) parts.push(`is_transient=${d.is_transient}`);
+  if (d.fbtrace_id) parts.push(`fbtrace ${d.fbtrace_id}`);
+  return `Threads 오류 코드: ${parts.join(' · ')}`;
+}
+
+/** LIVEP1-DIAG: 작업 이력에서 가장 최근 진단(없으면 null). */
+export function latestThreadsDiag(events: ReadonlyArray<{ eventSeq: number; sanitizedDetails: Record<string, unknown> }>): string | null {
+  const e = [...events].sort((a, b) => b.eventSeq - a.eventSeq).find((x) => sanitizeThreadsDiag((x.sanitizedDetails ?? {}).provider_diag));
+  return e ? threadsDiagLine(e.sanitizedDetails.provider_diag) : null;
+}
+
 export const LIVE_CANDIDATE_LABEL = '확인 후보(미확인 — 이 작업의 게시물이라는 증거 없음, 같은 글을 따로 올렸을 수도 있음)';
 
 /** 실제 게시 결과의 확인 상태(VERIFIED = 게시 뒤 원격 읽기로 ID·본문·링크 확인, UNVERIFIED = 게시 ID 는 받았지만 읽기 확인 못 함). */

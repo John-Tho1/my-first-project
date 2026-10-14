@@ -1137,7 +1137,15 @@ export function approvalView(a: ApprovalRow) {
 }
 
 /** 작업 응답 모양(비밀·본문 없음). lease_owner 는 worker 표시 이름(호스트 이름을 넣지 않는다). */
-export function jobView(j: JobRow) {
+/**
+ * LIVEP1-DIAG: 작업 응답의 mode — 항목 계정이 실제(live) 계정이면 LIVE(실제 게시 경로), 그 밖은 MOCK(이전과 같음).
+ * 표시용이다. 실제 게시 허용 여부는 실행·전송 게이트(assertExecutionAllowed·beginSend)가 정한다.
+ */
+export function modeForAccountKind(kind: string | null | undefined): 'MOCK' | 'LIVE' {
+  return kind === 'live' ? 'LIVE' : 'MOCK';
+}
+
+export function jobView(j: JobRow, accountKind?: string | null) {
   return {
     id: j.id,
     kind: j.kind,
@@ -1156,7 +1164,7 @@ export function jobView(j: JobRow) {
     cancel_requested_at: j.cancelRequestedAt ? j.cancelRequestedAt.toISOString() : null,
     done_at: j.doneAt ? j.doneAt.toISOString() : null,
     idempotency_key: j.idempotencyKey,
-    mode: 'MOCK' as const,
+    mode: modeForAccountKind(accountKind),
     created_at: j.createdAt.toISOString(),
     updated_at: j.updatedAt.toISOString(),
   };
@@ -1193,16 +1201,20 @@ export function itemView(i: DistributionItemRow) {
 }
 
 export function planDetailView(d: PlanDetail) {
+  // LIVEP1-DIAG: 계획 mode — 모든 항목이 모의면 MOCK(이전과 같음), 모두 실제면 LIVE, 섞이면 MIXED. 항목마다 mode 도 함께.
+  const modes = d.items.map((x) => modeForAccountKind(x.account?.kind));
+  const planMode: 'MOCK' | 'LIVE' | 'MIXED' = modes.every((m) => m === 'MOCK') ? 'MOCK' : modes.every((m) => m === 'LIVE') ? 'LIVE' : 'MIXED';
   return {
     plan: planView(d.plan),
-    mode: 'MOCK' as const,
+    mode: planMode,
     items: d.items.map((x) => ({
       ...itemView(x.item),
+      mode: modeForAccountKind(x.account?.kind),
       account: x.account ? channelAccountView(x.account) : null,
       variant: x.variant,
       active_approval: x.activeApproval ? approvalView(x.activeApproval) : null,
       approvals: x.approvals.map(approvalView),
-      jobs: x.jobs.map(jobView),
+      jobs: x.jobs.map((j) => jobView(j, x.account?.kind)),
       publications: x.publications.map(publicationViewOf),
       problems: x.problems,
       mock_scenario: x.mockScenario ? mockScenarioView(x.mockScenario) : null,

@@ -9,6 +9,7 @@
  */
 import { z } from 'zod';
 import { AppError } from './errors';
+import type { ThreadsDiag } from './live-publish';
 
 // ---- 상태 ----
 
@@ -330,6 +331,8 @@ export interface AdapterResult {
    * (docs/03 "실제 상태 조회로 확인한 결과만 VERIFIED"). 모의 어댑터는 쓰지 않는다(항상 MOCK).
    */
   verified?: boolean;
+  /** LIVEP1-DIAG: 실제 Threads 호출 실패 진단(허용 목록 — 숫자·짧은 열거만, live-publish.ts sanitizeThreadsDiag). 작업 이력·전송 의도에 남는다. */
+  provider_diag?: ThreadsDiag;
 }
 
 /**
@@ -370,6 +373,8 @@ export interface ReconcileResult {
    * 만들지 않고 작업 이력에 후보로만 남겨 사용자가 직접 확인하게 한다. external_id 는 'threads:<숫자>', permalink 는 공식 Threads 링크만.
    */
   candidate?: { external_id: string; permalink?: string };
+  /** LIVEP1-DIAG: 조회 중 실제 Threads 호출 실패 진단(허용 목록만) */
+  provider_diag?: ThreadsDiag;
 }
 
 export interface CancelResult {

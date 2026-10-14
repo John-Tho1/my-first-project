@@ -16,7 +16,9 @@ import {
   instagramStepLine,
   itemHeadline,
   jobStatusText,
+  latestThreadsDiag,
   liveCandidateFromEvents,
+  threadsDiagLine,
   mockScenarioOptionsFor,
   planAccountLabel,
   planFormDefaults,
@@ -646,5 +648,29 @@ describe('liveCandidateFromEvents — 최신 재확인 기준(오래된 후보 �
     expect(liveCandidateFromEvents([cand(3), ev(4, { event: 'blocked' })])).toEqual({ externalId: C1, permalink: L1 });
     expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: 'mock:threads:x' })])).toBeNull();
     expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: C1, candidate_permalink: 'https://evil.example/x' })])).toEqual({ externalId: C1, permalink: null });
+  });
+});
+
+// LIVEP1-DIAG: 실제 Threads 오류 진단 한 줄(허용 목록 필드만 — 이력에 다른 값이 섞여 있어도 화면에 나가지 않는다)
+describe('threadsDiagLine·latestThreadsDiag', () => {
+  const TOKEN = 'FAKE_diag_ui_token_tttttttttttttttt';
+  it('한국어 한 줄: 단계·HTTP·code·subcode·type·is_transient·fbtrace', () => {
+    expect(threadsDiagLine({ op: 'create', http_status: 403, code: 10, error_subcode: 2207051, error_type: 'OAuthException', is_transient: false, fbtrace_id: 'AbC_1' })).toBe(
+      'Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10 · subcode 2207051 · OAuthException · is_transient=false · fbtrace AbC_1',
+    );
+    expect(threadsDiagLine({ op: 'publish', transport: 'timeout' })).toBe('Threads 오류 코드: 게시 · 응답 시간 초과(응답 없음)');
+    expect(threadsDiagLine({ op: 'list' })).toBeNull();
+  });
+  it('이력에 문구·토큰·URL 이 섞여 있어도 줄에는 허용 목록만', () => {
+    const line = threadsDiagLine({ op: 'create', http_status: 403, code: 10, message: `perm ${TOKEN}`, error_user_msg: TOKEN, url: `https://graph.threads.net/x?access_token=${TOKEN}`, error_type: `x ${TOKEN}` })!;
+    expect(line).toBe('Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10');
+    expect(line).not.toContain(TOKEN);
+  });
+  it('가장 최근 진단(새 것부터)', () => {
+    const ev = (eventSeq: number, d: Record<string, unknown>) => ({ eventSeq, sanitizedDetails: d });
+    expect(latestThreadsDiag([ev(1, { provider_diag: { op: 'create', http_status: 500 } }), ev(2, { event: 'x' }), ev(3, { provider_diag: { op: 'create', http_status: 403, code: 10 } })])).toBe(
+      'Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10',
+    );
+    expect(latestThreadsDiag([ev(1, { event: 'x' })])).toBeNull();
   });
 });

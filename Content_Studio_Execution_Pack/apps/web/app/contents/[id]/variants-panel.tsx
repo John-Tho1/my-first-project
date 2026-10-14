@@ -24,6 +24,7 @@ export function VariantsPanel({
   newPackageId,
   contentTitle,
   planByVariant,
+  livePlatforms,
   llmMode,
 }: {
   contentId: string;
@@ -38,6 +39,8 @@ export function VariantsPanel({
   contentTitle: string;
   /** T10: 파생본 id → 가장 최근 배포 계획 id */
   planByVariant: Map<string, string>;
+  /** LIVEP1-DIAG: 실제 게시 계정으로 사용 중인 실제 계정의 플랫폼(안내 문구용 — 판정은 서버) */
+  livePlatforms?: ReadonlySet<string>;
   /** LIVE-UI: 설정의 LLM_MODE — AI 초안 버튼 문구 */
   llmMode: LlmMode;
 }) {
@@ -157,7 +160,10 @@ export function VariantsPanel({
                 )}
                 {s.variant.lifecycle === 'review' ? (
                   <p className="note">
-                    <a href={`/distribute/new?content_id=${contentId}`}>배포 계획 만들기</a> (MOCK — 계획 뒤에 채널별 내용을 확인하고 직접 승인)
+                    <a href={`/distribute/new?content_id=${contentId}`}>배포 계획 만들기</a>{' '}
+                    {livePlatforms?.has(s.variant.channel)
+                      ? '(실제 게시 계정 있음 — 계획에서 실제 계정을 고르면 승인·실행 뒤 실제로 게시, 모의 계정은 MOCK. 계획 뒤에 채널별 내용을 확인하고 직접 승인)'
+                      : '(MOCK — 계획 뒤에 채널별 내용을 확인하고 직접 승인)'}
                     {planByVariant.get(s.variant.id) ? (
                       <>
                         {' · '}

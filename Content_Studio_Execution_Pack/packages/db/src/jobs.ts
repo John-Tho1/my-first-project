@@ -31,6 +31,8 @@ import {
   DEFAULT_LEASE_TTL_MS,
   FREE_RESUME_MAX,
   isAllowedThreadsPermalink,
+  sanitizeThreadsDiag,
+  type ThreadsDiag,
   isScheduleStale,
   LIVE_THREADS_EXTERNAL_ID_RE,
   staleScheduleConfirmedBy,
@@ -283,6 +285,12 @@ async function settle(
 
 const CLEAR_LEASE = { leaseOwner: null, leaseUntil: null } as const;
 
+/** LIVEP1-DIAG: 진단을 이력 필드로(허용 목록 통과분만, 없으면 빈 객체). */
+function providerDiagDetail(d: unknown): { provider_diag?: ThreadsDiag } {
+  const s = sanitizeThreadsDiag(d);
+  return s ? { provider_diag: s } : {};
+}
+
 /**
  * 원격 결과 기록(추가 전용). 모의 어댑터 결과는 is_mock=true·verification=MOCK — 실제 발행 실적이 아니다(DB CHECK 로도 강제).
  * LIVE-P1(D38): 실제 결과는 원격 읽기로 확인했을 때만(r.verified) VERIFIED + verified_at, 아니면 UNVERIFIED. 형식(threads:<숫자>·공식 링크)은
@@ -329,7 +337,7 @@ async function fillIntent(
   ownerId: string,
   intent: SendIntentRow | null,
   outcome: 'accepted' | 'rejected' | 'ambiguous',
-  r: { provider_request_id?: string; external_id?: string; error_code?: string; status?: string; retry_class?: string },
+  r: { provider_request_id?: string; external_id?: string; error_code?: string; status?: string; retry_class?: string; provider_diag?: unknown },
   now: Date,
   source: string,
 ): Promise<void> {
@@ -347,6 +355,7 @@ async function fillIntent(
         status: r.status ?? null,
         error_code: r.error_code ?? null,
         retry_class: r.retry_class ?? null,
+        ...providerDiagDetail(r.provider_diag),
         ...(typeof intent.sanitizedDetails?.adapter_id === 'string' ? { adapter_id: intent.sanitizedDetails.adapter_id } : {}),
         // LIVE-P1: 실제 게시 승인 기록·모드도 남긴다(게시 수 상한을 세는 근거 — 결과를 채운 뒤에도 사라지지 않게).
         ...(typeof intent.sanitizedDetails?.live_approval_ref === 'string' ? { live_approval_ref: intent.sanitizedDetails.live_approval_ref } : {}),
@@ -924,6 +933,8 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
       retry_class: cls.retryClass,
       error_code: result.error_code ?? null,
       external_id: result.external_id ?? null,
+      // LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 — 쓰기 직전 한 번 더 걸러 숫자·짧은 열거만)
+      ...providerDiagDetail(result.provider_diag),
     };
     const common = { ...CLEAR_LEASE, lastErrorCode: result.error_code ?? null, lastRetryClass: cls.retryClass };
     const isMock = plan.adapter.kind === 'mock';
@@ -1049,7 +1060,7 @@ async function applyReconcile(
     r.status === 'unknown' && r.candidate && LIVE_THREADS_EXTERNAL_ID_RE.test(r.candidate.external_id)
       ? { candidate_external_id: r.candidate.external_id, ...(isAllowedThreadsPermalink(r.candidate.permalink) ? { candidate_permalink: r.candidate.permalink } : {}) }
       : {};
-  const base = { attempt: job.attempt, reconcile: r.status, error_code: r.error_code ?? null, manual: opts.manual || undefined, ...candidate };
+  const base = { attempt: job.attempt, reconcile: r.status, error_code: r.error_code ?? null, manual: opts.manual || undefined, ...candidate, ...providerDiagDetail(r.provider_diag) };
   const common = { ...CLEAR_LEASE };
   if (cancelResult?.status === 'canceled' && job.state === 'CANCEL_REQUESTED') {
     return settle(tx, ownerId, job, item, 'canceled', { ...base, remote_canceled: true }, now, common);
@@ -1582,6 +1593,16 @@ export function intentView(i: SendIntentRow) {
 export const MOCK_PUBLICATION_NOTICE = '실제 발행 실적 아님';
 export const publicationView = publicationViewOf;
 
+async function accountKindOfItem(db: DbOrTx, ownerId: string, itemId: string): Promise<string | null> {
+  const rows = await db
+    .select({ kind: channelAccounts.kind })
+    .from(distributionItems)
+    .innerJoin(channelAccounts, and(eq(channelAccounts.id, distributionItems.channelAccountId), eq(channelAccounts.ownerId, distributionItems.ownerId)))
+    .where(and(eq(distributionItems.id, itemId), eq(distributionItems.ownerId, ownerId)))
+    .limit(1);
+  return rows[0]?.kind ?? null;
+}
+
 /** GET /api/jobs/{id}: 비밀·본문 없는 작업 상태 + 이력(최근 50) + 전송 의도 + 원격 결과. */
 export async function getJobDetail(db: DbOrTx, ownerId: string, jobId: string) {
   const job = await getJobRow(db, ownerId, jobId);
@@ -1596,7 +1617,8 @@ export async function getJobDetail(db: DbOrTx, ownerId: string, jobId: string) {
       .orderBy(asc(publications.createdAt)),
   ]);
   return {
-    job: jobView(job),
+    // LIVEP1-DIAG: 항목 계정이 실제 계정이면 mode LIVE(표시용)
+    job: jobView(job, job.itemId ? await accountKindOfItem(db, ownerId, job.itemId) : null),
     events: events.map(jobEventView),
     intents: intents.map(intentView),
     publications: pubs.map(publicationView),

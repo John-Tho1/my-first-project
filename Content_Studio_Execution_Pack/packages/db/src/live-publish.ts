@@ -10,7 +10,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { AppError, isThreadsNumericId, isUuid, NotFoundError, TERMINAL_JOB_STATES } from '@cs/domain';
 import type { Db } from './client';
 import { setChannelAccountStateTx } from './distribution';
-import { credentialGate } from './oauth';
+import { credentialGate, LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY } from './oauth';
 import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, distributionItems, jobs, sendIntents } from './schema';
 
@@ -44,6 +44,14 @@ export async function pendingLiveJobs(tx: DbOrTx, ref: string): Promise<number> 
     );
   return rows.length;
 }
+
+/** LIVEP1-DIAG: "실제 게시 계정으로 사용" 중인 실제 Threads 계정의 capability_snapshot(표시용 — 게이트 아님) */
+export const LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET: Readonly<Record<string, unknown>> = Object.freeze({
+  mock: false,
+  external_writes: true,
+  publish: 'live_text_D38',
+  note: '실제 계정 — 실제 게시 계정으로 사용 중(D38): 승인한 Threads 텍스트 글 1개를 실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 모두 있을 때만 게시',
+});
 
 export class LivePublishTargetError extends AppError {
   constructor(code: 'live_target_not_live_threads' | 'live_target_unbound' | 'live_target_credential_unusable', message: string) {
@@ -83,6 +91,15 @@ export async function setLivePublishTarget(db: Db, ownerId: string, accountId: s
       }
     }
     const r = await setChannelAccountStateTx(tx, ownerId, accountId, enabled ? 'connected' : 'disconnected', now);
+    // LIVEP1-DIAG: 표시용 capability_snapshot 을 지금 상태에 맞춘다(사용 = D38 실제 텍스트 게시, 중지 = D31 연결만). 게이트는 이 값을 읽지 않는다
+    // (실행·전송 게이트 = PUBLISH_MODE·승인 기록·게시 수 상한·계정 state·연결 정보·승인 hash).
+    const snapshot = enabled ? { ...LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET } : { ...LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY };
+    const [withSnapshot] = await tx
+      .update(channelAccounts)
+      .set({ capabilitySnapshot: snapshot })
+      .where(and(eq(channelAccounts.id, accountId), eq(channelAccounts.ownerId, ownerId)))
+      .returning();
+    r.account = withSnapshot ?? r.account;
     await recordAudit(tx, {
       ownerId,
       action: 'channel_account.live_publish_target',

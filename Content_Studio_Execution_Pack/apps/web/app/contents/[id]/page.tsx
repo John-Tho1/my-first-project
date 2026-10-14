@@ -7,6 +7,7 @@ import {
   getWritingState,
   latestPlanForVariants,
   listAssets,
+  listChannelAccounts,
   listClaimsForRun,
   listPackages,
   listVariantStates,
@@ -75,6 +76,8 @@ export default async function ContentPage({
     session.ownerId,
     variantStates.map((v) => v.variant.id),
   );
+  // LIVEP1-DIAG: 실제 게시 계정으로 사용 중인(connected) 실제 계정의 플랫폼 — 채널 초안의 "배포 계획 만들기" 안내 문구용(판정 아님)
+  const livePlatforms = new Set((await listChannelAccounts(db, session.ownerId)).filter((a) => a.kind === 'live' && a.state === 'connected').map((a) => a.platform));
   const ownerAssets = await listAssets(db, session.ownerId, 50);
   const packages = await listPackages(exportsDir(config), session.ownerId, c.id, 5);
   const newPackage = str(q.package);
@@ -208,6 +211,7 @@ export default async function ContentPage({
             editError={err && VARIANT_EDIT_ERROR_CODES.has(str(q.error)!) ? err : null}
             contentTitle={c.title}
             planByVariant={planByVariant}
+            livePlatforms={livePlatforms}
             llmMode={config.LLM_MODE}
             newPackageId={newPackage && packages.some((p) => p.id === newPackage) ? newPackage : null}
           />

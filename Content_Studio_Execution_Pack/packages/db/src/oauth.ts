@@ -229,6 +229,17 @@ export function accountHealthView(account: AccountRow, cred: OAuthCredentialRow 
 }
 
 /**
+ * LIVE-T1(D31): 실제 계정 행의 capability_snapshot(표시용 — 어떤 게이트도 이 값을 읽지 않는다). LIVEP1-DIAG: "실제 게시 계정으로 사용"을
+ * 끄면 이 값으로 되돌린다(db live-publish.ts LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET 와 짝).
+ */
+export const LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY: Readonly<Record<string, unknown>> = Object.freeze({
+  mock: false,
+  external_writes: false,
+  publish: 'out_of_scope_D31',
+  note: '실제 계정 — 연결·프로필 조회만(D31), 게시 안 함',
+});
+
+/**
  * LIVE-T1(D31 2단계 준비): 실제 Threads 계정 행(연결 전)을 만든다 — owner 범위, 외부 호출 없음. 이미 "연결 전" 실제 Threads 행이 있으면 그 행을 돌려준다(멱등).
  * external_account_id = 'pending:<uuid>'(첫 실제 연결 callback 이 프로필 ID 로 묶는다), state = 'disconnected'(accountReady=false — 배포 계획에 고를 수 없다;
  * 실제 게시는 D31 범위 밖). 연결 정보·토큰은 만들지 않는다.
@@ -251,7 +262,7 @@ export async function createLiveThreadsAccount(db: Db, ownerId: string, now: Dat
         externalAccountId: `${UNBOUND_LIVE_EXTERNAL_PREFIX}${randomUUID()}`,
         displayName: '실제 Threads 계정(연결 전)',
         state: 'disconnected',
-        capabilitySnapshot: { mock: false, external_writes: false, publish: 'out_of_scope_D31', note: '실제 계정 — 연결·프로필 조회만(D31), 게시 안 함' },
+        capabilitySnapshot: { ...LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY },
         createdAt: now,
       })
       .returning();

@@ -270,6 +270,7 @@ describe('submit 성공: 컨테이너 → 상태 FINISHED → 게시 시도 표�
       external_id: `threads:${MEDIA}`,
       verified: false,
       error_code: 'readback_failed',
+      provider_diag: { op: 'read', http_status: 500, code: 2, error_type: 'OAuthException' }, // LIVEP1-DIAG: 허용 목록 진단(문구 없음)
     });
     const r2 = adapterWith({ ...happyRoutes(), [P.read]: ok({ id: MEDIA, permalink: 'https://evil.example/post/1', text: TEXT }) });
     const s2 = memSteps();
@@ -369,7 +370,10 @@ describe('게시(threads_publish) 중·뒤 결과 불명 — 다시 게시하지
     const steps = memSteps();
     const c = ctxOf(steps);
     const r = await a.submit(await a.prepare(snapshot(), c), c);
-    expect(r).toEqual({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: code });
+    // LIVEP1-DIAG: 진단(provider_diag)은 따로 확인하고 나머지는 정확히 같아야 한다
+    const { provider_diag: diag, ...rest } = r;
+    expect(rest).toEqual({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: code });
+    expect(diag === undefined || diag.op === 'publish').toBe(true); // 2xx 인데 id 없음은 상태를 모르는 응답이라 진단 없음
     expect(classifyOutcome(r).event).toBe('ambiguous');
     expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished', 'publish_attempt:created']);
   });
@@ -515,7 +519,7 @@ describe('게시(threads_publish) 중·뒤 결과 불명 — 다시 게시하지
     const steps = memSteps();
     const c = ctxOf(steps);
     await a.submit(await a.prepare(snapshot(), c), c);
-    expect(await a.reconcile({ platform: 'threads', intent_key: 'k', external_id: null, provider_request_id: null }, c)).toEqual({ status: 'unknown', error_code: 'list_unreadable' });
+    expect(await a.reconcile({ platform: 'threads', intent_key: 'k', external_id: null, provider_request_id: null }, c)).toEqual({ status: 'unknown', error_code: 'list_unreadable', provider_diag: { op: 'list', transport: 'timeout' } });
     expect(await a.reconcile({ platform: 'threads', intent_key: 'k', external_id: null, provider_request_id: null }, ctxOf(memSteps()))).toEqual({ status: 'not_found', error_code: 'no_remote_steps' });
     const closed = new LiveThreadsPublishAdapter({ gate: () => ({ ready: false, missing: ['PUBLISH_LIVE_APPROVAL_REF'] }), fetch: vi.fn() });
     const n = seen.length;
@@ -684,6 +688,57 @@ describe('FIX2-LIVEP1: 응답 크기 경계·조각 경계의 UTF-8', () => {
     const { a } = adapterWith({ ...happyRoutes(), [P.read]: () => chunked(body, 7) }); // 7바이트 조각 — 3바이트 문자가 여러 번 잘린다
     const c = ctxOf(memSteps());
     expect(await a.submit(await a.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted', verified: true, permalink: PERMALINK });
+  });
+});
+
+describe('LIVEP1-DIAG: 실패 진단(허용 목록 숫자·짧은 열거만)', () => {
+  const graphErr = (status: number, extra: Record<string, unknown> = {}) =>
+    ok({ error: { message: SECRET_MSG, type: 'OAuthException', code: 10, error_subcode: 2207051, is_transient: false, fbtrace_id: 'AbC_123-x', error_user_title: TOKEN, error_user_msg: SECRET_MSG, ...extra } }, status);
+  const noSecret = (x: unknown) => {
+    const s = JSON.stringify(x) + inspect(x, { depth: 6 });
+    expect(s).not.toContain(TOKEN);
+    expect(s).not.toContain('Invalid OAuth access token');
+    expect(s).not.toContain('graph.threads.net');
+  };
+  it('컨테이너 생성 403(D38 2단계와 같은 판정) → 결과에 진단 — 문구·사용자 문구·토큰은 없음', async () => {
+    const { a } = adapterWith({ [P.create]: graphErr(403) });
+    const c = ctxOf(memSteps());
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toEqual({
+      status: 'rejected',
+      retry_class: 'permanent',
+      error_code: 'container_permission_denied',
+      provider_diag: { op: 'create', http_status: 403, code: 10, error_subcode: 2207051, error_type: 'OAuthException', is_transient: false, fbtrace_id: 'AbC_123-x' },
+    });
+    noSecret(r);
+  });
+  it('형식 밖 type·fbtrace 는 버림, 응답 없음(시간 초과)은 transport 만', async () => {
+    const r1 = adapterWith({ [P.create]: graphErr(400, { code: 100, type: `Bad type ${TOKEN}`, fbtrace_id: 'has space' }) });
+    const c1 = ctxOf(memSteps());
+    expect((await r1.a.submit(await r1.a.prepare(snapshot(), c1), c1)).provider_diag).toEqual({ op: 'create', http_status: 400, code: 100, error_subcode: 2207051, is_transient: false });
+    const r2 = adapterWith({ [P.create]: timeoutErr() });
+    const c2 = ctxOf(memSteps());
+    expect((await r2.a.submit(await r2.a.prepare(snapshot(), c2), c2)).provider_diag).toEqual({ op: 'create', transport: 'timeout' });
+  });
+  it('게시·상태·읽기·목록 실패에도 단계별 진단', async () => {
+    const pub = adapterWith({ ...happyRoutes(), [P.publish]: graphErr(500, { code: 2, is_transient: true }) });
+    const c1 = ctxOf(memSteps());
+    const r1 = await pub.a.submit(await pub.a.prepare(snapshot(), c1), c1);
+    expect(r1).toMatchObject({ status: 'ambiguous', provider_diag: { op: 'publish', http_status: 500, code: 2, is_transient: true } });
+    const st = adapterWith({ [P.create]: ok({ id: CT }), [P.status]: graphErr(503, { code: 1 }) });
+    const c2 = ctxOf(memSteps());
+    expect((await st.a.submit(await st.a.prepare(snapshot(), c2), c2)).provider_diag).toMatchObject({ op: 'status', http_status: 503, code: 1 });
+    const rd = adapterWith({ ...happyRoutes(), [P.read]: graphErr(404, { code: 100 }) });
+    const c3 = ctxOf(memSteps());
+    const r3 = await rd.a.submit(await rd.a.prepare(snapshot(), c3), c3);
+    expect(r3).toMatchObject({ status: 'accepted', error_code: 'readback_failed', provider_diag: { op: 'read', http_status: 404, code: 100 } });
+    const ls = adapterWith({ ...happyRoutes(), [P.publish]: timeoutErr(), [P.list]: graphErr(403) });
+    const steps = memSteps();
+    const c4 = ctxOf(steps);
+    await ls.a.submit(await ls.a.prepare(snapshot(), c4), c4);
+    const rc = await ls.a.reconcile({ platform: 'threads', intent_key: 'k', external_id: null, provider_request_id: null }, c4);
+    expect(rc).toMatchObject({ status: 'unknown', error_code: 'list_unreadable', provider_diag: { op: 'list', http_status: 403, code: 10 } });
+    for (const x of [r1, r3, rc]) noSecret(x);
   });
 });
 

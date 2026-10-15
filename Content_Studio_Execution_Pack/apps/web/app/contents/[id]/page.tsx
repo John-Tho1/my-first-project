@@ -153,7 +153,7 @@ export default async function ContentPage({
             />
             <label htmlFor="note">저장 메모(선택)</label>
             <input id="note" name="note" type="text" maxLength={MAX_VERSION_NOTE} />
-            <button type="submit">새 버전으로 저장</button>
+            <button type="submit" className="primary">새 버전으로 저장</button>
           </form>
           <details className="more">
             <summary>자세히</summary>

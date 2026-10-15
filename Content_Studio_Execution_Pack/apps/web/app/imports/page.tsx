@@ -56,7 +56,7 @@ export default async function ImportsPage({ searchParams }: { searchParams: Prom
             <option value="notion_export">Notion 내보내기</option>
             <option value="drive_export">Drive 다운로드</option>
           </select>
-          <button type="submit">가져오기 미리보기 만들기</button>
+          <button type="submit" className="primary">가져오기 미리보기 만들기</button>
         </form>
       </section>
 

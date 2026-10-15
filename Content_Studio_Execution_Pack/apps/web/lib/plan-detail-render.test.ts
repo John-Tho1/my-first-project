@@ -106,7 +106,7 @@ describe('계획 상세 — 항목 상태 태그는 그 항목 기록으로', ()
     state.detail = detail(item({ live: false, verification: 'MOCK', name: 'mock' }));
     const [card] = cards(await render());
     expect(statusTag(card!)).toBe('CONFIRMED · MOCK 확인(실제 발행 아님)');
-    expect(card).toContain('<span class="tag warn">MOCK</span>');
+    expect(card).toContain('<span class="tag mock">MOCK</span>');
     expect(card).toContain('실제 발행 실적 아님');
   });
 
@@ -132,5 +132,26 @@ describe('계획 상세 — 항목 상태 태그는 그 항목 기록으로', ()
     expect(await render()).toContain('<span class="tag">처리 끝</span>');
     state.detail = detail(item({ live: false, verification: 'MOCK', name: 'mock' }));
     expect(await render()).toContain('<span class="tag">처리 끝(MOCK — 실제 발행 아님)</span>');
+  });
+});
+
+describe('DESIGN-A — 항목 카드: 실제 게시(주황 tag live)와 MOCK(회색 tag mock)을 섞지 않고, 공개 범위·일정·요청 결과는 묶음 목록 행', () => {
+  it('실제 카드: tag live 표시 · tag mock 없음 · 공개 범위 행(승인 값 public) · 요청 결과 행(실제 게시)', async () => {
+    state.detail = detail(item({ live: true, verification: 'USER_CONFIRMED', name: 'live' }));
+    const [card] = cards(await render());
+    expect(card).toContain('<span class="tag live">실제 게시 — 실제 계정</span>');
+    expect(card).not.toContain('tag mock');
+    expect(card).toContain('<dl class="group-list">');
+    expect(card).toMatch(/<div class="row"><dt>공개 범위<\/dt><dd>[^<]*\(승인 값 public\)<\/dd><\/div>/);
+    expect(card).toContain('<div class="row"><dt>일정</dt><dd>즉시(실행 후 대기열)</dd></div>');
+    expect(card).toContain('<div class="row"><dt>요청 결과</dt><dd>실제 게시(public_publish — Threads 텍스트 1개)</dd></div>');
+  });
+
+  it('모의 카드: tag mock 표시 · tag live 없음 · 요청 결과 행은 MOCK 실행(실제 게시 아님)', async () => {
+    state.detail = detail(item({ live: false, verification: 'MOCK', name: 'mock' }));
+    const [card] = cards(await render());
+    expect(card).toContain('<span class="tag mock">MOCK</span>');
+    expect(card).not.toContain('tag live');
+    expect(card).toContain('<div class="row"><dt>요청 결과</dt><dd>MOCK 실행(실제 게시 아님)</dd></div>');
   });
 });

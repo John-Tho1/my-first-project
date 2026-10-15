@@ -3,7 +3,7 @@
  * 안전 표시(실제 게시·MOCK·실제 발행 실적 아님·공개 범위·확인 상태·결과 불명 안내·확인 후보·Threads 오류 코드·준비 안 됨·AI 출처·개인 원문 등)가 남아 있어야 한다.
  * 소스 문자열 시험이다(렌더 아님) — 각 표시는 조건부로만 그려지므로, 여기서는 "접힌 곳으로 옮겨지지 않았음"만 본다.
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const read = (rel: string) => readFileSync(new URL(`../app/${rel}`, import.meta.url), 'utf8');
@@ -19,7 +19,7 @@ function stripDetails(src: string): string {
   return out;
 }
 
-const MOCK_TAG = '<span className="tag warn">MOCK</span>';
+const MOCK_TAG = '<span className="tag mock">MOCK</span>';
 
 /** 화면 소스 → 접힌 곳 밖에 남아야 하는 안전 표시 */
 const REQUIRED: Record<string, string[]> = {
@@ -37,7 +37,7 @@ const REQUIRED: Record<string, string[]> = {
     '<span className="hash">{diagLine}</span>',
     // 공개 범위·확인 상태
     '{LIVE_THREADS_VISIBILITY_TEXT}',
-    '공개 범위: {live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)`',
+    '<dt>공개 범위</dt><dd>{live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)`',
     'liveVerificationLabel(p.verification, p.permalink)',
     'liveVerificationTag(latestPub?.verification)',
     '<span className={pubTag.className}>{pubTag.text}</span>',
@@ -49,8 +49,8 @@ const REQUIRED: Record<string, string[]> = {
     '확인된 결과도 MOCK 이며 실제 발행 실적이 아닙니다.',
     `${MOCK_TAG} <strong>실제 발행 실적 아님</strong>`,
     '<strong> — 실제 발행 실적 아님</strong>',
-    '<span className="tag warn">실제 게시 — 실제 계정</span>',
-    '<span className="tag warn">실제 게시 승인</span>',
+    '<span className="tag live">실제 게시 — 실제 계정</span>',
+    '<span className="tag live">실제 게시 승인</span>',
     "'작업 처리 실행(1회 — 실제 게시 항목은 실제로 게시)'",
     '실제 Instagram 으로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.',
     '실제 Threads 로 아무것도 보내지 않았고 실제 발행 실적이 아닙니다.',
@@ -92,7 +92,7 @@ const REQUIRED: Record<string, string[]> = {
   ],
   'settings/page.tsx': [
     '실제 게시 준비 안 됨(실제로 게시하지 않음): {oauth.livePublish.missing.join',
-    '<span className="tag warn">실제 게시 준비됨</span>',
+    '<span className="tag live">실제 게시 준비됨</span>',
     '실제 Threads 연결 준비 안 됨: {oauth.live.missing.join',
     '`live 준비 안 됨: ${live.missing.join',
     '음성 전사 live 준비 안 됨: {sttLive.missing.join',
@@ -101,7 +101,7 @@ const REQUIRED: Record<string, string[]> = {
     '개인 원문이 들어 있으니 파일을 보관할 곳을 직접 정하세요.',
     '미리보기 단계에서는 데이터가 바뀌지 않습니다.',
     '모의 연결은 실제 게시에 쓰이지 않습니다.',
-    "<span className=\"tag warn\">MOCK</span> : <span className=\"tag warn\">실제 계정</span>",
+    "<span className=\"tag mock\">MOCK</span> : <span className=\"tag live\">실제 계정</span>",
     'id="accounts"',
   ],
   'contents/[id]/page.tsx': ['확인하지 않은 1인칭 경험 주장이', '"준비됨"으로 바꿀 수 없습니다'],
@@ -240,5 +240,43 @@ describe('FIX-UICLEAN — 고정 MOCK 단정 문구 없음', () => {
 
   it('복원 화면의 현재 위치는 복원 상태(미리보기/완료)를 넘긴다', () => {
     expect(read('settings/restores/[id]/page.tsx')).toContain("page: 'restore', committed: Boolean(committed)");
+  });
+});
+
+/**
+ * DESIGN-A(시스템 다크): 실제 게시 태그는 주황(`tag live`), MOCK 태그는 회색 점선(`tag mock`) — 화면 어디에서도 서로의 클래스를 쓰지 않는다.
+ * (색 값과 대비는 design-tokens.test.ts 가 globals.css 로 확인)
+ */
+describe('DESIGN-A — 실제 게시 태그와 MOCK 태그를 섞지 않는다', () => {
+  const appDir = new URL('../app/', import.meta.url);
+  const sources = (readdirSync(appDir, { recursive: true }) as string[])
+    .filter((p) => p.endsWith('.tsx'))
+    .map((p) => p.split('\\').join('/'))
+    .map((file) => ({ file, src: readFileSync(new URL(file, appDir), 'utf8') }));
+
+  it('화면 소스를 찾았다(배포 화면 포함)', () => {
+    expect(sources.some((s) => s.file === 'distribute/[id]/page.tsx')).toBe(true);
+    expect(sources.length).toBeGreaterThan(20);
+  });
+
+  it('글자 그대로 MOCK 태그는 모두 tag mock', () => {
+    const wrong = sources.flatMap(({ file, src }) =>
+      [...src.matchAll(/className="(tag[^"]*)">MOCK</g)].filter((m) => m[1] !== 'tag mock').map((m) => `${file}: ${m[0]}`),
+    );
+    expect(wrong).toEqual([]);
+    expect(sources.filter(({ src }) => src.includes('className="tag mock">MOCK<')).length).toBeGreaterThan(3);
+  });
+
+  it('글자 그대로 "실제 …" 태그는 tag live(경고인 "실제 게시 대상 미지정" 만 tag warn), tag live 에 MOCK 문구 없음', () => {
+    const wrong = sources.flatMap(({ file, src }) =>
+      [...src.matchAll(/className="(tag[^"]*)">(실제[^<]*)</g)]
+        .filter((m) => (m[2]!.startsWith('실제 게시 대상 미지정') ? m[1] !== 'tag warn' : m[1] !== 'tag live'))
+        .map((m) => `${file}: ${m[0]}`),
+    );
+    expect(wrong).toEqual([]);
+    const liveWithMock = sources.flatMap(({ file, src }) =>
+      [...src.matchAll(/className="tag live">([^<]*)</g)].filter((m) => m[1]!.includes('MOCK') || m[1]!.includes('모의')).map((m) => `${file}: ${m[0]}`),
+    );
+    expect(liveWithMock).toEqual([]);
   });
 });

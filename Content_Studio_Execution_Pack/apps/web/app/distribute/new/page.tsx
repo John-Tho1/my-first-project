@@ -39,7 +39,7 @@ function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; 
     // LIVE-P1(D38): 실제 Threads 계정 = 실제 게시(public_publish) 고정, 모의 계정 = MOCK 실행(서버가 계정마다 정함)
     return (
       <p className="meta">
-        요청 결과: <span className="tag warn">실제 게시</span> 실제 Threads 계정은 <strong>실제 게시(public_publish)</strong>
+        요청 결과: <span className="tag live">실제 게시</span> 실제 Threads 계정은 <strong>실제 게시(public_publish)</strong>
         {sel.choices.length ? ', 모의 계정은 MOCK 실행(실제 게시 아님)' : ''} — 계정에 따라 서버가 정합니다.
       </p>
     );
@@ -47,7 +47,7 @@ function ResultFields({ vid, sel, prev }: { vid: string; sel: PlanResultSelect; 
   if (sel.fixed) {
     return (
       <p className="meta">
-        요청 결과: <strong>{RESULT_CHOICE_LABEL.mock_publish}</strong> <span className="tag warn">MOCK</span>
+        요청 결과: <strong>{RESULT_CHOICE_LABEL.mock_publish}</strong> <span className="tag mock">MOCK</span>
       </p>
     );
   }
@@ -126,7 +126,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
       <h2 className="screen-title">배포 계획 만들기 — {content.title}</h2>
       {accounts.some(isLiveThreadsAccount) ? (
         <p className="notice" role="note">
-          <span className="tag warn">실제 게시 계정 있음</span> 실제 계정을 고르고 승인·실행하면 <strong>실제로 게시</strong>됩니다(모의 계정은 MOCK). 계획 생성만으로는 승인·게시되지
+          <span className="tag live">실제 게시 계정 있음</span> 실제 계정을 고르고 승인·실행하면 <strong>실제로 게시</strong>됩니다(모의 계정은 MOCK). 계획 생성만으로는 승인·게시되지
           않습니다.
         </p>
       ) : (
@@ -190,7 +190,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                   {v.channel === 'instagram' && accs.some((a) => adapterIdFor({ kind: a.kind === 'mock' ? 'mock' : 'live', platform: a.platform, credential_state: a.credentialState }) === 'mock_instagram') ? (
                     <>
                       <p className="note">
-                        <span className="tag warn">MOCK</span> 모의 연결 Instagram 계정: MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다(비공개·예약 결과 없음).
+                        <span className="tag mock">MOCK</span> 모의 연결 Instagram 계정: MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다(비공개·예약 결과 없음).
                       </p>
                       <details className="more">
                         <summary>자세히(이미지 규격)</summary>
@@ -202,7 +202,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
                   ) : null}
                   {accs.some(isLiveThreadsAccount) ? (
                     <p className="note">
-                      <span className="tag warn">실제 게시</span> {LIVE_PLAN_ACCOUNT_NOTE}
+                      <span className="tag live">실제 게시</span> {LIVE_PLAN_ACCOUNT_NOTE}
                     </p>
                   ) : null}
                   <ResultFields vid={v.id} sel={planResultSelect(accs)} prev={prev} />
@@ -212,7 +212,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
           ))}
           <label htmlFor="target_summary">계획 이름(선택)</label>
           <input id="target_summary" type="text" name="target_summary" maxLength={200} defaultValue={prev.name} />
-          <button type="submit">{accounts.some(isLiveThreadsAccount) ? '배포 계획 만들기(승인 전 — 아직 게시하지 않음)' : '배포 계획 만들기(MOCK — 승인 전)'}</button>
+          <button type="submit" className="primary">{accounts.some(isLiveThreadsAccount) ? '배포 계획 만들기(승인 전 — 아직 게시하지 않음)' : '배포 계획 만들기(MOCK — 승인 전)'}</button>
         </form>
       )}
     </main>

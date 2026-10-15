@@ -83,9 +83,14 @@ export default async function SettingsPage({
 
       <section className="card archive" aria-labelledby="auth-title">
         <h3 id="auth-title">로그인(인증)</h3>
-        <p className="meta">
-          <span className="tag">방식: {authView.mode === 'oidc' ? 'OpenID Connect(OIDC)' : '개발용(localhost 전용, 비밀번호 없음)'}</span>
-        </p>
+        <dl className="group-list">
+          <div className="row">
+            <dt>방식</dt>
+            <dd>
+              <span className="tag">{authView.mode === 'oidc' ? 'OpenID Connect(OIDC)' : '개발용(localhost 전용, 비밀번호 없음)'}</span>
+            </dd>
+          </div>
+        </dl>
         <p className="notice" role="note">
           {authView.ready ? 'OIDC 로그인 준비됨.' : `OIDC 로그인 준비 안 됨: ${authView.missing.join(', ')}`}
         </p>
@@ -94,13 +99,24 @@ export default async function SettingsPage({
 
       <section className="card archive" aria-labelledby="ai-title">
         <h3 id="ai-title">AI 모드·비용</h3>
-        <p className="meta">
-          <span className={config.LLM_MODE === 'live' ? 'tag warn' : 'tag'}>AI: {config.LLM_MODE === 'mock' ? '모의(실제 호출 없음)' : '실제(live)'}</span>
-          <span>
-            상한: {policy.monthlyLimitMicro !== null ? `${fromMicro(policy.monthlyLimitMicro)} ${policy.currency}` : '미설정'}(설정 통화 {policy.currency})
-          </span>
-          <span>{policy.pricing ? '가격 설정됨' : '가격 미설정(모의는 0 으로 기록, 실제 호출 차단)'}</span>
-        </p>
+        <dl className="group-list">
+          <div className="row">
+            <dt>AI</dt>
+            <dd>
+              <span className={config.LLM_MODE === 'live' ? 'tag live' : 'tag'}>{config.LLM_MODE === 'mock' ? '모의(실제 호출 없음)' : '실제(live)'}</span>
+            </dd>
+          </div>
+          <div className="row">
+            <dt>월 상한</dt>
+            <dd>
+              {policy.monthlyLimitMicro !== null ? `${fromMicro(policy.monthlyLimitMicro)} ${policy.currency}` : '미설정'}(설정 통화 {policy.currency})
+            </dd>
+          </div>
+          <div className="row">
+            <dt>가격</dt>
+            <dd>{policy.pricing ? '가격 설정됨' : '가격 미설정(모의는 0 으로 기록, 실제 호출 차단)'}</dd>
+          </div>
+        </dl>
         {usage.byCurrency.length ? (
           <ul className="list">
             {usage.byCurrency.map((u) => (
@@ -127,11 +143,22 @@ export default async function SettingsPage({
           <summary>자세히</summary>
           <p>실제 AI 호출은 사용자의 별도 승인 뒤에만 연결합니다(결정 D7·D13·D34). 설정 값·키는 이 화면에 보이지 않습니다.</p>
         </details>
-        <p className="meta">
-          <span className={config.STT_MODE === 'live' ? 'tag warn' : 'tag'}>음성 전사: {config.STT_MODE === 'mock' ? '모의(실제 음성 인식 없음)' : '실제(live)'}</span>
-          <span>{stt.pricing ? `1분 가격 설정됨(${stt.currency})` : '1분 가격 미설정(모의는 0 으로 기록)'}</span>
-          <span>예산 통화·상한은 AI 와 같은 원장을 씁니다</span>
-        </p>
+        <dl className="group-list">
+          <div className="row">
+            <dt>음성 전사</dt>
+            <dd>
+              <span className={config.STT_MODE === 'live' ? 'tag live' : 'tag'}>{config.STT_MODE === 'mock' ? '모의(실제 음성 인식 없음)' : '실제(live)'}</span>
+            </dd>
+          </div>
+          <div className="row">
+            <dt>1분 가격</dt>
+            <dd>{stt.pricing ? `1분 가격 설정됨(${stt.currency})` : '1분 가격 미설정(모의는 0 으로 기록)'}</dd>
+          </div>
+          <div className="row">
+            <dt>예산</dt>
+            <dd>예산 통화·상한은 AI 와 같은 원장을 씁니다</dd>
+          </div>
+        </dl>
         <p className="notice" role="note">
           음성 전사 live 준비 안 됨: {sttLive.missing.join(', ')}
         </p>
@@ -173,12 +200,20 @@ export default async function SettingsPage({
             권한까지 지우려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 삭제하세요(메뉴 이름은 Threads 앱 버전에 따라 다를 수 있음).
           </p>
         </details>
-        <p className="meta">
-          <span className={oauth.secrets.configured ? 'tag' : 'tag warn'}>
-            서버 암호화 키: {oauth.secrets.configured ? `설정됨(키 버전 ${oauth.secrets.currentVersion}${oauth.secrets.hasPrevious ? ', 이전 키 있음' : ''})` : '설정 안 됨'}
-          </span>
-          <span>redirect URI: {oauth.redirectUri}</span>
-        </p>
+        <dl className="group-list">
+          <div className="row">
+            <dt>서버 암호화 키</dt>
+            <dd>
+              <span className={oauth.secrets.configured ? 'tag' : 'tag warn'}>
+                {oauth.secrets.configured ? `설정됨(키 버전 ${oauth.secrets.currentVersion}${oauth.secrets.hasPrevious ? ', 이전 키 있음' : ''})` : '설정 안 됨'}
+              </span>
+            </dd>
+          </div>
+          <div className="row">
+            <dt>redirect URI</dt>
+            <dd className="hash">{oauth.redirectUri}</dd>
+          </div>
+        </dl>
         {!oauth.secrets.configured ? (
           <p className="notice" role="note">
             계정 연결 불가: {oauth.secrets.problems.join(', ')} — .env.local 에 SECRETS_MASTER_KEY·SECRETS_KEY_VERSION 을 넣고 서버를 다시 시작하세요(다른 기능은 그대로).
@@ -186,7 +221,7 @@ export default async function SettingsPage({
         ) : null}
         {oauth.live.ready ? (
           <p className="meta">
-            <span className="tag warn">실제 Threads 연결 준비됨</span>
+            <span className="tag live">실제 Threads 연결 준비됨</span>
             <span>(연결·프로필 조회만 — D31. 요청 권한 threads_basic, threads_content_publish)</span>
           </p>
         ) : (
@@ -196,7 +231,7 @@ export default async function SettingsPage({
         )}
         {oauth.livePublish.ready ? (
           <p className="notice" role="note">
-            <span className="tag warn">실제 게시 준비됨</span> 실제 게시 계정으로 사용 중인 Threads 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(텍스트만, 승인
+            <span className="tag live">실제 게시 준비됨</span> 실제 게시 계정으로 사용 중인 Threads 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(텍스트만, 승인
             기록당 게시 수 상한 안에서, 되돌리기 없음).
           </p>
         ) : (
@@ -233,7 +268,7 @@ export default async function SettingsPage({
                   return (
                     <tr key={a.account_id}>
                       <td>
-                        {a.mock ? <span className="tag warn">MOCK</span> : <span className="tag warn">실제 계정</span>} {a.display_name} ·{' '}
+                        {a.mock ? <span className="tag mock">MOCK</span> : <span className="tag live">실제 계정</span>} {a.display_name} ·{' '}
                         {CHANNEL_LABEL[a.platform as Channel] ?? a.platform}
                         {!a.mock ? (a.live_publish_target ? ' · 실제 게시 계정으로 사용 중(D38)' : ' · 실제 게시 계정 아님(게시 안 함)') : ''}
                       </td>

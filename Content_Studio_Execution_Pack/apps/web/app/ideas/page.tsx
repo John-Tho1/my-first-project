@@ -50,7 +50,7 @@ export default async function IdeasPage({
           <input id="audience" name="audience" type="text" maxLength={500} />
           <label htmlFor="tags">태그(쉼표로 구분, 최대 10개)</label>
           <input id="tags" name="tags" type="text" />
-          <button type="submit">카드 저장</button>
+          <button type="submit" className="primary">카드 저장</button>
         </form>
         <p className="note">근거·위험·다음 결정은 저장 후 카드 화면에서 채웁니다. 소재함의 소재에서 바로 카드로 발전시킬 수도 있습니다.</p>
       </section>

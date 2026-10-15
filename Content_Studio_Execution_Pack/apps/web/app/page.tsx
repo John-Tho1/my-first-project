@@ -100,7 +100,7 @@ export default async function TodayPage({
   return (
     <main className="container">
       <header className="header">
-        <h1>Content Studio</h1>
+        <h1 className="app-name">Content Studio</h1>
         <p className="now">현재 시각: {formatMsk(new Date())}</p>
         <div className="session-bar">
           <span>로그인: {maskIdentity(session.identity)}</span>
@@ -139,7 +139,7 @@ export default async function TodayPage({
           <input id="user_note" name="user_note" type="text" maxLength={MAX_USER_NOTE} />
           <label htmlFor="title">제목(선택)</label>
           <input id="title" name="title" type="text" maxLength={MAX_TITLE} />
-          <button type="submit">서버에 저장</button>
+          <button type="submit" className="primary">서버에 저장</button>
         </form>
         <details className="more">
           <summary>자세히</summary>

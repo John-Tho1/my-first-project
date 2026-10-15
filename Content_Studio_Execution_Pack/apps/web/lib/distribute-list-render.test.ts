@@ -110,12 +110,12 @@ describe('계획 한 줄 — 그 계획 항목의 기록으로 실제/MOCK', () 
     state.plans = [entry({ name: '지난 실제 계획', mock: false }), entry({ name: '모의 계획', mock: true })];
     const html = await render();
     const live = row(html, '지난 실제 계획');
-    expect(live).toContain('실제 게시 포함');
+    expect(live).toContain('<span class="tag live">실제 게시 포함</span>');
     // 상태 문구의 "(MOCK — 실제 발행 아님)"도 그 계획 기록(실제 계정)에 맞춰 붙이지 않는다
     expect(live).not.toContain('MOCK');
     expect(live).toContain('처리 끝');
     const mock = row(html, '모의 계획');
-    expect(mock).toContain('<span class="tag warn">MOCK</span>');
+    expect(mock).toContain('<span class="tag mock">MOCK</span>');
     expect(mock).not.toContain('실제 게시 포함');
     expect(mock).toContain('처리 끝(MOCK — 실제 발행 아님)');
     // 페이지 안내는 지금 상태(모의만)지만 지난 실제 계획을 MOCK 이라고 하지 않는다
@@ -125,7 +125,7 @@ describe('계획 한 줄 — 그 계획 항목의 기록으로 실제/MOCK', () 
   it('실제 게시 대상이 있어도 모의 계정 계획은 MOCK 그대로', async () => {
     state.accounts = [acc({ mock: false, live_publish_target: true })];
     state.plans = [entry({ name: '모의 계획', mock: true })];
-    expect(row(await render(), '모의 계획')).toContain('<span class="tag warn">MOCK</span>');
+    expect(row(await render(), '모의 계획')).toContain('<span class="tag mock">MOCK</span>');
   });
 
   it('항목 없는 계획은 태그 없음', async () => {

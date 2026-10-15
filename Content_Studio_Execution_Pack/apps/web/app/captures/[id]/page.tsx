@@ -305,7 +305,7 @@ export default async function CaptureDetailPage({
             <option value="none">위험 표시 없음</option>
             <option value="needs_check">확인 필요</option>
           </select>
-          <button type="submit">{yours ? `내 입력으로 다시 저장(현재 수정 ${c.revision} 기준)` : '저장'}</button>
+          <button type="submit" className="primary">{yours ? `내 입력으로 다시 저장(현재 수정 ${c.revision} 기준)` : '저장'}</button>
         </form>
       </section>
 

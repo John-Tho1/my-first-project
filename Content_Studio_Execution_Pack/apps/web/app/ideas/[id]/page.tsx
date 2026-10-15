@@ -147,7 +147,7 @@ export default async function IdeaPage({
           <textarea id="next_question" name="next_question" rows={2} maxLength={2000} defaultValue={i.nextQuestion ?? ''} />
           <label htmlFor="tags">태그(쉼표로 구분)</label>
           <input id="tags" name="tags" type="text" defaultValue={i.tags.join(', ')} />
-          <button type="submit">저장</button>
+          <button type="submit" className="primary">저장</button>
         </form>
         <p className="note">다른 곳에서 먼저 수정했다면 저장하지 않고 비교 화면을 보여 줍니다(입력은 그대로 남습니다).</p>
       </section>

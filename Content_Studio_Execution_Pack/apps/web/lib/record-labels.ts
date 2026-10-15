@@ -51,10 +51,23 @@ export function opsJobsTag(byKind: JobKindCounts): { text: string; warn: boolean
   return null;
 }
 
+/**
+ * DESIGN-A: 실제/MOCK 태그 클래스 — 실제 게시는 주황(`tag live`), MOCK 은 회색 점선(`tag mock`). 두 표시가 같은 색이 되지 않게 한 곳에서 고른다.
+ */
+export const LIVE_TAG_CLASS = 'tag live';
+export const MOCK_TAG_CLASS = 'tag mock';
+
+/** 운영 화면 「배포 작업」 태그의 클래스 — opsJobsTag 와 같은 기록 기준(실제 작업이 있으면 실제, 모의만이면 MOCK). */
+export function opsJobsTagClass(byKind: JobKindCounts): string | null {
+  if (byKind.live > 0) return LIVE_TAG_CLASS;
+  if (byKind.mock > 0) return MOCK_TAG_CLASS;
+  return null;
+}
+
 /** 배포함·홈 목록 한 줄의 태그 — 그 계획 항목들의 계정 kind 기록(PlanListEntry.mock = 모든 항목이 모의 계정). */
 export function planRowTag(entry: { mock: boolean; itemCount: number }): { text: string; className: string } | null {
   if (entry.itemCount === 0) return null;
-  return entry.mock ? { text: 'MOCK', className: 'tag warn' } : { text: '실제 게시 포함', className: 'tag warn' };
+  return entry.mock ? { text: 'MOCK', className: MOCK_TAG_CLASS } : { text: '실제 게시 포함', className: LIVE_TAG_CLASS };
 }
 
 /**

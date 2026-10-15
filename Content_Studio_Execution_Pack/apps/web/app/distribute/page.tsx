@@ -36,7 +36,7 @@ export default async function DistributePage({ searchParams }: { searchParams: P
       <h2 className="screen-title">배포함</h2>
       {mode === 'live_target' ? (
         <p className="notice" role="note">
-          <span className="tag warn">실제 게시 계정 있음</span> 실제 게시 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(되돌리기 없음). 모의 계정 항목은
+          <span className="tag live">실제 게시 계정 있음</span> 실제 게시 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(되돌리기 없음). 모의 계정 항목은
           MOCK(실제 발행 실적 아님)입니다. {recordNote}
         </p>
       ) : mode === 'live_no_target' ? (
@@ -104,7 +104,7 @@ export default async function DistributePage({ searchParams }: { searchParams: P
             const h = accountHealthLine(a);
             return (
               <li key={a.account_id}>
-                {a.mock ? <span className="tag warn">MOCK</span> : null} {a.display_name} · {CHANNEL_LABEL[a.platform as Channel] ?? a.platform} · 연결 상태{' '}
+                {a.mock ? <span className="tag mock">MOCK</span> : null} {a.display_name} · {CHANNEL_LABEL[a.platform as Channel] ?? a.platform} · 연결 상태{' '}
                 <span className={h.warn ? 'tag warn' : 'tag'}>{h.label}</span>
                 {h.text !== h.label ? h.text.slice(h.label.length) : ''}
               </li>

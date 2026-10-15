@@ -7,6 +7,9 @@ import {
   mixedResultSuffix,
   opsAccountsNote,
   opsJobsTag,
+  opsJobsTagClass,
+  LIVE_TAG_CLASS,
+  MOCK_TAG_CLASS,
   planCreatedBanner,
   planRowTag,
   planStatusText,
@@ -47,12 +50,24 @@ describe('운영 화면 문구', () => {
     expect(opsJobsTag({ mock: 3, live: 1 })).toEqual({ text: '실제 게시 작업 1개 포함', warn: true });
     expect(opsJobsTag({ mock: 0, live: 2 })).toEqual({ text: '실제 게시 작업 2개 포함', warn: true });
   });
+  it('DESIGN-A 배포 작업 태그 클래스: 실제 작업이 있으면 주황 실제(tag live), 모의만이면 회색 MOCK(tag mock) — opsJobsTag 와 같은 기준', () => {
+    expect(LIVE_TAG_CLASS).toBe('tag live');
+    expect(MOCK_TAG_CLASS).toBe('tag mock');
+    expect(opsJobsTagClass({ mock: 0, live: 0 })).toBeNull();
+    expect(opsJobsTagClass({ mock: 3, live: 0 })).toBe('tag mock');
+    expect(opsJobsTagClass({ mock: 3, live: 1 })).toBe('tag live');
+    expect(opsJobsTagClass({ mock: 0, live: 2 })).toBe('tag live');
+    for (const k of [{ mock: 0, live: 0 }, { mock: 3, live: 0 }, { mock: 3, live: 1 }, { mock: 0, live: 2 }]) {
+      expect(opsJobsTagClass(k) === null).toBe(opsJobsTag(k) === null);
+      if (opsJobsTag(k)?.text === 'MOCK') expect(opsJobsTagClass(k)).toBe('tag mock');
+    }
+  });
 });
 
 describe('계획 기록 기준 문구', () => {
   it('목록 한 줄 태그: 모든 항목이 모의 계정이면 MOCK, 아니면 "실제 게시 포함", 항목 없으면 없음', () => {
-    expect(planRowTag({ mock: true, itemCount: 2 })).toEqual({ text: 'MOCK', className: 'tag warn' });
-    expect(planRowTag({ mock: false, itemCount: 2 })).toEqual({ text: '실제 게시 포함', className: 'tag warn' });
+    expect(planRowTag({ mock: true, itemCount: 2 })).toEqual({ text: 'MOCK', className: 'tag mock' });
+    expect(planRowTag({ mock: false, itemCount: 2 })).toEqual({ text: '실제 게시 포함', className: 'tag live' });
     expect(planRowTag({ mock: true, itemCount: 0 })).toBeNull();
   });
   it('요청 결과 혼합 안내 끝말: 고를 수 있는 항목의 계정 기록으로', () => {

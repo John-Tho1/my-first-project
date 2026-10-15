@@ -56,7 +56,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
               <p className="muted-text">OpenID Connect 로그인: 허용된 계정 1개만 접속할 수 있습니다. 인증 공급자(IdP) 화면으로 이동합니다.</p>
               {errorBlock}
               <form className="form" method="get" action={OIDC_START_PATH}>
-                <button type="submit">OIDC로 로그인</button>
+                <button type="submit" className="primary">OIDC로 로그인</button>
               </form>
             </>
           ) : (
@@ -76,7 +76,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
             <form className="form" method="post" action="/api/auth/login">
               <label htmlFor="identity">식별자</label>
               <input id="identity" name="identity" type="text" autoComplete="username" required maxLength={320} />
-              <button type="submit">로그인</button>
+              <button type="submit" className="primary">로그인</button>
             </form>
           </>
         )}

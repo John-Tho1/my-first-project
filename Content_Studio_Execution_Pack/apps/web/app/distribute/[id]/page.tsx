@@ -146,7 +146,7 @@ function StepsPanel({ x }: { x: PlanItemDetail }) {
       <>
         <h4>{v.panel === 'threads' ? 'Threads 단계' : v.panel === 'instagram' ? 'Instagram 단계' : 'YouTube 업로드'}(MOCK)</h4>
         <p className="empty-text">
-          <span className="tag warn">MOCK</span> {v.note}
+          <span className="tag mock">MOCK</span> {v.note}
         </p>
       </>
     );
@@ -171,7 +171,7 @@ function InstagramSteps({ x }: { x: PlanItemDetail }) {
       <h4>Instagram 단계(MOCK — 모의 Instagram, 모의 ID)</h4>
       {x.connection ? (
         <p className="meta" role="status">
-          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          <span className="tag mock">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
           {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
         </p>
       ) : null}
@@ -222,7 +222,7 @@ function LiveThreadsSteps({ x }: { x: PlanItemDetail }) {
   return (
     <>
       <h4>
-        Threads 실제 게시 단계 <span className="tag warn">실제 게시</span>
+        Threads 실제 게시 단계 <span className="tag live">실제 게시</span>
       </h4>
       {x.connection ? (
         <p className="meta" role="status">
@@ -267,7 +267,7 @@ function ThreadsSteps({ x }: { x: PlanItemDetail }) {
       <h4>Threads 단계(MOCK — 모의 Threads, 모의 ID)</h4>
       {x.connection ? (
         <p className="meta" role="status">
-          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          <span className="tag mock">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
           {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
         </p>
       ) : null}
@@ -305,7 +305,7 @@ function YouTubeSteps({ x }: { x: PlanItemDetail }) {
       <h4>YouTube 업로드(MOCK — 모의 YouTube, 모의 ID)</h4>
       {x.connection ? (
         <p className="meta" role="status">
-          <span className="tag warn">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
+          <span className="tag mock">MOCK</span> 계정 연결(모의): <strong>{x.connection.status_label}</strong>
           {x.connection.usable_for_execution ? '' : ' — 실행 차단(설정 → 배포 계정 연결에서 다시 연결)'}
         </p>
       ) : null}
@@ -413,8 +413,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
       <h3>
         {CHANNEL_LABEL[channel as Channel] ?? channel} — {x.account?.displayName ?? '(계정 없음)'}{' '}
-        {x.account?.kind === 'mock' ? <span className="tag warn">MOCK</span> : null}
-        {live ? <span className="tag warn">실제 게시 — 실제 계정</span> : null}
+        {x.account?.kind === 'mock' ? <span className="tag mock">MOCK</span> : null}
+        {live ? <span className="tag live">실제 게시 — 실제 계정</span> : null}
       </h3>
       {live ? (
         <p className="notice" role="note">
@@ -427,7 +427,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         {x.item.status === 'CONFIRMED' && !live ? (
           <>
             {' '}
-            <span className="tag warn">MOCK</span> <strong>실제 발행 실적 아님</strong>
+            <span className="tag mock">MOCK</span> <strong>실제 발행 실적 아님</strong>
           </>
         ) : null}
         {x.item.status === 'CONFIRMED' && live && pubTag ? (
@@ -449,23 +449,31 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         {/* FIX2-UICLEAN: 상태 태그는 이 항목 기록(결과 is_mock · 계정 kind)으로 — 실제 CONFIRMED 는 "실제 게시 완료" */}
         <span className="tag">{itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub }), verification: latestPub?.verification ?? null })}</span>
         {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
-        <span>공개 범위: {live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)` : (VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility)}</span>
-        <span>
-          일정: {scheduled ? `${formatMsk(scheduled)} (UTC ${scheduled.toISOString()})` : '즉시(실행 후 대기열)'}
-        </span>
-        <span>
-          요청 결과:{' '}
-          {live
-            ? '실제 게시(public_publish — Threads 텍스트 1개)'
-            : x.item.requestedResult === 'mock_publish'
-            ? 'MOCK 실행(실제 게시 아님)'
-            : x.item.requestedResult === 'upload_private'
-              ? `비공개 업로드(upload_private${x.account?.kind === 'mock' ? ' — MOCK' : ''})`
-              : `공개 게시 계획(public_publish${x.account?.kind === 'mock' ? ' — MOCK' : ''})`}
-        </span>
         {publishAt ? <span className={publishAt.warn ? 'tag warn' : undefined}>{publishAt.text}</span> : null}
         {x.activeApproval ? <span className="tag">승인됨</span> : null}
       </p>
+      {/* DESIGN-A: 공개 범위·일정·요청 결과는 묶음 목록 행으로(문구는 그대로) */}
+      <dl className="group-list">
+        <div className="row">
+          <dt>공개 범위</dt><dd>{live ? `${LIVE_THREADS_VISIBILITY_TEXT}(승인 값 public)` : (VISIBILITY_LABEL[x.item.visibility] ?? x.item.visibility)}</dd>
+        </div>
+        <div className="row">
+          <dt>일정</dt>
+          <dd>{scheduled ? `${formatMsk(scheduled)} (UTC ${scheduled.toISOString()})` : '즉시(실행 후 대기열)'}</dd>
+        </div>
+        <div className="row">
+          <dt>요청 결과</dt>
+          <dd>
+            {live
+              ? '실제 게시(public_publish — Threads 텍스트 1개)'
+              : x.item.requestedResult === 'mock_publish'
+              ? 'MOCK 실행(실제 게시 아님)'
+              : x.item.requestedResult === 'upload_private'
+                ? `비공개 업로드(upload_private${x.account?.kind === 'mock' ? ' — MOCK' : ''})`
+                : `공개 게시 계획(public_publish${x.account?.kind === 'mock' ? ' — MOCK' : ''})`}
+          </dd>
+        </div>
+      </dl>
       {x.problems.length ? (
         <p className="notice" role="alert">
           스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): {x.problems.map(problemLabel).join(', ')}
@@ -604,14 +612,14 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
             {x.publications.map((p) =>
               p.isMock ? (
                 <li key={p.id}>
-                  <span className="tag warn">MOCK</span> {RESULT_KIND_LABEL[p.resultKind] ?? p.resultKind} · 원격 공개 범위 {p.remoteVisibility} · 확인 {p.verification} ·{' '}
+                  <span className="tag mock">MOCK</span> {RESULT_KIND_LABEL[p.resultKind] ?? p.resultKind} · 원격 공개 범위 {p.remoteVisibility} · 확인 {p.verification} ·{' '}
                   <span className="hash">{p.externalId}</span>
                   {p.permalink ? <span className="hash"> · {p.permalink}</span> : null}
                   <strong> — 실제 발행 실적 아님</strong>
                 </li>
               ) : (
                 <li key={p.id}>
-                  <span className="tag warn">실제 게시</span>{' '}
+                  <span className="tag live">실제 게시</span>{' '}
                   {liveVerificationTag(p.verification) ? (
                     <>
                       <span className={liveVerificationTag(p.verification)!.className}>{liveVerificationTag(p.verification)!.text}</span>{' '}
@@ -693,8 +701,8 @@ export default async function PlanPage({
       <Breadcrumbs at={{ page: 'plan', targetSummary: d.plan.targetSummary }} />
       <h2 className="screen-title">배포 계획 — {d.plan.targetSummary || '이름 없음'}</h2>
       <p className="meta">
-        {hasMock ? <span className="tag warn">MOCK</span> : null}
-        {hasLive ? <span className="tag warn">실제 게시 포함</span> : null}
+        {hasMock ? <span className="tag mock">MOCK</span> : null}
+        {hasLive ? <span className="tag live">실제 게시 포함</span> : null}
         <span className="tag">{planStatusText(PLAN_STATUS_LABEL[d.plan.status] ?? d.plan.status, !hasLive)}</span>
         <time dateTime={d.plan.createdAt.toISOString()}>만든 시각 {formatMsk(d.plan.createdAt)}</time>
       </p>
@@ -808,7 +816,7 @@ export default async function PlanPage({
             <p className="note">위 항목 카드에서 승인할 항목을 직접 고르세요(기본 선택 없음). 고른 항목의 위 내용 그대로(hash)만 승인됩니다.</p>
             {approvable.some((x) => x.account?.kind === 'live') ? (
               <p className="notice" role="alert">
-                <span className="tag warn">실제 게시 승인</span> 실제 Threads 계정 항목을 승인하면, 실행 뒤 그 내용 그대로 실제 계정에 게시됩니다(계정·본문·공개 범위{' '}
+                <span className="tag live">실제 게시 승인</span> 실제 Threads 계정 항목을 승인하면, 실행 뒤 그 내용 그대로 실제 계정에 게시됩니다(계정·본문·공개 범위{' '}
                 {LIVE_THREADS_VISIBILITY_TEXT}). 승인 뒤 내용·계정이 바뀌면 승인은 무효가 됩니다.
               </p>
             ) : null}

@@ -19,7 +19,7 @@ import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { exportsDir } from '../../lib/backup';
 import { oauthReadinessView } from '../../lib/oauth';
 import { OPS_ERROR_TEXT } from '../../lib/ops';
-import { accountModeOf, opsAccountsNote, opsJobsTag } from '../../lib/record-labels';
+import { accountModeOf, opsAccountsNote, opsJobsTag, opsJobsTagClass } from '../../lib/record-labels';
 import { getAppDb, getConfig } from '../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -154,7 +154,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           {jobsTag ? (
             <>
               {' '}
-              <span className={jobsTag.warn ? 'tag warn' : 'tag'}>{jobsTag.text}</span>
+              <span className={opsJobsTagClass(s.jobs.byKind) ?? (jobsTag.warn ? 'tag warn' : 'tag')}>{jobsTag.text}</span>
             </>
           ) : null}
         </h3>
@@ -280,7 +280,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <h3 id="modes-title">모드</h3>
         <p className="meta">
           {describeModes(config).map((b) => (
-            <span key={b.key} className={b.live ? 'tag warn' : 'tag'}>
+            <span key={b.key} className={b.live ? 'tag live' : 'tag'}>
               {b.label}
             </span>
           ))}

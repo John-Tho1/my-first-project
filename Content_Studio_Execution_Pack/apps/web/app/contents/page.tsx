@@ -144,7 +144,7 @@ export default async function ContentsPage({
           </datalist>
           <label htmlFor="body">본문</label>
           <textarea id="body" name="body" rows={6} maxLength={MAX_CONTENT_BODY} />
-          <button type="submit">원고 저장(버전 1)</button>
+          <button type="submit" className="primary">원고 저장(버전 1)</button>
         </form>
       </section>
     </main>

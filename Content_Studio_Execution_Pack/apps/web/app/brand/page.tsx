@@ -73,7 +73,7 @@ export default async function BrandPage({
           <textarea id="cta_rules" name="cta_rules" rows={3} defaultValue={current?.ctaRules.join('\n') ?? ''} />
           <label htmlFor="sample_texts">직접 쓴 예문(빈 줄로 구분, 최대 5개) — 말투 참고용이며 예문 속 사건은 새 글의 사실로 쓰지 않습니다</label>
           <textarea id="sample_texts" name="sample_texts" rows={8} defaultValue={current?.sampleTexts.join('\n\n') ?? ''} />
-          <button type="submit">새 버전으로 저장</button>
+          <button type="submit" className="primary">새 버전으로 저장</button>
         </form>
       </section>
 

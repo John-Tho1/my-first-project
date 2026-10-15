@@ -79,7 +79,7 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
           <input id="src-url" name="url" type="url" required placeholder="https://overseas-sales.mock.example/feed.xml" />
           <label htmlFor="src-label">이름(선택)</label>
           <input id="src-label" name="label" type="text" maxLength={100} />
-          <button type="submit">소스 추가(꺼진 상태로)</button>
+          <button type="submit" className="primary">소스 추가(꺼진 상태로)</button>
         </form>
       </section>
 

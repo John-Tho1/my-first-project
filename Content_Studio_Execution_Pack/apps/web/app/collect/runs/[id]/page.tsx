@@ -60,7 +60,7 @@ export default async function CollectRunPage({
       </p>
       <section className="card archive">
         <p className="meta">
-          <span className="tag warn">MOCK</span>
+          <span className="tag mock">MOCK</span>
           <span>{formatMsk(run.createdAt)}</span>
           <span>{run.trigger === 'manual' ? '수동 실행' : '주기 실행'}</span>
           <span>{COLLECTOR_RUN_STATUS_LABEL[run.status as CollectorRunStatus] ?? run.status}</span>

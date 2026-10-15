@@ -224,4 +224,4 @@ CHANGES_REQUESTED
 | UI-CLEAN | fdb6aea | CHANGES_REQUESTED — P1 1(실제 계정 있으나 게시 대상 없을 때 MOCK 단정), P2 1(복원 완료 위치 경로) |
 | FIX-UICLEAN | 254ee5e | **PASS** — 지적 없음(gpt-6-astra · xhigh). UI-CLEAN 종결 |
 | FIX2-UICLEAN | 3a66ec7 | **PASS** — 지적 없음(gpt-6-astra · xhigh) |
-| DESIGN-A | 9bbf96a | 검토 대기 (gpt-6-astra · xhigh) |
+| DESIGN-A | 9bbf96a | **PASS** — 지적 없음(gpt-6-astra · xhigh) |

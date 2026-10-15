@@ -154,3 +154,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - LIVE-P1(D38 1단계 — 실제 Threads 글 게시 어댑터, fixture 시험만): 320dadb → FIX1 1a22434 → **FIX2 b8a7200 Codex PASS**. 검사 unit 1630·integration 895 PASS. migration 0044 로컬 적용(백업 data/pglite.bak-20261013-pre0044). 남은 위험: 결과 불명 게시는 항상 UNKNOWN(사용자 확인), GET 질의 토큰의 앱 밖 기록 미검증, Postgres 독립 연결 동시성 미검증, 화면은 브라우저 미확인(2단계 때 확인).
 - LIVEP1-TIMEOUT(98f11cd → FIX e708106 PASS)·LIVEP1-USERCONFIRM(a67f462 → FIX 2af529b PASS) 종결. migration 0045 로컬 적용(백업 data/pglite.bak-20261014-pre0045), drill:restore PASS.
 - UI-CLEAN(fdb6aea → FIX 254ee5e PASS): 메뉴 5묶음+소메뉴·현재 위치 강조, 모든 화면 위치 경로, 긴 설명 '자세히'로 접기(안전 표시 유지·ui-safety 시험), 실제/MOCK 안내를 계정·기록 상태로. 검사 unit 1788·integration 917 PASS. 브라우저 확인: 데스크톱·375px 가로 넘침 없음.
+- DESIGN-A(9bbf96a PASS): 사용자 선택 샘플 A(Apple 시스템 다크) — 순흑 배경·세그먼트 메뉴·묶음 목록 행·시스템 색, 실제(주황 tag live)/MOCK(회색 점선 tag mock) 분리, AA 대비 시험, 밝은 모드 대응. 브라우저 확인(데스크톱·375px).

@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { latestDraft, listAssets, listCaptures, listCapturesPage, listRecentPlans, livePublishOverview } from '@cs/db';
+import { latestDraft, listAccountHealth, listAssets, listCaptures, listCapturesPage, listRecentPlans, livePublishOverview } from '@cs/db';
 import {
   CHANNEL_LABEL,
   describeModes,
+  expiryNotices,
   formatMsk,
   livePublishReadiness,
   livePublishStatusLine,
@@ -17,7 +18,9 @@ import {
 } from '@cs/domain';
 import { getSession } from '../lib/auth';
 import { LIFECYCLE_LABEL } from '../lib/contents';
+import { readDevCertExpiry } from '../lib/dev-cert';
 import { PLAN_STATUS_LABEL } from '../lib/distribution';
+import { ExpiryNoticeList } from '../lib/expiry-view';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
 import { planRowTag, planStatusText } from '../lib/record-labels';
 import { getAppDb, getConfig } from '../lib/server';
@@ -119,6 +122,8 @@ export default async function TodayPage({
         limit: config.PUBLISH_LIVE_DAILY_MAX ?? null,
       })
     : null;
+  // EXPIRY-1(D39): 실제 Threads 연결·로컬 인증서(개발 모드만) 만료 14일 전부터 맨 위에 경고(표시용 — 실행 차단은 기존 연결 상태 판정 그대로)
+  const expiry = expiryNotices({ accounts: await listAccountHealth(handle.db, session.ownerId), devCert: readDevCertExpiry(), now: new Date() });
 
   return (
     <main className="container">
@@ -147,6 +152,8 @@ export default async function TodayPage({
           </p>
         ) : null}
       </header>
+
+      <ExpiryNoticeList notices={expiry} />
 
       <h2 className="screen-title">오늘</h2>
 

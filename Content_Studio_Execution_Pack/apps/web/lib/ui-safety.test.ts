@@ -117,6 +117,12 @@ const REQUIRED: Record<string, string[]> = {
     '{LIVE_PUBLISH_RESUME_CONFIRM_TEXT}',
     '일시 중지는 서버 재시작 없이 바로 적용됩니다',
     '지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.',
+    // EXPIRY-1(D39): 만료 알림(맨 위)·만료 관리 구역·배포 계정 표의 만료 칸 옆 계정별 표시
+    '<ExpiryNoticeList notices={expiry} />',
+    'id="expiry"',
+    '{EXPIRY_ACCOUNT_TAG_TEXT[exp.level]}',
+    '실제 Threads 연결은 자동 갱신하지 않습니다',
+    '<code>bash scripts/dev-cert.sh renew</code>',
   ],
   'contents/[id]/page.tsx': ['확인하지 않은 1인칭 경험 주장이', '"준비됨"으로 바꿀 수 없습니다'],
   'contents/[id]/writing-panel.tsx': [
@@ -141,7 +147,7 @@ const REQUIRED: Record<string, string[]> = {
     "'(MOCK — 승인은 계획 화면에서 직접)'",
     '자동 게시 아님 — 파일을 받는 것은 승인이나 게시가 아닙니다.',
   ],
-  'page.tsx': ['planRowTag(e)', "b.live ? 'badge live' : 'badge'", '{liveLine}'],
+  'page.tsx': ['planRowTag(e)', "b.live ? 'badge live' : 'badge'", '{liveLine}', '<ExpiryNoticeList notices={expiry} />'],
   'ops/page.tsx': [
     'AI live 준비 안 됨: {live.missing',
     '음성 전사 live 준비 안 됨: {sttLive.missing',
@@ -187,6 +193,10 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
       'liveSwitch',
       'livePublishDailyUsageText',
       'LIVE_PUBLISH_RESUME_CONFIRM_TEXT',
+      // EXPIRY-1(D39)
+      'ExpiryNoticeList',
+      'EXPIRY_ACCOUNT_TAG_TEXT',
+      'EXPIRY_LEVEL_LABEL',
     ];
     for (const file of Object.keys(REQUIRED)) {
       const src = read(file);

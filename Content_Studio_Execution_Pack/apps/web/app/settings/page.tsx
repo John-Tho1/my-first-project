@@ -2,10 +2,16 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { listAccountHealth, listExportRuns, listRestoreRuns, livePublishOverview, monthlyUsage } from '@cs/db';
 import {
+  accountExpiryNotice,
   budgetPolicy,
   CHANNEL_LABEL,
+  devCertExpiryNotice,
+  EXPIRY_ACCOUNT_TAG_TEXT,
+  EXPIRY_LEVEL_LABEL,
+  expiryNotices,
   formatMsk,
   fromMicro,
+  isLiveThreadsCredential,
   LIVE_PUBLISH_RESUME_CONFIRM_TEXT,
   LIVE_SETTLEMENT_POLICY_TEXT,
   liveLlmReadiness,
@@ -18,6 +24,8 @@ import {
 import { getSession } from '../../lib/auth';
 import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
+import { readDevCertExpiry } from '../../lib/dev-cert';
+import { ExpiryNoticeList } from '../../lib/expiry-view';
 import { LIVE_PUBLISH_DONE_TEXT, LIVE_PUBLISH_ERROR_TEXT } from '../../lib/live-publish';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { oidcReadinessView } from '../../lib/oidc';
@@ -84,11 +92,18 @@ export default async function SettingsPage({
   const liveDailyLimit = config.PUBLISH_LIVE_DAILY_MAX ?? null;
   const liveDone = str(q.live_publish) ? LIVE_PUBLISH_DONE_TEXT[str(q.live_publish)!] : undefined;
   const liveErr = str(q.live_error) ? (LIVE_PUBLISH_ERROR_TEXT[str(q.live_error)!] ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
+  // EXPIRY-1(D39): 실제 Threads 연결·로컬 인증서(개발 모드만 읽음) 만료 14일 전부터 경고. 다시 연결은 아래 배포 계정 연결의 기존 연결 흐름(토큰 갱신 API 호출 없음 — D31).
+  const now = new Date();
+  const devCert = readDevCertExpiry();
+  const expiry = expiryNotices({ accounts, devCert, now });
+  const devCertNotice = devCertExpiryNotice(devCert, now);
+  const liveThreadsCreds = accounts.filter(isLiveThreadsCredential);
 
   return (
     <main className="container">
       <Breadcrumbs at={{ page: 'settings' }} />
       <h2 className="screen-title">설정</h2>
+      <ExpiryNoticeList notices={expiry} />
       {exported ? (
         <p className="saved" role="status">
           내보내기 파일 생성됨 (sha256 <span className="hash">{exported.manifestSha256.slice(0, 16)}…</span>, {formatBytes(exported.zipBytes)},{' '}
@@ -236,6 +251,60 @@ export default async function SettingsPage({
         </p>
       </section>
 
+      <section className="card archive" id="expiry" aria-labelledby="expiry-title">
+        <h3 id="expiry-title">만료 관리</h3>
+        <dl className="group-list">
+          {liveThreadsCreds.length ? (
+            liveThreadsCreds.map((a) => {
+              const exp = accountExpiryNotice(a, now);
+              return (
+                <div className="row" key={a.account_id}>
+                  <dt>Threads 연결</dt>
+                  <dd>
+                    {a.display_name} · {formatMsk(new Date(a.expires_at!))}
+                    {exp ? (
+                      <>
+                        {' '}
+                        <span className={exp.level === 'expired' ? 'tag danger' : 'tag warn'}>{EXPIRY_LEVEL_LABEL[exp.level]}</span>
+                      </>
+                    ) : null}
+                  </dd>
+                </div>
+              );
+            })
+          ) : (
+            <div className="row">
+              <dt>Threads 연결</dt>
+              <dd>실제 연결 없음</dd>
+            </div>
+          )}
+          <div className="row">
+            <dt>로컬 인증서</dt>
+            <dd>
+              {process.env.NODE_ENV === 'production'
+                ? '운영 빌드 — 확인하지 않음'
+                : devCert
+                  ? formatMsk(devCert.validTo)
+                  : '확인 안 됨(파일 없음 또는 읽을 수 없음 — 개발 모드만 확인)'}
+              {devCertNotice ? (
+                <>
+                  {' '}
+                  <span className={devCertNotice.level === 'expired' ? 'tag danger' : 'tag warn'}>{EXPIRY_LEVEL_LABEL[devCertNotice.level]}</span>
+                </>
+              ) : null}
+            </dd>
+          </div>
+        </dl>
+        <p className="note">
+          만료 14일 전부터 홈·설정 맨 위에 경고합니다. 실제 Threads 연결은 자동 갱신하지 않습니다 — 만료 전에 아래 배포 계정 연결의 &quot;다시 연결(실제 Threads)&quot;로
+          다시 연결하세요(기존 연결 흐름, 토큰 갱신 API 호출 없음).
+        </p>
+        <p className="note">
+          로컬 인증서(개발 모드): 앱 루트에서 <code>bash scripts/dev-cert.sh check</code> · <code>bash scripts/dev-cert.sh renew</code>(로컬 openssl 만, 외부 호출 없음). 갱신
+          뒤 dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락하세요.
+        </p>
+      </section>
+
       <section className="card archive" id="accounts" aria-labelledby="accounts-title">
         <h3 id="accounts-title">배포 계정 연결</h3>
         {accountDone ? (
@@ -338,6 +407,8 @@ export default async function SettingsPage({
                   // LIVE-T1(D31): 실제 Threads 계정 — 준비 상태가 모두 갖춰졌을 때만 실제 연결(아니면 빠진 이름만 보인다)
                   const liveThreads = !a.mock && a.platform === 'threads';
                   const hasCredential = a.connected_at !== null && a.revoked_at === null;
+                  // EXPIRY-1(D39): 실제 Threads 연결 정보의 만료 14일 이내·만료 표시(다시 연결은 이 행의 기존 연결 버튼)
+                  const exp = accountExpiryNotice(a, now);
                   return (
                     <tr key={a.account_id}>
                       <td>
@@ -352,7 +423,15 @@ export default async function SettingsPage({
                         {a.last_error_code ? ` · 오류 ${a.last_error_code}` : ''}
                         {a.credential_required && !a.usable_for_execution ? ' · 이 계정 배포 실행 차단' : ''}
                       </td>
-                      <td>{a.expires_at ? formatMsk(new Date(a.expires_at)) : '—'}</td>
+                      <td>
+                        {a.expires_at ? formatMsk(new Date(a.expires_at)) : '—'}
+                        {exp ? (
+                          <>
+                            {' '}
+                            <span className={exp.level === 'expired' ? 'tag danger' : 'tag warn'}>{EXPIRY_ACCOUNT_TAG_TEXT[exp.level]}</span>
+                          </>
+                        ) : null}
+                      </td>
                       <td>
                         {a.scopes_required.length ? `필요 ${a.scopes_required.join(', ')}` : '—'}
                         {a.scopes_granted.length ? ` · 허락 ${a.scopes_granted.join(', ')}` : ''}

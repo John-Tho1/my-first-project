@@ -505,6 +505,17 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 내보내기·복원: `live_publish_controls` 는 이 환경의 운영 스위치라 묶음에서 제외한다(복원 환경은 "중지 아님"으로 시작 — 복원한 작업은 어차피 다시 보내지 않는다). migration 0046 은 dev 서버를 끈 뒤 `pnpm db:migrate` 로 적용한다.
 - 운영 환경 파일(`deploy/`)에서는 D37(배포 대기) 동안 `PUBLISH_LIVE_DAILY_MAX` 도 비워 둔다(check-env 가 거부).
 
+### 만료 관리 (D39, EXPIRY-1)
+결정 D39(docs/DECISIONS.md). 외부 호출 없음 — 만료 시각은 이미 저장된 연결 정보와 로컬 인증서 파일에서만 읽는다.
+- **경고 시점**: 만료까지 남은 시간이 14일 이하(정확히 14일 포함)면 "곧 만료", 0 이하(만료 시각 그 순간부터)면 "만료됨". 홈 맨 위(헤더 아래)와 설정 맨 위에 보인다. 모의(MOCK) 계정·연결 해제한 계정은 경고하지 않는다.
+- **실제 Threads 연결**(현재 만료 2026-12-12): "Threads 연결이 YYYY-MM-DD HH:MM (MSK)에 만료됩니다 — 설정에서 다시 연결하세요", 만료 뒤 "Threads 연결이 만료되었습니다 — 다시 연결 전에는 실제 게시가 되지 않습니다". 설정 → 배포 계정 연결 표의 "만료" 칸 옆에도 계정별로 표시된다. 다시 연결은 그 행의 **다시 연결(실제 Threads)**(기존 연결 흐름 — 인증 창 → 코드 교환 → 장기 토큰). 토큰 갱신 API(`th_refresh_token`)는 부르지 않는다(D31 범위 밖, 자동 갱신 없음).
+- **로컬 인증서**(개발 모드만, 현재 만료 2026-11-12): dev 서버가 `DEV_TLS_CERT_PATH`(비우면 `data/dev-certs/localhost-cert.pem`)의 인증서 만료 시각만 읽는다 — 파일이 없거나 읽지 못하면 경고 없음, 운영 빌드는 읽지 않는다. 설정 → **만료 관리**에 만료 시각이 보인다.
+- **인증서 확인·갱신**(앱 루트에서, Git Bash):
+  - `bash scripts/dev-cert.sh check` — 만료 시각(notAfter)과 남은 날짜. 키는 출력하지 않는다.
+  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
+  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
+- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음).
+
 ### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
 **Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.
 - 화면: 상단 메뉴 `가져오기`(`/imports`) → ZIP 올리기(최대 50MB, 원본 종류 자동 판별 | Notion | Drive) → **미리보기**(`/imports/<id>`) → 항목·폴더 선택 → `선택한 항목 가져오기` | `이 미리보기 취소`. 실행 기록은 `/imports` 아래 표.
@@ -542,6 +553,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
 | `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표 + T16 Instagram 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
 | `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(연결 정보·진행 중 연결 요청·정리 대기 봉인별 다시 봉인 대상·현재 키·그 사이 바뀌어 건너뜀·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰·DB 오류 메시지 본문은 출력하지 않음(오류는 허용된 종류 이름·모양이 맞는 코드만) | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금·DB 닫기 실패면 안내 후 exit 1 |
+| `bash scripts/tests/test-dev-cert.sh` | EXPIRY-1 `scripts/dev-cert.sh` 시험(임시 폴더, openssl 이 있으면 실제 키·인증서 생성 검사 — 없으면 해당 시험 SKIP) | exit 0 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 

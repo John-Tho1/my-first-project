@@ -51,6 +51,30 @@ describe('loadConfig', () => {
     }
   });
 
+  it('LIVE-P2(D39): PUBLISH_LIVE_DAILY_MAX — 없으면 일일 상한 없음(undefined), 1~50 정수만, 0·51·정수 아님은 거부(오류에는 이름·라벨만, 값 없음)', () => {
+    expect(loadConfig({}).PUBLISH_LIVE_DAILY_MAX).toBeUndefined();
+    expect(loadConfig({ PUBLISH_LIVE_DAILY_MAX: '' }).PUBLISH_LIVE_DAILY_MAX).toBeUndefined();
+    expect(loadConfig({ PUBLISH_LIVE_DAILY_MAX: '  ' }).PUBLISH_LIVE_DAILY_MAX).toBeUndefined();
+    for (const n of [1, 2, 3, 10, 49, 50]) expect(loadConfig({ PUBLISH_LIVE_DAILY_MAX: String(n) }).PUBLISH_LIVE_DAILY_MAX).toBe(n);
+    expect(loadConfig({ PUBLISH_LIVE_DAILY_MAX: '03' }).PUBLISH_LIVE_DAILY_MAX).toBe(3);
+    for (const bad of ['0', '00', '51', '99', '100', '-1', '1.5', '3.0', '3e1', '3 ', ' 3', 'abc', 'three', '0x3', '+3']) {
+      let msg = '';
+      try {
+        loadConfig({ PUBLISH_LIVE_DAILY_MAX: bad });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        msg = (e as Error).message;
+      }
+      expect({ bad, named: msg.includes('PUBLISH_LIVE_DAILY_MAX(최근 24시간 실제 게시 수 상한, 1~50 — 없으면 일일 상한 없음)') }).toEqual({ bad, named: true });
+      expect(msg).not.toContain(`: ${bad}`);
+    }
+    // 다른 실제 게시 설정과 독립 — 일일 상한만 있어도 게시 준비 조건(승인 기록·게시 수 상한)은 그대로 필요하다
+    const c = loadConfig({ PUBLISH_MODE: 'enabled', PUBLISH_LIVE_DAILY_MAX: '3' });
+    expect(c.PUBLISH_LIVE_DAILY_MAX).toBe(3);
+    expect(c.PUBLISH_LIVE_APPROVAL_REF).toBeUndefined();
+    expect(c.PUBLISH_LIVE_MAX_POSTS).toBeUndefined();
+  });
+
   it('memory:// DATABASE_URL 을 허용한다', () => {
     expect(loadConfig({ DATABASE_URL: 'memory://' }).DATABASE_URL).toBe('memory://');
   });

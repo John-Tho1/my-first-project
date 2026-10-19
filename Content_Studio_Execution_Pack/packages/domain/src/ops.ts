@@ -70,6 +70,8 @@ export const RETENTION_PROTECTED_TABLES = [
   'oauth_pending_tokens',
   // T21-P1b: OIDC 로그인 요청 — 보존 정리 대상 아님(만료·사용된 요청은 로그인 시작이 스스로 지운다, 진행 중 최대 100개)
   'auth_oidc_states',
+  // LIVE-P2(D39): 실제 게시 즉시 중지 스위치 — 보존 기간으로 지우면 중지가 풀린다(절대 지우지 않음)
+  'live_publish_controls',
 ] as const;
 
 const HOUR = 3600_000;

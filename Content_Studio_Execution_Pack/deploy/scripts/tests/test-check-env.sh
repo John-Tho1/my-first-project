@@ -136,6 +136,16 @@ write_env "PUBLISH_LIVE_MAX_POSTS=1"
 run_capture r check
 expect_nonzero "$r_rc" "$r_out"
 expect_contains "$r_out" "PUBLISH_LIVE_MAX_POSTS 은(는) 이 단계에서 비어 있어야 합니다"
+t "PUBLISH_LIVE_DAILY_MAX 빈 값 → 허용(LIVE-P2 D39)"
+write_env "PUBLISH_LIVE_DAILY_MAX="
+run_capture r check
+expect_rc 0 "$r_rc" "$r_out"
+t "PUBLISH_LIVE_DAILY_MAX 값 있음 → 거부(값 출력 없음)"
+write_env "PUBLISH_LIVE_DAILY_MAX=37"
+run_capture r check
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "PUBLISH_LIVE_DAILY_MAX 은(는) 이 단계에서 비어 있어야 합니다"
+expect_not_contains "$r_out" "=37"
 t "PUBLISH_MODE=enabled → 거부(실제 게시 설정과 함께여도)"
 base_env | sed "s#^PUBLISH_MODE=.*#PUBLISH_MODE=enabled#" >"$ENV_FILE"
 run_capture r check

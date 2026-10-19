@@ -497,6 +497,14 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - 오류: 코드 교환 중 끊김·시간 초과·5xx 는 **결과 불명**(코드가 소비됐을 수 있음) — 다시 보내지 않고 400 `oauth_exchange_failed`(`outcome: unknown`), 감사 `outcome_ambiguous=yes`. 손에 받은 토큰이 없으므로 저장·정리 대기·철회할 것이 없다 — 설정에서 다시 연결한다. 이미 쓴 코드 → `invalid_grant`, 앱 ID·시크릿 거부 → `invalid_client`, 190 → `invalid_token`(463 만료 · 458/460 철회), 10·200번대 → `scope_not_allowed`, 429·4/17/32/613 → 요청 제한(`provider_error`).
 - API: `POST /api/channel-accounts`(본문 `platform=threads`, `kind=live` — 연결 전 실제 Threads 행, 같은 출처·로그인, 멱등). 첫 실제 연결이 `pending:<uuid>` 를 프로필 ID 로 묶는다. 같은 owner 의 다른 행이 이미 그 프로필에 묶여 있으면 409 `oauth_account_duplicate`, 묶인 행에 다른 Threads 계정이 돌아오면 409 `oauth_account_mismatch`(저장 안 함).
 
+### 실제 게시 상한·즉시 중지 (D39, LIVE-P2)
+결정 D39(docs/DECISIONS.md). 실제 Threads 게시를 평상시에 켜 둘 때의 안전장치 두 가지. 실제 호출은 시험에서 0(가짜 fetch 만).
+- **최근 24시간 상한** `PUBLISH_LIVE_DAILY_MAX`(1~50, 비우면 일일 상한 없음 — 이전 동작). 전송 직전(`beginSend`)에 이 owner 의 실제 게시 전송 의도를 최근 24시간 안에 만든 **서로 다른 작업 수**를 세고, 이미 상한이면 보내지 않고 보류(`live_publish_daily_limit`). 같은 작업의 재시도·이어 보내기는 새로 세지 않는다. 화면 문구: "최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. YYYY-MM-DD HH:MM (MSK) 이후 '재시도'로 다시 보낼 수 있습니다." — 그 시각 뒤 항목의 **재시도**로 보낸다(자동 재전송 없음). 승인 기록당 총량 `PUBLISH_LIVE_MAX_POSTS` 는 그대로 함께 적용된다.
+- **즉시 중지** 설정 → **실제 게시** → `실제 게시 일시 중지`(확인 없이 바로, 서버 재시작 없음 — DB `live_publish_controls` 에 저장). 중지 중에는 실제 게시 전송을 보내지 않고 보류(`live_publish_paused`), 모의 전송은 그대로. 이미 게시를 시도한(결과 확인 중) 항목은 바꾸지 않는다. 재개는 확인 칸에 `재개` 를 입력해야 하고, 보류된 항목은 재개 뒤 **재시도**를 눌러야 다시 보낸다. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
+- 표시: 실제 계정이 있으면 홈과 실제 항목이 있는 배포 계획 화면에 "실제 게시: 최근 24시간 n/3" 또는 "실제 게시 일시 중지됨" 한 줄. 설정 화면에 상태(켜짐/일시 중지됨/꺼짐)·최근 24시간 사용.
+- 내보내기·복원: `live_publish_controls` 는 이 환경의 운영 스위치라 묶음에서 제외한다(복원 환경은 "중지 아님"으로 시작 — 복원한 작업은 어차피 다시 보내지 않는다). migration 0046 은 dev 서버를 끈 뒤 `pnpm db:migrate` 로 적용한다.
+- 운영 환경 파일(`deploy/`)에서는 D37(배포 대기) 동안 `PUBLISH_LIVE_DAILY_MAX` 도 비워 둔다(check-env 가 거부).
+
 ### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
 **Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.
 - 화면: 상단 메뉴 `가져오기`(`/imports`) → ZIP 올리기(최대 50MB, 원본 종류 자동 판별 | Notion | Drive) → **미리보기**(`/imports/<id>`) → 항목·폴더 선택 → `선택한 항목 가져오기` | `이 미리보기 취소`. 실행 기록은 `/imports` 아래 표.

@@ -1,10 +1,24 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { listAccountHealth, listExportRuns, listRestoreRuns, monthlyUsage } from '@cs/db';
-import { budgetPolicy, CHANNEL_LABEL, formatMsk, fromMicro, LIVE_SETTLEMENT_POLICY_TEXT, liveLlmReadiness, sttBudgetPolicy, sttLiveReadiness, type Channel } from '@cs/domain';
+import { listAccountHealth, listExportRuns, listRestoreRuns, livePublishOverview, monthlyUsage } from '@cs/db';
+import {
+  budgetPolicy,
+  CHANNEL_LABEL,
+  formatMsk,
+  fromMicro,
+  LIVE_PUBLISH_RESUME_CONFIRM_TEXT,
+  LIVE_SETTLEMENT_POLICY_TEXT,
+  liveLlmReadiness,
+  livePublishDailyUsageText,
+  livePublishSwitchLabel,
+  sttBudgetPolicy,
+  sttLiveReadiness,
+  type Channel,
+} from '@cs/domain';
 import { getSession } from '../../lib/auth';
 import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
+import { LIVE_PUBLISH_DONE_TEXT, LIVE_PUBLISH_ERROR_TEXT } from '../../lib/live-publish';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { oidcReadinessView } from '../../lib/oidc';
 import { revokeNotice } from '../../lib/revoke-view';
@@ -64,6 +78,12 @@ export default async function SettingsPage({
         ? '실제 Threads 계정 행을 만들었습니다(연결 전). 준비 상태가 모두 갖춰지면 "실제 연결"을 누르세요.'
         : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : revokeMsg && !revokeMsg.warn ? revokeMsg.text : undefined;
   const accountWarn = revokeMsg?.warn ? revokeMsg.text : undefined;
+  // LIVE-P2(D39): 실제 게시 즉시 중지 스위치·최근 24시간 사용(표시용 — 판정은 전송 직전 서버)
+  const liveCtl = await livePublishOverview(db, session.ownerId);
+  const liveSwitch = livePublishSwitchLabel({ publishEnabled: config.PUBLISH_MODE === 'enabled', ready: oauth.livePublish.ready, paused: liveCtl.paused });
+  const liveDailyLimit = config.PUBLISH_LIVE_DAILY_MAX ?? null;
+  const liveDone = str(q.live_publish) ? LIVE_PUBLISH_DONE_TEXT[str(q.live_publish)!] : undefined;
+  const liveErr = str(q.live_error) ? (LIVE_PUBLISH_ERROR_TEXT[str(q.live_error)!] ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
 
   return (
     <main className="container">
@@ -164,6 +184,58 @@ export default async function SettingsPage({
         </p>
       </section>
 
+      <section className="card archive" id="live-publish" aria-labelledby="live-publish-title">
+        <h3 id="live-publish-title">실제 게시</h3>
+        {liveDone ? (
+          <p className="saved" role="status">
+            {liveDone}
+          </p>
+        ) : null}
+        {liveErr ? (
+          <p className="notice" role="alert">
+            {liveErr}
+          </p>
+        ) : null}
+        <dl className="group-list">
+          <div className="row">
+            <dt>상태</dt>
+            <dd>
+              <span className={liveCtl.paused ? 'tag warn' : liveSwitch === '켜짐' ? 'tag live' : 'tag'}>{liveSwitch}</span>
+              {liveCtl.paused && liveSwitch !== '일시 중지됨' ? ' · 일시 중지됨' : ''}
+            </dd>
+          </div>
+          <div className="row">
+            <dt>사용</dt>
+            <dd>
+              {livePublishDailyUsageText(liveCtl.used, liveDailyLimit)}
+              {liveDailyLimit !== null && liveCtl.used >= liveDailyLimit && liveCtl.availableAt ? ` — 다음 게시 가능 ${formatMsk(liveCtl.availableAt)}` : ''}
+            </dd>
+          </div>
+          {liveCtl.changedAt ? (
+            <div className="row">
+              <dt>스위치 변경</dt>
+              <dd>{formatMsk(liveCtl.changedAt)}</dd>
+            </div>
+          ) : null}
+        </dl>
+        {liveCtl.paused ? (
+          <form className="form" method="post" action="/api/live-publish/resume">
+            <label htmlFor="live-resume-confirm">
+              재개하려면 &apos;{LIVE_PUBLISH_RESUME_CONFIRM_TEXT}&apos;를 입력하세요(보류된 항목은 재개 뒤 &apos;재시도&apos;를 눌러야 다시 보냅니다)
+            </label>
+            <input id="live-resume-confirm" name="confirm_text" type="text" required maxLength={10} autoComplete="off" />
+            <button type="submit">실제 게시 재개</button>
+          </form>
+        ) : (
+          <form className="form inline" method="post" action="/api/live-publish/pause">
+            <button type="submit">실제 게시 일시 중지</button>
+          </form>
+        )}
+        <p className="note">
+          일시 중지는 서버 재시작 없이 바로 적용됩니다 — 실제 게시는 전송 직전에 확인해 보내지 않고 보류합니다(모의 전송은 그대로). 완전히 끄려면 PUBLISH_MODE=disabled.
+        </p>
+      </section>
+
       <section className="card archive" id="accounts" aria-labelledby="accounts-title">
         <h3 id="accounts-title">배포 계정 연결</h3>
         {accountDone ? (
@@ -233,6 +305,7 @@ export default async function SettingsPage({
           <p className="notice" role="note">
             <span className="tag live">실제 게시 준비됨</span> 실제 게시 계정으로 사용 중인 Threads 계정의 승인된 항목은 실행하면 <strong>실제로 게시</strong>됩니다(텍스트만, 승인
             기록당 게시 수 상한 안에서, 되돌리기 없음).
+            {liveCtl.paused ? <strong> 지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong> : null}
           </p>
         ) : (
           <p className="notice" role="note">

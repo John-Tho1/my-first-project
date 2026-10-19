@@ -10,6 +10,7 @@
  * 이 파일은 그 규칙을 서버·화면·시험이 같이 쓰게 한 곳에 둔다. 토큰·URL 은 여기 없다.
  */
 import { AppError, GuardError } from './errors';
+import { formatMsk } from './time';
 
 /** 실제 Threads 게시 어댑터 식별자(전송 의도 sanitized_details.adapter_id). */
 export const LIVE_THREADS_ADAPTER_ID = 'live_threads' as const;
@@ -123,6 +124,67 @@ export class LivePublishLimitError extends AppError {
       extra,
     );
   }
+}
+
+// ---- LIVE-P2(D39): 최근 24시간 실제 게시 상한 · 즉시 중지 스위치 ----
+
+/** 일일 상한의 이동 창(ms) — "최근 24시간". */
+export const LIVE_PUBLISH_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 전송 직전(beginSend)의 owner 별 advisory 잠금 이름. 잠금 순서(packages/db/src/jobs.ts beginSend): 계정(공유) → 항목 → 작업 → 요청 제한 잠금 →
+ * 승인 기록 잠금(cs_live_publish:<ref>) → **이 잠금**. 이 잠금을 잡는 곳은 beginSend 실제(LIVE) 분기와 setLivePublishPaused(다른 잠금 없이 이것만) 둘뿐.
+ */
+export const livePublishDailyLockName = (ownerId: string): string => `cs_live_publish_daily:${ownerId}`;
+
+/** 재개 확인 문구 — 재개 요청에 정확히 이 글자를 넣어야 한다(일시 중지는 확인 없이 바로). */
+export const LIVE_PUBLISH_RESUME_CONFIRM_TEXT = '재개';
+
+/** 재개 요청에 확인 문구가 없거나 다름. 400. 아무것도 바꾸지 않는다. */
+export class LivePublishResumeConfirmError extends AppError {
+  constructor() {
+    super('bad_request', 'live_resume_confirm_required', `재개하려면 확인 칸에 '${LIVE_PUBLISH_RESUME_CONFIRM_TEXT}'를 정확히 입력하세요(재개하지 않았습니다).`);
+  }
+}
+
+/** 최근 24시간 상한을 다 써서 보내지 않음(보류) — 언제부터 '재시도'로 다시 보낼 수 있는지(모스크바 시각)를 함께 말한다. */
+export function livePublishDailyLimitMessage(limit: number, availableAt: Date | string | null | undefined): string {
+  const at = availableAt ? new Date(availableAt) : null;
+  const when = at && !Number.isNaN(at.getTime()) ? formatMsk(at) : '잠시 뒤';
+  return `최근 24시간 실제 게시 상한(${limit}건)을 다 써서 게시하지 않았습니다. ${when} 이후 '재시도'로 다시 보낼 수 있습니다.`;
+}
+
+/** 즉시 중지 스위치가 켜져 있어 보내지 않음(보류). */
+export const LIVE_PUBLISH_PAUSED_MESSAGE = "실제 게시가 일시 중지되어 게시하지 않았습니다. 설정에서 재개한 뒤 '재시도'로 다시 보낼 수 있습니다.";
+
+export interface LivePublishSwitchInput {
+  /** PUBLISH_MODE === 'enabled' */
+  publishEnabled: boolean;
+  /** livePublishReadiness(config).ready — 승인 기록·게시 수 상한까지 있음 */
+  ready: boolean;
+  paused: boolean;
+}
+
+/** 설정 화면 "실제 게시" 상태 한 단어: 꺼짐(PUBLISH_MODE) · 꺼짐(실제 게시 준비 안 됨) · 일시 중지됨 · 켜짐. */
+export function livePublishSwitchLabel(x: LivePublishSwitchInput): string {
+  if (!x.publishEnabled) return '꺼짐(PUBLISH_MODE)';
+  if (!x.ready) return '꺼짐(실제 게시 준비 안 됨)';
+  return x.paused ? '일시 중지됨' : '켜짐';
+}
+
+/** "최근 24시간 n/limit" (상한이 없으면 "최근 24시간 n건(일일 상한 없음)"). */
+export function livePublishDailyUsageText(used: number, limit: number | null | undefined): string {
+  return limit === null || limit === undefined ? `최근 24시간 ${used}건(일일 상한 없음)` : `최근 24시간 ${used}/${limit}`;
+}
+
+/**
+ * 홈·배포 계획 화면의 한 줄: 일시 중지면 "실제 게시 일시 중지됨", 아니면 "실제 게시: 최근 24시간 n/limit"
+ * (실제 게시 조건이 없으면 뒤에 "꺼짐 — 실제로 게시하지 않음"을 붙인다).
+ */
+export function livePublishStatusLine(x: LivePublishSwitchInput & { used: number; limit: number | null | undefined }): string {
+  if (x.paused) return `실제 게시 일시 중지됨 — 재개 전에는 게시하지 않음(${livePublishDailyUsageText(x.used, x.limit)})`;
+  const base = `실제 게시: ${livePublishDailyUsageText(x.used, x.limit)}`;
+  return x.publishEnabled && x.ready ? base : `${base} · 꺼짐(실제로 게시하지 않음)`;
 }
 
 // ---- LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 — 숫자·짧은 열거만) ----

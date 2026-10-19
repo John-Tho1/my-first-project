@@ -10,7 +10,9 @@ import {
   formatMskInline,
   instagramSpecProblemLabel,
   isAllowedThreadsPermalink,
+  LIVE_PUBLISH_PAUSED_MESSAGE,
   LIVE_THREADS_EXTERNAL_ID_RE,
+  livePublishDailyLimitMessage,
   sanitizeThreadsDiag,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
@@ -326,6 +328,9 @@ const BLOCK_REASON_LABEL: Record<string, string> = {
   credential_unavailable: '계정 다시 연결 필요(연결 정보를 쓸 수 없음 — 보내지 않음)',
   credential_missing: '계정 다시 연결 필요(연결 정보 없음 — 보내지 않음)',
   secrets_not_configured: '서버 암호화 키 없음 — 연결 정보를 열 수 없음(보내지 않음)',
+  // LIVE-P2(D39): 실제 게시 즉시 중지·최근 24시간 상한(보내지 않음 — 재개·창이 풀린 뒤 '재시도')
+  live_publish_paused: '실제 게시 일시 중지됨 — 보내지 않음(재개 뒤 재시도)',
+  live_publish_daily_limit: '최근 24시간 실제 게시 상한 — 보내지 않음(창이 풀린 뒤 재시도)',
 };
 
 /** T14(D26): 요청 제한으로 기다리는 재시도 대기(로컬 제한 또는 원격 429). */
@@ -549,6 +554,20 @@ export function blockInfoOf(events: readonly BlockEventLike[], job: { lastErrorC
   return { code, detail: reason && reason !== code ? reason : null };
 }
 
+/**
+ * LIVE-P2(D39): 최근 24시간 상한으로 보류된 기록의 상한·다시 보낼 수 있는 시각(가장 최근 BLOCKED 사건 — blockInfoOf 와 같은 순서 가정).
+ * 형식이 맞는 값만(상한 1~50 정수, 시각은 ISO 로 읽히는 문자열). 없으면 null.
+ */
+export function liveDailyLimitOf(events: readonly BlockEventLike[]): { limit: number; availableAt: string | null } | null {
+  const ev = events.find((e) => e.stateAfter === 'BLOCKED');
+  const d = (ev?.sanitizedDetails ?? {}) as { reason?: unknown; limit?: unknown; available_at?: unknown };
+  if (d.reason !== 'live_publish_daily_limit') return null;
+  const limit = typeof d.limit === 'number' && Number.isInteger(d.limit) && d.limit >= 1 && d.limit <= 50 ? d.limit : null;
+  if (limit === null) return null;
+  const at = typeof d.available_at === 'string' && !Number.isNaN(new Date(d.available_at).getTime()) ? d.available_at : null;
+  return { limit, availableAt: at };
+}
+
 /** 상세 보류 사유 문구('invalidated:assets_changed' → '첨부 파일이 바뀜', 'user: …' → 사용자 사유). */
 export function blockDetailLabel(detail: string | null): string | null {
   if (!detail) return null;
@@ -600,6 +619,8 @@ export interface ItemHeadlineInput {
   publishAt?: string | null;
   /** T15: 영상 업로드 뒤 삭제는 범위 밖 — 취소 요청 뒤 업로드가 확인된 항목 */
   cancelTooLate?: boolean;
+  /** LIVE-P2(D39): 최근 24시간 상한 보류의 상한·다시 보낼 수 있는 시각(liveDailyLimitOf) */
+  liveDaily?: { limit: number; availableAt: string | null } | null;
 }
 
 /**
@@ -805,6 +826,13 @@ export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string 
       return `실패${job?.lastErrorCode ? ` (${job.lastErrorCode})` : ''} — 게시되지 않음이 확인된 실패만 여기에 옵니다. 자동 재시도 안 함`;
     case 'BLOCKED':
       if (reason === 'live_publish_limit' || job?.lastErrorCode === 'live_publish_limit') return '보류 — 승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 다 씀(보내지 않음)';
+      // LIVE-P2(D39): 즉시 중지·최근 24시간 상한 — 보내지 않았음(전송 의도 없음)
+      if (reason === 'live_publish_paused' || job?.lastErrorCode === 'live_publish_paused') return `보류 — ${LIVE_PUBLISH_PAUSED_MESSAGE}`;
+      if (reason === 'live_publish_daily_limit' || job?.lastErrorCode === 'live_publish_daily_limit') {
+        return x.liveDaily
+          ? `보류 — ${livePublishDailyLimitMessage(x.liveDaily.limit, x.liveDaily.availableAt)}`
+          : "보류 — 최근 24시간 실제 게시 상한을 다 써서 게시하지 않았습니다. 창이 풀린 뒤 '재시도'로 다시 보낼 수 있습니다.";
+      }
       if (reason === 'execution_not_allowed' || LIVE_NOT_READY_CODES.has(job?.lastErrorCode ?? '')) return '보류 — 실제 게시 조건이 갖춰지지 않음(보내지 않음). 설정 화면의 "실제 게시 준비"를 확인한 뒤 재시도';
       return itemHeadline(x);
     default:

@@ -33,6 +33,7 @@ const LABELS: Record<string, string> = {
   PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
   PUBLISH_LIVE_APPROVAL_REF: 'PUBLISH_LIVE_APPROVAL_REF(실제 게시 승인 기록)',
   PUBLISH_LIVE_MAX_POSTS: 'PUBLISH_LIVE_MAX_POSTS(승인 기록당 실제 게시 수, 1~1000)',
+  PUBLISH_LIVE_DAILY_MAX: 'PUBLISH_LIVE_DAILY_MAX(최근 24시간 실제 게시 수 상한, 1~50 — 없으면 일일 상한 없음)',
   COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
   COLLECTOR_SCHEDULER: 'COLLECTOR_SCHEDULER(주기 수집 실행)',
   WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
@@ -155,6 +156,20 @@ export const configSchema = z.object({
       .regex(/^\d{1,4}$/)
       .transform(Number)
       .pipe(z.int().min(1).max(1000))
+      .optional(),
+  ),
+  /**
+   * LIVE-P2(D39): 최근 24시간(이동 창) 실제 게시 수 상한(1 ~ 50, 양의 정수). **없으면 일일 상한 없음**(이전 동작 그대로 — PUBLISH_LIVE_MAX_POSTS 만).
+   * 세는 단위 = 이 owner 의 실제 게시 전송 의도(sanitized_details.live_approval_ref 가 있는 send_intents — 승인 기록 값과 무관)를 최근 24시간 안에 만든
+   * **서로 다른 작업 수**. 같은 작업의 재시도·이어 보내기는 새로 세지 않는다(그 작업이 창 안에 이미 실제 전송 의도를 가지면 새 게시가 아님).
+   * 전송 직전(beginSend) owner 별 advisory 잠금(cs_live_publish_daily:<owner>) 아래에서 센다 — packages/db/src/jobs.ts.
+   */
+  PUBLISH_LIVE_DAILY_MAX: opt(
+    z
+      .string()
+      .regex(/^\d{1,2}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(50))
       .optional(),
   ),
   /**

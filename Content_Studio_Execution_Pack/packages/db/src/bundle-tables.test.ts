@@ -25,10 +25,11 @@ describe('export 표 범위', () => {
     for (const t of [...exported, ...excluded]) expect(allTables, `${t} 는 schema.ts 에 없는 표`).toContain(t);
   });
 
-  it('sessions·export_runs·restore_runs·upload_sessions·upload_chunks(T08)·oauth_credentials·oauth_states(T13)·oauth_pending_tokens(T13 FIX4)·auth_oidc_states(T21-P1b) 는 제외된다', () => {
+  it('sessions·export_runs·restore_runs·upload_sessions·upload_chunks(T08)·oauth_credentials·oauth_states(T13)·oauth_pending_tokens(T13 FIX4)·auth_oidc_states(T21-P1b)·live_publish_controls(LIVE-P2) 는 제외된다', () => {
     expect(Object.keys(EXCLUDED_TABLES).sort()).toEqual([
       'auth_oidc_states',
       'export_runs',
+      'live_publish_controls',
       'oauth_credentials',
       'oauth_pending_tokens',
       'oauth_states',

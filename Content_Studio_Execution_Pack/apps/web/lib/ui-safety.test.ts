@@ -71,6 +71,9 @@ const REQUIRED: Record<string, string[]> = {
     'jobStatusTextFor(j, pub, reason, channel, live)',
     'revocationNoticeFor(',
     'requestedResultLabel(x.item.requestedResult',
+    // LIVE-P2(D39): 실제 게시 최근 24시간 사용·일시 중지 한 줄, 일일 상한 보류의 상한·다시 보낼 시각
+    '<strong>{liveLine}</strong>',
+    'liveDaily: live ? liveDailyLimitOf(x.events) : null',
   ],
   'distribute/new/page.tsx': [
     '<strong>실제로 게시</strong>',
@@ -103,6 +106,17 @@ const REQUIRED: Record<string, string[]> = {
     '모의 연결은 실제 게시에 쓰이지 않습니다.',
     "<span className=\"tag mock\">MOCK</span> : <span className=\"tag live\">실제 계정</span>",
     'id="accounts"',
+    // LIVE-P2(D39): 실제 게시 즉시 중지 스위치(상태·최근 24시간 사용·중지/재개)·준비 표시의 일시 중지
+    'id="live-publish"',
+    '{liveSwitch}',
+    '{livePublishDailyUsageText(liveCtl.used, liveDailyLimit)}',
+    '실제 게시 일시 중지</button>',
+    'action="/api/live-publish/pause"',
+    'action="/api/live-publish/resume"',
+    'name="confirm_text"',
+    '{LIVE_PUBLISH_RESUME_CONFIRM_TEXT}',
+    '일시 중지는 서버 재시작 없이 바로 적용됩니다',
+    '지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.',
   ],
   'contents/[id]/page.tsx': ['확인하지 않은 1인칭 경험 주장이', '"준비됨"으로 바꿀 수 없습니다'],
   'contents/[id]/writing-panel.tsx': [
@@ -127,7 +141,7 @@ const REQUIRED: Record<string, string[]> = {
     "'(MOCK — 승인은 계획 화면에서 직접)'",
     '자동 게시 아님 — 파일을 받는 것은 승인이나 게시가 아닙니다.',
   ],
-  'page.tsx': ['planRowTag(e)', "b.live ? 'badge live' : 'badge'"],
+  'page.tsx': ['planRowTag(e)', "b.live ? 'badge live' : 'badge'", '{liveLine}'],
   'ops/page.tsx': [
     'AI live 준비 안 됨: {live.missing',
     '음성 전사 live 준비 안 됨: {sttLive.missing',
@@ -168,6 +182,11 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
       'livePublish.missing',
       '실제 발행 실적 아님',
       '확인하지 않은 1인칭',
+      // LIVE-P2(D39)
+      'liveLine',
+      'liveSwitch',
+      'livePublishDailyUsageText',
+      'LIVE_PUBLISH_RESUME_CONFIRM_TEXT',
     ];
     for (const file of Object.keys(REQUIRED)) {
       const src = read(file);

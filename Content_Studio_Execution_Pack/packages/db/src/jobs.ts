@@ -36,6 +36,7 @@ import {
   isScheduleStale,
   LIVE_THREADS_EXTERNAL_ID_RE,
   LIVE_SUBMIT_BUDGET_MS,
+  livePublishDailyLockName,
   staleScheduleConfirmedBy,
   LEGACY_SEND_ADAPTER_ID,
   localRateLimitDecision,
@@ -89,7 +90,7 @@ import {
 } from './approval-invalidation';
 import type { Db } from './client';
 import { invalidationReasonOf, jobView, publicationViewOf, snapshotProblems } from './distribution';
-import { liveApprovalUsage } from './live-publish';
+import { getLivePublishPaused, liveApprovalUsage, livePublishDailyUsage } from './live-publish';
 import { mediaPortFor } from './media-spec';
 import { mockScenarioFor } from './mock-scenarios';
 import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oauth';
@@ -106,7 +107,7 @@ export interface JobRunOptions {
   /** lease 소유자 표시(호스트 이름을 넣지 않는다 — 예: 'cli-1a2b3c4d') */
   workerId: string;
   /** LIVE-P1(D38): 실제 게시 환경 조건(PUBLISH_LIVE_*)도 여기서 읽는다(없으면 실제 게시 차단). */
-  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>;
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'> & Partial<Pick<AppConfig, 'PUBLISH_LIVE_DAILY_MAX'>>;
   /** 시계(테스트 주입). 기본 new Date() */
   clock?: () => Date;
   leaseTtlMs?: number;
@@ -154,6 +155,11 @@ export interface JobRunOptions {
    * phase = 'before_snapshot'(잠금 직후·읽기 전) | 'after_usage'(창 안 사용량을 읽은 직후). 다른 작업의 커밋이 끼어드는 순서를 강제하는 데만 쓴다.
    */
   rateCheckHook?: (tx: DbOrTx, at: { phase: 'before_snapshot' | 'after_usage'; jobId: string; accountId: string }) => Promise<void>;
+  /**
+   * 시험 전용(LIVE-P2): 실제 게시 일일 판정 안(owner 별 일일 잠금을 잡은 같은 트랜잭션)에서 부른다. phase = 'after_daily_lock'(잠금 직후·중지 확인 전) |
+   * 'after_daily_usage'(창 안 사용량을 읽은 직후). 두 작업 처리기의 판정 순서를 시험에서 관찰·강제하는 데만 쓴다.
+   */
+  liveDailyHook?: (tx: DbOrTx, at: { phase: 'after_daily_lock' | 'after_daily_usage'; jobId: string }) => Promise<void>;
 }
 
 export function newWorkerId(prefix: string): string {
@@ -883,6 +889,44 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
         });
       }
       liveApprovalRef = ref;
+      // LIVE-P2(D39): 즉시 중지 스위치 + 최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX). owner 별 advisory 잠금(배타, 트랜잭션 끝까지) 아래에서 본다.
+      // 잠금 순서: 계정(공유) → 항목 → 작업 → 요청 제한 잠금(cs_rate:<계정>) → 승인 기록 잠금(cs_live_publish:<ref>) → 이 잠금(cs_live_publish_daily:<owner>).
+      // 이 잠금을 잡는 곳은 여기와 setLivePublishPaused(이 잠금 하나만 — 먼저 잡고 다른 잠금 없음)뿐이라 순서가 엇갈리지 않는다. 승인 기록이 달라도
+      // (설정을 바꾼 두 작업 처리기) 같은 owner 의 일일 판정은 이 잠금으로 줄을 선다 — 앞선 판정의 전송 의도는 커밋된 뒤에야 잠금이 풀리므로 다음 판정에 보인다.
+      // 일일 상한이 없어도(PUBLISH_LIVE_DAILY_MAX 미설정) 잠금은 잡는다 — 중지 스위치 판정이 setLivePublishPaused 와 줄을 서게.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${livePublishDailyLockName(ownerId)}))`);
+      await opts.liveDailyHook?.(tx, { phase: 'after_daily_lock', jobId: job.id });
+      // 중지 — 전송 의도를 쓰기 전에, 같은 트랜잭션에서(FOR SHARE). 행이 없으면 중지 아님. 보내지 않았음이 확실(not_sent) → 재개 뒤 '재시도'로 다시 보낼 수 있다.
+      if ((await getLivePublishPaused(tx, ownerId, { lock: true })).paused) {
+        return settle(tx, ownerId, job, item, 'blocked', { reason: 'live_publish_paused', not_sent: true }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: 'live_publish_paused',
+        });
+      }
+      const dailyMax = opts.config.PUBLISH_LIVE_DAILY_MAX;
+      if (dailyMax !== undefined && dailyMax !== null) {
+        // 창 안에 이미 실제 전송 의도가 있는 작업(재시도·이어 보내기)은 새 게시가 아니다 — 세지도 막지도 않는다.
+        const daily = await livePublishDailyUsage(tx, ownerId, job.id, now);
+        await opts.liveDailyHook?.(tx, { phase: 'after_daily_usage', jobId: job.id });
+        if (!daily.thisJobCounted && daily.used >= dailyMax) {
+          return settle(
+            tx,
+            ownerId,
+            job,
+            item,
+            'blocked',
+            {
+              reason: 'live_publish_daily_limit',
+              not_sent: true,
+              used: daily.used,
+              limit: dailyMax,
+              available_at: daily.availableAt ? daily.availableAt.toISOString() : null,
+            },
+            now,
+            { ...CLEAR_LEASE, lastErrorCode: 'live_publish_daily_limit' },
+          );
+        }
+      }
     }
     const attempt = job.attempt + 1;
     const intentKey = `${job.id}:${attempt}`;

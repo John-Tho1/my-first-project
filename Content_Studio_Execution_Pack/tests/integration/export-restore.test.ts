@@ -219,6 +219,7 @@ describe('M1 게이트: 입력 → 검색 → 원고 수정 → export → 빈 D
     expect(exported.manifest.excluded_tables).toEqual([
       'auth_oidc_states', // T21-P1b: OIDC 로그인 요청(인증 임시 상태)
       'export_runs',
+      'live_publish_controls', // LIVE-P2(D39): 실제 게시 즉시 중지 스위치(이 환경의 운영 상태)
       'oauth_credentials',
       'oauth_pending_tokens',
       'oauth_states',

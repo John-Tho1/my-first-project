@@ -236,6 +236,9 @@ export interface AuditInput {
     // LIVE-T1(D31): 실제 Threads 계정 행(연결 전) 생성 — 외부 호출 없음
     | 'channel_account.live_created'
     | 'channel_account.live_publish_target'
+    // LIVE-P2(D39): 실제 게시 즉시 중지·재개(누가 = owner, 언제 = at 만 — 사유 문구·식별자 없음)
+    | 'live_publish_paused'
+    | 'live_publish_resumed'
     | 'plan.create'
     | 'plan.execute'
     | 'approval.grant'

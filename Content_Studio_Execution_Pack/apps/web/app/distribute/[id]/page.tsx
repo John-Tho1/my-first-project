@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { notFound, redirect } from 'next/navigation';
-import { getPlanDetail, type PlanItemDetail } from '@cs/db';
+import { getPlanDetail, livePublishOverview, type PlanItemDetail } from '@cs/db';
 import {
   adapterIdFor,
   CHANNEL_LABEL,
   formatMsk,
   LIVE_THREADS_VISIBILITY_TEXT,
+  livePublishReadiness,
+  livePublishStatusLine,
   providerMetadataOf,
   USER_CONFIRM_BUTTON,
   USER_CONFIRM_WARNING,
@@ -26,6 +28,7 @@ import {
   LIVE_UNKNOWN_GUIDANCE,
   latestThreadsDiag,
   liveCandidateForCard,
+  liveDailyLimitOf,
   liveItemHeadline,
   liveStepLine,
   liveVerificationLabel,
@@ -390,6 +393,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     needsNewPlan: x.problems.length > 0,
     publishAt: providerMetadataOf(p).publish_at ?? null,
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
+    // LIVE-P2(D39): 최근 24시간 상한 보류면 상한·다시 보낼 수 있는 시각(모스크바)
+    liveDaily: live ? liveDailyLimitOf(x.events) : null,
   };
   // FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 확인 후보(미확인) — 결과로 쓰지 않고 안내만
   // FIX-LIVEP1-USERCONFIRM(Codex P2): 후보는 화면 이력(최근 10개)이 아니라 서버(user-confirm route)와 같은 조회의 가장 최근 재확인 이력에서
@@ -680,7 +685,8 @@ export default async function PlanPage({
   if (!session) redirect('/login');
   const { id } = await params;
   const q = await searchParams;
-  const { db } = await getAppDb(getConfig());
+  const config = getConfig();
+  const { db } = await getAppDb(config);
   // T16(D29 제안): Instagram 모의 연결 항목의 잠정 규격 문제를 승인 전에 보인다(저장소 범위 읽기 창구).
   const d = await getPlanDetail(db, session.ownerId, id.toLowerCase(), undefined, { media: getStorage() });
   if (!d) notFound();
@@ -695,6 +701,17 @@ export default async function PlanPage({
   const reconciledRaw = reconciledNotice(q.reconciled);
   const reconciled =
     hasLive && q.reconciled === 'found' ? '원격에서 결과를 찾았습니다. 실제 게시 항목의 확인 상태는 아래 항목 카드에서 보세요(모의 항목은 MOCK).' : reconciledRaw;
+  // LIVE-P2(D39): 실제 계정 항목이 있는 계획 — "실제 게시: 최근 24시간 n/limit" 또는 "실제 게시 일시 중지됨" 한 줄(표시용 — 판정은 전송 직전 서버)
+  const liveOverview = hasLive ? await livePublishOverview(db, session.ownerId) : null;
+  const liveLine = liveOverview
+    ? livePublishStatusLine({
+        publishEnabled: config.PUBLISH_MODE === 'enabled',
+        ready: livePublishReadiness(config).ready,
+        paused: liveOverview.paused,
+        used: liveOverview.used,
+        limit: config.PUBLISH_LIVE_DAILY_MAX ?? null,
+      })
+    : null;
 
   return (
     <main className="container">
@@ -716,6 +733,11 @@ export default async function PlanPage({
             {/* FIX-UICLEAN: 보류 조건은 접지 않고 한 줄로 */}
             실제 게시 조건(PUBLISH_MODE·게시 승인 기록·게시 수 상한)이 없으면 게시하지 않고 보류합니다.
           </p>
+          {liveLine ? (
+            <p className="status-line" role="status">
+              <strong>{liveLine}</strong>
+            </p>
+          ) : null}
         </>
       ) : (
         <>

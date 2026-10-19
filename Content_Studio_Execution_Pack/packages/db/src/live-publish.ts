@@ -6,13 +6,21 @@
  * - 실제 Threads 계정은 연결(D31)만으로는 배포 계획에 쓸 수 없다(state disconnected). 사용자가 설정 화면에서 "실제 게시 계정으로 사용"을 누를 때만
  *   connected 가 된다(묶인 계정 + 쓸 수 있는 연결 정보일 때만). 사용 중지는 disconnected — 그 계정의 활성 승인을 철회한다(A06 account_changed).
  */
-import { and, eq, sql } from 'drizzle-orm';
-import { AppError, isThreadsNumericId, isUuid, NotFoundError, TERMINAL_JOB_STATES } from '@cs/domain';
+import { and, eq, gt, max, sql } from 'drizzle-orm';
+import {
+  AppError,
+  isThreadsNumericId,
+  isUuid,
+  LIVE_PUBLISH_DAILY_WINDOW_MS,
+  livePublishDailyLockName,
+  NotFoundError,
+  TERMINAL_JOB_STATES,
+} from '@cs/domain';
 import type { Db } from './client';
 import { setChannelAccountStateTx } from './distribution';
 import { credentialGate, LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY } from './oauth';
 import { recordAudit, type DbOrTx } from './queries';
-import { channelAccounts, distributionItems, jobs, sendIntents } from './schema';
+import { channelAccounts, distributionItems, jobs, livePublishControls, sendIntents } from './schema';
 
 export async function liveApprovalUsage(tx: DbOrTx, ref: string, jobId: string | null): Promise<{ otherJobs: number; thisJobCounted: boolean }> {
   const rows = await tx
@@ -110,4 +118,107 @@ export async function setLivePublishTarget(db: Db, ownerId: string, accountId: s
     });
     return r;
   });
+}
+
+// ---- LIVE-P2(결정 D39): 최근 24시간 실제 게시 상한 · 즉시 중지 스위치 ----
+
+export interface LivePublishDailyUsage {
+  /** 창 안에 실제 전송 의도가 있는 **다른** 작업 수(jobId 가 null 이면 모든 작업 수 — 화면 표시용) */
+  used: number;
+  /** 이 작업이 창 안에 이미 실제 전송 의도를 가짐(재시도·이어 보내기 — 새 게시가 아님) */
+  thisJobCounted: boolean;
+  /**
+   * 다음에 자리가 나는 시각: 센 작업마다의 **가장 최근** 실제 전송 의도 시각 중 가장 이른 것 + 24시간. 그 시각이 되면 창은 `created_at > now − 24h`
+   * 이므로 그 작업이 빠진다(재시도한 작업은 마지막 의도 기준이라 첫 의도 + 24h 보다 늦을 수 있음). 센 작업이 없으면 null.
+   */
+  availableAt: Date | null;
+}
+
+/**
+ * 최근 24시간(`created_at > now − 24h`) 안에 이 owner 의 실제 게시 전송 의도(sanitized_details.live_approval_ref 가 있는 행 — 승인 기록 값과 무관)를
+ * 만든 서로 다른 작업 수. 위쪽 끝은 두지 않는다(시계가 앞선 의도도 센다 — 보수적). 권위 있는 판정은 beginSend 가 owner 별 일일 잠금 아래에서 부른다.
+ */
+export async function livePublishDailyUsage(tx: DbOrTx, ownerId: string, jobId: string | null, now: Date): Promise<LivePublishDailyUsage> {
+  const since = new Date(now.getTime() - LIVE_PUBLISH_DAILY_WINDOW_MS);
+  const rows = await tx
+    .select({ jobId: sendIntents.jobId, lastAt: max(sendIntents.createdAt) })
+    .from(sendIntents)
+    .where(and(eq(sendIntents.ownerId, ownerId), sql`${sendIntents.sanitizedDetails}->>'live_approval_ref' is not null`, gt(sendIntents.createdAt, since)))
+    .groupBy(sendIntents.jobId);
+  const others = rows.filter((r) => r.jobId !== jobId);
+  let earliest: number | null = null;
+  for (const r of others) {
+    const t = r.lastAt instanceof Date ? r.lastAt.getTime() : r.lastAt ? new Date(r.lastAt).getTime() : NaN;
+    if (Number.isFinite(t) && (earliest === null || t < earliest)) earliest = t;
+  }
+  return {
+    used: others.length,
+    thisJobCounted: jobId !== null && rows.some((r) => r.jobId === jobId),
+    availableAt: earliest === null ? null : new Date(earliest + LIVE_PUBLISH_DAILY_WINDOW_MS),
+  };
+}
+
+export interface LivePublishControlView {
+  paused: boolean;
+  changedAt: Date | null;
+}
+
+/**
+ * 즉시 중지 스위치 읽기. 행이 없으면 중지 아님. lock=true 면 FOR SHARE(beginSend 는 owner 별 일일 잠금 아래에서 읽는다 — setLivePublishPaused 도 같은
+ * 잠금을 먼저 잡으므로 중지가 커밋된 뒤 시작하는 전송 판정은 반드시 중지를 본다).
+ */
+export async function getLivePublishPaused(tx: DbOrTx, ownerId: string, opts: { lock?: boolean } = {}): Promise<LivePublishControlView> {
+  const q = tx
+    .select({ paused: livePublishControls.paused, changedAt: livePublishControls.changedAt })
+    .from(livePublishControls)
+    .where(eq(livePublishControls.ownerId, ownerId))
+    .limit(1);
+  const rows = opts.lock ? await q.for('share') : await q;
+  const r = rows[0];
+  return r ? { paused: r.paused, changedAt: r.changedAt } : { paused: false, changedAt: null };
+}
+
+/**
+ * 즉시 중지(paused=true) / 재개(false). 로그인한 소유자만(route 가 세션·같은 출처를 본다). 외부 호출 없음.
+ * owner 별 일일 잠금(cs_live_publish_daily:<owner>)을 **먼저** 잡는다 — 다른 잠금은 잡지 않으므로 beginSend(…→ 승인 기록 잠금 → 이 잠금)와 순서가 엇갈리지
+ * 않는다. 이미 그 상태면 바꾸지 않고 감사도 남기지 않는다(changed=false). 감사: live_publish_paused / live_publish_resumed(누가 = owner, 언제 = at 만).
+ * 중지는 이미 게시 시도 표식을 지난 작업(결과 불명·조회)을 바꾸지 않는다 — 막는 곳은 전송 직전(beginSend)뿐이다.
+ */
+export async function setLivePublishPaused(db: Db, ownerId: string, paused: boolean, now: Date = new Date()): Promise<{ paused: boolean; changed: boolean; changedAt: Date }> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${livePublishDailyLockName(ownerId)}))`);
+    const cur = await tx.select().from(livePublishControls).where(eq(livePublishControls.ownerId, ownerId)).for('update').limit(1);
+    const before = cur[0];
+    if (before && before.paused === paused) return { paused, changed: false, changedAt: before.changedAt };
+    if (!before && !paused) return { paused: false, changed: false, changedAt: now };
+    await tx
+      .insert(livePublishControls)
+      .values({ ownerId, paused, changedAt: now, changedBy: 'owner' })
+      .onConflictDoUpdate({ target: livePublishControls.ownerId, set: { paused, changedAt: now, changedBy: 'owner' } });
+    await recordAudit(tx, {
+      ownerId,
+      action: paused ? 'live_publish_paused' : 'live_publish_resumed',
+      entity: 'live_publish_controls',
+      entityId: ownerId,
+      details: { by: 'owner' },
+      at: now,
+    });
+    return { paused, changed: true, changedAt: now };
+  });
+}
+
+/** 화면용 요약(홈·배포 계획·설정): 실제 계정이 있는지, 중지 여부, 최근 24시간 실제 게시 작업 수. 잠금 없음(표시용 — 판정은 beginSend). */
+export async function livePublishOverview(
+  db: DbOrTx,
+  ownerId: string,
+  now: Date = new Date(),
+): Promise<{ hasLiveAccount: boolean; paused: boolean; changedAt: Date | null; used: number; availableAt: Date | null }> {
+  const live = await db
+    .select({ id: channelAccounts.id })
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.ownerId, ownerId), eq(channelAccounts.kind, 'live')))
+    .limit(1);
+  const control = await getLivePublishPaused(db, ownerId);
+  const usage = await livePublishDailyUsage(db, ownerId, null, now);
+  return { hasLiveAccount: live.length > 0, paused: control.paused, changedAt: control.changedAt, used: usage.used, availableAt: usage.availableAt };
 }

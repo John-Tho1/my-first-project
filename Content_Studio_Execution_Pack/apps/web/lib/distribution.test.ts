@@ -19,6 +19,7 @@ import {
   latestThreadsDiag,
   liveCandidateForCard,
   liveCandidateFromEvents,
+  liveDailyLimitOf,
   liveItemHeadline,
   liveVerificationLabel,
   liveVerificationTag,
@@ -753,5 +754,37 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
     for (const code of ['user_confirm_not_live', 'user_confirm_already_published', 'user_confirm_not_pending', 'user_confirm_restored', 'user_confirm_no_attempt', 'user_confirm_publish_recorded', 'user_confirm_no_candidate', 'user_confirm_candidate_mismatch']) {
       expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
     }
+  });
+});
+
+describe('LIVE-P2(D39): 즉시 중지·최근 24시간 상한 보류 문구', () => {
+  const job = (code: string) => ({ state: 'BLOCKED', attempt: 0, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: code });
+  const ev = (details: Record<string, unknown>) => [{ stateAfter: 'BLOCKED', sanitizedDetails: { event: 'blocked', not_sent: true, ...details } }];
+
+  it('liveDailyLimitOf: 가장 최근 BLOCKED 사건이 일일 상한일 때만, 형식이 맞는 값만', () => {
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', used: 3, limit: 3, available_at: '2026-10-20T09:00:00.000Z' }))).toEqual({ limit: 3, availableAt: '2026-10-20T09:00:00.000Z' });
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: 3, available_at: 'x' }))).toEqual({ limit: 3, availableAt: null });
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: 0 }))).toBeNull();
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: '3' }))).toBeNull();
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_paused' }))).toBeNull();
+    expect(liveDailyLimitOf([])).toBeNull();
+  });
+
+  it('실제 항목 BLOCKED: 일일 상한 → 상한·모스크바 시각, 중지 → 재개 뒤 재시도, 작업 줄도 보내지 않았음을 말한다', () => {
+    const base = { status: 'BLOCKED', channel: 'threads', pub: null } as const;
+    const daily = liveItemHeadline({
+      ...base,
+      job: job('live_publish_daily_limit'),
+      blockReason: 'live_publish_daily_limit',
+      liveDaily: { limit: 3, availableAt: '2026-10-20T09:00:00.000Z' },
+    });
+    expect(daily).toBe("보류 — 최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. 2026-10-20 12:00 (MSK) 이후 '재시도'로 다시 보낼 수 있습니다.");
+    expect(liveItemHeadline({ ...base, job: job('live_publish_daily_limit'), blockReason: 'live_publish_daily_limit' })).toContain('최근 24시간 실제 게시 상한');
+    const paused = liveItemHeadline({ ...base, job: job('live_publish_paused'), blockReason: 'live_publish_paused' });
+    expect(paused).toBe("보류 — 실제 게시가 일시 중지되어 게시하지 않았습니다. 설정에서 재개한 뒤 '재시도'로 다시 보낼 수 있습니다.");
+    expect(jobStatusText(job('live_publish_paused'), null, 'live_publish_paused')).toBe('BLOCKED · 실제 게시 일시 중지됨 — 보내지 않음(재개 뒤 재시도)');
+    expect(jobStatusText(job('live_publish_daily_limit'), null, 'live_publish_daily_limit')).toBe('BLOCKED · 최근 24시간 실제 게시 상한 — 보내지 않음(창이 풀린 뒤 재시도)');
+    // 기존 승인 기록 상한 문구는 그대로
+    expect(liveItemHeadline({ ...base, job: job('live_publish_limit'), blockReason: 'live_publish_limit' })).toBe('보류 — 승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 다 씀(보내지 않음)');
   });
 });

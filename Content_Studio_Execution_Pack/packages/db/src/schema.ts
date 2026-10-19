@@ -2019,3 +2019,22 @@ export const recommendationDismissals = pgTable(
     }).onDelete('restrict'),
   ],
 );
+
+/**
+ * LIVE-P2(결정 D39, migration 0046): 실제 게시 즉시 중지 스위치(owner 당 한 행). **행이 없으면 중지 아님**(이전 동작 그대로).
+ * paused=true 면 전송 직전(beginSend 실제 분기 — 같은 트랜잭션, owner 별 일일 잠금 아래)에 보내지 않고 BLOCKED(live_publish_paused). 모의 전송은 영향 없음.
+ * changed_by 는 누가 바꿨는지의 종류만('owner' — 로그인한 소유자). 식별자·IP·사유 문구는 넣지 않는다. 변경은 감사(live_publish_paused/resumed)에도 남는다.
+ * 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES — 이 환경의 운영 안전 스위치. 복원 환경으로 옮기면 다른 환경의 게시를 켜거나 멈추게 된다).
+ */
+export const livePublishControls = pgTable(
+  'live_publish_controls',
+  {
+    ownerId: uuid('owner_id')
+      .primaryKey()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    paused: boolean('paused').notNull(),
+    changedAt: ts('changed_at').notNull().defaultNow(),
+    changedBy: text('changed_by').notNull(),
+  },
+  (t) => [check('live_publish_controls_changed_by_chk', sql`${t.changedBy} in ('owner')`)],
+);

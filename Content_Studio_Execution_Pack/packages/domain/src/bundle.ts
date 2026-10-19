@@ -131,6 +131,8 @@ export const EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   oauth_states: '진행 중인 계정 연결 요청(T13) — 10분짜리 임시 상태',
   auth_oidc_states: '진행 중인 OIDC 로그인 요청(T21-P1b) — 10분짜리 인증 임시 상태(봉인한 PKCE verifier·nonce). 다른 환경으로 옮기지 않는다',
   oauth_pending_tokens: '정리 대기 토큰(T13 FIX4) — 봉인한 토큰·확인 의무. 인증 비밀이며 이 환경의 공급자 정리 작업이다(다른 환경으로 옮기지 않는다)',
+  live_publish_controls:
+    '실제 게시 즉시 중지 스위치(LIVE-P2, D39) — 이 환경의 운영 안전 상태. 다른 환경으로 옮기면 그 환경의 실제 게시를 켜거나 멈추게 되므로 옮기지 않는다(복원 환경은 행 없음 = 중지 아님 — 복원한 작업은 어차피 다시 보내지 않는다)',
 };
 
 /**

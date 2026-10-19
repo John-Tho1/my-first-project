@@ -1,8 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { latestDraft, listAssets, listCaptures, listCapturesPage, listRecentPlans } from '@cs/db';
-import { CHANNEL_LABEL, describeModes, formatMsk, maskIdentity, MAX_RAW_TEXT, MAX_TITLE, MAX_UPLOAD_BYTES, MAX_USER_NOTE, type Channel } from '@cs/domain';
+import { latestDraft, listAssets, listCaptures, listCapturesPage, listRecentPlans, livePublishOverview } from '@cs/db';
+import {
+  CHANNEL_LABEL,
+  describeModes,
+  formatMsk,
+  livePublishReadiness,
+  livePublishStatusLine,
+  maskIdentity,
+  MAX_RAW_TEXT,
+  MAX_TITLE,
+  MAX_UPLOAD_BYTES,
+  MAX_USER_NOTE,
+  type Channel,
+} from '@cs/domain';
 import { getSession } from '../lib/auth';
 import { LIFECYCLE_LABEL } from '../lib/contents';
 import { PLAN_STATUS_LABEL } from '../lib/distribution';
@@ -96,6 +108,17 @@ export default async function TodayPage({
   const recommended = captures.slice(0, 2);
   const needsCheck = captures.filter((c) => c.risk === 'needs_check');
   const publishLabel = badges.find((b) => b.key === 'publish')?.label ?? '게시: 비활성';
+  // LIVE-P2(D39): 실제 계정이 있으면 "실제 게시: 최근 24시간 n/limit" 또는 "실제 게시 일시 중지됨" 한 줄(표시용 — 판정은 전송 직전 서버)
+  const liveOverview = await livePublishOverview(handle.db, session.ownerId);
+  const liveLine = liveOverview.hasLiveAccount
+    ? livePublishStatusLine({
+        publishEnabled: config.PUBLISH_MODE === 'enabled',
+        ready: livePublishReadiness(config).ready,
+        paused: liveOverview.paused,
+        used: liveOverview.used,
+        limit: config.PUBLISH_LIVE_DAILY_MAX ?? null,
+      })
+    : null;
 
   return (
     <main className="container">
@@ -118,6 +141,11 @@ export default async function TodayPage({
             </li>
           ))}
         </ul>
+        {liveLine ? (
+          <p className="status-line" role="status">
+            <Link href="/settings#live-publish">{liveLine}</Link>
+          </p>
+        ) : null}
       </header>
 
       <h2 className="screen-title">오늘</h2>

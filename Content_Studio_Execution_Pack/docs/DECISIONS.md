@@ -508,3 +508,12 @@
 - 잠금(2026-10-14): `.env.local` 의 `PUBLISH_MODE=disabled`, `PUBLISH_LIVE_APPROVAL_REF` 비움, dev 서버 재시작 뒤 health `publish: disabled` 확인.
 - 발견·후속: (1) 실제 Threads 는 컨테이너 생성 ~5초·상태 확인 ~1.5초 — 화면 tick 10초 제한이 짧다(LIVEP1-TIMEOUT). (2) 결과 불명 항목을 사용자가 "Threads 에서 확인함"으로 표시하는 수단이 없다(후보 링크만). (3) UI 정리(메뉴 묶음·위치 경로·문구 축소) 요청.
 - **D38 마무리 (2026-10-14 18:18 MSK)**: 사용자가 계획 26578f3c 항목에서 "Threads에서 확인함" — publication threads:18032037416904820(USER_CONFIRMED, PUBLISHED, 공개 범위 unknown), 항목 CONFIRMED·계획 completed. 게시 기능은 잠긴 상태 유지(PUBLISH_MODE=disabled).
+
+## D39 — Threads 평상시 실제 게시 허용(하루 3건 상한·즉시 중지 스위치) + 만료 관리 (2026-10-19)
+- 사용자 승인(2026-10-19, "2단계 권장안 승인하고, 3단계 만료관리도 해줘"). 권장안: 게시 허용은 한 번만 켜고, 글마다 승인은 앱 안 승인 버튼(정확한 본문·계정·공개 범위·예약 시각 고정, 편집 시 승인 무효 — 기존 불변식 그대로), 하루 상한 3건, 즉시 끄는 스위치.
+- 범위: 계정 @yongho.tho("실제 게시 계정으로 사용"한 Threads 계정)만, Threads 글자 게시만(기존 어댑터 범위 — 이미지·링크 첨부 없음), 즉시 게시와 승인된 예약 게시(로컬 서버가 켜져 있을 때만 실행, D36 60분 지나면 차단). 다른 채널(Instagram·YouTube 실제)·다른 계정·배포는 범위 밖.
+- 상한: 실제 게시 전송 의도 기준 **최근 24시간 3건**(`PUBLISH_LIVE_DAILY_MAX=3`, 같은 작업의 재시도·이어 보내기는 새로 세지 않음). 승인 기록 `PUBLISH_LIVE_APPROVAL_REF=D39`, `PUBLISH_LIVE_MAX_POSTS=1000`(기록당 총량 — 일일 상한이 실제 제한).
+- 즉시 중지: 설정 화면 "실제 게시 일시 중지" — 서버 재시작 없이 바로 막힘(DB 저장, 전송 직전 트랜잭션 안에서 확인). 재개는 로그인한 소유자만. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
+- 결과 불명 처리·재게시 금지·USER_CONFIRMED 는 D38 그대로.
+- 만료 관리: Threads 연결 만료(현재 2026-12-12) 14일 전부터 홈·설정에 경고 + 설정의 "다시 연결"(D31 연결 범위 안 — 토큰 갱신 API 호출은 추가하지 않음). 로컬 인증서(`data/dev-certs`, 만료 2026-11-12) 14일 전부터 홈에 경고(개발 모드만) + 갱신 스크립트(로컬 openssl, 외부 호출 없음).
+- 시행 순서: LIVE-P2(상한·스위치)·EXPIRY-1 구현 → Codex PASS → `.env.local` 설정 → 서버 재시작 → health·화면 확인. 그 전까지 게시는 잠긴 상태(PUBLISH_MODE=disabled).

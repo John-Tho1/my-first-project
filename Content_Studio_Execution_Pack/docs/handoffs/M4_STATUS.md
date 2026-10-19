@@ -155,3 +155,8 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - LIVEP1-TIMEOUT(98f11cd → FIX e708106 PASS)·LIVEP1-USERCONFIRM(a67f462 → FIX 2af529b PASS) 종결. migration 0045 로컬 적용(백업 data/pglite.bak-20261014-pre0045), drill:restore PASS.
 - UI-CLEAN(fdb6aea → FIX 254ee5e PASS): 메뉴 5묶음+소메뉴·현재 위치 강조, 모든 화면 위치 경로, 긴 설명 '자세히'로 접기(안전 표시 유지·ui-safety 시험), 실제/MOCK 안내를 계정·기록 상태로. 검사 unit 1788·integration 917 PASS. 브라우저 확인: 데스크톱·375px 가로 넘침 없음.
 - DESIGN-A(9bbf96a PASS): 사용자 선택 샘플 A(Apple 시스템 다크) — 순흑 배경·세그먼트 메뉴·묶음 목록 행·시스템 색, 실제(주황 tag live)/MOCK(회색 점선 tag mock) 분리, AA 대비 시험, 밝은 모드 대응. 브라우저 확인(데스크톱·375px).
+
+## 2026-10-19 — D39 승인 · 클라우드 인계
+- 사용자 승인: Threads 평상시 실제 게시(최근 24시간 3건 상한·즉시 중지 스위치) + 만료 관리 → D39. 계획 `LIVEP2_EXPIRY_PLAN.md`.
+- 로컬 PC 메모리 부족(dev 서버 컴파일 중 V8 OOM 2회)으로 구현·검사는 클라우드로 인계: `M4_CLOUD_KICKOFF_D39.md`. Codex 검증·실제 설정 적용은 로컬.
+- 게시는 계속 잠김(PUBLISH_MODE=disabled). 로컬 dev 서버·Codex 실행기 꺼짐.

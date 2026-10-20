@@ -507,14 +507,14 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 ### 만료 관리 (D39, EXPIRY-1)
 결정 D39(docs/DECISIONS.md). 외부 호출 없음 — 만료 시각은 이미 저장된 연결 정보와 로컬 인증서 파일에서만 읽는다.
-- **경고 시점**: 만료까지 남은 시간이 14일 이하(정확히 14일 포함)면 "곧 만료", 0 이하(만료 시각 그 순간부터)면 "만료됨". 홈 맨 위(헤더 아래)와 설정 맨 위에 보인다. 모의(MOCK) 계정·연결 해제한 계정은 경고하지 않는다.
+- **경고 시점**: 만료까지 남은 시간이 14일 이하(정확히 14일 포함)면 "곧 만료", 0 이하(만료 시각 그 순간부터)면 "만료됨". 홈 맨 위(헤더 아래)와 설정 맨 위에 보인다. 모의(MOCK) 계정·연결 해제한 계정(해제 진행 중 포함 — 그동안은 다시 연결도 막힘)은 경고하지 않는다.
 - **실제 Threads 연결**(현재 만료 2026-12-12): "Threads 연결이 YYYY-MM-DD HH:MM (MSK)에 만료됩니다 — 설정에서 다시 연결하세요", 만료 뒤 "Threads 연결이 만료되었습니다 — 다시 연결 전에는 실제 게시가 되지 않습니다". 설정 → 배포 계정 연결 표의 "만료" 칸 옆에도 계정별로 표시된다. 다시 연결은 그 행의 **다시 연결(실제 Threads)**(기존 연결 흐름 — 인증 창 → 코드 교환 → 장기 토큰). 토큰 갱신 API(`th_refresh_token`)는 부르지 않는다(D31 범위 밖, 자동 갱신 없음).
 - **로컬 인증서**(개발 모드만, 현재 만료 2026-11-12): dev 서버가 `DEV_TLS_CERT_PATH`(비우면 `data/dev-certs/localhost-cert.pem`)의 인증서 만료 시각만 읽는다 — 파일이 없거나 읽지 못하면 경고 없음, 운영 빌드는 읽지 않는다. 설정 → **만료 관리**에 만료 시각이 보인다.
 - **인증서 확인·갱신**(앱 루트에서, Git Bash):
   - `bash scripts/dev-cert.sh check` — 만료 시각(notAfter)과 남은 날짜. 키는 출력하지 않는다.
-  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
-  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
-- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음).
+  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 키와 인증서를 바꾸는 사이에 실패하거나 멈추면(Ctrl+C 포함) 백업에서 기존 키를 되돌리고, 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일의 경로와 옮길 명령을 알려 준다. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
+  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). `DEV_CERT_FILE`·`DEV_KEY_FILE` 은 대소문자만 달라도 같은 파일로 보고 거부한다(NTFS·macOS 는 대소문자를 가리지 않음). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
+- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음). 바꾸기 중 실패·중단은 가짜 `mv`, 백업 이름 충돌은 가짜 `date` 로 만든다. 파일 시스템이 `chmod 600` 을 지키지 않으면(Git Bash/NTFS) 키 권한 확인만 SKIP.
 
 ### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
 **Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.

@@ -15,6 +15,7 @@ import {
   THREADS_CONNECTION_EXPIRED_TEXT,
   type ExpiryAccountInput,
 } from './expiry';
+import { credentialHealth } from './oauth';
 import { formatMsk } from './time';
 
 const NOW = new Date('2026-11-28T12:00:00.000Z');
@@ -79,6 +80,34 @@ describe('expiryNotices — Threads 연결(실제만)', () => {
     expect(run([live({ expires_at: null }), live({ revoked_at: at(-DAY).toISOString(), expires_at: at(DAY).toISOString() }), live({ expires_at: 'not-a-date' })])).toEqual([]);
     expect(isLiveThreadsCredential(live({ expires_at: null }))).toBe(false);
     expect(isLiveThreadsCredential(live())).toBe(true);
+  });
+
+  // FIX1-EXPIRY1(D39 검토 P2 expiry.ts:83): 연결 해제 진행 중(credential 'revoking' — revoked_at 은 아직 null)도 "다시 연결" 경고 대상이 아니다.
+  // 화면 입력(db accountHealthView)의 status 는 credentialHealth 결과라 'revoking' 이 'revoked'(reason 'revoking')로 온다.
+  it('연결 해제 진행 중(status revoked·reason revoking, revoked_at null) → 1일·만료됨이어도 무시', () => {
+    const h = credentialHealth({
+      account: { kind: 'live', credentialState: 'linked' },
+      credential: { status: 'revoking', expiresAt: at(DAY), scopes: ['threads_basic', 'threads_content_publish'], revokedAt: null, lastErrorCode: null },
+      requiredScopes: ['threads_basic', 'threads_content_publish'],
+      now: NOW,
+    });
+    expect(h).toMatchObject({ status: 'revoked', reason: 'revoking', usable: false });
+    const revoking = live({ status: h.status, revoked_at: null, expires_at: at(DAY).toISOString() });
+    expect(isLiveThreadsCredential(revoking)).toBe(false);
+    expect(accountExpiryNotice(revoking, NOW)).toBeNull();
+    expect(accountExpiryNotice(live({ status: 'revoked', expires_at: at(0).toISOString() }), NOW)).toBeNull();
+    expect(accountExpiryNotice(live({ status: 'revoked', expires_at: at(-DAY).toISOString() }), NOW)).toBeNull();
+    // 연결 정보 행의 원래 상태 이름(revoking)을 그대로 넘겨도 같다
+    expect(accountExpiryNotice(live({ status: 'revoking', expires_at: at(DAY).toISOString() }), NOW)).toBeNull();
+    expect(run([revoking, live({ account_id: 'b', status: 'revoking', expires_at: at(-DAY).toISOString() })])).toEqual([]);
+  });
+
+  it('연결 해제가 아닌 다른 실행 불가 상태(error·needs_reconnect·expired)와 상태 미지정은 그대로 알린다 — 다시 연결로 풀리는 상태', () => {
+    for (const status of [undefined, 'connected', 'expiring_soon', 'error', 'needs_reconnect', 'expired']) {
+      expect(accountExpiryNotice(live({ status, expires_at: at(DAY).toISOString() }), NOW)?.level).toBe('warn');
+      expect(accountExpiryNotice(live({ status, expires_at: at(-1).toISOString() }), NOW)?.level).toBe('expired');
+      expect(accountExpiryNotice(live({ status, expires_at: at(14 * DAY + 1).toISOString() }), NOW)).toBeNull();
+    }
   });
 
   it('실제 15일 남음 → 없음, 14일 + 1ms → 없음', () => {

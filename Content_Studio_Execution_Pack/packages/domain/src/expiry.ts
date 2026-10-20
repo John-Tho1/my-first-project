@@ -1,6 +1,9 @@
 /**
  * EXPIRY-1(결정 D39): 만료 관리 알림 — 실제 Threads 연결(장기 토큰)과 로컬 개발용 HTTPS 인증서의 만료 14일 전부터 경고(순수 함수, 외부 호출 없음).
  * - 실제(live) Threads 연결 정보만 센다. 모의(MOCK) 계정·연결 정보 없는 계정·연결 해제(revoked)한 계정은 무시한다.
+ *   FIX1-EXPIRY1: "연결 해제"는 끝난 것(revoked_at 있음)과 진행 중인 것(연결 정보 상태 revoking — 화면 입력 status 는 credentialHealth 가
+ *   'revoked'(reason revoking)로 바꿔 줌, revoked_at 은 아직 null)을 모두 뜻한다. 진행 중이면 콜백 저장이 CredentialBusyError 로 막혀
+ *   "다시 연결" 안내가 틀리므로 둘 다 뺀다. 그 밖의 실행 불가 상태(error·needs_reconnect·expired)는 다시 연결하면 풀리므로 그대로 알린다.
  * - 다시 연결은 기존 연결 흐름(설정 → 배포 계정 연결 → "다시 연결(실제 Threads)")뿐 — 토큰 갱신 API 호출은 추가하지 않는다(D31 범위 밖).
  * - 로컬 인증서 정보는 서버 전용 읽기 함수(apps/web/lib/dev-cert.ts — 개발 모드에서만 파일을 읽음)가 넘긴다. 없으면 알림 없음.
  *
@@ -37,7 +40,12 @@ export interface ExpiryAccountInput {
   platform: string;
   expires_at: string | Date | null;
   revoked_at?: string | Date | null;
+  /** 연결 상태(accountHealthView.status = credentialHealth 결과, 또는 연결 정보 행의 원래 상태). 'revoked'·'revoking' 이면 알림 대상이 아니다. */
+  status?: string | null;
 }
+
+/** 연결 해제(끝남·진행 중)를 뜻하는 상태 이름 — credentialHealth 는 revoking 도 'revoked' 로 보고한다. */
+const REVOKE_STATUSES: ReadonlySet<string> = new Set(['revoked', 'revoking']);
 
 export interface DevCertExpiryInput {
   validTo: Date;
@@ -78,9 +86,16 @@ export function expiryLevel(expiresAt: Date, now: Date): ExpiryLevel | null {
   return null;
 }
 
-/** 알림 대상인 계정인가: 실제(live) Threads 계정 + 연결 정보(만료 시각)가 있고 연결 해제하지 않음. */
+/** 알림 대상인 계정인가: 실제(live) Threads 계정 + 연결 정보(만료 시각)가 있고 연결 해제하지 않음(끝남·진행 중 모두 아님). */
 export function isLiveThreadsCredential(a: ExpiryAccountInput): boolean {
-  return a.kind === 'live' && a.mock !== true && a.platform === 'threads' && toDate(a.expires_at) !== null && toDate(a.revoked_at ?? null) === null;
+  return (
+    a.kind === 'live' &&
+    a.mock !== true &&
+    a.platform === 'threads' &&
+    toDate(a.expires_at) !== null &&
+    toDate(a.revoked_at ?? null) === null &&
+    !(a.status != null && REVOKE_STATUSES.has(a.status))
+  );
 }
 
 /** 계정 한 행의 만료 알림(설정 표의 "만료" 칸 옆 표시에도 쓴다). 대상이 아니거나 14일보다 많이 남았으면 null. */

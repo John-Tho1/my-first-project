@@ -12,9 +12,13 @@
 #   OPENSSL        openssl 실행 파일(기본: PATH 의 openssl — Git for Windows 의 Git Bash 에는 보통 들어 있다)
 #
 # 규칙: 개인 키 내용은 어떤 경우에도 화면에 내보내지 않는다(openssl 출력은 버리거나 키가 없는 오류만 보인다).
-#       renew 는 새 키·인증서를 임시 파일에 다 만들고 검사한 뒤에만 기존 파일을 백업(backup-YYYYMMDD-HHMMSS/ 에 복사)하고 바꾼다 —
-#       중간에 실패하면 기존 파일은 그대로다. 백업 폴더에는 예전 개인 키도 들어 있으니 data/ 밖으로 옮기지 않는다.
-# 종료 코드: 0 성공 · 1 실행 실패(openssl 없음·파일 없음·읽기/생성 실패) · 2 사용법 오류
+#       renew 는 새 키·인증서를 같은 폴더의 임시 파일에 다 만들고 검사한 뒤에만 기존 파일을 백업(backup-YYYYMMDD-HHMMSS[-n]/ 에 복사)하고
+#       키 → 인증서 순서로 이름을 바꿔(rename) 넣는다. 만들기·검사·백업 중에 실패하면 기존 파일은 그대로다.
+#       두 이동 사이에서 실패하거나 멈추면(오류·INT/TERM/HUP) 백업에서 기존 키를 되돌려(기존 키가 없었으면 새 키를 지워) 갱신 전 상태로
+#       돌아간다. 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일을 지우지 않고 경로와 옮길 명령을 알려 준다(짝이 어긋난 채 끝나지 않게).
+#       백업 폴더에는 예전 개인 키도 들어 있으니 data/ 밖으로 옮기지 않는다.
+#       DEV_CERT_FILE·DEV_KEY_FILE 은 대소문자만 달라도 같은 파일로 보고 거부한다(Git Bash 의 NTFS·macOS 기본 APFS 는 대소문자를 가리지 않음).
+# 종료 코드: 0 성공 · 1 실행 실패(openssl 없음·파일 없음·읽기/생성/바꾸기 실패) · 2 사용법 오류 · 129/130/143 신호로 중단(HUP/INT/TERM)
 set -euo pipefail
 umask 077
 
@@ -102,11 +106,91 @@ cmd_check() {
 }
 
 TMP_FILES=()
+# 정리할 때 지우지 않을 임시 파일(되돌리기에 실패해 새 키와 짝인 새 인증서를 남길 때만 채운다)
+KEEP_FILE=""
+
+# ---- renew 의 바꾸기(키 → 인증서 이동) 상태 — 실패·중단 시 되돌리기용 ----
+# SWAP_STATE: "" → key_moving → key_moved → cert_moving → done.  되돌리기: rolling_back → rolled_back | stuck
+SWAP_STATE=""
+SWAP_TMP_KEY="" SWAP_TMP_CERT="" SWAP_KEY="" SWAP_CERT="" SWAP_BACKUP="" SWAP_HAD_KEY=0
+
+# 이동 중(key_moving·cert_moving)에 멈췄으면 임시 파일이 아직 있는지로 실제 이동 여부를 정한다(rename 은 한 번에 일어나거나 안 일어남).
+swap_settle() {
+  case "$SWAP_STATE" in
+    key_moving) if [[ -e "$SWAP_TMP_KEY" ]]; then SWAP_STATE=""; else SWAP_STATE=key_moved; fi ;;
+    cert_moving) if [[ -e "$SWAP_TMP_CERT" ]]; then SWAP_STATE=key_moved; else SWAP_STATE=done; fi ;;
+  esac
+  return 0
+}
+
+# 키만 바뀐 상태(key_moved)를 갱신 전으로 되돌린다. 기존 키가 있었으면 백업 사본을 같은 폴더 임시 파일로 복사한 뒤 rename
+# (반쯤 쓴 키가 제자리에 놓이지 않게), 없었으면 새 키를 지운다. 인증서는 아직 바뀌지 않았다(인증서 임시 파일이 남아 있음).
+# 성공 0 — 새 키가 사라졌으니 새 인증서 임시 파일은 정리 대상 그대로.
+# 실패 1 — 새 키가 제자리에 남았으므로 짝인 새 인증서 임시 파일을 지우지 않고(KEEP_FILE) 경로·옮길 명령을 알린다.
+rollback_swap() {
+  swap_settle
+  [[ "$SWAP_STATE" == key_moved ]] || return 0
+  SWAP_STATE=rolling_back
+  local tmp_restore=""
+  if [[ "$SWAP_HAD_KEY" == 1 ]]; then
+    if [[ -n "$SWAP_BACKUP" && -f "$SWAP_BACKUP/$KEY_NAME" ]] &&
+      tmp_restore="$(mktemp "$DIR/.restore-key.XXXXXX")" &&
+      TMP_FILES+=("$tmp_restore") &&
+      cp -p -- "$SWAP_BACKUP/$KEY_NAME" "$tmp_restore" &&
+      mv -f -- "$tmp_restore" "$SWAP_KEY"; then
+      SWAP_STATE=rolled_back
+      echo "[dev-cert] 되돌렸습니다: 기존 개인 키를 백업($SWAP_BACKUP)에서 제자리에 두었습니다 — 인증서·키는 갱신 전 그대로입니다." >&2
+      return 0
+    fi
+  elif rm -f -- "$SWAP_KEY"; then
+    SWAP_STATE=rolled_back
+    echo "[dev-cert] 되돌렸습니다: 새 개인 키를 지웠습니다(갱신 전에는 키 파일이 없었음) — 인증서·키는 갱신 전 그대로입니다." >&2
+    return 0
+  fi
+  SWAP_STATE=stuck
+  KEEP_FILE="$SWAP_TMP_CERT"
+  echo "[dev-cert] 기존 개인 키를 되돌리지 못했습니다. 지금 $SWAP_KEY 는 새 키이고, 짝이 맞는 새 인증서를 $SWAP_TMP_CERT 에 남겨 두었습니다." >&2
+  echo "[dev-cert] 해결: mv -f -- \"$SWAP_TMP_CERT\" \"$SWAP_CERT\"  (새 키·인증서로 맞춤) — 또는 ${SWAP_BACKUP:-백업 폴더}의 파일을 복사해 갱신 전으로 되돌리세요." >&2
+  return 1
+}
+
+# 두 이동 중 하나가 실패했을 때: 되돌리고 결과를 알린 뒤 exit 1. 되돌리는 동안 신호(두 번째 Ctrl+C 등)는 무시해 끝까지 한다.
+swap_fail() {
+  trap '' HUP INT TERM
+  echo "[dev-cert] 오류: $1" >&2
+  rollback_swap || exit 1
+  case "$SWAP_STATE" in
+    "" | rolled_back) echo "[dev-cert] 기존 파일은 그대로입니다${SWAP_BACKUP:+(백업 $SWAP_BACKUP)}." >&2 ;;
+    done) echo "[dev-cert] 이동은 끝났습니다 — 새 키·인증서가 제자리에 있습니다. bash scripts/dev-cert.sh check 로 확인하세요." >&2 ;;
+  esac
+  exit 1
+}
+
 cleanup() {
   local f
-  for f in "${TMP_FILES[@]+"${TMP_FILES[@]}"}"; do rm -f -- "$f"; done
+  # 정리·되돌리기는 끝까지 한다 — 그동안 들어온 신호(두 번째 Ctrl+C·TERM)는 무시(종료 코드는 처음 멈춘 이유 그대로).
+  trap '' HUP INT TERM
+  # 두 이동 사이에서 멈춤(신호·예상 못 한 종료) → 되돌린다. 되돌리는 도중에 멈췄으면 새 인증서를 남긴다(새 키가 제자리일 수 있음).
+  case "$SWAP_STATE" in
+    key_moving | key_moved | cert_moving)
+      echo "[dev-cert] 중단: 키와 인증서를 바꾸는 도중에 멈췄습니다." >&2
+      rollback_swap || true
+      ;;
+    rolling_back)
+      KEEP_FILE="$SWAP_TMP_CERT"
+      echo "[dev-cert] 중단: 되돌리는 도중에 멈췄습니다. 새 키와 짝인 새 인증서를 $SWAP_TMP_CERT 에 남겨 두었습니다 — ${SWAP_BACKUP:-백업 폴더}와 비교해 직접 정리하세요." >&2
+      ;;
+  esac
+  for f in "${TMP_FILES[@]+"${TMP_FILES[@]}"}"; do
+    [[ -n "$KEEP_FILE" && "$f" == "$KEEP_FILE" ]] && continue
+    rm -f -- "$f"
+  done
 }
 trap cleanup EXIT
+# 신호로 멈춰도 EXIT 정리(위 되돌리기 포함)를 거치게 명시한다(bash·Git Bash 공통).
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cmd_renew() {
   [[ $# -le 1 ]] || usage
@@ -117,7 +201,11 @@ cmd_renew() {
   need_openssl
 
   mkdir -p -- "$DIR" || die "인증서 폴더를 만들지 못했습니다: $DIR"
-  local cert="$DIR/$CERT_NAME" key="$DIR/$KEY_NAME"
+  local cert="$DIR/$CERT_NAME" key="$DIR/$KEY_NAME" target
+  # 자리가 폴더 등 일반 파일이 아니면 mv 가 그 안으로 옮겨 버린다 — 아무것도 만들기 전에 멈춘다.
+  for target in "$key" "$cert"; do
+    [[ ! -e "$target" || -f "$target" ]] || die "일반 파일이 아닙니다: $target. 기존 파일은 그대로입니다."
+  done
   local tmp_key tmp_cert tmp_cfg err
   tmp_key="$(mktemp "$DIR/.new-key.XXXXXX")" || die "임시 파일을 만들지 못했습니다: $DIR"
   TMP_FILES+=("$tmp_key")
@@ -180,9 +268,14 @@ EOF
     cp -p -- "${existing[@]}" "$backup/" || die "기존 파일을 백업하지 못했습니다($backup). 기존 파일은 그대로입니다."
   fi
 
-  # 5) 바꾸기(같은 폴더 안 mv — 키 먼저, 그다음 인증서)
-  mv -f -- "$tmp_key" "$key" || die "새 개인 키를 제자리에 두지 못했습니다(${backup:-백업 없음})."
-  mv -f -- "$tmp_cert" "$cert" || die "새 인증서를 제자리에 두지 못했습니다 — 키만 바뀌었을 수 있습니다. ${backup:+$backup 의 파일로 되돌리세요.}"
+  # 5) 바꾸기(같은 폴더 안 rename — 키 먼저, 그다음 인증서). 둘째 이동이 실패하거나 그 사이에 멈추면 rollback_swap 이 되돌린다.
+  SWAP_TMP_KEY="$tmp_key" SWAP_TMP_CERT="$tmp_cert" SWAP_KEY="$key" SWAP_CERT="$cert" SWAP_BACKUP="$backup" SWAP_HAD_KEY=0
+  if [[ -f "$key" ]]; then SWAP_HAD_KEY=1; fi
+  SWAP_STATE=key_moving
+  mv -f -- "$tmp_key" "$key" || swap_fail "새 개인 키를 제자리에 두지 못했습니다."
+  SWAP_STATE=cert_moving
+  mv -f -- "$tmp_cert" "$cert" || swap_fail "새 인증서를 제자리에 두지 못했습니다."
+  SWAP_STATE=done
   chmod 600 -- "$key" 2>/dev/null || true
   chmod 644 -- "$cert" 2>/dev/null || true
 
@@ -201,7 +294,21 @@ EOF
 [[ $# -ge 1 ]] || usage
 valid_name "$CERT_NAME" || { echo "[dev-cert] DEV_CERT_FILE 은 폴더 없는 파일 이름(영문·숫자·._-, .pem)이어야 합니다" >&2; exit 2; }
 valid_name "$KEY_NAME" || { echo "[dev-cert] DEV_KEY_FILE 은 폴더 없는 파일 이름(영문·숫자·._-, .pem)이어야 합니다" >&2; exit 2; }
-[[ "$CERT_NAME" != "$KEY_NAME" ]] || { echo "[dev-cert] DEV_CERT_FILE 과 DEV_KEY_FILE 이 같습니다" >&2; exit 2; }
+# 인증서·키가 같은 파일이면 안 된다(인증서 이동이 새 키를 덮어씀) — 대소문자만 다른 이름도 같은 파일로 본다: Git Bash 의 NTFS·macOS 기본
+# APFS 는 대소문자를 가리지 않아 Localhost.pem 과 localhost.pem 이 한 파일이다. 이름에는 폴더·"/"가 들어올 수 없어(valid_name)
+# "./x.pem"·"x.pem/" 꼴은 위에서 이미 사용법 오류이고, 두 파일은 같은 DIR 안이라 이름만 비교하면 된다.
+# nocasematch(bash 3.1+) — 외부 명령(tr 등)이 없어도 동작한다.
+same_name_ci() {
+  local rc=1
+  shopt -s nocasematch
+  [[ "$1" == "$2" ]] && rc=0
+  shopt -u nocasematch
+  return "$rc"
+}
+if same_name_ci "$CERT_NAME" "$KEY_NAME"; then
+  echo "[dev-cert] DEV_CERT_FILE 과 DEV_KEY_FILE 이 같은 파일입니다(대소문자만 다른 이름도 같은 파일로 봄): $CERT_NAME / $KEY_NAME" >&2
+  exit 2
+fi
 cmd="$1"
 shift
 case "$cmd" in

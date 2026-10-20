@@ -9,6 +9,8 @@ import { formatMsk, THREADS_CONNECTION_EXPIRED_TEXT } from '@cs/domain';
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
   devCert: null as { validTo: Date } | null,
+  /** FIX1-EXPIRY1: 화면이 readDevCertExpiry 에 넘긴 인수(옵션 없음이어야 dev-cert-default.test.ts 의 운영 판정 시험이 그 경로를 덮는다) */
+  devCertArgs: [] as unknown[][],
   overview: { hasLiveAccount: false, paused: false, changedAt: null as Date | null, used: 0, availableAt: null as Date | null },
 }));
 
@@ -17,7 +19,12 @@ vi.mock('./server', async () => {
   const { loadConfig } = await import('@cs/domain');
   return { getConfig: () => loadConfig({ NODE_ENV: 'test' }), getAppDb: async () => ({ db: {} }), getStorage: () => ({}) };
 });
-vi.mock('./dev-cert', () => ({ readDevCertExpiry: () => state.devCert }));
+vi.mock('./dev-cert', () => ({
+  readDevCertExpiry: (...args: unknown[]) => {
+    state.devCertArgs.push(args);
+    return state.devCert;
+  },
+}));
 vi.mock('next/navigation', () => ({
   redirect: () => {
     throw new Error('redirect');
@@ -45,7 +52,7 @@ const { default: SettingsPage } = await import('../app/settings/page');
 const DAY = 86_400_000;
 const fromNow = (ms: number) => new Date(Date.now() + ms);
 
-function account(o: { id: string; live: boolean; expiresAt: Date | null; name?: string; revoked?: boolean }) {
+function account(o: { id: string; live: boolean; expiresAt: Date | null; name?: string; revoked?: boolean; revoking?: boolean }) {
   return {
     account_id: o.id,
     platform: 'threads',
@@ -53,11 +60,12 @@ function account(o: { id: string; live: boolean; expiresAt: Date | null; name?: 
     mock: !o.live,
     display_name: o.name ?? (o.live ? '@tester' : '모의 Threads'),
     credential_state: 'linked',
-    status: 'connected',
-    status_label: '연결됨',
-    usable_for_execution: true,
+    // FIX1-EXPIRY1: 연결 해제 진행 중은 accountHealthView 가 status 'revoked'·reason 'revoking'·revoked_at null 로 보낸다(credentialHealth)
+    status: o.revoking ? 'revoked' : 'connected',
+    status_label: o.revoking ? '연결 해제됨' : '연결됨',
+    usable_for_execution: !o.revoking,
     credential_required: true,
-    reason: null,
+    reason: o.revoking ? 'revoking' : null,
     provider: o.live ? 'threads' : 'mock_threads',
     scopes_required: ['threads_basic', 'threads_content_publish'],
     scopes_granted: ['threads_basic', 'threads_content_publish'],
@@ -103,7 +111,18 @@ const expirySection = (html: string) => {
 beforeEach(() => {
   state.accounts = [];
   state.devCert = null;
+  state.devCertArgs = [];
   state.overview = { hasLiveAccount: false, paused: false, changedAt: null, used: 0, availableAt: null };
+});
+
+describe('FIX1-EXPIRY1: 화면의 인증서 읽기 호출 꼴', () => {
+  it('홈·설정은 readDevCertExpiry() 를 옵션 없이 한 번씩 부른다(운영 판정은 그 기본 경로에서 시험 — dev-cert-default.test.ts)', async () => {
+    await renderHome();
+    expect(state.devCertArgs).toEqual([[]]);
+    state.devCertArgs = [];
+    await renderSettings();
+    expect(state.devCertArgs).toEqual([[]]);
+  });
 });
 
 describe('홈 — 맨 위 만료 알림', () => {
@@ -136,6 +155,16 @@ describe('홈 — 맨 위 만료 알림', () => {
       account({ id: 'mock-1', live: false, expiresAt: fromNow(DAY) }),
       account({ id: 'live-far', live: true, expiresAt: fromNow(30 * DAY), name: '@far' }),
       account({ id: 'live-rev', live: true, expiresAt: fromNow(DAY), name: '@revoked', revoked: true }),
+    ];
+    const html = await renderHome();
+    expect(html).not.toContain('aria-label="만료 알림"');
+    expect(html).not.toContain('Threads 연결이');
+  });
+
+  it('FIX1-EXPIRY1: 연결 해제 진행 중(revoking, revoked_at 아직 null)인 실제 계정은 1일·만료됨이어도 "다시 연결" 알림이 없다', async () => {
+    state.accounts = [
+      account({ id: 'live-revoking', live: true, expiresAt: fromNow(DAY), name: '@revoking', revoking: true }),
+      account({ id: 'live-revoking-exp', live: true, expiresAt: fromNow(-DAY), name: '@revoking2', revoking: true }),
     ];
     const html = await renderHome();
     expect(html).not.toContain('aria-label="만료 알림"');
@@ -191,6 +220,19 @@ describe('설정 — 맨 위 알림 · 만료 관리 · 배포 계정 표의 만
     const html = await renderSettings();
     expect(tableRow(html, '@yongho')).toContain('<span class="tag danger">만료됨 — 다시 연결 필요</span>');
     expect(noticeLines(html)[0]).toContain(THREADS_CONNECTION_EXPIRED_TEXT);
+  });
+
+  it('FIX1-EXPIRY1: 연결 해제 진행 중인 실제 계정 → 맨 위 알림·표의 "다시 연결" 태그·만료 관리 행 없음(상태 칸은 연결 해제됨)', async () => {
+    const exp = fromNow(DAY);
+    state.accounts = [account({ id: 'live-1', live: true, expiresAt: exp, name: '@yongho', revoking: true })];
+    const html = await renderSettings();
+    expect(noticeBlock(html)).toBe('');
+    const row = tableRow(html, '@yongho');
+    expect(row).toContain('연결 해제됨');
+    expect(row).toContain(`<td>${formatMsk(exp)}</td>`);
+    expect(row).not.toContain('14일 안에 만료');
+    expect(row).not.toContain('다시 연결 필요');
+    expect(expirySection(html)).toContain('<dt>Threads 연결</dt><dd>실제 연결 없음</dd>');
   });
 
   it('실제 30일 남음 → 표에 날짜만(경고 없음), 알림 없음', async () => {

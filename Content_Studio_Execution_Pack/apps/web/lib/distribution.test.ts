@@ -10,6 +10,7 @@ import {
   blockDetailLabel,
   blockInfoOf,
   DISTRIBUTE_ERROR_TEXT,
+  distributeFormFailure,
   formToApprove,
   formToPlanCreate,
   instagramProgressLine,
@@ -44,6 +45,7 @@ import {
   YOUTUBE_MOCK_DISCLAIMER,
   youtubeSessionNote,
 } from './distribution';
+import { NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE } from '@cs/domain';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
 const ev = (details: Record<string, unknown>) => [
@@ -760,6 +762,22 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
 describe('LIVE-P2(D39): 즉시 중지·최근 24시간 상한 보류 문구', () => {
   const job = (code: string) => ({ state: 'BLOCKED', attempt: 0, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: code });
   const ev = (details: Record<string, unknown>) => [{ stateAfter: 'BLOCKED', sanitizedDetails: { event: 'blocked', not_sent: true, ...details } }];
+
+  // FIX2-LIVEP2(검토 #7): 재시도 거절 코드는 폼 경로에서 그대로 넘어가 화면 문구가 된다 — schedule_stale 이 일반 conflict("다른 곳에서 먼저 바뀌었습니다")로
+  // 뭉개지면 사용자는 다음 재시도가 D36 확인이라는 안내를 못 본다.
+  it('재시도 거절 코드(schedule_stale 등) → 폼 303 back?error=<코드>, 그 화면 문구(schedule_stale = SCHEDULE_STALE_RETRY_MESSAGE)', () => {
+    const req = new Request('http://localhost:3000/api/distribution-items/x/retry', { method: 'POST', headers: { accept: 'text/html', origin: 'http://localhost:3000' } });
+    for (const code of ['schedule_stale', 'attempts_exhausted', 'outcome_unknown', 'not_retryable', 'approval_required'] as const) {
+      const r = distributeFormFailure(new NotRetryableError(code, '시험'), req, '/distribute/P');
+      expect(r.status, code).toBe(303);
+      expect(r.headers.get('location'), code).toBe(`/distribute/P?error=${code}`);
+      expect(DISTRIBUTE_ERROR_TEXT[code], code).toMatch(/[가-힣]/u);
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.schedule_stale).toBe(SCHEDULE_STALE_RETRY_MESSAGE);
+    expect(SCHEDULE_STALE_RETRY_MESSAGE).toContain('재시도');
+    // back 에 이미 질의가 있으면 & 로 잇는다
+    expect(distributeFormFailure(new NotRetryableError('schedule_stale', '시험'), req, '/distribute/P?x=1').headers.get('location')).toBe('/distribute/P?x=1&error=schedule_stale');
+  });
 
   it('liveDailyLimitOf: 가장 최근 BLOCKED 사건이 일일 상한일 때만, 형식이 맞는 값만', () => {
     expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', used: 3, limit: 3, available_at: '2026-10-20T09:00:00.000Z' }))).toEqual({ limit: 3, availableAt: '2026-10-20T09:00:00.000Z' });

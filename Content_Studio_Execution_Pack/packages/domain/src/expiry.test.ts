@@ -102,6 +102,30 @@ describe('expiryNotices — Threads 연결(실제만)', () => {
     expect(run([revoking, live({ account_id: 'b', status: 'revoking', expires_at: at(-DAY).toISOString() })])).toEqual([]);
   });
 
+  // FIX2-EXPIRY1(검토 #8 expiry.ts:97): 정리 대기 행(oauth_pending_tokens)이 함께 있으면 credentialHealth 는 해제 진행 중보다 정리 대기를 먼저 보고한다
+  // (status 'error', reason pending_<kind>) — 화면 status 만 보면 해제 중임을 놓친다. 연결 정보 행의 원래 상태(credential_status)로도 뺀다.
+  it('연결 해제 진행 중 + 정리 대기 행(credentialHealth 가 error·pending_cleanup_revoke 로 보고) → 원래 상태 revoking 으로 무시, 정리 대기만 있는 error 는 그대로 알림', () => {
+    const cred = (status: string) => ({ status, expiresAt: at(DAY), scopes: ['threads_basic', 'threads_content_publish'], revokedAt: null, lastErrorCode: null });
+    const base = { account: { kind: 'live', credentialState: 'linked' }, requiredScopes: ['threads_basic', 'threads_content_publish'], now: NOW } as const;
+    for (const pendingKind of ['cleanup_revoke', 'refresh_unknown', 'verify_current'] as const) {
+      const h = credentialHealth({ ...base, credential: cred('revoking'), pendingKind });
+      expect(h).toMatchObject({ status: 'error', reason: `pending_${pendingKind}`, usable: false });
+      for (const expires of [at(DAY), at(0), at(-DAY)]) {
+        const a = live({ status: h.status, credential_status: 'revoking', revoked_at: null, expires_at: expires.toISOString() });
+        expect(isLiveThreadsCredential(a), pendingKind).toBe(false);
+        expect(accountExpiryNotice(a, NOW), pendingKind).toBeNull();
+      }
+    }
+    expect(run([live({ status: 'error', credential_status: 'revoking', expires_at: at(DAY).toISOString() })])).toEqual([]);
+    expect(accountExpiryNotice(live({ status: 'error', credential_status: 'revoked', expires_at: at(DAY).toISOString() }), NOW)).toBeNull();
+    // 정리 대기만 있는(연결 정보는 active) error 는 다시 연결로 새 만료가 생기므로 계속 알린다(검토 Q1 답 — 콜백은 revoking 만 막는다)
+    const pendingOnly = credentialHealth({ ...base, credential: cred('active'), pendingKind: 'cleanup_revoke' });
+    expect(pendingOnly.status).toBe('error');
+    expect(accountExpiryNotice(live({ status: pendingOnly.status, credential_status: 'active', expires_at: at(DAY).toISOString() }), NOW)?.level).toBe('warn');
+    expect(accountExpiryNotice(live({ status: 'error', credential_status: 'error', expires_at: at(-DAY).toISOString() }), NOW)?.level).toBe('expired');
+    expect(accountExpiryNotice(live({ status: 'connected', credential_status: null, expires_at: at(DAY).toISOString() }), NOW)?.level).toBe('warn');
+  });
+
   it('연결 해제가 아닌 다른 실행 불가 상태(error·needs_reconnect·expired)와 상태 미지정은 그대로 알린다 — 다시 연결로 풀리는 상태', () => {
     for (const status of [undefined, 'connected', 'expiring_soon', 'error', 'needs_reconnect', 'expired']) {
       expect(accountExpiryNotice(live({ status, expires_at: at(DAY).toISOString() }), NOW)?.level).toBe('warn');

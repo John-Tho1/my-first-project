@@ -343,10 +343,48 @@
 1. **멈춤·백업**: dev/운영 서버를 멈추고(PGlite 는 한 프로세스만) `corepack pnpm export` 로 owner 묶음을 내보내 보관한다. 이 묶음이 원래 증거(보고값 포함)다.
 2. **확인**: 해당 행을 조회한다 — `select id, run_id, created_at, reserved_amount, actual_amount, failed, pricing_snapshot from usage_ledger where owner_id = … and pricing_snapshot->>'usage_source' = 'provider_unstorable'`. `reported_tokens_in/out`·`reported_cost` 와 run 의 status·error 를 기록한다.
 3. **실제 청구 확인**: Anthropic 콘솔(사용자가 직접)의 그 시각 사용량·청구와 비교한다. 보고값이 비정상(공급자 오류)인지 실제 대량 사용인지 판단한다.
-4. **보존**: 원래 보고값은 지우지 않는다. 스냅숏에 `resolution` 객체를 **덧붙인다** — 예 `{ "resolved_at": "<UTC ISO>", "resolved_by": "<운영자>", "reason": "<판단 근거·콘솔 확인 결과>", "settled_amount": "<확정할 금액 10진 6자리>", "original_usage_source": "provider_unstorable" }`.
-5. **재정산**: `actual_amount` 를 판단한 금액으로 바꾼다. 실제 청구가 numeric(18,6)·예산을 넘으면 그 범위의 최대값으로 두고 reason 에 적는다. `overage_amount = max(0, actual - reserved)`, `over_budget` 도 맞춘다. `tokens_in/out` 은 열 범위 밖이면 NULL 로 둔다.
-6. **차단 해제**: `usage_source` 를 `'provider'`(실제 사용으로 확정) 또는 `'none'`(보고값을 믿지 않고 예약액 유지)으로 바꾼다. 그와 함께 `reported_*` 키를 `resolution.original_reported` 안으로 옮긴다 — 최상위에 `reported_*` 가 남으면 FIX4 무결성 검사가 복원을 거부한다.
-7. **확인**: 앱을 다시 켜고 설정 화면의 이번 달 사용액이 재정산을 반영하는지, 새 live 예약이 `live_usage_unresolved` 없이 진행되는지(또는 월 상한으로 429 인지) 확인한다. `corepack pnpm export` 로 해결 후 묶음을 한 번 더 보관한다.
+> **FIX2-LIVEL1H2 갱신(4~7)**: LIVEL1-H2 부터 복원 무결성(`checkIntegrity` → `isValidResolution`, `packages/domain/src/bundle.ts`)이 `resolution` 형식을 검사한다. 이전 4단계 예시(키 5개·`<UTC ISO>`)대로 하면 앱은 정상으로 돌지만 **해결 뒤 내보낸 묶음이 복원 때 integrity 로 거부**될 수 있었다(내보내기는 검사하지 않는다). 아래 4~6 은 그 검사와 정확히 같은 규칙이고, 7 에서 묶음을 믿기 전에 읽기 전용 확인을 한다. H2 이전에 이미 손으로 해결한 행이 있으면 최근 묶음을 7-③ 으로 먼저 확인한다.
+
+4. **보존 — `resolution` 객체(규칙이 닫혀 있다)**: 원래 보고값은 지우지 않는다. 스냅숏에 `resolution` 객체를 덧붙인다. 키는 **정확히 아래 6개** — 하나라도 빠지거나 다른 키(메모·콘솔 참조 등)가 있으면 그 묶음은 복원에서 거부된다.
+
+   | 키 | 값(모두 JSON 문자열) |
+   |---|---|
+   | `resolved_at` | UTC 시각, **끝이 `Z`**: `YYYY-MM-DDTHH:MM:SS` + 선택 소수 1~6자리 + `Z`(예 `2026-10-20T09:15:00.123456Z`). `+00:00`·`+00`·`T` 대신 공백은 거부 — SQL 의 `to_jsonb(now())`(`…+00:00`)·`now()::text`(`… +00`)는 쓰지 않고 `to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')` 를 쓴다 |
+   | `resolved_by` | 공백만이 아닌 문자열, 200자 이하 |
+   | `reason` | 공백만이 아닌 문자열, 4000자 이하 — 판단 근거·콘솔 확인 결과(5단계 상한을 썼으면 실제 청구액도) |
+   | `settled_amount` | 확정할 금액: 정수부(`0` 이거나 앞자리 0 없음, 최대 40자리) + `.` + 소수 **정확히 6자리** — 예 `"9.950000"`. `"9.95"`·숫자 `9.95`·`"09.950000"` 은 거부 |
+   | `original_usage_source` | 정확히 `"provider_unstorable"` |
+   | `original_reported` | 키 정확히 3개 `reported_tokens_in`·`reported_tokens_out`·`reported_cost` — 6단계에서 최상위에서 옮긴 원래 값 그대로(토큰 = 숫자만 문자열, 비용 = 정수부 + 소수 6자리 문자열) |
+5. **재정산 — `settled_amount` 와 `actual_amount` 규칙**: `actual_amount` 를 판단한 금액으로 바꾸고, **`settled_amount` 와 같은 금액**으로 둔다(micro 단위로 비교 — `actual_amount` 9.95 와 `"9.950000"` 은 같다). 예외는 하나뿐: 실제 청구가 numeric(18,6) 열 최대값 또는 월 예산 한도를 넘어 `actual_amount` 를 **그 고정 최대값**(열 최대값이나 월 한도 — "이번 달 남은 예산"이 아님)으로 깎은 경우만 `settled_amount`(실제 청구) > `actual_amount` 가 허용되고, 그때 `actual_amount` 는 `reserved_amount` 보다 커야 한다(위로 재정산이 실제로 일어남). 그래서 거부되는 것: `settled_amount` < `actual_amount`, `actual_amount` 를 예약액 그대로 두고 `settled_amount` 만 큼(재정산을 빠뜨림 — 월 합계가 돈을 모름). 행 `state` 는 `settled` 그대로(provider_unstorable 행은 처음부터 settled). `overage_amount = max(0, actual − reserved)`, `over_budget = actual > reserved`. `tokens_in/out` 은 열 범위 밖이면 NULL.
+6. **차단 해제**: `usage_source` 를 `'provider'`(실제 사용으로 확정) 또는 `'none'`(보고값을 믿지 않고 예약액 유지 — 이때 `actual_amount` = `reserved_amount` = `settled_amount`)으로 바꾸고, 최상위 `reported_*` 세 키를 **지워** `resolution.original_reported` 로 옮긴다(최상위에 남으면 FIX4 검사가 거부). `resolution` 이 붙었는데 `usage_source` 가 아직 `provider_unstorable` 인 반쯤 끝난 상태도 거부되므로 **4~6 은 아래 한 문장으로 한 번에** 한다. `<…>` 를 채운다 — `<SETTLED>`·`<ACTUAL>` 은 소수 정확히 6자리 문자열(보통 같은 값, 5단계 상한일 때만 `<ACTUAL>` 이 작다), `<USAGE_SOURCE>` 는 `provider` 또는 `none`, 글자 안 작은따옴표는 두 번(`''`). 다른 키를 덧붙이지 않는다.
+
+   ```sql
+   -- LIVEL1 수동 해결 4~6 (한 문장, FIX2-LIVEL1H2)
+   update usage_ledger
+      set pricing_snapshot = (pricing_snapshot - 'reported_tokens_in' - 'reported_tokens_out' - 'reported_cost') || jsonb_build_object(
+            'usage_source', '<USAGE_SOURCE>',
+            'resolution', jsonb_build_object(
+              'resolved_at', to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+              'resolved_by', '<RESOLVED_BY>',
+              'reason', '<REASON>',
+              'settled_amount', '<SETTLED>',
+              'original_usage_source', 'provider_unstorable',
+              'original_reported', jsonb_build_object(
+                'reported_tokens_in', pricing_snapshot -> 'reported_tokens_in',
+                'reported_tokens_out', pricing_snapshot -> 'reported_tokens_out',
+                'reported_cost', pricing_snapshot -> 'reported_cost'))),
+          actual_amount = '<ACTUAL>'::numeric,
+          overage_amount = greatest('<ACTUAL>'::numeric - reserved_amount, 0),
+          over_budget = '<ACTUAL>'::numeric > reserved_amount
+    where id = '<LEDGER_ID>' and owner_id = '<OWNER_ID>' and state = 'settled'
+      and pricing_snapshot ->> 'usage_source' = 'provider_unstorable';
+   ```
+   (`tests/integration/live-llm.test.ts` 의 FIX2-LIVEL1H2 시험이 이 블록을 그대로 읽어 실행하고, 그 뒤 내보낸 묶음이 아래 7-③ 확인과 복원 미리보기를 통과하는지 본다.)
+7. **확인**:
+   ① 앱을 다시 켜고 설정 화면의 이번 달 사용액이 재정산을 반영하는지, 새 live 예약이 `live_usage_unresolved` 없이 진행되는지(또는 월 상한으로 429 인지) 확인한다.
+   ② `corepack pnpm export` 로 해결 후 묶음을 한 번 더 보관한다(6단계가 끝난 뒤에만 — 반쯤 끝난 상태의 묶음은 복원 거부).
+   ③ **그 묶음을 믿기 전에** `corepack pnpm bundle:check data/exports/<id>.zip` — exit 0·`"ok":true` 여야 한다. 읽기 전용이다: 복원 미리보기와 같은 묶음 검증만 하고 DB 를 열지 않으며 아무것도 쓰지 않는다(dev 서버가 켜져 있어도 된다, `.env.local` 도 읽지 않음). exit 1·`"error":"integrity"` 이고 `problems` 에 `usage_ledger.pricing_snapshot.resolution 형식` 이 있으면 4~6 의 규칙(키 6개·`Z` 시각·소수 6자리·settled = actual)을 다시 보고 DB 를 고친 뒤 ②·③ 을 다시 한다(문구에는 값·필드 이름이 없다).
+   ④ (선택) 실제 복원 경로까지 보려면 **버릴 DB** 에서만: `DATABASE_URL=./data/pglite-check-<날짜> corepack pnpm restore:preview <zip>`(README 의 T05 방식 — 그 DB 에 restore_runs·감사 행과 ZIP 사본이 남으므로 실제 DB 에는 하지 않는다), 끝나면 그 폴더를 지운다.
 - 이 절차는 감사 기록(audit)을 자동으로 남기지 않는다 — reason 을 스냅숏에 남기는 것이 유일한 기록이다. 반복된다면 해결 화면·API·감사가 필요하다(별도 작업).
 
 ## 바뀐 파일(FIX round 4)

@@ -4,6 +4,9 @@
  *   FIX1-EXPIRY1: "연결 해제"는 끝난 것(revoked_at 있음)과 진행 중인 것(연결 정보 상태 revoking — 화면 입력 status 는 credentialHealth 가
  *   'revoked'(reason revoking)로 바꿔 줌, revoked_at 은 아직 null)을 모두 뜻한다. 진행 중이면 콜백 저장이 CredentialBusyError 로 막혀
  *   "다시 연결" 안내가 틀리므로 둘 다 뺀다. 그 밖의 실행 불가 상태(error·needs_reconnect·expired)는 다시 연결하면 풀리므로 그대로 알린다.
+ *   FIX2-EXPIRY1: 해제 진행 중 연결 정보에 정리 대기 행(oauth_pending_tokens)도 있으면 credentialHealth 는 정리 대기를 먼저 보고해 화면 status 가
+ *   'error'(reason pending_<kind>)가 된다 — 화면 status 만으로는 해제 중임을 놓치므로 연결 정보 행의 원래 상태(credential_status)로도 뺀다.
+ *   정리 대기만 있는 error(연결 정보 active)는 다시 연결이 막히지 않으므로(콜백은 revoking 만 거부) 그대로 알린다.
  * - 다시 연결은 기존 연결 흐름(설정 → 배포 계정 연결 → "다시 연결(실제 Threads)")뿐 — 토큰 갱신 API 호출은 추가하지 않는다(D31 범위 밖).
  * - 로컬 인증서 정보는 서버 전용 읽기 함수(apps/web/lib/dev-cert.ts — 개발 모드에서만 파일을 읽음)가 넘긴다. 없으면 알림 없음.
  *
@@ -42,6 +45,11 @@ export interface ExpiryAccountInput {
   revoked_at?: string | Date | null;
   /** 연결 상태(accountHealthView.status = credentialHealth 결과, 또는 연결 정보 행의 원래 상태). 'revoked'·'revoking' 이면 알림 대상이 아니다. */
   status?: string | null;
+  /**
+   * FIX2-EXPIRY1: 연결 정보 행의 원래 상태(oauth_credentials.status — accountHealthView.credential_status). 'revoked'·'revoking' 이면 알림 대상이 아니다
+   * (정리 대기가 함께 있어 status 가 'error' 로 보고돼도).
+   */
+  credential_status?: string | null;
 }
 
 /** 연결 해제(끝남·진행 중)를 뜻하는 상태 이름 — credentialHealth 는 revoking 도 'revoked' 로 보고한다. */
@@ -86,7 +94,7 @@ export function expiryLevel(expiresAt: Date, now: Date): ExpiryLevel | null {
   return null;
 }
 
-/** 알림 대상인 계정인가: 실제(live) Threads 계정 + 연결 정보(만료 시각)가 있고 연결 해제하지 않음(끝남·진행 중 모두 아님). */
+/** 알림 대상인 계정인가: 실제(live) Threads 계정 + 연결 정보(만료 시각)가 있고 연결 해제하지 않음(끝남·진행 중 모두 아님 — 화면 상태와 연결 정보 원래 상태 둘 다). */
 export function isLiveThreadsCredential(a: ExpiryAccountInput): boolean {
   return (
     a.kind === 'live' &&
@@ -94,7 +102,8 @@ export function isLiveThreadsCredential(a: ExpiryAccountInput): boolean {
     a.platform === 'threads' &&
     toDate(a.expires_at) !== null &&
     toDate(a.revoked_at ?? null) === null &&
-    !(a.status != null && REVOKE_STATUSES.has(a.status))
+    !(a.status != null && REVOKE_STATUSES.has(a.status)) &&
+    !(a.credential_status != null && REVOKE_STATUSES.has(a.credential_status))
   );
 }
 

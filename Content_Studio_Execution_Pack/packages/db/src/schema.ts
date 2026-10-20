@@ -1247,6 +1247,7 @@ export const jobs = pgTable(
     /**
      * FIX-T14(0034, Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING) 뒤의 재개(resume) 횟수 — 장애가 아니므로 시도 한도에서 뺀다
      * (센 시도 = attempt - resume_count). 상한 FREE_RESUME_MAX. 장애 뒤(RECONCILING)의 재개는 여기 넣지 않는다(시도로 센다).
+     * 같은 열로 세지 않는 시도: T15 upload_yield, FIX2-LIVEP2 게시 시도 표식 전 즉시 중지 보류(BLOCKED — 사용자 재개·재시도로만 다음 시도).
      */
     resumeCount: integer('resume_count').notNull().default(0),
   },

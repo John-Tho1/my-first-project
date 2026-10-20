@@ -2,15 +2,18 @@
  * LIVE-L1(D34 1단계): 실제 Claude 어댑터(ClaudeLlmProvider)를 db 층·route 로 끝까지 — 가짜 fetch 가 기록된 Messages API 응답을 돌려준다.
  * 네트워크 0(setupFiles 가드가 api.anthropic.com 을 막는다), 과금 0. 시험 키는 가짜 sentinel 이며 응답·DB·감사에 나오지 않아야 한다.
  */
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, count, eq, sql } from 'drizzle-orm';
 import {
   adoptProposal,
   appendContentVersion,
+  checkBundleZip,
   closeDb,
   commitRestore,
   confirmClaims,
@@ -1174,6 +1177,141 @@ describe('LIVEL1-H2 — 수동 해결 resolution 형식: 실제 복원 경로', 
       } finally {
         await h.close();
       }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// FIX2-LIVEL1H2(검토 #12): 운영자 절차(인계 LIVEL1 "수동 해결 절차" 4~7)가 H2 복원 무결성 규칙과 맞는지 — 문서의 SQL 블록을 **그대로 읽어** 실행하고,
+// 그 뒤 내보낸 묶음이 읽기 전용 확인(`pnpm bundle:check` = checkBundleZip)과 복원 미리보기를 통과하는지, 절차가 금지한 자연스러운 실수(SQL now()
+// 시각·키 추가·소수 자릿수)는 확인에서 걸리는지 본다. 확인은 DB 를 열지 않는다(함수 인자에 DB 가 없고, 스크립트는 DATABASE_URL 폴더를 만들지 않음).
+describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bundle:check)', () => {
+  const APP = fileURLToPath(new URL('../../', import.meta.url));
+  const TSX_CLI = path.join(APP, 'node_modules/tsx/dist/cli.mjs');
+  const CHECK_SCRIPT = path.join(APP, 'packages/db/scripts/bundle-check.ts');
+  const RESOLUTION_PROBLEM = ['usage_ledger.pricing_snapshot.resolution 형식'];
+  /** 인계 문서의 "LIVEL1 수동 해결 4~6" SQL 블록(목록 안 들여쓰기 3칸을 걷어 냄) */
+  const docSql = () => {
+    const doc = readFileSync(path.join(APP, 'docs/handoffs/LIVEL1_IMPLEMENTATION_HANDOFF.md'), 'utf8');
+    const m = /```sql\n([ \t]*-- LIVEL1 수동 해결 4~6[^\n]*\n[\s\S]*?)\n[ \t]*```/.exec(doc);
+    expect(m, '문서에 SQL 블록이 있다').not.toBeNull();
+    return m![1]!.split('\n').map((l) => l.replace(/^ {3}/, '')).join('\n');
+  };
+  const fill = (tpl: string, v: Record<string, string>) => {
+    let out = tpl;
+    for (const [k, val] of Object.entries(v)) out = out.split(`<${k}>`).join(val);
+    expect(out, '모든 자리표시를 채웠다').not.toMatch(/<[A-Z_]+>/);
+    return out;
+  };
+  const runCheck = (args: string[], env: Record<string, string> = {}) =>
+    spawnSync(process.execPath, [TSX_CLI, CHECK_SCRIPT, ...args], { cwd: APP, encoding: 'utf8', timeout: 120_000, env: { ...process.env, ...env } });
+  const writeCounts = async () => ({
+    restoreRuns: (await db.select({ n: count() }).from(schema.restoreRuns))[0]!.n,
+    audits: (await db.select({ n: count() }).from(schema.auditEvents))[0]!.n,
+  });
+
+  it('문서의 4~6 SQL 그대로 → 차단 해제·재정산, 해결 뒤 묶음은 bundle:check 통과(exit 0)·복원 미리보기 통과 — 상한(5단계) 경우도. 절차가 금지한 실수는 bundle:check 가 integrity(exit 1)로 잡고, 확인은 DB·파일에 쓰지 않는다', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix2-h2-proc-'));
+    try {
+      const tpl = docSql();
+      const cases = [
+        { who: 'fix2-h2-proc@example.local', settled: '9.950000', actual: '9.950000' }, // 원칙: settled = actual
+        { who: 'fix2-h2-cap@example.local', settled: '25.000000', actual: '10.000000' }, // 5단계 상한(월 한도 10 으로 깎음, 실제 청구 25)
+      ];
+      const zips: string[] = [];
+      for (const c of cases) {
+        const { owner, ledgerId } = await unstorableRun(c.who);
+        expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
+        const [before] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
+        const { reported_tokens_in, reported_tokens_out, reported_cost } = before!.pricingSnapshot as Record<string, unknown>;
+        await db.execute(
+          sql.raw(
+            fill(tpl, {
+              USAGE_SOURCE: 'provider',
+              RESOLVED_BY: 'operator',
+              REASON: "시험: 운영자''의 콘솔 확인 — 실제 청구 " + c.settled + ' USD',
+              SETTLED: c.settled,
+              ACTUAL: c.actual,
+              LEDGER_ID: ledgerId,
+              OWNER_ID: owner,
+            }),
+          ),
+        );
+        const [row] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
+        const snap = row!.pricingSnapshot as Record<string, unknown> & { resolution: Record<string, unknown> };
+        expect(snap.usage_source).toBe('provider');
+        expect(Object.keys(snap).filter((k) => k.startsWith('reported_'))).toEqual([]);
+        expect(Object.keys(snap.resolution).sort()).toEqual(['original_reported', 'original_usage_source', 'reason', 'resolved_at', 'resolved_by', 'settled_amount']);
+        expect(snap.resolution.resolved_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
+        expect(snap.resolution.reason).toContain("운영자'의"); // '' → '
+        expect(snap.resolution.original_reported).toEqual({ reported_tokens_in, reported_tokens_out, reported_cost });
+        expect(row!.actualAmount).toBe(c.actual);
+        expect(row!.state).toBe('settled');
+        expect(row!.overBudget).toBe(toMicro(c.actual) > toMicro(row!.reservedAmount));
+        expect(toMicro(row!.overageAmount)).toBe(toMicro(c.actual) - toMicro(row!.reservedAmount));
+        expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
+        // 7-② 내보내기 → 7-③ 읽기 전용 확인
+        const zip = await exportZip(owner, tmp, c.who.split('@')[0]!);
+        const w0 = await writeCounts();
+        const ok = await checkBundleZip(zip);
+        expect(ok).toMatchObject({ ok: true });
+        expect(ok.ok && ok.rows.usage_ledger).toBe(1);
+        expect(await writeCounts()).toEqual(w0);
+        const zipFile = path.join(tmp, `${c.who.split('@')[0]}.zip`);
+        writeFileSync(zipFile, zip);
+        zips.push(zipFile);
+        // 7-④ 실제 복원 경로(버릴 DB)도 통과
+        const h = await createTestDb();
+        try {
+          const target = (await ensureOwner(h.db, `restore-${c.who}`)).id;
+          const pv = await createRestorePreview(h.db, target, zip, { restoresDir: path.join(tmp, 'restores'), source: 'upload' });
+          expect(pv.preview.tables.usage_ledger).toMatchObject({ in_bundle: 1, new: 1 });
+        } finally {
+          await h.close();
+        }
+      }
+
+      // 절차가 금지한 자연스러운 실수 — 앱은 정상으로 돌지만 묶음은 복원 거부(이제 7-③ 이 미리 잡는다)
+      const parsed = await parseBundleZip(new Uint8Array(readFileSync(zips[0]!)));
+      const ledgerId0 = parsed.tables.usage_ledger[0]!.id;
+      const resOf = (t: BundleTables) => (t.usage_ledger.find((l) => l.id === ledgerId0)!.pricing_snapshot as { resolution: Record<string, unknown> }).resolution;
+      const pgNow = ((await db.execute(sql`select to_jsonb(now()) #>> '{}' as j, now()::text as t`)).rows as Array<{ j: string; t: string }>)[0]!;
+      expect(pgNow.j).toMatch(/\+00:00$/); // 이 실행 환경의 세션 시간대 UTC 에서
+      const mistakes: Array<[string, (r: Record<string, unknown>) => void]> = [
+        ['resolved_at = to_jsonb(now())(…+00:00)', (r) => void (r.resolved_at = pgNow.j)],
+        ['resolved_at = now()::text(공백·+00)', (r) => void (r.resolved_at = pgNow.t)],
+        ['키 추가(console_ref)', (r) => void (r.console_ref = 'console-2026-10')],
+        ['settled_amount "9.95"(소수 2자리)', (r) => void (r.settled_amount = '9.95')],
+        ['settled_amount 숫자 9.95', (r) => void (r.settled_amount = 9.95)],
+        ['이전 4단계 예시(키 5개 — original_reported 없음)', (r) => void delete r.original_reported],
+      ];
+      const w1 = await writeCounts();
+      for (const [label, mutate] of mistakes) {
+        const bad = await checkBundleZip(rebuiltZip(parsed, (t) => mutate(resOf(t))));
+        expect(bad, label).toEqual({ ok: false, error: 'integrity', message: '묶음 안의 관계(ID 참조)가 맞지 않습니다', problems: RESOLUTION_PROBLEM });
+      }
+      expect(await writeCounts()).toEqual(w1); // 확인은 DB 에 아무것도 쓰지 않는다
+      const badFile = path.join(tmp, 'bad.zip');
+      writeFileSync(badFile, rebuiltZip(parsed, (t) => mistakes[0]![1](resOf(t))));
+
+      // 스크립트(pnpm bundle:check 와 같은 명령): 통과 exit 0(stdout JSON), 실패 exit 1(stderr JSON·값 없음), 사용법 2, 없는 파일 1 — DB 를 열지 않는다
+      const noDb = path.join(tmp, 'must-not-exist-pglite');
+      const before = readdirSync(tmp).sort();
+      const good = runCheck([zips[0]!], { DATABASE_URL: noDb });
+      expect(good.status, good.stderr).toBe(0);
+      expect(JSON.parse(good.stdout.trim())).toMatchObject({ action: 'bundle.check', ok: true, manifest_sha256: parsed.manifestSha256 });
+      const fail = runCheck([badFile], { DATABASE_URL: noDb });
+      expect(fail.status).toBe(1);
+      expect(fail.stdout.trim()).toBe('');
+      const failJson = JSON.parse(fail.stderr.trim()) as Record<string, unknown>;
+      expect(failJson).toMatchObject({ action: 'bundle.check', ok: false, error: 'integrity', problems: RESOLUTION_PROBLEM });
+      expect(fail.stderr).not.toContain(pgNow.j); // 값은 내보내지 않는다
+      expect(runCheck([], { DATABASE_URL: noDb }).status).toBe(2);
+      const missing = runCheck([path.join(tmp, 'no-such.zip')], { DATABASE_URL: noDb });
+      expect(missing.status).toBe(1);
+      expect(JSON.parse(missing.stderr.trim())).toMatchObject({ ok: false, error: 'unreadable_file' });
+      expect(readdirSync(tmp).sort()).toEqual(before); // DATABASE_URL 폴더·다른 파일을 만들지 않았다
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

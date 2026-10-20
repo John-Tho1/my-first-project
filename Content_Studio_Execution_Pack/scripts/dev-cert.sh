@@ -18,6 +18,9 @@
 #       돌아간다. 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일을 지우지 않고 경로와 옮길 명령을 알려 준다(짝이 어긋난 채 끝나지 않게).
 #       백업 폴더에는 예전 개인 키도 들어 있으니 data/ 밖으로 옮기지 않는다.
 #       DEV_CERT_FILE·DEV_KEY_FILE 은 대소문자만 달라도 같은 파일로 보고 거부한다(Git Bash 의 NTFS·macOS 기본 APFS 는 대소문자를 가리지 않음).
+#       두 이름은 점(.)으로 시작할 수 없다(숨김 파일은 백업의 *.pem 에 잡히지 않아 예전 키가 백업 없이 덮어써진다). 백업에 바꿀 키·인증서가 없으면
+#       (대소문자 무시 파일 시스템의 다른 대소문자 확장자 등) 바꾸기 전에 멈춘다 — 되돌리기는 그 백업에 기댄다.
+#       정리·되돌리기(EXIT trap·이동 실패)는 errexit 를 끄고 SIGPIPE 를 무시한 채 끝까지 한다 — 터미널을 닫아 stderr 쓰기가 실패해도 되돌린다.
 # 종료 코드: 0 성공 · 1 실행 실패(openssl 없음·파일 없음·읽기/생성/바꾸기 실패) · 2 사용법 오류 · 129/130/143 신호로 중단(HUP/INT/TERM)
 set -euo pipefail
 umask 077
@@ -44,7 +47,8 @@ die() {
   exit 1
 }
 
-valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+\.pem$ ]]; }
+# FIX2-EXPIRY1: 첫 글자는 점이 아니다(숨김 파일 — 백업 glob *.pem 에서 빠진다).
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*\.pem$ ]]; }
 
 need_openssl() {
   OPENSSL_BIN="${OPENSSL:-openssl}"
@@ -156,7 +160,10 @@ rollback_swap() {
 
 # 두 이동 중 하나가 실패했을 때: 되돌리고 결과를 알린 뒤 exit 1. 되돌리는 동안 신호(두 번째 Ctrl+C 등)는 무시해 끝까지 한다.
 swap_fail() {
-  trap '' HUP INT TERM
+  # FIX2-EXPIRY1: errexit 를 끄고(이 함수는 `mv … || swap_fail` 의 마지막 명령이라 errexit 가 켜진 채 돈다) SIGPIPE 도 무시한다 — 끊긴 터미널(EIO)·
+  # 닫힌 stderr·읽는 쪽이 끝난 파이프에 대한 echo 실패가 되돌리기 전에 셸을 끝내지 않게. 메시지는 실패해도 되돌리기·exit 1 은 그대로.
+  set +e
+  trap '' HUP INT TERM PIPE
   echo "[dev-cert] 오류: $1" >&2
   rollback_swap || exit 1
   case "$SWAP_STATE" in
@@ -167,9 +174,12 @@ swap_fail() {
 }
 
 cleanup() {
+  # FIX2-EXPIRY1: EXIT trap 안에서도 errexit 는 켜져 있다 — 끄지 않으면 stderr 쓰기 실패(터미널을 닫아 끊긴 tty 의 EIO 등) 한 번에 되돌리기·임시 파일
+  # 정리 전에 셸이 rc 1 로 끝나 짝이 어긋난 채(새 키 + 예전 인증서) 남는다. SIGPIPE 도 무시한다(읽는 쪽이 끝난 파이프로 가는 stderr).
+  set +e
   local f
   # 정리·되돌리기는 끝까지 한다 — 그동안 들어온 신호(두 번째 Ctrl+C·TERM)는 무시(종료 코드는 처음 멈춘 이유 그대로).
-  trap '' HUP INT TERM
+  trap '' HUP INT TERM PIPE
   # 두 이동 사이에서 멈춤(신호·예상 못 한 종료) → 되돌린다. 되돌리는 도중에 멈췄으면 새 인증서를 남긴다(새 키가 제자리일 수 있음).
   case "$SWAP_STATE" in
     key_moving | key_moved | cert_moving)
@@ -268,6 +278,15 @@ EOF
     cp -p -- "${existing[@]}" "$backup/" || die "기존 파일을 백업하지 못했습니다($backup). 기존 파일은 그대로입니다."
   fi
 
+  # FIX2-EXPIRY1(방어): 바꿀 키·인증서가 백업에 없으면(대소문자 무시 파일 시스템에서 *.pem 이 다른 대소문자 확장자를 놓치는 등) 되돌리기의 전제가
+  # 없으므로 아무것도 옮기기 전에 멈춘다(예전 키를 백업 없이 덮어쓰지 않음).
+  if [[ -f "$key" ]] && ! [[ -n "$backup" && -f "$backup/$KEY_NAME" ]]; then
+    die "백업에 기존 개인 키가 없어 바꾸지 않았습니다($key → ${backup:-백업 없음}). 기존 파일은 그대로입니다."
+  fi
+  if [[ -f "$cert" ]] && ! [[ -n "$backup" && -f "$backup/$CERT_NAME" ]]; then
+    die "백업에 기존 인증서가 없어 바꾸지 않았습니다($cert → ${backup:-백업 없음}). 기존 파일은 그대로입니다."
+  fi
+
   # 5) 바꾸기(같은 폴더 안 rename — 키 먼저, 그다음 인증서). 둘째 이동이 실패하거나 그 사이에 멈추면 rollback_swap 이 되돌린다.
   SWAP_TMP_KEY="$tmp_key" SWAP_TMP_CERT="$tmp_cert" SWAP_KEY="$key" SWAP_CERT="$cert" SWAP_BACKUP="$backup" SWAP_HAD_KEY=0
   if [[ -f "$key" ]]; then SWAP_HAD_KEY=1; fi
@@ -292,8 +311,16 @@ EOF
 }
 
 [[ $# -ge 1 ]] || usage
-valid_name "$CERT_NAME" || { echo "[dev-cert] DEV_CERT_FILE 은 폴더 없는 파일 이름(영문·숫자·._-, .pem)이어야 합니다" >&2; exit 2; }
-valid_name "$KEY_NAME" || { echo "[dev-cert] DEV_KEY_FILE 은 폴더 없는 파일 이름(영문·숫자·._-, .pem)이어야 합니다" >&2; exit 2; }
+# 이름 검사(valid_name). 거부 문구만 경우에 따라 다르다 — 점으로 시작하면 그 이유를 말한다(FIX2-EXPIRY1).
+for name_var in DEV_CERT_FILE:"$CERT_NAME" DEV_KEY_FILE:"$KEY_NAME"; do
+  valid_name "${name_var#*:}" && continue
+  if [[ "${name_var#*:}" == .* ]]; then
+    echo "[dev-cert] ${name_var%%:*} 은 점(.)으로 시작할 수 없습니다(숨김 파일은 백업에서 빠짐): ${name_var#*:}" >&2
+  else
+    echo "[dev-cert] ${name_var%%:*} 은 폴더 없는 파일 이름(영문·숫자·._-, 점으로 시작하지 않음, .pem)이어야 합니다" >&2
+  fi
+  exit 2
+done
 # 인증서·키가 같은 파일이면 안 된다(인증서 이동이 새 키를 덮어씀) — 대소문자만 다른 이름도 같은 파일로 본다: Git Bash 의 NTFS·macOS 기본
 # APFS 는 대소문자를 가리지 않아 Localhost.pem 과 localhost.pem 이 한 파일이다. 이름에는 폴더·"/"가 들어올 수 없어(valid_name)
 # "./x.pem"·"x.pem/" 꼴은 위에서 이미 사용법 오류이고, 두 파일은 같은 DIR 안이라 이름만 비교하면 된다.

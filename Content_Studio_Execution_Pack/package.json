@@ -22,6 +22,7 @@
     "export": "tsx packages/db/scripts/export.ts",
     "restore:preview": "tsx packages/db/scripts/restore.ts preview",
     "restore:commit": "tsx packages/db/scripts/restore.ts commit",
+    "bundle:check": "tsx packages/db/scripts/bundle-check.ts",
     "worker": "tsx apps/worker/src/cli.ts",
     "drill:mock": "tsx packages/db/scripts/drill.ts",
     "drill:restore": "tsx packages/db/scripts/restore-drill.ts",

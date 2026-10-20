@@ -233,6 +233,7 @@ CLI(dev 서버를 끈 상태에서 — PGlite 단일 연결):
 ```bash
 pnpm export                                    # AUTH_ALLOWED_IDENTITY 의 데이터 → data/exports/<id>.zip (JSON 출력: export_id, zip, totals, 표 sha256)
 pnpm restore:preview data/exports/<id>.zip     # 미리보기(DB 변경 없음, restore_runs 에 기록)
+pnpm bundle:check data/exports/<id>.zip        # 묶음만 확인(복원 미리보기와 같은 검증 — DB 를 열지 않고 아무것도 쓰지 않음, dev 서버가 켜져 있어도 됨. 통과 exit 0, 검증 실패 exit 1)
 pnpm restore:commit data/exports/<id>.zip --mode empty_only --confirm    # --confirm 없으면 거부(exit 2)
 pnpm restore:commit data/exports/<id>.zip --mode add_missing --confirm
 ```
@@ -512,9 +513,9 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 - **로컬 인증서**(개발 모드만, 현재 만료 2026-11-12): dev 서버가 `DEV_TLS_CERT_PATH`(비우면 `data/dev-certs/localhost-cert.pem`)의 인증서 만료 시각만 읽는다 — 파일이 없거나 읽지 못하면 경고 없음, 운영 빌드는 읽지 않는다. 설정 → **만료 관리**에 만료 시각이 보인다.
 - **인증서 확인·갱신**(앱 루트에서, Git Bash):
   - `bash scripts/dev-cert.sh check` — 만료 시각(notAfter)과 남은 날짜. 키는 출력하지 않는다.
-  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 키와 인증서를 바꾸는 사이에 실패하거나 멈추면(Ctrl+C 포함) 백업에서 기존 키를 되돌리고, 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일의 경로와 옮길 명령을 알려 준다. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
-  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). `DEV_CERT_FILE`·`DEV_KEY_FILE` 은 대소문자만 달라도 같은 파일로 보고 거부한다(NTFS·macOS 는 대소문자를 가리지 않음). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
-- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음). 바꾸기 중 실패·중단은 가짜 `mv`, 백업 이름 충돌은 가짜 `date` 로 만든다. 파일 시스템이 `chmod 600` 을 지키지 않으면(Git Bash/NTFS) 키 권한 확인만 SKIP.
+  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 키와 인증서를 바꾸는 사이에 실패하거나 멈추면(Ctrl+C·터미널 닫기 포함 — 화면 출력이 실패해도 끝까지) 백업에서 기존 키를 되돌리고, 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일의 경로와 옮길 명령을 알려 준다. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
+  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). `DEV_CERT_FILE`·`DEV_KEY_FILE` 은 대소문자만 달라도 같은 파일로 보고 거부하고, 점(.)으로 시작하는 이름도 거부한다(숨김 파일은 백업 `*.pem` 에서 빠짐). 바꿀 키·인증서가 백업에 없으면 바꾸기 전에 멈춘다(NTFS·macOS 는 대소문자를 가리지 않음). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
+- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음). 바꾸기 중 실패·중단은 가짜 `mv`(TERM·HUP·INT, stderr 를 `/dev/full`·닫힌 fd·읽는 쪽이 닫힌 파이프로 둔 경우 포함), 백업에 키가 빠진 경우는 가짜 `cp`, 백업 이름 충돌은 가짜 `date` 로 만든다. 파일 시스템이 `chmod 600` 을 지키지 않으면(Git Bash/NTFS) 키 권한 확인만 SKIP.
 
 ### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
 **Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.
@@ -556,6 +557,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `bash scripts/tests/test-dev-cert.sh` | EXPIRY-1 `scripts/dev-cert.sh` 시험(임시 폴더, openssl 이 있으면 실제 키·인증서 생성 검사 — 없으면 해당 시험 SKIP) | exit 0 |
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
+| `pnpm bundle:check <zip>` | 묶음 읽기 전용 확인(FIX2-LIVEL1H2 — 복원 미리보기와 같은 묶음 검증, DB·파일 쓰기 없음. 수동 해결 뒤 묶음 확인: 인계 LIVEL1 절차 7) | exit 0, JSON 출력(실패 exit 1) |
 
 ### PGlite 단일 연결 주의
 - 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.

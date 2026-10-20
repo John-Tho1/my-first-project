@@ -710,6 +710,39 @@ export async function parseBundleZip(zip: Uint8Array): Promise<ParsedBundle> {
   return parseBundle(readZip(zip), { migrations: await readMigrationTags() });
 }
 
+export type BundleCheckResult =
+  | { ok: true; manifest_sha256: string; rows: Record<string, number>; assets: number }
+  | { ok: false; error: string; message: string; problems?: unknown; fields?: unknown; tables?: unknown };
+
+/**
+ * FIX2-LIVEL1H2(검토 #12): 운영자용 **읽기 전용** 묶음 확인(`pnpm bundle:check <zip>`). 복원 미리보기와 같은 묶음 검증(parseBundleZip — manifest·migration
+ * 호환·파일 sha256·행 스키마·owner·참조 무결성(수동 해결 `resolution` 형식 포함)·asset checksum)만 하고 DB 를 열지 않으며 아무것도 쓰지 않는다
+ * (restore:preview 는 대상 DB 에 restore_runs·감사 행을 남기고 ZIP 사본을 저장하며 앱을 멈춰야 한다). 실패는 오류 코드·고정 문구·문제 목록만(값 없음 —
+ * 묶음 오류 extra 의 problems·fields·tables 만 옮긴다). 묶음 오류가 아닌 예외는 그대로 던진다.
+ */
+export async function checkBundleZip(zip: Uint8Array): Promise<BundleCheckResult> {
+  try {
+    const b = await parseBundleZip(zip);
+    return {
+      ok: true,
+      manifest_sha256: b.manifestSha256,
+      rows: Object.fromEntries(Object.entries(b.manifest.tables).map(([name, t]) => [name, t.rows])),
+      assets: b.manifest.assets.length,
+    };
+  } catch (e) {
+    if (!(e instanceof AppError) || e.kind !== 'bad_request') throw e;
+    const extra = (e.extra ?? {}) as Record<string, unknown>;
+    return {
+      ok: false,
+      error: e.code,
+      message: e.message,
+      ...(extra.problems !== undefined ? { problems: extra.problems } : {}),
+      ...(extra.fields !== undefined ? { fields: extra.fields } : {}),
+      ...(extra.tables !== undefined ? { tables: extra.tables } : {}),
+    };
+  }
+}
+
 export type RestoreRunRow = typeof restoreRuns.$inferSelect;
 
 export interface CreatePreviewOptions {

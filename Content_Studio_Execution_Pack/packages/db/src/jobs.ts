@@ -1003,10 +1003,20 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
       // FIX-LIVEP2(D39 즉시 중지 · 리뷰 P2 jobs.ts:900): 전송 시작 뒤·게시 시도 표식 전에 중지가 커밋됨 — 표식 트랜잭션이 거절해 게시 요청을 보내지 않았다
       // (의도는 rejected 로 채움). 자동 재시도(RETRY_WAIT)가 아니라 beginSend 의 중지 보류와 같은 BLOCKED(not_sent) — 재개 뒤 '재시도'만 다시 보낸다.
       // 이미 표식을 쓴 시도는 여기 오지 않는다(표식 뒤는 기존 결과 규칙 그대로).
-      return settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'live_publish_paused', not_sent: true, stage: 'before_publish_attempt' }, now, {
-        ...common,
-        lastErrorCode: 'live_publish_paused',
-      });
+      // FIX2-LIVEP2(검토 #3): 이 시도는 시도 한도에 세지 않는다(resume_count + 1 — upload_yield 와 같은 방식, resume_count ≤ attempt 유지). 그래야 마지막 시도
+      // (max_attempts)에서 멈춰도 화면이 약속한 "재개 뒤 '재시도'"가 409 attempts_exhausted 막다른 길이 되지 않고, 의도 전 중지(beginSend — 시도 없음)와 같아진다.
+      // 자동 재시도는 늘지 않는다: 이 보류는 BLOCKED 라 사용자가 중지한 뒤 재개하고 '재시도'를 눌러야만 다음 시도가 생긴다(시도마다 사용자 동작 2개).
+      const free = job.resumeCount < job.attempt;
+      return settle(
+        tx,
+        ownerId,
+        job,
+        item,
+        'blocked',
+        { ...base, reason: 'live_publish_paused', not_sent: true, stage: 'before_publish_attempt', counted: !free },
+        now,
+        { ...common, lastErrorCode: 'live_publish_paused', ...(free ? { resumeCount: job.resumeCount + 1 } : {}) },
+      );
     }
     if (!cancel && cls.event === 'remote_accepted' && result.upload_yield && !result.external_id) {
       // FIX-T15(Codex review-T15 P1): 조각 예산을 다 쓰고 양보(원격이 받은 바이트를 확인, 세션 유효, 영상 아직 없음). 결과 불명이 아니므로 조회 없이

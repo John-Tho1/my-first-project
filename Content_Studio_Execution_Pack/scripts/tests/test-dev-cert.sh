@@ -55,7 +55,15 @@ run_dc() {
     shift
   done
   [[ "${1:-}" == "--" ]] && shift
-  OUT="$(env -u OPENSSL -u DEV_CERT_FILE -u DEV_KEY_FILE DEV_CERT_DIR="$dir" "${envs[@]+"${envs[@]}"}" "$BASH_BIN" "$SCRIPT" "$@" 2>&1)"
+  # FIX2-EXPIRY1: RUN_DC_STDERR=full 이면 dev-cert.sh 의 stderr 를 /dev/full(쓰기마다 실패 — 끊긴 터미널의 EIO 대용), closed 면 닫힌 fd 로 —
+  # 이때 OUT 은 stdout 만. 비어 있으면(기본) 예전처럼 stdout+stderr.
+  case "${RUN_DC_STDERR:-}" in
+    full) OUT="$(env -u OPENSSL -u DEV_CERT_FILE -u DEV_KEY_FILE DEV_CERT_DIR="$dir" "${envs[@]+"${envs[@]}"}" "$BASH_BIN" "$SCRIPT" "$@" 2>/dev/full)" ;;
+    closed) OUT="$(env -u OPENSSL -u DEV_CERT_FILE -u DEV_KEY_FILE DEV_CERT_DIR="$dir" "${envs[@]+"${envs[@]}"}" "$BASH_BIN" "$SCRIPT" "$@" 2>&-)" ;;
+    # brokenpipe: 호출자가 fd 6 에 읽는 쪽이 닫힌 파이프를 열어 둔다(쓰면 SIGPIPE/EPIPE — 예: `renew 2>&1 | head -1` 에서 head 가 먼저 끝남)
+    brokenpipe) OUT="$(env -u OPENSSL -u DEV_CERT_FILE -u DEV_KEY_FILE DEV_CERT_DIR="$dir" "${envs[@]+"${envs[@]}"}" "$BASH_BIN" "$SCRIPT" "$@" 2>&6)" ;;
+    *) OUT="$(env -u OPENSSL -u DEV_CERT_FILE -u DEV_KEY_FILE DEV_CERT_DIR="$dir" "${envs[@]+"${envs[@]}"}" "$BASH_BIN" "$SCRIPT" "$@" 2>&1)" ;;
+  esac
   RC=$?
 }
 
@@ -151,6 +159,13 @@ for name in "./localhost.pem" "localhost.pem/" "./Localhost.pem"; do
   t "사용법 오류: 폴더 꼴 이름($name) — ./·끝 / 는 정규화하지 않고 거부"
   run_dc "$D_USAGE" DEV_CERT_FILE="$name" DEV_KEY_FILE=localhost.pem -- renew 30
   expect_rc 2 "$RC" "$OUT"
+done
+# FIX2-EXPIRY1(검토 #10 dev-cert.sh:255): 점(.)으로 시작하는 이름은 백업 glob(*.pem)에 잡히지 않아 예전 키가 백업 없이 덮어써졌다 — 이름 단계에서 거부
+for env_name in "DEV_KEY_FILE=.dev-key.pem" "DEV_CERT_FILE=.dev-cert.pem" "DEV_KEY_FILE=..pem" "DEV_CERT_FILE=.pem"; do
+  t "사용법 오류: 점(.)으로 시작하는 이름($env_name) → exit 2"
+  run_dc "$D_USAGE" "$env_name" -- renew 30
+  expect_rc 2 "$RC" "$OUT"
+  expect_contains "$OUT" "점(.)으로 시작할 수 없습니다"
 done
 t "사용법 오류는 폴더를 만들지 않는다"
 expect_true '[[ ! -e "$D_USAGE" ]]' "usage 폴더 없음"
@@ -255,6 +270,8 @@ chmod +x "$STUB"
 #                           restore = 원본이 .restore-key.*(되돌리기 사본)이면 실패 — 되돌리기까지 실패
 #                           term-after-key = 새 키(.new-key.*) 이동은 진짜로 한 뒤 부모(dev-cert.sh)에 TERM 을 보내고 성공 — 두 이동 사이 중단
 #                           term-again = 되돌리기 이동(.restore-key.*)도 진짜로 한 뒤 TERM 한 번 더(두 번째 신호에도 되돌리기·정리가 끝까지 가는지)
+#                           hup-after-key·int-after-key = term-after-key 와 같되 HUP·INT(FIX2-EXPIRY1 — 터미널 닫기·Ctrl+C)
+#   FAKE_CP_DROP  (FIX2-EXPIRY1) 이 이름(basename)의 원본은 복사하지 않고 넘어간다 — 백업에 키가 빠진 상태(대소문자 무시 파일 시스템의 *.pem 누락 등)
 #   FAKE_MV_LOG  호출 기록(원본 이름 -> 목적지 이름, 한 줄씩)
 #   FAKE_DATE_STAMP  `date +%Y%m%d-%H%M%S` 에 이 값을 낸다(백업 폴더 이름 충돌을 시계와 무관하게 고정). 다른 date 호출은 진짜.
 FAKE_BIN="$T_ROOT/fake-bin"
@@ -271,11 +288,13 @@ has() { [[ ",\${FAKE_MV_FAIL:-}," == *",\$1,"* ]]; }
 if has key && [[ "\$db" == localhost-key.pem ]]; then echo "fake mv: 실패(시험) \$db" >&2; exit 1; fi
 if has cert && [[ "\$db" == localhost-cert.pem ]]; then echo "fake mv: 실패(시험) \$db" >&2; exit 1; fi
 if has restore && [[ "\$sb" == .restore-key.* ]]; then echo "fake mv: 실패(시험) \$sb" >&2; exit 1; fi
-if has term-after-key && [[ "\$sb" == .new-key.* && "\$db" == localhost-key.pem ]]; then
-  "$REAL_MV" "\$@" || exit 1
-  kill -TERM "\$PPID"
-  exit 0
-fi
+for pair in TERM:term HUP:hup INT:int; do
+  if has "\${pair#*:}-after-key" && [[ "\$sb" == .new-key.* && "\$db" == localhost-key.pem ]]; then
+    "$REAL_MV" "\$@" || exit 1
+    kill -"\${pair%%:*}" "\$PPID"
+    exit 0
+  fi
+done
 if has term-again && [[ "\$sb" == .restore-key.* ]]; then
   "$REAL_MV" "\$@" || exit 1
   kill -TERM "\$PPID"
@@ -283,12 +302,22 @@ if has term-again && [[ "\$sb" == .restore-key.* ]]; then
 fi
 exec "$REAL_MV" "\$@"
 EOF
+REAL_CP="$(command -v cp)"
+cat >"$FAKE_BIN/cp" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${FAKE_CP_DROP:-}" ]]; then
+  args=()
+  for a in "\$@"; do [[ "\${a##*/}" == "\$FAKE_CP_DROP" ]] || args+=("\$a"); done
+  exec "$REAL_CP" "\${args[@]}"
+fi
+exec "$REAL_CP" "\$@"
+EOF
 cat >"$FAKE_BIN/date" <<EOF
 #!/usr/bin/env bash
 if [[ -n "\${FAKE_DATE_STAMP:-}" && \$# -eq 1 && "\$1" == "+%Y%m%d-%H%M%S" ]]; then echo "\$FAKE_DATE_STAMP"; exit 0; fi
 exec "$REAL_DATE" "\$@"
 EOF
-chmod +x "$FAKE_BIN/mv" "$FAKE_BIN/date"
+chmod +x "$FAKE_BIN/mv" "$FAKE_BIN/cp" "$FAKE_BIN/date"
 FAKE_PATH="$FAKE_BIN:$PATH"
 
 # 인증서 공개 키 = 키의 공개 키(짝이 맞음): pair_ok <cert> <key>
@@ -523,23 +552,29 @@ fi
 
 t "renew: 기존 키 없이 인증서만 있을 때 인증서 이동 실패 → 새 키를 지워 갱신 전 그대로(키 없음·인증서 그대로)"
 if swap_setup swap-nokey nokey; then
-  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=cert -- renew 30
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=cert OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-nokey-newkey.pem" -- renew 30
   expect_rc 1 "$RC" "$OUT"
   expect_contains "$OUT" "되돌렸습니다"
   expect_true '[[ ! -e "$SW/localhost-key.pem" ]] && cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem"' "키 없음·인증서 그대로"
   expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+  # FIX2-EXPIRY1(검토 #11): 되돌리기의 rm 분기(새 키를 지움) — 지운 새 키는 가로챈 사본으로만 확인할 수 있다
+  expect_true '[[ -s "$T_ROOT/swap-nokey-newkey.pem" ]]' "새 키 사본을 가로챔"
+  expect_no_key_in "$OUT" "$T_ROOT/swap-nokey-newkey.pem"
 else
   ng "시험 인증서를 만들지 못함"
 fi
 
 t "renew: 키 이동 실패(가짜 mv) → exit 1, 기존 파일 그대로, 임시 파일 없음"
 if swap_setup swap-key; then
-  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=key -- renew 30
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=key OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-key-newkey.pem" -- renew 30
   expect_rc 1 "$RC" "$OUT"
   expect_contains "$OUT" "새 개인 키를 제자리에 두지 못했습니다"
   expect_contains "$OUT" "기존 파일은 그대로입니다"
   expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 그대로"
   expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+  # FIX2-EXPIRY1(검토 #11): 키 이동 실패의 swap_fail("" 분기) 출력에도 키가 없다
+  expect_true '[[ -s "$T_ROOT/swap-key-newkey.pem" ]] && ! cmp -s "$T_ROOT/swap-key-newkey.pem" "$SW/localhost-key.pem"' "새 키 사본을 가로챔(제자리 키와 다름)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-key-newkey.pem"
 else
   ng "시험 인증서를 만들지 못함"
 fi
@@ -560,12 +595,14 @@ fi
 
 t "renew: 두 이동 사이 TERM + 되돌리는 중 TERM 한 번 더 → 되돌리기·정리를 끝까지(짝 맞음·임시 파일 없음, 종료 코드 143)"
 if swap_setup swap-term2; then
-  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=term-after-key,term-again -- renew 30
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=term-after-key,term-again OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-term2-newkey.pem" -- renew 30
   expect_rc 143 "$RC" "$OUT"
   expect_contains "$OUT" "되돌렸습니다"
   expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 그대로"
   expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
   expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+  expect_true '[[ -s "$T_ROOT/swap-term2-newkey.pem" ]]' "새 키 사본을 가로챔"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-term2-newkey.pem"
 else
   ng "시험 인증서를 만들지 못함"
 fi
@@ -574,11 +611,112 @@ t "renew: 인증서 자리가 폴더(일반 파일 아님) → exit 1, 키를 �
 if swap_setup swap-dir; then
   rm -f "$SW/localhost-cert.pem"
   mkdir "$SW/localhost-cert.pem"
-  run_dc "$SW" -- renew 30
+  run_dc "$SW" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-dir-newkey.pem" -- renew 30
   expect_rc 1 "$RC" "$OUT"
   expect_contains "$OUT" "일반 파일이 아닙니다"
+  # FIX2-EXPIRY1(검토 #11): 키를 만들기 전에 멈춘다(가로챌 새 키 없음) — 제자리 기존 키도 출력에 없다
+  expect_true '[[ ! -e "$T_ROOT/swap-dir-newkey.pem" ]]' "새 키를 만들지 않음(req 호출 없음)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem"
   expect_true 'cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem" && [[ -d "$SW/localhost-cert.pem" && -z "$(ls -A "$SW/localhost-cert.pem")" ]]' "키 그대로·폴더 안에 아무것도 옮기지 않음"
   expect_true '[[ "$(dot_files "$SW")" == 0 && -z "$(find "$SW" -maxdepth 1 -name "backup-*")" ]]' "백업·임시 파일 없음"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# ---- FIX2-EXPIRY1(검토 #9 dev-cert.sh:176): EXIT trap·swap_fail 안의 errexit — stderr 쓰기 실패(터미널을 닫아 끊긴 tty 의 EIO 등)가 되돌리기 전에
+# 셸을 끝내 짝이 어긋난 채(새 키 + 예전 인증서) 임시 파일까지 남았다. stderr 가 /dev/full(쓰기마다 ENOSPC)·닫힌 fd 여도 되돌리기·정리는 끝까지 간다.
+# 신호 경우: 두 이동 사이에 TERM·HUP·INT(HUP 은 stderr 정상 경우도 — 광고했지만 시험이 없던 신호). OUT 은 stderr 를 버리는 경우 stdout 만.
+for spec in "full term TERM 143" "full hup HUP 129" "full int INT 130" "closed term TERM 143" "closed hup HUP 129" "normal hup HUP 129"; do
+  read -r err_mode sig sig_name want_rc <<<"$spec"
+  t "renew: 두 이동 사이 ${sig_name} + stderr ${err_mode} → 되돌리기·정리 끝까지(종료 코드 $want_rc, 갱신 전 짝 그대로·임시 파일 없음)"
+  if [[ "$err_mode" == full && ! -w /dev/full ]]; then
+    skip "/dev/full 이 없는 시스템(닫힌 fd 경우가 같은 경로를 본다)"
+    continue
+  fi
+  if swap_setup "swap-sig-$err_mode-$sig"; then
+    if [[ "$err_mode" == normal ]]; then RUN_DC_STDERR=""; else RUN_DC_STDERR="$err_mode"; fi
+    run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL="$sig-after-key" FAKE_MV_LOG="$T_ROOT/swap-sig-$err_mode-$sig.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-sig-$err_mode-$sig-newkey.pem" -- renew 30
+    RUN_DC_STDERR=""
+    expect_rc "$want_rc" "$RC" "$OUT"
+    expect_true 'grep -q "^\.new-key\.[^ ]* -> localhost-key\.pem$" "$T_ROOT/swap-sig-$err_mode-$sig.log"' "주입 확인: 새 키를 제자리로 옮긴 뒤 신호"
+    expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+    expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+    expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일(.new-*·.restore-*·.openssl-*) 남지 않음"
+    expect_true '[[ -s "$T_ROOT/swap-sig-$err_mode-$sig-newkey.pem" ]] && ! cmp -s "$T_ROOT/swap-sig-$err_mode-$sig-newkey.pem" "$SW/localhost-key.pem"' "새 키(가로챈 사본)는 제자리에 없음"
+    if [[ "$err_mode" == normal ]]; then expect_contains "$OUT" "되돌렸습니다"; fi
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-sig-$err_mode-$sig-newkey.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+# 읽는 쪽이 닫힌 파이프: FIFO 를 읽기·쓰기로 연 뒤(막히지 않음) 쓰기 fd 를 따로 열고 읽는 fd 를 닫는다 — 쓰기마다 SIGPIPE(무시되면 EPIPE). 결정적.
+t "renew: 두 이동 사이 TERM + stderr 가 읽는 쪽이 닫힌 파이프(SIGPIPE) → 되돌리기·정리 끝까지(종료 코드 143, 갱신 전 짝 그대로·임시 파일 없음)"
+if ! command -v mkfifo >/dev/null 2>&1; then
+  skip "mkfifo 없음"
+elif swap_setup swap-sig-pipe; then
+  mkfifo "$T_ROOT/broken.fifo"
+  exec 5<>"$T_ROOT/broken.fifo"
+  exec 6>"$T_ROOT/broken.fifo"
+  exec 5<&-
+  RUN_DC_STDERR=brokenpipe
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=term-after-key OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-sig-pipe-newkey.pem" -- renew 30
+  RUN_DC_STDERR=""
+  exec 6>&-
+  expect_rc 143 "$RC" "$OUT"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+  expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-sig-pipe-newkey.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+for err_mode in full closed; do
+  t "renew: 인증서 이동 실패 + stderr ${err_mode} → swap_fail 이 되돌리기를 끝까지(exit 1, 갱신 전 짝 그대로·임시 파일 없음)"
+  if [[ "$err_mode" == full && ! -w /dev/full ]]; then
+    skip "/dev/full 이 없는 시스템(닫힌 fd 경우가 같은 경로를 본다)"
+    continue
+  fi
+  if swap_setup "swap-fail-$err_mode"; then
+    RUN_DC_STDERR="$err_mode"
+    run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=cert OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-fail-$err_mode-newkey.pem" -- renew 30
+    RUN_DC_STDERR=""
+    expect_rc 1 "$RC" "$OUT"
+    expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+    expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+    expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-fail-$err_mode-newkey.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+
+# ---- FIX2-EXPIRY1(검토 #10): 점으로 시작하는 키 이름 + 기존 키·인증서 — 예전에는 백업 없이 키를 덮어썼다(지금은 이름 단계 exit 2, 아무것도 바꾸지 않음) ----
+t "renew: 점으로 시작하는 키 이름(DEV_KEY_FILE=.k.pem) + 기존 키·인증서 → exit 2, 파일·폴더 그대로(백업·임시 파일 없음)"
+if swap_setup swap-dotname; then
+  "$REAL_MV" -f -- "$SW/localhost-key.pem" "$SW/.k.pem"
+  cp -p -- "$SW/.k.pem" "$SW-old/.k.pem"
+  run_dc "$SW" DEV_KEY_FILE=.k.pem -- renew 30
+  expect_rc 2 "$RC" "$OUT"
+  expect_contains "$OUT" "점(.)으로 시작할 수 없습니다"
+  expect_true 'cmp -s "$SW-old/.k.pem" "$SW/.k.pem" && cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem"' "기존 키·인증서 바이트 그대로"
+  expect_true '[[ "$(dot_files "$SW")" == 1 && -z "$(find "$SW" -maxdepth 1 -name "backup-*")" ]]' "백업·임시 파일 없음(.k.pem 하나뿐)"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# ---- FIX2-EXPIRY1(검토 #10 방어): 백업에 기존 키가 빠지면(대소문자 무시 파일 시스템에서 *.pem 이 다른 대소문자 확장자를 놓치는 등) 되돌리기의 전제가
+# 없으므로 바꾸기 전에 멈춘다 — 예전에는 그대로 바꾸다가 둘째 이동이 실패하면 "되돌리지 못함"(새 키 + 예전 인증서)으로 끝났다. ----
+t "renew: 백업에 기존 키가 빠짐(가짜 cp) + 인증서 이동 실패 주입 → 바꾸기 전에 exit 1, 키를 옮기지 않음·갱신 전 짝 그대로·임시 파일 없음"
+if swap_setup swap-nobackup; then
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_CP_DROP=localhost-key.pem FAKE_MV_FAIL=cert FAKE_MV_LOG="$T_ROOT/swap-nobackup.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-nobackup-newkey.pem" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_contains "$OUT" "백업에 기존 개인 키가 없어"
+  expect_contains "$OUT" "기존 파일은 그대로입니다"
+  expect_true '! grep -q -- "-> localhost-key\.pem$" "$T_ROOT/swap-nobackup.log" 2>/dev/null' "키 이동을 시작하지 않음"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+  expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-nobackup-newkey.pem"
 else
   ng "시험 인증서를 만들지 못함"
 fi

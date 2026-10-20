@@ -5,6 +5,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatMsk, THREADS_CONNECTION_EXPIRED_TEXT } from '@cs/domain';
+import { accountHealthView, type OAuthCredentialRow } from '@cs/db';
 
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
@@ -233,6 +234,73 @@ describe('설정 — 맨 위 알림 · 만료 관리 · 배포 계정 표의 만
     expect(row).not.toContain('14일 안에 만료');
     expect(row).not.toContain('다시 연결 필요');
     expect(expirySection(html)).toContain('<dt>Threads 연결</dt><dd>실제 연결 없음</dd>');
+  });
+
+  // FIX2-EXPIRY1(검토 #8): 화면 입력을 손으로 만들지 않고 실제 accountHealthView(@cs/db — 가짜로 바꾸지 않음)로 만든다. 해제 진행 중(revoking) 연결 정보에
+  // 정리 대기 행이 함께 있으면 credentialHealth 는 error(pending_cleanup_revoke)를 보고하지만, 원래 상태로 해제 중임을 알아 "다시 연결" 알림·태그를 내지 않는다.
+  it('FIX2-EXPIRY1: 실제 accountHealthView — 해제 진행 중 + 정리 대기(상태 error) 계정은 홈·설정 알림·표 태그 없음, 정리 대기만 있는 active 계정은 알림', async () => {
+    const now = new Date();
+    const exp = fromNow(DAY);
+    const accRow = (id: string, name: string, externalAccountId: string): Parameters<typeof accountHealthView>[0] => ({
+      id,
+      ownerId: '00000000-0000-4000-8000-000000000001',
+      platform: 'threads',
+      kind: 'live',
+      externalAccountId,
+      displayName: name,
+      state: 'connected',
+      capabilitySnapshot: {},
+      createdAt: new Date('2026-10-13T12:00:00Z'),
+      credentialState: 'linked',
+    });
+    const credRow = (accountId: string, status: string): OAuthCredentialRow => ({
+      id: `${accountId.slice(0, -4)}cccc`,
+      ownerId: '00000000-0000-4000-8000-000000000001',
+      channelAccountId: accountId,
+      provider: 'threads',
+      isMock: false,
+      encryptedToken: null,
+      keyVersion: 1,
+      tokenGeneration: 1,
+      revocationEpoch: 0,
+      revokeOpId: null,
+      revokeResumeAt: null,
+      revokeResumeAttempts: 0,
+      expiresAt: exp,
+      scopes: ['threads_basic', 'threads_content_publish'],
+      status,
+      connectedAt: new Date('2026-10-13T12:41:00Z'),
+      lastCheckedAt: null,
+      lastRefreshedAt: null,
+      lastErrorCode: status === 'revoking' ? 'revoke_provider_unavailable' : null,
+      revokedAt: null,
+      createdAt: new Date('2026-10-13T12:41:00Z'),
+      updatedAt: new Date('2026-10-13T12:41:00Z'),
+    });
+    const REV = '55555555-5555-4555-8555-555555555555';
+    const ACT = '66666666-6666-4666-8666-666666666666';
+    const revoking = accountHealthView(accRow(REV, '@revoking-pending', '17841400000000091'), credRow(REV, 'revoking'), { kind: 'cleanup_revoke', count: 1 }, now);
+    expect(revoking).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', revoked_at: null, credential_status: 'revoking' });
+    state.accounts = [revoking];
+    let html = await renderHome();
+    expect(html).not.toContain('aria-label="만료 알림"');
+    expect(html).not.toContain('Threads 연결이');
+    html = await renderSettings();
+    expect(noticeBlock(html)).toBe('');
+    const row = tableRow(html, '@revoking-pending');
+    expect(row).toContain(`<td>${formatMsk(exp)}</td>`);
+    expect(row).not.toContain('14일 안에 만료');
+    expect(row).not.toContain('다시 연결 필요');
+    expect(expirySection(html)).toContain('<dt>Threads 연결</dt><dd>실제 연결 없음</dd>');
+    // 대조: 정리 대기만 있는 active 연결 정보(같은 error 상태)는 다시 연결로 풀리므로 그대로 알린다
+    const pendingOnly = accountHealthView(accRow(ACT, '@pending-only', '17841400000000092'), credRow(ACT, 'active'), { kind: 'cleanup_revoke', count: 1 }, now);
+    expect(pendingOnly).toMatchObject({ status: 'error', credential_status: 'active' });
+    state.accounts = [revoking, pendingOnly];
+    html = await renderSettings();
+    expect(noticeLines(html)).toHaveLength(1);
+    expect(noticeLines(html)[0]).toContain(`Threads 연결이 ${formatMsk(exp)}에 만료됩니다 — 설정에서 다시 연결하세요`);
+    expect(tableRow(html, '@pending-only')).toContain('<span class="tag warn">14일 안에 만료 — 다시 연결하세요</span>');
+    expect(tableRow(html, '@revoking-pending')).not.toContain('14일 안에 만료');
   });
 
   it('실제 30일 남음 → 표에 날짜만(경고 없음), 알림 없음', async () => {

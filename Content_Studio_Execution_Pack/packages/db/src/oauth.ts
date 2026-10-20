@@ -211,6 +211,11 @@ export function accountHealthView(account: AccountRow, cred: OAuthCredentialRow 
     last_refreshed_at: cred?.lastRefreshedAt ? cred.lastRefreshedAt.toISOString() : null,
     last_error_code: cred?.lastErrorCode ?? null,
     revoked_at: cred?.revokedAt ? cred.revokedAt.toISOString() : null,
+    /**
+     * FIX2-EXPIRY1: 연결 정보 행의 원래 상태(active·error·revoking·revoked, 없으면 null). status 는 credentialHealth 결과라 정리 대기가 있으면 해제 진행 중도
+     * 'error' 로 보인다 — 만료 알림(isLiveThreadsCredential)은 이 값으로도 해제 중을 뺀다. 토큰·암호문 아님.
+     */
+    credential_status: cred?.status ?? null,
     key_version: cred?.keyVersion ?? null,
     /** FIX3·FIX4-T13: 정리 대기 종류(refresh_unknown·verify_current·cleanup_revoke 중 가장 앞의 것)와 건수만 — 봉인·행 ID 는 내보내지 않는다 */
     pending_reconcile: pending?.kind ?? null,

@@ -160,3 +160,14 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 사용자 승인: Threads 평상시 실제 게시(최근 24시간 3건 상한·즉시 중지 스위치) + 만료 관리 → D39. 계획 `LIVEP2_EXPIRY_PLAN.md`.
 - 로컬 PC 메모리 부족(dev 서버 컴파일 중 V8 OOM 2회)으로 구현·검사는 클라우드로 인계: `M4_CLOUD_KICKOFF_D39.md`. Codex 검증·실제 설정 적용은 로컬.
 - 게시는 계속 잠김(PUBLISH_MODE=disabled). 로컬 dev 서버·Codex 실행기 꺼짐.
+
+## 2026-10-19~20 — D39 구현(클라우드 세션)
+- 사용자 지시(2026-10-19): 로컬로 돌아가지 않고 **클라우드에서 계속** 진행. 클라우드에는 Codex CLI·OpenAI 인증이 없어 Codex 검증은 미실행으로 남고, 대신 Claude 독립 검토(여러 관점 + 지적마다 반박 검증, **Codex 판정 아님**)를 돌린다.
+- **LIVE-P2**(Task A, 최근 24시간 실제 게시 상한 + 즉시 중지 스위치, migration 0046): 코드 **ca7228e**, 인계 c5597e1(`LIVEP2_IMPLEMENTATION_HANDOFF.md`). 검사(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): lint·typecheck·build PASS, unit 76 files / 1838, integration 51 files / 928, drill:mock 위반 0, test-check-env.sh 58/58, lockfile 불변.
+- **EXPIRY-1**(Task B, Threads 실제 연결·로컬 인증서 만료 14일 전 경고, `scripts/dev-cert.sh check|renew`): 코드 **5739e5a**, 인계 0b7220f(`EXPIRY1_IMPLEMENTATION_HANDOFF.md`). 검사: lint·typecheck·build PASS, unit 79 files / 1885, integration 51 files / 928, drill:mock 위반 0, test-dev-cert.sh 82/82, lockfile 불변. `renew` 는 임시 디렉터리에서만 시험(실제 경로 실행 안 함).
+- not_run: Codex(클라우드 불가), 실제 Postgres 다중 연결(LIVE-P2 경쟁 시험은 PGlite 단일 연결이라 advisory 잠금 자체를 증명하지 못함), 브라우저 렌더링, 사용자 PC 의 실제 인증서·Windows Git Bash, `./data` migrate(0046)·`drill:restore`, 실제 Threads.
+- 알려진 불안정: `packages/db/src/lock.test.ts`(다중 프로세스 시간 시험) 첫 단위 실행 1건 실패 → 단독·재실행 PASS(이번 작업과 무관한 파일).
+- Codex 큐 줄(나중에 로컬에서 쓸 경우): `ca7228e LIVEP2 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md`, `5739e5a EXPIRY1 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md`.
+- D39 실제 적용(`.env.local` 의 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF=D39·PUBLISH_LIVE_MAX_POSTS=1000·PUBLISH_LIVE_DAILY_MAX=3, `./data` 백업 → `db:migrate`(0046))은 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만 가능 — 그 전까지 게시는 잠김(PUBLISH_MODE=disabled).
+- 진행 중: LIVE-P2·EXPIRY-1 Claude 독립 검토 → 확인된 지적 FIX.
+- 푸시 메모: 2026-10-19 한때 GitHub 앱 권한 403 → 사용자가 앱 권한 정리 후 해결. 1회 `commit_refs` 일시 오류는 재시도로 해결.

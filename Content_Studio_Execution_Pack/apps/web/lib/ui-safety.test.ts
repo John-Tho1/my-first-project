@@ -83,6 +83,9 @@ const REQUIRED: Record<string, string[]> = {
     `${MOCK_TAG} 모의 연결 Instagram 계정: MOCK 게시뿐이고 공개 범위는 공개(public)만 됩니다`,
     '배포 조건을 채우지 못했습니다',
     "'배포 계획 만들기(승인 전 — 아직 게시하지 않음)'",
+    // FIX-LIVEP2(계획 3(b)): 실제 게시 준비 안내 옆 즉시 중지 표시
+    'getLivePublishPaused(db, session.ownerId)',
+    '<strong>지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong>',
   ],
   'distribute/page.tsx': [
     MOCK_TAG,
@@ -92,6 +95,9 @@ const REQUIRED: Record<string, string[]> = {
     '<strong>실제로 게시</strong>',
     'MOCK(실제 발행 실적 아님)',
     '실제/MOCK 표시는 각 계획',
+    // FIX-LIVEP2(계획 3(b)): 실제 게시 안내 옆 즉시 중지 표시
+    'getLivePublishPaused(db, session.ownerId)',
+    '<strong>지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong>',
   ],
   'settings/page.tsx': [
     '실제 게시 준비 안 됨(실제로 게시하지 않음): {oauth.livePublish.missing.join',
@@ -157,6 +163,9 @@ const REQUIRED: Record<string, string[]> = {
     '원문 소재·출처·원고 버전은 지우지 않습니다.',
     'opsAccountsNote(accountModeOf(accounts))',
     'opsJobsTag(s.jobs.byKind)',
+    // FIX-LIVEP2(계획 3(b)): 실제 게시 준비 줄의 즉시 중지 표시
+    'getLivePublishPaused(db, session.ownerId)',
+    "{livePaused ? ' · 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않음' : ''}",
   ],
   'record/page.tsx': ['모의(실제 음성 인식 아님)', 'live 준비 안 됨: {live.missing.join'],
 };
@@ -193,6 +202,8 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
       'liveSwitch',
       'livePublishDailyUsageText',
       'LIVE_PUBLISH_RESUME_CONFIRM_TEXT',
+      // FIX-LIVEP2
+      'livePaused',
       // EXPIRY-1(D39)
       'ExpiryNoticeList',
       'EXPIRY_ACCOUNT_TAG_TEXT',

@@ -26,6 +26,7 @@ import {
   LeaseLostError,
   LIVE_PUBLISH_BUDGET_MARGIN_MS,
   LIVE_PUBLISH_MARKER_ALLOWANCE_MS,
+  LIVE_PUBLISH_PAUSED_STEP_CODE,
   LIVE_THREADS_ADAPTER_ID,
   liveThreadsExternalId,
   liveThreadsStepId,
@@ -472,16 +473,19 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     // 게시: lease 확인 → 다시 남은 시간 → 시도 표식(컨테이너마다 하나 — DB unique, 몫 안에서) → 바로 threads_publish. 표식 기록이 실패하면 게시하지 않는다(예외 → 조회).
     await this.#beforeWrite(ctx);
     if (budgetShort()) return insufficient;
-    let marker: 'saved' | 'exists' | 'slow';
+    let marker: 'saved' | 'exists' | 'slow' | 'paused';
     let allowanceTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // FIX-LIVEP1(Codex 놓친 케이스 "기존 표식 반환 뒤 재전송"): 새 표식을 만든 실행만 게시한다(createOnly — 이미 있으면 409, 기존 행을 돌려주지 않음).
+      // FIX-LIVEP2(D39 즉시 중지): 작업 처리기의 창구가 표식 트랜잭션 안에서 중지를 다시 보고 거절하면(live_publish_paused) 표식·게시 없이 멈춘다.
       const save = steps
         .record({ kind: 'publish_attempt', post_index: 0, remote_id: liveThreadsStepId.publishAttempt(containerId), status: 'created', createOnly: true })
         .then(
           () => 'saved' as const,
           (e: unknown) => {
-            if (e && typeof e === 'object' && (e as { code?: unknown }).code === 'remote_step_exists') return 'exists' as const;
+            const code = e && typeof e === 'object' ? (e as { code?: unknown }).code : undefined;
+            if (code === 'remote_step_exists') return 'exists' as const;
+            if (code === LIVE_PUBLISH_PAUSED_STEP_CODE) return 'paused' as const;
             throw e;
           },
         );
@@ -496,6 +500,8 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     }
     if (marker === 'exists') return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'publish_attempt_exists' };
     if (marker === 'slow') return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_marker_slow' };
+    // 표식이 없으므로 게시하지 않았음이 확실 — 컨테이너 참조는 남긴다(재개 뒤 재시도가 같은 컨테이너로 이어 게시, 새 컨테이너 없음).
+    if (marker === 'paused') return { status: 'rejected', retry_class: 'transient_no_side_effect', error_code: LIVE_PUBLISH_PAUSED_STEP_CODE };
     // 표식은 저장됐다(이 아래에서만 게시 요청). 중단(lease 상실·마감)됐으면 보내지 않는다 — 표식이 있으므로 이후는 기존 규칙(조회만).
     if (ctx.signal.aborted) throw abortError();
     let mediaId: string;

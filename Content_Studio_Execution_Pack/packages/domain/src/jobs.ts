@@ -201,6 +201,13 @@ export function isScheduleStale(scheduledAtUtc: Date | null, now: Date): boolean
   return scheduledAtUtc !== null && now.getTime() - scheduledAtUtc.getTime() > SCHEDULE_STALE_GRACE_MS;
 }
 
+/**
+ * FIX-LIVEP2(D36): 다른 사유(일일 상한·즉시 중지 등)로 첫 전송 전에 보류된 예약 항목을, 예약이 60분 넘게 지난 뒤 재시도할 때의 안내. 그 재시도는 대기열에 넣지 않고
+ * 바로 schedule_stale 로 보류한다 — 다음 재시도가 "지난 예약을 지금 보내겠다"는 D36 확인이다(60분 기준·확인 규칙 그대로).
+ */
+export const SCHEDULE_STALE_RETRY_MESSAGE =
+  "예약 시각이 60분 넘게 지나 보내지 않았습니다(오래 지난 예약은 자동으로 보내지 않음). 지금 보내려면 '재시도'를 한 번 더 누르세요 — 그 재시도가 지난 예약을 지금 보내겠다는 확인입니다.";
+
 /** 오래 지난 예약 확인이 가리키는 대상 — 지금의 활성 승인·내용 hash·예약 시각(ISO). */
 export interface StaleScheduleConfirmTarget {
   approvalId: string;
@@ -234,6 +241,52 @@ export function staleScheduleConfirmedBy(
       e.details.confirmed_scheduled_at_utc === target.scheduledAtUtc,
   );
 }
+/**
+ * FIX-LIVEP2(리뷰 확정 jobs.ts:1543 · Codex Q3): 조회가 "남은 원격 단계가 게시되지 않았음"을 증명(resume)한 뒤 **전송 의도를 쓰기 전에** 막힌 보류 사유 —
+ * 이 사유로 막힌 작업은 마지막 의도가 결과 불명(pending·ambiguous)으로 남아 있어도 재시도(새 시도 = beginSend 재검사)로 보낼 수 있다.
+ */
+export const RESUME_PROVEN_RETRY_BLOCK_REASONS = ['live_publish_paused', 'live_publish_daily_limit', 'credential_blocked'] as const;
+
+/**
+ * resume 와 마지막 보류 사이에 있어도 되는 사건(모두 전송 의도를 쓰지 않는다 — 원격에 아무것도 보내지 않음):
+ * lease · lease_expired_before_intent · local_rate_limited(not_sent) · 위 사유의 blocked(not_sent) · 사용자 재시도 unblock.
+ */
+function preIntentNotSentEvent(d: Record<string, unknown>): boolean {
+  switch (d.event) {
+    case 'lease':
+    case 'lease_expired_before_intent':
+      return true;
+    case 'local_rate_limited':
+      return d.not_sent === true;
+    case 'blocked':
+      return d.not_sent === true && (RESUME_PROVEN_RETRY_BLOCK_REASONS as readonly unknown[]).includes(d.reason);
+    case 'unblock':
+      return d.cause === 'user_retry';
+    default:
+      return false;
+  }
+}
+
+/**
+ * FIX-LIVEP2: 결과 불명 의도가 남은 BLOCKED 작업을 다시 보내도 되는 증명이 작업 이력에 있는가(순수 함수 — DB 없음). 모두 만족해야 true:
+ * ① 가장 최근 사건이 blocked · not_sent=true · 사유 ∈ RESUME_PROVEN_RETRY_BLOCK_REASONS(전송 의도 전 보류),
+ * ② 그 앞을 거슬러 올라가면 전송 의도 없는 사건(preIntentNotSentEvent)만 지나 조회의 `resume`(reconcile='resumable')에 닿고,
+ * ③ 그 resume 의 attempt 가 지금 작업의 attempt 와 같다(그 뒤 새 시도·새 의도 없음 — send_start 등 다른 사건이 끼면 false).
+ * 조회 resume 는 "게시 시도 표식 없음·컨테이너 미게시"처럼 남은 단계가 원격에 없음을 단계 기록으로 확인했을 때만 생긴다(자동으로 이어 보내는 근거와 같다).
+ * 그 증명이 없으면(결과가 정말 불명) 재시도는 계속 outcome_unknown 으로 거부한다.
+ */
+export function resumeProvenRetryable(events: ReadonlyArray<{ eventSeq: number; details: Record<string, unknown> }>, attempt: number): boolean {
+  const desc = [...events].sort((a, b) => b.eventSeq - a.eventSeq);
+  const latest = desc[0];
+  if (!latest || latest.details.event !== 'blocked' || !preIntentNotSentEvent(latest.details)) return false;
+  for (const e of desc.slice(1)) {
+    const d = e.details;
+    if (d.event === 'resume') return d.reconcile === 'resumable' && d.attempt === attempt;
+    if (!preIntentNotSentEvent(d)) return false;
+  }
+  return false;
+}
+
 /**
  * FIX-T11 round 2(P1): 전송 의도 없이 lease 가 만료된 횟수의 한도(시도 한도 max_attempts 와 별개). 시도(attempt)는 전송 의도를 쓸 때만 센다.
  * 이 횟수가 한도에 이르면 보내지 않은 채 FAILED(lease_expired_before_intent) — 보내기 전에 되풀이해 죽는 작업이 끝없이 lease 되지 않게.
@@ -539,6 +592,8 @@ export interface RemoteStepsPort {
     /**
      * FIX-LIVEP1(Codex 놓친 케이스 "기존 표식 반환 뒤 재전송"): true 면 새 행만 — 같은 (작업, 순서, 종류) 행이 이미 있으면 기존 행을 돌려주지 않고
      * 409 remote_step_exists 를 던진다. 실제 Threads 의 게시 시도 표식(publish_attempt)이 쓴다: 두 실행이 겹쳐도 표식을 새로 만든 쪽만 게시한다.
+     * FIX-LIVEP2(D39 즉시 중지): 실제 어댑터 전송 실행의 창구는 **새** publish_attempt 표식을 쓰기 전 같은 트랜잭션에서 즉시 중지 스위치를 다시 보고,
+     * 중지면 표식을 쓰지 않고 409 live_publish_paused(LIVE_PUBLISH_PAUSED_STEP_CODE)를 던진다 — 어댑터는 게시하지 않고 멈춘다.
      */
     createOnly?: boolean;
   }): Promise<RemoteStep>;
@@ -898,7 +953,7 @@ export class NothingToReconcileError extends AppError {
 
 /** T12(D19): 보류(BLOCKED) 항목 재시도 불가. code 로 이유를 구분한다. */
 export class NotRetryableError extends AppError {
-  constructor(code: 'not_retryable' | 'approval_required' | 'attempts_exhausted' | 'outcome_unknown', message: string, details?: Record<string, unknown>) {
+  constructor(code: 'not_retryable' | 'approval_required' | 'attempts_exhausted' | 'outcome_unknown' | 'schedule_stale', message: string, details?: Record<string, unknown>) {
     super('conflict', code, message, details);
   }
 }

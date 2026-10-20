@@ -3,6 +3,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  ceilToMinute,
+  formatLiveAvailableAt,
   LIVE_PUBLISH_DAILY_WINDOW_MS,
   LIVE_PUBLISH_PAUSED_MESSAGE,
   LIVE_PUBLISH_RESUME_CONFIRM_TEXT,
@@ -69,6 +71,18 @@ describe('LIVE-P2(D39): 최근 24시간 상한·즉시 중지 문구', () => {
     expect(livePublishDailyLimitMessage(1, '2026-10-19T21:30:00.000Z')).toContain('2026-10-20 00:30 (MSK) 이후');
     // 시각을 모르거나 읽을 수 없으면 꾸며내지 않는다
     for (const v of [null, undefined, '', 'not-a-date']) expect(livePublishDailyLimitMessage(3, v)).toContain('잠시 뒤 이후');
+  });
+  it('FIX-LIVEP2(A): 다시 보낼 수 있는 시각은 분 단위 올림 — 보이는 시각이 실제보다 이르지 않다(분 아래가 있으면 다음 분)', () => {
+    // 09:00:01 UTC 에 풀림 → 12:00 이라고 하면 12:00:00 의 재시도는 아직 막힌다 → 12:01
+    expect(livePublishDailyLimitMessage(3, new Date('2026-10-20T09:00:01Z'))).toContain('2026-10-20 12:01 (MSK) 이후');
+    expect(livePublishDailyLimitMessage(3, '2026-10-20T09:00:59.999Z')).toContain('2026-10-20 12:01 (MSK) 이후');
+    expect(livePublishDailyLimitMessage(3, '2026-10-20T09:00:00.001Z')).toContain('2026-10-20 12:01 (MSK) 이후');
+    // 정확히 분이면 그대로, 자정 넘김도 올림
+    expect(livePublishDailyLimitMessage(3, '2026-10-20T09:00:00.000Z')).toContain('2026-10-20 12:00 (MSK) 이후');
+    expect(livePublishDailyLimitMessage(3, '2026-10-20T20:59:30Z')).toContain('2026-10-21 00:00 (MSK) 이후');
+    expect(ceilToMinute(new Date('2026-10-20T09:00:01Z')).toISOString()).toBe('2026-10-20T09:01:00.000Z');
+    expect(ceilToMinute(new Date('2026-10-20T09:00:00Z')).toISOString()).toBe('2026-10-20T09:00:00.000Z');
+    expect(formatLiveAvailableAt('2026-10-20T09:00:01Z')).toBe('2026-10-20 12:01 (MSK)');
   });
   it('중지 문구·재개 확인 문구·창·잠금 이름', () => {
     expect(LIVE_PUBLISH_PAUSED_MESSAGE).toContain('일시 중지');

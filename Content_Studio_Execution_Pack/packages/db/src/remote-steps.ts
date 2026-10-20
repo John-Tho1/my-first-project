@@ -8,10 +8,10 @@
  * - ID 는 모의 ID 만(CHECK remote_id LIKE 'mock%'). 토큰·본문은 넣지 않는다.
  */
 import { and, asc, eq, gt, inArray, sql } from 'drizzle-orm';
-import { AppError, type RemoteStep, type RemoteStepKind, type RemoteStepStatus, type RemoteStepsPort } from '@cs/domain';
+import { AppError, LIVE_PUBLISH_PAUSED_STEP_CODE, livePublishDailyLockName, type RemoteStep, type RemoteStepKind, type RemoteStepStatus, type RemoteStepsPort } from '@cs/domain';
 import type { Db } from './client';
 import type { DbOrTx } from './queries';
-import { distributionItems, remoteSteps, sendIntents } from './schema';
+import { distributionItems, livePublishControls, remoteSteps, sendIntents } from './schema';
 
 export type RemoteStepRow = typeof remoteSteps.$inferSelect;
 
@@ -89,6 +89,11 @@ export async function recordRemoteStep(
     resumed?: boolean;
     /** FIX-LIVEP1: 새 행만(있으면 409 remote_step_exists — 기존 행을 돌려주지 않는다) */
     createOnly?: boolean;
+    /**
+     * FIX-LIVEP2(D39 즉시 중지 · 리뷰 P2 jobs.ts:900): 실제(live) 어댑터 작업의 창구. 새 게시 시도 표식(publish_attempt)을 쓰기 직전, 같은 트랜잭션에서
+     * owner 별 일일 잠금 아래 즉시 중지 스위치를 다시 본다 — 중지면 표식을 쓰지 않고 409 live_publish_paused(어댑터는 게시하지 않고 멈춘다).
+     */
+    livePauseGate?: boolean;
   },
 ): Promise<RemoteStepRow> {
   return db.transaction(async (tx) => {
@@ -101,6 +106,20 @@ export async function recordRemoteStep(
       .where(and(eq(distributionItems.id, input.itemId), eq(distributionItems.ownerId, input.ownerId)))
       .limit(1);
     if (accRow[0]) await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`cs_rate:${accRow[0].accountId}`}))`);
+    // FIX-LIVEP2(D): 실제 게시 시도 표식 직전의 중지 재확인. 잠금 순서 cs_rate:<계정>(공유) → cs_live_publish_daily:<owner> → live_publish_controls(FOR SHARE)
+    // → 단계 행 — beginSend(cs_rate 배타 → 승인 기록 잠금 → 일일 잠금 → 스위치 행)·setLivePublishPaused(일일 잠금 → 스위치 행)와 같은 방향이라 엇갈리지 않는다.
+    // 중지가 이 잠금보다 먼저 커밋됐으면 여기서 보이고(표식·게시 없음), 표식이 먼저 커밋됐으면 그 시도는 기존 결과 규칙 그대로(중지가 바꾸지 않음).
+    let paused = false;
+    if (input.livePauseGate && input.kind === 'publish_attempt') {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${livePublishDailyLockName(input.ownerId)}))`);
+      const ctl = await tx
+        .select({ paused: livePublishControls.paused })
+        .from(livePublishControls)
+        .where(eq(livePublishControls.ownerId, input.ownerId))
+        .limit(1)
+        .for('share');
+      paused = ctl[0]?.paused === true;
+    }
     const existing = await tx
       .select()
       .from(remoteSteps)
@@ -111,6 +130,10 @@ export async function recordRemoteStep(
     if (row && input.createOnly) {
       // FIX-LIVEP1(Codex 놓친 케이스): 게시 시도 표식처럼 "새로 만든 쪽만 진행"해야 하는 단계 — 이미 있으면 진행하지 않게 알린다.
       throw new AppError('conflict', 'remote_step_exists', '이미 기록된 원격 단계입니다(다시 진행하지 않음)', { kind: input.kind, post_index: input.postIndex });
+    }
+    if (!row && paused) {
+      // 새 표식을 쓰지 않는다(이미 있는 표식은 위에서 remote_step_exists — 표식 뒤 시도는 중지가 바꾸지 않음).
+      throw new AppError('conflict', LIVE_PUBLISH_PAUSED_STEP_CODE, '실제 게시가 일시 중지되어 게시 시도를 시작하지 않았습니다', { kind: input.kind, post_index: input.postIndex });
     }
     if (row) {
       if (row.remoteId !== input.remoteId) {
@@ -170,8 +193,11 @@ export async function recordRemoteStep(
   });
 }
 
-/** 작업 하나의 단계 창구(어댑터용). */
-export function remoteStepsPort(db: Db, input: { ownerId: string; jobId: string; itemId: string; intentKey: string; clock: () => Date }): RemoteStepsPort {
+/** 작업 하나의 단계 창구(어댑터용). livePauseGate: 실제 어댑터 전송 실행의 창구(게시 시도 표식 직전 중지 재확인 — recordRemoteStep). */
+export function remoteStepsPort(
+  db: Db,
+  input: { ownerId: string; jobId: string; itemId: string; intentKey: string; clock: () => Date; livePauseGate?: boolean },
+): RemoteStepsPort {
   return {
     list: async () => (await listRemoteSteps(db, input.ownerId, input.jobId)).map(remoteStepOf),
     record: async (step) =>
@@ -190,6 +216,7 @@ export function remoteStepsPort(db: Db, input: { ownerId: string; jobId: string;
           totalBytes: step.total_bytes,
           resumed: step.resumed,
           createOnly: step.createOnly,
+          livePauseGate: input.livePauseGate === true,
         }),
       ),
   };

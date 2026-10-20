@@ -9,6 +9,7 @@ import {
   EXPIRY_ACCOUNT_TAG_TEXT,
   EXPIRY_LEVEL_LABEL,
   expiryNotices,
+  formatLiveAvailableAt,
   formatMsk,
   fromMicro,
   isLiveThreadsCredential,
@@ -87,9 +88,10 @@ export default async function SettingsPage({
         : q.refreshed ? '연결 정보를 갱신했습니다.' : q.checked ? '연결을 확인했습니다.' : revokeMsg && !revokeMsg.warn ? revokeMsg.text : undefined;
   const accountWarn = revokeMsg?.warn ? revokeMsg.text : undefined;
   // LIVE-P2(D39): 실제 게시 즉시 중지 스위치·최근 24시간 사용(표시용 — 판정은 전송 직전 서버)
-  const liveCtl = await livePublishOverview(db, session.ownerId);
-  const liveSwitch = livePublishSwitchLabel({ publishEnabled: config.PUBLISH_MODE === 'enabled', ready: oauth.livePublish.ready, paused: liveCtl.paused });
   const liveDailyLimit = config.PUBLISH_LIVE_DAILY_MAX ?? null;
+  // FIX-LIVEP2(A): 상한을 넘겨 쓰는 중(상한을 줄임 등)이면 "다음 게시 가능"은 상한 아래로 내려가는 시각(상한을 넘겨 준다), 표시는 분 단위 올림
+  const liveCtl = await livePublishOverview(db, session.ownerId, new Date(), liveDailyLimit);
+  const liveSwitch = livePublishSwitchLabel({ publishEnabled: config.PUBLISH_MODE === 'enabled', ready: oauth.livePublish.ready, paused: liveCtl.paused });
   const liveDone = str(q.live_publish) ? LIVE_PUBLISH_DONE_TEXT[str(q.live_publish)!] : undefined;
   const liveErr = str(q.live_error) ? (LIVE_PUBLISH_ERROR_TEXT[str(q.live_error)!] ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
   // EXPIRY-1(D39): 실제 Threads 연결·로컬 인증서(개발 모드만 읽음) 만료 14일 전부터 경고. 다시 연결은 아래 배포 계정 연결의 기존 연결 흐름(토큰 갱신 API 호출 없음 — D31).
@@ -223,7 +225,7 @@ export default async function SettingsPage({
             <dt>사용</dt>
             <dd>
               {livePublishDailyUsageText(liveCtl.used, liveDailyLimit)}
-              {liveDailyLimit !== null && liveCtl.used >= liveDailyLimit && liveCtl.availableAt ? ` — 다음 게시 가능 ${formatMsk(liveCtl.availableAt)}` : ''}
+              {liveDailyLimit !== null && liveCtl.used >= liveDailyLimit && liveCtl.availableAt ? ` — 다음 게시 가능 ${formatLiveAvailableAt(liveCtl.availableAt)}` : ''}
             </dd>
           </div>
           {liveCtl.changedAt ? (

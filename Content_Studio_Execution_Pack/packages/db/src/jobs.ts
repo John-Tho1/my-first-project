@@ -36,6 +36,7 @@ import {
   isScheduleStale,
   LIVE_THREADS_EXTERNAL_ID_RE,
   LIVE_SUBMIT_BUDGET_MS,
+  LIVE_PUBLISH_PAUSED_STEP_CODE,
   livePublishDailyLockName,
   staleScheduleConfirmedBy,
   LEGACY_SEND_ADAPTER_ID,
@@ -53,9 +54,11 @@ import {
   RECONCILE_BASE_MS,
   RECONCILE_MAX_ATTEMPTS,
   reconcileDelay,
+  resumeProvenRetryable,
   REMOTE_POLL_MAX,
   REMOTE_POLL_MS,
   recordedAdapterIdOf,
+  SCHEDULE_STALE_RETRY_MESSAGE,
   SEND_LEASE_STATES,
   type AdapterContext,
   type AdapterId,
@@ -537,7 +540,7 @@ function makeContext(
   signal: AbortSignal,
   mockScenario: MockScenarioSetting | null = null,
   onLeaseLost?: () => void,
-  extra?: { snapshot: PublishSnapshot; rateUnitsReserved?: number; deadline?: number },
+  extra?: { snapshot: PublishSnapshot; rateUnitsReserved?: number; deadline?: number; livePauseGate?: boolean },
 ): AdapterContext {
   const clock = opts.clock ?? (() => new Date());
   const snapshot = extra?.snapshot;
@@ -558,7 +561,8 @@ function makeContext(
     },
     mockScenario,
     // T14: 원격 단계 기록(작업 단위, 호출마다 짧은 트랜잭션)과 서버 쪽 토큰 창구(T13). 토큰은 어댑터 메모리에만.
-    steps: remoteStepsPort(db, { ownerId: job.ownerId, jobId: job.id, itemId: job.itemId!, intentKey, clock }),
+    // FIX-LIVEP2(D): 실제 어댑터 전송 실행이면 새 게시 시도 표식을 쓰기 직전 같은 트랜잭션에서 즉시 중지를 다시 본다(recordRemoteStep).
+    steps: remoteStepsPort(db, { ownerId: job.ownerId, jobId: job.id, itemId: job.itemId!, intentKey, clock, livePauseGate: extra?.livePauseGate === true }),
     credential: snapshot
       ? {
           accessToken: async () => {
@@ -891,7 +895,8 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       liveApprovalRef = ref;
       // LIVE-P2(D39): 즉시 중지 스위치 + 최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX). owner 별 advisory 잠금(배타, 트랜잭션 끝까지) 아래에서 본다.
       // 잠금 순서: 계정(공유) → 항목 → 작업 → 요청 제한 잠금(cs_rate:<계정>) → 승인 기록 잠금(cs_live_publish:<ref>) → 이 잠금(cs_live_publish_daily:<owner>).
-      // 이 잠금을 잡는 곳은 여기와 setLivePublishPaused(이 잠금 하나만 — 먼저 잡고 다른 잠금 없음)뿐이라 순서가 엇갈리지 않는다. 승인 기록이 달라도
+      // 이 잠금을 잡는 곳은 여기, setLivePublishPaused(이 잠금 하나만 — 먼저 잡고 다른 잠금 없음), FIX-LIVEP2 게시 시도 표식 기록(recordRemoteStep —
+      // cs_rate 공유 → 이 잠금)뿐이라 순서가 엇갈리지 않는다. 승인 기록이 달라도
       // (설정을 바꾼 두 작업 처리기) 같은 owner 의 일일 판정은 이 잠금으로 줄을 선다 — 앞선 판정의 전송 의도는 커밋된 뒤에야 잠금이 풀리므로 다음 판정에 보인다.
       // 일일 상한이 없어도(PUBLISH_LIVE_DAILY_MAX 미설정) 잠금은 잡는다 — 중지 스위치 판정이 setLivePublishPaused 와 줄을 서게.
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${livePublishDailyLockName(ownerId)}))`);
@@ -906,7 +911,7 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       const dailyMax = opts.config.PUBLISH_LIVE_DAILY_MAX;
       if (dailyMax !== undefined && dailyMax !== null) {
         // 창 안에 이미 실제 전송 의도가 있는 작업(재시도·이어 보내기)은 새 게시가 아니다 — 세지도 막지도 않는다.
-        const daily = await livePublishDailyUsage(tx, ownerId, job.id, now);
+        const daily = await livePublishDailyUsage(tx, ownerId, job.id, now, dailyMax);
         await opts.liveDailyHook?.(tx, { phase: 'after_daily_usage', jobId: job.id });
         if (!daily.thisJobCounted && daily.used >= dailyMax) {
           return settle(
@@ -994,6 +999,15 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
     };
     const common = { ...CLEAR_LEASE, lastErrorCode: result.error_code ?? null, lastRetryClass: cls.retryClass };
     const isMock = plan.adapter.kind === 'mock';
+    if (!cancel && !isMock && result.status === 'rejected' && result.error_code === LIVE_PUBLISH_PAUSED_STEP_CODE) {
+      // FIX-LIVEP2(D39 즉시 중지 · 리뷰 P2 jobs.ts:900): 전송 시작 뒤·게시 시도 표식 전에 중지가 커밋됨 — 표식 트랜잭션이 거절해 게시 요청을 보내지 않았다
+      // (의도는 rejected 로 채움). 자동 재시도(RETRY_WAIT)가 아니라 beginSend 의 중지 보류와 같은 BLOCKED(not_sent) — 재개 뒤 '재시도'만 다시 보낸다.
+      // 이미 표식을 쓴 시도는 여기 오지 않는다(표식 뒤는 기존 결과 규칙 그대로).
+      return settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'live_publish_paused', not_sent: true, stage: 'before_publish_attempt' }, now, {
+        ...common,
+        lastErrorCode: 'live_publish_paused',
+      });
+    }
     if (!cancel && cls.event === 'remote_accepted' && result.upload_yield && !result.external_id) {
       // FIX-T15(Codex review-T15 P1): 조각 예산을 다 쓰고 양보(원격이 받은 바이트를 확인, 세션 유효, 영상 아직 없음). 결과 불명이 아니므로 조회 없이
       // 즉시 다음 시도(같은 세션 재개). 진행이 있어야만 오므로 시도 한도에 넣지 않는다(resume_count + 1 — 받은 바이트 단조 증가가 끝을 보장).
@@ -1067,6 +1081,7 @@ async function sendJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow,
       snapshot: begun.snapshot,
       rateUnitsReserved: begun.rateUnitsReserved,
       deadline,
+      livePauseGate: begun.adapter.kind === 'live',
     });
     let prepared;
     try {
@@ -1506,7 +1521,10 @@ export interface RetryOutcome {
  * (attempt + 1) = 새 전송 의도. 조건(한 트랜잭션, 항목·승인·작업 잠금):
  * - 항목·최근 작업이 모두 BLOCKED(보내지 않았음이 확실한 보류: 401 거절·실행 모드·계정). 작업이 없는 보류(복원된 진행 중 항목)는 409 not_retryable —
  *   원격 결과를 모르므로 맹목 재전송 금지.
- * - 최근 전송 의도가 결과 불명(pending·ambiguous)이면 409 outcome_unknown(재확인 먼저).
+ * - 최근 전송 의도가 결과 불명(pending·ambiguous)이면 409 outcome_unknown(재확인 먼저). FIX-LIVEP2 예외: 조회가 남은 단계 미게시를 증명(resume)한 뒤
+ *   전송 의도 없이 중지·일일 상한·연결 정보로 막힌 작업(resumeProvenRetryable)은 재시도할 수 있다(unblock 이력에 unresolved_intent_cleared_by).
+ * - FIX-LIVEP2(D36): 첫 전송 전(attempt 0) 예약이 60분 넘게 지났고 그 예약에 대한 확인이 아직 없으면 대기열에 넣지 않고 바로 schedule_stale 로 보류하고
+ *   409 schedule_stale — 다음 재시도가 기존 D36 확인이다(첫 재시도가 tick 에서야 막히는 헛된 한 바퀴 없음).
  * - 활성 승인 hash = 항목 hash(아니면 409 approval_required — 승인 없음 보류는 항목이 PLANNED 로 돌아가 있으므로 다시 승인 후 실행).
  * - 스냅샷 재검사(예약 시각 경과 제외 — 사용자가 지금 다시 보내기로 한 것) 문제 있으면 409 snapshot_stale(아무것도 바꾸지 않음).
  * - 시도 한도(attempt >= max_attempts) 409 attempts_exhausted.
@@ -1514,6 +1532,13 @@ export interface RetryOutcome {
  */
 export async function retryItem(db: Db, ownerId: string, itemId: string, now: Date = new Date()): Promise<RetryOutcome> {
   if (!isUuid(itemId)) throw new NotFoundError(ITEM_NOT_FOUND);
+  const r = await retryItemTx(db, ownerId, itemId, now);
+  // FIX-LIVEP2(D36): schedule_stale 보류는 커밋한 뒤 거절로 알린다(다음 재시도가 확인이 되도록 보류 이력은 남아야 한다).
+  if ('staleBlocked' in r) throw new NotRetryableError('schedule_stale', SCHEDULE_STALE_RETRY_MESSAGE, { item_id: itemId, late_minutes: r.lateMinutes });
+  return r;
+}
+
+async function retryItemTx(db: Db, ownerId: string, itemId: string, now: Date): Promise<RetryOutcome | { staleBlocked: true; lateMinutes: number }> {
   return db.transaction(async (tx) => {
     await shareLockItemAccount(tx, ownerId, itemId);
     const item = await lockItem(tx, ownerId, itemId);
@@ -1540,8 +1565,23 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
       throw new NotRetryableError('not_retryable', '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다', { status: item.status, job_state: job?.state ?? null });
     }
     const last = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt) : null;
+    let unresolvedClearedBy: 'reconcile_resume' | null = null;
     if (last && (last.outcome === 'pending' || last.outcome === 'ambiguous')) {
-      throw new NotRetryableError('outcome_unknown', '마지막 전송 결과를 알 수 없어 다시 보내지 않습니다. 재확인을 먼저 하세요.');
+      // FIX-LIVEP2(리뷰 확정 jobs.ts:1543 · Codex Q3): 마지막 의도가 결과 불명이어도, 조회가 남은 원격 단계가 게시되지 않았음을 증명(resume — 자동 이어 보내기와
+      // 같은 근거)했고 그 뒤 전송 의도 없이 중지·일일 상한·연결 정보로 보류된 작업이면 다시 보낼 수 있다(막다른 길 해소). 재시도는 여전히 beginSend 의
+      // 중지·상한·승인·스냅샷 재검사를 거치고, 어댑터는 기록된 컨테이너로 남은 게시만 한다(게시 시도 표식이 있으면 다시 게시하지 않음).
+      // 증명이 없으면(결과가 정말 불명) 지금처럼 거부한다. 방어선: 결과 기록 없는 게시 시도 표식이 있으면 증명이 있어도 거부.
+      const evs = await tx
+        .select({ eventSeq: jobEvents.eventSeq, details: jobEvents.sanitizedDetails })
+        .from(jobEvents)
+        .where(and(eq(jobEvents.ownerId, ownerId), eq(jobEvents.jobId, job.id)))
+        .orderBy(asc(jobEvents.eventSeq));
+      const unresolvedAttempts =
+        (await publishedStepCount(tx, ownerId, job.id, ['publish_attempt'])) - (await publishedStepCount(tx, ownerId, job.id, ['publish']));
+      if (!resumeProvenRetryable(evs, job.attempt) || unresolvedAttempts > 0) {
+        throw new NotRetryableError('outcome_unknown', '마지막 전송 결과를 알 수 없어 다시 보내지 않습니다. 재확인을 먼저 하세요.');
+      }
+      unresolvedClearedBy = 'reconcile_resume';
     }
     const approval = active.get(item.id);
     if (!approval || approval.payloadHash !== item.payloadHash) {
@@ -1555,13 +1595,44 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
     // T13: 연결 정보가 아직 쓸 수 없으면(만료·해제·다시 연결 필요) 다시 대기열에 넣지 않는다 — 먼저 다시 연결.
     const cred = (await credentialGate(tx, ownerId, [item.channelAccountId], now)).get(item.channelAccountId);
     if (cred && !cred.usable) throw new AccountCredentialBlockedError([{ item_id: item.id, account_id: item.channelAccountId, status: cred.status }]);
+    // FIX-LIVEP2(D36 · 리뷰 확정 jobs.ts:730): 첫 전송 전(attempt 0) 다른 사유(일일 상한·즉시 중지 등)로 보류된 예약 항목인데 지금 예약이 60분 넘게 지났고 그 예약에 대한
+    // 확인도 없으면, beginSend 가 어차피 schedule_stale 로 막는다 — 대기열에 넣었다가 tick 에서야 막히는 헛된 한 바퀴 대신 지금 같은 판정으로 보류하고 바로 알린다.
+    // 보류 이력(blocked schedule_stale)이 남으므로 다음 재시도가 기존 D36 확인(stale_schedule_confirmed)이 된다. 60분 기준·확인 규칙은 그대로.
+    if (
+      job.attempt === 0 &&
+      job.lastErrorCode !== 'schedule_stale' &&
+      isScheduleStale(item.scheduledAtUtc, now) &&
+      !(await staleScheduleConfirmed(tx, ownerId, job, { approvalId: approval.id, payloadHash: item.payloadHash, scheduledAtUtc: item.scheduledAtUtc! }))
+    ) {
+      const lateMinutes = Math.floor((now.getTime() - item.scheduledAtUtc!.getTime()) / 60_000);
+      const queued = await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id, outcome: 'schedule_stale' }, now, {
+        ...CLEAR_LEASE,
+        lastErrorCode: null,
+        lastRetryClass: null,
+        reconcileCount: 0,
+      });
+      await settle(tx, ownerId, { id: job.id, state: queued }, item, 'blocked', { reason: 'schedule_stale', not_sent: true, late_minutes: lateMinutes, cause: 'retry_precheck' }, now, {
+        ...CLEAR_LEASE,
+        lastErrorCode: 'schedule_stale',
+      });
+      await recordAudit(tx, {
+        ownerId,
+        action: 'item.retry',
+        entity: 'distribution_item',
+        entityId: item.id,
+        details: { job_id: job.id, previous_error: job.lastErrorCode, result: 'schedule_stale', late_minutes: lateMinutes },
+        at: now,
+      });
+      return { staleBlocked: true as const, lateMinutes };
+    }
     // FIX1-T21P2(Codex P1 :623): 오래 지난 예약(schedule_stale)으로 막힌 작업의 재시도 = 그 예약을 지금 보내겠다는 명시적 확인. 승인 ID·내용 hash·예약 시각을
     // 함께 기록한다 — 보내기 직전(beginSend) 이 값이 지금과 모두 같을 때만 통과(승인·내용·예약이 바뀌면 확인은 효력이 없다). 다른 사유 재시도는 확인이 아니다.
     const staleConfirm =
       job.lastErrorCode === 'schedule_stale'
         ? { stale_schedule_confirmed: true, confirmed_payload_hash: item.payloadHash, confirmed_scheduled_at_utc: item.scheduledAtUtc ? item.scheduledAtUtc.toISOString() : null }
         : {};
-    await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id, ...staleConfirm }, now, {
+    const cleared: Record<string, string> = unresolvedClearedBy ? { unresolved_intent_cleared_by: unresolvedClearedBy } : {};
+    await settle(tx, ownerId, job, item, 'unblock', { cause: 'user_retry', previous_error: job.lastErrorCode, approval_id: approval.id, ...staleConfirm, ...cleared }, now, {
       ...CLEAR_LEASE,
       nextRunAt: now,
       lastErrorCode: null,
@@ -1580,6 +1651,7 @@ export async function retryItem(db: Db, ownerId: string, itemId: string, now: Da
         attempt_next: job.attempt + 1,
         mode: live ? 'LIVE' : 'MOCK',
         ...(job.lastErrorCode === 'schedule_stale' ? { stale_schedule_confirmed: true } : {}),
+        ...cleared,
       },
       at: now,
     });

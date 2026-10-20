@@ -396,3 +396,58 @@ describe('FIX1-T21P2 staleScheduleConfirmedBy (오래 지난 예약 확인은 sc
     expect(staleScheduleConfirmedBy([block(2), confirm(3), block(4)], target)).toBe(false); // 확인 뒤 다시 오래 지난 예약으로 차단 → 새 확인 필요
   });
 });
+
+describe('FIX-LIVEP2 resumeProvenRetryable (결과 불명 의도가 남은 보류 작업 재시도는 조회 resume 증명이 있을 때만)', () => {
+  let seq = 0;
+  const ev = (details: Record<string, unknown>) => ({ eventSeq: ++seq, details });
+  const ambiguous = () => ev({ event: 'ambiguous', attempt: 1, error_code: 'container_status_unreadable' });
+  const resume = (over: Record<string, unknown> = {}) => ev({ event: 'resume', attempt: 1, reconcile: 'resumable', published_parts: 0, ...over });
+  const lease = () => ev({ event: 'lease' });
+  const blocked = (reason: string, over: Record<string, unknown> = {}) => ev({ event: 'blocked', reason, not_sent: true, ...over });
+  const unblock = () => ev({ event: 'unblock', cause: 'user_retry' });
+
+  it('인정: resume → lease → 중지·일일 상한·연결 정보 보류(not_sent), 그 사이 사용자 재시도·다시 보류·요청 제한 대기·전송 전 lease 만료가 있어도', async () => {
+    const { resumeProvenRetryable, RESUME_PROVEN_RETRY_BLOCK_REASONS } = await import('./jobs');
+    expect([...RESUME_PROVEN_RETRY_BLOCK_REASONS]).toEqual(['live_publish_paused', 'live_publish_daily_limit', 'credential_blocked']);
+    for (const reason of RESUME_PROVEN_RETRY_BLOCK_REASONS) {
+      expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked(reason)], 1)).toBe(true);
+    }
+    expect(
+      resumeProvenRetryable(
+        [
+          ambiguous(),
+          resume(),
+          lease(),
+          ev({ event: 'local_rate_limited', not_sent: true }),
+          lease(),
+          ev({ event: 'lease_expired_before_intent' }),
+          lease(),
+          blocked('live_publish_paused'),
+          unblock(),
+          lease(),
+          blocked('live_publish_daily_limit', { used: 3, limit: 3 }),
+        ],
+        1,
+      ),
+    ).toBe(true);
+    // 순서와 무관(eventSeq 로 정렬)
+    const evs = [ambiguous(), resume(), lease(), blocked('live_publish_paused')];
+    expect(resumeProvenRetryable([...evs].reverse(), 1)).toBe(true);
+  });
+
+  it('인정하지 않음: resume 없음 / 다른 사유·not_sent 없는 보류 / resume 뒤 새 시도(send_start) / 다른 attempt 의 resume / resumable 아닌 resume / 마지막 사건이 보류 아님', async () => {
+    const { resumeProvenRetryable } = await import('./jobs');
+    expect(resumeProvenRetryable([], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), blocked('live_publish_paused')], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), ev({ event: 'reconcile_retry', checks: 1 }), lease(), blocked('live_publish_paused')], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('adapter_changed')], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_limit')], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_paused', { not_sent: false })], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), ev({ event: 'blocked', reason: 'execution_not_allowed', code: 'publish_disabled' })], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), ev({ event: 'send_start', attempt: 2 }), ev({ event: 'ambiguous', attempt: 2 }), lease(), blocked('live_publish_paused')], 2)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_paused')], 2)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume({ reconcile: 'unknown' }), lease(), blocked('live_publish_paused')], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_paused'), unblock()], 1)).toBe(false);
+    expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_paused'), ev({ event: 'unblock', cause: 'system' }), lease(), blocked('live_publish_paused')], 1)).toBe(false);
+  });
+});

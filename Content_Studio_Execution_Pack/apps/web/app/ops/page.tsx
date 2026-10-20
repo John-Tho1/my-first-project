@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { DRILL_PARTIAL_LABEL, listAccountHealth, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
+import { DRILL_PARTIAL_LABEL, getLivePublishPaused, listAccountHealth, opsSnapshot, planRetention, type DirUsage } from '@cs/db';
 import {
   CHANNEL_LABEL,
   CREDENTIAL_STATUS_LABEL,
@@ -63,6 +63,8 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const live = liveLlmReadiness(config, process.env);
   const sttLive = sttLiveReadiness(config);
   const oauth = oauthReadinessView(config);
+  // FIX-LIVEP2(계획 3(b)): 실제 게시 준비 줄에 즉시 중지 상태를 함께(표시용 — 판정은 전송 직전 서버)
+  const livePaused = (await getLivePublishPaused(db, session.ownerId)).paused;
   const drill = s.backup.lastDrill;
   const drillMismatches = (drill?.mismatchJson ?? []) as Array<{ kind?: string; table?: string; sample_ids?: string[]; columns?: string[] }>;
   const drillScope = (drill?.scopeJson ?? null) as null | { partial: boolean; partial_reasons: string[]; empty_tables: string[]; search_probe: string };
@@ -292,7 +294,8 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
         <p className="note">음성 전사 live 준비 안 됨: {sttLive.missing.length ? sttLive.missing.join(', ') : '없음'}</p>
         <p className="note">
           계정 연결: {config.OAUTH_MODE === 'mock' ? '모의' : '실제(live)'} · 서버 암호화 키 {oauth.secrets.configured ? '설정됨' : '설정 안 됨'} · 실제 Threads 연결 준비 안 됨:{' '}
-          {oauth.live.missing.length ? oauth.live.missing.join(', ') : '없음(준비됨 — 연결·프로필 조회만, D31)'} · 실제 게시 준비 안 됨: {oauth.livePublish.missing.join(', ')}
+          {oauth.live.missing.length ? oauth.live.missing.join(', ') : '없음(준비됨 — 연결·프로필 조회만, D31)'} · 실제 게시 준비 안 됨: {oauth.livePublish.missing.join(', ') || '없음(준비됨)'}
+          {livePaused ? ' · 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않음' : ''}
         </p>
       </section>
 

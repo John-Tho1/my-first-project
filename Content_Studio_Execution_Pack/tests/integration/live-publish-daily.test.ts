@@ -17,8 +17,10 @@ import {
   getDb,
   getLivePublishPaused,
   listChannelAccounts,
+  listRemoteSteps,
   livePublishDailyUsage,
   livePublishOverview,
+  retryItem,
   runJobsTick,
   schema,
   seed,
@@ -56,6 +58,8 @@ const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
 let db: Db;
+/** PGlite 클라이언트(잠금 시험이 실행된 SQL 문장 순서를 관찰 — debug 기록) */
+let pg: { debug: number };
 let owner: string;
 let token: string;
 let tmp: string;
@@ -84,7 +88,18 @@ interface Call {
 }
 let idSeq = 500;
 const nextId = () => `18000000000${String(++idSeq).padStart(6, '0')}`;
-function fakeThreads(opts: { failCreateOnce?: Set<string>; publishTimeout?: Set<string> } = {}) {
+function fakeThreads(
+  opts: {
+    failCreateOnce?: Set<string>;
+    publishTimeout?: Set<string>;
+    /** FIX-LIVEP2(C): 이 본문의 컨테이너 상태 읽기를 한 번 5xx — 표식 전 결과 불명(container_status_unreadable) */
+    statusFailOnce?: Set<string>;
+    /** FIX-LIVEP2(D): 컨테이너 생성 응답 직전(= beginSend 뒤·게시 시도 표식 전)에 부른다 */
+    onCreate?: (text: string) => Promise<void>;
+    /** FIX-LIVEP2(D): 게시 요청을 받은 뒤(= 표식 뒤) 응답 직전에 부른다 */
+    onPublish?: (text: string) => Promise<void>;
+  } = {},
+) {
   const containers = new Map<string, { text: string; media: string }>();
   const posted = new Map<string, string>();
   const calls: Call[] = [];
@@ -99,6 +114,7 @@ function fakeThreads(opts: { failCreateOnce?: Set<string>; publishTimeout?: Set<
       if (opts.failCreateOnce?.delete(text)) return jsonRes(500, { error: { code: 2, is_transient: true, type: 'OAuthException' } });
       const ct = nextId();
       containers.set(ct, { text, media: nextId() });
+      await opts.onCreate?.(text);
       return jsonRes(200, { id: ct });
     }
     if (method === 'POST' && p === `/v1.0/${PROFILE_ID}/threads_publish`) {
@@ -106,10 +122,14 @@ function fakeThreads(opts: { failCreateOnce?: Set<string>; publishTimeout?: Set<
       if (!c) return jsonRes(400, { error: { code: 100 } });
       if (opts.publishTimeout?.has(c.text)) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
       posted.set(c.media, c.text);
+      await opts.onPublish?.(c.text);
       return jsonRes(200, { id: c.media });
     }
     if (method === 'GET' && p === `/v1.0/${PROFILE_ID}/threads`) return jsonRes(200, { data: [], paging: {} });
     const seg = p.replace('/v1.0/', '');
+    if (method === 'GET' && containers.has(seg) && opts.statusFailOnce?.delete(containers.get(seg)!.text)) {
+      return jsonRes(500, { error: { code: 2, is_transient: true, type: 'OAuthException' } });
+    }
     if (method === 'GET' && containers.has(seg)) return jsonRes(200, { status: 'FINISHED', id: seg });
     if (method === 'GET' && posted.has(seg)) {
       return jsonRes(200, {
@@ -123,7 +143,8 @@ function fakeThreads(opts: { failCreateOnce?: Set<string>; publishTimeout?: Set<
     throw new Error(`fixture 없음: ${method} ${p}`);
   });
   const publishes = () => calls.filter((c) => c.method === 'POST' && c.url.pathname.endsWith('threads_publish')).length;
-  return { fetch, calls, publishes };
+  const creates = () => calls.filter((c) => c.method === 'POST' && c.url.pathname === `/v1.0/${PROFILE_ID}/threads`).length;
+  return { fetch, calls, publishes, creates };
 }
 
 function registryWith(fetch: (input: string, init?: RequestInit) => Promise<Response>, config: AppConfig) {
@@ -135,8 +156,13 @@ let vt = 0;
 /** 경계 시험용: 값이 있으면 시계를 이 시각에 고정한다(실제 시간이 흐르지 않음) */
 let frozen: number | null = null;
 const clockNow = () => new Date(frozen ?? Date.now() + vt);
-async function tick(registry: LiveCapableAdapterRegistry, config: AppConfig, extra: { workerId?: string; maxJobs?: number; liveDailyHook?: Parameters<typeof runJobsTick>[2]['liveDailyHook'] } = {}) {
+async function tick(
+  registry: LiveCapableAdapterRegistry,
+  config: AppConfig,
+  extra: { workerId?: string; maxJobs?: number; planId?: string; liveDailyHook?: Parameters<typeof runJobsTick>[2]['liveDailyHook'] } = {},
+) {
   return runJobsTick(db, registry, {
+    ...(extra.planId ? { planId: extra.planId } : {}),
     workerId: extra.workerId ?? 'livep2-w',
     config,
     ownerId: owner,
@@ -159,9 +185,9 @@ interface Planned {
   planId: string;
   items: Array<{ id: string; payload_hash: string }>;
 }
-async function planApproved(bodies: string[], accountId = liveAccount, purpose = 'public_publish'): Promise<Planned> {
+async function planApproved(bodies: string[], accountId = liveAccount, purpose = 'public_publish', schedule?: { date: string; time: string }): Promise<Planned> {
   const items = [];
-  for (const b of bodies) items.push({ variant_id: await reviewVariant(b), channel_account_id: accountId });
+  for (const b of bodies) items.push({ variant_id: await reviewVariant(b), channel_account_id: accountId, ...(schedule ? { schedule } : {}) });
   const res = await plansPOST(post('/api/distribution-plans', { items }));
   expect(res.status, await res.clone().text()).toBe(201);
   const p = (await res.json()) as { plan: { id: string }; items: Array<{ id: string; payload_hash: string; variant_id: string }> };
@@ -198,6 +224,43 @@ async function lastBlocked(jobId: string) {
   const ev = (await eventsOf(jobId)).find((e) => e.stateAfter === 'BLOCKED');
   return (ev?.sanitizedDetails ?? {}) as Record<string, unknown>;
 }
+/** FIX-LIVEP2(A): 화면 시각은 분 단위 올림(보이는 시각이 실제로 보낼 수 있는 시각보다 이르지 않게) */
+const ceilMin = (t: number) => Math.ceil(t / MIN) * MIN;
+/** FIX-LIVEP2(F): UTC 시각 → 계획 입력(모스크바 날짜·시각, MSK = UTC+3 고정) — 분 단위로 올림 */
+function mskSchedule(at: number): { date: string; time: string } {
+  const iso = new Date(ceilMin(at) + 3 * HOUR).toISOString();
+  return { date: iso.slice(0, 10), time: iso.slice(11, 16) };
+}
+
+/**
+ * FIX-LIVEP2(G): fn 이 실행한 SQL 문장을 순서대로 모은다(PGlite debug 기록 — "runQuery"/"runExec", 문장, 매개변수). PGlite 는 한 연결이라
+ * 이 동안 다른 문장이 끼어들지 않는다. 아무 문장도 모이지 않으면(PGlite 내부가 바뀜) 시험이 실패하도록 호출자가 확인한다.
+ */
+async function captureSql<T>(fn: () => Promise<T>): Promise<{ result: T; stmts: Array<{ sql: string; params: unknown[] }> }> {
+  const stmts: Array<{ sql: string; params: unknown[] }> = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+    if (a[0] === 'runQuery' || a[0] === 'runExec') stmts.push({ sql: String(a[1]), params: Array.isArray(a[2]) ? a[2] : [] });
+  });
+  const prev = pg.debug;
+  pg.debug = 1;
+  try {
+    return { result: await fn(), stmts };
+  } finally {
+    pg.debug = prev;
+    spy.mockRestore();
+  }
+}
+/** 이 트랜잭션이 owner 별 일일 advisory 잠금(cs_live_publish_daily:<owner>, int8 키 = hashtext 부호 확장)을 지금 쥐고 있는가(pg_locks) */
+async function holdsDailyLock(tx: DbOrTx): Promise<boolean> {
+  const name = `cs_live_publish_daily:${owner}`;
+  const r = await tx.execute(sql`
+    select count(*)::int as n from pg_locks
+     where locktype = 'advisory' and granted and objsubid = 1
+       and classid = ((hashtext(${name})::int8 >> 32) & 4294967295)::oid
+       and objid = (hashtext(${name})::int8 & 4294967295)::oid`);
+  return Number((r as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0) === 1;
+}
+const isDailyLockStmt = (s: { sql: string; params: unknown[] }) => s.sql.includes('pg_advisory_xact_lock(hashtext(') && s.params[0] === `cs_live_publish_daily:${owner}`;
 
 /** 실제 Threads 계정(연결 전 행) → 실제 OAuth 연결(fixture) → 실제 게시 계정으로 사용 */
 async function connectLiveAccount(): Promise<string> {
@@ -239,7 +302,9 @@ beforeAll(async () => {
   vi.stubEnv('SECRETS_MASTER_KEY', KEY);
   vi.stubEnv('SECRETS_KEY_VERSION', '1');
   vi.stubEnv('AUTH_ALLOWED_IDENTITY', A);
-  db = (await getDb(loadConfig())).db;
+  const handle = await getDb(loadConfig());
+  db = handle.db;
+  pg = handle.client as unknown as { debug: number };
   owner = (await seed(db, { allowedIdentity: A })).ownerId;
   Object.assign(mockAcc, Object.fromEntries((await listChannelAccounts(db, owner)).map((a) => [a.platform, a.id])));
   token = await login(A);
@@ -318,7 +383,19 @@ describe('최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX)', () => {
     expect(info).toEqual({ limit: 3, availableAt: new Date(t0 + DAY).toISOString() });
     const headline = liveItemHeadline({ status: 'BLOCKED', channel: 'threads', job, pub: null, blockReason: 'live_publish_daily_limit', liveDaily: info });
     expect(headline).toBe(`보류 — ${livePublishDailyLimitMessage(3, new Date(t0 + DAY))}`);
-    expect(headline).toContain(`${formatMsk(new Date(t0 + DAY))} 이후 '재시도'로 다시 보낼 수 있습니다.`);
+    // FIX-LIVEP2(A, 리뷰 확정 finding "분 단위 버림"): 화면 시각은 분 단위 **올림** — 이전 단언(formatMsk(t0 + DAY), 버림)은 실제보다 최대 59초 이른
+    // 시각을 약속하는 틀린 값이었다. 올린 시각에 재시도하면 창(created_at > now − 24h)에서 그 작업이 이미 빠져 있다.
+    expect(headline).toContain(`${formatMsk(new Date(ceilMin(t0 + DAY)))} 이후 '재시도'로 다시 보낼 수 있습니다.`);
+    // FIX-LIVEP2(H): 모의 전송은 실제 게시 상한과 무관 — 상한이 찬 지금도 모의 계획은 MOCK 으로 처리되고(원격 호출 0), 사용 수는 그대로 3
+    const mockPlan = await planApproved(['상한 중 모의 글.'], mockAcc.threads, 'mock_publish');
+    await execute(mockPlan.planId);
+    expect((await tick(reg, config)).results).toEqual({ CONFIRMED: 1 });
+    const mockIntents = await intentsOf((await jobOf(mockPlan.items[0]!.id)).id);
+    expect(mockIntents).toHaveLength(1);
+    expect(mockIntents[0]!.sanitizedDetails).toMatchObject({ mode: 'MOCK' });
+    expect(mockIntents[0]!.sanitizedDetails).not.toHaveProperty('live_approval_ref');
+    expect((await livePublishOverview(db, owner, clockNow())).used).toBe(3);
+    expect(fake.calls.length).toBe(callsBefore);
     await cancel(fourth.items[0]!.id);
   });
 
@@ -385,12 +462,35 @@ describe('최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX)', () => {
     const dJob = await jobOf(d.items[0]!.id);
     expect(await lastBlocked(dJob.id)).toMatchObject({ reason: 'live_publish_daily_limit', used: 3, limit: 2 });
     expect(await intentsOf(dJob.id)).toHaveLength(0);
-    // available_at = 각 작업의 **마지막** 실제 전송 의도 중 가장 이른 것 + 24h — A 는 재시도(마지막 의도가 늦음)라 B·C 의 시각이 기준
+    // available_at: 각 작업의 **마지막** 실제 전송 의도 시각(A 는 재시도라 마지막 의도가 늦음)을 오름차순으로 놓고 [used − limit] 번째 + 24h —
+    // 그 시각이 되어야 창 안 다른 작업 수가 상한 아래로 내려간다(used 3, limit 2 → 두 번째로 이른 것).
+    // FIX-LIVEP2(A, 리뷰 확정 finding live-publish.ts:149): 이전 단언은 가장 이른 것(min(B,C)) + 24h 였다 — 그 시각에는 한 작업만 빠져 used 2 ≥ 2 로
+    // 다시 보류되는 **틀린 값**이었다(아래에서 그 시각의 재시도가 다시 보류됨을 보인다).
     const bcAt = await Promise.all(bc.items.map(async (i) => (await intentsOf((await jobOf(i.id)).id))[0]!.createdAt.getTime()));
-    const aFirst = (await intentsOf(aJob.id))[0]!.createdAt.getTime();
+    const aIntents = await intentsOf(aJob.id);
+    const aFirst = aIntents[0]!.createdAt.getTime();
+    const aLast = aIntents[1]!.createdAt.getTime();
     expect(aFirst).toBeLessThan(Math.min(...bcAt)); // A 의 첫 의도가 가장 이르지만 기준이 아니다
-    expect((await lastBlocked(dJob.id)).available_at).toBe(new Date(Math.min(...bcAt) + DAY).toISOString());
-    await cancel(d.items[0]!.id);
+    const lastAts = [...bcAt, aLast].sort((x, y) => x - y);
+    expect(lastAts[2]).toBe(aLast);
+    const availableAt = lastAts[3 - 2]! + DAY;
+    expect((await lastBlocked(dJob.id)).available_at).toBe(new Date(availableAt).toISOString());
+    const dItem = d.items[0]!.id;
+    // 예전 값(가장 이른 것 + 24h)에 재시도 → 아직 다른 작업 2(≥ 상한 2) → 다시 보류(보내지 않음), 이번 available_at 은 같은 올바른 값
+    frozen = lastAts[0]! + DAY;
+    await retry(dItem);
+    expect((await tick(reg2, config2)).results).toEqual({ BLOCKED: 1 });
+    expect(await lastBlocked(dJob.id)).toMatchObject({ reason: 'live_publish_daily_limit', used: 2, limit: 2, available_at: new Date(availableAt).toISOString() });
+    // 알려 준 시각 1분 전 → 보류, 알려 준 시각 → 게시(창에서 두 번째 작업이 빠져 used 1 < 2)
+    frozen = availableAt - MIN;
+    await retry(dItem);
+    expect((await tick(reg2, config2)).results).toEqual({ BLOCKED: 1 });
+    expect(await intentsOf(dJob.id)).toHaveLength(0);
+    frozen = availableAt;
+    await retry(dItem);
+    expect((await tick(reg2, config2)).results).toEqual({ CONFIRMED: 1 });
+    expect(await intentsOf(dJob.id)).toHaveLength(1);
+    expect(fake.publishes()).toBe(4);
   });
 
   it('PUBLISH_LIVE_DAILY_MAX 없음 = 일일 상한 없음(이전 동작): 24시간 안에 4건 모두 게시', async () => {
@@ -404,7 +504,9 @@ describe('최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX)', () => {
     expect(fake.publishes()).toBe(4);
   });
 
-  it('동시 실행(PGlite 한 연결, 판정 안 지연 주입): 상한 − 1 에서 두 작업을 승인 기록이 다른 두 작업 처리기가 동시에 → 한 건만 게시, 나머지는 보류(전송 의도 0)', async () => {
+  // FIX-LIVEP2(G, 리뷰 확정 finding test.ts:434): PGlite 는 연결 하나에서 트랜잭션 전체를 직렬화한다(_runExclusiveTransaction) — 이 시험은 그 직렬화
+  // 아래에서의 결과(한 건만 게시)만 본다. advisory 잠금을 지워도 통과하므로 **잠금 자체는 이 시험이 증명하지 않는다**(잠금은 아래 '잠금 순서' 시험이 본다).
+  it('동시 실행(PGlite 한 연결 — 트랜잭션 직렬화, 판정 안 지연 주입): 상한 − 1 에서 승인 기록이 다른 두 작업 처리기가 동시에 → 한 건만 게시, 나머지는 보류(전송 의도 0)', async () => {
     const configA = cfg('2', 'D39-conc-a');
     const fake = fakeThreads();
     const first = await planApproved(['동시 앞선 글.']);
@@ -431,12 +533,77 @@ describe('최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX)', () => {
     const blocked = two.items[codes.indexOf('live_publish_daily_limit')]!;
     expect(await intentsOf((await jobOf(blocked.id)).id)).toHaveLength(0);
     expect(await lastBlocked((await jobOf(blocked.id)).id)).toMatchObject({ used: 2, limit: 2 });
-    // 두 판정은 겹치지 않았다: 한 처리기의 잠금 → 사용량 읽기가 끝난 뒤에야 다른 처리기가 잠금을 얻음
+    // 관찰된 순서: 한 처리기의 판정(잠금 → 사용량 읽기)이 끝난 뒤 다른 처리기의 판정. PGlite 에서는 트랜잭션 직렬화 때문에도 이렇게 되므로
+    // 이 순서는 advisory 잠금의 증거가 아니다(실제 Postgres 다중 연결에서의 상호 배제는 잠금 설계 + 아래 잠금 순서 시험에 기댄다).
     expect(order).toHaveLength(4);
     expect(order[0]!.split(':')[0]).toBe(order[1]!.split(':')[0]);
     expect(order[2]!.split(':')[0]).toBe(order[3]!.split(':')[0]);
     expect(order.map((o) => o.split(':')[1])).toEqual(['after_daily_lock', 'after_daily_usage', 'after_daily_lock', 'after_daily_usage']);
     await cancel(blocked.id);
+  });
+
+  // FIX-LIVEP2(G): 잠금을 실제로 잡는지 — 실행된 SQL 문장 순서(PGlite debug 기록)와 판정 시점의 pg_locks 로 본다. 잠금을 지우거나 읽기 뒤로 옮기면 실패한다.
+  it('잠금 순서(SQL 문장 관찰 + pg_locks): beginSend 는 owner 별 일일 advisory 잠금을 중지 읽기·사용량 세기·전송 의도 쓰기보다 먼저 같은 트랜잭션에서 잡는다(상한 있음·없음), 게시 시도 표식 기록과 setLivePublishPaused 도 행 읽기·쓰기보다 먼저', async () => {
+    const fake = fakeThreads();
+    const sql0 = (s: { sql: string }) => s.sql.trim();
+    /** i·j 가 같은 트랜잭션(사이에 COMMIT·ROLLBACK 없음, 앞에 BEGIN) 안인가 */
+    const sameTx = (stmts: Array<{ sql: string }>, i: number, j: number) => {
+      const [lo, hi] = [Math.min(i, j), Math.max(i, j)];
+      const begin = stmts.slice(0, lo + 1).map(sql0).lastIndexOf('BEGIN');
+      return begin >= 0 && !stmts.slice(begin + 1, hi + 1).some((s) => sql0(s) === 'COMMIT' || sql0(s) === 'ROLLBACK');
+    };
+    const isPauseRead = (lockMode: 'share' | 'update') => (s: { sql: string }) => s.sql.includes('from "live_publish_controls"') && s.sql.includes(`for ${lockMode}`);
+    for (const daily of ['3', '']) {
+      const config = cfg(daily);
+      const p = await planApproved([`잠금 순서 글 ${daily || '상한 없음'}.`]);
+      await execute(p.planId);
+      const held: Record<string, boolean> = {};
+      const { result, stmts } = await captureSql(() =>
+        tick(registryWith(fake.fetch, config), config, {
+          liveDailyHook: async (tx, at) => {
+            held[at.phase] = await holdsDailyLock(tx);
+          },
+        }),
+      );
+      expect(result.results).toEqual({ CONFIRMED: 1 });
+      expect(stmts.length).toBeGreaterThan(10); // PGlite 기록을 실제로 모았다
+      // beginSend: 잠금 → 중지 읽기(FOR SHARE) → [상한 있으면] 사용량 세기 → 전송 의도 쓰기, 한 트랜잭션
+      const lock = stmts.findIndex(isDailyLockStmt);
+      const pauseRead = stmts.findIndex(isPauseRead('share'));
+      const intentInsert = stmts.findIndex((s) => s.sql.startsWith('insert into "send_intents"'));
+      expect(lock).toBeGreaterThan(-1);
+      expect(pauseRead).toBeGreaterThan(lock);
+      expect(intentInsert).toBeGreaterThan(pauseRead);
+      expect(sameTx(stmts, lock, intentInsert)).toBe(true);
+      // 판정 시점에 이 트랜잭션이 잠금을 쥐고 있다(pg_locks — 중지 읽기 전 훅)
+      expect(held.after_daily_lock).toBe(true);
+      if (daily) {
+        const usage = stmts.findIndex((s) => s.sql.includes('from "send_intents"') && s.sql.includes("live_approval_ref' is not null"));
+        expect(usage).toBeGreaterThan(pauseRead);
+        expect(usage).toBeLessThan(intentInsert);
+        expect(held.after_daily_usage).toBe(true);
+      } else {
+        expect(held.after_daily_usage).toBeUndefined(); // 상한 없음 — 사용량은 세지 않지만 잠금·중지 확인은 그대로
+      }
+      // 게시 시도 표식(publish_attempt) 기록: 같은 owner 잠금 → 중지 읽기 → 표식 행 쓰기, 한 트랜잭션(FIX-LIVEP2 D)
+      const marker = stmts.findIndex((s) => s.sql.startsWith('insert into "remote_steps"') && s.params.includes('publish_attempt'));
+      expect(marker).toBeGreaterThan(intentInsert);
+      const markerLock = stmts.slice(0, marker).map(isDailyLockStmt).lastIndexOf(true);
+      const markerPauseRead = stmts.slice(0, marker).map(isPauseRead('share')).lastIndexOf(true);
+      expect(markerLock).toBeGreaterThan(intentInsert);
+      expect(markerPauseRead).toBeGreaterThan(markerLock);
+      expect(sameTx(stmts, markerLock, marker)).toBe(true);
+    }
+    // setLivePublishPaused: 잠금 → 행 읽기(FOR UPDATE) → 쓰기, 한 트랜잭션
+    const { stmts } = await captureSql(() => setLivePublishPaused(db, owner, true));
+    const lock = stmts.findIndex(isDailyLockStmt);
+    const read = stmts.findIndex(isPauseRead('update'));
+    const write = stmts.findIndex((s) => s.sql.startsWith('insert into "live_publish_controls"'));
+    expect(lock).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(lock);
+    expect(write).toBeGreaterThan(read);
+    expect(sameTx(stmts, lock, write)).toBe(true);
+    await setLivePublishPaused(db, owner, false);
   });
 });
 
@@ -502,6 +669,162 @@ describe('즉시 중지 스위치(live_publish_controls)', () => {
     for (const a of audits) expect(a.sanitizedDetails).toEqual({ by: 'owner' });
   });
 
+  // FIX-LIVEP2(B, 리뷰 확정 P1 test.ts:444): 중지는 "이미 집계된 작업"(창 안에 실제 전송 의도가 있는 재시도·이어 보내기) 예외와 일일 상한 설정에 상관없이
+  // publish_attempt 표식 전의 모든 실제 전송을 막는다 — 상한 예외 안으로 옮기거나(!thisJobCounted) 상한 블록 안으로 옮기는 변형을 잡는다.
+  for (const daily of ['', '3']) {
+    it(`중지는 창 안에 이미 실제 전송 의도가 있는 작업의 자동 재시도도 막는다(일일 상한 ${daily || '없음'}): 컨테이너 5xx → RETRY_WAIT(의도 1) → 중지 → 다음 시도 BLOCKED live_publish_paused(의도 1 그대로·원격 호출 0) → 재개·재시도 → 게시`, async () => {
+      const config = cfg(daily);
+      const TEXT = `중지 재시도 글(상한 ${daily || '없음'}).`;
+      const fake = fakeThreads({ failCreateOnce: new Set([TEXT]) });
+      const reg = registryWith(fake.fetch, config);
+      const p = await planApproved([TEXT]);
+      await execute(p.planId);
+      expect((await tick(reg, config)).results).toEqual({ RETRY_WAIT: 1 }); // 부작용 없는 일시 실패
+      const job = await jobOf(p.items[0]!.id);
+      expect(await intentsOf(job.id)).toHaveLength(1);
+      // 이 작업은 이미 창 안에 집계됨(일일 상한 예외 대상) — 그래도 중지는 막아야 한다
+      expect((await livePublishDailyUsage(db, owner, job.id, clockNow())).thisJobCounted).toBe(true);
+      await setLivePublishPaused(db, owner, true);
+      vt += 30 * MIN; // 자동 재시도 시각(약 30초 뒤) 지남
+      const callsBefore = fake.calls.length;
+      expect((await tick(reg, config)).results).toEqual({ BLOCKED: 1 });
+      expect((await jobOf(p.items[0]!.id)).lastErrorCode).toBe('live_publish_paused');
+      expect(await lastBlocked(job.id)).toMatchObject({ reason: 'live_publish_paused', not_sent: true });
+      expect(await intentsOf(job.id)).toHaveLength(1);
+      expect(fake.calls.length).toBe(callsBefore);
+      expect(fake.publishes()).toBe(0);
+      await setLivePublishPaused(db, owner, false);
+      await retry(p.items[0]!.id);
+      expect((await tick(reg, config)).results).toEqual({ CONFIRMED: 1 });
+      expect(fake.publishes()).toBe(1);
+      expect(await intentsOf(job.id)).toHaveLength(2);
+    });
+  }
+
+  it('일일 상한 없음(PUBLISH_LIVE_DAILY_MAX 미설정)에서도 중지는 새 실제 작업을 막는다(BLOCKED live_publish_paused·전송 의도 0·원격 호출 0)', async () => {
+    const config = cfg('');
+    expect(config.PUBLISH_LIVE_DAILY_MAX).toBeUndefined();
+    const fake = fakeThreads();
+    const reg = registryWith(fake.fetch, config);
+    const p = await planApproved(['상한 없음 중지 글.']);
+    await execute(p.planId);
+    await setLivePublishPaused(db, owner, true);
+    expect((await tick(reg, config)).results).toEqual({ BLOCKED: 1 });
+    const job = await jobOf(p.items[0]!.id);
+    expect(job.lastErrorCode).toBe('live_publish_paused');
+    expect(await intentsOf(job.id)).toHaveLength(0);
+    expect(fake.calls).toHaveLength(0);
+    await cancel(p.items[0]!.id);
+  });
+
+  // FIX-LIVEP2(C, 리뷰 확정 jobs.ts:1543·Codex Q3): 표식 전 결과 불명 → 조회가 남은 원격 단계가 게시되지 않았음을 증명('resumable' → 'resume') → 이어 보내기가
+  // 중지에 막힘(전송 의도 전 not_sent). 마지막 의도는 여전히 ambiguous 지만 재개 뒤 '재시도'로 보낼 수 있어야 한다(자동 전송 없음, 남은 게시만).
+  it('결과 불명(표식 전) → 조회 resume → 중지로 보류된 작업: 재개만으로는 보내지 않고, 재시도하면 같은 컨테이너로 남은 게시 1건만(새 컨테이너 0·재게시 0)', async () => {
+    const config = cfg('3');
+    const TEXT = '이어 보내기 중지 글.';
+    const fake = fakeThreads({ statusFailOnce: new Set([TEXT]) });
+    const reg = registryWith(fake.fetch, config);
+    const p = await planApproved([TEXT]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    // 컨테이너 생성 뒤 상태 읽기 실패 — 표식 전 결과 불명(RECONCILING, 의도 ambiguous)
+    expect((await tick(reg, config)).results).toEqual({ RECONCILING: 1 });
+    const job = await jobOf(itemId);
+    expect((await intentsOf(job.id)).map((i) => i.outcome)).toEqual(['ambiguous']);
+    expect([fake.creates(), fake.publishes()]).toEqual([1, 0]);
+    // 소유자가 결과 불명 글을 보고 중지
+    await setLivePublishPaused(db, owner, true);
+    vt += 2 * MIN;
+    // 조회: 컨테이너 FINISHED · 게시 시도 표식 없음 → resume(RETRY_WAIT) — 의도는 채우지 않는다(ambiguous 그대로)
+    expect((await tick(reg, config)).results).toEqual({ RETRY_WAIT: 1 });
+    // 이어 보내기 → 중지로 보류(전송 의도 없음)
+    expect((await tick(reg, config)).results).toEqual({ BLOCKED: 1 });
+    expect((await jobOf(itemId)).lastErrorCode).toBe('live_publish_paused');
+    expect((await intentsOf(job.id)).map((i) => i.outcome)).toEqual(['ambiguous']);
+    expect([fake.creates(), fake.publishes()]).toEqual([1, 0]);
+    // 재개만으로는 보내지 않는다
+    await setLivePublishPaused(db, owner, false);
+    expect((await tick(reg, config)).results).toEqual({});
+    // 재시도(이전: 409 outcome_unknown — 새 계획 말고는 길이 없었다) → beginSend 재검사 → 같은 컨테이너로 게시
+    await retry(itemId);
+    expect((await tick(reg, config)).results).toEqual({ CONFIRMED: 1 });
+    expect([fake.creates(), fake.publishes()]).toEqual([1, 1]);
+    expect((await intentsOf(job.id)).map((i) => i.outcome)).toEqual(['ambiguous', 'accepted']);
+    expect((await listRemoteSteps(db, owner, job.id)).map((s) => s.kind).sort()).toEqual(['container', 'publish', 'publish_attempt']);
+    const unblock = (await eventsOf(job.id)).find((e) => (e.sanitizedDetails as { event?: string }).event === 'unblock');
+    expect(unblock?.sanitizedDetails).toMatchObject({ cause: 'user_retry', previous_error: 'live_publish_paused', unresolved_intent_cleared_by: 'reconcile_resume' });
+  });
+
+  it('결과 불명 의도가 남은 보류 작업이라도 그 앞에 조회의 resume 증명이 없으면 재시도 거부(409 outcome_unknown, 아무것도 바꾸지 않음) — 직접 만든 상태', async () => {
+    const config = cfg('3');
+    const TEXT = '증명 없는 보류 글.';
+    const fake = fakeThreads({ statusFailOnce: new Set([TEXT]) });
+    const p = await planApproved([TEXT]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    expect((await tick(registryWith(fake.fetch, config), config)).results).toEqual({ RECONCILING: 1 });
+    const job = await jobOf(itemId);
+    // 조회(resume) 없이 "중지 보류"가 된 상태를 직접 만든다(코드 경로로는 생기지 않는 상태 — 재시도 판단이 차단 사유만 보지 않고 증명을 요구하는지 고정)
+    const n = ((await db.execute(sql`select coalesce(max(event_seq), 0)::int as n from job_events where job_id = ${job.id}`)).rows as Array<{ n: number }>)[0]!.n;
+    await db.execute(sql`update jobs set state = 'BLOCKED', lease_owner = null, lease_until = null, last_error_code = 'live_publish_paused' where id = ${job.id}`);
+    await db.execute(sql`update distribution_items set status = 'BLOCKED' where id = ${itemId}`);
+    await db.execute(sql`insert into job_events (owner_id, job_id, event_seq, state_before, state_after, at, sanitized_details)
+      values (${owner}, ${job.id}, ${n + 1}, 'RECONCILING', 'BLOCKED', now(), ${JSON.stringify({ event: 'blocked', transition: 'blocked', reason: 'live_publish_paused', not_sent: true })}::jsonb)`);
+    const res = await retryPOST(post(`/api/distribution-items/${itemId}/retry`), ctx(itemId));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('outcome_unknown');
+    expect((await jobOf(itemId)).state).toBe('BLOCKED');
+    expect(fake.publishes()).toBe(0);
+    await cancel(itemId);
+  });
+
+  // FIX-LIVEP2(D, 리뷰 확정 P2 jobs.ts:900): 전송 시작(beginSend) 뒤·게시 시도 표식 전에 커밋된 중지 — 표식 기록 트랜잭션이 같은 잠금 아래에서 다시 보고
+  // 표식·게시 없이 멈춘다. 표식 뒤는 기존 결과 규칙 그대로(아래 시험).
+  it('중지가 전송 시작 뒤·게시 시도 표식 전에 커밋되면: 표식·게시 없이 BLOCKED live_publish_paused(not_sent·의도 rejected), 컨테이너는 남김 → 재개·재시도 → 같은 컨테이너로 게시 1', async () => {
+    const config = cfg('3');
+    const TEXT = '표식 전 중지 글.';
+    const fake = fakeThreads({
+      onCreate: async (t) => {
+        if (t === TEXT && !(await getLivePublishPaused(db, owner)).paused) await setLivePublishPaused(db, owner, true);
+      },
+    });
+    const reg = registryWith(fake.fetch, config);
+    const p = await planApproved([TEXT]);
+    const itemId = p.items[0]!.id;
+    await execute(p.planId);
+    expect((await tick(reg, config)).results).toEqual({ BLOCKED: 1 });
+    const job = await jobOf(itemId);
+    expect(job.lastErrorCode).toBe('live_publish_paused');
+    expect(await lastBlocked(job.id)).toMatchObject({ reason: 'live_publish_paused', not_sent: true, stage: 'before_publish_attempt', error_code: 'live_publish_paused' });
+    expect((await intentsOf(job.id)).map((i) => i.outcome)).toEqual(['rejected']);
+    expect((await listRemoteSteps(db, owner, job.id)).map((s) => s.kind)).toEqual(['container']);
+    expect([fake.creates(), fake.publishes()]).toEqual([1, 0]);
+    await setLivePublishPaused(db, owner, false);
+    expect((await tick(reg, config)).results).toEqual({});
+    await retry(itemId);
+    expect((await tick(reg, config)).results).toEqual({ CONFIRMED: 1 });
+    expect([fake.creates(), fake.publishes()]).toEqual([1, 1]);
+    expect((await listRemoteSteps(db, owner, job.id)).map((s) => s.kind).sort()).toEqual(['container', 'publish', 'publish_attempt']);
+  });
+
+  it('중지가 게시 시도 표식 뒤(게시 요청 중)에 커밋되면 그 게시는 기존 결과 규칙 그대로 확인된다(보류로 바꾸지 않음)', async () => {
+    const config = cfg('3');
+    const TEXT = '표식 뒤 중지 글.';
+    const fake = fakeThreads({
+      onPublish: async (t) => {
+        if (t === TEXT) await setLivePublishPaused(db, owner, true);
+      },
+    });
+    const p = await planApproved([TEXT]);
+    await execute(p.planId);
+    expect((await tick(registryWith(fake.fetch, config), config)).results).toEqual({ CONFIRMED: 1 });
+    expect((await getLivePublishPaused(db, owner)).paused).toBe(true);
+    const job = await jobOf(p.items[0]!.id);
+    expect(job.lastErrorCode).toBeNull();
+    expect((await eventsOf(job.id)).some((e) => (e.sanitizedDetails as { reason?: unknown }).reason === 'live_publish_paused')).toBe(false);
+    expect(fake.publishes()).toBe(1);
+  });
+
   it('중지는 게시 시도 표식을 지난 작업을 바꾸지 않는다: 게시 시간 초과(RECONCILING) 뒤 중지 → 조회 경로 그대로(보류 아님, 재게시 0)', async () => {
     const config = cfg('3');
     const TEXT = '중지 전 결과 불명 글.';
@@ -535,6 +858,55 @@ describe('즉시 중지 스위치(live_publish_controls)', () => {
     expect(await livePublishOverview(db, owner, clockNow())).toMatchObject({ paused: true, used: 1 });
     expect((await livePublishOverview(db, owner, new Date(clockNow().getTime() + DAY + MIN))).used).toBe(0);
   });
+});
+
+// FIX-LIVEP2(F, 리뷰 확정 jobs.ts:730): 승인된 예약 실제 게시가 상한·중지로 보류(attempt 0)된 뒤 예약 시각보다 60분 넘게 지나 재시도하면 D36(오래 지난 예약 자동
+// 전송 금지)이 그대로 적용된다 — 다만 첫 재시도가 대기열에 들어갔다가 tick 에서야 schedule_stale 로 다시 보류되는 헛된 한 바퀴 대신, 재시도 자체가 바로
+// D36 확인 요청(409 schedule_stale)으로 끝나고, 다음 재시도가 기존 D36 명시 확인이 된다(60분 기준·확인 규칙은 바꾸지 않음).
+describe('예약 실제 항목(D36) — 상한·중지 보류 뒤 재시도', () => {
+  for (const cause of ['live_publish_daily_limit', 'live_publish_paused'] as const) {
+    it(`예약 항목이 ${cause} 로 보류 → 예약 시각보다 60분 넘게 지나 재시도: 첫 재시도는 바로 409 schedule_stale(대기열에 넣지 않음·원격 호출 0), 두 번째 재시도(D36 명시 확인)로 게시`, async () => {
+      const config = cfg('1');
+      const fake = fakeThreads();
+      const reg = registryWith(fake.fetch, config);
+      let windowFreeAt = 0;
+      if (cause === 'live_publish_daily_limit') {
+        const a = await planApproved(['예약 상한 앞선 글.']);
+        await execute(a.planId);
+        expect((await tick(reg, config, { planId: a.planId })).results).toEqual({ CONFIRMED: 1 }); // 1/1 사용
+        windowFreeAt = (await intentsOf((await jobOf(a.items[0]!.id)).id))[0]!.createdAt.getTime() + DAY;
+      }
+      const s = await planApproved([`예약 글(${cause}).`], liveAccount, 'public_publish', mskSchedule(clockNow().getTime() + 10 * MIN));
+      const sItem = s.items[0]!.id;
+      const planId = s.planId;
+      await execute(s.planId);
+      const sched = (await itemOf(sItem)).scheduledAtUtc!.getTime();
+      expect((await tick(reg, config, { planId })).results).toEqual({}); // 예약 시각 전
+      if (cause === 'live_publish_paused') await setLivePublishPaused(db, owner, true);
+      frozen = sched + MIN; // 예약 시각 1분 뒤 — 아직 오래되지 않음(D36 통과), 상한·중지로 보류
+      expect((await tick(reg, config, { planId })).results).toEqual({ BLOCKED: 1 });
+      const job = await jobOf(sItem);
+      expect(job.lastErrorCode).toBe(cause);
+      expect(job.attempt).toBe(0);
+      if (cause === 'live_publish_paused') await setLivePublishPaused(db, owner, false);
+      // 창이 풀린 뒤·재개 뒤 — 예약 시각보다 60분 넘게 지남
+      frozen = Math.max(sched + 2 * HOUR, windowFreeAt);
+      const callsBefore = fake.calls.length;
+      await expect(retryItem(db, owner, sItem, clockNow())).rejects.toMatchObject({ code: 'schedule_stale' });
+      const after = await jobOf(sItem);
+      expect(after.state).toBe('BLOCKED');
+      expect(after.lastErrorCode).toBe('schedule_stale');
+      expect(await lastBlocked(job.id)).toMatchObject({ reason: 'schedule_stale', not_sent: true, cause: 'retry_precheck' });
+      expect((await itemOf(sItem)).status).toBe('BLOCKED');
+      expect((await tick(reg, config, { planId })).results).toEqual({}); // 대기열에 들어가지 않았다
+      expect(fake.calls.length).toBe(callsBefore);
+      // 두 번째 재시도 = 오래 지난 예약을 지금 보내겠다는 명시적 확인(D36 그대로) → 게시
+      expect((await retryItem(db, owner, sItem, clockNow())).state).toBe('QUEUED');
+      expect((await tick(reg, config, { planId })).results).toEqual({ CONFIRMED: 1 });
+      expect(await intentsOf(job.id)).toHaveLength(1);
+      expect(fake.publishes()).toBe(cause === 'live_publish_daily_limit' ? 2 : 1);
+    });
+  }
 });
 
 describe('중지·재개 route — 로그인·같은 출처', () => {

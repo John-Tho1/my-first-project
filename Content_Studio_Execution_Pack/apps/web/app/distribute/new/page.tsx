@@ -1,5 +1,5 @@
 import { notFound, redirect } from 'next/navigation';
-import { getContentRow, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
+import { getContentRow, getLivePublishPaused, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
 import { adapterIdFor, CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { Breadcrumbs } from '../../../lib/breadcrumbs';
@@ -119,15 +119,24 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // 화면 확인 D10: 오류로 돌아온 경우에만 입력값을 되살린다(오류 없이 연 화면은 기본 선택 없음 — docs/03).
   const prev = err ? planFormDefaults(q) : planFormDefaults({});
+  // FIX-LIVEP2(리뷰 확정 distribute/new:129 · 계획 3(b)): 실제 게시 계정이 있어도 즉시 중지 중이면 "실제로 게시됩니다" 옆에 일시 중지됨을 함께 보인다(표시용 — 판정은 전송 직전 서버).
+  const hasLiveAccount = accounts.some(isLiveThreadsAccount);
+  const livePaused = hasLiveAccount ? (await getLivePublishPaused(db, session.ownerId)).paused : false;
 
   return (
     <main className="container">
       <Breadcrumbs at={{ page: 'distribute-new', contentId: content.id, title: content.title }} />
       <h2 className="screen-title">배포 계획 만들기 — {content.title}</h2>
-      {accounts.some(isLiveThreadsAccount) ? (
+      {hasLiveAccount ? (
         <p className="notice" role="note">
           <span className="tag live">실제 게시 계정 있음</span> 실제 계정을 고르고 승인·실행하면 <strong>실제로 게시</strong>됩니다(모의 계정은 MOCK). 계획 생성만으로는 승인·게시되지
           않습니다.
+          {livePaused ? (
+            <>
+              {' '}
+              <span className="tag warn">일시 중지됨</span> <strong>지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong>
+            </>
+          ) : null}
         </p>
       ) : (
         <p className="notice" role="note">

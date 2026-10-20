@@ -16,6 +16,7 @@ import {
   sanitizeThreadsDiag,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
+  SCHEDULE_STALE_RETRY_MESSAGE,
   USER_CONFIRMED_LABEL,
   userConfirmCandidateFromEvents,
   userConfirmProblem,
@@ -121,6 +122,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   not_retryable: '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.',
   attempts_exhausted: '시도 한도에 이르렀습니다. 새 배포 계획을 만드세요.',
   outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
+  // FIX-LIVEP2(D36): 상한·중지 등으로 보류된 예약 항목을 예약 시각보다 60분 넘게 지나 재시도 — 대기열에 넣지 않고 확인을 한 번 더 요청
+  schedule_stale: SCHEDULE_STALE_RETRY_MESSAGE,
   // LIVEP1-USERCONFIRM: "Threads에서 확인함" 거절(아무것도 기록하지 않음·외부 호출 없음)
   user_confirm_not_live: '실제 Threads 계정 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(모의 결과는 해당 없음).',
   user_confirm_already_published: '이미 결과가 기록된 항목입니다(다시 기록하지 않았습니다).',

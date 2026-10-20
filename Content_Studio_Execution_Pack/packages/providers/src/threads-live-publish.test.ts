@@ -544,6 +544,30 @@ describe('게시(threads_publish) 중·뒤 결과 불명 — 다시 게시하지
     await expect(a.submit(await a.prepare(snapshot(), c), c)).rejects.toThrow('db down');
     expect(seen.some((s) => s.url.pathname.endsWith('threads_publish'))).toBe(false);
   });
+
+  it('FIX-LIVEP2(D): 표식 기록이 즉시 중지로 거절(live_publish_paused) → 게시 요청 0, 부작용 없는 rejected(live_publish_paused), 컨테이너 참조는 남김 → 다음 submit 은 같은 컨테이너로 게시', async () => {
+    const { a, seen } = adapterWith(happyRoutes());
+    const steps = memSteps();
+    let paused = true;
+    const gated: RemoteStepsPort = {
+      list: steps.list,
+      record: async (s) => {
+        if (s.kind === 'publish_attempt' && paused) throw Object.assign(new Error('paused'), { code: 'live_publish_paused' });
+        return steps.record(s);
+      },
+    };
+    const c = ctxOf(gated);
+    const r = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'live_publish_paused' });
+    expect(classifyOutcome(r).intentOutcome).toBe('rejected');
+    expect(seen.some((s) => s.url.pathname.endsWith('threads_publish'))).toBe(false);
+    expect(steps.rows.map((x) => [x.kind, x.status])).toEqual([['container', 'finished']]);
+    paused = false;
+    const again = await a.submit(await a.prepare(snapshot(), c), c);
+    expect(again).toMatchObject({ status: 'accepted', external_id: `threads:${MEDIA}` });
+    expect(seen.filter((s) => s.method === 'POST' && s.url.pathname === `/v1.0/${USER_ID}/threads`)).toHaveLength(1);
+    expect(seen.filter((s) => s.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+  });
 });
 
 describe('게이트·연결 정보·lease', () => {

@@ -394,7 +394,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | API | 설명 |
 | --- | --- |
 | `PUT /api/distribution-items/{id}/mock-scenario` | `{scenario, delay_ms?}` → `{item_id, scenario, delay_ms, notice:'개발용 · 모의 결과 선택 (실제 채널 없음)'}`. 모의 계정 아님 400 `not_mock_account`, 끝난 항목 409 `item_finished`(POST = HTML 폼) |
-| `POST /api/distribution-items/{id}/retry` | `{}` → `{state:'QUEUED', attempt_next, mode:'MOCK'}`. 보류 아님 409 `not_retryable`, 승인 없음 409 `approval_required`, 결과 불명 409 `outcome_unknown`, 한도 409 `attempts_exhausted`, 내용 변경 409 `snapshot_stale` |
+| `POST /api/distribution-items/{id}/retry` | `{}` → `{state:'QUEUED', attempt_next, mode:'MOCK'}`. 보류 아님 409 `not_retryable`, 승인 없음 409 `approval_required`, 결과 불명 409 `outcome_unknown`(조회가 남은 단계 미게시를 확인한 뒤 중지·일일 상한·연결 정보로 보류된 작업은 예외 — 재시도 가능), 한도 409 `attempts_exhausted`, 내용 변경 409 `snapshot_stale`, 첫 전송 전 보류된 예약이 60분 넘게 지남 409 `schedule_stale`(대기열에 넣지 않음 — 한 번 더 재시도 = 지난 예약 전송 확인, D36) |
 | `GET /api/ops/summary`(로그인) | `ops.attention_plans`(내 확인 필요 계획 수). T12 에서는 공개 `/api/health` 의 `jobs.attention_plans` 였으나 D30-3 에서 옮김 |
 
 - migration `0018_t12_mock_scenarios`: `mock_scenarios`(항목당 1행, 시나리오 CHECK, 지연 0~5000, 모의 계정 항목만 트리거) — **내보내기만**. 계획 상태 CHECK 에 `attention` 추가(기존 `failed`·`partial` 중 확인 없이 보류·불명이 있는 계획은 `attention` 으로 재분류). 브랜드 프로필 새 버전은 옛 브랜드를 가리키는 활성 승인을 `invalidated:brand_changed` 로 철회한다.
@@ -499,9 +499,9 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 
 ### 실제 게시 상한·즉시 중지 (D39, LIVE-P2)
 결정 D39(docs/DECISIONS.md). 실제 Threads 게시를 평상시에 켜 둘 때의 안전장치 두 가지. 실제 호출은 시험에서 0(가짜 fetch 만).
-- **최근 24시간 상한** `PUBLISH_LIVE_DAILY_MAX`(1~50, 비우면 일일 상한 없음 — 이전 동작). 전송 직전(`beginSend`)에 이 owner 의 실제 게시 전송 의도를 최근 24시간 안에 만든 **서로 다른 작업 수**를 세고, 이미 상한이면 보내지 않고 보류(`live_publish_daily_limit`). 같은 작업의 재시도·이어 보내기는 새로 세지 않는다. 화면 문구: "최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. YYYY-MM-DD HH:MM (MSK) 이후 '재시도'로 다시 보낼 수 있습니다." — 그 시각 뒤 항목의 **재시도**로 보낸다(자동 재전송 없음). 승인 기록당 총량 `PUBLISH_LIVE_MAX_POSTS` 는 그대로 함께 적용된다.
-- **즉시 중지** 설정 → **실제 게시** → `실제 게시 일시 중지`(확인 없이 바로, 서버 재시작 없음 — DB `live_publish_controls` 에 저장). 중지 중에는 실제 게시 전송을 보내지 않고 보류(`live_publish_paused`), 모의 전송은 그대로. 이미 게시를 시도한(결과 확인 중) 항목은 바꾸지 않는다. 재개는 확인 칸에 `재개` 를 입력해야 하고, 보류된 항목은 재개 뒤 **재시도**를 눌러야 다시 보낸다. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
-- 표시: 실제 계정이 있으면 홈과 실제 항목이 있는 배포 계획 화면에 "실제 게시: 최근 24시간 n/3" 또는 "실제 게시 일시 중지됨" 한 줄. 설정 화면에 상태(켜짐/일시 중지됨/꺼짐)·최근 24시간 사용.
+- **최근 24시간 상한** `PUBLISH_LIVE_DAILY_MAX`(1~50, 비우면 일일 상한 없음 — 이전 동작). 전송 직전(`beginSend`)에 이 owner 의 실제 게시 전송 의도를 최근 24시간 안에 만든 **서로 다른 작업 수**를 세고, 이미 상한이면 보내지 않고 보류(`live_publish_daily_limit`). 같은 작업의 재시도·이어 보내기는 새로 세지 않는다. 화면 문구: "최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. YYYY-MM-DD HH:MM (MSK) 이후 '재시도'로 다시 보낼 수 있습니다." — 그 시각 뒤 항목의 **재시도**로 보낸다(자동 재전송 없음). 시각은 사용 수가 상한 아래로 내려가는 때(상한을 줄여 사용 수가 상한보다 많아도 맞게)이고 분 단위로 **올려** 보인다(보이는 시각에는 이미 보낼 수 있다). 그 사이 창 안 다른 작업의 재시도가 있으면 더 늦어질 수 있다(판정은 언제나 전송 직전). 예약 항목이 이렇게 보류됐다가 예약 시각보다 60분 넘게 지난 뒤 재시도하면 D36 대로 먼저 확인을 묻는다(첫 재시도는 대기열에 넣지 않고 `schedule_stale`, 한 번 더 누르면 전송). 승인 기록당 총량 `PUBLISH_LIVE_MAX_POSTS` 는 그대로 함께 적용된다.
+- **즉시 중지** 설정 → **실제 게시** → `실제 게시 일시 중지`(확인 없이 바로, 서버 재시작 없음 — DB `live_publish_controls` 에 저장). 중지 중에는 실제 게시 전송을 보내지 않고 보류(`live_publish_paused`), 모의 전송은 그대로. 전송 직전 판정 뒤라도 게시 시도 표식(publish_attempt)을 쓰기 전이면 표식 기록 트랜잭션이 중지를 다시 보고 게시하지 않고 보류한다(만든 컨테이너는 남겨 재시도 때 이어 게시). 이미 게시를 시도한(표식 뒤·결과 확인 중) 항목은 바꾸지 않는다. 결과 불명 뒤 조회가 "남은 단계 미게시"를 확인하고 이어 보내다 중지·일일 상한에 막힌 항목도 재개 뒤 **재시도**로 보낼 수 있다. 재개는 확인 칸에 `재개` 를 입력해야 하고, 보류된 항목은 재개 뒤 **재시도**를 눌러야 다시 보낸다. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
+- 표시: 실제 계정이 있으면 홈과 실제 항목이 있는 배포 계획 화면에 "실제 게시: 최근 24시간 n/3" 또는 "실제 게시 일시 중지됨" 한 줄. 설정 화면에 상태(켜짐/일시 중지됨/꺼짐)·최근 24시간 사용. "실제로 게시됩니다" 안내(배포 계획 만들기·배포함·설정 준비 표시)와 운영의 실제 게시 준비 줄은 중지 중이면 "일시 중지됨"을 함께 보인다.
 - 내보내기·복원: `live_publish_controls` 는 이 환경의 운영 스위치라 묶음에서 제외한다(복원 환경은 "중지 아님"으로 시작 — 복원한 작업은 어차피 다시 보내지 않는다). migration 0046 은 dev 서버를 끈 뒤 `pnpm db:migrate` 로 적용한다.
 - 운영 환경 파일(`deploy/`)에서는 D37(배포 대기) 동안 `PUBLISH_LIVE_DAILY_MAX` 도 비워 둔다(check-env 가 거부).
 

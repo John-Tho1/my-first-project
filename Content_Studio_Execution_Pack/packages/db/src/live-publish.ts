@@ -128,8 +128,13 @@ export interface LivePublishDailyUsage {
   /** 이 작업이 창 안에 이미 실제 전송 의도를 가짐(재시도·이어 보내기 — 새 게시가 아님) */
   thisJobCounted: boolean;
   /**
-   * 다음에 자리가 나는 시각: 센 작업마다의 **가장 최근** 실제 전송 의도 시각 중 가장 이른 것 + 24시간. 그 시각이 되면 창은 `created_at > now − 24h`
-   * 이므로 그 작업이 빠진다(재시도한 작업은 마지막 의도 기준이라 첫 의도 + 24h 보다 늦을 수 있음). 센 작업이 없으면 null.
+   * 다음에 자리가 나는 시각(지금 기록 기준 추정 — 판정은 아님). 센 작업마다의 **가장 최근** 실제 전송 의도 시각(재시도한 작업은 마지막 의도 기준)을
+   * 오름차순으로 놓고:
+   * - limit 이 있고 used ≥ limit: [used − limit] 번째 + 24시간 — 그 시각이 되어야 앞의 used − limit + 1 개 작업이 창(`created_at > now − 24h`)에서
+   *   빠져 used 가 limit 아래로 내려간다(FIX-LIVEP2: 이전에는 가장 이른 것 + 24h 라 used > limit(상한을 줄였거나 복원으로 늘어남)일 때 너무 일렀다).
+   *   used == limit 이면 가장 이른 것 + 24h(이전과 같음).
+   * - 그 밖(limit 없음·used < limit): 가장 이른 것 + 24h(다음에 사용 수가 줄어드는 시각).
+   * 센 작업이 없으면 null. 그 사이 다른 작업의 재시도로 마지막 의도가 늦어지면 실제로는 더 늦어질 수 있다(막는 쪽 — 판정은 언제나 전송 직전).
    */
   availableAt: Date | null;
 }
@@ -137,8 +142,15 @@ export interface LivePublishDailyUsage {
 /**
  * 최근 24시간(`created_at > now − 24h`) 안에 이 owner 의 실제 게시 전송 의도(sanitized_details.live_approval_ref 가 있는 행 — 승인 기록 값과 무관)를
  * 만든 서로 다른 작업 수. 위쪽 끝은 두지 않는다(시계가 앞선 의도도 센다 — 보수적). 권위 있는 판정은 beginSend 가 owner 별 일일 잠금 아래에서 부른다.
+ * limit(PUBLISH_LIVE_DAILY_MAX)은 availableAt 계산에만 쓴다.
  */
-export async function livePublishDailyUsage(tx: DbOrTx, ownerId: string, jobId: string | null, now: Date): Promise<LivePublishDailyUsage> {
+export async function livePublishDailyUsage(
+  tx: DbOrTx,
+  ownerId: string,
+  jobId: string | null,
+  now: Date,
+  limit: number | null = null,
+): Promise<LivePublishDailyUsage> {
   const since = new Date(now.getTime() - LIVE_PUBLISH_DAILY_WINDOW_MS);
   const rows = await tx
     .select({ jobId: sendIntents.jobId, lastAt: max(sendIntents.createdAt) })
@@ -146,15 +158,17 @@ export async function livePublishDailyUsage(tx: DbOrTx, ownerId: string, jobId: 
     .where(and(eq(sendIntents.ownerId, ownerId), sql`${sendIntents.sanitizedDetails}->>'live_approval_ref' is not null`, gt(sendIntents.createdAt, since)))
     .groupBy(sendIntents.jobId);
   const others = rows.filter((r) => r.jobId !== jobId);
-  let earliest: number | null = null;
-  for (const r of others) {
-    const t = r.lastAt instanceof Date ? r.lastAt.getTime() : r.lastAt ? new Date(r.lastAt).getTime() : NaN;
-    if (Number.isFinite(t) && (earliest === null || t < earliest)) earliest = t;
-  }
+  const lastAts = others
+    .map((r) => (r.lastAt instanceof Date ? r.lastAt.getTime() : r.lastAt ? new Date(r.lastAt).getTime() : NaN))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b);
+  const used = others.length;
+  // 날짜를 읽지 못한 행이 있으면(있을 수 없음) 가장 늦은 것으로 — 이른 시각을 약속하지 않게
+  const idx = limit !== null && used >= limit ? Math.min(used - limit, lastAts.length - 1) : 0;
   return {
-    used: others.length,
+    used,
     thisJobCounted: jobId !== null && rows.some((r) => r.jobId === jobId),
-    availableAt: earliest === null ? null : new Date(earliest + LIVE_PUBLISH_DAILY_WINDOW_MS),
+    availableAt: lastAts.length === 0 ? null : new Date(lastAts[idx]! + LIVE_PUBLISH_DAILY_WINDOW_MS),
   };
 }
 
@@ -182,7 +196,8 @@ export async function getLivePublishPaused(tx: DbOrTx, ownerId: string, opts: { 
  * 즉시 중지(paused=true) / 재개(false). 로그인한 소유자만(route 가 세션·같은 출처를 본다). 외부 호출 없음.
  * owner 별 일일 잠금(cs_live_publish_daily:<owner>)을 **먼저** 잡는다 — 다른 잠금은 잡지 않으므로 beginSend(…→ 승인 기록 잠금 → 이 잠금)와 순서가 엇갈리지
  * 않는다. 이미 그 상태면 바꾸지 않고 감사도 남기지 않는다(changed=false). 감사: live_publish_paused / live_publish_resumed(누가 = owner, 언제 = at 만).
- * 중지는 이미 게시 시도 표식을 지난 작업(결과 불명·조회)을 바꾸지 않는다 — 막는 곳은 전송 직전(beginSend)뿐이다.
+ * 중지는 이미 게시 시도 표식을 지난 작업(결과 불명·조회)을 바꾸지 않는다 — 막는 곳은 전송 직전(beginSend)과, FIX-LIVEP2: 그 뒤 게시 시도 표식을 쓰기 직전
+ * (recordRemoteStep publish_attempt — 같은 잠금 아래 다시 확인, 중지면 표식·게시 없이 멈춤) 두 곳이다.
  */
 export async function setLivePublishPaused(db: Db, ownerId: string, paused: boolean, now: Date = new Date()): Promise<{ paused: boolean; changed: boolean; changedAt: Date }> {
   return db.transaction(async (tx) => {
@@ -207,11 +222,15 @@ export async function setLivePublishPaused(db: Db, ownerId: string, paused: bool
   });
 }
 
-/** 화면용 요약(홈·배포 계획·설정): 실제 계정이 있는지, 중지 여부, 최근 24시간 실제 게시 작업 수. 잠금 없음(표시용 — 판정은 beginSend). */
+/**
+ * 화면용 요약(홈·배포 계획·설정): 실제 계정이 있는지, 중지 여부, 최근 24시간 실제 게시 작업 수. 잠금 없음(표시용 — 판정은 beginSend).
+ * limit(PUBLISH_LIVE_DAILY_MAX)을 주면 availableAt 이 "상한 아래로 내려가는 시각"이다(livePublishDailyUsage).
+ */
 export async function livePublishOverview(
   db: DbOrTx,
   ownerId: string,
   now: Date = new Date(),
+  limit: number | null = null,
 ): Promise<{ hasLiveAccount: boolean; paused: boolean; changedAt: Date | null; used: number; availableAt: Date | null }> {
   const live = await db
     .select({ id: channelAccounts.id })
@@ -219,6 +238,6 @@ export async function livePublishOverview(
     .where(and(eq(channelAccounts.ownerId, ownerId), eq(channelAccounts.kind, 'live')))
     .limit(1);
   const control = await getLivePublishPaused(db, ownerId);
-  const usage = await livePublishDailyUsage(db, ownerId, null, now);
+  const usage = await livePublishDailyUsage(db, ownerId, null, now, limit);
   return { hasLiveAccount: live.length > 0, paused: control.paused, changedAt: control.changedAt, used: usage.used, availableAt: usage.availableAt };
 }

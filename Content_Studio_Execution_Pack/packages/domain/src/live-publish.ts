@@ -133,7 +133,8 @@ export const LIVE_PUBLISH_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 전송 직전(beginSend)의 owner 별 advisory 잠금 이름. 잠금 순서(packages/db/src/jobs.ts beginSend): 계정(공유) → 항목 → 작업 → 요청 제한 잠금 →
- * 승인 기록 잠금(cs_live_publish:<ref>) → **이 잠금**. 이 잠금을 잡는 곳은 beginSend 실제(LIVE) 분기와 setLivePublishPaused(다른 잠금 없이 이것만) 둘뿐.
+ * 승인 기록 잠금(cs_live_publish:<ref>) → **이 잠금**. 이 잠금을 잡는 곳은 beginSend 실제(LIVE) 분기, setLivePublishPaused(다른 잠금 없이 이것만),
+ * FIX-LIVEP2: 실제 게시 시도 표식 기록(recordRemoteStep publish_attempt — 요청 제한 잠금(공유) → 이 잠금) 셋뿐이고 모두 같은 방향이다.
  */
 export const livePublishDailyLockName = (ownerId: string): string => `cs_live_publish_daily:${ownerId}`;
 
@@ -147,12 +148,32 @@ export class LivePublishResumeConfirmError extends AppError {
   }
 }
 
-/** 최근 24시간 상한을 다 써서 보내지 않음(보류) — 언제부터 '재시도'로 다시 보낼 수 있는지(모스크바 시각)를 함께 말한다. */
+/** 분 단위 올림(분 아래가 0 이면 그대로). */
+export function ceilToMinute(at: Date): Date {
+  return new Date(Math.ceil(at.getTime() / 60_000) * 60_000);
+}
+
+/**
+ * FIX-LIVEP2: "다시 보낼 수 있는 시각" 표시(모스크바) — 분 단위 **올림**. formatMsk 는 분 아래를 버리므로 그대로 쓰면 실제보다 최대 59초 이른 시각을
+ * 약속한다(그 시각의 재시도는 아직 막힘). 올린 시각에는 창(`created_at > now − 24h`)에서 그 작업이 이미 빠져 있다. 읽을 수 없는 값은 던진다(formatMsk).
+ */
+export function formatLiveAvailableAt(at: Date | string): string {
+  return formatMsk(ceilToMinute(at instanceof Date ? at : new Date(at)));
+}
+
+/** 최근 24시간 상한을 다 써서 보내지 않음(보류) — 언제부터 '재시도'로 다시 보낼 수 있는지(모스크바 시각, 분 단위 올림)를 함께 말한다. */
 export function livePublishDailyLimitMessage(limit: number, availableAt: Date | string | null | undefined): string {
   const at = availableAt ? new Date(availableAt) : null;
-  const when = at && !Number.isNaN(at.getTime()) ? formatMsk(at) : '잠시 뒤';
+  const when = at && !Number.isNaN(at.getTime()) ? formatLiveAvailableAt(at) : '잠시 뒤';
   return `최근 24시간 실제 게시 상한(${limit}건)을 다 써서 게시하지 않았습니다. ${when} 이후 '재시도'로 다시 보낼 수 있습니다.`;
 }
+
+/**
+ * FIX-LIVEP2(D): 즉시 중지가 전송 시작(beginSend) 뒤·게시 시도 표식 전에 커밋됨 — 실제 작업의 단계 창구(RemoteStepsPort.record)가 새 publish_attempt 표식을
+ * 거절할 때의 오류 코드이자, 어댑터가 게시하지 않고 멈춘 결과의 error_code(rejected · transient_no_side_effect). 작업 처리기는 이 결과를 BLOCKED
+ * live_publish_paused(not_sent)로 둔다(재개 뒤 '재시도' — 같은 컨테이너로 이어 게시).
+ */
+export const LIVE_PUBLISH_PAUSED_STEP_CODE = 'live_publish_paused' as const;
 
 /** 즉시 중지 스위치가 켜져 있어 보내지 않음(보류). */
 export const LIVE_PUBLISH_PAUSED_MESSAGE = "실제 게시가 일시 중지되어 게시하지 않았습니다. 설정에서 재개한 뒤 '재시도'로 다시 보낼 수 있습니다.";

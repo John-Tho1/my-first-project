@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 type Acc = { account_id: string; display_name: string; platform: string; mock: boolean; live_publish_target: boolean; status: string; credential_required: boolean; usable_for_execution: boolean; pending_reconcile: string | null };
 type Entry = { plan: { id: string; targetSummary: string; status: string; createdAt: Date }; itemCount: number; channels: string[]; mock: boolean };
 
-const state = vi.hoisted(() => ({ accounts: [] as unknown[], plans: [] as unknown[] }));
+const state = vi.hoisted(() => ({ accounts: [] as unknown[], plans: [] as unknown[], paused: false }));
 
 vi.mock('./auth', () => ({ getSession: async () => ({ ownerId: '00000000-0000-4000-8000-000000000001', identity: 'owner@example.local', expiresAt: new Date() }) }));
 vi.mock('./server', () => ({ getConfig: () => ({}), getAppDb: async () => ({ db: {} }) }));
@@ -18,6 +18,8 @@ vi.mock('@cs/db', async (orig) => ({
   ...(await orig<typeof import('@cs/db')>()),
   listPlans: async () => ({ items: state.plans, next: null }),
   listAccountHealth: async () => state.accounts,
+  // FIX-LIVEP2: 즉시 중지 스위치(표시용 읽기)
+  getLivePublishPaused: async () => ({ paused: state.paused, changedAt: null }),
 }));
 
 const { default: DistributePage } = await import('../app/distribute/page');
@@ -57,6 +59,7 @@ const row = (html: string, name: string) => {
 beforeEach(() => {
   state.accounts = [];
   state.plans = [];
+  state.paused = false;
 });
 
 describe('배포함 안내 — 지금 계정 상태 셋을 구분', () => {
@@ -85,6 +88,18 @@ describe('배포함 안내 — 지금 계정 상태 셋을 구분', () => {
     expect(n).toContain('<strong>실제로 게시</strong>');
     expect(n).toContain('되돌리기 없음');
     expect(n).not.toContain('실제 게시 대상 미지정');
+    expect(n).not.toContain('일시 중지');
+  });
+
+  it('FIX-LIVEP2(계획 3(b)): 실제 게시 대상이 있는데 즉시 중지 중 → 안내에 "일시 중지됨 — 재개 전에는 게시하지 않습니다"를 함께', async () => {
+    state.accounts = [acc({ mock: true }), acc({ mock: false, live_publish_target: true })];
+    state.paused = true;
+    const n = notice(await render());
+    expect(n).toContain('<strong>실제로 게시</strong>');
+    expect(n).toContain('<span class="tag warn">일시 중지됨</span> <strong>지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong>');
+    // 모의 계정만이면 중지 문구 없음(실제 게시 안내 자체가 없다)
+    state.accounts = [acc({ mock: true })];
+    expect(notice(await render())).not.toContain('일시 중지');
   });
 
   it('계정 0개 → "배포 계정 없음"(MOCK 결과라고 말하지 않음)', async () => {

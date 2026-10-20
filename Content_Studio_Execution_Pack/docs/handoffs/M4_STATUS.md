@@ -169,5 +169,24 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 알려진 불안정: `packages/db/src/lock.test.ts`(다중 프로세스 시간 시험) 첫 단위 실행 1건 실패 → 단독·재실행 PASS(이번 작업과 무관한 파일).
 - Codex 큐 줄(나중에 로컬에서 쓸 경우): `ca7228e LIVEP2 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md`, `5739e5a EXPIRY1 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md`.
 - D39 실제 적용(`.env.local` 의 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF=D39·PUBLISH_LIVE_MAX_POSTS=1000·PUBLISH_LIVE_DAILY_MAX=3, `./data` 백업 → `db:migrate`(0046))은 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만 가능 — 그 전까지 게시는 잠김(PUBLISH_MODE=disabled).
-- 진행 중: LIVE-P2·EXPIRY-1 Claude 독립 검토 → 확인된 지적 FIX.
+- (이 줄은 아래 "2026-10-20 — 독립 검토·FIX·보강" 절로 완료됨.)
 - 푸시 메모: 2026-10-19 한때 GitHub 앱 권한 403 → 사용자가 앱 권한 정리 후 해결. 1회 `commit_refs` 일시 오류는 재시도로 해결.
+
+## 2026-10-20 — 독립 검토·FIX·보강(클라우드 세션, Codex 대신 Claude 독립 검토)
+- 방식: 읽기 전용 검토자 5명(관점별) + 지적마다 반박 검증(P0·P1 3표 중 2표, P2 1표). **Codex 판정 아님.** 기록 `D39_CLAUDE_REVIEW.md`(1차 bc24fbe, 2차 41bd767).
+- 1차(LIVE-P2 ca7228e · EXPIRY-1 5739e5a): 확정 21(중복 포함, P1 2 = 같은 시험 누락)·기각 3.
+  - **LIVE-P2 FIX1 7538492**(인계 4865c23): 다음 가능 시각(상한 초과·분 올림), 중지 시험(P1), 결과 불명 → resume → 중지/상한 보류 재시도 가능, 게시 시도 표식 전 중지 재확인, 화면 중지 표시, 오래된 예약 재시도, 잠금 순서 시험, 모의 미집계·화면 연결 시험. unit 1896 · integration 938.
+  - **EXPIRY-1 FIX1 92cd026**(인계 1cb9d3c): 해제 중 연결 경고 제외, 운영 기본 경로 시험, 인증서 교체 되돌리기·원자성, 대소문자 무시 같은 이름, bash 시험 보강. unit 1906 · integration 938 · test-dev-cert 165.
+- 보강 후보 조사(읽기 전용 워크플로): 7개 중 2개는 이미 처리됨(목적 섞인 계획 승인·계획 만들기 입력 = M4UI cd0a2aa, Codex PASS — 위 "클라우드 세션이 남긴 화면·흐름 공백" 문구는 오래된 기록).
+  - **LIVEL1-H2 990fd5d**(인계 41addc3): 복원 시 수동 해결(resolution) 형식 검증, 모의 provider 공통 1인칭(NFC), 경험 claim NFC 중복 제거, 복원 예산·실패 시 값 보존 시험. unit 1931 · integration 952.
+- 2차(7538492 · 92cd026 · 990fd5d): 확정 12(중복 2쌍, 실질 10, **전부 P2**)·기각 2.
+  - **FIX2 561bc5f**: 재개 증명 + 표식만 있는 경우 거부 시험, 잠금끼리 순서 시험, 마지막 시도 표식 전 중지 → 재시도 가능(그 시도 미집계), 설정 다음 가능 시각·오래된 예약 경로 시험, 해제 중 + 정리 대기 연결 경고 제외, dev-cert 정리 중 errexit·신호, 점 이름 거부·백업 누락 가드, 키 누출 단언, 운영자 수동 해결 절차 갱신 + 읽기 전용 `pnpm bundle:check <zip>`.
+  - 마지막 검사(561bc5f, 클라우드 Node 22.22.2): lint·typecheck·build PASS, **unit 81 files / 1934 · integration 51 files / 956** · drill:mock 위반 0 · test-dev-cert.sh 251/251 · lockfile 불변(새 의존성 0) · 외부 호출 0.
+- not_run: Codex(클라우드 불가), FIX2 에 대한 3차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS 의 dev-cert.sh, 사용자 PC 의 실제 인증서, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(잠정 적용):
+  1. LIVE-P2: 게시 시도 표식 전 중지로 끝난 시도를 max_attempts 에 세지 않음(사용자 중지·재개·재시도가 있어야 하므로 유한). 시도 표시가 6/5 처럼 보일 수 있음.
+  2. LIVE-P2: 다음 가능 시각 표시는 다음 분으로 올림. 상한 미설정 = 상한 없음(D39 적용 값 3 으로 해소).
+  3. EXPIRY-1: error·needs_reconnect·expired 실제 연결은 계속 경고, 해제 중·해제됨만 제외. 만료된 인증서도 `check` 는 exit 0.
+  4. LIVEL1-H2: settled_amount 는 actual 과 같음, 단 actual > reserved(상향 재정산·상한)일 때만 더 클 수 있음. 실제 Claude 출력에서 NFC 만 다른 경험 claim 을 합침(확인 수·경고 수가 줄 수 있음). **실제 `./data` 에 옛 형식의 수동 해결 행이 있으면 그 백업 복원이 거부될 수 있으니 적용 전 `pnpm bundle:check` 로 확인.**
+- Codex 큐 줄(나중에 로컬에서 쓸 경우, 순서대로): `ca7228e LIVEP2`, `5739e5a EXPIRY1`, `7538492 FIX1-LIVEP2`, `92cd026 FIX1-EXPIRY1`, `990fd5d LIVEL1H2`, `561bc5f FIX2-D39` — 인계 문서는 각각 `docs/handoffs/{LIVEP2,EXPIRY1,LIVEL1H2}_IMPLEMENTATION_HANDOFF.md`.
+- D39 실제 적용(`.env.local`·`./data` migrate 0046·실제 게시)은 여전히 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만. 게시는 잠긴 상태(PUBLISH_MODE=disabled).

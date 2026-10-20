@@ -40,3 +40,17 @@
   5. 항목 4 A3: 미리보기에 막지 않는 경고를 넣을지, 부분 복원을 막을지?
   6. 월 경계에서 흔들릴 수 있는 고정 기준 시각 시험이 허용 가능한가?
 - Next authorized task: 독립 검토(Claude, Codex 아님) — LIVE-P2 FIX1·EXPIRY-1 FIX1·LIVEL1-H2 → 확인된 지적 FIX.
+
+---
+
+# FIX round 2 (2차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 41bd767 (2차 검토 기록 docs) · **HEAD_SHA: 561bc5f** (`561bc5f9e6c73ca9164913b0e1ab86e786207a68`) — LIVE-P2·EXPIRY-1·LIVEL1-H2 지적을 한 커밋으로 처리.
+- 검토: 2차 Claude 독립 검토(Codex 아님, `D39_CLAUDE_REVIEW.md` 2차) 확정 12건(중복 2쌍, 실질 10건, 전부 P2), 기각 2건.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 51 files / 956 · drill:mock 위반 0 · test-dev-cert.sh 251/251 · bash -n ok · data/dev-certs 생성 없음.
+- FIX round 2 자체는 아직 독립 검토하지 않았다(필요하면 3차 검토). Codex 미검증.
+
+- 지적: 운영자 수동 해결 절차(LIVEL1_IMPLEMENTATION_HANDOFF 4~7단계)가 H2 의 새 복원 규칙을 반영하지 않아, 평소대로 해결한 뒤 만든 백업이 복원 때에야 실패할 수 있음.
+- 변경: 4~7단계 다시 씀 — 키 6개 닫힌 집합, `resolved_at` 은 Z 로 끝나는 UTC, `settled_amount` 소수 6자리이고 상한 경우 외에는 `actual_amount` 와 같음, 4~6단계를 한 문장 SQL 로. 새 읽기 전용 점검 `corepack pnpm bundle:check <zip>`(`packages/db/scripts/bundle-check.ts`) — restore:preview 와 같은 묶음 검증을 DB 를 열지 않고(쓰기·.env.local 없음) 실행, exit 0(통과)/1(무결성 등)/2(사용법). `restore:preview` 는 restore_runs·감사·ZIP 사본을 쓰므로 버려도 되는 DB 에서만 쓰라고 문서화.
+- 시험: 문서의 SQL 블록을 그대로 읽어 같음·상한 두 경우 실행 → 내보내기 → `bundle:check` 통과·복원 미리보기 통과. 흔한 실수 6종(`to_jsonb(now())`, `now()::text`, 키 추가, `"9.95"`, 숫자 9.95, 옛 5키 예) integrity 거부. 실행한 스크립트 exit 0/1/2/1, DATABASE_URL 폴더 미생성. 변이 4종(문서 SQL 2·checkBundleZip·exit 코드) 실패.
+- 남은 위험: 시험이 인계 문서의 SQL 블록 형식에 묶임(문서 형식을 바꾸면 시험 실패), PGlite 용 SQL 콘솔은 여전히 없음, 무결성 메시지는 실패한 칸 이름을 말하지 않음.
+- 검토자에게 물을 것: (1) `bundle:check` 가 아직 provider_unstorable 인 행을 정보로 알려야 하는가? (2) 무결성 메시지에 칸 이름을 넣어야 하는가(H2 정확 문자열 단언 변경 필요)? (3) 시험이 문서의 SQL 을 읽는 결합이 허용되는가?

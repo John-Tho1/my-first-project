@@ -70,3 +70,20 @@
   4. 정리 중 추가 신호 무시가 허용되는가(짧은 cp·mv 동안 중단 불가)?
   5. 출력 전체를 16진 문자로 줄여 비교하는 누출 검사의 거짓 양성 위험이 허용 가능한가?
   6. 키·인증서 자리 폴더 검사를 이 FIX 에 두는가, 따로 뺄 것인가?
+
+---
+
+# FIX round 2 (2차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 41bd767 (2차 검토 기록 docs) · **HEAD_SHA: 561bc5f** (`561bc5f9e6c73ca9164913b0e1ab86e786207a68`) — LIVE-P2·EXPIRY-1·LIVEL1-H2 지적을 한 커밋으로 처리.
+- 검토: 2차 Claude 독립 검토(Codex 아님, `D39_CLAUDE_REVIEW.md` 2차) 확정 12건(중복 2쌍, 실질 10건, 전부 P2), 기각 2건.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 51 files / 956 · drill:mock 위반 0 · test-dev-cert.sh 251/251 · bash -n ok · data/dev-certs 생성 없음.
+- FIX round 2 자체는 아직 독립 검토하지 않았다(필요하면 3차 검토). Codex 미검증.
+
+| 지적 | 변경 | 시험·증거 |
+|---|---|---|
+| 해제 중이면서 정리 대기(health error)인 연결에 경고 | `accountHealthView` 가 원래 `credential_status` 노출, `isLiveThreadsCredential` 이 그 값의 revoking/revoked 도 제외. 정리 대기 때문에만 error 인 연결은 계속 경고 | 도메인 시험 + 실제 accountHealthView 를 홈·설정에 넣은 렌더 시험(수정 전 실패, 검사 제거 시 경고 다시 표시) |
+| EXIT trap·swap_fail 안 errexit 로 정리·되돌리기가 끊김 | `cleanup()`·`swap_fail()` 시작에서 `set +e`, HUP·INT·TERM·PIPE 무시 | 두 rename 사이 TERM/HUP/INT + stderr `/dev/full`·닫힌 fd, 끊긴 파이프, 인증서 이동 실패 + /dev/full·닫힌 fd: 이전 rc 1/141·짝 불일치·임시 파일 → 이후 rc 143/129/130/1, 원래 짝 바이트 동일·임시 파일 없음 |
+| 점으로 시작하는 이름이 백업 glob 에서 빠짐 | `valid_name` 이 앞 점 거부(exit 2, "점(.)으로 시작할 수 없습니다") + 교체할 키·인증서가 백업에 없으면 옮기기 전 중단(대소문자 무시 FS 틈 보완) | 이름 4경우, 실제 `.k.pem` 폴더(그대로·백업 없음), 백업에서 키를 빼는 가짜 cp. 정규식 되돌림 10건·가드 제거 6건 실패 |
+| 교체 실패 4경우에 키 누출 단언 없음 | swap-nokey·swap-key·swap-term2·swap-dir 에 새 키 캡처 + `expect_no_key_in`(swap-dir 는 키 미생성도) | 각 경로에서 키를 출력하는 변이 모두 잡힘 |
+
+- test-dev-cert.sh: 이전 스크립트로 198 통과 / 53 실패 → 수정 후 251/251. `/dev/full` 없는 환경은 해당 경우 건너뜀, `mkfifo` 없으면 FIFO 경우 건너뜀. Git Bash·macOS 실행 안 함.

@@ -73,3 +73,22 @@
   3. F: unblock → blocked 두 사건 대신 BLOCKED → BLOCKED 전용 전이가 필요한가? 사전 확인을 상한·중지 보류로만 좁혀야 하는가?
   4. 표식 트랜잭션(cs_rate 공유 → 일일 → 스위치 → 단계 행)이 beginSend(cs_rate 배타 → ref → 일일)·setLivePublishPaused 와 교착할 수 있는가?
   5. G: 잠금 순서 시험이 PGlite 디버그 로그에 의존하는 것이 허용 가능한가?
+
+---
+
+# FIX round 2 (2차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 41bd767 (2차 검토 기록 docs) · **HEAD_SHA: 561bc5f** (`561bc5f9e6c73ca9164913b0e1ab86e786207a68`) — LIVE-P2·EXPIRY-1·LIVEL1-H2 지적을 한 커밋으로 처리.
+- 검토: 2차 Claude 독립 검토(Codex 아님, `D39_CLAUDE_REVIEW.md` 2차) 확정 12건(중복 2쌍, 실질 10건, 전부 P2), 기각 2건.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 51 files / 956 · drill:mock 위반 0 · test-dev-cert.sh 251/251 · bash -n ok · data/dev-certs 생성 없음.
+- FIX round 2 자체는 아직 독립 검토하지 않았다(필요하면 3차 검토). Codex 미검증.
+
+| 지적 | 변경 | 시험·증거 |
+|---|---|---|
+| 재개 증명 + 표식만 있고 게시 없음 → 재시도 거부 가드 시험 없음 | 시험만 | 증명 체인 뒤 SQL 로 publish_attempt 행 삽입 → 409 outcome_unknown·BLOCKED 유지·unblock 없음·의도 그대로·게시 0. `|| unresolvedAttempts > 0` 제거 변이 실패 |
+| 잠금 순서 시험이 잠금끼리 순서를 안 봄 | 시험 확장 | beginSend cs_rate(배타) → ref → 일일(일일 1회), 표식 트랜잭션 cs_rate(공유) → 일일 — 각각 같은 트랜잭션. 변이 3종(remote-steps 순서 바꾸기·일일을 ref 앞·일일을 cs_rate 앞) 실패 |
+| 마지막 시도에서 표식 전 중지 → 재개 뒤 재시도가 409 attempts_exhausted | 표식 전 중지로 끝난 시도는 max_attempts 에 세지 않음(resume_count +1, `resume_count < attempt` 가드, 이벤트 counted:false). 유한: BLOCKED 라 매번 사용자 중지·재개·재시도 필요. migration 없음(스키마 주석만) | 4회 실패 → 5/5 에서 중지 → 재개만으로는 0건 → 재시도로 같은 컨테이너 1회 게시(이전 409) |
+| 설정 "다음 게시 가능" 끝까지 시험 없음 | 시험만 | `livePublishOverview(...,2).availableAt` = sorted[used−limit]+24h, `formatLiveAvailableAt` 문자열, 상한 없음·3 이면 earliest+24h. 상한 전달 제거 변이 실패 |
+| F(오래된 예약) 경로·폼 결과 시험 없음 | 시험만 | 실제 재시도 경로(Date 만 대체): JSON 409 + SCHEDULE_STALE 문구·late_minutes ≥ 60, 폼 303 `?error=schedule_stale` 한국어 문구, 두 번째 폼 재시도 retried=1·게시. `distributeFormFailure` 단위. 문구 제거 변이 실패 |
+
+- 남은 위험: 배포 화면의 `시도 {attempt}/{max}` 가 표식 전 중지 재시도 뒤 6/5 로 보일 수 있음(upload_yield 와 같은 기존 특성), 중지로 돌려받은 시도가 원격 처리 재개와 resume_count 예산을 공유(일찍 세는 쪽으로만).
+- 검토자에게 물을 것: (1) 표식 전 중지 시도를 세지 않는 규칙이 맞는가, "새 계획" 안내로 바꿔야 하는가? (2) 시도 표시를 `attempt − resume_count` 로 바꿔야 하는가?

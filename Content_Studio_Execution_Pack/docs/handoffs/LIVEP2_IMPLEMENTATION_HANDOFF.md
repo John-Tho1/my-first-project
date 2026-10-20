@@ -46,3 +46,30 @@
   5. 중지 중이거나 일일 상한일 때 `executePlan` 이 거부(또는 경고)해야 하는가, 지금처럼 대기열에 넣고 전송 시점에 막는 것이 맞는가?
   6. 창 상한이 없어 미래 시각 의도까지 세는 보수적 선택이 허용 가능한가?
 - Next authorized task: EXPIRY-1(D39 Task B).
+
+---
+
+# FIX round 1 (Claude 독립 검토 — Codex 아님, `D39_CLAUDE_REVIEW.md`)
+- BASE_SHA: bc24fbe (검토 기록 docs) · **HEAD_SHA: 7538492** (`7538492e6f1a1ba6d167016591798d7559692fc6`)
+- 검토: 읽기 전용 검토자 5명 + 지적마다 반박 검증. LIVE-P2 확정 14건(중복 포함, P1 2건은 같은 내용) → 아래 A~H 로 묶어 처리. 기각: "표식 전 중지 미적용" P1 판정(같은 내용의 P2 는 확정 → D), "상한 미설정 = 상한 없음은 실패 개방"(설계상 하위 호환, D39 적용 값으로 해소).
+
+| 묶음 | 지적 | 변경 | 시험(실패 → 통과 증거) |
+|---|---|---|---|
+| A | 상한 초과 시 다음 가능 시각이 이르다, 분 잘림 | used ≥ 상한이면 작업별 마지막 의도 오름차순 [used − 상한] + 24h, 표시는 다음 분 올림(`formatLiveAvailableAt`) | 통합 ~392(기존 단언이 확정된 오류 값 → 올바른 값으로 교체), ~321(잘린 분 → 올림), 옛 시각 재시도 차단·1분 전 차단·새 시각 전송 |
+| B (P1) | 중지 시험 누락 | 코드 변경 없음(이미 맞음) | 창 안 의도가 있는 작업의 재시도도 중지(상한 없음·3), 상한 미설정 중지 — 변이(이미 집계 작업 중지 면제·상한 있을 때만 중지 검사) 각각 실패 |
+| C | 결과 불명 → resume → 중지/상한 보류 = 재시도 막다른 길 | `resumeProvenRetryable`(domain) + `retryItem`: 마지막 사건이 not_sent 보류(중지·일일 상한·credential_blocked)이고 거슬러 올라가며 허용 사건만 지나 같은 attempt 의 `resume`(reconcile resumable)에 닿을 때만 허용, 표식 있는데 게시 없음이면 거부. unblock 사건·감사에 `unresolved_intent_cleared_by: reconcile_resume` | 막다른 길 → 재시도로 컨테이너 1·게시 1(이전 409), resume 증명 없는 상태는 계속 409(SQL 로 구성) — 증명 요구 제거 변이에서 실패 |
+| D | beginSend 뒤·표식 전 중지 무시 | 표식 트랜잭션에서 cs_rate(공유) → 일일 잠금 → 스위치 행(FOR SHARE) 확인, 중지면 표식·게시 없이 컨테이너 유지 → BLOCKED(not_sent, before_publish_attempt, 의도 rejected — 일반 재시도 가능, 시도 횟수 1 소모). 표식 이후는 기존 규칙 | 이전 `{CONFIRMED:1}`(중지 중 게시) → BLOCKED, 재개·재시도로 같은 컨테이너 게시 1회. 표식 뒤 중지는 정상 확인. 게이트 제거 변이에서 실패 |
+| E | 중지 중에도 준비 표시가 "게시됨" 취지 | 계획 만들기·배포 목록·ops 에 "일시 중지됨"(설정과 같은 문구), ops 빈 목록은 "없음(준비됨)" | `live-publish-render.test.ts`, 목록 렌더 중지 경우, ui-safety 토큰 — 옛 화면에서 4건 실패 |
+| F | 오래된 예약(D36) 보류 항목은 재시도 두 번 필요 | attempt 0·60분 초과·미확인 예약 항목의 재시도는 schedule_stale 로 다시 보류하고 409(대기열에 넣지 않음) → 다음 재시도가 기존 D36 확인 | daily_limit·paused 두 경우: 이전 첫 재시도 대기열 → 이후 409·원격 호출 0, 두 번째 재시도 게시 |
+| G | 경쟁 시험이 잠금을 증명한다고 과장 | 기존 시험 이름·주석 수정, 새 잠금 순서 시험(PGlite SQL 순서 + pg_locks): beginSend(상한 유무)·표식 트랜잭션·setLivePublishPaused | 잠금 제거(두 곳)·중지 읽기 뒤로 이동 변이 각각 실패 |
+| H | 모의 집계·화면 연결 시험 누락 | 시험만 | 상한 가득 찬 상태 모의 확인·used 3 유지, 실제 loadConfig 로 홈·설정·계획 화면 n/상한·중지 |
+
+- 잠금 순서(갱신): beginSend `cs_rate:<계정>`(배타) → `cs_live_publish:<ref>` → `cs_live_publish_daily:<owner>` → 스위치 행(FOR SHARE) / 표식 트랜잭션 `cs_rate:<계정>`(공유) → 일일 잠금 → 스위치 행 → 단계 행 / setLivePublishPaused 일일 잠금 → 스위치 행. 모두 같은 방향.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 80 files / 1896 · integration 51 files / 938(LIVE-P2 시험 11 → 21) · drill:mock 위반 0. check-env 미변경(시험 미실행).
+- 남은 위험: 다음 가능 시각은 현재 자료 기준 추정(창 안 다른 작업이 재시도하면 실제는 더 늦을 수 있음 — 막을 뿐 초과 게시 없음), resume 뒤 `execution_not_allowed`·`live_publish_limit`·`adapter_changed` 보류는 여전히 재시도 불가(이번 범위 밖), 잠금 순서 시험은 PGlite 디버그 로그 형식에 의존(바뀌면 크게 실패), F 경로는 주입 시계로 `retryItem` 직접 호출(HTTP 경로는 실제 시계), 실제 Postgres 다중 연결·브라우저·실제 Threads 미실행.
+- 검토자에게 물을 것:
+  1. D: BLOCKED(의도 rejected, 시도 1 소모) 정산이 맞는가? 순환 import 를 피하려 `remote-steps.ts` 가 스위치 행을 직접 읽는 것이 허용되는가?
+  2. C: resume 과 마지막 보류 사이 허용 사건 집합이 충분히 좁은가? `execution_not_allowed`·`live_publish_limit` 도 나중에 넣어야 하는가?
+  3. F: unblock → blocked 두 사건 대신 BLOCKED → BLOCKED 전용 전이가 필요한가? 사전 확인을 상한·중지 보류로만 좁혀야 하는가?
+  4. 표식 트랜잭션(cs_rate 공유 → 일일 → 스위치 → 단계 행)이 beginSend(cs_rate 배타 → ref → 일일)·setLivePublishPaused 와 교착할 수 있는가?
+  5. G: 잠금 순서 시험이 PGlite 디버그 로그에 의존하는 것이 허용 가능한가?

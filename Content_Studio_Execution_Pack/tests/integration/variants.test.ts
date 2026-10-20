@@ -299,6 +299,20 @@ describe('A03 — 채널 초안 검토', () => {
     await confirmClaims(db, ownerA, id, r.run.id, idx, 'confirmed');
     expect((await lifecycle(v, { lifecycle: 'review', base_version: 1 })).status).toBe(200);
   });
+
+  it('LIVEL1-H2: 원고 현재 본문이 NFD 1인칭이면 채널 AI 초안(모의, 채널 초안 경로)도 experience claim — 채택한 초안의 검토 409, 확인하면 200', async () => {
+    const nfd = '제가 직접 가격 조건을 제안했습니다.'.normalize('NFD');
+    const id = await newContent(ownerA, nfd);
+    const body = await (await createVariant(id, { channel: 'blog', mode: 'ai_draft', base_version: 1 })).json();
+    const rows = await db.select().from(schema.claims).where(eq(schema.claims.runId, body.run.id));
+    expect(rows.map((x) => [x.statement, x.kind])).toEqual([[nfd, 'experience']]);
+    expect((await adopt(body.variant.id, body.proposal.id, { base_version: 0 })).status).toBe(201);
+    const res = await lifecycle(body.variant.id, { lifecycle: 'review', base_version: 2 });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('unconfirmed_experience_claims');
+    await confirmClaims(db, ownerA, id, body.run.id, [0], 'confirmed');
+    expect((await lifecycle(body.variant.id, { lifecycle: 'review', base_version: 2 })).status).toBe(200);
+  });
 });
 
 describe('배포 파일(수동 게시용)', () => {

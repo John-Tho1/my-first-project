@@ -421,6 +421,30 @@ describe('assist(모의) · 채택 · A03', () => {
     expect((await contentRow(id)).lifecycle).toBe('ready');
   });
 
+  it('LIVEL1-H2: NFD 1인칭 답변 → 모의 experience claim(원문 NFD 그대로), ready 원고에 채택 409 unconfirmed_experience_claims, 확인 뒤 채택 201', async () => {
+    const id = (await createContent(db, ownerA, { title: 'NFD 원고', body: '이미 준비된 본문' })).content.id;
+    expect((await setLifecycle(id, 'review')).status).toBe(200);
+    expect((await setLifecycle(id, 'ready')).status).toBe(200);
+    const nfd = '저는 현장에서 직접 계약을 마무리했습니다.'.normalize('NFD');
+    expect(nfd).not.toBe(nfd.normalize('NFC'));
+    const ans = await (await answersPost(id, { answers: { judgment: nfd } })).json();
+    const r = await (await assist(id, { mode: 'draft', base_version: 1, brand_profile_version: 2, answer_ids: [ans.current[0].id] })).json();
+    const claims = r.claims as Array<{ text: string; kind: string; needs_user_confirmation: boolean }>;
+    expect(claims.filter((c) => c.kind === 'experience')).toEqual([expect.objectContaining({ text: nfd, needs_user_confirmation: true })]);
+    const rows = await db.select().from(schema.claims).where(eq(schema.claims.runId, r.run.id));
+    expect(rows.filter((x) => x.kind === 'experience').map((x) => x.statement)).toEqual([nfd]);
+    const before = await contentRow(id);
+    const versions = await versionCount(id);
+    const blocked = await adopt(id, r.run.id, { base_version: 1 });
+    expect(blocked.status).toBe(409);
+    expect((await blocked.json()).error).toBe('unconfirmed_experience_claims');
+    expect(await versionCount(id)).toBe(versions);
+    expect((await contentRow(id)).currentVersionId).toBe(before.currentVersionId);
+    const expIdx = claims.map((c, i) => (c.kind === 'experience' ? i : -1)).filter((i) => i >= 0);
+    expect((await confirm(id, { run_id: r.run.id, claim_indexes: expIdx })).status).toBe(200);
+    expect((await adopt(id, r.run.id, { base_version: 1 })).status).toBe(201);
+  });
+
   it('폼 경로: assist 303 → ?run=, 오래된 base → ?error=stale', async () => {
     const other = (await createContent(db, ownerA, { title: '폼 원고', body: '폼 본문' })).content.id;
     const form = (fields: Record<string, string>) =>

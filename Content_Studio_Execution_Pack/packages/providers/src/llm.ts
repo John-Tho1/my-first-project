@@ -57,6 +57,8 @@ const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|�
 /**
  * LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다.
  * LIVEL1-H1: 판별 전에 NFC 로 정규화한다 — 분해형(NFD) 한글 "저는" 도 같은 표현으로 잡는다(원문은 바꾸지 않음).
+ * LIVEL1-H2: 모의 provider(MockLlmProvider)도 이 함수로 판별한다 — live 와 같은 판정. NFC 는 순수 함수라 결정성은 그대로이고,
+ * NFC 입력의 모의 출력은 전과 같다(바뀌는 것은 NFC 가 아닌 입력의 claim 종류뿐 — 확인이 필요한 쪽으로).
  */
 export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text.normalize('NFC'));
 
@@ -90,7 +92,7 @@ export class MockLlmProvider implements LlmProvider {
     );
     const sentences = splitSentences(input.text).slice(0, 3);
     const claims = sentences.map((s) => {
-      const firstPerson = FIRST_PERSON.test(s);
+      const firstPerson = hasFirstPersonExpression(s);
       return {
         text: s,
         kind: firstPerson ? ('experience' as const) : ('opinion' as const),

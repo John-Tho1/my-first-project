@@ -15,6 +15,7 @@
  */
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { toMicro } from './budget';
 import { CONTENT_LIFECYCLES } from './content';
 import { canonicalPayloadProblems, MOCK_EXTERNAL_PREFIX, payloadHash, PLAN_STATUSES } from './distribution';
 import { AppError } from './errors';
@@ -1255,6 +1256,60 @@ const LEDGER_USAGE_SOURCES = new Set(['provider', 'estimate', 'none', 'provider_
 const isReportedTokens = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})$/.test(v);
 const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})\.\d{6}$/.test(v);
 
+/**
+ * LIVEL1-H2: provider_unstorable 수동 해결 기록(인계 LIVEL1 "수동 해결 절차" 4~6)의 `pricing_snapshot.resolution` 형식.
+ * 제품 코드는 이 객체를 쓰지 않는다(화면·API 없음) — 묶음에 있으면 운영자의 직접 DB 수정이거나 변조다.
+ * 규칙(모두 맞아야 한다):
+ *  (a) 행의 usage_source 가 'provider' 또는 'none'(절차 6 — 차단을 푼 뒤). estimate·없음·provider_unstorable(반쯤 끝난 상태)은 거부.
+ *  (b) 평범한 객체이고 키가 정확히 RESOLUTION_KEYS 여섯 개(빠지거나 모르는 키는 거부).
+ *  (c) resolved_at: UTC ISO 시각(Z — 다른 시각 열과 같은 TS_RE).
+ *  (d) resolved_by: 비어 있지 않은 문자열, 최대 200자. reason: 비어 있지 않은 문자열, 최대 4000자(구현자가 정한 상한).
+ *  (e) settled_amount: 정수부(앞자리 0 없음, 최대 40자리) + 소수 정확히 6자리 — original_reported.reported_cost 와 같은 형식이라
+ *      numeric(18,6) 를 넘는 실제 청구액도 적을 수 있다. 행은 state 'settled' 이고 actual_amount 가 있어야 하며,
+ *      재정산액 = 확정액(micro 비교 — '9.95' 와 '9.950000' 은 같다) 이 원칙이다.
+ *      재정산액 > 확정액 은 **확정액을 위로 재정산해 상한으로 깎은 경우**(절차 5: 실제 청구가 numeric(18,6)·예산을 넘으면
+ *      actual_amount 는 그 범위의 최대값, 사유에 기록)만 허용한다 — 판별 기준은 확정액 > 예약액(재정산이 실제로 일어남).
+ *      재정산액 < 확정액, 또는 확정액이 예약액 그대로인데 재정산액만 큰 경우(절차 5 를 빠뜨림 — 월 합계가 재정산액을 모름)는 거부.
+ *  (f) original_usage_source === 'provider_unstorable'.
+ *  (g) original_reported: 키가 정확히 reported_tokens_in·reported_tokens_out·reported_cost 이고 각 값이 FIX4 보고값 형식.
+ * 오류 문구에는 값을 넣지 않는다(다른 무결성 문제와 같다). 런타임 차단(hasUnresolvedLiveUsage)·월 합계(actual_amount)는 바꾸지 않는다.
+ */
+const RESOLUTION_KEYS = ['resolved_at', 'resolved_by', 'reason', 'settled_amount', 'original_usage_source', 'original_reported'] as const;
+const ORIGINAL_REPORTED_KEYS = ['reported_tokens_in', 'reported_tokens_out', 'reported_cost'] as const;
+const RESOLUTION_RESOLVED_BY_MAX = 200;
+const RESOLUTION_REASON_MAX = 4000;
+/** 묶음 `amount`(numeric(18,6) 문자열)와 같은 형식 — toMicro 가 던지지 않는 것만 넘긴다(AmountRangeError 는 integrity 가 아님). */
+const LEDGER_AMOUNT_RE = /^\d{1,12}(\.\d{1,6})?$/;
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const hasExactlyKeys = (o: Record<string, unknown>, keys: readonly string[]) => {
+  const own = Object.keys(o);
+  return own.length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(o, k));
+};
+const isNonBlank = (v: unknown, max: number) => typeof v === 'string' && v.trim() !== '' && v.length <= max;
+
+function isValidResolution(
+  snap: Record<string, unknown>,
+  row: { state: string; reserved_amount: unknown; actual_amount: unknown },
+): boolean {
+  if (snap.usage_source !== 'provider' && snap.usage_source !== 'none') return false; // (a)
+  const res = snap.resolution;
+  if (!isPlainObject(res) || !hasExactlyKeys(res, RESOLUTION_KEYS)) return false; // (b)
+  if (typeof res.resolved_at !== 'string' || !TS_RE.test(res.resolved_at)) return false; // (c)
+  if (!isNonBlank(res.resolved_by, RESOLUTION_RESOLVED_BY_MAX) || !isNonBlank(res.reason, RESOLUTION_REASON_MAX)) return false; // (d)
+  if (res.original_usage_source !== 'provider_unstorable') return false; // (f)
+  const orig = res.original_reported;
+  if (!isPlainObject(orig) || !hasExactlyKeys(orig, ORIGINAL_REPORTED_KEYS)) return false; // (g)
+  if (!isReportedTokens(orig.reported_tokens_in) || !isReportedTokens(orig.reported_tokens_out) || !isReportedCost(orig.reported_cost)) return false;
+  // (e) — 형식을 모두 확인한 뒤에만 micro 로 바꾼다
+  if (!isReportedCost(res.settled_amount) || row.state !== 'settled') return false;
+  if (typeof row.actual_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.actual_amount)) return false;
+  if (typeof row.reserved_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.reserved_amount)) return false;
+  const settled = BigInt((res.settled_amount as string).replace('.', '')); // 소수 정확히 6자리 → micro
+  const actual = toMicro(row.actual_amount);
+  if (settled === actual) return true;
+  return settled > actual && actual > toMicro(row.reserved_amount);
+}
+
 /** 묶음 안 참조 무결성: PK 중복 없음, 모든 FK 대상이 묶음 안에 있음, 현재 버전은 그 원고의 버전. */
 export function checkIntegrity(t: BundleTables): void {
   const problems: string[] = [];
@@ -1344,6 +1399,8 @@ export function checkIntegrity(t: BundleTables): void {
     } else if (reportedKeys.some(has)) {
       problems.push('usage_ledger.pricing_snapshot: reported_* 는 usage_source=provider_unstorable 에서만');
     }
+    // LIVEL1-H2: 수동 해결 기록이 있으면 형식·출처·재정산액을 검사한다(isValidResolution). 없으면 지금과 같다.
+    if (has('resolution') && !isValidResolution(snap, r)) problems.push('usage_ledger.pricing_snapshot.resolution 형식');
   }
   // T08: job 은 묶음 안 파일, 전사 버전은 그 job 의 것(버전 번호 unique), job 의 첫 전사는 같은 job 의 버전, 소재의 전사는 묶음 안.
   const transcriptJob = new Map(t.transcripts.map((x) => [x.id, x.job_id]));

@@ -346,6 +346,16 @@ describe('FIX-T06 round 2: 본문 포함 검사와 제외 해결', () => {
     expect(bodyContainsClaim('아무 본문', '...!?')).toBe(true);
   });
 
+  it('LIVEL1-H2(지금 동작 고정): NFD·NFC 로만 다른 본문·claim 도 "있음" — NFD 로 다시 넣은 문장은 removed 를 다시 미해결로', () => {
+    const nfd = claim.normalize('NFD');
+    expect(nfd).not.toBe(claim);
+    expect(bodyContainsClaim(nfd, claim)).toBe(true);
+    expect(bodyContainsClaim(claim, nfd)).toBe(true);
+    const removed = [{ runId: 'r', claimIndex: 0, resolution: 'removed' }];
+    expect(isClaimResolved('r', 0, claim, removed, `다시 넣음 ${nfd}`)).toBe(false);
+    expect(isClaimResolved('r', 0, nfd, removed, `다시 넣음 ${claim}`)).toBe(false);
+  });
+
   it('isClaimResolved: confirmed 는 영구, removed 는 현재 본문에 없을 때만, 본문을 모르면 미해결', () => {
     const removed = [{ runId: 'r', claimIndex: 0, resolution: 'removed' }];
     const confirmed = [{ runId: 'r', claimIndex: 0, resolution: 'confirmed' }];

@@ -22,6 +22,8 @@ import {
   getAccountHealth,
   oauthTestHooks,
   getDb,
+  getRestoreRun,
+  insertAsset,
   listChannelAccounts,
   parseBundleZip,
   refreshExpiringCredentials,
@@ -31,9 +33,22 @@ import {
   schema,
   seed,
   setVariantLifecycle,
+  type BlobStore,
   type Db,
 } from '@cs/db';
-import { buildBundle, loadConfig, OAuthProviderError, openSecret, requireSecretKeyring, sealSecret, writeZip, type BundleTables, type Channel } from '@cs/domain';
+import {
+  buildAssetKey,
+  buildBundle,
+  loadConfig,
+  OAuthProviderError,
+  openSecret,
+  requireSecretKeyring,
+  sealSecret,
+  sha256Hex,
+  writeZip,
+  type BundleTables,
+  type Channel,
+} from '@cs/domain';
 import { createMockAdapterRegistry, LocalStorageAdapter, mockOAuthStore, MockThreadsOAuthProvider } from '@cs/providers';
 import { GET as accountsGET } from '../../apps/web/app/api/channel-accounts/route';
 import { POST as connectPOST } from '../../apps/web/app/api/channel-accounts/[id]/connect/route';
@@ -957,6 +972,48 @@ describe('FIX P1 #4 — 복원의 연결 이력 규칙', () => {
     } finally {
       await h.close();
     }
+  });
+
+  it('LIVEL1-H2: add_missing 커밋이 파일 단계에서 실패하면 로컬 none→needs_reconnect UPDATE 도 되돌린다 — 대조: 실제 저장소로 다시 하면 needs_reconnect', async () => {
+    const x = await newThreadsAccount();
+    const y = await newThreadsAccount();
+    await connectFully(x);
+    await connectFully(y);
+    // 파일 단계가 실제로 돌도록 묶음에 "새" 파일 하나 — 내보내기 전에 넣고, 내보낸 뒤 행을 지운다(참조 없는 새 파일)
+    const storage = new LocalStorageAdapter(path.join(tmp, 'assets'));
+    const assetId = randomUUID();
+    const key = buildAssetKey(ownerA, assetId);
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9]);
+    await storage.put(key, bytes);
+    await insertAsset(db, { id: assetId, ownerId: ownerA, key, mime: 'image/png', bytes: bytes.byteLength, checksum: sha256Hex(bytes), rightsStatus: 'owned', verificationState: 'VERIFIED' });
+    const exported = await exportOwner(db, storage, ownerA, { outDir: path.join(tmp, 'exp-h2-fail') });
+    const zip = new Uint8Array(readFileSync(exported.zipPath));
+    await db.delete(schema.assets).where(eq(schema.assets.id, assetId));
+    // x 를 "연결 전 상태"로(위 시험과 같은 구성)
+    await db.delete(schema.oauthCredentials).where(eq(schema.oauthCredentials.channelAccountId, x));
+    await db.update(schema.channelAccounts).set({ credentialState: 'none' }).where(eq(schema.channelAccounts.id, x));
+    const restoresDir = path.join(tmp, 'restores-h2-fail');
+    const p = await createRestorePreview(db, ownerA, zip, { restoresDir, source: 'upload' });
+    expect(p.preview.reconnect_required_accounts).toContain(x);
+    expect(p.preview.tables.assets).toMatchObject({ new: 1 });
+    const failingStore: BlobStore = { put: async () => {}, get: async () => new Uint8Array([0]) };
+    const err = await commitRestore(db, failingStore, ownerA, p.restoreId, { mode: 'add_missing', confirm: true, restoresDir }).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err?.message).toContain('checksum');
+    expect((await accountRow(x)).credentialState).toBe('none');
+    expect((await getAccountHealth(db, ownerA, x)).status).toBe('not_connected');
+    expect((await accountRow(y)).credentialState).toBe('linked');
+    expect((await getRestoreRun(db, ownerA, p.restoreId))?.status).toBe('failed');
+    expect(await db.select().from(schema.assets).where(eq(schema.assets.id, assetId))).toEqual([]);
+    // 대조: 새 미리보기 + 실제 저장소 → 같은 UPDATE 가 실제로 일어난다(위의 되돌림이 진짜였음)
+    const p2 = await createRestorePreview(db, ownerA, zip, { restoresDir, source: 'upload' });
+    const r = await commitRestore(db, storage, ownerA, p2.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+    expect(r.reconnect_required_accounts).toContain(x);
+    expect(r.assets_verified).toBe(1);
+    expect((await accountRow(x)).credentialState).toBe('needs_reconnect');
+    expect(await getAccountHealth(db, ownerA, x)).toMatchObject({ status: 'needs_reconnect', usable_for_execution: false });
   });
 });
 

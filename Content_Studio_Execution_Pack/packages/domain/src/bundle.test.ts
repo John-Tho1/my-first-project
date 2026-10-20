@@ -419,6 +419,127 @@ describe('T08 전사 표·지운 원본', () => {
     expect(() => checkIntegrity(withSnap({ reported_tokens_in: '1' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
   });
 
+  it('LIVEL1-H2: 수동 해결 resolution 형식 — provider·none 에서만, 키 6개 정확히, 각 값 형식, 재정산액은 확정액과 같거나(상한으로 깎아 재정산한 경우만) 더 큼', () => {
+    type Row = BundleTables['usage_ledger'][number];
+    const ORIGINAL = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
+    const RES = {
+      resolved_at: '2026-10-10T12:00:00.000Z',
+      resolved_by: 'operator',
+      reason: '콘솔 확인 결과 실제 청구 9.95 USD 로 판단',
+      settled_amount: '9.950000',
+      original_usage_source: 'provider_unstorable',
+      original_reported: ORIGINAL,
+    };
+    // 수동 해결 뒤 행: 재정산(인계 절차 5) — state settled, actual 9.95, 예약 0.105476 → 초과 기록
+    const RESOLVED_ROW: Partial<Row> = { state: 'settled', reserved_amount: '0.105476', actual_amount: '9.950000', overage_amount: '9.844524', over_budget: true };
+    const make = (snap: Record<string, unknown>, row: Partial<Row> = {}) => {
+      const t = withJob();
+      Object.assign(t.usage_ledger[0]!, RESOLVED_ROW, row);
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', ...snap };
+      return () => checkIntegrity(t);
+    };
+    const res = (over: Record<string, unknown>) => ({ usage_source: 'provider', resolution: { ...RES, ...over } });
+    const d40 = '1'.repeat(40);
+    const ok: Array<[string, Record<string, unknown>, Partial<Row>?]> = [
+      ['provider + 유효한 resolution', res({})],
+      ['none + 예약액 유지(재정산액 = 확정액 = 예약액)', { usage_source: 'none', resolution: { ...RES, settled_amount: '0.105476' } }, { actual_amount: '0.105476', overage_amount: '0.000000', over_budget: false }],
+      ['확정액 소수 2자리(9.95) vs 재정산액 9.950000 — micro 로 비교', res({}), { actual_amount: '9.95' }],
+      ['original_reported 40자리 경계', res({ original_reported: { reported_tokens_in: d40, reported_tokens_out: d40, reported_cost: `${d40}.000000` } })],
+      ['재정산액 0(0.000000 = 확정액 0)', { usage_source: 'none', resolution: { ...RES, settled_amount: '0.000000' } }, { reserved_amount: '0.000000', actual_amount: '0.000000', overage_amount: '0.000000', over_budget: false }],
+      ['운영자 200자·사유 4000자(상한 경계)', res({ resolved_by: 'o'.repeat(200), reason: 'r'.repeat(4000) })],
+      ['resolved_at 마이크로초·소수 없음', res({ resolved_at: '2026-10-10T12:00:00Z' })],
+      // 인계 절차 5: 실제 청구가 numeric(18,6)·예산을 넘으면 actual_amount 는 상한으로 두고 사유에 적는다 — 재정산액에 실제 청구액을 적은 경우
+      ['상한 재정산: 확정액 = numeric(18,6) 최대, 재정산액 = 실제 청구(정수부 13자리)', res({ settled_amount: '1234567890123.000000' }), { actual_amount: '999999999999.999999', overage_amount: '999999999999.894523' }],
+      ['상한 재정산: 확정액 = 월 상한 10, 재정산액 = 실제 청구 25', res({ settled_amount: '25.000000' }), { actual_amount: '10.000000', overage_amount: '9.894524' }],
+      ['상한 재정산: 재정산액 정수부 40자리', res({ settled_amount: `${d40}.000000` }), { actual_amount: '999999999999.999999', overage_amount: '999999999999.894523' }],
+    ];
+    for (const [label, snap, row] of ok) expect(make(snap, row), label).not.toThrow();
+    // resolution 이 없는 행은 출처와 무관하게 지금과 같다
+    for (const src of ['provider', 'estimate', 'none']) expect(make({ usage_source: src }), `resolution 없음 ${src}`).not.toThrow();
+    expect(make({ usage_source: 'provider_unstorable', ...ORIGINAL }), 'resolution 없음 provider_unstorable').not.toThrow();
+    expect(make({}), 'resolution 없음 · usage_source 없음').not.toThrow();
+
+    const without = (k: string) => {
+      const r: Record<string, unknown> = { ...RES };
+      delete r[k];
+      return { usage_source: 'provider', resolution: r };
+    };
+    const origWithout = (k: string) => {
+      const o: Record<string, unknown> = { ...ORIGINAL };
+      delete o[k];
+      return res({ original_reported: o });
+    };
+    const bad: Array<[string, Record<string, unknown>, Partial<Row>?]> = [
+      // (a) 출처: provider·none 에서만
+      ['estimate 에 resolution', { usage_source: 'estimate', resolution: RES }],
+      ['usage_source 없음 + resolution', { resolution: RES }],
+      ['provider_unstorable 인데 resolution(반쯤 끝난 상태)', { usage_source: 'provider_unstorable', ...ORIGINAL, resolution: RES }],
+      // (b) 모양: 평범한 객체 + 키 정확히 6개
+      ['resolution null', { usage_source: 'provider', resolution: null }],
+      ['resolution 문자열', { usage_source: 'provider', resolution: 'resolved' }],
+      ['resolution 배열', { usage_source: 'provider', resolution: [RES] }],
+      ['resolution 숫자', { usage_source: 'provider', resolution: 1 }],
+      ...(['resolved_at', 'resolved_by', 'reason', 'settled_amount', 'original_usage_source', 'original_reported'] as const).map(
+        (k) => [`${k} 없음`, without(k)] as [string, Record<string, unknown>],
+      ),
+      ['모르는 키', res({ note: 'x' })],
+      // (c) resolved_at: UTC ISO(Z)
+      ['resolved_at 날짜만', res({ resolved_at: '2026-10-10' })],
+      ['resolved_at Z 없음', res({ resolved_at: '2026-10-10T12:00:00' })],
+      ['resolved_at +03:00', res({ resolved_at: '2026-10-10T12:00:00+03:00' })],
+      ['resolved_at 숫자', res({ resolved_at: 1760097600000 })],
+      // (d) resolved_by·reason: 비어 있지 않은 문자열, 길이 상한
+      ['resolved_by 빈 문자열', res({ resolved_by: '' })],
+      ['resolved_by 공백만', res({ resolved_by: '  ' })],
+      ['resolved_by 숫자', res({ resolved_by: 1 })],
+      ['resolved_by 201자', res({ resolved_by: 'o'.repeat(201) })],
+      ['reason 빈 문자열', res({ reason: '' })],
+      ['reason 공백만', res({ reason: ' \n ' })],
+      ['reason null', res({ reason: null })],
+      ['reason 4001자', res({ reason: 'r'.repeat(4001) })],
+      // (e) settled_amount: 정수부 + 소수 정확히 6자리, 행은 settled·확정액 있음, 재정산액 ≥ 확정액(더 크면 상한 재정산 — 확정액 > 예약액)
+      ['settled_amount 소수 2자리', res({ settled_amount: '9.95' })],
+      ['settled_amount 음수', res({ settled_amount: '-1.000000' })],
+      ['settled_amount 지수', res({ settled_amount: '1e3' })],
+      ['settled_amount 앞자리 0', res({ settled_amount: '09.950000' })],
+      ['settled_amount 정수부 41자리', res({ settled_amount: `${'1'.repeat(41)}.000000` })],
+      ['settled_amount 숫자형', res({ settled_amount: 9.95 })],
+      ['settled_amount 뒤 공백', res({ settled_amount: '9.950000 ' })],
+      ['재정산액 < 확정액(9.94 vs 9.95)', res({ settled_amount: '9.940000' })],
+      ['재정산액만 적고 확정액은 예약액 그대로(절차 5 빠뜨림)', res({}), { actual_amount: '0.105476', overage_amount: '0.000000', over_budget: false }],
+      ['state reserved', res({}), { state: 'reserved', actual_amount: null }],
+      ['state released', res({}), { state: 'released' }],
+      ['settled 인데 actual_amount null', res({}), { actual_amount: null }],
+      // (f) original_usage_source
+      ['original_usage_source provider', res({ original_usage_source: 'provider' })],
+      ['original_usage_source 없음 값(null)', res({ original_usage_source: null })],
+      // (g) original_reported: 키 3개 정확히, 기존 보고값 형식
+      ...(['reported_tokens_in', 'reported_tokens_out', 'reported_cost'] as const).map((k) => [`original_reported.${k} 없음`, origWithout(k)] as [string, Record<string, unknown>]),
+      ['original_reported 모르는 키', res({ original_reported: { ...ORIGINAL, extra: '1' } })],
+      ['original_reported tokens -1', res({ original_reported: { ...ORIGINAL, reported_tokens_in: '-1' } })],
+      ['original_reported tokens 01', res({ original_reported: { ...ORIGINAL, reported_tokens_out: '01' } })],
+      ['original_reported tokens 41자리', res({ original_reported: { ...ORIGINAL, reported_tokens_in: '1'.repeat(41) } })],
+      ['original_reported cost 1.5', res({ original_reported: { ...ORIGINAL, reported_cost: '1.5' } })],
+      ['original_reported null', res({ original_reported: null })],
+      ['original_reported 배열', res({ original_reported: [ORIGINAL] })],
+      // 기존 규칙 유지: 해결된 행이라도 최상위 reported_* 가 남으면 거부
+      ['provider + 유효한 resolution + 최상위 reported_cost', { ...res({}), reported_cost: ORIGINAL.reported_cost }],
+    ];
+    for (const [label, snap, row] of bad) expect(make(snap, row), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // 문제 목록은 값이 아니라 고정 문구(다른 무결성 문제와 같은 방식)
+    const err = (() => {
+      try {
+        make(res({ reason: 'SECRET-REASON-값', settled_amount: '9.940000' }))();
+      } catch (e) {
+        return e as BundleError;
+      }
+      return null;
+    })();
+    expect(err?.extra).toEqual({ problems: ['usage_ledger.pricing_snapshot.resolution 형식'] });
+    expect(`${err?.message} ${JSON.stringify(err?.extra)}`).not.toContain('SECRET-REASON-값');
+    expect(`${err?.message} ${JSON.stringify(err?.extra)}`).not.toContain('9.940000');
+  });
+
   it('FIX3-LIVEL1: 원장 pricing_snapshot.usage_source 는 provider·estimate·none·provider_unstorable 또는 없음(이전 행)만 — 그 밖은 integrity', () => {
     // FIX4-LIVEL1: provider_unstorable 은 보고값 세 개가 필수가 됐다(의도한 동작 변경) — 이 시험은 출처 값만 보므로 유효한 보고값을 함께 둔다.
     const REPORTED = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };

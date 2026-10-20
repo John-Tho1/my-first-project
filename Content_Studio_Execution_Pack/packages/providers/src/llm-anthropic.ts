@@ -290,9 +290,10 @@ export class ClaudeLlmProvider implements LlmProvider {
     if (!model.success) throw invalid();
     const m = model.data;
     // 1인칭 표현이 있거나 experience 인 claim 은 experience + 사용자 확인 필요(모의와 같은 규칙, 보수적 방향으로만 바꾼다).
-    const claims = m.claims.map((c) =>
+    const reclassified = m.claims.map((c) =>
       c.kind === 'experience' || hasFirstPersonExpression(c.text) ? { ...c, kind: 'experience' as const, needs_user_confirmation: true } : c,
     );
+    const claims = dedupeExperienceClaims(reclassified);
     // FIX1-LIVEL1(놓친 케이스 c): 제안 본문의 1인칭 문장이 experience claim 으로 덮이지 않으면 서버가 experience claim(확인 필요, 출처 없음)을
     // 더한다 — 채택 뒤 미확인 경험 게이트(claims-gate)가 모의와 같이 막도록. 출처·증거 등급을 만들지 않는다(보수적 방향만).
     // FIX3-LIVEL1: 단위는 문단(splitParagraphs), 덮임은 **정규화 텍스트 완전 일치**만 — 포함·부분 일치는 쓰지 않는다
@@ -342,6 +343,40 @@ export class ClaudeLlmProvider implements LlmProvider {
  * + 공백 접기(줄바꿈 포함) + trim. 본문 문단과 claim 양쪽에 같은 함수를 쓴다.
  */
 const normalizeForCoverage = (s: string): string => s.normalize('NFC').replace(/\s+/g, ' ').trim();
+
+/**
+ * LIVEL1-H2: 모델이 같은 경험 claim 을 NFC·NFD(또는 바이트까지 같게) 여러 번 내면 앞의 것 하나만 남긴다 — 같은 문장을 여러 번 확인하지 않게.
+ * - 대상: 재분류 뒤 kind 'experience' 만. fact·opinion 은 게이트 대상이 아니므로 그대로 둔다.
+ * - 키: **`text.normalize('NFC')` 그대로**(공백 접기·trim·NFKC 없음). 이 단계는 db 층의 sanitizeLlmOutput(인용·출처 검사)보다 **앞**이라,
+ *   지운 claim 은 정제가 보지 못한다. normalizeForCoverage 처럼 `\s` 로 접으면 U+FEFF·탭만 다른 claim(예: `fake\uFEFF.example`,
+ *   버린 출처 문구 `fake\tsource`)이 지워져 unverifiable_citation 을 피할 수 있다. NFC 로 같은 두 문자열은 정제의 전처리
+ *   (서식 문자 제거 + NFKC) 결과도 같으므로 검사 결과가 바뀌지 않는다. 공백만 있는 claim 은 지우지 않는다.
+ * - 출처: 뒤 claim 의 source_refs 원문이 모두 같은 키의 남은 claim 에 그대로(===) 있을 때만 지운다(빈 목록은 부분집합).
+ *   그래서 정제가 버리는 출처 문구 집합이 같다. 아니면 둘 다 남긴다(확인이 한 번 더 필요할 뿐 — 안전 쪽).
+ * - 남는 claim 은 고치지 않는다(원문 바이트·출처·확인 표시 그대로, 출처를 합치지 않음).
+ * 부수 효과: 지운 중복이 허용 밖 출처를 들고 있었다면 정제의 "출처 미확인 … N건" 경고 개수가 그만큼 줄어든다(출처 문구 집합은 같음).
+ * 본문 문단과의 덮임(아래 experienceTexts·normalizeForCoverage)은 바뀌지 않는다.
+ */
+function dedupeExperienceClaims<C extends { text: string; kind: string; source_refs: string[] }>(claims: readonly C[]): C[] {
+  const kept: C[] = [];
+  const refsByKey = new Map<string, Array<readonly string[]>>();
+  for (const c of claims) {
+    if (c.kind !== 'experience') {
+      kept.push(c);
+      continue;
+    }
+    const key = c.text.normalize('NFC');
+    if (key.trim() === '') {
+      kept.push(c);
+      continue;
+    }
+    const seen = refsByKey.get(key);
+    if (seen?.some((refs) => c.source_refs.every((r) => refs.includes(r)))) continue;
+    kept.push(c);
+    refsByKey.set(key, [...(seen ?? []), c.source_refs]);
+  }
+  return kept;
+}
 
 /**
  * FIX3/FIX4-LIVEL1: 1인칭 확인 claim 의 단위 = **문단** — 빈 줄(공백만 있는 줄 포함, CRLF·CR 은 LF 로 맞춘 뒤 `\n\s*\n`)로만 나눈다.

@@ -3,11 +3,11 @@
  * 네트워크 0(setupFiles 가드가 api.anthropic.com 을 막는다), 과금 0. 시험 키는 가짜 sentinel 이며 응답·DB·감사에 나오지 않아야 한다.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { count, eq, sql } from 'drizzle-orm';
+import { and, count, eq, sql } from 'drizzle-orm';
 import {
   adoptProposal,
   appendContentVersion,
@@ -20,32 +20,44 @@ import {
   ensureOwner,
   exportOwner,
   getDb,
+  getRestoreRun,
+  insertAsset,
   parseBundleZip,
   hasUnresolvedLiveUsage,
   listUnconfirmedExperienceClaims,
   liveRunsUsed,
+  monthlyUsage,
+  ownerScope,
+  restoreZipPath,
   runAssist,
   runVariantAssist,
   schema,
   seed,
+  selectBundleRows,
   updateContentMeta,
   usageLedgerView,
+  type BlobStore,
   type Db,
 } from '@cs/db';
 import {
   AppError,
   budgetPolicy,
+  buildAssetKey,
   buildBundle,
   costMicro,
   fromMicro,
   LIVE_LLM_FIXED_INPUT_BYTES,
   LIVE_LLM_FRAMING_OVERHEAD_TOKENS,
   loadConfig,
+  mskMonthStart,
+  RESTORED_TABLES,
   reserveFor,
+  sha256Hex,
   toMicro,
   utf8ByteLength,
   writeZip,
   type BundleTables,
+  type ParsedBundle,
 } from '@cs/domain';
 import { ClaudeLlmProvider, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 import { GET as healthGET } from '../../apps/web/app/api/health/route';
@@ -1055,5 +1067,439 @@ describe('LIVEL1-H1 — 실제 복원 경로·수동 해결 왕복', () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ---- LIVEL1-H2(LIVEL1-H1 뒤 낮은 우선순위 보강) ----
+
+/** owner 에 provider_unstorable 원장 1개(2^31 tokens)를 만든다(공용 DB). */
+async function unstorableRun(identity: string) {
+  const owner = await freshOwner(identity);
+  const c = await createContent(db, owner, { title: 'H2', body: '본문.' });
+  const { fetch } = fakeFetch(json(200, message({ usage: OVER_INT })));
+  const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+  return { owner, contentId: c.content.id, ledgerId: r.ledger.id };
+}
+
+/** 인계 LIVEL1 수동 해결 절차 4~6 을 공용 DB 의 원장 행에 적용(H1 시험과 같은 모양): reported_* → resolution.original_reported, 재정산, 출처 provider. */
+async function resolveUnstorable(ledgerId: string, settledAmount = '9.950000') {
+  const [row] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
+  const { reported_tokens_in, reported_tokens_out, reported_cost, ...rest } = row!.pricingSnapshot as Record<string, unknown>;
+  const original = { reported_tokens_in, reported_tokens_out, reported_cost };
+  const resolved = {
+    ...rest,
+    usage_source: 'provider',
+    resolution: {
+      resolved_at: '2026-10-10T12:00:00.000Z',
+      resolved_by: 'operator',
+      reason: `시험: 콘솔 확인 결과 실제 청구 ${settledAmount} USD 로 판단`,
+      settled_amount: settledAmount,
+      original_usage_source: 'provider_unstorable',
+      original_reported: original,
+    },
+  };
+  const reserved = toMicro(row!.reservedAmount);
+  const settled = toMicro(settledAmount);
+  await db
+    .update(schema.usageLedger)
+    .set({ pricingSnapshot: resolved, actualAmount: settledAmount, overageAmount: fromMicro(settled > reserved ? settled - reserved : 0n), overBudget: settled > reserved })
+    .where(eq(schema.usageLedger.id, ledgerId));
+  return { original };
+}
+
+async function exportZip(owner: string, tmp: string, tag: string) {
+  const exported = await exportOwner(db, new LocalStorageAdapter(path.join(tmp, `assets-${tag}`)), owner, { outDir: path.join(tmp, `exports-${tag}`) });
+  return new Uint8Array(readFileSync(exported.zipPath));
+}
+
+/** H1 시험과 같은 구성: 검증된 묶음의 표를 고친 뒤 buildBundle(manifest 해시 다시 계산) → zip. */
+function rebuiltZip(parsed: ParsedBundle, mutate: (t: BundleTables) => void) {
+  const t = structuredClone(parsed.tables) as BundleTables;
+  mutate(t);
+  const bundle = buildBundle({
+    exportId: randomUUID(),
+    exportedAt: new Date().toISOString(),
+    appVersion: parsed.manifest.app_version,
+    migrations: parsed.manifest.schema_migrations,
+    owner: { id: parsed.manifest.owner.id, identityMasked: parsed.manifest.owner.identity_masked },
+    tables: t,
+    assetBytes: new Map(parsed.assetBytes),
+  });
+  return writeZip(bundle.entries);
+}
+
+const rowCountsOf = async (dbX: Db) =>
+  Object.fromEntries(
+    await Promise.all(
+      (['usageLedger', 'generationRuns', 'contents', 'contentVersions', 'claims'] as const).map(async (k) => [k, (await dbX.select({ n: count() }).from(schema[k]))[0]!.n] as const),
+    ),
+  );
+const errOf = async (p: Promise<unknown>) =>
+  p.then(
+    () => null,
+    (x: unknown) => x as AppError,
+  );
+
+describe('LIVEL1-H2 — 수동 해결 resolution 형식: 실제 복원 경로', () => {
+  type ResolvedSnap = { usage_source: unknown; resolution: { settled_amount: string; original_reported: { reported_cost: string } } };
+
+  it('해결한 행의 resolution 을 고친 묶음(재정산액 ≠ 확정액·original_reported 비용 형식·출처 estimate) → 복원 미리보기 integrity, 대상 DB 변화 없음 — 고치지 않은 같은 묶음은 통과', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h2-res-'));
+    try {
+      const { owner, ledgerId } = await unstorableRun('live-l1-h2-res@example.local');
+      await resolveUnstorable(ledgerId);
+      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
+      const parsed = await parseBundleZip(await exportZip(owner, tmp, 'src'));
+      const h = await createTestDb();
+      try {
+        const target = (await ensureOwner(h.db, 'restore-livel1-h2-res@example.local')).id;
+        const restoresDir = path.join(tmp, 'restores');
+        const before = await rowCountsOf(h.db);
+        const snapOf = (t: BundleTables) => t.usage_ledger.find((l) => l.id === ledgerId)!.pricing_snapshot as unknown as ResolvedSnap;
+        const cases: Array<[string, (t: BundleTables) => void]> = [
+          ['settled_amount 9.940000 < actual_amount 9.950000', (t) => void (snapOf(t).resolution.settled_amount = '9.940000')],
+          ['original_reported.reported_cost = 1.5', (t) => void (snapOf(t).resolution.original_reported.reported_cost = '1.5')],
+          ['usage_source 를 estimate 로(resolution 은 그대로)', (t) => void (snapOf(t).usage_source = 'estimate')],
+        ];
+        for (const [label, mutate] of cases) {
+          const e = await errOf(createRestorePreview(h.db, target, rebuiltZip(parsed, mutate), { restoresDir, source: 'upload' }));
+          expect(e?.code, label).toBe('integrity');
+          expect((e?.extra as { problems?: string[] } | undefined)?.problems, label).toEqual(['usage_ledger.pricing_snapshot.resolution 형식']);
+        }
+        expect(await rowCountsOf(h.db)).toEqual(before);
+        expect(await hasUnresolvedLiveUsage(h.db, target)).toBe(false);
+        // 대조: 손대지 않은 같은 표(다시 만든 manifest)는 미리보기를 통과 — 위 거부는 바꾼 값 때문이다
+        const pv = await createRestorePreview(h.db, target, rebuiltZip(parsed, () => undefined), { restoresDir, source: 'upload' });
+        expect(pv.preview.tables.usage_ledger).toMatchObject({ in_bundle: 1, new: 1 });
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('LIVEL1-H2 — NFC/NFD 교차 중복 experience claim 은 한 번만 저장·확인(가짜 fetch)', () => {
+  const t = '제가 협상했습니다.';
+  const tNfd = t.normalize('NFD');
+  const expC = (text: string, source_refs: string[] = []) => ({ text, kind: 'experience', source_refs, needs_user_confirmation: true });
+
+  it('같은 경험 claim 을 NFC·NFD 로 두 번 → claims 행·output_json 모두 1개(claim_index 0), 한 번 확인으로 ready', async () => {
+    const owner = await freshOwner('live-l1-h2-dedupe@example.local');
+    const c = await createContent(db, owner, { title: '교차 중복', body: '본문.' });
+    const out = { ...modelOut, proposed_text: t, claims: [expC(t), expC(tNfd)] };
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
+    const r = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+    expect(r.claims.map((x) => [x.text, x.kind, x.needs_user_confirmation])).toEqual([[t, 'experience', true]]);
+    const rows = await db.select().from(schema.claims).where(eq(schema.claims.runId, r.run.id));
+    expect(rows.map((x) => [x.claimIndex, x.statement, x.kind])).toEqual([[0, t, 'experience']]);
+    const [run] = await db.select().from(schema.generationRuns).where(eq(schema.generationRuns.id, r.run.id));
+    expect((run!.outputJson as { claims: unknown[] }).claims).toHaveLength(1);
+    await adoptProposal(db, owner, c.content.id, r.run.id, 1);
+    expect((await confirmClaims(db, owner, c.content.id, r.run.id, [0])).unconfirmed).toEqual([]);
+    const rev = async () => (await db.select().from(schema.contents).where(eq(schema.contents.id, c.content.id)))[0]!.revision;
+    await updateContentMeta(db, owner, c.content.id, { lifecycle: 'review' }, await rev());
+    expect((await updateContentMeta(db, owner, c.content.id, { lifecycle: 'ready' }, await rev())).lifecycle).toBe('ready');
+  });
+
+  it('채널 초안(variant)도 같은 provider 후처리 — 중복 claim 은 1개', async () => {
+    const owner = await freshOwner('live-l1-h2-dedupe-variant@example.local');
+    const c = await createContent(db, owner, { title: '교차 중복 채널', body: '본문.' });
+    const out = { ...modelOut, proposed_text: t, claims: [expC(tNfd), expC(t)] };
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify(out))));
+    const r = await runVariantAssist(db, owner, c.content.id, { channel: 'blog', baseVersion: 1, budget: policy() }, claude(fetch));
+    const rows = await db.select().from(schema.claims).where(eq(schema.claims.runId, r.run.id));
+    expect(rows.map((x) => [x.claimIndex, x.statement])).toEqual([[0, tNfd]]);
+  });
+
+  it.each<[string, unknown[]]>([
+    ['BOM 으로만 다른 두 경험 claim(하나는 호스트 모양)', [expC('제가 fake .example 에서 협상했습니다.'), expC('제가 fake\uFEFF.example 에서 협상했습니다.')]],
+    [
+      '탭으로만 다른 두 경험 claim(하나는 버린 출처 문구를 그대로 담음)',
+      [
+        { text: '시장 자료가 있다.', kind: 'fact', source_refs: ['fake\tsource'], needs_user_confirmation: false },
+        expC('제가 fake source 에서 들었습니다.'),
+        expC('제가 fake\tsource 에서 들었습니다.'),
+      ],
+    ],
+  ])('인용 검사 우회 방지(지금 동작 고정): %s → 중복으로 지우지 않으므로 출력 전체 unverifiable_citation', async (_label, claims) => {
+    const owner = await freshOwner(`live-l1-h2-cite-${randomUUID()}@example.local`);
+    const c = await createContent(db, owner, { title: '인용 우회', body: '본문.' });
+    const { fetch } = fakeFetch(json(200, message({}, JSON.stringify({ ...modelOut, claims }))));
+    expect(await failCode(runAssist(db, owner, c.content.id, draft(), claude(fetch)))).toBe('llm_failed');
+    const { run } = await ledgerOf(c.content.id);
+    expect(run.error).toBe('unverifiable_citation');
+    expect(await db.select().from(schema.claims).where(eq(schema.claims.runId, run.id))).toEqual([]);
+  });
+});
+
+describe('LIVEL1-H2 — 복원한 원장과 대상의 이번 달(MSK) 예산', () => {
+  const limitErr = (e: AppError | null) => [e?.code, (e?.extra as { reason?: string } | undefined)?.reason];
+  /** 빈 대상 DB 에 empty_only 로 복원하고 대상 owner 와 복원된 첫 원고 id 를 돌려준다. */
+  async function restoreInto(h: Awaited<ReturnType<typeof createTestDb>>, zip: Uint8Array, tmp: string, tag: string) {
+    const target = (await ensureOwner(h.db, `restore-livel1-h2-${tag}@example.local`)).id;
+    const restoresDir = path.join(tmp, `restores-${tag}`);
+    const pv = await createRestorePreview(h.db, target, zip, { restoresDir, source: 'upload' });
+    await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, `assets-b-${tag}`)), target, pv.restoreId, { mode: 'empty_only', confirm: true, restoresDir });
+    const contentId = (await h.db.select().from(schema.contents).where(eq(schema.contents.ownerId, target)))[0]!.id;
+    return { target, contentId, restoresDir };
+  }
+  const hCounts = async (dbX: Db) => ({
+    runs: (await dbX.select({ n: count() }).from(schema.generationRuns))[0]!.n,
+    ledger: (await dbX.select({ n: count() }).from(schema.usageLedger))[0]!.n,
+  });
+
+  it('A1: 수동 해결(9.95)된 원장을 빈 DB 에 복원 → 대상의 이번 달 사용액 = 원본, 월 상한 10 의 다음 live 예약은 429 monthly_limit(호출 0·run·원장 0), 상한 100 이면 호출 1', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h2-a1-'));
+    try {
+      const { owner, ledgerId } = await unstorableRun('live-l1-h2-a1@example.local');
+      await resolveUnstorable(ledgerId);
+      const zip = await exportZip(owner, tmp, 'a1');
+      const h = await createTestDb();
+      try {
+        const { target, contentId } = await restoreInto(h, zip, tmp, 'a1');
+        const before = await hCounts(h.db);
+        const f = fakeFetch(json(200, message()));
+        const e = await errOf(runAssist(h.db, target, contentId, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '10' })), claude(f.fetch)));
+        expect(limitErr(e)).toEqual(['budget_exceeded', 'monthly_limit']);
+        expect(f.calls).toHaveLength(0);
+        expect(await hCounts(h.db)).toEqual(before);
+        // 복원된 원장이 대상의 이번 달 합계에 그대로 들어간다(원본과 같음)
+        const usedT = (await monthlyUsage(h.db, target)).byCurrency;
+        expect(usedT).toEqual((await monthlyUsage(db, owner)).byCurrency);
+        expect(usedT.map((u) => [u.currency, u.used])).toEqual([['USD', '9.950000']]);
+        // 상한을 올리면 호출된다(차단 원인은 월 상한뿐)
+        const ok = await runAssist(h.db, target, contentId, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '100' })), claude(f.fetch));
+        expect(ok.run.status).toBe('succeeded');
+        expect(f.calls).toHaveLength(1);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('A2: 지난달(MSK) 원장은 복원해도 이번 달 예산에 들어가지 않는다 — 대조: 같은 행을 이번 달에 둔 채 따로 내보낸 묶음은 429 monthly_limit', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h2-a2-'));
+    try {
+      const owner = await freshOwner('live-l1-h2-a2@example.local');
+      const c = await createContent(db, owner, { title: 'A2', body: '본문.' });
+      const { fetch } = fakeFetch(json(200, message()), json(200, message()));
+      const prev = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+      const cur = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+      // Lprev 를 9.95 로 재정산(초과 기록) — 아직 이번 달
+      const settled = toMicro('9.950000');
+      await db
+        .update(schema.usageLedger)
+        .set({ actualAmount: '9.950000', overageAmount: fromMicro(settled - toMicro(prev.ledger.reservedAmount)), overBudget: true })
+        .where(eq(schema.usageLedger.id, prev.ledger.id));
+      // 대조 묶음: 이번 달 그대로 내보낸다. 그 뒤 Lprev 를 지난달(MSK 월 시작 하루 전)로 옮겨 한 번 더 내보낸다 — 묶음 두 개
+      const zipCur = await exportZip(owner, tmp, 'a2-cur');
+      const now = new Date();
+      const prevAt = new Date(mskMonthStart(now).getTime() - 24 * 3600_000);
+      await db.update(schema.usageLedger).set({ createdAt: prevAt }).where(eq(schema.usageLedger.id, prev.ledger.id));
+      const zipPrev = await exportZip(owner, tmp, 'a2-prev');
+      // (월 경계를 지나는 순간 실행되면 now 와 runAssist 의 시각이 다른 달일 수 있다 — 무시할 만한 위험)
+      {
+        const h = await createTestDb();
+        try {
+          const { target, contentId } = await restoreInto(h, zipPrev, tmp, 'a2-prev');
+          expect((await monthlyUsage(h.db, target, now)).byCurrency.map((u) => [u.currency, u.used])).toEqual([['USD', cur.ledger.actualAmount]]);
+          const lastMonth = new Date(mskMonthStart(now).getTime() - 12 * 3600_000);
+          expect((await monthlyUsage(h.db, target, lastMonth)).byCurrency.map((u) => u.used)).toEqual(['9.950000']);
+          const f = fakeFetch(json(200, message()));
+          const ok = await runAssist(h.db, target, contentId, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '10' })), claude(f.fetch));
+          expect(ok.run.status).toBe('succeeded');
+          expect(f.calls).toHaveLength(1);
+        } finally {
+          await h.close();
+        }
+      }
+      {
+        const h = await createTestDb();
+        try {
+          const { target, contentId } = await restoreInto(h, zipCur, tmp, 'a2-cur');
+          const used = fromMicro(settled + toMicro(cur.ledger.actualAmount!));
+          expect((await monthlyUsage(h.db, target, now)).byCurrency.map((u) => u.used)).toEqual([used]);
+          const before = await hCounts(h.db);
+          const f = fakeFetch(json(200, message()));
+          const e = await errOf(runAssist(h.db, target, contentId, draft(policy({ LLM_BUDGET_MONTHLY_LIMIT: '10' })), claude(f.fetch)));
+          expect(limitErr(e)).toEqual(['budget_exceeded', 'monthly_limit']);
+          expect(f.calls).toHaveLength(0);
+          expect(await hCounts(h.db)).toEqual(before);
+        } finally {
+          await h.close();
+        }
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('A3(현재 동작 기록): add_missing 에서 원고가 대상에서 바뀌어 dependency 충돌로 빠진 run·원장은 대상의 이번 달 사용액에 들어가지 않는다', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h2-a3-'));
+    try {
+      const owner = await freshOwner('live-l1-h2-a3@example.local');
+      const c = await createContent(db, owner, { title: 'A3', body: '본문.' });
+      const { fetch } = fakeFetch(json(200, message()), json(200, message()));
+      const r1 = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+      const zip1 = await exportZip(owner, tmp, 'a3-e1');
+      const h = await createTestDb();
+      try {
+        const { target, restoresDir } = await restoreInto(h, zip1, tmp, 'a3');
+        // 대상에서 같은 원고를 고친다 → contents 행이 묶음과 달라진다(different)
+        await appendContentVersion(h.db, target, c.content.id, { baseVersion: 1, body: '대상에서 고침' });
+        const r2 = await runAssist(db, owner, c.content.id, draft(), claude(fetch));
+        const zip2 = await exportZip(owner, tmp, 'a3-e2');
+        const pv = await createRestorePreview(h.db, target, zip2, { restoresDir, source: 'upload' });
+        const dropped = [
+          { table: 'generation_runs', id: r2.run.id, reason: 'dependency' },
+          { table: 'usage_ledger', id: r2.ledger.id, reason: 'dependency' },
+        ];
+        expect(pv.preview.conflicts).toEqual(expect.arrayContaining([{ table: 'contents', id: c.content.id, reason: 'different' }, ...dropped]));
+        const res = await commitRestore(h.db, new LocalStorageAdapter(path.join(tmp, 'assets-b-a3')), target, pv.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+        expect(res.conflicts).toEqual(expect.arrayContaining(dropped));
+        const ids = (await h.db.select({ id: schema.usageLedger.id }).from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, target))).map((x) => x.id);
+        expect(ids).toEqual([r1.ledger.id]);
+        // 대상의 이번 달 사용액에는 L1 만 — 원본은 L1 + L2. (미리보기에 금액 경고는 없다: 남은 위험으로 기록)
+        expect((await monthlyUsage(h.db, target)).byCurrency.map((u) => u.used)).toEqual([r1.ledger.actualAmount]);
+        expect((await monthlyUsage(db, owner)).byCurrency.map((u) => u.used)).toEqual([fromMicro(toMicro(r1.ledger.actualAmount!) + toMicro(r2.ledger.actualAmount!))]);
+        expect(pv.preview.warnings.map((w) => w.code)).toEqual([]);
+      } finally {
+        await h.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('LIVEL1-H2 — 복원이 실패하면 비어 있지 않은 대상 DB 의 행 값이 그대로(개수가 아니라 필드 값)', () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7, 7]);
+  /** put 은 아무것도 하지 않고 get 은 다른 바이트 — 커밋의 파일 단계(applyBundle 이 이미 쓴 뒤)에서 checksum 실패(AppError 아님) */
+  const failingStore: BlobStore = { put: async () => {}, get: async () => new Uint8Array([0]) };
+  // H1 시험과 같은 손상 3종
+  const CORRUPT: Array<[string, (s: Record<string, unknown>) => void]> = [
+    ['reported_cost 없음', (s) => void delete s.reported_cost],
+    ['reported_tokens_in 음수', (s) => void (s.reported_tokens_in = '-1')],
+    ['reported_* 만 남고 usage_source 없음', (s) => void delete s.usage_source],
+  ];
+  let tmp: string;
+  let restoresDir: string;
+  let h: Awaited<ReturnType<typeof createTestDb>>;
+  let T: string;
+  let src: { zip: Uint8Array; parsed: ParsedBundle; ledgerId: string; assetId: string };
+  // 월 사용량 비교는 같은 기준 시각으로(시험이 MSK 월 경계를 지나면 흔들릴 수 있다 — 무시할 만한 위험)
+  let fixedNow: Date;
+
+  const ownerRows = async (dbX: Db, ownerId: string) => {
+    const out: Record<string, unknown[]> = {};
+    for (const t of RESTORED_TABLES) out[t] = (await selectBundleRows(dbX, t, ownerScope(t, ownerId))).map((r) => r.row);
+    return out;
+  };
+  const restoreRunsOfT = () => h.db.select().from(schema.restoreRuns).where(eq(schema.restoreRuns.ownerId, T));
+  const commitAudits = (restoreId: string) =>
+    h.db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.action, 'restore.commit'), eq(schema.auditEvents.entityId, restoreId)));
+  const corruptZip = (mutate: (s: Record<string, unknown>) => void) =>
+    rebuiltZip(src.parsed, (t) => mutate(t.usage_ledger.find((l) => l.id === src.ledgerId)!.pricing_snapshot as Record<string, unknown>));
+  const commit = (store: BlobStore, restoreId: string) => commitRestore(h.db, store, T, restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+  /** 전제: 정상 묶음의 미리보기 — 대상은 비어 있지 않고, 원장·파일이 새로 들어갈 자리가 있다(새면 잡히고, 저장소까지 닿는다). */
+  async function validPreview() {
+    const pv = await createRestorePreview(h.db, T, src.zip, { restoresDir, source: 'upload' });
+    expect(pv.preview.can_commit_empty_only).toBe(false);
+    expect(pv.preview.conflicts_total).toBe(0);
+    expect(pv.preview.tables.usage_ledger).toMatchObject({ new: 1 });
+    expect(pv.preview.tables.assets).toMatchObject({ new: 1 });
+    expect(await hasUnresolvedLiveUsage(h.db, T)).toBe(false);
+    return pv;
+  }
+
+  beforeAll(async () => {
+    tmp = mkdtempSync(path.join(tmpdir(), 'cs-livel1-h2-keep-'));
+    restoresDir = path.join(tmp, 'restores');
+    // 원본 S(공용 DB): provider_unstorable 원장 + 파일 1개 → 내보내기
+    const { owner: S, ledgerId } = await unstorableRun('live-l1-h2-keep-src@example.local');
+    const storageDir = path.join(tmp, 'assets-src');
+    const assetId = randomUUID();
+    const key = buildAssetKey(S, assetId);
+    await new LocalStorageAdapter(storageDir).put(key, PNG);
+    await insertAsset(db, { id: assetId, ownerId: S, key, mime: 'image/png', bytes: PNG.byteLength, checksum: sha256Hex(PNG), rightsStatus: 'owned', verificationState: 'VERIFIED' });
+    const exported = await exportOwner(db, new LocalStorageAdapter(storageDir), S, { outDir: path.join(tmp, 'exports') });
+    const zip = new Uint8Array(readFileSync(exported.zipPath));
+    src = { zip, parsed: await parseBundleZip(zip), ledgerId, assetId };
+    // 대상 T(새 DB): 브랜드 v2(묶음의 v1 이 version_exists 충돌이 되지 않게) + 원고 + 정상 live run(usage_source provider)
+    h = await createTestDb();
+    T = (await ensureOwner(h.db, 'restore-livel1-h2-keep@example.local')).id;
+    await h.db.insert(schema.brandProfiles).values({ ownerId: T, version: 2, penName: 'tp', audience: 'ta', pillars: ['y'] });
+    const tc = await createContent(h.db, T, { title: '대상 원고', body: '대상 본문.' });
+    const tr = await runAssist(h.db, T, tc.content.id, { ...draft(), brandProfileVersion: 2 }, claude(fakeFetch(json(200, message())).fetch));
+    expect(tr.ledger.pricingSnapshot).toMatchObject({ usage_source: 'provider' });
+    fixedNow = new Date();
+  });
+  afterAll(async () => {
+    await h?.close();
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('H2(a) 업로드 미리보기 integrity 거부(3종) → 모든 복원 표의 대상 행 값 그대로, restore_runs·ZIP 추가 없음, 차단·월 사용량 그대로', async () => {
+    await validPreview(); // 전제 + restoresDir 생성(손상 미리보기는 디렉터리를 만들기 전에 거부된다)
+    const before = await ownerRows(h.db, T);
+    const runsBefore = await restoreRunsOfT();
+    const filesBefore = readdirSync(restoresDir).sort();
+    const usageBefore = await monthlyUsage(h.db, T, fixedNow);
+    for (const [label, mutate] of CORRUPT) {
+      const e = await errOf(createRestorePreview(h.db, T, corruptZip(mutate), { restoresDir, source: 'upload' }));
+      expect(e?.code, label).toBe('integrity');
+    }
+    expect(await ownerRows(h.db, T)).toEqual(before);
+    expect(await restoreRunsOfT()).toEqual(runsBefore);
+    expect(readdirSync(restoresDir).sort()).toEqual(filesBefore);
+    expect(await hasUnresolvedLiveUsage(h.db, T)).toBe(false);
+    expect(await monthlyUsage(h.db, T, fixedNow)).toEqual(usageBefore);
+  });
+
+  it('H2(b) 미리보기 뒤 저장 ZIP 이 손상 묶음으로 바뀜 → 커밋 integrity 거부·restore_runs rejected, 대상 행 값 그대로, 감사 없음, 다시 커밋은 restore_not_committable', async () => {
+    const pv = await validPreview();
+    const before = await ownerRows(h.db, T);
+    const usageBefore = await monthlyUsage(h.db, T, fixedNow);
+    writeFileSync(restoreZipPath(restoresDir, pv.restoreId), corruptZip(CORRUPT[0]![1]));
+    const e = await errOf(commit(new LocalStorageAdapter(path.join(tmp, 'assets-t')), pv.restoreId));
+    expect(e).toBeInstanceOf(AppError);
+    expect(e?.code).toBe('integrity');
+    expect((await getRestoreRun(h.db, T, pv.restoreId))?.status).toBe('rejected');
+    expect(await ownerRows(h.db, T)).toEqual(before);
+    expect(await h.db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, src.ledgerId))).toEqual([]);
+    expect(await hasUnresolvedLiveUsage(h.db, T)).toBe(false);
+    expect(await monthlyUsage(h.db, T, fixedNow)).toEqual(usageBefore);
+    expect(await commitAudits(pv.restoreId)).toEqual([]);
+    expect((await errOf(commit(new LocalStorageAdapter(path.join(tmp, 'assets-t')), pv.restoreId)))?.code).toBe('restore_not_committable');
+  });
+
+  it('H2(c) 커밋 트랜잭션 안 실패(파일 checksum — 행을 쓴 뒤) → 전체 되돌림·restore_runs failed, 행 값·차단·월 사용량 그대로 — 대조: 실제 저장소로 다시 하면 복원되고 차단이 켜진다', async () => {
+    const pv = await validPreview();
+    const before = await ownerRows(h.db, T);
+    const usageBefore = await monthlyUsage(h.db, T, fixedNow);
+    const e = await errOf(commit(failingStore, pv.restoreId));
+    expect(e).toBeInstanceOf(Error);
+    expect(e).not.toBeInstanceOf(AppError);
+    expect((e as unknown as Error).message).toContain('checksum');
+    expect((await getRestoreRun(h.db, T, pv.restoreId))?.status).toBe('failed');
+    expect(await ownerRows(h.db, T)).toEqual(before);
+    expect(await h.db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, src.ledgerId))).toEqual([]);
+    expect(await h.db.select().from(schema.assets).where(eq(schema.assets.id, src.assetId))).toEqual([]);
+    // 되돌림이 새면 S 의 provider_unstorable 행 때문에 true 가 된다
+    expect(await hasUnresolvedLiveUsage(h.db, T)).toBe(false);
+    expect(await monthlyUsage(h.db, T, fixedNow)).toEqual(usageBefore);
+    expect(await commitAudits(pv.restoreId)).toEqual([]);
+    expect((await errOf(commit(failingStore, pv.restoreId)))?.code).toBe('restore_not_committable');
+    // 대조: 같은 묶음 + 실제 저장소 → 실제로 쓰는 경로였다(되돌림을 증명)
+    const pv2 = await validPreview();
+    const ok = await commit(new LocalStorageAdapter(path.join(tmp, 'assets-t')), pv2.restoreId);
+    expect([ok.restored.usage_ledger, ok.restored.assets, ok.assets_verified]).toEqual([1, 1, 1]);
+    expect(await hasUnresolvedLiveUsage(h.db, T)).toBe(true);
+    expect((await commitAudits(pv2.restoreId)).length).toBe(1);
+    expect(await ownerRows(h.db, T)).not.toEqual(before);
   });
 });

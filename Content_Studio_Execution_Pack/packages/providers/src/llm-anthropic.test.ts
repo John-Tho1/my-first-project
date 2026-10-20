@@ -736,3 +736,85 @@ describe('LIVEL1-H1 — NFD(분해형 한글) 본문·claim 의 1인칭 판별',
     expect(claims).toEqual([{ text, kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
   });
 });
+
+// ---- LIVEL1-H2(LIVEL1-H1 뒤 낮은 우선순위 보강) ----
+
+describe('LIVEL1-H2 — NFC/NFD 교차 중복: 모델의 experience claim 끼리', () => {
+  const t = '제가 협상했습니다.';
+  const tNfd = t.normalize('NFD');
+  const BODY = '시장은 크다.';
+  const expRefs = (text: string, source_refs: string[]) => ({ ...exp(text), source_refs });
+
+  it('(a) NFC 다음 NFD(정규화 NFC 가 같음) → 앞의 것 하나만', async () => {
+    expect(tNfd).not.toBe(t);
+    expect(await claimsOut(BODY, [exp(t), exp(tNfd)])).toEqual([exp(t)]);
+  });
+
+  it('(b) 순서를 바꾸면 앞의 NFD 하나만 — 남는 claim 의 원문은 입력과 바이트까지 같다(NFC 로 고쳐 쓰지 않음)', async () => {
+    const r = await claimsOut(BODY, [exp(tNfd), exp(t)]);
+    expect(r).toEqual([exp(tNfd)]);
+    expect(r[0]!.text).toBe(tNfd);
+  });
+
+  it('(c) 1인칭이라 experience 로 재분류된 NFD opinion + 같은 NFC experience → 재분류된 앞의 것 하나(확인 필요)', async () => {
+    const r = await claimsOut(BODY, [{ text: tNfd, kind: 'opinion', source_refs: [], needs_user_confirmation: false }, exp(t)]);
+    expect(r).toEqual([{ text: tNfd, kind: 'experience', source_refs: [], needs_user_confirmation: true }]);
+  });
+
+  it('(d) 공백만 다른 claim 은 합치지 않는다(공백 접기 없음 — 정제 전이라 접은 키로 지우면 인용 검사를 피할 수 있다)', async () => {
+    const spaced = exp('  제가   협상했습니다. ');
+    expect(await claimsOut(BODY, [spaced, exp(tNfd)])).toEqual([spaced, exp(tNfd)]);
+  });
+
+  it('(e) 바이트까지 같은 두 claim → 하나', async () => {
+    expect(await claimsOut(BODY, [exp(t), exp(t)])).toEqual([exp(t)]);
+  });
+
+  it('(f) 출처 규칙: 뒤 claim 의 source_refs 원문이 모두 앞 claim 에 그대로(===) 있을 때만 지운다', async () => {
+    // 다른 출처 → 둘 다
+    expect(await claimsOut(BODY, [expRefs(t, ['A']), expRefs(tNfd, ['B'])])).toEqual([expRefs(t, ['A']), expRefs(tNfd, ['B'])]);
+    // 공백·대소문자만 다른 출처 문자열도 다른 것 → 둘 다(정제의 버린 문구 집합이 그대로이도록)
+    expect(await claimsOut(BODY, [expRefs(t, ['A', 'B']), expRefs(tNfd, [' a '])])).toEqual([expRefs(t, ['A', 'B']), expRefs(tNfd, [' a '])]);
+    // 부분집합 → 앞의 것만
+    expect(await claimsOut(BODY, [expRefs(t, ['A', 'B']), expRefs(tNfd, ['B'])])).toEqual([expRefs(t, ['A', 'B'])]);
+    // 앞이 출처 없음, 뒤에 출처 → 둘 다 / 앞에 출처, 뒤가 출처 없음(빈 목록은 부분집합) → 앞의 것만
+    expect(await claimsOut(BODY, [expRefs(t, []), expRefs(tNfd, ['A'])])).toEqual([expRefs(t, []), expRefs(tNfd, ['A'])]);
+    expect(await claimsOut(BODY, [expRefs(t, ['A']), expRefs(tNfd, [])])).toEqual([expRefs(t, ['A'])]);
+  });
+
+  it('(g) 호환 문자(전각 마침표)는 NFC 로 같아지지 않으므로 둘 다', async () => {
+    expect(await claimsOut(BODY, [exp(t), exp('제가 협상했습니다．')])).toEqual([exp(t), exp('제가 협상했습니다．')]);
+  });
+
+  it('(h) fact·opinion claim 은 중복이어도 지우지 않는다(게이트 대상이 아님)', async () => {
+    const op = (text: string) => ({ text, kind: 'opinion', source_refs: [], needs_user_confirmation: false });
+    expect(await claimsOut(BODY, [op(BODY), op(BODY.normalize('NFD')), op(BODY)])).toEqual([op(BODY), op(BODY.normalize('NFD')), op(BODY)]);
+  });
+
+  it('(i) 문단↔문단(지금 동작 고정): NFC·NFD 로만 다른 두 1인칭 문단 → 앞 문단 하나의 claim', async () => {
+    expect(await claimsOut(`${t}\n\n${tNfd}`)).toEqual([exp(t)]);
+    expect(await claimsOut(`${tNfd}\n\n${t}`)).toEqual([exp(tNfd)]);
+  });
+
+  it('(j) NFD claim 하나 + NFC·NFD 두 문단 → claim 하나(문단이 덮임)', async () => {
+    expect(await claimsOut(`${t}\n\n${tNfd}`, [exp(tNfd)])).toEqual([exp(tNfd)]);
+  });
+
+  it('(k) 공백만 있는 experience claim 두 개는 지우지 않는다', async () => {
+    expect(await claimsOut(BODY, [exp('   '), exp('   ')])).toEqual([exp('   '), exp('   ')]);
+  });
+
+  it('claim↔문단(지금 동작 고정): 1인칭 NFD opinion claim + 같은 NFC 문단 → 재분류된 NFD claim 하나', async () => {
+    expect(await claimsOut(t, [{ text: tNfd, kind: 'opinion', source_refs: [], needs_user_confirmation: false }])).toEqual([exp(tNfd)]);
+  });
+
+  it('인용 검사 우회 방지(지금 동작 고정): BOM·탭으로만 다른 claim 은 NFC 가 달라 둘 다 남는다(정제가 둘 다 본다)', async () => {
+    const plain = exp('제가 fake .example 에서 협상했습니다.');
+    const bom = exp('제가 fake\uFEFF.example 에서 협상했습니다.');
+    expect(await claimsOut(BODY, [plain, bom])).toEqual([plain, bom]);
+    const fact = { text: '시장 자료가 있다.', kind: 'fact', source_refs: ['fake\tsource'], needs_user_confirmation: false };
+    const sp = exp('제가 fake source 에서 들었습니다.');
+    const tab = exp('제가 fake\tsource 에서 들었습니다.');
+    expect(await claimsOut(BODY, [fact, sp, tab])).toEqual([fact, sp, tab]);
+  });
+});

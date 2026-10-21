@@ -71,3 +71,22 @@
 - 차이: 수정문도 usage_source 를 가드 아래 다시 씀(FIX3 전 채움이 `'providers'` 를 넣었을 수 있음). SQL 은 `none` ⇒ actual = reserved 를 강제(6단계대로, 검증기보다 엄격). id 는 텍스트 비교라 대문자 uuid 는 0행(2단계 출력 그대로 붙이라고 문서화).
 - 남은 위험: SQL 가드는 bundle.ts 규칙을 손으로 옮긴 것(새 규칙은 문서-SQL 시험으로만 드러남), 추가 키·original_reported 없는 옛 수동 해결 행은 복구 절차 없음(멈춤 안내), README T05 CLI 예시도 DATABASE_URL 만 설정(합성 데이터 예라 범위 밖으로 둠), Windows Git Bash·macOS 미실행.
 - 검토자에게 물을 것: (1) 수정문이 usage_source 를 바꿔도 되는가? (2) none ⇒ actual = reserved 를 SQL 에서만 더 엄격하게 둔 것이 맞는가? (3) 추가 키·original_reported 없는 행에 1단계 백업으로부터 재구성 절차가 필요한가? (4) stderr 안내 + JSON 칸 형태가 맞는가?
+
+---
+
+# FIX round 4 (4차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 8bff163 (4차 검토 기록 docs) · **HEAD_SHA: fb1fa58** (`fb1fa58a1d6a196a230701a9341fba4d95181154`)
+- 검토: 4차 Claude 독립 검토(`D39_CLAUDE_REVIEW.md` 4차) — FIX3 e7c73c9 대상, 확정 11건(실질 전부 P2)·기각 4건. 대부분 손으로 채워 실행하는 수동 해결 SQL 에서 나옴.
+- **판단(근본 원인 수정 — 확인 필요):** SQL 가드를 더하는 대신 수동 SQL 을 없애고, 앱 검증기(`isValidResolution`)를 그대로 쓰는 CLI `corepack pnpm ledger:resolve` 로 대체. 운영 절차가 SQL → 명령으로 바뀐다.
+- 만든 것:
+  - `packages/domain/src/bundle.ts`: `resolutionProblem(snap,row)`(첫 실패 규칙 또는 null) + 행 단위 원장 검사 `usageLedgerRowProblems(r)` 분리 — `isValidResolution`·`checkIntegrity` 의 판정·메시지·순서 그대로.
+  - `packages/domain/src/ledger-resolution.ts`(순수): `classifyLedgerRow` → resolve / correct(`--correct` 필요) / refuse(사유 코드), `planLedgerResolution` 이 내보내기 형식의 새 행을 만들어 `resolutionProblem`·`usageLedgerRowProblems`·행 스키마를 통과할 때만 계획 반환. CLI 자체 규칙은 더 엄격한 두 가지(`--actual` 정규형 소수 6자리·정수부 12자리, none ⇒ actual = reserved) + NUL·짝 없는 서로게이트 거부.
+  - `packages/db/src/ledger-resolve-cli.ts` + `packages/db/scripts/ledger-resolve.ts`: `--list`(읽기 전용 — 후보 행·보고 값·처리 방식·복원 검사 통과 여부), 기본 미리보기(아무것도 안 씀, by/reason 은 길이만), `--confirm`(행 잠금 → 다시 읽어 전체 비교 → 값 조건 UPDATE 정확히 1행 → 다시 읽어 재검증 → 감사 `usage_ledger.manual_resolve`(건수·금액만) → `updated 1`). 잠금 오류는 잠금 안내, 그 밖은 `describeErrorSafely`. exit 0/1/2.
+  - 운영 절차 `LIVEL1_IMPLEMENTATION_HANDOFF.md` 2·4~7단계 CLI 로 다시 씀(손으로 쓰는 SQL 미지원 + 이유), 1단계 백업 유지, README 명령 행.
+- 4차 지적 처리: #1 역슬래시 — SQL 없음(소수점 빠짐·지수·이모지 101개 표 시험) · #2·#5 확인 질의 — 없앰, `updated 1` + exit 0 / 거부는 exit 1·행 그대로, 잘못된 id 는 exit 2 · #3 최상위 reported 형식 — `reported_invalid` 시험 · #4 수정 대상·이웃 행 — `--correct` 필수, `--list` 가 복원 검사 통과 여부 표시, 이미 유효하면 미리보기 경고 · #6 반쯤 끝난 옛 행 — `--correct` 없이 최상위 값으로 해결, 위험하면 `partial_resolution_unsafe` · #7 `bundle:check` 미해결 건수 — 건너뛸 행(provider·none(실패)·estimate·옛 행)과 셀 행(실패 포함) 섞어 2→1→0(`checkBundleZip`·실제 스크립트) · #8 수정 모드 가드 — 잘못 채움 전체를 수정 모드에도 · #9 `.env.local` 우선순위 — 임시 작업 공간 `.env.local` 경로는 비어 있고, 대조로 `.env.local` 의 AUTH_ALLOWED_IDENTITY owner 가 버리는 DB 에 생김(파일을 실제로 읽음) · #10 공백 — JS `trim()` 25문자 전체를 by·reason, resolve·correct 모두 · #11 문서 경로 — `<날짜>` 포함·기본 DB/복원/내보내기/저장소/가져오기 폴더와 같거나 안이거나 포함하지 않음.
+- 제거·대체한 시험(`live-llm.test.ts`): FIX3 의 4~6 문장 시험·수정문 시험(+SQL 도우미) — 없어진 SQL 대상, 모든 경우를 새 파일로 같거나 더 강한 "행·다른 행 그대로" 단언과 함께 옮김. 예외: 대문자 uuid(이제 같은 행으로 해결 — SQL 텍스트 비교 부작용이었음), 자리표시 1회 검사(이제 문서의 명령 한 줄을 파싱·채워 실행), 재실행 0행(이제 `needs_correct`·행 그대로), 확인 질의 단언(→ `updated 1`·`hasUnresolvedLiveUsage`). FIX2 시험은 CLI 로 해결하도록 바꿈(`resolved_at` 은 마이크로초 정규식 → 주입 시각과 정확히 같음, reason 정확 일치 추가). 7-④ 시험 목록에 `.env.local` 추가.
+- 변이: 26 중 25 잡힘. 남은 1개 = UPDATE 의 값 조건만 제거(행 전체 재비교가 먼저 잡음 — PGlite 단일 연결에서는 따로 시험 불가), 둘 다 제거는 잡힘.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 52 files / 980 · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 변경 파일 보이지 않는 문자 0 · 실제 `./data` 미접근(구현 에이전트: data 아래 1269개 mtime 전후 동일).
+- 차이: `--list` 추가(2단계도 손으로 쓰는 SQL 이었음), 수정 모드는 현재 usage_source 를 provider|none 으로 한정하지 않음(original_* 증거가 있으면 `providers`·덜 바뀐 `provider_unstorable` 도 수정), 문서 경로는 `./data/pglite-check-<날짜>`(gitignore 안 — "기본 data 폴더와 겹치지 않음"으로 해석), 미리보기는 by·reason 길이만.
+- 남은 위험: UPDATE 뒤 재검증은 결함 주입 시험 없음, UPDATE 값 조건은 재비교와 분리 시험 불가, 일부 `resolution:*` 사유 코드는 계획기 버그 없이는 도달 불가, Windows Git Bash 인용·UTF-8 인자 미확인, Postgres 동시성 미검증, 추가 키·original_reported 없는 옛 행은 여전히 멈춤.
+- 검토자에게 물을 것: (1) 미리보기가 by·reason 을 그대로 보여 셸 변형을 보이게 해야 하는가? (2) `--confirm` 이 미리보기 지문(`--expect <hash>`)을 요구해야 하는가? (3) 이미 복원 검사를 통과하는 행 수정에 추가 플래그가 필요한가? (4) `--list` 가 보고 값을 출력하는 것이 허용되는가? (5) 수정 모드의 넓은 usage_source 허용이 맞는가?

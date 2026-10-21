@@ -15,13 +15,15 @@
  *   `거부(expect_mismatch)`(행이나 입력이 그 미리보기와 다름 — FIX5 #1). 같으면 미리보기와 같은 칸을 출력한 뒤 한 트랜잭션에서 행을 잠그고 다시 읽어
  *   방금 읽은 행과 같은지 비교하고(다르면 중단), 같은 값을 조건으로 건 UPDATE 가 정확히 1행일 때만, 쓴 행을 다시 읽어 계획한 행과 같고 검사를 통과하는지
  *   본 뒤 감사 기록과 함께 커밋한다. `updated 1` 을 출력한다. 이미 resolution 이 있는 행은 `--correct` 가 있어야 하고(original_usage_source·original_reported 는
- *   그대로), 그 행이 이미 복원 검사를 통과하면 `--overwrite-valid` 도 있어야 한다(`already_valid` — FIX5 Q3).
+ *   그대로), 그 행이 이미 복원 검사를 통과하면 `--overwrite-valid` 도 있어야 하며(`already_valid` — FIX5 Q3), 통과하지 않으면 `--overwrite-valid` 는 거부한다
+ *   (`overwrite_not_needed` — FIX6, FIX5 Q2). 정정이면 미리보기·적용 칸과 감사 기록에 정정 전 settled_amount·resolved_at 을 복원 형식일 때만 보여 준다(FIX6, FIX5 Q3).
  * - 확인 지문 = sha256(stableStringify({v:1, owner, ledger, mode, correct, overwriteValid, current: 지금 행(묶음 형식), args:{source, actual, settled, by, reason}}))
  *   의 앞 16자리 16진수. resolved_at(실행 시각)은 넣지 않는다 — 같은 행·같은 입력이면 두 번 실행해도 같다.
  * - 출력: 미리보기 칸(id·usage_source 전후·금액·live 차단 여부)과 `resolved_by:`·`reason:` — 받은 값 그대로를 JSON 으로(보이지 않는 문자·제어 문자는 \u 이스케이프,
  *   FIX5 #4·#5 — 셸이 바꾼 글을 쓰기 전에 볼 수 있게) + UTF-16 길이. by·reason 값은 계획이 통과했을 때의 미리보기·적용 칸에만 나오고, 거부·오류 메시지·
- *   감사 기록·--list 에는 나오지 않는다. 보고값(--list 제외)·다른 스냅숏 값·DB 오류 메시지 본문은 쓰지 않는다(오류는 secrets-cli 와 같은 describeErrorSafely).
- *   --by·--reason 의 `"`·`%`·`\` 는 받지 않는다(`text_shell_unsafe` — pnpm 의 두 번째 셸이 바꾸는 문자).
+ *   감사 기록·--list 에는 나오지 않는다(정정 전 by·reason 은 어디에도 나오지 않는다). 보고값(--list 제외)·다른 스냅숏 값·DB 오류 메시지 본문은 쓰지 않는다
+ *   (오류는 secrets-cli 와 같은 describeErrorSafely). --by·--reason 의 `"`·`%`·`\`·`&`·`|`·`<`·`>`·`^` 와 `/` 로 시작하는 값은 받지 않는다(`text_shell_unsafe` —
+ *   어느 셸에서나 같은 글이 되게 하는 일관성 규칙. 프로그램이 시작하기 전에 셸이 없앤 문자는 이 거부가 볼 수 없어 표시 줄에서만 보인다 — FIX6 #1·#5).
  * - 종료 코드: 0 성공(미리보기·적용·목록) · 1 거부(DB 폴더 없음·범위 밖 owner·대상 없음·형식·검사·모양·지문·경쟁)·DB 잠금(dev 서버가 열고 있음)·예상하지 못한 오류·
  *   DB 닫기 실패 · 2 사용법(DB 를 열지 않음).
  */
@@ -29,6 +31,7 @@ import { existsSync } from 'node:fs';
 import { and, asc, eq, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import {
   classifyLedgerRow,
+  isBundleTimestamp,
   isReportedCost,
   isReportedTokens,
   LEDGER_RESOLUTION_MESSAGES,
@@ -64,10 +67,10 @@ export interface LedgerResolveCliDeps {
 export const LEDGER_RESOLVE_USAGE = [
   '사용법(서버를 끈 상태 — PGlite 단일 연결):',
   '  corepack pnpm ledger:resolve --list [--owner <owner id>]',
-  "  MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner <owner id> --ledger <ledger id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct [--overwrite-valid]] [--expect <확인 지문> --confirm]",
+  "  corepack pnpm ledger:resolve --owner <owner id> --ledger <ledger id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct [--overwrite-valid]] [--expect <확인 지문> --confirm]",
   '  (기본은 미리보기 — 원장 행·감사 기록은 바꾸지 않는다. 적용은 같은 명령 끝에 미리보기 마지막 줄의 --expect <확인 지문> --confirm.',
-  '   이미 resolution 이 있는 행의 정정은 --correct, 그 행이 이미 복원 검사를 통과하면 --correct --overwrite-valid)',
-  '  (--by·--reason 은 셸을 두 번 지난다 — 큰따옴표·퍼센트·역슬래시·줄바꿈을 쓰지 않고, 미리보기의 resolved_by:·reason: 줄이 뜻한 글과 같은지 본다)',
+  '   이미 resolution 이 있는 행의 정정은 --correct, 그 행이 이미 복원 검사를 통과할 때만 --correct --overwrite-valid)',
+  '  (--by·--reason 은 셸을 두 번 지난다 — " % \\ & | < > ^ 와 줄바꿈을 쓰지 않고 / 로 시작하지 않으며, 미리보기의 resolved_by:·reason: 줄이 뜻한 글과 같은지 본다)',
 ].join('\n');
 
 const REQUIRED_VALUE_FLAGS = ['owner', 'ledger', 'source', 'actual', 'settled', 'by', 'reason'] as const;
@@ -188,8 +191,11 @@ export function ledgerResolutionFingerprint(p: {
   ).slice(0, 16);
 }
 
-/** JSON.stringify 위에, 그래도 글자 그대로 남는 보이지 않는 문자(\p{C}·\p{Zl}·\p{Zp}, U+0020 이 아닌 \p{Zs})를 \uXXXX(BMP 밖은 \u{…})로 */
-const DISPLAY_ESCAPE_RE = /[\p{C}\p{Zl}\p{Zp}]|(?!\u0020)\p{Zs}/gu;
+/**
+ * JSON.stringify 위에, 그래도 글자 그대로 남는 보이지 않는 문자(\p{C}·\p{Zl}·\p{Zp}, U+0020 이 아닌 \p{Zs}, 그리고 FIX6(6차 검토 #2)의 \p{Default_Ignorable_Code_Point} —
+ * 한글 채움 문자 U+3164·U+115F·U+1160·U+FFA0, 결합 자소 결합자 U+034F, 변이 선택자 U+FE00–FE0F·U+E0100–E01EF, 몽골 변이 선택자 등)를 \uXXXX(BMP 밖은 \u{…})로
+ */
+const DISPLAY_ESCAPE_RE = /[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]|(?!\u0020)\p{Zs}/gu;
 /**
  * FIX5(5차 검토 #4·#5, Q1): --by·--reason 을 이 명령이 **받은 그대로** 보여 준다 — 셸(Git Bash·pnpm 의 스크립트 셸)이 바꾼 글, 보이지 않는 문자·제어 문자,
  * 터미널 제어 순서를 모두 이스케이프로. 계획이 통과한 미리보기·적용 칸에만 쓴다(거부·오류 메시지·감사·--list 에는 쓰지 않는다).
@@ -237,6 +243,17 @@ const showSource = (snap: Record<string, unknown>) =>
       ? snap.usage_source
       : '(형식 밖 값)';
 const showAmount = (v: string | null) => (v === null ? '(없음)' : v);
+/**
+ * FIX6(6차 검토 FIX5 Q3): 정정 전 resolution 의 settled_amount·resolved_at — 복원 검사와 같은 형식 검사(isReportedCost·isBundleTimestamp)를 통과할 때만 값 그대로,
+ * 키가 없으면 '(없음)', 그 밖은 '(형식 밖 값)'(정정 대상 행은 대개 바로 이 값이 틀린 행이다 — 스냅숏 값을 그대로 되풀이하지 않는다). 정정 전 resolved_by·reason 은 다루지 않는다.
+ */
+const showResolutionBefore = (snap: Record<string, unknown>, key: 'settled_amount' | 'resolved_at'): string => {
+  const res = snap.resolution;
+  if (typeof res !== 'object' || res === null || Array.isArray(res) || !Object.prototype.hasOwnProperty.call(res, key)) return '(없음)';
+  const v: unknown = (res as Record<string, unknown>)[key];
+  if (key === 'settled_amount') return isReportedCost(v) ? (v as string) : '(형식 밖 값)';
+  return isBundleTimestamp(v) ? v : '(형식 밖 값)';
+};
 const blockedLine = (n: number) =>
   n === 0 ? '열림(이 owner 의 provider_unstorable 0행)' : `계속 막힘(이 owner 에 provider_unstorable ${n}행이 남음 — 행마다 이 명령으로 해결)`;
 
@@ -294,7 +311,7 @@ function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, curren
   if (plan.mode === 'correct') {
     lines.push(
       plan.currentRowValid
-        ? '지금 행의 복원 검사: 통과 — 이미 올바른 해결 기록을 덮어쓴다(--overwrite-valid). 이전 resolved_by·reason·resolved_at·settled_amount 는 1단계 백업 묶음에만 남는다 — 고치려던 행이 맞는지 --list 로 다시 확인'
+        ? '지금 행의 복원 검사: 통과 — 이미 올바른 해결 기록을 덮어쓴다(--overwrite-valid). 이전 resolved_by·reason 은 1단계 백업 묶음에만 남는다(이전 settled_amount·resolved_at 은 아래 줄과 감사 기록에) — 고치려던 행이 맞는지 --list 로 다시 확인'
         : '지금 행의 복원 검사: 거부(이 정정의 대상)',
     );
   }
@@ -303,7 +320,13 @@ function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, curren
     `reserved_amount: ${current.reserved_amount}`,
     `actual_amount: ${showAmount(current.actual_amount)} → ${showAmount(next.actual_amount)}`,
     `overage_amount: ${current.overage_amount} → ${next.overage_amount} · over_budget: ${current.over_budget} → ${next.over_budget}`,
-    `settled_amount: ${a.settled}`,
+    // FIX6(FIX5 Q3): 정정은 무엇을 바꾸는지 보여 준다(정정 전 값은 복원 형식일 때만). 새 해결은 그대로(정정 전 기록이 없거나 반쯤 끝난 기록)
+    ...(plan.mode === 'correct'
+      ? [
+          `settled_amount: ${showResolutionBefore(current.pricing_snapshot, 'settled_amount')} → ${a.settled}`,
+          `resolved_at: ${showResolutionBefore(current.pricing_snapshot, 'resolved_at')} → (실행 시각)`,
+        ]
+      : [`settled_amount: ${a.settled}`]),
     `resolved_by: ${escapeForDisplay(a.by)}`,
     `reason: ${escapeForDisplay(a.reason)}`,
     `resolved_by ${a.by.length}자 · reason ${a.reason.length}자(UTF-16 길이 — 위 두 줄은 이 명령이 받은 값 그대로를 JSON 으로 적은 것: 보이지 않는 문자·제어 문자는 \\u 이스케이프. 뜻한 글과 같은지 본다)`,
@@ -416,6 +439,10 @@ async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve
           actual_amount_before: current.actual_amount,
           actual_amount_after: next.actual_amount,
           settled_amount: a.settled,
+          // FIX6(FIX5 Q3): 정정이면 바뀌기 전 settled_amount·resolved_at(복원 형식일 때만 값, 아니면 '(형식 밖 값)'·'(없음)') — 정정 전 by·reason 은 남기지 않는다
+          ...(plan.mode === 'correct'
+            ? { settled_amount_before: showResolutionBefore(current.pricing_snapshot, 'settled_amount'), resolved_at_before: showResolutionBefore(current.pricing_snapshot, 'resolved_at') }
+            : {}),
           resolved_by_length: a.by.length,
           reason_length: a.reason.length,
           live_blocked_after: unresolved > 0,
@@ -518,7 +545,7 @@ async function runList(db: Db, ownerArg: string | null, config: AppConfig, deps:
   }
   if (rows.length > 0) {
     deps.out(
-      `해결: ${outOfScope ? 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> ' : ''}MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>'` +
+      `해결: ${outOfScope ? 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> ' : ''}corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>'` +
         '(미리보기 → 그 마지막 줄의 --expect <확인 지문> --confirm 을 같은 명령 끝에 붙여 적용. 정정은 처리 방식에 적힌 --correct·--overwrite-valid 를 함께)',
     );
   }

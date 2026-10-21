@@ -1255,6 +1255,11 @@ const LEDGER_USAGE_SOURCES = new Set(['provider', 'estimate', 'none', 'provider_
  */
 export const isReportedTokens = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})$/.test(v);
 export const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})\.\d{6}$/.test(v);
+/**
+ * FIX6-LIVEL1H2(6차 검토 FIX5 Q3): 묶음 시각 형식(TS_RE — 아래 resolution (c) resolved_at 검사와 같은 정규식)인가.
+ * 운영자 CLI(`pnpm ledger:resolve`)가 정정 전 resolved_at 을 보여 주거나 감사에 남길지 정할 때만 쓴다(형식 밖이면 값을 되풀이하지 않는다).
+ */
+export const isBundleTimestamp = (v: unknown): v is string => typeof v === 'string' && TS_RE.test(v);
 
 /**
  * LIVEL1-H2: provider_unstorable 수동 해결 기록(인계 LIVEL1 "수동 해결 절차" 4~6)의 `pricing_snapshot.resolution` 형식.

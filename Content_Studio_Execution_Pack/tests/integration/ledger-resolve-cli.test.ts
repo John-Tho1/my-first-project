@@ -6,6 +6,9 @@
  * FIX5-LIVEL1H2(5차 Claude 독립 검토 — Codex 아님): 확인 지문(--expect)·이미 올바른 행(already_valid)·by/reason 이스케이프 표시·셸 위험 문자(text_shell_unsafe)·
  * DB 폴더 없음·1단계 내보내기 범위(owner_not_exported)·원자성(시험이 만든 plpgsql 트리거)·UPDATE 값 조건(큰 수)·실패할 수 있는 비밀 누출 단언.
  * 모든 CLI 호출은 실제 모양의 비밀(ANTHROPIC_API_KEY·SECRETS_MASTER_KEY·OIDC_CLIENT_SECRET)을 env 로 넘기고, 출력에 그 값이 없는지 매번 본다.
+ * FIX6-LIVEL1H2(6차 Claude 독립 검토 — Codex 아님): 문서 명령 앞붙임 없음(`MSYS_NO_PATHCONV` 제거)·셸 문자 `& | < > ^`·`/` 로 시작하는 값 거부·기본 무시 문자 이스케이프
+ * (명시한 코드 포인트 목록)·정정·--overwrite-valid·반쯤 끝난 행의 셸/인코딩 거부·`updated 1` 뒤 exit 1(커밋 뒤 확인·DB 닫기 실패)·1단계 기준값(--list 수)·
+ * `overwrite_not_needed`·정정 전 settled_amount·resolved_at 표시와 감사.
  */
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -25,6 +28,8 @@ import {
   ensureOwner,
   exportOwner,
   hasUnresolvedLiveUsage,
+  LEDGER_RESOLVE_USAGE,
+  ledgerResolutionFingerprint,
   openDb,
   parseLedgerResolveArgs,
   runAssist,
@@ -35,7 +40,7 @@ import {
   type DbHandle,
   type LedgerResolveCliDeps,
 } from '@cs/db';
-import { budgetPolicy, isValidOidcClientSecret, loadConfig, readSecretKeyring, sha256Hex, stableStringify, toMicro, fromMicro } from '@cs/domain';
+import { budgetPolicy, isValidOidcClientSecret, loadConfig, readSecretKeyring, sha256Hex, stableStringify, toMicro, fromMicro, type LedgerBundleRow } from '@cs/domain';
 import { ClaudeLlmProvider, LocalStorageAdapter, MockLlmProvider } from '@cs/providers';
 
 const APP = fileURLToPath(new URL('../../', import.meta.url));
@@ -287,6 +292,43 @@ const RESOLUTION_KEYS_SORTED = ['original_reported', 'original_usage_source', 'r
 const TRIM_WS = Array.from({ length: 0x10000 }, (_, c) => String.fromCharCode(c))
   .filter((ch) => (ch < '\uD800' || ch > '\uDFFF') && ch.trim() === '')
   .join('');
+/**
+ * FIX6(6차 검토 #2): 미리보기·적용 칸이 반드시 \u 로 적어야 하는 코드 포인트 — 구현의 정규식을 베끼지 않은 **명시 목록**. 기본 무시 문자(한글 채움 U+3164·U+115F·
+ * U+1160·U+FFA0, 결합 자소 결합자 U+034F, 변이 선택자 U+FE00·U+FE0F·U+E0100, 크메르 U+17B4, 몽골 변이 선택자 U+180B·U+180F)·폭 없는 공백·양방향 제어·
+ * ESC·C1(CSI U+009B·NEL U+0085)·줄/문단 구분자·NBSP·전각 공백·SHY·BOM·BMP 밖 태그·사용자 영역.
+ */
+const MUST_ESCAPE = [
+  0x3164, 0x115f, 0x1160, 0xffa0, 0x034f, 0xfe00, 0xfe0f, 0xe0100, 0x17b4, 0x180b, 0x180f, 0x200b, 0x202e, 0x2066, 0x001b, 0x009b, 0x0085, 0x2028, 0x2029, 0x00a0,
+  0x3000, 0x00ad, 0xfeff, 0xe0041, 0xf0000,
+];
+/** 표시 형식(BMP 는 \uXXXX 소문자 4자리, BMP 밖은 \u{…}) */
+const escOf = (cp: number) => (cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`);
+/**
+ * FIX6(6차 검토 #4): 제품 코드에 훅을 더하지 않고 "커밋 뒤" 를 재현하는 db 감싸개 — 적용 트랜잭션(transaction())이 커밋돼 끝난 뒤에만 afterCommit 을 부르고,
+ * failSelects 이면 그 뒤의 select(커밋 뒤 차단 판정 다시 보기)를 실패시킨다. 트랜잭션이 되돌려지면(throw) 아무것도 하지 않는다.
+ */
+function dbAfterCommit(base: Db, afterCommit: (d: Db) => Promise<void>, failSelects: boolean): Db {
+  let committed = false;
+  return new Proxy(base, {
+    get(target, prop) {
+      if (prop === 'transaction') {
+        return async (...args: unknown[]) => {
+          const r: unknown = await (target.transaction as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          committed = true;
+          await afterCommit(target);
+          return r;
+        };
+      }
+      if (prop === 'select' && failSelects && committed) {
+        return () => {
+          throw new TypeError('fix6-after-commit-select');
+        };
+      }
+      const v: unknown = Reflect.get(target, prop, target);
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+}
 
 const FULL = (): string[] => ['--owner', randomUUID(), '--ledger', randomUUID(), '--source', 'provider', '--actual', '1.000000', '--settled', '1.000000', '--by', 'x', '--reason', 'y'];
 describe('FIX4-LIVEL1H2 — ledger:resolve 인자(사용법 오류는 exit 2, DB 를 열지 않음)', () => {
@@ -325,6 +367,14 @@ describe('FIX4-LIVEL1H2 — ledger:resolve 인자(사용법 오류는 exit 2, DB
     expect(readSecretKeyring({ SECRETS_MASTER_KEY: MASTER_KEY, SECRETS_KEY_VERSION: '1' }).ok).toBe(true);
     expect(isValidOidcClientSecret(OIDC_SECRET)).toBe(true);
     expect(Object.keys(SECRET_ENV).sort()).toEqual(['ANTHROPIC_API_KEY', 'OIDC_CLIENT_SECRET', 'SECRETS_MASTER_KEY']);
+  });
+
+  it('FIX6(6차 검토 #5·#1): 사용법의 명령 줄은 앞붙임 없이 corepack pnpm ledger:resolve 로 시작하고(MSYS_NO_PATHCONV 없음), 쓰지 않을 문자에 & | < > ^ 와 / 로 시작을 적는다', () => {
+    expect(LEDGER_RESOLVE_USAGE).not.toContain('MSYS_NO_PATHCONV');
+    const cmdLines = LEDGER_RESOLVE_USAGE.split('\n').filter((l) => l.includes('ledger:resolve'));
+    expect(cmdLines).toHaveLength(2);
+    for (const l of cmdLines) expect(l.startsWith('  corepack pnpm ledger:resolve --'), l).toBe(true);
+    expect(LEDGER_RESOLVE_USAGE).toContain('" % \\ & | < > ^ 와 줄바꿈을 쓰지 않고 / 로 시작하지 않으며');
   });
 
   it('--이름=값·대문자 uuid(소문자로)·앞의 -- 를 받는다', () => {
@@ -393,6 +443,8 @@ describe('FIX4-LIVEL1H2 — 새 해결: 미리보기는 쓰지 않고, --confirm
         const lines = r.out.split('\n');
         expect(lines.filter((l) => l.includes(BY))).toEqual([`resolved_by: ${JSON.stringify(BY)}`]);
         expect(lines.filter((l) => l.includes(REASON_SENTINEL))).toEqual([`reason: ${JSON.stringify(REASON)}`]);
+        // FIX6(FIX5 Q3): 새 해결의 칸은 그대로 — settled_amount 는 새 값 한 줄뿐, 정정 전 값·resolved_at 줄 없음(그 줄은 정정에만)
+        expect(lines.filter((l) => /^(settled_amount|resolved_at):/.test(l))).toEqual(['settled_amount: 9.950000']);
         expect(r.err).toBe('');
         const text = r.out + r.err;
         for (const v of [String(snapA0.reported_cost), String(snapA0.reported_tokens_in), APPROVAL, KEY, 'sk-ant', 'input_per_1k', '0.004000']) {
@@ -579,14 +631,26 @@ describe('FIX4-LIVEL1H2 — 검증기가 거부하는 채움은 모두 exit 1, �
       ['reason UTF-16 4002(이모지 2001개)', { reason: '😀'.repeat(2001) }, 'resolution:reason'],
       ['resolved_by NUL', { by: 'a\u0000b' }, 'text_encoding'],
       ['reason 짝 없는 서로게이트', { reason: 'x\uD800y' }, 'text_encoding'],
-      // FIX5(5차 검토 #4·#5): pnpm 의 두 번째 셸(Windows cmd.exe)이 바꾸는 문자는 받지 않는다(복원 검사는 받지만 이 명령이 거부)
+      // FIX5(5차 검토 #4·#5): 셸 문자는 받지 않는다(복원 검사는 받지만 이 명령이 거부). FIX6(6차 검토 #1): 거부는 문자가 **도착했을 때만** 본다 —
+      // 아래는 그 문자가 그대로 도착한 경우(in-process)이고, 셸이 확장·삭제한 경우(문자가 도착하지 않음)는 시험하지 않는다(표시 줄로 확인 — 인계 6단계)
       ['resolved_by 큰따옴표', { by: 'op "kim"' }, 'text_shell_unsafe'],
       ['resolved_by 퍼센트(%USERNAME%)', { by: '%USERNAME%' }, 'text_shell_unsafe'],
       ['resolved_by 역슬래시', { by: 'CORP\\op' }, 'text_shell_unsafe'],
       ['reason 큰따옴표', { reason: '콘솔 "확인"' }, 'text_shell_unsafe'],
-      ['reason 퍼센트(%PATH% 확장)', { reason: '콘솔 확인 %PATH%' }, 'text_shell_unsafe'],
+      ['reason 퍼센트(%PATH% 글자 그대로 도착 — 확장은 시험하지 않음)', { reason: '콘솔 확인 %PATH%' }, 'text_shell_unsafe'],
       ['reason 퍼센트 하나(9.95% 할인)', { reason: '실제 청구 9.95% 할인' }, 'text_shell_unsafe'],
       ['reason 역슬래시(경로)', { reason: 'C:\\logs\\x.txt 확인' }, 'text_shell_unsafe'],
+      // FIX6(6차 검토 #1): cmd.exe 연산자 & | < > ^ (Windows [미확인] — 따옴표 밖이면 프로그램이 시작하기 전에 동작)
+      ['resolved_by 앰퍼샌드(&)', { by: 'kim & lee' }, 'text_shell_unsafe'],
+      ['resolved_by 파이프(|)', { by: 'ops|kim' }, 'text_shell_unsafe'],
+      ['reason 작다(<)', { reason: '청구 < 10 USD' }, 'text_shell_unsafe'],
+      ['reason 크다(>)', { reason: '청구 > 9 USD' }, 'text_shell_unsafe'],
+      ['reason 캐럿(^)', { reason: '2^31 토큰 넘음' }, 'text_shell_unsafe'],
+      // FIX6(6차 검토 #5): / 로 시작하는 값(Git Bash 의 MSYS 가 POSIX 경로로 보고 바꾸는 모양 — 앞붙임 MSYS_NO_PATHCONV 대신 거부)
+      ['resolved_by / 로 시작', { by: '/c/op' }, 'text_shell_unsafe'],
+      ['resolved_by // 로 시작', { by: '//op' }, 'text_shell_unsafe'],
+      ['reason / 로 시작', { reason: '/var/log 확인' }, 'text_shell_unsafe'],
+      ['reason / 하나', { reason: '/' }, 'text_shell_unsafe'],
     ];
     for (const [label, over, code] of wrong) {
       for (const flags of [[], ['--expect', goodFp, '--confirm']]) {
@@ -594,10 +658,20 @@ describe('FIX4-LIVEL1H2 — 검증기가 거부하는 채움은 모두 exit 1, �
         expect(r.code, `${label} ${flags.join(' ')}`).toBe(1);
         expect(r.err, label).toContain(`거부(${code})`);
         expect(r.err, label).toContain('아무것도 바꾸지 않았습니다');
-        expect(r.out, label).not.toContain('updated');
+        expect(r.out, label).toBe(''); // FIX6: 계획 거부는 stdout 에 아무것도 내지 않는다(FIX5 까지는 'updated' 없음만)
         expect(await ownerLedger(owner), label).toEqual(before);
         expect(await ownerLedger(other.owner), label).toEqual(otherBefore);
       }
+    }
+    // FIX6 대조: / 가 처음이 아니면 받고, Git Bash 가 바꾼 뒤의 모양(C:/…)은 거부가 볼 수 없어 받는다 — 받은 그대로 표시(그 변형은 표시 줄로 본다, 인계 6단계).
+    // 미리보기만(아무것도 안 바뀜)
+    for (const over of [{ by: 'ops/kim', reason: '콘솔/청구 확인 (1/2)' }, { reason: 'C:/Program Files/Git/var/log 확인' }] as Array<Partial<Fill>>) {
+      const r = await cli(argvOf({ ...good, ...over }));
+      expect(r.code, `${JSON.stringify(over)}: ${r.err}`).toBe(0);
+      const lines = r.out.split('\n');
+      expect(lines).toContain(`resolved_by: ${JSON.stringify(over.by ?? BY)}`);
+      expect(lines).toContain(`reason: ${JSON.stringify(over.reason ?? REASON)}`);
+      expect(await ownerLedger(owner)).toEqual(before);
     }
     // 대상 찾기: 없는 id·다른 owner 의 id → 0행, exit 1
     for (const [label, over] of [
@@ -631,17 +705,29 @@ describe('FIX4-LIVEL1H2 — 검증기가 거부하는 채움은 모두 exit 1, �
 });
 
 describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(FIX3 이전 문·H2 이전 손 작업). original_* 그대로', () => {
-  it('깨진 해결 5변형 → --correct 없이는 거부, 잘못 채우면 거부, 맞게 채우면 1행·original_reported 그대로·묶음 통과', async () => {
+  it('깨진 해결 6변형 → --correct 없이는 거부, --overwrite-valid 는 거부(overwrite_not_needed), 잘못 채우면 거부(셸·인코딩 포함), 맞게 채우면 1행·original_reported 그대로·묶음 통과. 미리보기·적용 칸과 감사는 정정 전 settled_amount·resolved_at 을 형식 검사 뒤에만', async () => {
     const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix4-lr-corr-'));
     try {
-      const variants: Array<[string, (s: Snap) => void, boolean]> = [
-        ['settled_amount "9.95"(FIX3 이전 문에 잘못 채움)', (s) => void (s.resolution.settled_amount = '9.95'), false],
-        ['resolved_at +00:00·빈 resolved_by(H2 이전 손 작업)', (s) => void Object.assign(s.resolution, { resolved_at: '2026-10-10T12:00:00+00:00', resolved_by: ' ' }), false],
-        ['usage_source providers(FIX3 이전 문 — 차단은 풀렸지만 복원 거부)', (s) => void (s.usage_source = 'providers'), false],
-        ['재정산 누락(actual = 예약액, settled 9.95)', () => undefined, true],
-        ['반쯤 끝남(provider_unstorable 그대로 + resolution, 최상위 reported_* 는 이미 옮김)', (s) => void (s.usage_source = 'provider_unstorable'), false],
+      const HAND_AT = '2026-10-10T12:00:00.000Z'; // handResolve 의 resolved_at
+      // [이름, 깨뜨리기, 예약액 유지, FIX6: 정정 전 [settled_amount, resolved_at] 표시(형식 밖이면 값을 되풀이하지 않음)]
+      const variants: Array<[string, (s: Snap) => void, boolean, [string, string]]> = [
+        ['settled_amount "9.95"(FIX3 이전 문에 잘못 채움)', (s) => void (s.resolution.settled_amount = '9.95'), false, ['(형식 밖 값)', HAND_AT]],
+        ['resolved_at +00:00·빈 resolved_by(H2 이전 손 작업)', (s) => void Object.assign(s.resolution, { resolved_at: '2026-10-10T12:00:00+00:00', resolved_by: ' ' }), false, ['9.950000', '(형식 밖 값)']],
+        ['usage_source providers(FIX3 이전 문 — 차단은 풀렸지만 복원 거부)', (s) => void (s.usage_source = 'providers'), false, ['9.950000', HAND_AT]],
+        ['재정산 누락(actual = 예약액, settled 9.95)', () => undefined, true, ['9.950000', HAND_AT]],
+        ['반쯤 끝남(provider_unstorable 그대로 + resolution, 최상위 reported_* 는 이미 옮김)', (s) => void (s.usage_source = 'provider_unstorable'), false, ['9.950000', HAND_AT]],
+        // FIX6(FIX5 Q3): 키가 없거나 문자열이 아닌 옛 값 — (없음)·(형식 밖 값)
+        [
+          'settled_amount 키 없음·resolved_at 숫자(H2 이전 손 작업)',
+          (s) => {
+            delete s.resolution.settled_amount;
+            s.resolution.resolved_at = 1760097600000;
+          },
+          false,
+          ['(없음)', '(형식 밖 값)'],
+        ],
       ];
-      for (const [i, [label, mutate, keepReserved]] of variants.entries()) {
+      for (const [i, [label, mutate, keepReserved, [settledBefore, resolvedAtBefore]]] of variants.entries()) {
         const { owner, ledgerId } = await unstorableRun(db, `fix4-lr-corr-${i}@example.local`);
         const { original } = await handResolve(ledgerId);
         const r0 = await rowOf(db, ledgerId);
@@ -665,6 +751,21 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
         expect(pv.code, `${label}: ${pv.err}`).toBe(0);
         const corrFp = fpOf(pv.out);
         expect(corrFp, label).toBe(await expectedFp(good, 'correct', { correct: true }));
+        // FIX6(FIX5 Q3): 정정이 바꾸는 것 — settled_amount·resolved_at 의 전 → 후(전 값은 복원 형식일 때만). 형식 밖 원문·정정 전 by/reason 은 나오지 않는다
+        const beforeLines = [`settled_amount: ${settledBefore} → 9.950000`, `resolved_at: ${resolvedAtBefore} → (실행 시각)`];
+        expect(pv.out.split('\n').filter((l) => /^(settled_amount|resolved_at):/.test(l)), label).toEqual(beforeLines);
+        for (const v of ['+00:00', '1760097600000', '"9.95"', '시험: 손 작업', 'operator']) expect(pv.out.includes(v), `${label}: ${v}`).toBe(false);
+        // FIX6(FIX5 Q2): 이 행은 복원 검사에서 거부되므로 --overwrite-valid 는 거부 — 미리보기도 --confirm 도(지문 비교보다 먼저), stdout 비어 있음, 행 그대로
+        for (const flags of [['--correct', '--overwrite-valid'], ['--correct', '--overwrite-valid', '--expect', corrFp, '--confirm']]) {
+          const ov = await cli(argvOf(good, ...flags));
+          expect([ov.code, ov.err.includes('거부(overwrite_not_needed)'), ov.err.includes('--overwrite-valid 를 빼고 --correct 만으로'), ov.out], `${label} ${flags.join(' ')}`).toEqual([
+            1,
+            true,
+            true,
+            '',
+          ]);
+        }
+        expect(await ownerLedger(owner), label).toEqual(broken);
         // 잘못 채움(4~6 표의 대표 + 정정 문이 시험하지 않던 길이·none·state — 4차 검토 #8·#10)
         const wrongCorr: Array<[Partial<Fill>, string]> = [
           [{ settled: '9.95' }, 'resolution:settled_amount'],
@@ -682,10 +783,20 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
           [{ source: 'estimate', actual: r0.reservedAmount, settled: r0.reservedAmount }, 'resolution:usage_source'],
           [{ source: 'none' }, 'none_actual'],
           [{ actual: r0.reservedAmount }, 'resolution:settled_vs_actual'],
+          // FIX6(6차 검토 #3): 셸·인코딩 거부는 정정에서도(새 해결 표와 같은 대표 + 6차의 & · / 로 시작)
+          [{ reason: '실제 청구 9.95% 할인' }, 'text_shell_unsafe'],
+          [{ by: 'CORP\\op' }, 'text_shell_unsafe'],
+          [{ reason: '콘솔 "확인"' }, 'text_shell_unsafe'],
+          [{ by: 'kim & lee' }, 'text_shell_unsafe'],
+          [{ reason: '/var/log 확인' }, 'text_shell_unsafe'],
+          [{ by: 'a\u0000b' }, 'text_encoding'],
+          [{ reason: 'x\uD800y' }, 'text_encoding'],
         ];
         for (const [over, code] of wrongCorr) {
           const r = await cli(argvOf({ ...good, ...over }, '--correct', '--expect', corrFp, '--confirm'));
-          expect([r.code, r.err.includes(`거부(${code})`)], `${label} ${JSON.stringify(over).slice(0, 80)}`).toEqual([1, true]);
+          const l = `${label} ${JSON.stringify(over).slice(0, 80)}`;
+          expect([r.code, r.err.includes(`거부(${code})`), r.err.includes('아무것도 바꾸지 않았습니다')], l).toEqual([1, true, true]);
+          expect(r.out, l).toBe(''); // FIX6: 계획 거부는 stdout 에 아무것도 내지 않는다
           expect(await ownerLedger(owner), label).toEqual(broken);
         }
         // 없는 owner(1단계 내보내기 owner 가 아님 — FIX5 #6, FIX4 에서는 "대상 행이 없습니다") · 없는 원장 id
@@ -703,9 +814,35 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
         expect(pv.out).toContain('지금 행의 복원 검사: 거부(이 정정의 대상)');
         expect(await ownerLedger(owner), label).toEqual(broken);
         // 맞게 채우면(처음 미리보기의 지문) 정확히 1행 — 바뀌는 것은 resolution 네 키·usage_source·금액 열뿐, original_* 그대로
+        const audits0 = await resolveAudits();
         const done = await cli(argvOf(good, '--correct', '--expect', corrFp, '--confirm'));
         expect(done.code, `${label}: ${done.err}`).toBe(0);
         expect(done.out.split('\n')).toContain('updated 1');
+        expect(done.out.split('\n').filter((l) => /^(settled_amount|resolved_at):/.test(l)), label).toEqual(beforeLines); // 적용 칸도 같은 전 → 후
+        // FIX6(FIX5 Q3): 감사 전체(FIX5 까지는 정정의 감사를 toMatchObject 로만 봄) — 정정 전 settled_amount·resolved_at 은 형식 검사 뒤, by/reason 은 길이만
+        expect(await resolveAudits(), label).toBe(audits0 + 1);
+        const brokenRow = broken.find((r) => r.id === ledgerId)!;
+        const [audit] = await db
+          .select()
+          .from(schema.auditEvents)
+          .where(and(eq(schema.auditEvents.action, 'usage_ledger.manual_resolve'), eq(schema.auditEvents.entityId, ledgerId)));
+        expect(audit!.sanitizedDetails, label).toEqual({
+          mode: 'correct',
+          half_finished: false,
+          current_row_valid: false,
+          usage_source_before: snap.usage_source,
+          usage_source_after: 'provider',
+          reserved_amount: brokenRow.reservedAmount,
+          actual_amount_before: brokenRow.actualAmount,
+          actual_amount_after: '9.950000',
+          settled_amount: '9.950000',
+          settled_amount_before: settledBefore,
+          resolved_at_before: resolvedAtBefore,
+          resolved_by_length: BY.length,
+          reason_length: REASON.length,
+          live_blocked_after: false,
+        });
+        for (const v of ['+00:00', '1760097600000', '시험: 손 작업', 'operator', 'sentinel']) expect(JSON.stringify(audit).includes(v), `${label}: 감사에 ${v}`).toBe(false);
         const r1 = await rowOf(db, ledgerId);
         const s1 = r1.pricingSnapshot as Snap;
         expect(Object.keys(s1.resolution).sort(), label).toEqual(RESOLUTION_KEYS_SORTED);
@@ -765,16 +902,49 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
       const pvA = await cli(argvOf(wrongPick, '--correct', '--overwrite-valid'));
       expect(pvA.code, pvA.err).toBe(0);
       expect(pvA.out).toContain('지금 행의 복원 검사: 통과 — 이미 올바른 해결 기록을 덮어쓴다(--overwrite-valid)');
+      // FIX6(FIX5 Q3): 무엇을 덮어쓰는지 — 올바른 행이라 정정 전 값이 그대로 보인다(정정 전 by/reason 은 안 보임)
+      expect(pvA.out.split('\n').filter((l) => /^(settled_amount|resolved_at):/.test(l))).toEqual(['settled_amount: 9.950000 → 120.500000', 'resolved_at: 2026-10-10T12:00:00.000Z → (실행 시각)']);
+      for (const v of ['시험: 손 작업', 'operator']) expect(pvA.out.includes(v), v).toBe(false);
       expect(fpOf(pvA.out)).toBe(await expectedFp(wrongPick, 'correct', { correct: true, overwriteValid: true }));
+      expect(await ownerLedger(owner)).toEqual(before);
+      // FIX6(6차 검토 #3): --correct --overwrite-valid(사유를 새로 적는 경로)에서도 셸·인코딩 거부 — 미리보기·--confirm 모두, stdout 비어 있음, A 그대로
+      for (const [over, code] of [
+        [{ reason: '정정: 사유 100% 고쳐 씀' }, 'text_shell_unsafe'],
+        [{ reason: '/정정 사유' }, 'text_shell_unsafe'],
+        [{ by: 'ops^kim' }, 'text_shell_unsafe'],
+        [{ reason: 'x\uDC00y' }, 'text_encoding'],
+      ] as Array<[Partial<Fill>, string]>) {
+        for (const flags of [['--correct', '--overwrite-valid'], ['--correct', '--overwrite-valid', '--expect', fpOf(pvA.out), '--confirm']]) {
+          const r = await cli(argvOf({ ...wrongPick, ...over }, ...flags));
+          expect([r.code, r.err.includes(`거부(${code})`), r.out], `${JSON.stringify(over)} ${flags.join(' ')}`).toEqual([1, true, '']);
+        }
+      }
       expect(await ownerLedger(owner)).toEqual(before);
       // 올바른 대상(B)을 정정(--overwrite-valid 없이) → B 만 바뀐다
       const fillB = { ...fillFor(B, owner), actual: '120.500000', settled: '120.500000' };
       const pvB = await cli(argvOf(fillB, '--correct'));
       expect(pvB.code, pvB.err).toBe(0);
       expect(pvB.out).toContain('지금 행의 복원 검사: 거부(이 정정의 대상)');
-      // 지문은 --overwrite-valid 도 담는다: B 의 미리보기 지문에 --overwrite-valid 를 더해 --confirm 하면 거부
-      const mixed = await cli(argvOf(fillB, '--correct', '--overwrite-valid', '--expect', fpOf(pvB.out), '--confirm'));
-      expect([mixed.code, mixed.err.includes('거부(expect_mismatch)')]).toEqual([1, true]);
+      // FIX6(FIX5 Q3): B 의 정정 전 settled_amount('120.5')는 형식 밖이라 값을 되풀이하지 않는다
+      expect(pvB.out.split('\n').filter((l) => /^(settled_amount|resolved_at):/.test(l))).toEqual(['settled_amount: (형식 밖 값) → 120.500000', 'resolved_at: 2026-10-10T12:00:00.000Z → (실행 시각)']);
+      // FIX5 는 "B 의 미리보기 지문에 --overwrite-valid 를 더한 --confirm → expect_mismatch"(유효하지 않은 행의 --overwrite-valid 허용) →
+      // FIX6(FIX5 Q2): 유효하지 않은 행의 --overwrite-valid 는 미리보기·--confirm 모두 계획에서 거부(overwrite_not_needed — 지문 비교보다 먼저, stdout 비어 있음)
+      for (const flags of [['--correct', '--overwrite-valid'], ['--correct', '--overwrite-valid', '--expect', fpOf(pvB.out), '--confirm']]) {
+        const mixed = await cli(argvOf(fillB, ...flags));
+        expect([mixed.code, mixed.err.includes('거부(overwrite_not_needed)'), mixed.out], flags.join(' ')).toEqual([1, true, '']);
+      }
+      // 지문이 --overwrite-valid 를 담는 것은 함수로 직접(같은 행·입력에서 플래그만 다르면 다른 지문, 플래그 없는 쪽이 B 의 미리보기 지문)
+      const [rowB] = await selectBundleRows(db, 'usage_ledger', sql`"usage_ledger"."id" = ${B}::uuid`);
+      const fpInput = {
+        owner,
+        ledger: B,
+        mode: 'correct' as const,
+        correct: true,
+        current: rowB!.row as LedgerBundleRow,
+        args: { source: fillB.source, actual: fillB.actual, settled: fillB.settled, by: fillB.by, reason: fillB.reason },
+      };
+      expect(ledgerResolutionFingerprint({ ...fpInput, overwriteValid: false })).toBe(fpOf(pvB.out));
+      expect(ledgerResolutionFingerprint({ ...fpInput, overwriteValid: true })).not.toBe(fpOf(pvB.out));
       expect(await ownerLedger(owner)).toEqual(before);
       const ok = await cli(argvOf(fillB, '--correct', '--expect', fpOf(pvB.out), '--confirm'));
       expect(ok.code, ok.err).toBe(0);
@@ -782,6 +952,7 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
       expect(after.find((r) => r.id === A)).toEqual(before.find((r) => r.id === A));
       expect(await checkBundleZip(await exportZip(db, owner, tmp, 'y'))).toMatchObject({ ok: true, unresolved_live_usage: 0 });
       // 일부러 올바른 A 를 고쳐 쓰기(사유 고쳐 쓰기) — --correct --overwrite-valid 로만, 감사에 current_row_valid true
+      const rowA0 = before.find((r) => r.id === A)!;
       const rewrite = await apply(argvOf({ ...fillFor(A, owner), reason: '정정: 사유 고쳐 씀' }, '--correct', '--overwrite-valid'));
       expect(rewrite.code, rewrite.err).toBe(0);
       expect(((await rowOf(db, A)).pricingSnapshot as Snap).resolution).toMatchObject({ reason: '정정: 사유 고쳐 씀', resolved_by: BY });
@@ -789,7 +960,24 @@ describe('FIX4-LIVEL1H2 — 정정(--correct): resolution 이 이미 있는 행(
         .select()
         .from(schema.auditEvents)
         .where(and(eq(schema.auditEvents.action, 'usage_ledger.manual_resolve'), eq(schema.auditEvents.entityId, A)));
-      expect(auditA!.sanitizedDetails).toMatchObject({ mode: 'correct', current_row_valid: true });
+      // FIX5 는 toMatchObject({ mode, current_row_valid }) → FIX6: 감사 전체(정정 전 settled_amount·resolved_at 포함, by/reason 은 길이만)
+      expect(auditA!.sanitizedDetails).toEqual({
+        mode: 'correct',
+        half_finished: false,
+        current_row_valid: true,
+        usage_source_before: 'provider',
+        usage_source_after: 'provider',
+        reserved_amount: rowA0.reservedAmount,
+        actual_amount_before: '9.950000',
+        actual_amount_after: '9.950000',
+        settled_amount: '9.950000',
+        settled_amount_before: '9.950000',
+        resolved_at_before: '2026-10-10T12:00:00.000Z',
+        resolved_by_length: BY.length,
+        reason_length: '정정: 사유 고쳐 씀'.length,
+        live_blocked_after: false,
+      });
+      expect(JSON.stringify(auditA)).not.toContain('시험: 손 작업');
       expect(JSON.stringify(auditA)).not.toContain('sentinel');
       expect(await resolveAudits()).toBe(audits0 + 2);
       expect(await checkBundleZip(await exportZip(db, owner, tmp, 'z'))).toMatchObject({ ok: true, unresolved_live_usage: 0 });
@@ -816,9 +1004,28 @@ describe('FIX4-LIVEL1H2 — 4차 검토 #6: 반쯤 끝난 H2 이전 행(provider
         expect(await checkBundleZip(await exportZip(db, owner, tmp, `h${i}`)), label).toMatchObject({ ok: false, error: 'integrity', problems: ['usage_ledger.pricing_snapshot.resolution 형식'] });
         const list = await cli(['--list', '--owner', owner]);
         expect(list.out, label).toContain('→ 새 해결(--correct 없이 — 반쯤 끝난 기록을 다시 만듦)');
+        // FIX6(6차 검토 #6): 이렇게 백업 묶음의 bundle:check 가 integrity 로 거부될 때 1단계가 대신 적는 기준값 — --list 둘째 줄의 수(해결 뒤 묶음은 0 = 1 − 1)
+        expect(list.out.split('\n')[1], label).toBe(`owner ${owner} · 후보 1행 · 아직 provider_unstorable 1행(0 이면 새 live 호출이 열려 있음)`);
         const before = await ownerLedger(owner);
         const wc = await cli(argvOf(fillFor(ledgerId, owner), '--correct', '--expect', DUMMY_FP, '--confirm'));
         expect([wc.code, wc.err.includes('거부(not_resolved_yet)')], label).toEqual([1, true]);
+        // FIX6: --correct --overwrite-valid 도 not_resolved_yet(새 해결 행 — overwrite_not_needed 보다 분류가 먼저)
+        const wo = await cli(argvOf(fillFor(ledgerId, owner), '--correct', '--overwrite-valid'));
+        expect([wo.code, wo.err.includes('거부(not_resolved_yet)'), wo.out], label).toEqual([1, true, '']);
+        // FIX6(6차 검토 #3): 반쯤 끝난 행에서도 셸·인코딩 거부 — 미리보기·--confirm 모두 exit 1, stdout 비어 있음, 행 그대로
+        const halfPv = await cli(argvOf(fillFor(ledgerId, owner)));
+        expect(halfPv.code, `${label}: ${halfPv.err}`).toBe(0);
+        for (const [over, code] of [
+          [{ reason: '콘솔 확인 %PATH%' }, 'text_shell_unsafe'],
+          [{ by: 'kim<lee>' }, 'text_shell_unsafe'],
+          [{ by: '/op' }, 'text_shell_unsafe'],
+          [{ reason: 'a\u0000b' }, 'text_encoding'],
+        ] as Array<[Partial<Fill>, string]>) {
+          for (const flags of [[], ['--expect', fpOf(halfPv.out), '--confirm']]) {
+            const r = await cli(argvOf({ ...fillFor(ledgerId, owner), ...over }, ...flags));
+            expect([r.code, r.err.includes(`거부(${code})`), r.err.includes('아무것도 바꾸지 않았습니다'), r.out], `${label} ${JSON.stringify(over)} ${flags.join(' ')}`).toEqual([1, true, true, '']);
+          }
+        }
         expect(await ownerLedger(owner)).toEqual(before);
         const ok = await apply(argvOf(fillFor(ledgerId, owner)));
         expect(ok.preview.out, label).toContain('반쯤 끝난 해결 기록(provider_unstorable + resolution)을 최상위 원래 보고값으로 다시 만든다');
@@ -1013,6 +1220,65 @@ describe('FIX4-LIVEL1H2 — 적용 트랜잭션의 compare-and-swap·DB 잠금·
     expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
   });
 
+  it('6차 검토 #4: 커밋 뒤 실패 = "updated 1" 뒤 exit 1 — (a) 적용 뒤 DB 닫기 실패 (b) 커밋 뒤 확인 실패(차단 판정이 다름·다시 읽기 실패). stderr 는 커밋이 끝났다고 말하고 "아무것도 바꾸지 않았습니다" 는 없다. 행은 해결됨·감사 +1', async () => {
+    // (a) 적용(--confirm)은 커밋됐고 그 뒤 close() 가 던진다
+    const a = await unstorableRun(db, 'fix6-lr-close@example.local');
+    const pvA = await cli(argvOf(fillFor(a.ledgerId, a.owner)));
+    expect(pvA.code, pvA.err).toBe(0);
+    const auditsA = await resolveAudits();
+    const closeFail = await cli(argvOf(fillFor(a.ledgerId, a.owner), '--expect', fpOf(pvA.out), '--confirm'), {
+      openDb: async () => ({
+        ...h,
+        close: async () => {
+          throw new TypeError(`x ${KEY}`);
+        },
+      }),
+    });
+    expect(closeFail.code).toBe(1);
+    expect(closeFail.out.split('\n')).toEqual(expect.arrayContaining([CONFIRM_HEADER, 'updated 1']));
+    expect(closeFail.err).toBe('DB 를 닫지 못했습니다(오류 종류: TypeError).');
+    expect(closeFail.err).not.toContain('아무것도 바꾸지 않았습니다');
+    expect(((await rowOf(db, a.ledgerId)).pricingSnapshot as Snap).resolution).toMatchObject({ resolved_by: BY, reason: REASON, resolved_at: NOW.toISOString() });
+    expect(await hasUnresolvedLiveUsage(db, a.owner)).toBe(false);
+    expect(await resolveAudits()).toBe(auditsA + 1);
+    // (b) 커밋 뒤 확인(hasUnresolvedLiveUsage)이 실패 — 제품 훅 없이 db 감싸개로(transaction() 이 끝난 뒤에만 동작)
+    const postCommitCases: Array<[string, (plain: string) => Db, string]> = [
+      [
+        '차단 판정이 커밋 직후 값과 다름(커밋 뒤 같은 owner 의 다른 행이 provider_unstorable 이 됨)',
+        (plain: string) =>
+          dbAfterCommit(
+            db,
+            async (d) => {
+              const p = await rowOf(d, plain);
+              await setSnap(d, plain, { ...p.pricingSnapshot, usage_source: 'provider_unstorable' });
+            },
+            false,
+          ),
+        'Error',
+      ],
+      ['커밋 뒤 다시 읽기(select) 실패', () => dbAfterCommit(db, async () => undefined, true), 'TypeError'],
+    ];
+    for (const [label, makeDb, errName] of postCommitCases) {
+      const owner = await freshOwner(db, `fix6-lr-postcommit-${randomUUID()}@example.local`);
+      const plain = await liveRun(db, owner, json(200, message())); // 보통 provider 행(먼저 — 미해결 행이 있으면 live 호출이 막힌다)
+      const ledgerId = await liveRun(db, owner, json(200, message({ usage: OVER_INT })));
+      const pv = await cli(argvOf(fillFor(ledgerId, owner)));
+      expect(pv.code, `${label}: ${pv.err}`).toBe(0);
+      const audits0 = await resolveAudits();
+      const wrapped = makeDb(plain);
+      const r = await cli(argvOf(fillFor(ledgerId, owner), '--expect', fpOf(pv.out), '--confirm'), { openDb: async () => ({ ...h, db: wrapped, close: async () => undefined }) });
+      expect(r.code, label).toBe(1);
+      expect(r.out.split('\n'), label).toEqual(expect.arrayContaining([CONFIRM_HEADER, 'updated 1', '이 owner 의 새 live 호출: 열림(이 owner 의 provider_unstorable 0행)']));
+      expect(r.err, label).toBe(`적용(커밋)은 끝났지만 그 뒤 확인을 마치지 못했습니다(오류 종류: ${errName}). --list 로 결과를 확인하세요.`);
+      expect(r.err, label).not.toContain('아무것도 바꾸지 않았습니다');
+      expect(r.err, label).not.toContain('fix6-after-commit-select');
+      const row = await rowOf(db, ledgerId);
+      expect((row.pricingSnapshot as Snap).usage_source, label).toBe('provider');
+      expect((row.pricingSnapshot as Snap).resolution, label).toMatchObject({ resolved_by: BY, reason: REASON, resolved_at: NOW.toISOString() });
+      expect(await resolveAudits(), label).toBe(audits0 + 1);
+    }
+  });
+
   it('DB 잠금(dev 서버가 열고 있음) → 잠금 안내 exit 1 / 예상하지 못한 오류는 종류·코드만 / DB 닫기 실패 exit 1', async () => {
     const locked = await cli(['--list'], {
       openDb: async () => {
@@ -1110,7 +1376,6 @@ describe('FIX5-LIVEL1H2 — 5차 검토 #1·Q2: 확인 지문(--expect)이 ② �
 });
 
 describe('FIX5-LIVEL1H2 — 5차 검토 #4·#5·Q1: --by·--reason 을 받은 그대로(이스케이프) 보여 주고 그대로 저장한다', () => {
-  const INVISIBLE = /[\p{C}\p{Zl}\p{Zp}]|(?!\x20)\p{Zs}/u;
   it('보이지 않는 문자·제어 문자·줄 구분자·BMP 밖 형식/사용자 문자는 \\u 로, 보이는 글자·U+0020 은 그대로 — 미리보기·적용 칸이 같고, 저장 값은 받은 값 그대로, 감사·--list 에는 없음', async () => {
     const { owner, ledgerId } = await unstorableRun(db, 'fix5-lr-escape@example.local');
     const by = 'op\u{a0}kim\u{200b}\u{202e}';
@@ -1122,7 +1387,12 @@ describe('FIX5-LIVEL1H2 — 5차 검토 #4·#5·Q1: --by·--reason 을 받은 �
       expect(lines).toContain('resolved_by: "op\\u00a0kim\\u200b\\u202e"');
       expect(lines).toContain('reason: "line1\\nline2\\ttab\\u2028sep\\u0085nel \\u3000wide\\u{e0041}tag\\u{f0000}pua \u{1f600} 끝"');
       expect(lines.some((l) => l.startsWith(`resolved_by ${by.length}자 · reason ${reason.length}자(UTF-16 길이`))).toBe(true);
-      for (const l of lines) expect(INVISIBLE.test(l), JSON.stringify(l)).toBe(false); // 출력 어디에도 보이지 않는 문자가 글자 그대로 남지 않는다
+      // FIX5 는 구현과 같은 정규식(INVISIBLE)으로 봤다 → FIX6(6차 검토 #2): 구현을 베끼지 않은 기준 둘 — (1) 명시 목록의 문자와 탭·CR 은 어느 줄에도 글자 그대로 없고,
+      // (2) 두 값 줄은 ASCII 보이는 글자(U+0020–U+007E)와 받은 값의 보이는 글자(😀·끝)로만 이뤄진다(그 밖의 보이지 않는 문자가 하나라도 남으면 실패)
+      for (const l of lines) for (const cp of [0x09, 0x0d, ...MUST_ESCAPE]) expect(l.includes(String.fromCodePoint(cp)), `U+${cp.toString(16)} 글자 그대로: ${JSON.stringify(l)}`).toBe(false);
+      for (const l of lines.filter((x) => x.startsWith('resolved_by: ') || x.startsWith('reason: '))) {
+        expect([...l].filter((ch) => !(ch >= ' ' && ch <= '~') && ch !== '\u{1f600}' && ch !== '끝'), JSON.stringify(l)).toEqual([]);
+      }
     }
     const res = ((await rowOf(db, ledgerId)).pricingSnapshot as Snap).resolution;
     expect([res.resolved_by, res.reason]).toEqual([by, reason]); // 표시는 이스케이프, 저장은 받은 그대로
@@ -1131,6 +1401,27 @@ describe('FIX5-LIVEL1H2 — 5차 검토 #4·#5·Q1: --by·--reason 을 받은 �
     for (const v of ['kim', 'line1', 'wide']) expect(JSON.stringify(audit), v).not.toContain(v);
     const lst = await cli(['--list', '--owner', owner]);
     for (const v of ['kim', 'line1', 'wide']) expect(lst.out + lst.err, v).not.toContain(v);
+  });
+
+  it('6차 검토 #2: 명시한 코드 포인트 목록(한글 채움·변이 선택자 같은 기본 무시 문자 포함)은 하나하나 by·reason 모두에서 \\u 로, U+0020·보통 한글·이모지는 글자 그대로. 채움 문자만인 by 도 공백처럼 보이지 않는다', async () => {
+    const { owner, ledgerId } = await unstorableRun(db, 'fix6-lr-escape-list@example.local');
+    const before = await ownerLedger(owner);
+    const VISIBLE = '콘솔 확인 가나다 \u{1f600} 끝';
+    for (const cp of MUST_ESCAPE) {
+      const ch = String.fromCodePoint(cp);
+      const label = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+      const r = await cli(argvOf({ ...fillFor(ledgerId, owner), by: `op${ch}kim`, reason: `${VISIBLE}${ch}${VISIBLE}` }));
+      expect(r.code, `${label}: ${r.err}`).toBe(0);
+      const lines = r.out.split('\n');
+      expect(lines, label).toContain(`resolved_by: "op${escOf(cp)}kim"`);
+      expect(lines, label).toContain(`reason: "${VISIBLE}${escOf(cp)}${VISIBLE}"`); // 공백·한글·이모지는 그대로
+      expect(r.out.includes(ch), `${label} 가 글자 그대로 출력됨`).toBe(false);
+    }
+    // 한글 채움 문자만으로 된 by: JS trim() 이 지우지 않아 검사는 통과하지만, 표시는 공백처럼 보이지 않고 \u3164 로
+    const filler = await cli(argvOf({ ...fillFor(ledgerId, owner), by: '\u3164\u3164' }));
+    expect(filler.code, filler.err).toBe(0);
+    expect(filler.out.split('\n')).toContain('resolved_by: "\\u3164\\u3164"');
+    expect(await ownerLedger(owner)).toEqual(before); // 미리보기만 — 아무것도 바뀌지 않음
   });
 });
 
@@ -1216,7 +1507,9 @@ describe('FIX4-LIVEL1H2 — --list(읽기 전용, 절차 2): 후보 행·처리 
     expect(lineOf(U)).toMatch(/status succeeded · error -\).*usage_source provider_unstorable.*→ 새 해결\(--correct 없이\)$/);
     expect(lineOf(failedU)).toMatch(/failed true · run \S+\(status failed · error llm_refusal\)/);
     expect(lineOf(R)).toMatch(/usage_source provider · 해결 기록 있음\(복원 검사 통과\) → 정정만\(--correct --overwrite-valid — 이미 복원 검사 통과\)$/);
-    expect(lines.at(-1)).toContain(`해결: MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id>`);
+    // FIX5 의 `해결: MSYS_NO_PATHCONV=1 corepack …` → FIX6(6차 검토 #5): 앞붙임 없이 corepack 으로 시작(그 앞붙임은 Git Bash 의 corepack shim 을 깰 수 있음 [추정])
+    expect(lines.at(-1)).toContain(`해결: corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id>`);
+    expect(r.out).not.toContain('MSYS_NO_PATHCONV');
     expect(lines.at(-1)).toContain('--expect <확인 지문> --confirm');
     for (const v of [APPROVAL, KEY, 'sk-ant', '시험: 손 작업', 'operator']) expect(r.out.includes(v), v).toBe(false);
     expect(await ownerLedger(owner)).toEqual(before);
@@ -1231,7 +1524,8 @@ describe('FIX4-LIVEL1H2 — --list(읽기 전용, 절차 2): 후보 행·처리 
     expect(oLines[2]).toMatch(/^범위 밖: 이 owner 는 1단계 내보내기 대상\(AUTH_ALLOWED_IDENTITY 의 owner\)이 아닙니다 — 해결 명령은 거부\(owner_not_exported\)\. /);
     expect(oLines[2]).toContain('1~7단계의 모든 명령 앞에 AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> 를 붙여');
     expect(oLines.slice(3, -1)).toEqual(lines.slice(2, -1));
-    expect(oLines.at(-1)).toContain(`해결: AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner ${owner}`);
+    expect(oLines.at(-1)).toContain(`해결: AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> corepack pnpm ledger:resolve --owner ${owner}`);
+    expect(outside.out).not.toContain('MSYS_NO_PATHCONV');
     for (const v of ['fix4-lr-wrong@example.local', identity]) expect(outside.out + outside.err, v).not.toContain(v);
     expect(await ownerLedger(owner)).toEqual(before);
     // 없는 owner·허용 사용자 없음 → exit 1
@@ -1267,13 +1561,18 @@ describe('FIX4-LIVEL1H2 — 4차 검토 #7: bundle:check 미해결 수는 세지
       ]);
       const backup = await exportZip(db, owner, tmp, 'backup');
       expect(await checkBundleZip(backup)).toMatchObject({ ok: true, rows: { usage_ledger: 6 }, unresolved_live_usage: 2 });
+      // FIX6(6차 검토 #6): 1단계가 묶음 검사 대신 적을 수 있는 기준값(--list 둘째 줄의 수)은 bundle:check 의 수와 같다 — 세지 않을 행(보통·실패 none·estimate·이전 행)도 같게 건너뜀
+      const listLine2 = async () => (await cli(['--list', '--owner', owner])).out.split('\n')[1];
+      expect(await listLine2()).toBe(`owner ${owner} · 후보 2행 · 아직 provider_unstorable 2행(0 이면 새 live 호출이 열려 있음)`);
       expect((await apply(argvOf(fillFor(U1, owner)))).code).toBe(0);
       const mid = await exportZip(db, owner, tmp, 'mid');
       expect(await checkBundleZip(mid)).toMatchObject({ ok: true, rows: { usage_ledger: 6 }, unresolved_live_usage: 1 });
+      expect(await listLine2()).toBe(`owner ${owner} · 후보 2행 · 아직 provider_unstorable 1행(0 이면 새 live 호출이 열려 있음)`);
       const reserved2 = (await rowOf(db, U2)).reservedAmount;
       expect((await apply(argvOf({ ...fillFor(U2, owner), source: 'none', actual: reserved2, settled: reserved2 }))).code).toBe(0);
       const fin = await exportZip(db, owner, tmp, 'final');
       expect(await checkBundleZip(fin)).toMatchObject({ ok: true, rows: { usage_ledger: 6 }, unresolved_live_usage: 0 });
+      expect(await listLine2()).toBe(`owner ${owner} · 후보 2행 · 아직 provider_unstorable 0행(0 이면 새 live 호출이 열려 있음)`);
       expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
       const s1 = (await rowOf(db, U1)).pricingSnapshot as Snap;
       // 스크립트(pnpm bundle:check): stdout JSON 한 줄 + stderr 정보 줄(수만), exit 0, DB 폴더 만들지 않음, 값·id 없음
@@ -1306,10 +1605,13 @@ describe('FIX4-LIVEL1H2 — 인계 문서의 명령 그대로·실제 스크립�
       .map((l) => l.trim())
       .filter((l) => /^(\S+=\S* )*corepack pnpm ledger:resolve --owner/.test(l));
     expect(lines, '문서에 해결 명령 틀이 정확히 한 줄').toHaveLength(1);
+    // FIX5 는 "앞에 정확히 MSYS_NO_PATHCONV=1 하나" → FIX6(6차 검토 #5): 앞붙임 없이 corepack pnpm ledger:resolve 로 시작하고 MSYS_NO_PATHCONV 가 없다
+    // (위 필터는 앞붙임이 있는 줄도 찾으므로, 앞붙임이 다시 생기면 여기서 실패한다)
+    expect(lines[0]).not.toContain('MSYS_NO_PATHCONV');
+    expect(lines[0]!.startsWith('corepack pnpm ledger:resolve --owner ')).toBe(true);
     const w = words(lines[0]!);
-    // FIX5(5차 검토 #4): Git Bash 의 MSYS 경로 변환을 끄는 환경변수 접두(값이 / 로 시작하면 바뀜) — 명령 앞에 정확히 이것 하나
-    expect(w.slice(0, 4)).toEqual(['MSYS_NO_PATHCONV=1', 'corepack', 'pnpm', 'ledger:resolve']);
-    return w.slice(4);
+    expect(w.slice(0, 3)).toEqual(['corepack', 'pnpm', 'ledger:resolve']);
+    return w.slice(3);
   };
   const fillDoc = (tpl: string[], v: Record<string, string>) =>
     tpl.map((t) => {
@@ -1336,17 +1638,59 @@ describe('FIX4-LIVEL1H2 — 인계 문서의 명령 그대로·실제 스크립�
         for (const t of parts) expect(text, `${label}: ${t}`).toContain(t);
       };
       expectAll(step('1. **멈춤·백업**'), '1단계', ['`AUTH_ALLOWED_IDENTITY`)의 owner 하나뿐', 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity>', 'corepack pnpm bundle:check', '`unresolved_live_usage`', '적어 둔다']);
+      // FIX6(6차 검토 #6): 옛 행 때문에 백업 묶음의 bundle:check 가 integrity 로 거부되면 --list 둘째 줄의 수를 기준값으로(7-③ 이 그 값과 비교)
+      expectAll(step('1. **멈춤·백업**'), '1단계 옛 행', [
+        'exit 1·`"error":"integrity"`',
+        '`반쯤 끝난 기록을 다시 만듦` 이나 `복원 검사 거부`',
+        '다시 내보내거나 지우지 않는다',
+        '2단계 `--list` 의 둘째 줄 `아직 provider_unstorable N행` 의 N 을 적어 둔다',
+        '7-③ 이 이 값과 비교한다',
+      ]);
+      expectAll(step('   ③ '), '7-③', [
+        '1단계에서 적어 둔 값(백업 묶음의 `unresolved_live_usage`, 그 묶음이 integrity 로 거부됐으면 대신 적은 2단계 `--list` 의 `아직 provider_unstorable N행`)',
+        '6단계 전에 `usage_source provider_unstorable` 이던 행',
+        'integrity 로 거부되는 것도 정상',
+      ]);
+      // FIX6(6차 검토 #5): 문서·README 어디에도 MSYS_NO_PATHCONV 앞붙임 명령이 없다(설명 문장은 "붙이지 않는다" 로만)
+      expect(doc).not.toMatch(/MSYS_NO_PATHCONV=1\s+(corepack\s+)?pnpm/);
+      expect(doc.split('\n').filter((l) => l.includes('MSYS_NO_PATHCONV')).every((l) => l.includes('붙이지 않는다') || l.includes('없앴다'))).toBe(true);
+      // FIX6(6차 검토 #1·#5): 4단계 표 — --by·--reason 의 쓰지 못하는 문자(표 칸 안의 | 는 \| 로)
+      expectAll(step('   | `--by` |'), '4단계 --by', ['`"`', '`%`', '`\\`', '`&`·`\\|`·`<`·`>`·`^`', '`/` 로 시작할 수 없다', '`text_shell_unsafe`']);
+      expectAll(step('   | `--reason` |'), '4단계 --reason', ['`&`·`\\|`·`<`·`>`·`^`', '`/` 로 시작하는 값']);
       const s2 = step('2. **확인');
       expectAll(s2, '2단계', ['원장 행·감사 기록은 바꾸지 않는다', 'migration', '범위 밖:', '거부(owner_not_exported)', 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity>', 'DB 폴더가 없습니다(DATABASE_URL 확인) — 아무것도 만들지 않았습니다.', '정정만(--correct --overwrite-valid — 이미 복원 검사 통과)']);
       expect(s2).not.toContain('아무것도 쓰지 않는다');
       expectAll(step('6. **미리보기'), '6단계', ['셸을 두 번 지난다', 'cmd.exe [미확인']);
-      expectAll(docText().split('\n').filter((l) => /^ {3}- (큰따옴표|명령 앞의|그래도)/.test(l)).join('\n'), '6단계 셸', ['거부(text_shell_unsafe)', '`MSYS_NO_PATHCONV=1`', '`/` 로 시작', '`resolved_by:`·`reason:` 줄이 뜻한 글과 같은지']);
+      // FIX5 는 "두 번째 셸이 바꾸는 문자를 명령이 막는다"·"앞의 MSYS_NO_PATHCONV=1" → FIX6(6차 검토 #1·#5): 거부는 도착한 문자만 보는 일관성 규칙,
+      // Linux·macOS 는 그대로 도착, Windows cmd.exe·Git Bash 변환은 표시 줄로만, 앞붙임은 붙이지 않는다([추정] shim)
+      const shellBullets = doc.split('\n').filter((l) => /^ {3}- (큰따옴표|명령 앞에|그래도)/.test(l));
+      expect(shellBullets).toHaveLength(3);
+      expectAll(shellBullets.join('\n'), '6단계 셸', [
+        '거부(text_shell_unsafe)',
+        '`&`·`|`·`<`·`>`·`^`',
+        '값을 `/` 로 시작하지 않는다',
+        '일관성 규칙',
+        '**도착했을 때만**',
+        'Linux·macOS 에서는 고정한 pnpm 12.6.0',
+        'cmd.exe [미확인]',
+        '`%VAR%` 확장',
+        '**프로그램이 시작하기 전에**',
+        '`--reason=\'/var/log 확인\'` 은 `C:/…/var/log 확인` 으로 도착해 거부되지 않는다',
+        '명령 앞에 `MSYS_NO_PATHCONV=1` 을 붙이지 않는다',
+        '[추정]',
+        'sh shim',
+        '`resolved_by:`·`reason:` 줄이 뜻한 글과 같은지',
+      ]);
+      expect(shellBullets.join('\n')).not.toContain('로 막는다');
+      expect(shellBullets.join('\n')).not.toContain('`%VAR%` 를 환경변수 값으로 바꾼다');
       expectAll(step('   - **① 미리보기'), '6-①', ['`resolved_by: "…"`·`reason: "…"`', '`확인 지문: <16자리 16진수>`', '--expect <확인 지문> --confirm']);
+      // FIX6(FIX5 Q3·6차 검토 #2): 정정의 전 → 후(형식 검사)·기본 무시 문자 이스케이프
+      expectAll(step('   - **① 미리보기'), '6-① FIX6', ['`settled_amount: 전 → 후`', '`resolved_at: 전 → (실행 시각)`', '`(형식 밖 값)`', '`(없음)`', '정정 전 `resolved_by`·`reason` 은 보여 주지 않는다', 'U+3164']);
       expect(step('   - **① 미리보기')).not.toContain('값은 출력하지 않음'); // FIX4 의 길이만 보여 주던 문구
-      expectAll(step('   - **② 적용'), '6-②', ['` --expect <확인 지문> --confirm`', '`거부(expect_mismatch)`', '트랜잭션을 열기 전에', '`updated 1` 뒤에 exit 1', '`거부(needs_correct)`', '모두 되돌린다']);
+      expectAll(step('   - **② 적용'), '6-②', ['` --expect <확인 지문> --confirm`', '`거부(expect_mismatch)`', '트랜잭션을 열기 전에', '`updated 1` 뒤에 exit 1', '`거부(needs_correct)`', '모두 되돌린다', '`settled_amount_before`·`resolved_at_before`']);
       expect(step('   - **② 적용')).not.toContain('미리보기 때와 같은지'); // FIX4 의 사실과 다르던 문구(같은 실행 안에서만 비교)
-      expectAll(step('   - **이미 `resolution`'), '6-정정', ['`거부(already_valid)`', '`--correct --overwrite-valid`']);
-      expectAll(step('   - 입력 거부 코드'), '6-코드', ['`text_shell_unsafe`', '`already_valid`', '`owner_not_exported`', '`expect_mismatch`']);
+      expectAll(step('   - **이미 `resolution`'), '6-정정', ['`거부(already_valid)`', '`--correct --overwrite-valid`', '`거부(overwrite_not_needed)`', '이전 `resolved_by`·`reason` 은 1단계 백업 묶음에만 남고']);
+      expectAll(step('   - 입력 거부 코드'), '6-코드', ['`text_shell_unsafe`', '`"`·`%`·`\\`·`&`·`|`·`<`·`>`·`^` 또는 `/` 로 시작', '`already_valid`', '`overwrite_not_needed`', '`owner_not_exported`', '`expect_mismatch`']);
       expectAll(step('   ④ '), '7-④', ['성공은 exit 0', '`"ok":true`']);
       const tpl = docCommand();
       const { owner, ledgerId } = await unstorableRun(db, 'fix4-lr-doc@example.local');
@@ -1373,7 +1717,11 @@ describe('FIX4-LIVEL1H2 — 인계 문서의 명령 그대로·실제 스크립�
       const readme = readFileSync(path.join(APP, 'README_KO.md'), 'utf8');
       expect(readme).toContain('pnpm ledger:resolve');
       const readmeLine = readme.split('\n').find((l) => l.includes('pnpm ledger:resolve --owner'))!;
-      for (const t of ['--expect <확인 지문> --confirm', '--correct [--overwrite-valid]', 'MSYS_NO_PATHCONV=1']) expect(readmeLine, t).toContain(t);
+      // FIX5 는 README 줄에 'MSYS_NO_PATHCONV=1' 이 있어야 했다 → FIX6(6차 검토 #5): README 어디에도 없고, 명령은 `pnpm ledger:resolve --owner` 로 시작
+      for (const t of ['--expect <확인 지문> --confirm', '--correct [--overwrite-valid]', '`pnpm ledger:resolve --owner <id>', '`overwrite_not_needed`', '`&`·`\\|`·`<`·`>`·`^` 와 `/` 로 시작하는 값 불가']) {
+        expect(readmeLine, t).toContain(t);
+      }
+      expect(readme).not.toContain('MSYS_NO_PATHCONV');
       expect(readmeLine).not.toContain('[--confirm]');
       const pkg = JSON.parse(readFileSync(path.join(APP, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
       expect(pkg.scripts['ledger:resolve']).toBe('tsx packages/db/scripts/ledger-resolve.ts');

@@ -198,3 +198,11 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - not_run: Codex, FIX3 에 대한 4차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
 - 확인 필요(추가, 잠정 적용): 수정문이 usage_source 도 가드 아래 다시 씀, SQL 은 none ⇒ actual = reserved 를 강제(검증기보다 엄격), 추가 키·original_reported 없는 옛 수동 해결 행은 "멈춤"만 안내.
 - Codex 큐 줄(추가): `e7c73c9 FIX3-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX2 줄 다음).
+
+## 2026-10-21 — 4차 독립 검토·FIX4(클라우드 세션)
+- 4차 Claude 독립 검토(Codex 아님, FIX3 e7c73c9 대상, 기록 8bff163): 확정 11(**실질 전부 P2**)·기각 4. 대부분 손으로 채워 실행하는 운영자 수동 해결 SQL 에서 나옴 → 가드를 더하지 않고 SQL 자체를 없앰.
+- **FIX4 fb1fa58**: 수동 해결 SQL → 검증기(`isValidResolution`)를 그대로 쓰는 CLI `corepack pnpm ledger:resolve` (`--list` 읽기 전용 · 기본 미리보기 · `--confirm` 정확히 1행 + 재검증 + 감사 · 이미 해결된 행은 `--correct` 필수). 운영 절차(LIVEL1 인계 2·4~7단계)·README 갱신, `bundle:check` 미해결 건수 시험, 7-④ `.env.local` 우선순위 시험. 인계: LIVEL1H2 "FIX round 4" 절(a490261).
+- 마지막 검사(fb1fa58, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 980** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX4 에 대한 5차 독립 검토(이어서 진행), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(CLI 인자 인용·UTF-8 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 절차가 SQL → CLI 로 바뀜(손으로 쓰는 SQL 미지원), `--list` 는 보고 값을 출력, 수정 모드는 original_* 증거가 있으면 현재 usage_source 를 가리지 않음, 버리는 DB 경로는 `./data/pglite-check-<날짜>`(기본 data 폴더와 겹치지 않는 하위 폴더).
+- Codex 큐 줄(추가): `fb1fa58 FIX4-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX3 줄 다음).

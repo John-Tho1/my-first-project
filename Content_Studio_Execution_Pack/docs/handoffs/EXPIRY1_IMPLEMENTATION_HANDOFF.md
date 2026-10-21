@@ -87,3 +87,13 @@
 | 교체 실패 4경우에 키 누출 단언 없음 | swap-nokey·swap-key·swap-term2·swap-dir 에 새 키 캡처 + `expect_no_key_in`(swap-dir 는 키 미생성도) | 각 경로에서 키를 출력하는 변이 모두 잡힘 |
 
 - test-dev-cert.sh: 이전 스크립트로 198 통과 / 53 실패 → 수정 후 251/251. `/dev/full` 없는 환경은 해당 경우 건너뜀, `mkfifo` 없으면 FIFO 경우 건너뜀. Git Bash·macOS 실행 안 함.
+
+---
+
+# FIX round 3 (3차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 2803382 (3차 검토 기록 docs) · **HEAD_SHA: e7c73c9** (`e7c73c9c13d03ea4a268179291c2d97e8bda4a59`)
+- 검토: 3차 Claude 독립 검토(Codex 아님, `D39_CLAUDE_REVIEW.md` 3차) — FIX2 561bc5f 대상, 확정 3건(전부 P2)·기각 3건.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 51 files / 959 · drill:mock 위반 0 · test-dev-cert.sh 271/271 · bash -n ok · 변경 파일 보이지 않는 문자 0 · data/dev-certs 생성 없음. Codex 미검증.
+- 지적: FIX2 의 "백업에 없으면 옮기기 전 중단" 가드 중 인증서 분기(dev-cert.sh:286~288)를 어떤 시험도 거치지 않음(키 분기만 고정).
+- 변경: 시험만 — 백업에서 인증서만 빠진 두 경우(`FAKE_CP_DROP=localhost-cert.pem`, 이동 실패 없음 / `FAKE_MV_FAIL=cert`): exit 1, "백업에 기존 인증서가 없어"·"기존 파일은 그대로입니다", 키 쪽 문구 없음, `FAKE_MV_LOG` 에 키·인증서 경로로 이동 없음, 바이트·짝 그대로, 점 파일 없음, `expect_no_key_in`.
+- 증거: 251 → 271/271. 286~288줄 삭제 변이에서 새 경우 9건 실패(가드 없으면 첫 경우는 exit 0 으로 옛 인증서 덮어씀, 둘째는 키를 옮겼다 되돌림).

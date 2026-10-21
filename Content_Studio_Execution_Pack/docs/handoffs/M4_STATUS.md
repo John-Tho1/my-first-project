@@ -190,3 +190,11 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   4. LIVEL1-H2: settled_amount 는 actual 과 같음, 단 actual > reserved(상향 재정산·상한)일 때만 더 클 수 있음. 실제 Claude 출력에서 NFC 만 다른 경험 claim 을 합침(확인 수·경고 수가 줄 수 있음). **실제 `./data` 에 옛 형식의 수동 해결 행이 있으면 그 백업 복원이 거부될 수 있으니 적용 전 `pnpm bundle:check` 로 확인.**
 - Codex 큐 줄(나중에 로컬에서 쓸 경우, 순서대로): `ca7228e LIVEP2`, `5739e5a EXPIRY1`, `7538492 FIX1-LIVEP2`, `92cd026 FIX1-EXPIRY1`, `990fd5d LIVEL1H2`, `561bc5f FIX2-D39` — 인계 문서는 각각 `docs/handoffs/{LIVEP2,EXPIRY1,LIVEL1H2}_IMPLEMENTATION_HANDOFF.md`.
 - D39 실제 적용(`.env.local`·`./data` migrate 0046·실제 게시)은 여전히 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만. 게시는 잠긴 상태(PUBLISH_MODE=disabled).
+
+## 2026-10-21 — 3차 독립 검토·FIX3(클라우드 세션)
+- 3차 Claude 독립 검토(Codex 아님, FIX2 561bc5f 대상, 에이전트 10개): 확정 3(**전부 P2**)·기각 3. 라운드별 확정 21 → 12(실질 10) → 3 — 수렴.
+- **FIX3 e7c73c9**: dev-cert 인증서 쪽 백업 가드 시험(271/271), 운영자 수동 해결 SQL 안전화(잘못 채우면 0행·returning 1행·확인 질의) + 이미 resolution 이 있는 행용 수정문(original_reported 보존), `bundle:check` 미해결 건수 표시, 7-④ 의 RESTORE_LOCAL_DIR 쓰기 경로 안내. 인계: EXPIRY1·LIVEL1H2 "FIX round 3" 절.
+- 마지막 검사(e7c73c9, 클라우드 Node 22.22.2): lint·typecheck·build PASS, **unit 81 files / 1934 · integration 51 files / 959** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · lockfile 불변 · 외부 호출 0.
+- not_run: Codex, FIX3 에 대한 4차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 수정문이 usage_source 도 가드 아래 다시 씀, SQL 은 none ⇒ actual = reserved 를 강제(검증기보다 엄격), 추가 키·original_reported 없는 옛 수동 해결 행은 "멈춤"만 안내.
+- Codex 큐 줄(추가): `e7c73c9 FIX3-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX2 줄 다음).

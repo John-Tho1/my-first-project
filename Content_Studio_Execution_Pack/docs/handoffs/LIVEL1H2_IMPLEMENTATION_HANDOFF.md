@@ -54,3 +54,20 @@
 - 시험: 문서의 SQL 블록을 그대로 읽어 같음·상한 두 경우 실행 → 내보내기 → `bundle:check` 통과·복원 미리보기 통과. 흔한 실수 6종(`to_jsonb(now())`, `now()::text`, 키 추가, `"9.95"`, 숫자 9.95, 옛 5키 예) integrity 거부. 실행한 스크립트 exit 0/1/2/1, DATABASE_URL 폴더 미생성. 변이 4종(문서 SQL 2·checkBundleZip·exit 코드) 실패.
 - 남은 위험: 시험이 인계 문서의 SQL 블록 형식에 묶임(문서 형식을 바꾸면 시험 실패), PGlite 용 SQL 콘솔은 여전히 없음, 무결성 메시지는 실패한 칸 이름을 말하지 않음.
 - 검토자에게 물을 것: (1) `bundle:check` 가 아직 provider_unstorable 인 행을 정보로 알려야 하는가? (2) 무결성 메시지에 칸 이름을 넣어야 하는가(H2 정확 문자열 단언 변경 필요)? (3) 시험이 문서의 SQL 을 읽는 결합이 허용되는가?
+
+---
+
+# FIX round 3 (3차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 2803382 (3차 검토 기록 docs) · **HEAD_SHA: e7c73c9** (`e7c73c9c13d03ea4a268179291c2d97e8bda4a59`)
+- 검토: 3차 Claude 독립 검토(Codex 아님, `D39_CLAUDE_REVIEW.md` 3차) — FIX2 561bc5f 대상, 확정 3건(전부 P2)·기각 3건.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변) · lint · typecheck · build PASS · unit 81 files / 1934 · integration 51 files / 959 · drill:mock 위반 0 · test-dev-cert.sh 271/271 · bash -n ok · 변경 파일 보이지 않는 문자 0 · data/dev-certs 생성 없음. Codex 미검증.
+- 지적: (a) 4~6단계 SQL 이 자기 입력을 검사하지 않아 잘못 채워도 반영되고(실제 연결 차단 해제·최상위 reported 삭제), 7-③ 실패 뒤 다시 실행하면 조용히 0행, 흔한 수정 방법은 `original_reported` 를 지움, "UPDATE 1" 확인 안내 없음, `bundle:check` 는 아직 provider_unstorable 인 행이 있어도 exit 0. (b) 7-④ 는 ZIP 사본이 버리는 DB 쪽에 남는다고 했지만 `restore:preview` 는 `RESTORE_LOCAL_DIR` 에 쓴다.
+- 변경(`LIVEL1_IMPLEMENTATION_HANDOFF.md` 4~7단계, `packages/db/scripts/bundle-check.ts`, `packages/db/src/restore.ts`):
+  - 해결문: 자리표시마다 `values` 한 행에 한 번, `actual_amount`·`overage_amount`·`over_budget` 을 한 `<ACTUAL>` 에서. WHERE 가드 = `isValidResolution` 규칙(출처 provider|none, 정산 `^(0|[1-9][0-9]{0,39})\.[0-9]{6}$`·실제 정수부 12자리, 같음 또는 정산 > 실제 > 예약, resolved_by ≤200·reason ≤4000 UTF-16·공백 아님 — JS `trim()` 과 같은 집합, BMP 전수 대조 25=25). 캐스트는 `CASE` 뒤라 `'abc'` 도 SQL 오류 대신 0행. 대상 행은 이 owner·이 id·settled·여전히 provider_unstorable·최상위 reported 3개 유효. `returning` 으로 1행 확인, "결과가 UPDATE 1" 안내, 읽기 전용 확인 질의(`target_resolved` = 1, `unresolved_rows`).
+  - 수정문(이미 resolution 이 있는 행): resolution 의 resolved_at·resolved_by·reason·settled_amount 4개 키, usage_source, 금액 칸만 변경. `original_usage_source`·`original_reported` 바이트 그대로. 같은 가드. 추가 키·original_reported 없음·무효면 0행 + "멈추고 1단계 백업 보관".
+  - `bundle:check`: 통과 시 stdout JSON 에 `unresolved_live_usage`(건수만), stderr 건수 안내 1줄, exit 코드 그대로. 7-③ 에서 해결한 수만큼 줄었는지(모두 해결이면 0) 확인.
+  - 7-④: `DATABASE_URL` 과 `RESTORE_LOCAL_DIR` 를 모두 버리는 폴더로, 끝나면 둘 다 삭제. 쓰기 경로 인용: `scripts/restore.ts:53-75`, `createRestorePreview`(mkdir + `<id>.zip` writeFile), `client.ts` `createDb`(DB 폴더·잠금 파일). 저장소는 commit 에서만.
+- 시험(`tests/integration/live-llm.test.ts`, 문서의 두 문장을 그대로 읽음): 잘못 채움 32종 → 0행(대상·같은 owner 다른 미해결 행·다른 owner 행 그대로), 올바른 채움(경계 길이·none·상한) → 1행·묶음 통과·재실행 0행, 수정문으로 깨진 resolution 5변형 복구(original_reported 원래 값), 못 고치는 9형태 0행, 실제 `restore:preview` 를 임시 작업 공간에서 문서 값으로 실행해 두 폴더만 생성·ZIP 은 RESTORE_LOCAL_DIR. 문서·코드 변이 21/21 잡힘(처음 살아남은 2개 — 출처 가드 제거·usage_source 조건 제거 — 는 시험 강화로 잡음). FIX2 문장 복원 시 실패.
+- 차이: 수정문도 usage_source 를 가드 아래 다시 씀(FIX3 전 채움이 `'providers'` 를 넣었을 수 있음). SQL 은 `none` ⇒ actual = reserved 를 강제(6단계대로, 검증기보다 엄격). id 는 텍스트 비교라 대문자 uuid 는 0행(2단계 출력 그대로 붙이라고 문서화).
+- 남은 위험: SQL 가드는 bundle.ts 규칙을 손으로 옮긴 것(새 규칙은 문서-SQL 시험으로만 드러남), 추가 키·original_reported 없는 옛 수동 해결 행은 복구 절차 없음(멈춤 안내), README T05 CLI 예시도 DATABASE_URL 만 설정(합성 데이터 예라 범위 밖으로 둠), Windows Git Bash·macOS 미실행.
+- 검토자에게 물을 것: (1) 수정문이 usage_source 를 바꿔도 되는가? (2) none ⇒ actual = reserved 를 SQL 에서만 더 엄격하게 둔 것이 맞는가? (3) 추가 키·original_reported 없는 행에 1단계 백업으로부터 재구성 절차가 필요한가? (4) stderr 안내 + JSON 칸 형태가 맞는가?

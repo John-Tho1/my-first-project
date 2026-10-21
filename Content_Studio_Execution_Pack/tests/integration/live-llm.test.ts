@@ -1196,14 +1196,17 @@ describe('FIX2-LIVEL1H2 — 운영자 절차(4~6 = ledger:resolve)·읽기 전�
   const CHECK_SCRIPT = path.join(APP, 'packages/db/scripts/bundle-check.ts');
   const RESOLUTION_PROBLEM = ['usage_ledger.pricing_snapshot.resolution 형식'];
   const DOC = path.join(APP, 'docs/handoffs/LIVEL1_IMPLEMENTATION_HANDOFF.md');
-  /** FIX4-LIVEL1H2: 인계 4~6 = 운영자 CLI 본체(공용 DB 를 그대로 넘기고 닫지 않음). resolved_at 은 주입한 시각. */
+  /**
+   * FIX4-LIVEL1H2: 인계 4~6 = 운영자 CLI 본체(공용 DB 를 그대로 넘기고 닫지 않음). resolved_at 은 주입한 시각.
+   * FIX5-LIVEL1H2: 1단계 내보내기 owner(AUTH_ALLOWED_IDENTITY)를 그 owner 로 두고, 적용은 미리보기의 `--expect <확인 지문> --confirm` 으로.
+   */
   const RESOLVED_NOW = new Date('2026-10-21T09:15:00.123Z');
-  const resolveCli = async (argv: string[]) => {
+  const resolveCli = async (argv: string[], identity: string) => {
     const out: string[] = [];
     const err: string[] = [];
     const code = await runLedgerResolveCli({
       argv,
-      env: { DATABASE_URL: 'memory://' },
+      env: { DATABASE_URL: 'memory://', AUTH_ALLOWED_IDENTITY: identity },
       openDb: async () => ({ ...(await getDb(loadConfig())), close: async () => undefined }),
       out: (l) => out.push(l),
       err: (l) => err.push(l),
@@ -1232,7 +1235,13 @@ describe('FIX2-LIVEL1H2 — 운영자 절차(4~6 = ledger:resolve)·읽기 전�
         const [before] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
         const { reported_tokens_in, reported_tokens_out, reported_cost } = before!.pricingSnapshot as Record<string, unknown>;
         const reason = "시험: 운영자'의 콘솔 확인 — 실제 청구 " + c.settled + ' USD';
-        const done = await resolveCli(['--owner', owner, '--ledger', ledgerId, '--source', 'provider', '--actual', c.actual, '--settled', c.settled, '--by', 'operator', `--reason=${reason}`, '--confirm']);
+        const args = ['--owner', owner, '--ledger', ledgerId, '--source', 'provider', '--actual', c.actual, '--settled', c.settled, '--by', 'operator', `--reason=${reason}`];
+        const pv = await resolveCli(args, c.who);
+        expect(pv.code, pv.err).toBe(0);
+        const fp = /^확인 지문: ([0-9a-f]{16})$/m.exec(pv.out)?.[1];
+        expect(fp, '미리보기의 확인 지문').toBeDefined();
+        expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true); // 미리보기는 원장 행을 바꾸지 않는다
+        const done = await resolveCli([...args, '--expect', fp!, '--confirm'], c.who);
         expect(done.code, done.err).toBe(0);
         expect(done.out.split('\n')).toContain('updated 1');
         const [row] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));

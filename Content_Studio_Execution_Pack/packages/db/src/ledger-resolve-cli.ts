@@ -1,19 +1,31 @@
 /**
- * `pnpm ledger:resolve` 의 본체(FIX4-LIVEL1H2 — 4차 Claude 검토). 스크립트(packages/db/scripts/ledger-resolve.ts)는 이것을 부르기만 한다 — 시험 가능하게.
+ * `pnpm ledger:resolve` 의 본체(FIX4-LIVEL1H2 — 4차 Claude 검토, FIX5 — 5차 Claude 검토). 스크립트(packages/db/scripts/ledger-resolve.ts)는 이것을 부르기만 한다 — 시험 가능하게.
  * provider_unstorable 수동 해결(인계 LIVEL1 절차 4~6)을 손으로 쓴 SQL 대신 이 명령으로 한다. 규칙은 복원 검사와 같은 함수(@cs/domain
  * ledger-resolution.ts → bundle.ts resolutionProblem·usageLedgerRowProblems)에서만 온다.
  *
- * - `--list [--owner <id>]`: 읽기 전용 — 그 owner 의 provider_unstorable·해결 기록 있는 원장 행과 처리 방식(새 해결 / 정정만 / 고칠 수 없음).
- *   절차 2·3 에 필요한 보고값(토큰·비용)과 run 상태·오류 코드도 보여 준다. --owner 가 없으면 AUTH_ALLOWED_IDENTITY 의 owner.
- * - `--owner <id> --ledger <id> --source provider|none --actual <금액> --settled <금액> --by <누가> --reason <사유> [--correct] [--confirm]`:
- *   기본은 미리보기(아무것도 쓰지 않음). 그 owner 의 그 id 한 행을 찾아(없으면 exit 1) 분류하고, 쓸 행을 만들어 검증기로 검사한 뒤
- *   (틀리면 exit 1) 미리보기를 출력한다. `--confirm` 이면 한 트랜잭션에서 행을 잠그고 다시 읽어 미리보기 때와 같은지 비교하고(다르면 중단),
- *   같은 값을 조건으로 건 UPDATE 가 정확히 1행일 때만, 쓴 행을 다시 읽어 계획한 행과 같고 검사를 통과하는지 본 뒤 감사 기록과 함께 커밋한다.
- *   `updated 1` 을 출력한다. 이미 resolution 이 있는 행은 `--correct` 가 있어야 한다(original_usage_source·original_reported 는 그대로).
- * - 출력: 미리보기 칸(id·usage_source 전후·금액·live 차단 여부·by/reason 길이)만. resolved_by·reason 값, 보고값(--list 제외), 다른 스냅숏 값,
- *   DB 오류 메시지 본문은 쓰지 않는다(오류는 secrets-cli 와 같은 describeErrorSafely).
- * - 종료 코드: 0 성공(미리보기·적용·목록) · 1 거부(대상 없음·형식·검사·모양·경쟁)·DB 잠금(dev 서버가 열고 있음)·예상하지 못한 오류·DB 닫기 실패 · 2 사용법.
+ * - 열기 전: 파일 DB(DATABASE_URL — createDb 와 같은 pgliteDataDir 로 푼 경로) 폴더가 없으면 exit 1 — 새 DB 를 만들지 않는다(FIX5 #2).
+ *   폴더가 있으면 openDb 가 1단계 export 와 똑같이 밀린 migration 을 적용한다. 원장 행·감사 기록을 쓰는 것은 `--confirm` 뿐이다.
+ * - `--list [--owner <id>]`: 원장 행·감사 기록은 바꾸지 않는다 — 그 owner 의 provider_unstorable·해결 기록 있는 원장 행과 처리 방식(새 해결 / 정정만 /
+ *   정정만(--overwrite-valid) / 고칠 수 없음). 절차 2·3 에 필요한 보고값(토큰·비용)과 run 상태·오류 코드도 보여 준다. --owner 가 없으면 AUTH_ALLOWED_IDENTITY 의
+ *   owner. 그 밖의 owner 는 보여 주되 1단계 내보내기 범위 밖이라고 알린다(FIX5 #6).
+ * - `--owner <id> --ledger <id> --source provider|none --actual <금액> --settled <금액> --by <누가> --reason <사유> [--correct [--overwrite-valid]] [--expect <지문> --confirm]`:
+ *   --owner 는 AUTH_ALLOWED_IDENTITY 의 owner(1단계 백업이 담는 owner)여야 한다(아니면 `owner_not_exported`). 그 owner 의 그 id 한 행을 찾아(없으면 exit 1)
+ *   분류하고, 쓸 행을 만들어 검증기로 검사한 뒤(틀리면 exit 1) 미리보기를 출력한다 — 마지막에 **확인 지문**(아래)과 적용에 붙일 `--expect <지문> --confirm`.
+ *   `--confirm` 은 `--expect` 가 있어야 하고(사용법 오류 exit 2), 행을 다시 읽어 계획하고 지문을 다시 계산해 `--expect` 와 다르면 트랜잭션을 열기 전에
+ *   `거부(expect_mismatch)`(행이나 입력이 그 미리보기와 다름 — FIX5 #1). 같으면 미리보기와 같은 칸을 출력한 뒤 한 트랜잭션에서 행을 잠그고 다시 읽어
+ *   방금 읽은 행과 같은지 비교하고(다르면 중단), 같은 값을 조건으로 건 UPDATE 가 정확히 1행일 때만, 쓴 행을 다시 읽어 계획한 행과 같고 검사를 통과하는지
+ *   본 뒤 감사 기록과 함께 커밋한다. `updated 1` 을 출력한다. 이미 resolution 이 있는 행은 `--correct` 가 있어야 하고(original_usage_source·original_reported 는
+ *   그대로), 그 행이 이미 복원 검사를 통과하면 `--overwrite-valid` 도 있어야 한다(`already_valid` — FIX5 Q3).
+ * - 확인 지문 = sha256(stableStringify({v:1, owner, ledger, mode, correct, overwriteValid, current: 지금 행(묶음 형식), args:{source, actual, settled, by, reason}}))
+ *   의 앞 16자리 16진수. resolved_at(실행 시각)은 넣지 않는다 — 같은 행·같은 입력이면 두 번 실행해도 같다.
+ * - 출력: 미리보기 칸(id·usage_source 전후·금액·live 차단 여부)과 `resolved_by:`·`reason:` — 받은 값 그대로를 JSON 으로(보이지 않는 문자·제어 문자는 \u 이스케이프,
+ *   FIX5 #4·#5 — 셸이 바꾼 글을 쓰기 전에 볼 수 있게) + UTF-16 길이. by·reason 값은 계획이 통과했을 때의 미리보기·적용 칸에만 나오고, 거부·오류 메시지·
+ *   감사 기록·--list 에는 나오지 않는다. 보고값(--list 제외)·다른 스냅숏 값·DB 오류 메시지 본문은 쓰지 않는다(오류는 secrets-cli 와 같은 describeErrorSafely).
+ *   --by·--reason 의 `"`·`%`·`\` 는 받지 않는다(`text_shell_unsafe` — pnpm 의 두 번째 셸이 바꾸는 문자).
+ * - 종료 코드: 0 성공(미리보기·적용·목록) · 1 거부(DB 폴더 없음·범위 밖 owner·대상 없음·형식·검사·모양·지문·경쟁)·DB 잠금(dev 서버가 열고 있음)·예상하지 못한 오류·
+ *   DB 닫기 실패 · 2 사용법(DB 를 열지 않음).
  */
+import { existsSync } from 'node:fs';
 import { and, asc, eq, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import {
   classifyLedgerRow,
@@ -22,6 +34,7 @@ import {
   LEDGER_RESOLUTION_MESSAGES,
   loadConfig,
   planLedgerResolution,
+  sha256Hex,
   stableStringify,
   usageLedgerRowProblems,
   type AppConfig,
@@ -30,7 +43,7 @@ import {
 } from '@cs/domain';
 import { selectBundleRows } from './bundle-tables';
 import { hasUnresolvedLiveUsage } from './budget';
-import type { Db, DbHandle } from './client';
+import { pgliteDataDir, type Db, type DbHandle } from './client';
 import { DbLockedError } from './lock';
 import { findOwner, recordAudit, type DbOrTx } from './queries';
 import { generationRuns, usageLedger, users } from './schema';
@@ -44,22 +57,27 @@ export interface LedgerResolveCliDeps {
   err: (line: string) => void;
   /** resolved_at 시각(시험용 주입). 없으면 지금. */
   now?: () => Date;
-  /** 시험 전용: 미리보기를 계산한 뒤, 적용 트랜잭션을 열기 전에 부른다(그 사이 행이 바뀌는 경쟁 재현). */
+  /** 시험 전용: --confirm 실행이 계획·지문 확인을 마친 뒤, 적용 트랜잭션을 열기 전에 부른다(그 사이 행이 바뀌는 경쟁 재현). */
   beforeApply?: (db: Db) => Promise<void>;
 }
 
 export const LEDGER_RESOLVE_USAGE = [
   '사용법(서버를 끈 상태 — PGlite 단일 연결):',
   '  corepack pnpm ledger:resolve --list [--owner <owner id>]',
-  "  corepack pnpm ledger:resolve --owner <owner id> --ledger <ledger id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct] [--confirm]",
-  '  (기본은 미리보기 — 아무것도 바꾸지 않는다. 적용은 같은 명령 끝에 --confirm. 이미 resolution 이 있는 행의 정정은 --correct)',
+  "  MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner <owner id> --ledger <ledger id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct [--overwrite-valid]] [--expect <확인 지문> --confirm]",
+  '  (기본은 미리보기 — 원장 행·감사 기록은 바꾸지 않는다. 적용은 같은 명령 끝에 미리보기 마지막 줄의 --expect <확인 지문> --confirm.',
+  '   이미 resolution 이 있는 행의 정정은 --correct, 그 행이 이미 복원 검사를 통과하면 --correct --overwrite-valid)',
+  '  (--by·--reason 은 셸을 두 번 지난다 — 큰따옴표·퍼센트·역슬래시·줄바꿈을 쓰지 않고, 미리보기의 resolved_by:·reason: 줄이 뜻한 글과 같은지 본다)',
 ].join('\n');
 
-const VALUE_FLAGS = ['owner', 'ledger', 'source', 'actual', 'settled', 'by', 'reason'] as const;
-const BOOL_FLAGS = ['confirm', 'correct', 'list'] as const;
+const REQUIRED_VALUE_FLAGS = ['owner', 'ledger', 'source', 'actual', 'settled', 'by', 'reason'] as const;
+const VALUE_FLAGS = [...REQUIRED_VALUE_FLAGS, 'expect'] as const;
+const BOOL_FLAGS = ['confirm', 'correct', 'list', 'overwrite-valid'] as const;
 type ValueFlag = (typeof VALUE_FLAGS)[number];
 type BoolFlag = (typeof BOOL_FLAGS)[number];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** 확인 지문(미리보기가 출력 — --expect 로 받는다): 16자리 16진수, 대소문자 무관 */
+const FINGERPRINT_RE = /^[0-9a-f]{16}$/i;
 /** 출력해도 되는 옵션 이름 모양(그 밖은 값이 섞였을 수 있어 되풀이하지 않는다) */
 const SAFE_FLAG_NAME = /^[a-z][a-z-]{0,23}$/;
 
@@ -75,7 +93,11 @@ export type LedgerResolveArgs =
       by: string;
       reason: string;
       correct: boolean;
+      /** --overwrite-valid(--correct 와 함께만): 이미 복원 검사를 통과하는 행의 정정 허용 */
+      overwriteValid: boolean;
       confirm: boolean;
+      /** --expect(--confirm 과 함께만): 미리보기의 확인 지문(소문자로) */
+      expect: string | null;
     };
 
 /** 인자 해석. 값은 `--이름 값` 또는 `--이름=값`(값이 --로 시작하면 = 형식만). 같은 옵션 두 번·모르는 옵션·위치 인자는 사용법 오류. */
@@ -116,11 +138,18 @@ export function parseLedgerResolveArgs(argv: readonly string[]): { ok: true; arg
     if (values.has('owner') && !uuidOf('owner')) return { ok: false, message: '--owner 는 uuid 입니다.' };
     return { ok: true, args: { kind: 'list', owner: uuidOf('owner') } };
   }
-  const missing = VALUE_FLAGS.filter((k) => !values.has(k));
+  const missing = REQUIRED_VALUE_FLAGS.filter((k) => !values.has(k));
   if (missing.length > 0) return { ok: false, message: `빠진 옵션: ${missing.map((k) => `--${k}`).join(', ')}` };
   const owner = uuidOf('owner');
   const ledger = uuidOf('ledger');
   if (!owner || !ledger) return { ok: false, message: '--owner·--ledger 는 uuid 입니다(--list 로 확인).' };
+  if (bools.has('overwrite-valid') && !bools.has('correct')) return { ok: false, message: '--overwrite-valid 는 --correct 와 함께만 씁니다(이미 복원 검사를 통과하는 행의 정정).' };
+  const expect = values.get('expect');
+  if (bools.has('confirm') && expect === undefined) {
+    return { ok: false, message: '--confirm 에는 --expect <확인 지문> 이 필요합니다 — 먼저 --confirm 없이 미리보기를 실행하고, 그 마지막 줄이 알려 주는 --expect <확인 지문> --confirm 을 붙입니다.' };
+  }
+  if (!bools.has('confirm') && expect !== undefined) return { ok: false, message: '--expect 는 --confirm 과 함께만 씁니다(미리보기에는 붙이지 않습니다).' };
+  if (expect !== undefined && !FINGERPRINT_RE.test(expect)) return { ok: false, message: '--expect 는 미리보기가 출력한 확인 지문(16자리 16진수)입니다.' };
   return {
     ok: true,
     args: {
@@ -133,10 +162,52 @@ export function parseLedgerResolveArgs(argv: readonly string[]): { ok: true; arg
       by: values.get('by')!,
       reason: values.get('reason')!,
       correct: bools.has('correct'),
+      overwriteValid: bools.has('overwrite-valid'),
       confirm: bools.has('confirm'),
+      expect: expect === undefined ? null : expect.toLowerCase(),
     },
   };
 }
+
+/**
+ * FIX5(5차 검토 #1, Q2): 미리보기(①)와 적용(②)을 묶는 확인 지문. 지금 행(묶음 형식)·방식·플래그·받은 입력 그대로를 담고 resolved_at(실행 시각)은 뺀다.
+ * 미리보기가 출력하고, --confirm 실행이 다시 계산해 --expect 와 같을 때만 쓴다 — 두 실행 사이에 행이 바뀌었거나 입력(셸이 바꾼 글 포함)이 다르면 거부.
+ */
+export function ledgerResolutionFingerprint(p: {
+  owner: string;
+  ledger: string;
+  mode: LedgerResolutionPlan['mode'];
+  correct: boolean;
+  overwriteValid: boolean;
+  current: LedgerBundleRow;
+  args: { source: string; actual: string; settled: string; by: string; reason: string };
+}): string {
+  const { source, actual, settled, by, reason } = p.args;
+  return sha256Hex(
+    stableStringify({ v: 1, owner: p.owner, ledger: p.ledger, mode: p.mode, correct: p.correct, overwriteValid: p.overwriteValid, current: p.current, args: { source, actual, settled, by, reason } }),
+  ).slice(0, 16);
+}
+
+/** JSON.stringify 위에, 그래도 글자 그대로 남는 보이지 않는 문자(\p{C}·\p{Zl}·\p{Zp}, U+0020 이 아닌 \p{Zs})를 \uXXXX(BMP 밖은 \u{…})로 */
+const DISPLAY_ESCAPE_RE = /[\p{C}\p{Zl}\p{Zp}]|(?!\u0020)\p{Zs}/gu;
+/**
+ * FIX5(5차 검토 #4·#5, Q1): --by·--reason 을 이 명령이 **받은 그대로** 보여 준다 — 셸(Git Bash·pnpm 의 스크립트 셸)이 바꾼 글, 보이지 않는 문자·제어 문자,
+ * 터미널 제어 순서를 모두 이스케이프로. 계획이 통과한 미리보기·적용 칸에만 쓴다(거부·오류 메시지·감사·--list 에는 쓰지 않는다).
+ */
+export function escapeForDisplay(value: string): string {
+  return JSON.stringify(value).replace(DISPLAY_ESCAPE_RE, (ch) => {
+    const cp = ch.codePointAt(0)!;
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
+  });
+}
+
+/** FIX5 #2: 파일 DB 폴더가 없으면 — openDb 가 새 PGlite 클러스터를 만들고 migration 을 적용하기 전에 멈춘다 */
+export const LEDGER_RESOLVE_MISSING_DB_DIR = 'DB 폴더가 없습니다(DATABASE_URL 확인) — 아무것도 만들지 않았습니다.';
+/** FIX5 #6: 1단계 내보내기(AUTH_ALLOWED_IDENTITY 의 owner) 범위 밖 owner 를 다루는 방법 */
+const OWNER_SCOPE_HELP =
+  '1단계 백업(corepack pnpm export)과 7-②·③ 확인은 AUTH_ALLOWED_IDENTITY 의 owner 만 담습니다. 다른 owner 의 행을 다루려면 1~7단계의 모든 명령 앞에 ' +
+  'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> 를 붙여 1단계부터 다시 합니다(앞에 붙인 값이 .env.local 보다 우선)';
+
 
 /** 묶음 형식(내보내기와 같은 열·같은 변환)으로 owner 의 원장 행을 읽는다. */
 async function readLedgerRows(db: DbOrTx, where: SQL): Promise<LedgerBundleRow[]> {
@@ -184,8 +255,15 @@ export async function runLedgerResolveCli(deps: LedgerResolveCliDeps): Promise<n
   const state = { committed: false };
   try {
     const config = loadConfig(deps.env);
-    handle = await deps.openDb(config);
-    code = parsed.args.kind === 'list' ? await runList(handle.db, parsed.args.owner, config, deps) : await runResolve(handle.db, parsed.args, deps, state);
+    // FIX5 #2: createDb 와 같은 함수로 푼 폴더가 없으면 열지 않는다(열면 새 DB 를 만들고 migration 을 적용한다 — 틀린 DATABASE_URL 이 빈 DB 로 보이지 않게)
+    const dir = pgliteDataDir({ driver: config.DB_DRIVER, url: config.DATABASE_URL });
+    if (dir !== null && !existsSync(/*turbopackIgnore: true*/ dir)) {
+      deps.err(LEDGER_RESOLVE_MISSING_DB_DIR);
+      code = 1;
+    } else {
+      handle = await deps.openDb(config);
+      code = parsed.args.kind === 'list' ? await runList(handle.db, parsed.args.owner, config, deps) : await runResolve(handle.db, parsed.args, config, deps, state);
+    }
   } catch (e) {
     if (e instanceof DbLockedError) deps.err(e.message);
     else if (state.committed) deps.err(`적용(커밋)은 끝났지만 그 뒤 확인을 마치지 못했습니다(오류 종류: ${describeErrorSafely(e)}). --list 로 결과를 확인하세요.`);
@@ -203,7 +281,7 @@ export async function runLedgerResolveCli(deps: LedgerResolveCliDeps): Promise<n
   return code;
 }
 
-function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, current: LedgerBundleRow, plan: LedgerResolutionPlan, remainingOthers: number): string[] {
+function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, current: LedgerBundleRow, plan: LedgerResolutionPlan, remainingOthers: number, fingerprint: string): string[] {
   const next = plan.next;
   const lines = [
     `대상: usage_ledger ${a.ledger} · owner ${a.owner}`,
@@ -216,7 +294,7 @@ function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, curren
   if (plan.mode === 'correct') {
     lines.push(
       plan.currentRowValid
-        ? '지금 행의 복원 검사: 통과 — 이미 올바른 해결 기록이다. 고치려던 행이 맞는지 --list 로 다시 확인한 뒤에만 --confirm'
+        ? '지금 행의 복원 검사: 통과 — 이미 올바른 해결 기록을 덮어쓴다(--overwrite-valid). 이전 resolved_by·reason·resolved_at·settled_amount 는 1단계 백업 묶음에만 남는다 — 고치려던 행이 맞는지 --list 로 다시 확인'
         : '지금 행의 복원 검사: 거부(이 정정의 대상)',
     );
   }
@@ -226,13 +304,26 @@ function previewLines(a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, curren
     `actual_amount: ${showAmount(current.actual_amount)} → ${showAmount(next.actual_amount)}`,
     `overage_amount: ${current.overage_amount} → ${next.overage_amount} · over_budget: ${current.over_budget} → ${next.over_budget}`,
     `settled_amount: ${a.settled}`,
-    `resolved_by ${a.by.length}자 · reason ${a.reason.length}자(UTF-16 길이 — 값은 출력하지 않음)`,
+    `resolved_by: ${escapeForDisplay(a.by)}`,
+    `reason: ${escapeForDisplay(a.reason)}`,
+    `resolved_by ${a.by.length}자 · reason ${a.reason.length}자(UTF-16 길이 — 위 두 줄은 이 명령이 받은 값 그대로를 JSON 으로 적은 것: 보이지 않는 문자·제어 문자는 \\u 이스케이프. 뜻한 글과 같은지 본다)`,
     `적용 뒤 이 owner 의 새 live 호출: ${blockedLine(remainingOthers)}`,
+    `확인 지문: ${fingerprint}`,
   );
   return lines;
 }
 
-async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, deps: LedgerResolveCliDeps, state: { committed: boolean }): Promise<number> {
+async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve' }>, config: AppConfig, deps: LedgerResolveCliDeps, state: { committed: boolean }): Promise<number> {
+  // FIX5 #6: 1단계 백업·7-②·③ 이 담는 owner(export.ts 와 같은 findOwner(AUTH_ALLOWED_IDENTITY))만 고친다
+  const exported = await findOwner(db, config.AUTH_ALLOWED_IDENTITY);
+  if (!exported || exported.id !== a.owner) {
+    deps.err(
+      exported
+        ? `거부(owner_not_exported): --owner 가 1단계 내보내기 대상(AUTH_ALLOWED_IDENTITY 의 owner)이 아닙니다 — ${OWNER_SCOPE_HELP}. 아무것도 바꾸지 않았습니다.`
+        : `거부(owner_not_exported): 허용 사용자(AUTH_ALLOWED_IDENTITY)의 owner 가 이 DB 에 없어 1단계 내보내기가 담는 owner 가 없습니다 — DATABASE_URL·AUTH_ALLOWED_IDENTITY 를 확인하세요. ${OWNER_SCOPE_HELP}. 아무것도 바꾸지 않았습니다.`,
+    );
+    return 1;
+  }
   const rows = await readLedgerRows(db, targetWhere(a.owner, a.ledger));
   if (rows.length !== 1) {
     deps.err(`대상 행이 없습니다: owner ${a.owner} 의 usage_ledger ${a.ledger}(${rows.length}행) — 아무것도 바꾸지 않았습니다. id 는 --list 로 확인합니다.`);
@@ -240,18 +331,44 @@ async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve
   }
   const current = rows[0]!;
   const now = (deps.now ?? (() => new Date()))();
-  const planned = planLedgerResolution(current, { source: a.source, actual: a.actual, settled: a.settled, resolvedBy: a.by, reason: a.reason, correct: a.correct, now });
+  const planned = planLedgerResolution(current, {
+    source: a.source,
+    actual: a.actual,
+    settled: a.settled,
+    resolvedBy: a.by,
+    reason: a.reason,
+    correct: a.correct,
+    overwriteValid: a.overwriteValid,
+    now,
+  });
   if (!planned.ok) {
     const extra = planned.code === 'none_actual' ? ` (예약액 ${current.reserved_amount})` : '';
     deps.err(`거부(${planned.code}): ${LEDGER_RESOLUTION_MESSAGES[planned.code]}${extra} — 아무것도 바꾸지 않았습니다.`);
     return 1;
   }
   const plan = planned.plan;
+  const fingerprint = ledgerResolutionFingerprint({
+    owner: a.owner,
+    ledger: a.ledger,
+    mode: plan.mode,
+    correct: a.correct,
+    overwriteValid: a.overwriteValid,
+    current,
+    args: { source: a.source, actual: a.actual, settled: a.settled, by: a.by, reason: a.reason },
+  });
+  // FIX5 #1: ② 는 ① 에서 본 바로 그 행·입력일 때만(트랜잭션을 열기 전에, by·reason 을 출력하기 전에 거부)
+  if (a.confirm && a.expect !== fingerprint) {
+    deps.err(
+      '거부(expect_mismatch): 이 행 또는 입력(--source·--actual·--settled·--by·--reason·--correct·--overwrite-valid)이 --expect 의 미리보기와 다릅니다 — 아무것도 바꾸지 않았습니다. ' +
+        '미리보기(--confirm 없이)부터 다시 실행하고 그 마지막 줄의 --expect 값을 씁니다.',
+    );
+    return 1;
+  }
   const remaining = await unresolvedCount(db, a.owner, a.ledger);
-  deps.out(a.confirm ? '원장 수동 해결 — 적용(--confirm)' : '원장 수동 해결 — 미리보기(아무것도 바꾸지 않음)');
-  for (const l of previewLines(a, current, plan, remaining)) deps.out(l);
+  deps.out(a.confirm ? '원장 수동 해결 — 적용(--confirm)' : '원장 수동 해결 — 미리보기(원장 행·감사 기록은 바꾸지 않음)');
+  for (const l of previewLines(a, current, plan, remaining, fingerprint)) deps.out(l);
   if (!a.confirm) {
-    deps.out('미리보기만 했습니다. 적용하려면 같은 명령 끝에 --confirm 을 붙입니다.');
+    deps.out(`미리보기만 했습니다. 적용하려면 같은 명령 끝에 --expect ${fingerprint} --confirm 을 붙입니다.`);
     return 0;
   }
   await deps.beforeApply?.(db);
@@ -259,7 +376,7 @@ async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve
   let after: { unresolved: number };
   try {
     after = await db.transaction(async (tx) => {
-      // 행 잠금 → 다시 읽기: 미리보기를 계산한 행과 한 글자라도 다르면 중단(compare-and-swap)
+      // 행 잠금 → 다시 읽기: 이 실행이 계획·지문을 계산한 행과 한 글자라도 다르면 중단(compare-and-swap)
       await tx.select({ id: usageLedger.id }).from(usageLedger).where(and(eq(usageLedger.id, a.ledger), eq(usageLedger.ownerId, a.owner))).for('update');
       const again = await readLedgerRows(tx, targetWhere(a.owner, a.ledger));
       if (again.length !== 1 || stableStringify(again[0]) !== stableStringify(current)) throw new LedgerChangedError();
@@ -308,7 +425,7 @@ async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve
     });
   } catch (e) {
     if (e instanceof LedgerChangedError) {
-      deps.err('거부(changed): 미리보기를 계산한 뒤 행이 바뀌었습니다(또는 스냅숏에 JS 로 정확히 옮길 수 없는 값이 있음) — 아무것도 바꾸지 않았습니다. 미리보기부터 다시 실행하세요.');
+      deps.err('거부(changed): 이 실행이 행을 읽고 계획한 뒤 행이 바뀌었습니다(또는 스냅숏에 JS 로 정확히 옮길 수 없는 값이 있음) — 아무것도 바꾸지 않았습니다. 미리보기부터 다시 실행하세요.');
       return 1;
     }
     if (e instanceof LedgerVerifyError) {
@@ -326,11 +443,12 @@ async function runResolve(db: Db, a: Extract<LedgerResolveArgs, { kind: 'resolve
   return 0;
 }
 
-/** --list: 읽기 전용. 그 owner 의 provider_unstorable·resolution·reported_* 가 있는 원장 행과 처리 방식. */
+/** --list: 원장 행·감사 기록은 바꾸지 않는다. 그 owner 의 provider_unstorable·resolution·reported_* 가 있는 원장 행과 처리 방식. */
 async function runList(db: Db, ownerArg: string | null, config: AppConfig, deps: LedgerResolveCliDeps): Promise<number> {
   let owner = ownerArg;
+  const exported = await findOwner(db, config.AUTH_ALLOWED_IDENTITY);
   if (owner === null) {
-    const o = await findOwner(db, config.AUTH_ALLOWED_IDENTITY);
+    const o = exported;
     if (!o) {
       deps.err('허용 사용자(AUTH_ALLOWED_IDENTITY)의 owner 가 이 DB 에 없습니다 — --owner 로 지정하거나 DATABASE_URL 을 확인하세요.');
       return 1;
@@ -359,8 +477,10 @@ async function runList(db: Db, ownerArg: string | null, config: AppConfig, deps:
   const runOf = new Map(runs.map((r) => [r.id, r]));
   const code = (v: string | null) => (v === null ? '-' : /^[a-z0-9_]{1,64}$/.test(v) ? v : '(형식 밖)');
   const unresolved = await unresolvedCount(db, owner);
-  deps.out('원장 수동 해결 대상 목록(읽기 전용 — 아무것도 바꾸지 않음)');
+  const outOfScope = !exported || exported.id !== owner;
+  deps.out('원장 수동 해결 대상 목록(원장 행·감사 기록은 바꾸지 않음 — DB 를 열 때 밀린 migration 은 1단계 export 와 똑같이 적용)');
   deps.out(`owner ${owner} · 후보 ${rows.length}행 · 아직 provider_unstorable ${unresolved}행(0 이면 새 live 호출이 열려 있음)`);
+  if (outOfScope) deps.out(`범위 밖: 이 owner 는 1단계 내보내기 대상(AUTH_ALLOWED_IDENTITY 의 owner)이 아닙니다 — 해결 명령은 거부(owner_not_exported). ${OWNER_SCOPE_HELP}.`);
   for (const r of rows) {
     const snap = r.pricing_snapshot;
     const run = r.run_id ? runOf.get(r.run_id) : undefined;
@@ -390,12 +510,17 @@ async function runList(db: Db, ownerArg: string | null, config: AppConfig, deps:
           ? '새 해결(--correct 없이 — 반쯤 끝난 기록을 다시 만듦)'
           : '새 해결(--correct 없이)'
         : cls.kind === 'correct'
-          ? '정정만(--correct)'
+          ? cls.currentRowValid
+            ? '정정만(--correct --overwrite-valid — 이미 복원 검사 통과)'
+            : '정정만(--correct)'
           : `이 명령으로 고칠 수 없음(${cls.code})`;
     deps.out(`${parts.join(' · ')} → ${action}`);
   }
   if (rows.length > 0) {
-    deps.out(`해결: corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>'(미리보기 → 같은 명령 + --confirm)`);
+    deps.out(
+      `해결: ${outOfScope ? 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity> ' : ''}MSYS_NO_PATHCONV=1 corepack pnpm ledger:resolve --owner ${owner} --ledger <위 id> --source provider|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>'` +
+        '(미리보기 → 그 마지막 줄의 --expect <확인 지문> --confirm 을 같은 명령 끝에 붙여 적용. 정정은 처리 방식에 적힌 --correct·--overwrite-valid 를 함께)',
+    );
   }
   return 0;
 }

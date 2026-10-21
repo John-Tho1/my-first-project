@@ -2,14 +2,16 @@
  * FIX4-LIVEL1H2(4차 Claude 검토): provider_unstorable 수동 해결(인계 LIVEL1 절차 4~6)을 **손으로 쓴 SQL 대신** 운영자 CLI(`pnpm ledger:resolve`)로 한다.
  * 이 파일은 순수 함수(DB 없음)다: 원장 한 행(묶음 형식 — 내보내기가 쓰는 그대로)을 분류하고, 입력으로 새 행을 만들고,
  * **복원 검사와 같은 함수**(bundle.ts `resolutionProblem`·`usageLedgerRowProblems`·`ROW_SCHEMAS.usage_ledger`)로 그 행을 검사한다.
- * 규칙을 SQL 이나 CLI 로 옮겨 적지 않는다 — 검증기가 유일한 기준이다. CLI 에만 있는 더 엄격한 규칙은 두 개뿐(아래 LEDGER_RESOLUTION_MESSAGES 의
- * `actual_format`·`none_actual`, 그리고 DB 가 담을 수 없는 문자 `text_encoding`).
+ * 규칙을 SQL 이나 CLI 로 옮겨 적지 않는다 — 검증기가 유일한 기준이다. CLI 에만 있는 더 엄격한 규칙(아래 LEDGER_RESOLUTION_MESSAGES)은
+ * `actual_format`·`none_actual`, DB 가 담을 수 없는 문자 `text_encoding`, 그리고 FIX5(5차 Claude 검토)의 `already_valid`(이미 복원 검사를 통과하는 행의
+ * 정정은 `overwriteValid` 가 있어야 함)·`text_shell_unsafe`(--by·--reason 의 `"`·`%`·`\` — pnpm 의 두 번째 셸(Windows 는 cmd.exe)이 바꾸는 문자)뿐이다.
  *
  * 분류(classifyLedgerRow):
  * - resolve: state settled · usage_source provider_unstorable · 최상위 reported_* 세 개가 FIX4 형식. resolution 이 이미 붙은 "반쯤 끝난" H2 이전 행도
  *   (그 resolution 이 옮길 수 없는 키·값을 갖지 않으면) 최상위 원래 보고값으로 다시 만든다(4차 검토 #6).
  * - correct: 최상위 reported_* 없음 · resolution 객체의 나머지(바꿀 네 키 외)가 정확히 original_usage_source='provider_unstorable' +
  *   original_reported(키 3개, FIX4 형식). original_* 는 바이트 그대로 두고 네 키·usage_source·금액만 바꾼다. `--correct` 가 있어야 한다(#4).
+ *   지금 행이 이미 복원 검사(행 규칙 usageLedgerRowProblems)를 통과하면 `--overwrite-valid` 도 있어야 한다(FIX5 — 5차 검토 Q3, 거부 코드 `already_valid`).
  * - refuse: 그 밖의 모든 모양(값을 지어내야 하거나 옮길 수 없는 키가 있음) — 아무것도 바꾸지 않는다.
  */
 import { fromMicro, toMicro } from './budget';
@@ -91,15 +93,19 @@ export interface LedgerResolutionInput {
   reason: string;
   /** `--correct`: 이미 resolution 이 있는 행의 정정을 허용 */
   correct: boolean;
+  /** `--overwrite-valid`: 이미 복원 검사를 통과하는 행(올바른 해결 기록)의 정정을 허용(FIX5 — 없으면 `already_valid`) */
+  overwriteValid: boolean;
   now: Date;
 }
 
 export type LedgerResolutionError =
   | LedgerRowRefusal
   | 'needs_correct'
+  | 'already_valid'
   | 'not_resolved_yet'
   | 'actual_format'
   | 'text_encoding'
+  | 'text_shell_unsafe'
   | `resolution:${ResolutionProblem}`
   | 'row_integrity'
   | 'row_schema'
@@ -108,7 +114,7 @@ export type LedgerResolutionError =
 export interface LedgerResolutionPlan {
   mode: 'resolve' | 'correct';
   halfFinished: boolean;
-  /** 정정일 때만: 지금 행이 복원 검사를 통과하는가(통과면 이미 올바른 행을 고치는 것 — 미리보기가 경고한다) */
+  /** 정정일 때만: 지금 행이 복원 검사를 통과하는가(통과면 이미 올바른 행을 고치는 것 — overwriteValid 일 때만 여기까지 오고, 미리보기가 경고한다) */
   currentRowValid: boolean | null;
   /** 쓸 행(묶음 형식) — 검증기를 통과한 바로 그 값 */
   next: LedgerBundleRow;
@@ -119,14 +125,21 @@ export const LEDGER_ACTUAL_INPUT_RE = /^(0|[1-9]\d{0,11})\.\d{6}$/;
 /** PostgreSQL text/jsonb 가 담을 수 없는 문자(NUL·짝 없는 서로게이트) */
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 const isUnstorableText = (v: string) => v.includes('\u0000') || LONE_SURROGATE_RE.test(v);
+/**
+ * FIX5(5차 검토 #4·#5): 운영자 명령의 자유 글(--by·--reason)은 셸을 두 번 지난다(Git Bash → pnpm 의 스크립트 셸, Windows 는 cmd.exe).
+ * 두 번째 셸이 바꾸는 문자 — `\`(두 배가 됨)·`"`(글이 끊김)·`%`(`%VAR%` 확장) — 는 받지 않는다(복원 검사가 아니라 이 명령만의 규칙).
+ */
+export const LEDGER_SHELL_UNSAFE_TEXT_RE = /["%\\]/;
 
 export function planLedgerResolution(current: LedgerBundleRow, input: LedgerResolutionInput): { ok: true; plan: LedgerResolutionPlan } | { ok: false; code: LedgerResolutionError } {
   const cls = classifyLedgerRow(current);
   if (cls.kind === 'refuse') return { ok: false, code: cls.code };
   if (cls.kind === 'correct' && !input.correct) return { ok: false, code: 'needs_correct' };
+  if (cls.kind === 'correct' && cls.currentRowValid && !input.overwriteValid) return { ok: false, code: 'already_valid' };
   if (cls.kind === 'resolve' && input.correct) return { ok: false, code: 'not_resolved_yet' };
   if (!LEDGER_ACTUAL_INPUT_RE.test(input.actual)) return { ok: false, code: 'actual_format' };
   if (isUnstorableText(input.resolvedBy) || isUnstorableText(input.reason)) return { ok: false, code: 'text_encoding' };
+  if (LEDGER_SHELL_UNSAFE_TEXT_RE.test(input.resolvedBy) || LEDGER_SHELL_UNSAFE_TEXT_RE.test(input.reason)) return { ok: false, code: 'text_shell_unsafe' };
 
   const snap = structuredClone(current.pricing_snapshot);
   const resolvedAt = input.now.toISOString();
@@ -186,9 +199,13 @@ export const LEDGER_RESOLUTION_MESSAGES: Record<LedgerResolutionError, string> =
     '이미 있는 resolution 을 정정할 수 없는 모양입니다(바꿀 네 키 외에 다른 키, original_reported 없음·키 수·형식이 틀림, original_usage_source 가 provider_unstorable 이 아님, resolution 이 객체가 아님) — 멈추고 1단계 백업 묶음을 보관한 채 별도 작업으로 다룹니다',
   needs_correct:
     '이 행에는 이미 수동 해결 기록(resolution)이 있습니다. 정정하려면 --correct 를 붙입니다(resolved_at·resolved_by·reason·settled_amount·usage_source·금액만 바꾸고 original_usage_source·original_reported 는 그대로). 고치려던 행이 맞는지 --list 로 먼저 확인하세요',
+  already_valid:
+    '이 행의 해결 기록은 이미 복원 검사를 통과합니다(복원 때문에 고칠 필요가 없는 행) — 고치려던 행이 맞는지 --list 로 다시 확인하세요(7-③ 이 거부한 행은 --list 에 "복원 검사 거부" 로 나옵니다). 올바른 기록을 일부러 바꾸려면(예: 사유 고쳐 쓰기) --correct --overwrite-valid 로 미리보기부터 다시 합니다 — 이전 resolved_by·reason·resolved_at·settled_amount 는 1단계 백업 묶음에만 남습니다',
   not_resolved_yet: '이 행은 아직 해결되지 않은 provider_unstorable 행입니다 — --correct 없이 실행합니다',
   actual_format: '--actual 은 정수부(0 이거나 앞자리 0 없음, 최대 12자리) + "." + 소수 정확히 6자리입니다(예 9.950000 — numeric(18,6) 열에 그대로 들어가는 값)',
   text_encoding: '--by·--reason 에 DB 가 담을 수 없는 문자(NUL·짝 없는 서로게이트)가 있습니다',
+  text_shell_unsafe:
+    '--by·--reason 에 큰따옴표(")·퍼센트(%)·역슬래시(\\)를 쓸 수 없습니다 — 명령 글은 셸을 두 번 지나고(Git Bash, 그다음 pnpm 의 스크립트 셸 — Windows 는 cmd.exe) 두 번째 셸이 이 문자를 바꿉니다(\\ 는 두 배, " 는 글을 끊음, %VAR% 는 환경변수 값으로). 다른 말로 바꿔 적습니다',
   'resolution:usage_source': '--source 는 provider 또는 none 입니다',
   'resolution:keys': '만든 resolution 의 키가 6개가 아닙니다(내부 오류)',
   'resolution:resolved_at': '만든 resolved_at 이 UTC(Z) 시각 형식이 아닙니다(내부 오류)',

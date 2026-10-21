@@ -45,16 +45,26 @@ export function migrationsFolder(): string {
   return resolveFromRoot('packages/db/drizzle');
 }
 
+/**
+ * 파일 DB 의 데이터 폴더 — createDb 가 만들고(mkdir) 잠그고 여는 바로 그 경로(워크스페이스 루트 기준 resolveFromRoot).
+ * 메모리 DB(`memory://`)이거나 pglite 가 아니면(createDb 가 아무것도 만들지 않고 거부) null.
+ * FIX5-LIVEL1H2: 읽기만 하는 CLI(`ledger:resolve --list`·미리보기)가 열기 전에 폴더가 있는지 보려고 같은 함수를 쓴다.
+ */
+export function pgliteDataDir(opts: CreateDbOptions): string | null {
+  if (opts.driver !== 'pglite' || opts.url === 'memory://') return null;
+  return resolveFromRoot(opts.url);
+}
+
 export function createDb(opts: CreateDbOptions): DbHandle {
   if (opts.driver !== 'pglite') throw new DbDriverNotImplementedError();
   let client: PGlite;
   let release = () => {};
   // T04: 검색 색인용 pg_trgm(0003 migration 의 CREATE EXTENSION)을 메모리·파일 DB 모두에 등록한다.
   const extensions = { pg_trgm };
-  if (opts.url === 'memory://') {
+  const dir = pgliteDataDir(opts);
+  if (dir === null) {
     client = new PGlite({ extensions });
   } else {
-    const dir = resolveFromRoot(opts.url);
     mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
     release = acquireDirLock(dir);
     try {

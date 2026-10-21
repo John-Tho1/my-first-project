@@ -90,3 +90,26 @@
 - 차이: `--list` 추가(2단계도 손으로 쓰는 SQL 이었음), 수정 모드는 현재 usage_source 를 provider|none 으로 한정하지 않음(original_* 증거가 있으면 `providers`·덜 바뀐 `provider_unstorable` 도 수정), 문서 경로는 `./data/pglite-check-<날짜>`(gitignore 안 — "기본 data 폴더와 겹치지 않음"으로 해석), 미리보기는 by·reason 길이만.
 - 남은 위험: UPDATE 뒤 재검증은 결함 주입 시험 없음, UPDATE 값 조건은 재비교와 분리 시험 불가, 일부 `resolution:*` 사유 코드는 계획기 버그 없이는 도달 불가, Windows Git Bash 인용·UTF-8 인자 미확인, Postgres 동시성 미검증, 추가 키·original_reported 없는 옛 행은 여전히 멈춤.
 - 검토자에게 물을 것: (1) 미리보기가 by·reason 을 그대로 보여 셸 변형을 보이게 해야 하는가? (2) `--confirm` 이 미리보기 지문(`--expect <hash>`)을 요구해야 하는가? (3) 이미 복원 검사를 통과하는 행 수정에 추가 플래그가 필요한가? (4) `--list` 가 보고 값을 출력하는 것이 허용되는가? (5) 수정 모드의 넓은 usage_source 허용이 맞는가?
+
+---
+
+# FIX round 5 (5차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 4edf71e (5차 검토 기록 docs) · **HEAD_SHA: 4769c4e** (`4769c4ec8a957abf46a9c74dcb079e1750e11dcf`)
+- 검토: 5차 Claude 독립 검토(`D39_CLAUDE_REVIEW.md` 5차) — FIX4 fb1fa58 대상, 확정 9건(전부 P2)·기각 16건. FIX4 질문 (1)(2)(3) 에 검토자 다수 "예" → 함께 반영.
+- 지적 처리:
+  - #1·Q2 미리보기와 적용이 묶이지 않음 → 미리보기가 **확인 지문**(sha256(stableStringify({v:1, owner, ledger, mode, correct, overwriteValid, current, args}))) 앞 16자리, 실행 시각 제외)을 출력, `--confirm` 은 `--expect <지문>` 필수(둘 중 하나만은 exit 2). 적용 실행이 다시 계산해 다르면 트랜잭션 전 `거부(expect_mismatch)`. 트랜잭션 안 재비교·값 조건 UPDATE 는 그대로.
+  - #2 읽기 모드가 DB 를 만듦 → createDb 와 같은 `pgliteDataDir()`(client.ts 에 분리)로 푼 폴더가 없으면 열지 않고 exit 1 `DB 폴더가 없습니다(DATABASE_URL 확인) — 아무것도 만들지 않았습니다.` 목록·미리보기 머리말과 2단계 문구는 "원장 행·감사 기록은 바꾸지 않음 — DB 를 열 때 밀린 migration 은 1단계 export 와 같이 적용".
+  - #3 원자성 시험 없음 → 시험이 만든 plpgsql 트리거(PGlite 0.5.8 에서 동작)로 (a) UPDATE 때 스냅숏을 바꿔 `거부(verify)`, (b) 감사 insert 실패로 일반 실패 — 둘 다 행·감사 수 그대로, 트리거 제거 뒤 대조 적용.
+  - #4·#5·Q1 셸 두 번(Git Bash → pnpm 스크립트 셸, Windows 는 cmd.exe [미확인]) → 미리보기·적용 칸에 `resolved_by:`·`reason:` 을 받은 그대로 JSON 이스케이프(\p{C}·Zl·Zp·U+0020 밖 Zs 는 \u)로 표시, `"`·`%`·`\` 는 `text_shell_unsafe`(이 명령만의 규칙 — 복원 검증기 그대로). 문서 명령 줄 앞 `MSYS_NO_PATHCONV=1`, 표시 줄 확인 후에만 ②.
+  - #6 1단계 백업 밖 owner → 해결·정정은 `AUTH_ALLOWED_IDENTITY` 의 owner 만(`owner_not_exported`, 행 조회 전), `--list --owner <다른>` 은 `범위 밖:` 줄 + 모든 명령 앞 `AUTH_ALLOWED_IDENTITY=<그 identity>` 안내.
+  - #7 누출 단언이 실패할 수 없음 → 시험 도우미·스크립트 시험 env 에 가짜 `ANTHROPIC_API_KEY`·형식 맞는 `SECRETS_MASTER_KEY`·`OIDC_CLIENT_SECRET`, 모든 호출에서 stdout/stderr 에 없음 단언. by/reason 은 stderr·`--list`·감사·사전 거부에 없음, 성공한 표시 두 줄에만.
+  - #8 UPDATE 값 조건 시험 → `{"x":12345678901234567890}` 를 넣은 행: 지문은 맞아도 `거부(changed)`·감사 없음·`pricing_snapshot::text` 그대로(값 조건 제거 변이 시 exit 0 으로 적용 — 잡힘). **FIX round 4 의 "UPDATE 값 조건은 PGlite 에서 따로 시험 불가" 기록은 틀렸다**(이 시험으로 분리됨).
+  - #9 옮기며 빠진 단언 → B 해결 뒤 형제 A·다른 owner 그대로.
+  - Q3 이미 유효한 행 → 도메인 `planLedgerResolution` 에서 `already_valid`(`--overwrite-valid` 없으면), `--list` 표시 `정정만(--correct --overwrite-valid — 이미 복원 검사 통과)`, 지문에 포함.
+  - 검토자 답의 작은 문서 공백: 7-④ 성공 기준(exit 0·`"ok":true`), 1단계에서 백업 묶음 `unresolved_live_usage` 기록, `updated 1` 뒤 exit 1 의미, README 명령 줄.
+- 바뀐 시험(제거 0, 23 → 42개): 미리보기 "길이만" → 이스케이프 한 줄씩 정확히 1회 + 나머지 누출 없음 · `--confirm` 단독 적용 → `--expect` 와 지문 재계산·`now` 무관 · 정정 변형의 무작위 owner → `owner_not_exported`(무작위 ledger 는 여전히 0행) · 유효한 형제 `--correct` 적용 → `already_valid`, `--overwrite-valid` 로 의도적 정정(`current_row_valid: true` 감사) · 문서 시험: `MSYS_NO_PATHCONV=1` 시작·단계별 문구·README 플래그 · 스크립트 시험: 맨 `--confirm` exit 2, 없는 절대 폴더(목록·미리보기·적용 exit 1, 폴더 안 생김), 상대 경로는 워크스페이스 루트 기준 · live-llm FIX2 시험: 미리보기 → `--expect`.
+- 변이: 11 중 11 잡힘(지문 검사 끔·지문에서 current/by 뺌·already_valid·text_shell_unsafe·폴더 확인·owner 확인 제거, 재검증·감사를 커밋 뒤로, jsonb 값 조건 제거, 이스케이프 끔).
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS · unit 81 files / 1934 · **integration 52 files / 999** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 변경 파일 보이지 않는 문자 0 · `./data` 아래 새 파일 0.
+- 차이(결정 대비): (1) 적용 칸이 by/reason 을 출력한 뒤 `changed`·`verify`·트리거·커밋 뒤 확인이 실패하면 by/reason 이 이미 stdout 에 있는 채 exit ≠ 0 — "쓰기 전 칸" 유지(운영자 자신의 입력, 비밀 아님). (2) 미리보기 머리말도 "원장 행·감사 기록은 바꾸지 않음", `changed` 문구 "이 실행이 행을 읽고 계획한 뒤". (3) `text_shell_unsafe` 는 `planLedgerResolution` 의 `text_encoding` 옆(bundle.ts 미변경). (4) 유효하지 않은 행의 `--overwrite-valid` 는 허용(허가 플래그 — 지문은 달라짐).
+- 남은 위험: Windows(cmd.exe 스크립트 셸·MSYS 변환) 미확인, 결합 문자(Mn)는 이스케이프하지 않음(NFD/NFC 가 같아 보임), 폴더는 있기만 하면(빈 폴더 포함) 초기화, pnpm 자체 배너의 인자 출력은 명령 밖, 지문 64비트(실수 방지용), Postgres 동시성 미검증.
+- 검토자에게 물을 것: (1) 적용 실행이 실패해도 by/reason 이 stdout 에 남는 것이 괜찮은가? (2) 유효하지 않은 행의 `--overwrite-valid` 를 거부해야 하는가? (3) 정정 미리보기에 settled_amount·resolved_at 전 → 후, 감사에 settled_amount_before 를 넣어야 하는가?

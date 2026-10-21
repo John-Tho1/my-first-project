@@ -206,3 +206,11 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - not_run: Codex, FIX4 에 대한 5차 독립 검토(이어서 진행), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(CLI 인자 인용·UTF-8 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
 - 확인 필요(추가, 잠정 적용): 운영 절차가 SQL → CLI 로 바뀜(손으로 쓰는 SQL 미지원), `--list` 는 보고 값을 출력, 수정 모드는 original_* 증거가 있으면 현재 usage_source 를 가리지 않음, 버리는 DB 경로는 `./data/pglite-check-<날짜>`(기본 data 폴더와 겹치지 않는 하위 폴더).
 - Codex 큐 줄(추가): `fb1fa58 FIX4-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX3 줄 다음).
+
+## 2026-10-21 오후 — 5차 독립 검토·FIX5(클라우드 세션)
+- 5차 Claude 독립 검토(Codex 아님, FIX4 fb1fa58 대상, 에이전트 30개 — 첫 실행이 세션 한도로 일부 실패해 한도 해제 뒤 이어 실행, 기록 cacfd05·4edf71e): 확정 9(**전부 P2**, P0·P1 없음)·기각 16.
+- **FIX5 4769c4e**: `ledger:resolve` 적용은 미리보기 확인 지문 `--expect` 필수(`expect_mismatch`), by/reason 을 받은 그대로 이스케이프 표시 + `"`·`%`·`\` 거부(`text_shell_unsafe`)·문서 `MSYS_NO_PATHCONV=1`, 이미 유효한 행 정정은 `--overwrite-valid`(`already_valid`), DB 폴더 없으면 만들지 않음, 해결 owner 를 1단계 export 범위로(`owner_not_exported`), 원자성(트리거)·누출·큰 수·형제 단언 시험. 인계: LIVEL1H2 "FIX round 5" 절.
+- 마지막 검사(4769c4e, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 999** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX5 에 대한 6차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(cmd.exe 스크립트 셸·MSYS 변환 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 명령이 두 번(미리보기 → `--expect <지문> --confirm`)으로 바뀜, by/reason 에 `"`·`%`·`\` 를 쓸 수 없음, 다른 owner 는 모든 명령 앞 `AUTH_ALLOWED_IDENTITY=` 로만, 적용 실행이 실패해도 by/reason 이 터미널에 남음.
+- Codex 큐 줄(추가): `4769c4e FIX5-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX4 줄 다음).

@@ -721,5 +721,28 @@ else
   ng "시험 인증서를 만들지 못함"
 fi
 
+# ---- FIX3-EXPIRY1(3차 검토): 같은 가드의 인증서 쪽(dev-cert.sh "백업에 기존 인증서가 없어") — 키는 백업에 있고 인증서만 빠진 경우.
+# 이동 실패 주입 없음(가드가 없으면 두 이동이 모두 성공해 예전 인증서를 백업 없이 덮어씀) · 인증서 이동 실패 주입(가드가 없으면 키를 옮겼다 되돌림) 두 경우. ----
+for cert_mv_fail in none cert; do
+  t "renew: 백업에 기존 인증서가 빠짐(가짜 cp) + 이동 실패 주입 '$cert_mv_fail' → 바꾸기 전에 exit 1, 키를 옮기지 않음·갱신 전 짝 그대로·임시 파일 없음"
+  if swap_setup "swap-nobackup-cert-$cert_mv_fail"; then
+    mv_fail=""
+    [[ "$cert_mv_fail" == none ]] || mv_fail="$cert_mv_fail"
+    run_dc "$SW" PATH="$FAKE_PATH" FAKE_CP_DROP=localhost-cert.pem FAKE_MV_FAIL="$mv_fail" FAKE_MV_LOG="$T_ROOT/swap-nobackup-cert-$cert_mv_fail.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/swap-nobackup-cert-$cert_mv_fail-newkey.pem" -- renew 30
+    expect_rc 1 "$RC" "$OUT"
+    expect_contains "$OUT" "백업에 기존 인증서가 없어"
+    expect_contains "$OUT" "기존 파일은 그대로입니다"
+    expect_true '[[ "$OUT" != *"백업에 기존 개인 키가 없어"* ]]' "키 쪽 가드가 아니라 인증서 쪽 가드에서 멈춤(키는 백업에 있음)"
+    expect_true '! grep -q -- "-> localhost-key\.pem$" "$T_ROOT/swap-nobackup-cert-$cert_mv_fail.log" 2>/dev/null' "키 이동을 시작하지 않음"
+    expect_true '! grep -q -- "-> localhost-cert\.pem$" "$T_ROOT/swap-nobackup-cert-$cert_mv_fail.log" 2>/dev/null' "인증서 이동을 시작하지 않음"
+    expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+    expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+    expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-nobackup-cert-$cert_mv_fail-newkey.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+
 echo "  $(basename "$0"): $PASS passed, $FAIL failed, $SKIP skipped"
 [[ "$FAIL" -eq 0 ]]

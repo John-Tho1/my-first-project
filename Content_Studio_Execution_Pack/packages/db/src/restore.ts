@@ -711,7 +711,17 @@ export async function parseBundleZip(zip: Uint8Array): Promise<ParsedBundle> {
 }
 
 export type BundleCheckResult =
-  | { ok: true; manifest_sha256: string; rows: Record<string, number>; assets: number }
+  | {
+      ok: true;
+      manifest_sha256: string;
+      rows: Record<string, number>;
+      assets: number;
+      /**
+       * FIX3-LIVEL1H2: 아직 해결되지 않은 live 사용량 — usage_ledger 중 pricing_snapshot.usage_source 가 'provider_unstorable' 인 행 수(정보 — 통과·실패와 무관).
+       * 복원하면 그 owner 의 live 예약이 다시 막힌다(hasUnresolvedLiveUsage). 수동 해결(인계 LIVEL1 4~6) 뒤 묶음에서는 해결한 행만큼 줄어야 한다. 값은 내보내지 않는다.
+       */
+      unresolved_live_usage: number;
+    }
   | { ok: false; error: string; message: string; problems?: unknown; fields?: unknown; tables?: unknown };
 
 /**
@@ -728,6 +738,7 @@ export async function checkBundleZip(zip: Uint8Array): Promise<BundleCheckResult
       manifest_sha256: b.manifestSha256,
       rows: Object.fromEntries(Object.entries(b.manifest.tables).map(([name, t]) => [name, t.rows])),
       assets: b.manifest.assets.length,
+      unresolved_live_usage: b.tables.usage_ledger.filter((r) => (r.pricing_snapshot as Record<string, unknown>).usage_source === 'provider_unstorable').length,
     };
   } catch (e) {
     if (!(e instanceof AppError) || e.kind !== 'bad_request') throw e;

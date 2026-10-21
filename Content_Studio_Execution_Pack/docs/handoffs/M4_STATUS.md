@@ -214,3 +214,11 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - not_run: Codex, FIX5 에 대한 6차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(cmd.exe 스크립트 셸·MSYS 변환 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
 - 확인 필요(추가, 잠정 적용): 운영 명령이 두 번(미리보기 → `--expect <지문> --confirm`)으로 바뀜, by/reason 에 `"`·`%`·`\` 를 쓸 수 없음, 다른 owner 는 모든 명령 앞 `AUTH_ALLOWED_IDENTITY=` 로만, 적용 실행이 실패해도 by/reason 이 터미널에 남음.
 - Codex 큐 줄(추가): `4769c4e FIX5-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX4 줄 다음).
+
+## 2026-10-21 저녁 — 6차 독립 검토·FIX6(클라우드 세션)
+- 6차 Claude 독립 검토(Codex 아님, FIX5 4769c4e 대상, 에이전트 22개·실패 0, 기록 7340e8b): 확정 6(**실질 전부 P2** — #5 는 검증자 1명 P1·2명 P2)·기각 9. 라운드별 확정 21 → 12 → 3 → 11 → 9 → 6.
+- **FIX6 1b6e4f4**: FIX5 의 `MSYS_NO_PATHCONV=1` 앞붙임 제거(Git Bash 의 corepack shim 이 시작하지 못할 수 있음 [추정]) + `/` 로 시작하는 값 거부, 셸 문자 거부에 `& | < > ^` 추가·문구 정정(도착한 문자만 봄), 보이지 않는 기본 무시 문자(한글 채움 문자 등) 이스케이프 표시, 불필요한 `--overwrite-valid` 거부(`overwrite_not_needed`), 정정 전 settled_amount·resolved_at 표시·감사, 시험 보강(정정·반쯤 끝난 행 거부, `updated 1` 뒤 exit 1), 1단계 기준값 보완. 인계: LIVEL1H2 "FIX round 6" 절.
+- 마지막 검사(1b6e4f4, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 1002** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX6 에 대한 7차 독립 검토, 실제 Postgres 다중 연결, 브라우저, **Windows Git Bash 에서 `corepack pnpm ledger:resolve` 실제 실행**(인용·경로 변환·corepack shim), macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 명령 앞붙임 없음, by/reason 에 `" % \ & | < > ^` 와 앞 `/` 를 쓸 수 없음(`R&D` 등도 거부), 정정 감사에 정정 전 settled_amount·resolved_at 을 남김. **사용자 PC 에서 처음 쓸 때 `corepack pnpm ledger:resolve --list` 가 Git Bash 에서 실행되는지 먼저 확인.**
+- Codex 큐 줄(추가): `1b6e4f4 FIX6-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX5 줄 다음).

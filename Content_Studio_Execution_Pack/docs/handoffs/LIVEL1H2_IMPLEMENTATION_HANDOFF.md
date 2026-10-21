@@ -113,3 +113,24 @@
 - 차이(결정 대비): (1) 적용 칸이 by/reason 을 출력한 뒤 `changed`·`verify`·트리거·커밋 뒤 확인이 실패하면 by/reason 이 이미 stdout 에 있는 채 exit ≠ 0 — "쓰기 전 칸" 유지(운영자 자신의 입력, 비밀 아님). (2) 미리보기 머리말도 "원장 행·감사 기록은 바꾸지 않음", `changed` 문구 "이 실행이 행을 읽고 계획한 뒤". (3) `text_shell_unsafe` 는 `planLedgerResolution` 의 `text_encoding` 옆(bundle.ts 미변경). (4) 유효하지 않은 행의 `--overwrite-valid` 는 허용(허가 플래그 — 지문은 달라짐).
 - 남은 위험: Windows(cmd.exe 스크립트 셸·MSYS 변환) 미확인, 결합 문자(Mn)는 이스케이프하지 않음(NFD/NFC 가 같아 보임), 폴더는 있기만 하면(빈 폴더 포함) 초기화, pnpm 자체 배너의 인자 출력은 명령 밖, 지문 64비트(실수 방지용), Postgres 동시성 미검증.
 - 검토자에게 물을 것: (1) 적용 실행이 실패해도 by/reason 이 stdout 에 남는 것이 괜찮은가? (2) 유효하지 않은 행의 `--overwrite-valid` 를 거부해야 하는가? (3) 정정 미리보기에 settled_amount·resolved_at 전 → 후, 감사에 settled_amount_before 를 넣어야 하는가?
+
+---
+
+# FIX round 6 (6차 Claude 독립 검토 — Codex 아님)
+- BASE_SHA: 7340e8b (6차 검토 기록 docs) · **HEAD_SHA: 1b6e4f4** (`1b6e4f49a7ff50ee9825c7538fbb450b7f4be609`)
+- 검토: 6차 Claude 독립 검토(`D39_CLAUDE_REVIEW.md` 6차) — FIX5 4769c4e 대상, 확정 6건(실질 전부 P2)·기각 9건. FIX5 질문 (2)(3) 검토자 3명 모두 "예" → 반영, (1) "괜찮다" → 그대로.
+- 지적 처리:
+  - #5 `MSYS_NO_PATHCONV=1` 앞붙임 → 문서·README·사용법·`--list` 안내·시험에서 제거. 이유: Git Bash 에서 corepack 의 sh shim 이 자기 스크립트 경로를 MSYS 변환에 기대므로 앞붙임이 그 변환까지 꺼 명령이 시작하지 못할 수 있음([추정] — shim 원본을 읽은 판단, Windows 미실행). 대신 `/` 로 시작하는 `--by`/`--reason` 은 `text_shell_unsafe`, 다른 변형(`--reason='/…'` → `C:/…` 등)은 미리보기 `resolved_by:`·`reason:` 표시로 확인. 문서 시험은 명령 줄이 `corepack pnpm ledger:resolve --owner ` 로 시작하고 앞붙임이 없음을 단언.
+  - #1 문구 → 거부는 문자가 **도착했을 때만** 보는 일관성 규칙(Linux·macOS 의 pnpm 12.6.0 은 그대로 넘김 — 검토자·구현 에이전트가 Linux 에서 확인, cmd.exe 의 `%VAR%` 확장·`"` 끊김은 [미확인]이며 표시로만 보임). 거부 문자에 `&`·`|`·`<`·`>`·`^` 추가(`/["%\\&|<>^]|^\//`). 시험 이름 "%PATH% 확장" → "%PATH% 글자 그대로 도착 — 확장은 시험하지 않음".
+  - #2 표시 이스케이프 → `\p{Default_Ignorable_Code_Point}` 추가(한글 채움 문자 U+3164 등 267개, ASCII 영향 없음). 시험은 구현 정규식 복사 대신 명시 코드포인트 25개 목록.
+  - #3 모든 방식에서 셸·인코딩 거부 → 정정 표(wrongCorr)·`--correct --overwrite-valid` 형제 행·반쯤 끝난 행 시험(exit 1·코드·stdout 비어 있음·행 그대로).
+  - #4 `updated 1` 뒤 exit 1 → 운영 hook 없이 시험용 Proxy(트랜잭션이 끝난 뒤에만 동작)로 DB 닫기 실패·커밋 뒤 확인 실패 2가지: stdout `updated 1`·exit 1·`적용(커밋)은 끝났지만`(“아무것도 바꾸지 않았습니다” 없음)·행 해결됨·감사 +1.
+  - #6 1단계 기준값 → 백업 묶음의 `bundle:check` 가 무결성 거부(exit 1)면 묶음은 보관하고 2단계 `--list` 둘째 줄의 `아직 provider_unstorable N행` 을 기준값으로, 7-③ 은 그 값과 비교. 시험: `--list` 건수 = `bundle:check` 건수(2→1→0), 반쯤 끝난 행은 묶음 거부여도 `--list` 1.
+  - Q2 → 복원 검사에서 거부되는 행에 `--overwrite-valid` 는 `overwrite_not_needed`(already_valid 바로 다음 검사).
+  - Q3 → 정정 미리보기·적용 칸에 `settled_amount: 전 → 후`·`resolved_at: 전 → (실행 시각)`, 감사에 `settled_amount_before`·`resolved_at_before` — 정정 전 값은 복원 형식(`isReportedCost`·새 `isBundleTimestamp` = bundle.ts 의 TS_RE)일 때만 값, 아니면 `(형식 밖 값)`·`(없음)`. 정정 전 resolved_by·reason 은 출력·감사하지 않음. 새 해결 방식은 그대로.
+- 바뀐 시험(제거·약화 0, 42 → 45개): 잘못 채움 표 이름 1개·11행 추가, 루프 "updated 없음" → "stdout 비어 있음", `/` 가 처음이 아닌 값·`C:/…` 는 받음 · 정정 변형 5 → 6, 전 → 후 줄·`overwrite_not_needed`·감사 전체 `toEqual` · 형제 `mixed`: `expect_mismatch` → `overwrite_not_needed`(미리보기·적용) + 지문 직접 비교 · 이스케이프 시험: 정규식 복사 → 명시 목록 · `--list` 안내·문서·README: 앞붙임 필수 → 앞붙임 없음 · 새 시험: 사용법 앞붙임 없음, 커밋 뒤·닫기 실패, 명시 코드포인트.
+- 변이: 33 중 33 잡힘(앞 `/` 거부 제거·새 문자 각각 제거·`/` 어디서나 거부, Default_Ignorable 제거, overwrite_not_needed 제거, 정정 전 값 원문 출력·줄 제거·감사 키 제거·새 해결에 추가, committed 표시를 커밋 뒤 확인 아래로·확인 제거·닫기 실패 exit 0·"아무것도"로, 셸·인코딩 거부를 새 해결만으로, 앞붙임 복원 등). 대조 11개 통과.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS · unit 81 files / 1934 · **integration 52 files / 1002** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 변경 파일 보이지 않는 문자(기본 무시 코드포인트 포함) 0 · `./data` 아래 새 파일 0.
+- 차이: 새 감사 키는 정정 방식에만, 정정 전 값이 형식 밖·없음이면 감사에도 null 대신 표시와 같은 문자열, 결정 밖 시험 추가(`--list` 건수 일치·받는 입력·사용법).
+- 남은 위험: Git Bash 에서 앞 `/` 는 MSYS 가 먼저 바꿔 거부가 아니라 표시가 실제 보호([추정]), Windows 의 cmd.exe·corepack shim 동작 미실행, 이모지 변이 선택자도 이스케이프로 보임(겉모양만), 결합 문자(Mn) 미이스케이프, 반쯤 끝난 행의 버리는 부분 기록은 표시·감사 안 함, `R&D`·`<10` 같은 글도 거부됨.
+- 검토자에게 물을 것: (1) 반쯤 끝난 행도 버리는 settled_amount·resolved_at 을 보여 주고 감사해야 하는가? (2) 감사의 형식 밖·없음 값을 문자열 대신 null 로 둬야 하는가? (3) Linux·macOS 에서만 실제로 걸릴 앞 `/` 거부를 일관성 규칙으로 둘 가치가 있는가? (4) 기본 무시 문자(한글 채움 문자 등)만으로 된 by·reason 을 공백으로 보고 거부해야 하는가(지금은 복원 검사와 같은 `trim()` 으로 통과)?

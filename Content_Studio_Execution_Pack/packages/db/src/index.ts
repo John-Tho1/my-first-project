@@ -30,6 +30,7 @@ export * from './retention';
 export * from './oauth';
 export * from './auth-oidc';
 export * from './secrets-cli';
+export * from './ledger-resolve-cli';
 export * from './remote-steps';
 export * from './media-spec';
 export * from './imports';

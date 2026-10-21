@@ -558,6 +558,7 @@ DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 m
 | `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
 | `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
 | `pnpm bundle:check <zip>` | 묶음 읽기 전용 확인(FIX2-LIVEL1H2 — 복원 미리보기와 같은 묶음 검증, DB·파일 쓰기 없음. 수동 해결 뒤 묶음 확인: 인계 LIVEL1 절차 7) | exit 0, JSON 출력(실패 exit 1) |
+| `pnpm ledger:resolve --list [--owner <id>]` · `pnpm ledger:resolve --owner <id> --ledger <id> --source provider\|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct] [--confirm]` | provider_unstorable(저장 범위 밖 보고 usage) 수동 해결 — 인계 LIVEL1 절차 2·4~6(FIX4-LIVEL1H2, **손으로 쓴 SQL 대신**). `--list` 는 읽기 전용 후보·처리 방식, 해결은 기본 미리보기(쓰지 않음)·`--confirm` 이면 복원 검사와 같은 함수로 검사한 행만 한 트랜잭션으로 적용(`updated 1`, 감사 `usage_ledger.manual_resolve`), 이미 해결 기록이 있는 행의 정정은 `--correct`. 서버를 끈 상태, 사유·보고값·스냅숏 값·DB 오류 본문은 출력하지 않음(`--list` 는 절차 3 비교용 보고값만) | exit 0, 거부·대상 없음·DB 잠금 exit 1, 사용법 exit 2 |
 
 ### PGlite 단일 연결 주의
 - 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.

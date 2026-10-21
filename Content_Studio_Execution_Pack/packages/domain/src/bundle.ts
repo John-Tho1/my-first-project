@@ -1253,8 +1253,8 @@ const LEDGER_USAGE_SOURCES = new Set(['provider', 'estimate', 'none', 'provider_
  * 토큰: 음이 아닌 정수 10진 — 숫자만, 부호·소수점·지수 없음, "0" 이 아니면 앞자리 0 없음, 최대 40자리.
  * 비용: fromMicro 출력과 같은 형식 — 정수부(같은 앞자리 규칙, 최대 40자리) + "." + 소수 정확히 6자리.
  */
-const isReportedTokens = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})$/.test(v);
-const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})\.\d{6}$/.test(v);
+export const isReportedTokens = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})$/.test(v);
+export const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1-9]\d{0,39})\.\d{6}$/.test(v);
 
 /**
  * LIVEL1-H2: provider_unstorable 수동 해결 기록(인계 LIVEL1 "수동 해결 절차" 4~6)의 `pricing_snapshot.resolution` 형식.
@@ -1274,10 +1274,10 @@ const isReportedCost = (v: unknown): boolean => typeof v === 'string' && /^(0|[1
  *  (g) original_reported: 키가 정확히 reported_tokens_in·reported_tokens_out·reported_cost 이고 각 값이 FIX4 보고값 형식.
  * 오류 문구에는 값을 넣지 않는다(다른 무결성 문제와 같다). 런타임 차단(hasUnresolvedLiveUsage)·월 합계(actual_amount)는 바꾸지 않는다.
  */
-const RESOLUTION_KEYS = ['resolved_at', 'resolved_by', 'reason', 'settled_amount', 'original_usage_source', 'original_reported'] as const;
-const ORIGINAL_REPORTED_KEYS = ['reported_tokens_in', 'reported_tokens_out', 'reported_cost'] as const;
-const RESOLUTION_RESOLVED_BY_MAX = 200;
-const RESOLUTION_REASON_MAX = 4000;
+export const RESOLUTION_KEYS = ['resolved_at', 'resolved_by', 'reason', 'settled_amount', 'original_usage_source', 'original_reported'] as const;
+export const ORIGINAL_REPORTED_KEYS = ['reported_tokens_in', 'reported_tokens_out', 'reported_cost'] as const;
+export const RESOLUTION_RESOLVED_BY_MAX = 200;
+export const RESOLUTION_REASON_MAX = 4000;
 /** 묶음 `amount`(numeric(18,6) 문자열)와 같은 형식 — toMicro 가 던지지 않는 것만 넘긴다(AmountRangeError 는 integrity 가 아님). */
 const LEDGER_AMOUNT_RE = /^\d{1,12}(\.\d{1,6})?$/;
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -1287,27 +1287,81 @@ const hasExactlyKeys = (o: Record<string, unknown>, keys: readonly string[]) => 
 };
 const isNonBlank = (v: unknown, max: number) => typeof v === 'string' && v.trim() !== '' && v.length <= max;
 
-function isValidResolution(
+/**
+ * FIX4-LIVEL1H2: isValidResolution 이 거부한 **첫** 규칙(위 (a)~(g) 순서). 통과면 null.
+ * 운영자 CLI(`pnpm ledger:resolve`)가 같은 검사로 "어느 입력이 틀렸는지"를 알려 주려고 쓴다 — 규칙은 여기 한 곳뿐이다(CLI 가 따로 옮겨 적지 않음).
+ */
+export type ResolutionProblem =
+  | 'usage_source'
+  | 'keys'
+  | 'resolved_at'
+  | 'resolved_by'
+  | 'reason'
+  | 'original_usage_source'
+  | 'original_reported'
+  | 'settled_amount'
+  | 'state'
+  | 'amount_format'
+  | 'settled_vs_actual';
+
+export function resolutionProblem(
+  snap: Record<string, unknown>,
+  row: { state: string; reserved_amount: unknown; actual_amount: unknown },
+): ResolutionProblem | null {
+  if (snap.usage_source !== 'provider' && snap.usage_source !== 'none') return 'usage_source'; // (a)
+  const res = snap.resolution;
+  if (!isPlainObject(res) || !hasExactlyKeys(res, RESOLUTION_KEYS)) return 'keys'; // (b)
+  if (typeof res.resolved_at !== 'string' || !TS_RE.test(res.resolved_at)) return 'resolved_at'; // (c)
+  if (!isNonBlank(res.resolved_by, RESOLUTION_RESOLVED_BY_MAX)) return 'resolved_by'; // (d)
+  if (!isNonBlank(res.reason, RESOLUTION_REASON_MAX)) return 'reason';
+  if (res.original_usage_source !== 'provider_unstorable') return 'original_usage_source'; // (f)
+  const orig = res.original_reported;
+  if (!isPlainObject(orig) || !hasExactlyKeys(orig, ORIGINAL_REPORTED_KEYS)) return 'original_reported'; // (g)
+  if (!isReportedTokens(orig.reported_tokens_in) || !isReportedTokens(orig.reported_tokens_out) || !isReportedCost(orig.reported_cost)) return 'original_reported';
+  // (e) — 형식을 모두 확인한 뒤에만 micro 로 바꾼다
+  if (!isReportedCost(res.settled_amount)) return 'settled_amount';
+  if (row.state !== 'settled') return 'state';
+  if (typeof row.actual_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.actual_amount)) return 'amount_format';
+  if (typeof row.reserved_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.reserved_amount)) return 'amount_format';
+  const settled = BigInt((res.settled_amount as string).replace('.', '')); // 소수 정확히 6자리 → micro
+  const actual = toMicro(row.actual_amount);
+  if (settled === actual) return null;
+  return settled > actual && actual > toMicro(row.reserved_amount) ? null : 'settled_vs_actual';
+}
+
+export function isValidResolution(
   snap: Record<string, unknown>,
   row: { state: string; reserved_amount: unknown; actual_amount: unknown },
 ): boolean {
-  if (snap.usage_source !== 'provider' && snap.usage_source !== 'none') return false; // (a)
-  const res = snap.resolution;
-  if (!isPlainObject(res) || !hasExactlyKeys(res, RESOLUTION_KEYS)) return false; // (b)
-  if (typeof res.resolved_at !== 'string' || !TS_RE.test(res.resolved_at)) return false; // (c)
-  if (!isNonBlank(res.resolved_by, RESOLUTION_RESOLVED_BY_MAX) || !isNonBlank(res.reason, RESOLUTION_REASON_MAX)) return false; // (d)
-  if (res.original_usage_source !== 'provider_unstorable') return false; // (f)
-  const orig = res.original_reported;
-  if (!isPlainObject(orig) || !hasExactlyKeys(orig, ORIGINAL_REPORTED_KEYS)) return false; // (g)
-  if (!isReportedTokens(orig.reported_tokens_in) || !isReportedTokens(orig.reported_tokens_out) || !isReportedCost(orig.reported_cost)) return false;
-  // (e) — 형식을 모두 확인한 뒤에만 micro 로 바꾼다
-  if (!isReportedCost(res.settled_amount) || row.state !== 'settled') return false;
-  if (typeof row.actual_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.actual_amount)) return false;
-  if (typeof row.reserved_amount !== 'string' || !LEDGER_AMOUNT_RE.test(row.reserved_amount)) return false;
-  const settled = BigInt((res.settled_amount as string).replace('.', '')); // 소수 정확히 6자리 → micro
-  const actual = toMicro(row.actual_amount);
-  if (settled === actual) return true;
-  return settled > actual && actual > toMicro(row.reserved_amount);
+  return resolutionProblem(snap, row) === null;
+}
+
+/**
+ * 원장 한 행만 보고 판단하는 무결성 규칙(checkIntegrity 의 usage_ledger 부분 중 참조 검사를 뺀 전부 — 순서·문구 그대로).
+ * FIX4-LIVEL1H2: 운영자 CLI 가 **쓰기 전에** 만들 행을 이 함수로 검사한다(복원 검사와 같은 함수).
+ */
+export function usageLedgerRowProblems(r: Pick<BundleRow<'usage_ledger'>, 'run_id' | 'transcription_job_id' | 'pricing_snapshot' | 'state' | 'reserved_amount' | 'actual_amount'>): string[] {
+  const problems: string[] = [];
+  if ((r.run_id === null) === (r.transcription_job_id === null)) problems.push('usage_ledger: run_id·transcription_job_id 중 정확히 하나');
+  // FIX3-LIVEL1: 사용량 출처는 정해진 값만. 키가 없으면 이전 행(그대로 둔다 — none 으로 바꾸지 않는다).
+  const snap = r.pricing_snapshot as Record<string, unknown>;
+  const has = (k: string) => Object.prototype.hasOwnProperty.call(snap, k);
+  if (has('usage_source')) {
+    const src = snap.usage_source;
+    if (typeof src !== 'string' || !LEDGER_USAGE_SOURCES.has(src)) problems.push('usage_ledger.pricing_snapshot.usage_source 값');
+  }
+  // FIX4-LIVEL1: provider_unstorable 은 수동 정산에 필요한 보고값 세 개가 필수(형식 엄격). reported_* 는 그 출처에서만 허용
+  // (다른 출처·usage_source 없는 이전 행에 있으면 손상으로 본다).
+  if (snap.usage_source === 'provider_unstorable') {
+    if (!isReportedTokens(snap.reported_tokens_in) || !isReportedTokens(snap.reported_tokens_out) || !isReportedCost(snap.reported_cost)) {
+      problems.push('usage_ledger.pricing_snapshot: provider_unstorable 보고값(reported_tokens_in/out·reported_cost) 형식');
+    }
+  } else if (ORIGINAL_REPORTED_KEYS.some(has)) {
+    problems.push('usage_ledger.pricing_snapshot: reported_* 는 usage_source=provider_unstorable 에서만');
+  }
+  // LIVEL1-H2: 수동 해결 기록이 있으면 형식·출처·재정산액을 검사한다(isValidResolution). 없으면 지금과 같다.
+  if (has('resolution') && !isValidResolution(snap, r)) problems.push('usage_ledger.pricing_snapshot.resolution 형식');
+  return problems;
 }
 
 /** 묶음 안 참조 무결성: PK 중복 없음, 모든 FK 대상이 묶음 안에 있음, 현재 버전은 그 원고의 버전. */
@@ -1381,26 +1435,8 @@ export function checkIntegrity(t: BundleTables): void {
   for (const r of t.usage_ledger) {
     need('usage_ledger', 'run_id', r.run_id, 'generation_runs');
     need('usage_ledger', 'transcription_job_id', r.transcription_job_id, 'transcription_jobs');
-    if ((r.run_id === null) === (r.transcription_job_id === null)) problems.push('usage_ledger: run_id·transcription_job_id 중 정확히 하나');
-    // FIX3-LIVEL1: 사용량 출처는 정해진 값만. 키가 없으면 이전 행(그대로 둔다 — none 으로 바꾸지 않는다).
-    const snap = r.pricing_snapshot as Record<string, unknown>;
-    const has = (k: string) => Object.prototype.hasOwnProperty.call(snap, k);
-    if (has('usage_source')) {
-      const src = snap.usage_source;
-      if (typeof src !== 'string' || !LEDGER_USAGE_SOURCES.has(src)) problems.push('usage_ledger.pricing_snapshot.usage_source 값');
-    }
-    // FIX4-LIVEL1: provider_unstorable 은 수동 정산에 필요한 보고값 세 개가 필수(형식 엄격). reported_* 는 그 출처에서만 허용
-    // (다른 출처·usage_source 없는 이전 행에 있으면 손상으로 본다).
-    const reportedKeys = ['reported_tokens_in', 'reported_tokens_out', 'reported_cost'];
-    if (snap.usage_source === 'provider_unstorable') {
-      if (!isReportedTokens(snap.reported_tokens_in) || !isReportedTokens(snap.reported_tokens_out) || !isReportedCost(snap.reported_cost)) {
-        problems.push('usage_ledger.pricing_snapshot: provider_unstorable 보고값(reported_tokens_in/out·reported_cost) 형식');
-      }
-    } else if (reportedKeys.some(has)) {
-      problems.push('usage_ledger.pricing_snapshot: reported_* 는 usage_source=provider_unstorable 에서만');
-    }
-    // LIVEL1-H2: 수동 해결 기록이 있으면 형식·출처·재정산액을 검사한다(isValidResolution). 없으면 지금과 같다.
-    if (has('resolution') && !isValidResolution(snap, r)) problems.push('usage_ledger.pricing_snapshot.resolution 형식');
+    // 행 하나로 판단하는 규칙(정확히 하나·usage_source·FIX4 보고값·resolution 형식) — 운영자 CLI 도 같은 함수를 쓴다(FIX4-LIVEL1H2).
+    problems.push(...usageLedgerRowProblems(r));
   }
   // T08: job 은 묶음 안 파일, 전사 버전은 그 job 의 것(버전 번호 unique), job 의 첫 전사는 같은 job 의 버전, 소재의 전사는 묶음 안.
   const transcriptJob = new Map(t.transcripts.map((x) => [x.id, x.job_id]));

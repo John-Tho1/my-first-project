@@ -4,7 +4,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,9 +30,11 @@ import {
   listUnconfirmedExperienceClaims,
   liveRunsUsed,
   monthlyUsage,
+  openDb,
   ownerScope,
   restoreZipPath,
   runAssist,
+  runLedgerResolveCli,
   runVariantAssist,
   schema,
   seed,
@@ -1183,31 +1185,31 @@ describe('LIVEL1-H2 — 수동 해결 resolution 형식: 실제 복원 경로', 
   });
 });
 
-// FIX2-LIVEL1H2(검토 #12): 운영자 절차(인계 LIVEL1 "수동 해결 절차" 4~7)가 H2 복원 무결성 규칙과 맞는지 — 문서의 SQL 블록을 **그대로 읽어** 실행하고,
+// FIX2-LIVEL1H2(검토 #12): 운영자 절차(인계 LIVEL1 "수동 해결 절차" 4~7)가 H2 복원 무결성 규칙과 맞는지 — 4~6 을 실행하고,
 // 그 뒤 내보낸 묶음이 읽기 전용 확인(`pnpm bundle:check` = checkBundleZip)과 복원 미리보기를 통과하는지, 절차가 금지한 자연스러운 실수(SQL now()
 // 시각·키 추가·소수 자릿수)는 확인에서 걸리는지 본다. 확인은 DB 를 열지 않는다(함수 인자에 DB 가 없고, 스크립트는 DATABASE_URL 폴더를 만들지 않음).
-describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bundle:check)', () => {
+// FIX4-LIVEL1H2(4차 검토): 4~6 은 문서의 손 SQL 이 아니라 운영자 CLI(`pnpm ledger:resolve` = runLedgerResolveCli)로 한다. FIX3 의 문서-SQL 시험(4~6 문의
+// 잘못 채움 32종·정정 문·확인 조회)은 SQL 이 없어져 지우고, 같은 경우를 tests/integration/ledger-resolve-cli.test.ts 에서 CLI 로 같은 단언 이상으로 본다.
+describe('FIX2-LIVEL1H2 — 운영자 절차(4~6 = ledger:resolve)·읽기 전용 묶음 확인(bundle:check)', () => {
   const APP = fileURLToPath(new URL('../../', import.meta.url));
   const TSX_CLI = path.join(APP, 'node_modules/tsx/dist/cli.mjs');
   const CHECK_SCRIPT = path.join(APP, 'packages/db/scripts/bundle-check.ts');
   const RESOLUTION_PROBLEM = ['usage_ledger.pricing_snapshot.resolution 형식'];
   const DOC = path.join(APP, 'docs/handoffs/LIVEL1_IMPLEMENTATION_HANDOFF.md');
-  /**
-   * 인계 문서의 SQL 블록(목록 안 들여쓰기 3칸을 걷어 냄). 기본은 "LIVEL1 수동 해결 4~6".
-   * FIX3-LIVEL1H2: 첫 줄 주석 제목으로 "LIVEL1 수동 해결 정정"·"LIVEL1 수동 해결 확인" 블록도 고른다(제목마다 블록은 정확히 하나).
-   */
-  const docSql = (title = 'LIVEL1 수동 해결 4~6') => {
-    const doc = readFileSync(DOC, 'utf8');
-    const esc = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const all = [...doc.matchAll(new RegExp('```sql\\n([ \\t]*-- ' + esc + '[^\\n]*\\n[\\s\\S]*?)\\n[ \\t]*```', 'g'))];
-    expect(all, `문서에 "${title}" SQL 블록이 정확히 하나 있다`).toHaveLength(1);
-    return all[0]![1]!.split('\n').map((l) => l.replace(/^ {3}/, '')).join('\n');
-  };
-  const fill = (tpl: string, v: Record<string, string>) => {
-    let out = tpl;
-    for (const [k, val] of Object.entries(v)) out = out.split(`<${k}>`).join(val);
-    expect(out, '모든 자리표시를 채웠다').not.toMatch(/<[A-Z_]+>/);
-    return out;
+  /** FIX4-LIVEL1H2: 인계 4~6 = 운영자 CLI 본체(공용 DB 를 그대로 넘기고 닫지 않음). resolved_at 은 주입한 시각. */
+  const RESOLVED_NOW = new Date('2026-10-21T09:15:00.123Z');
+  const resolveCli = async (argv: string[]) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runLedgerResolveCli({
+      argv,
+      env: { DATABASE_URL: 'memory://' },
+      openDb: async () => ({ ...(await getDb(loadConfig())), close: async () => undefined }),
+      out: (l) => out.push(l),
+      err: (l) => err.push(l),
+      now: () => RESOLVED_NOW,
+    });
+    return { code, out: out.join('\n'), err: err.join('\n') };
   };
   const runCheck = (args: string[], env: Record<string, string> = {}) =>
     spawnSync(process.execPath, [TSX_CLI, CHECK_SCRIPT, ...args], { cwd: APP, encoding: 'utf8', timeout: 120_000, env: { ...process.env, ...env } });
@@ -1216,10 +1218,9 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
     audits: (await db.select({ n: count() }).from(schema.auditEvents))[0]!.n,
   });
 
-  it('문서의 4~6 SQL 그대로 → 차단 해제·재정산, 해결 뒤 묶음은 bundle:check 통과(exit 0)·복원 미리보기 통과 — 상한(5단계) 경우도. 절차가 금지한 실수는 bundle:check 가 integrity(exit 1)로 잡고, 확인은 DB·파일에 쓰지 않는다', async () => {
+  it('4~6(ledger:resolve --confirm) → 차단 해제·재정산, 해결 뒤 묶음은 bundle:check 통과(exit 0)·복원 미리보기 통과 — 상한(5단계) 경우도. 절차가 금지한 실수는 bundle:check 가 integrity(exit 1)로 잡고, 확인은 DB·파일에 쓰지 않는다', async () => {
     const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix2-h2-proc-'));
     try {
-      const tpl = docSql();
       const cases = [
         { who: 'fix2-h2-proc@example.local', settled: '9.950000', actual: '9.950000' }, // 원칙: settled = actual
         { who: 'fix2-h2-cap@example.local', settled: '25.000000', actual: '10.000000' }, // 5단계 상한(월 한도 10 으로 깎음, 실제 청구 25)
@@ -1230,26 +1231,19 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
         expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
         const [before] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
         const { reported_tokens_in, reported_tokens_out, reported_cost } = before!.pricingSnapshot as Record<string, unknown>;
-        await db.execute(
-          sql.raw(
-            fill(tpl, {
-              USAGE_SOURCE: 'provider',
-              RESOLVED_BY: 'operator',
-              REASON: "시험: 운영자''의 콘솔 확인 — 실제 청구 " + c.settled + ' USD',
-              SETTLED: c.settled,
-              ACTUAL: c.actual,
-              LEDGER_ID: ledgerId,
-              OWNER_ID: owner,
-            }),
-          ),
-        );
+        const reason = "시험: 운영자'의 콘솔 확인 — 실제 청구 " + c.settled + ' USD';
+        const done = await resolveCli(['--owner', owner, '--ledger', ledgerId, '--source', 'provider', '--actual', c.actual, '--settled', c.settled, '--by', 'operator', `--reason=${reason}`, '--confirm']);
+        expect(done.code, done.err).toBe(0);
+        expect(done.out.split('\n')).toContain('updated 1');
         const [row] = await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, ledgerId));
         const snap = row!.pricingSnapshot as Record<string, unknown> & { resolution: Record<string, unknown> };
         expect(snap.usage_source).toBe('provider');
         expect(Object.keys(snap).filter((k) => k.startsWith('reported_'))).toEqual([]);
         expect(Object.keys(snap.resolution).sort()).toEqual(['original_reported', 'original_usage_source', 'reason', 'resolved_at', 'resolved_by', 'settled_amount']);
-        expect(snap.resolution.resolved_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
-        expect(snap.resolution.reason).toContain("운영자'의"); // '' → '
+        expect(snap.resolution.resolved_at).toBe(RESOLVED_NOW.toISOString()); // FIX4: 문서 SQL 의 마이크로초 형식 대신 CLI 의 실행 시각(정확히 같은 값 — TS_RE 형식)
+        expect(snap.resolution.resolved_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        expect(snap.resolution.reason).toContain("운영자'의"); // 따옴표 그대로(셸·SQL 처리 없음)
+        expect(snap.resolution.reason).toBe(reason);
         expect(snap.resolution.original_reported).toEqual({ reported_tokens_in, reported_tokens_out, reported_cost });
         expect(row!.actualAmount).toBe(c.actual);
         expect(row!.state).toBe('settled');
@@ -1323,298 +1317,10 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
     }
   });
 
-  // ---- FIX3-LIVEL1H2(3차 Claude 검토): 문이 스스로 입력을 검사(잘못 채우면 0행)·정정 문·확인 조회·bundle:check 미해결 수·7-④ 쓰기 위치 ----
-  const PLACEHOLDERS = ['LEDGER_ID', 'OWNER_ID', 'USAGE_SOURCE', 'ACTUAL', 'SETTLED', 'RESOLVED_BY', 'REASON'] as const;
-  type Fill = Record<(typeof PLACEHOLDERS)[number], string>;
-  type Snap = Record<string, unknown> & { resolution: Record<string, unknown> };
-  /** 문서대로 채운다: 글자 안 작은따옴표는 두 번 */
-  const runDoc = async (tpl: string, f: Fill) =>
-    (await db.execute(sql.raw(fill(tpl, Object.fromEntries(Object.entries(f).map(([k, v]) => [k, v.split("'").join("''")]))))))
-      .rows as Array<Record<string, unknown>>;
-  const ownerLedger = (owner: string) => db.select().from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, owner)).orderBy(schema.usageLedger.id);
-  const ledgerRow = async (id: string) => (await db.select().from(schema.usageLedger).where(eq(schema.usageLedger.id, id)))[0]!;
-  const setSnap = (id: string, s: Record<string, unknown>) => db.update(schema.usageLedger).set({ pricingSnapshot: s }).where(eq(schema.usageLedger.id, id));
-  /** 문서의 "확인 조회"(읽기 전용) */
-  const confirmQuery = async (ledgerId: string, owner: string) => {
-    const rows = (await db.execute(sql.raw(fill(docSql('LIVEL1 수동 해결 확인'), { LEDGER_ID: ledgerId, OWNER_ID: owner })))).rows as Array<Record<string, unknown>>;
-    expect(rows).toHaveLength(1);
-    return { target: Number(rows[0]!.target_resolved), unresolved: Number(rows[0]!.unresolved_rows) };
-  };
-  const fillFor = (ledgerId: string, owner: string): Fill => ({
-    LEDGER_ID: ledgerId,
-    OWNER_ID: owner,
-    USAGE_SOURCE: 'provider',
-    ACTUAL: '9.950000',
-    SETTLED: '9.950000',
-    RESOLVED_BY: 'operator',
-    REASON: "콘솔 확인 — 운영자's 판단, 실제 청구 9.95 USD",
-  });
-  /** 같은 owner 에 provider_unstorable 원장 2개(A·B). 둘째 live 실행 동안만 A 의 출처를 잠깐 바꿔(미해결 차단을 비켜 감) A 의 원래 스냅숏을 그대로 되돌린다. */
-  const unstorablePair = async (identity: string) => {
-    const a = await unstorableRun(identity);
-    const snapA = (await ledgerRow(a.ledgerId)).pricingSnapshot;
-    await setSnap(a.ledgerId, { ...snapA, usage_source: 'provider' });
-    const c = await createContent(db, a.owner, { title: 'H2-B', body: '본문.' });
-    const { fetch } = fakeFetch(json(200, message({ usage: OVER_INT })));
-    const b = await runAssist(db, a.owner, c.content.id, draft(), claude(fetch));
-    await setSnap(a.ledgerId, snapA);
-    const rows = await ownerLedger(a.owner);
-    expect(rows.map((r) => (r.pricingSnapshot as { usage_source?: string }).usage_source)).toEqual(['provider_unstorable', 'provider_unstorable']);
-    return { owner: a.owner, ledgerA: a.ledgerId, ledgerB: b.ledger.id };
-  };
-  const RESOLUTION_KEYS_SORTED = ['original_reported', 'original_usage_source', 'reason', 'resolved_at', 'resolved_by', 'settled_amount'];
-  const RESOLVED_AT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+  // FIX3-LIVEL1H2 의 문서-SQL 시험 두 개(4~6 문의 자리표시·잘못 채움 32종·state·경계·none·확인 조회·bundle:check 미해결 수 / 정정 문 5변형·고칠 수 없는 9형태)는
+  // FIX4-LIVEL1H2 에서 손 SQL 이 문서에서 빠져 지웠다. 같은 경우(와 4차 검토가 더한 경우)를 tests/integration/ledger-resolve-cli.test.ts 가 CLI 로 본다.
 
-  it('FIX3-LIVEL1H2: 4~6 문 — 자리표시는 values 에 한 번씩, 잘못 채우면 0행(대상·같은 owner 의 다른 미해결 행·다른 owner 그대로), 맞게 채우면 정확히 1행·다시 실행 0행. none·길이 경계, 확인 조회, bundle:check 미해결 수(정보 줄·exit 0)', async () => {
-    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix3-h2-guard-'));
-    try {
-      const tpl = docSql();
-      const corr = docSql('LIVEL1 수동 해결 정정');
-      const conf = docSql('LIVEL1 수동 해결 확인');
-      const occurrences = (s: string, k: string) => s.split(`<${k}>`).length - 1;
-      for (const k of PLACEHOLDERS) {
-        expect(occurrences(tpl, k), `4~6 문의 <${k}>`).toBe(1);
-        expect(occurrences(corr, k), `정정 문의 <${k}>`).toBe(1);
-      }
-      expect([occurrences(conf, 'LEDGER_ID'), occurrences(conf, 'OWNER_ID')]).toEqual([1, 1]);
-      for (const s of [tpl, corr, conf]) for (const p of s.match(/<[A-Z_]+>/g)!) expect(PLACEHOLDERS as readonly string[]).toContain(p.slice(1, -1));
-
-      const { owner, ledgerA, ledgerB } = await unstorablePair('fix3-h2-guard@example.local');
-      const other = (await unstorableRun('fix3-h2-guard-other@example.local')).owner;
-      const otherBefore = await ownerLedger(other);
-      // 1단계 백업 묶음: 통과 + 미해결 2행(정보)
-      const backup = await exportZip(owner, tmp, 'backup');
-      expect(await checkBundleZip(backup)).toMatchObject({ ok: true, unresolved_live_usage: 2 });
-      const before = await ownerLedger(owner);
-      const rowA = before.find((r) => r.id === ledgerA)!;
-      const snapA0 = rowA.pricingSnapshot as Record<string, unknown>;
-      expect(snapA0.usage_source).toBe('provider_unstorable');
-      expect(snapA0).not.toHaveProperty('resolution');
-      const reservedA = rowA.reservedAmount;
-      expect(toMicro(reservedA) < toMicro('9.950000')).toBe(true);
-      const good = fillFor(ledgerA, owner);
-      const wrong: Array<[string, Partial<Fill>]> = [
-        ['settled 소수 2자리', { SETTLED: '9.95' }],
-        ['settled 앞자리 0', { SETTLED: '09.950000' }],
-        ['settled 소수 7자리', { SETTLED: '9.9500000' }],
-        ['settled 숫자 아님(형변환 오류 없이 0행)', { SETTLED: 'abc' }],
-        ['settled 빈 값', { SETTLED: '' }],
-        ['actual 소수 2자리', { ACTUAL: '9.95' }],
-        ['actual 음수', { ACTUAL: '-9.950000' }],
-        ['actual 정수부 13자리(열 범위 밖)', { ACTUAL: '1234567890123.000000', SETTLED: '1234567890123.000000' }],
-        ['settled < actual', { SETTLED: '9.590000' }],
-        ['settled ≠ actual 이고 상한 아님(actual = 예약액 — 재정산 누락)', { ACTUAL: reservedA }],
-        ['출처 providers', { USAGE_SOURCE: 'providers' }],
-        ['출처 Provider', { USAGE_SOURCE: 'Provider' }],
-        ['출처 estimate', { USAGE_SOURCE: 'estimate' }],
-        ['출처 provider_unstorable', { USAGE_SOURCE: 'provider_unstorable' }],
-        ['출처 빈 값', { USAGE_SOURCE: '' }],
-        // 출처 검사만으로 막히는지(actual = settled = 예약액이면 none 규칙은 통과하므로 출처 목록 검사가 유일한 근거)
-        ['출처 estimate(actual = settled = 예약액)', { USAGE_SOURCE: 'estimate', ACTUAL: reservedA, SETTLED: reservedA }],
-        ['출처 provider_unstorable(actual = settled = 예약액)', { USAGE_SOURCE: 'provider_unstorable', ACTUAL: reservedA, SETTLED: reservedA }],
-        ['출처 providers(actual = settled = 예약액)', { USAGE_SOURCE: 'providers', ACTUAL: reservedA, SETTLED: reservedA }],
-        ['none 인데 actual ≠ 예약액', { USAGE_SOURCE: 'none' }],
-        ['resolved_by 빈 값', { RESOLVED_BY: '' }],
-        ['resolved_by 공백', { RESOLVED_BY: '   ' }],
-        ['resolved_by 탭·줄바꿈', { RESOLVED_BY: '\t\n\r\v\f' }],
-        ['resolved_by 전각 공백·BOM·NBSP·줄 구분자', { RESOLVED_BY: '\u3000\uFEFF\u00A0\u2028\u2029\u202F' }],
-        ['resolved_by 201자', { RESOLVED_BY: 'o'.repeat(201) }],
-        ['resolved_by UTF-16 202(이모지 101개 — 글자 수 101)', { RESOLVED_BY: '😀'.repeat(101) }],
-        ['reason 빈 값', { REASON: '' }],
-        ['reason 공백·줄바꿈', { REASON: ' \n \u2028 \t' }],
-        ['reason 4001자', { REASON: 'r'.repeat(4001) }],
-        ['reason UTF-16 4002(이모지 2001개)', { REASON: '😀'.repeat(2001) }],
-        ['없는 ledger id', { LEDGER_ID: randomUUID() }],
-        ['ledger id 대문자(2단계 결과 그대로가 아님)', { LEDGER_ID: ledgerA.toUpperCase() }],
-        ['대상 id 는 맞지만 다른 owner id', { OWNER_ID: other }],
-      ];
-      for (const [label, over] of wrong) {
-        expect(await runDoc(tpl, { ...good, ...over }), label).toEqual([]);
-        expect(await ownerLedger(owner), label).toEqual(before); // 대상·같은 owner 의 다른 미해결 행 모두 그대로(provider_unstorable·reported_* 그대로)
-        expect(await ownerLedger(other), label).toEqual(otherBefore);
-      }
-      // 행 상태 조건: settled 가 아닌 행은 고르지 않는다(시험 준비로만 잠깐 바꿨다가 되돌림)
-      await db.update(schema.usageLedger).set({ state: 'reserved' }).where(eq(schema.usageLedger.id, ledgerA));
-      expect(await runDoc(tpl, good)).toEqual([]);
-      await db.update(schema.usageLedger).set({ state: 'settled' }).where(eq(schema.usageLedger.id, ledgerA));
-      expect(await ownerLedger(owner)).toEqual(before);
-      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
-      expect(await confirmQuery(ledgerA, owner)).toEqual({ target: 0, unresolved: 2 });
-
-      // 맞게 채움(길이 경계: resolved_by 이모지 100개 = UTF-16 200, reason 앞뒤 공백 포함 4000자) → 정확히 1행, 다른 미해결 행 그대로
-      const boundary: Fill = { ...good, RESOLVED_BY: '😀'.repeat(100), REASON: ' ' + 'r'.repeat(3998) + ' ' };
-      const done = await runDoc(tpl, boundary);
-      expect(done).toHaveLength(1);
-      expect(done[0]).toMatchObject({ id: ledgerA, usage_source: 'provider', actual_amount: '9.950000' });
-      const afterA = await ownerLedger(owner);
-      expect(afterA.find((r) => r.id === ledgerB)).toEqual(before.find((r) => r.id === ledgerB));
-      const rA = afterA.find((r) => r.id === ledgerA)!;
-      const sA = rA.pricingSnapshot as Snap;
-      expect(Object.keys(sA.resolution).sort()).toEqual(RESOLUTION_KEYS_SORTED);
-      expect(sA.resolution.original_reported).toEqual({
-        reported_tokens_in: snapA0.reported_tokens_in,
-        reported_tokens_out: snapA0.reported_tokens_out,
-        reported_cost: snapA0.reported_cost,
-      });
-      expect(sA.resolution).toMatchObject({ resolved_by: '😀'.repeat(100), settled_amount: '9.950000', original_usage_source: 'provider_unstorable' });
-      expect(sA.resolution.resolved_at).toMatch(RESOLVED_AT_RE);
-      expect([rA.actualAmount, rA.overBudget, toMicro(rA.overageAmount)]).toEqual(['9.950000', true, toMicro('9.950000') - toMicro(reservedA)]);
-      expect(await confirmQuery(ledgerA, owner)).toEqual({ target: 1, unresolved: 1 });
-      expect(await confirmQuery(ledgerB, owner)).toEqual({ target: 0, unresolved: 1 });
-      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true); // B 가 남아 있다
-      const mid = await exportZip(owner, tmp, 'mid');
-      expect(await checkBundleZip(mid)).toMatchObject({ ok: true, unresolved_live_usage: 1 }); // 경계 길이도 복원 검사 통과, 해결한 행은 세지 않음
-      // 같은 문 다시 실행 → 0행(이미 provider_unstorable 아님), 모두 그대로
-      expect(await runDoc(tpl, boundary)).toEqual([]);
-      expect(await ownerLedger(owner)).toEqual(afterA);
-
-      // B: none(보고값을 믿지 않고 예약액 유지 — actual = reserved = settled)
-      const reservedB = before.find((r) => r.id === ledgerB)!.reservedAmount;
-      const doneB = await runDoc(tpl, { ...good, LEDGER_ID: ledgerB, USAGE_SOURCE: 'none', ACTUAL: reservedB, SETTLED: reservedB });
-      expect(doneB).toHaveLength(1);
-      const rB = await ledgerRow(ledgerB);
-      expect([(rB.pricingSnapshot as Snap).usage_source, rB.actualAmount, toMicro(rB.overageAmount), rB.overBudget]).toEqual(['none', reservedB, 0n, false]);
-      expect(await ownerLedger(owner).then((rs) => rs.find((r) => r.id === ledgerA))).toEqual(rA);
-      expect(await confirmQuery(ledgerB, owner)).toEqual({ target: 1, unresolved: 0 });
-      expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
-      expect(await ownerLedger(other)).toEqual(otherBefore);
-      const fin = await exportZip(owner, tmp, 'final');
-      expect(await checkBundleZip(fin)).toMatchObject({ ok: true, unresolved_live_usage: 0 });
-      const h = await createTestDb();
-      try {
-        const target = (await ensureOwner(h.db, 'restore-fix3-h2-guard@example.local')).id;
-        const pv = await createRestorePreview(h.db, target, fin, { restoresDir: path.join(tmp, 'restores'), source: 'upload' });
-        expect(pv.preview.tables.usage_ledger).toMatchObject({ in_bundle: 2, new: 2 });
-      } finally {
-        await h.close();
-      }
-
-      // 스크립트: stdout 은 JSON 한 줄 그대로(+ unresolved_live_usage), stderr 에 수만 담은 정보 줄, exit 0(미해결이 있어도). 값·id 는 내보내지 않는다
-      const noDb = path.join(tmp, 'must-not-exist-pglite');
-      for (const [tag, bytes, nRows] of [['backup', backup, 2], ['mid', mid, 1], ['final', fin, 0]] as const) {
-        const file = path.join(tmp, `${tag}.zip`);
-        writeFileSync(file, bytes);
-        const r = runCheck([file], { DATABASE_URL: noDb });
-        expect(r.status, r.stderr).toBe(0);
-        const lines = r.stdout.trim().split('\n');
-        expect(lines).toHaveLength(1);
-        expect(JSON.parse(lines[0]!)).toMatchObject({ action: 'bundle.check', ok: true, unresolved_live_usage: nRows });
-        expect(r.stderr).toContain(`[bundle:check] 정보: 아직 해결되지 않은 live 사용량(usage_ledger.pricing_snapshot.usage_source=provider_unstorable) ${nRows}행`);
-        for (const v of [String(snapA0.reported_cost), String(snapA0.reported_tokens_in), ledgerA, ledgerB, owner]) expect(r.stdout + r.stderr, tag).not.toContain(v);
-      }
-      expect(readdirSync(tmp)).not.toContain('must-not-exist-pglite');
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it('FIX3-LIVEL1H2: 정정 문 — resolution 이 이미 있는데 복원 검사가 거부하는 행(FIX3 이전 문·H2 이전 손 작업)을 정확히 1행으로 고친다: original_reported 그대로·묶음 통과. 4~6 문은 그런 행을 고르지 않고(원래 보고값을 null 로 덮지 않음), 잘못 채우거나 고칠 수 없는 모양이면 0행', async () => {
-    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix3-h2-corr-'));
-    try {
-      const tpl = docSql();
-      const corr = docSql('LIVEL1 수동 해결 정정');
-      // FIX3 이전(입력 검사 없는) 4~6 문이나 H2 이전 손 작업이 커밋했을 모양: H1 모양으로 해결한 뒤 일부를 틀리게 만든다
-      const variants: Array<[string, (s: Snap) => void, boolean]> = [
-        ['settled_amount "9.95"(FIX3 이전 문에 잘못 채움)', (s) => void (s.resolution.settled_amount = '9.95'), false],
-        ['resolved_at +00:00·빈 resolved_by(H2 이전 손 작업)', (s) => void Object.assign(s.resolution, { resolved_at: '2026-10-10T12:00:00+00:00', resolved_by: ' ' }), false],
-        ['usage_source providers(FIX3 이전 문 — 차단은 풀렸지만 복원 거부)', (s) => void (s.usage_source = 'providers'), false],
-        ['재정산 누락(actual = 예약액, settled 9.95)', () => undefined, true],
-        ['반쯤 끝남(provider_unstorable 그대로 + resolution, 최상위 reported_* 는 이미 옮김)', (s) => void (s.usage_source = 'provider_unstorable'), false],
-      ];
-      for (const [i, [label, mutate, keepReserved]] of variants.entries()) {
-        const { owner, ledgerId } = await unstorableRun(`fix3-h2-corr-${i}@example.local`);
-        const { original } = await resolveUnstorable(ledgerId);
-        const r0 = await ledgerRow(ledgerId);
-        const snap = structuredClone(r0.pricingSnapshot) as Snap;
-        mutate(snap);
-        await db
-          .update(schema.usageLedger)
-          .set({ pricingSnapshot: snap, ...(keepReserved ? { actualAmount: r0.reservedAmount, overageAmount: '0', overBudget: false } : {}) })
-          .where(eq(schema.usageLedger.id, ledgerId));
-        expect(await checkBundleZip(await exportZip(owner, tmp, `bad-${i}`)), label).toMatchObject({ ok: false, error: 'integrity' });
-        const broken = await ownerLedger(owner);
-        // 4~6 문은 이 행을 고르지 않는다 → 0행, 원래 보고값(resolution.original_reported) 그대로
-        expect(await runDoc(tpl, fillFor(ledgerId, owner)), label).toEqual([]);
-        expect(await ownerLedger(owner), label).toEqual(broken);
-        // 정정 문도 잘못 채우면 0행
-        const wrongCorr: Array<Partial<Fill>> = [
-          { SETTLED: '9.95' },
-          { RESOLVED_BY: ' ' },
-          { REASON: '' },
-          { USAGE_SOURCE: 'providers' },
-          { USAGE_SOURCE: 'estimate', ACTUAL: r0.reservedAmount, SETTLED: r0.reservedAmount }, // 출처 검사만으로 막힘
-          { ACTUAL: r0.reservedAmount }, // settled > actual 인데 상한 아님
-          { OWNER_ID: ownerA },
-          { LEDGER_ID: randomUUID() },
-        ];
-        for (const over of wrongCorr) {
-          expect(await runDoc(corr, { ...fillFor(ledgerId, owner), ...over }), `${label} ${JSON.stringify(over)}`).toEqual([]);
-          expect(await ownerLedger(owner), label).toEqual(broken);
-        }
-        // 맞게 채우면 정확히 1행 — 바뀌는 것은 resolution 네 키·usage_source·금액 열뿐, original_* 그대로
-        const done = await runDoc(corr, fillFor(ledgerId, owner));
-        expect(done, label).toHaveLength(1);
-        expect(done[0]).toMatchObject({ id: ledgerId, usage_source: 'provider', actual_amount: '9.950000' });
-        const r1 = await ledgerRow(ledgerId);
-        const s1 = r1.pricingSnapshot as Snap;
-        expect(Object.keys(s1.resolution).sort(), label).toEqual(RESOLUTION_KEYS_SORTED);
-        expect(s1.resolution.original_reported, label).toEqual(original);
-        expect(s1.resolution.original_usage_source).toBe('provider_unstorable');
-        expect(s1.resolution).toMatchObject({ resolved_by: 'operator', settled_amount: '9.950000', reason: "콘솔 확인 — 운영자's 판단, 실제 청구 9.95 USD" });
-        expect(s1.resolution.resolved_at).toMatch(RESOLVED_AT_RE);
-        expect(s1.usage_source).toBe('provider');
-        const strip = ({ usage_source: _u, resolution: _r, ...rest }: Snap) => rest;
-        expect(strip(s1), label).toEqual(strip(snap)); // 스냅숏의 다른 키 그대로(reported_* 다시 생기지 않음)
-        expect(Object.keys(s1).filter((k) => k.startsWith('reported_'))).toEqual([]);
-        expect([r1.actualAmount, r1.overBudget, toMicro(r1.overageAmount)]).toEqual(['9.950000', true, toMicro('9.950000') - toMicro(r1.reservedAmount)]);
-        expect([r1.state, r1.tokensIn, r1.tokensOut, r1.settledAt]).toEqual([r0.state, r0.tokensIn, r0.tokensOut, r0.settledAt]);
-        expect(await hasUnresolvedLiveUsage(db, owner)).toBe(false);
-        expect(await checkBundleZip(await exportZip(owner, tmp, `fixed-${i}`)), label).toMatchObject({ ok: true, unresolved_live_usage: 0 });
-      }
-
-      // 행 선택: 같은 owner 에 고칠 행이 둘이어도 지정한 행만 바뀐다
-      const pair = await unstorablePair('fix3-h2-corr-pair@example.local');
-      for (const id of [pair.ledgerA, pair.ledgerB]) {
-        expect(await runDoc(tpl, fillFor(id, pair.owner))).toHaveLength(1);
-        const s = structuredClone((await ledgerRow(id)).pricingSnapshot) as Snap;
-        s.resolution.settled_amount = '9.95';
-        await setSnap(id, s);
-      }
-      const pairBroken = await ownerLedger(pair.owner);
-      expect(await runDoc(corr, fillFor(pair.ledgerA, pair.owner))).toHaveLength(1);
-      expect((await ownerLedger(pair.owner)).find((r) => r.id === pair.ledgerB)).toEqual(pairBroken.find((r) => r.id === pair.ledgerB));
-
-      // 정정 문이 다루지 않는 모양(문서: 멈추고 별도 작업) → 두 문 모두 0행, 그대로
-      const unfixable: Array<[string, (s: Snap) => void]> = [
-        ['resolution 에 다른 키(console_ref)', (s) => void (s.resolution.console_ref = 'console-2026-10')],
-        ['original_reported 없음(H2 이전 키 5개 예시)', (s) => void delete s.resolution.original_reported],
-        ['original_reported 키 하나 없음', (s) => void delete (s.resolution.original_reported as Record<string, unknown>).reported_cost],
-        ['original_reported 비용이 숫자', (s) => void ((s.resolution.original_reported as Record<string, unknown>).reported_cost = 42.5)],
-        ['original_reported 토큰이 형식 밖', (s) => void ((s.resolution.original_reported as Record<string, unknown>).reported_tokens_in = '01')],
-        ['original_reported 에 다른 키', (s) => void ((s.resolution.original_reported as Record<string, unknown>).note = 'x')],
-        ['original_usage_source 다름', (s) => void (s.resolution.original_usage_source = 'provider')],
-        ['최상위 reported_* 가 남음(옮기지 않고 복사)', (s) => void Object.assign(s, s.resolution.original_reported as object)],
-        ['resolution 이 객체가 아님', (s) => void ((s as Record<string, unknown>).resolution = 'resolved')],
-      ];
-      const u = await unstorableRun('fix3-h2-corr-unfixable@example.local');
-      await resolveUnstorable(u.ledgerId);
-      const base = structuredClone((await ledgerRow(u.ledgerId)).pricingSnapshot) as Snap;
-      for (const [label, mutate] of unfixable) {
-        const s = structuredClone(base);
-        s.resolution.settled_amount = '9.95';
-        mutate(s);
-        await setSnap(u.ledgerId, s);
-        const rows = await ownerLedger(u.owner);
-        expect(await runDoc(corr, fillFor(u.ledgerId, u.owner)), label).toEqual([]);
-        expect(await runDoc(tpl, fillFor(u.ledgerId, u.owner)), label).toEqual([]);
-        expect(await ownerLedger(u.owner), label).toEqual(rows);
-      }
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it('FIX3-LIVEL1H2: 7-④ — 문서 줄의 DATABASE_URL·RESTORE_LOCAL_DIR 로 실제 restore:preview 스크립트를 임시 작업 폴더에서 실행하면 새로 생긴 것은 그 두 폴더뿐(ZIP 사본은 RESTORE_LOCAL_DIR). RESTORE_LOCAL_DIR 를 빼면 기본값은 ./data/restores(정정 전 문구의 사본 위치)', async () => {
+  it('FIX3-LIVEL1H2: 7-④ — 문서 줄의 DATABASE_URL·RESTORE_LOCAL_DIR 로 실제 restore:preview 스크립트를 임시 작업 폴더에서 실행하면 새로 생긴 것은 그 두 폴더뿐(ZIP 사본은 RESTORE_LOCAL_DIR). RESTORE_LOCAL_DIR 를 빼면 기본값은 ./data/restores(정정 전 문구의 사본 위치). FIX4: 다른 위치를 가리키는 .env.local 이 있어도 앞에 붙인 값이 이긴다(그 .env.local 은 실제로 읽힘), 문서의 두 값은 실제 데이터 폴더가 아니다', async () => {
     const doc = readFileSync(DOC, 'utf8');
     const cmds = [...doc.matchAll(/`DATABASE_URL=(\S+) RESTORE_LOCAL_DIR=(\S+) corepack pnpm restore:preview <zip>`/g)];
     expect(cmds, '7-④ 명령 줄이 정확히 하나').toHaveLength(1);
@@ -1624,6 +1330,17 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
     const restoresRel = day(cmds[0]![2]!);
     for (const p of [dbRel, restoresRel]) expect(p).toMatch(/^\.\/data\/[A-Za-z0-9._-]+$/);
     expect(restoresRel).not.toBe(dbRel);
+    // FIX4-LIVEL1H2(4차 검토 #11): 버릴 위치여야 한다 — 설정 기본값(실제 DB·복원·내보내기·저장·가져오기 폴더)과 같거나 그 안·위가 아니고, <날짜>를 담는다
+    expect(cmds[0]![1]).toContain('<날짜>');
+    expect(cmds[0]![2]).toContain('<날짜>');
+    const defaults = loadConfig({});
+    for (const p of [dbRel, restoresRel]) {
+      for (const real of [defaults.DATABASE_URL, defaults.RESTORE_LOCAL_DIR, defaults.EXPORT_LOCAL_DIR, defaults.STORAGE_LOCAL_DIR, defaults.IMPORT_LOCAL_DIR]) {
+        const a = path.posix.normalize(p);
+        const b = path.posix.normalize(real);
+        expect(a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`), `${p} 는 실제 폴더 ${real} 와 겹치지 않는다`).toBe(false);
+      }
+    }
     const RESTORE_SCRIPT = path.join(APP, 'packages/db/scripts/restore.ts');
     const ws = mkdtempSync(path.join(tmpdir(), 'cs-fix3-h2-74-'));
     const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix3-h2-74x-'));
@@ -1633,6 +1350,12 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
       // migration 폴더만 복사한다(링크 아님 — 정리할 때 원본을 지우지 않도록).
       writeFileSync(path.join(ws, 'pnpm-workspace.yaml'), 'packages: []\n');
       cpSync(path.join(APP, 'packages/db/drizzle'), path.join(ws, 'packages/db/drizzle'), { recursive: true });
+      // FIX4-LIVEL1H2(4차 검토 #9): 실제 환경처럼 .env.local 이 다른 DB·복원 폴더를 가리킨다(이 임시 폴더 안의 절대 경로 — 무엇이 이겨도 실제 ./data 가 아님).
+      // 같은 파일의 AUTH_ALLOWED_IDENTITY 는 앞에 붙이지 않는다 — 복원 미리보기가 그 owner 를 만들면 이 .env.local 이 실제로 읽힌 것이다(대조).
+      const envDb = path.join(ws, 'data', 'envlocal-db');
+      const envRestores = path.join(ws, 'data', 'envlocal-restores');
+      const envIdentity = 'envlocal-owner@example.local';
+      writeFileSync(path.join(ws, '.env.local'), `DATABASE_URL=${envDb}\nRESTORE_LOCAL_DIR=${envRestores}\nAUTH_ALLOWED_IDENTITY=${envIdentity}\n`);
       const drizzleFiles = readdirSync(path.join(ws, 'packages/db/drizzle'), { recursive: true }).map(String).sort();
       const { owner, ledgerId } = await unstorableRun('fix3-h2-74@example.local');
       await resolveUnstorable(ledgerId);
@@ -1640,6 +1363,7 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
       writeFileSync(path.join(ws, 'bundle.zip'), zip);
       const preview = (extra: Record<string, string>) => {
         const env: Record<string, string | undefined> = { ...process.env, ...extra };
+        delete env.AUTH_ALLOWED_IDENTITY; // 시험 프로세스의 값이 아니라 .env.local 의 값이 쓰이게(대조)
         const r = spawnSync(process.execPath, [TSX_CLI, RESTORE_SCRIPT, 'preview', 'bundle.zip'], { cwd: ws, encoding: 'utf8', timeout: 180_000, env });
         expect(r.status, r.stderr).toBe(0);
         const out = JSON.parse(r.stdout.trim()) as { ok: boolean; action: string; restore_id: string; preview: { tables: Record<string, unknown> } };
@@ -1648,7 +1372,7 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
         return out.restore_id;
       };
       const top0 = readdirSync(ws).sort();
-      expect(top0).toEqual(['bundle.zip', 'packages', 'pnpm-workspace.yaml']);
+      expect(top0).toEqual(['.env.local', 'bundle.zip', 'packages', 'pnpm-workspace.yaml']);
       // 문서대로: 새로 생기는 것은 data/<DATABASE_URL 폴더>·data/<RESTORE_LOCAL_DIR 폴더> 두 개뿐, ZIP 사본은 RESTORE_LOCAL_DIR 에
       const id1 = preview({ DATABASE_URL: path.join(ws, dbRel), RESTORE_LOCAL_DIR: path.join(ws, restoresRel) });
       expect(readdirSync(ws).sort()).toEqual([...top0, 'data'].sort());
@@ -1658,6 +1382,14 @@ describe('FIX2-LIVEL1H2 — 운영자 절차 SQL·읽기 전용 묶음 확인(bu
       expect(readdirSync(path.join(ws, dbRel))).not.toContain(`${id1}.zip`); // ZIP 사본은 버릴 DB 폴더가 아니라 RESTORE_LOCAL_DIR 에 있다(정정 전 문구가 틀린 곳)
       expect(readdirSync(path.join(ws, 'packages/db/drizzle'), { recursive: true }).map(String).sort()).toEqual(drizzleFiles);
       expect(readdirSync(path.join(ws, 'packages/db'))).toEqual(['drizzle']);
+      // .env.local 이 가리킨 곳에는 아무것도 생기지 않았다(앞에 붙인 값이 이김) — 그리고 그 .env.local 은 읽혔다(AUTH_ALLOWED_IDENTITY owner 가 버릴 DB 에 있음)
+      expect([existsSync(envDb), existsSync(envRestores)]).toEqual([false, false]);
+      const thrown = await openDb({ DB_DRIVER: 'pglite', DATABASE_URL: path.join(ws, dbRel) });
+      try {
+        expect((await thrown.db.select({ identity: schema.users.allowedIdentity }).from(schema.users)).map((u) => u.identity)).toEqual([envIdentity]);
+      } finally {
+        await thrown.close();
+      }
       // 정정 전 문구(DATABASE_URL 만)면 사본이 가는 곳 = 설정 기본값 ./data/restores(.env.local 에 값이 있으면 그 값) — 버릴 DB 폴더를 지워도 남는다
       expect(loadConfig({}).RESTORE_LOCAL_DIR).toBe('./data/restores');
       expect(doc).toContain('`RESTORE_LOCAL_DIR`(`.env.local` 값, 없으면 `./data/restores`)');

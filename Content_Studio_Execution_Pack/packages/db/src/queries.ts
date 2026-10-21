@@ -253,6 +253,8 @@ export interface AuditInput {
     | 'item.mock_scenario'
     | 'worker.tick'
     | 'restore_drill.run'
+    // FIX4-LIVEL1H2: 운영자 CLI(pnpm ledger:resolve --confirm)의 provider_unstorable 수동 해결·정정(방식·출처·금액·차단 여부만 — resolved_by·reason·보고값 없음)
+    | 'usage_ledger.manual_resolve'
     | 'retention.sweep'
     | 'retention.files'
     // T13 계정 연결(OAuth) — details 에 토큰·code·state·verifier·암호문을 넣지 않는다(코드 값만)

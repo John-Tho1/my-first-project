@@ -4,7 +4,15 @@
  * - 결과·작업의 실제/MOCK 표시는 페이지 수준 계정 상태가 아니라 그 기록(항목 계정 kind·publications.is_mock — DB 트리거로 서로 같음)에서 고른다.
  *   그래서 지금 계정 상태만으로 "결과가 모두 MOCK" 이라고 말하지 않는다.
  */
-import { ITEM_STATUS_LABEL, jobStatusText, REQUESTED_RESULT_LABEL } from './distribution';
+import {
+  ITEM_STATUS_LABEL,
+  jobStatusText,
+  REQUESTED_RESULT_LABEL,
+  UNKNOWN_JOB_LINE_PARTIAL_MOCK,
+  UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
+  UNKNOWN_STATUS_LABEL_BY_KIND,
+  unknownKindOf,
+} from './distribution';
 
 export type AccountMode = 'none' | 'mock_only' | 'live_no_target' | 'live_target';
 
@@ -121,18 +129,27 @@ const LIVE_VERIFICATION_SHORT: Record<string, string> = { VERIFIED: '앱 확인(
 /**
  * 항목 상태 태그. 실제 항목의 CONFIRMED 만 "CONFIRMED · 실제 게시 완료 · {앱 확인(VERIFIED) | 사용자 확인 | 확인 전}" 으로 바꾸고,
  * 모의 항목·다른 상태는 ITEM_STATUS_LABEL 그대로(모의 CONFIRMED = "CONFIRMED · MOCK 확인(실제 발행 아님)").
+ * FIX2-FULLREV(Q2): UNKNOWN 인데 최근 작업의 lastErrorCode 가 부분 게시 사유(thread_partial_*)·복원 취소 미확정(restored_cancel_unverified)이면
+ * 일반 UNKNOWN 문구("재확인 또는 새 계획 필요" — 새 계획은 게시된 부분을 다시 게시) 대신 그 종류의 문구(unknownKindOf). lastErrorCode 를 넘기지 않으면 지금 그대로.
  */
-export function itemStatusText(status: string, rec: { live: boolean; verification?: string | null }): string {
+export function itemStatusText(status: string, rec: { live: boolean; verification?: string | null; lastErrorCode?: string | null }): string {
   if (status === 'CONFIRMED' && rec.live) return `CONFIRMED · 실제 게시 완료 · ${LIVE_VERIFICATION_SHORT[rec.verification ?? ''] ?? '확인 전'}`;
+  const kind = unknownKindOf(status, { lastErrorCode: rec.lastErrorCode ?? null });
+  if (kind) return rec.live ? UNKNOWN_STATUS_LABEL_BY_KIND[kind].live : UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock;
   return ITEM_STATUS_LABEL[status] ?? status;
 }
 
 /**
  * 작업 한 줄. jobStatusText 는 결과 기록이 없는 CONFIRMED 를 "MOCK 결과 확인" 으로 쓴다 — 실제 항목이면 그 대신 실제 게시라고만 말한다.
  * 결과 기록이 있으면 그 기록(is_mock)대로 jobStatusText 그대로.
+ * FIX2-FULLREV(FX4): 모의 항목의 복원 취소 미확정(restored_cancel_unverified) UNKNOWN 은 "채널에서 직접 확인"(모의라 할 수 없음) 대신 모의 문구.
+ * FIX2-FULLREV(FX6): 모의 항목의 부분 게시(thread_partial_*) UNKNOWN 도 같은 이유로 모의 문구.
  */
 export function jobStatusTextFor(job: Parameters<typeof jobStatusText>[0], pub: Parameters<typeof jobStatusText>[1], reason: string | null | undefined, channel: string | undefined, live: boolean): string {
   if (live && job.state === 'CONFIRMED' && !pub) return 'CONFIRMED · 실제 게시(이 작업의 결과 기록 없음 — 항목 상태·원격 결과에서 확인)';
+  const kind = live ? null : unknownKindOf(job.state, job);
+  if (kind === 'restored_unverified') return UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK;
+  if (kind === 'partial') return UNKNOWN_JOB_LINE_PARTIAL_MOCK;
   return jobStatusText(job, pub, reason, channel);
 }
 

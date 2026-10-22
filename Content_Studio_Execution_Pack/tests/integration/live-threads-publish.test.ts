@@ -47,7 +47,8 @@ import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
-import { latestThreadsDiag, liveCandidateFromEvents, liveItemHeadline } from '../../apps/web/lib/distribution';
+import { latestThreadsDiag, liveCandidateFromEvents, liveItemHeadline, UNKNOWN_JOB_LINE_BY_KIND, UNKNOWN_STATUS_LABEL_BY_KIND } from '../../apps/web/lib/distribution';
+import { itemStatusText, jobStatusTextFor } from '../../apps/web/lib/record-labels';
 import { GET as planGET } from '../../apps/web/app/api/distribution-plans/[id]/route';
 import { GET as jobGET } from '../../apps/web/app/api/jobs/[id]/route';
 import { jobCredentials } from '../../apps/web/lib/oauth';
@@ -535,6 +536,80 @@ describe('LIVEP1-DIAG: 실제 실패 진단 · mode 표시 · 실패 뒤 다시 
     const fx2 = publishFixture(happy(TEXT));
     expect((await tick(registryWith(fx2.fetch, cfg2), cfg2)).results).toEqual({ CONFIRMED: 1 });
     expect(await pubsOf(ni.id)).toHaveLength(1);
+  });
+});
+
+describe('FIX2-FULLREV(Q1): 게시 시도 표식만 있고 원격이 게시를 확정 거절 — 게시된 부분이 없으므로 지금처럼 FAILED', () => {
+  it('threads_publish 403(code 10) — 표식(publish_attempt) 뒤 확정 거절 → FAILED(publish_permission_denied), UNKNOWN 아님 · 사건에 부분 게시 기록 없음 · 단계는 컨테이너·표식만 · 게시 1번', async () => {
+    const TEXT = '표식 뒤 확정 거절 글.';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('FIX2-Q1-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => ({
+      ...happy(TEXT)(ids),
+      [P(ids).publish]: () => jsonRes(403, { error: { message: '(#10) Application does not have permission for this action', type: 'OAuthException', code: 10, is_transient: false } }),
+    }));
+    expect((await tick(registryWith(fx.fetch, config), config)).results).toEqual({ FAILED: 1 });
+    const item = p.items[0]!;
+    const job = await jobOf(item.id);
+    expect(job).toMatchObject({ state: 'FAILED', lastErrorCode: 'publish_permission_denied', lastRetryClass: 'permanent' });
+    expect((await stepsOf(item.id)).map((st) => st.kind)).toEqual(['container', 'publish_attempt']);
+    const events = await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job.id)).orderBy(asc(schema.jobEvents.eventSeq));
+    const last = events.at(-1)!;
+    expect(last).toMatchObject({ stateBefore: 'SENDING', stateAfter: 'FAILED' });
+    expect(last.sanitizedDetails).toMatchObject({ transition: 'permanent_failure', status: 'rejected', error_code: 'publish_permission_denied' });
+    expect(last.sanitizedDetails).not.toHaveProperty('published_parts');
+    expect(events.some((e) => e.stateAfter === 'UNKNOWN' || e.stateAfter === 'BLOCKED')).toBe(false);
+    expect((await itemOf(item.id)).status).toBe('FAILED');
+    expect(await pubsOf(item.id)).toHaveLength(0);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(1);
+    expect(liveItemHeadline({ status: 'FAILED', channel: 'threads', job, pub: null, blockReason: null })).toContain('게시되지 않음이 확인된 실패만 여기에 옵니다');
+  });
+});
+
+/**
+ * FIX2-FULLREV(FX4): 복원 취소 미확정(restored_cancel_unverified)의 모의 문구("MOCK — 실제 채널로 보낸 것 없음")는 모의 계정 항목에만 — 실제 계정 항목의 응답·화면은
+ * 지금 문구(채널·Threads 에서 직접 확인) 그대로. 복원 묶음은 실제 연결 정보를 싣지 않으므로 복원된 작업 표시는 live-orphan-blocked 와 같이 작업 행에 직접 켠다.
+ */
+describe('FIX2-FULLREV(FX4): 실제 계정의 복원 작업 취소 미확정은 실제 문구 — 모의 문구를 쓰지 않는다', () => {
+  it('첫 컨테이너 401 → BLOCKED(의도 1 확정 거절·단계 0, 게시 호출 0) · 작업 복원 표시 → 취소 → UNKNOWN(restored_cancel_unverified) · 응답 "채널에서 직접 확인하세요"(MOCK·"실제 채널로 보낸 것" 없음) · 화면 실제 문구', async () => {
+    const TEXT = '복원 취소 미확정 실제 글.';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('FIX2-FX4-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => ({
+      ...happy(TEXT)(ids),
+      [P(ids).create]: () => jsonRes(401, { error: { message: 'Error validating access token', type: 'OAuthException', code: 190 } }),
+    }));
+    expect((await tick(registryWith(fx.fetch, config), config)).results).toEqual({ BLOCKED: 1 });
+    const item = p.items[0]!;
+    const job = await jobOf(item.id);
+    expect(job).toMatchObject({ state: 'BLOCKED', lastRetryClass: 'auth' });
+    expect((await intentsOf(job.id)).map((i) => i.outcome)).toEqual(['rejected']);
+    expect(await stepsOf(item.id)).toHaveLength(0);
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(0);
+    await db.update(schema.jobs).set({ restoredNeedsReview: true }).where(eq(schema.jobs.id, job.id));
+    const res = await rec(await cancelPOST(post(`/api/distribution-items/${item.id}/cancel`), ctx(item.id)));
+    expect(res.status, await res.clone().text()).toBe(200);
+    const body = (await res.json()) as { message: string };
+    expect(body).toMatchObject({ canceled: false, cancel_requested: false, state: 'UNKNOWN', published_parts: 0, reason: 'restored_cancel_unverified' });
+    expect(body.message).toBe('더 보내지 않습니다. 복원한 작업이라 보냈는지 이 환경에서 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명 — 다시 보내지 않음). 채널에서 직접 확인하세요.');
+    for (const w of ['MOCK', '실제 채널로 보낸 것']) expect(body.message).not.toContain(w);
+    const after = await jobOf(item.id);
+    expect(after).toMatchObject({ state: 'UNKNOWN', lastErrorCode: 'restored_cancel_unverified' });
+    expect((await itemOf(item.id)).status).toBe('UNKNOWN');
+    // 실제 카드의 문구(머리줄·상태 태그·작업 줄) — 모의 문구가 아니다
+    const texts = [
+      liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: after, pub: null, blockReason: null }),
+      itemStatusText('UNKNOWN', { live: true, lastErrorCode: after.lastErrorCode }),
+      jobStatusTextFor(after, null, null, 'threads', true),
+    ];
+    expect(texts[1]).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.live);
+    expect(texts[2]).toBe(UNKNOWN_JOB_LINE_BY_KIND.restored_unverified);
+    for (const t of texts) {
+      expect(t).toContain('직접 확인');
+      for (const w of ['MOCK', '실제 채널로 보낸 것']) expect(t).not.toContain(w);
+    }
   });
 });
 

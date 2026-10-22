@@ -202,3 +202,93 @@ describe('LIVE-P2(D39) — 계획 화면의 실제 게시 한 줄·보류 문구
     for (const c of [daily!, paused!]) expect(c).not.toContain('MOCK');
   });
 });
+
+/**
+ * FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN 항목 — 페이지가 최근 작업의 사유 코드(lastErrorCode)를 상태 태그·작업 줄·안내에 넘겨
+ * 카드 어디에서도 "새 계획 필요"(새 계획은 게시된 부분을 처음부터 다시 게시)·"없을 때만 새 배포 계획으로 다시 승인"을 말하지 않는다. 일반 UNKNOWN 은 그대로.
+ */
+describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권하지 않는다', () => {
+  const unknownItem = (name: string, o: { live: boolean; code: string | null; reason?: string; problems?: string[] }) => {
+    const x = item({ live: o.live, verification: o.live ? 'UNVERIFIED' : 'MOCK', withPub: false, name });
+    return {
+      ...x,
+      item: { ...x.item, status: 'UNKNOWN' },
+      jobs: [{ ...x.jobs[0]!, state: 'UNKNOWN', lastErrorCode: o.code }],
+      events: o.reason
+        ? [
+            { id: `e2-${name}`, eventSeq: 3, at: T, stateBefore: 'BLOCKED', stateAfter: 'UNKNOWN', sanitizedDetails: { event: 'cancel_partial', transition: 'cancel_partial', cause: o.reason } },
+            { id: `e1-${name}`, eventSeq: 2, at: T, stateBefore: 'SENDING', stateAfter: 'BLOCKED', sanitizedDetails: { event: 'blocked', transition: 'blocked', reason: o.reason } },
+          ]
+        : [],
+      problems: o.problems ?? [],
+    };
+  };
+
+  it('모의 부분 게시(thread_partial_failed, 스냅샷 바뀜): 상태 태그·작업 줄·머리줄·스냅샷 안내 모두 부분 게시 문구, "새 계획 필요" 없음', async () => {
+    const { UNKNOWN_JOB_LINE_BY_KIND, UNKNOWN_JOB_LINE_PARTIAL_MOCK, UNKNOWN_STATUS_LABEL_BY_KIND, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND } = await import('./distribution');
+    state.detail = detail(unknownItem('mp', { live: false, code: 'thread_partial_failed', reason: 'permanent_failure', problems: ['content_changed'] }));
+    const [card] = cards(await render());
+    expect(statusTag(card!)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock);
+    // FIX2-FULLREV(FX6): 작업 목록 줄(<strong>)만 본다 — 모의 카드는 모의 줄(채널 확인 지시 없음), 공통 줄 없음
+    expect(card).toContain(`<strong>${UNKNOWN_JOB_LINE_PARTIAL_MOCK}</strong>`);
+    expect(card).not.toContain(UNKNOWN_JOB_LINE_BY_KIND.partial);
+    expect(card).not.toContain('채널에서 직접 확인');
+    expect(card).toContain('일부만 게시됨(MOCK) — 남은 게시물 전송 실패(원격 거절)');
+    expect(card).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.mock}: 원고가 바뀜`);
+    expect(card).not.toContain('새 계획 필요');
+    expect(card).not.toContain('재확인 또는 새 계획');
+  });
+
+  it('실제 부분 게시(thread_partial_revoked): 상태 태그(MOCK 없음)·결과 불명 안내가 부분 게시 문구 — "없을 때만 새 배포 계획으로 다시 승인" 없음', async () => {
+    const { LIVE_UNKNOWN_GUIDANCE_BY_KIND, UNKNOWN_STATUS_LABEL_BY_KIND, UNKNOWN_JOB_LINE_BY_KIND, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND } = await import('./distribution');
+    state.detail = detail(unknownItem('lp', { live: true, code: 'thread_partial_revoked', problems: ['content_changed'] }));
+    const [card] = cards(await render());
+    expect(statusTag(card!)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.live);
+    expect(card).toContain(LIVE_UNKNOWN_GUIDANCE_BY_KIND.partial);
+    expect(card).toContain(`<strong>${UNKNOWN_JOB_LINE_BY_KIND.partial}</strong>`);
+    // FIX2-FULLREV(FX3): 실제 카드의 스냅샷 안내는 실제 문구 — 단일 게시물·게시 시도 표식뿐일 수 있어 "일부 게시된 작업"·"게시된 부분"이라고 단정하지 않는다
+    expect(card).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live}: 원고가 바뀜`);
+    expect(card).not.toContain('일부 게시된');
+    expect(card).not.toContain('게시된 부분');
+    expect(card).not.toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
+    expect(card).not.toContain('새 계획 필요');
+    expect(card).not.toContain('MOCK');
+  });
+
+  it('복원 취소 미확정(restored_cancel_unverified): 실제 카드는 Threads 직접 확인 안내, 모의 카드는 MOCK(실제 채널로 보낸 것 없음 — 채널 확인 지시 없음), "새 계획 필요" 없음', async () => {
+    const { LIVE_UNKNOWN_GUIDANCE_BY_KIND, UNKNOWN_STATUS_LABEL_BY_KIND, UNKNOWN_JOB_LINE_BY_KIND, UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND } =
+      await import('./distribution');
+    state.detail = detail(
+      unknownItem('rm', { live: false, code: 'restored_cancel_unverified', problems: ['content_changed'] }),
+      unknownItem('rl', { live: true, code: 'restored_cancel_unverified', problems: ['content_changed'] }),
+    );
+    const [mock, live] = cards(await render());
+    expect(statusTag(mock!)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.mock);
+    expect(statusTag(live!)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.live);
+    expect(live).toContain(LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified);
+    // FIX2-FULLREV(FX4): 작업 줄 — 실제 카드는 공통 줄(직접 확인), 모의 카드는 모의 줄 · 스냅샷 안내도 모의·실제(FX3)
+    // FIX2-FULLREV(FX6): 모의 작업 줄 문구는 상태 태그와 같은 글이라 카드 전체가 아니라 작업 목록 줄(<strong>)에서 본다
+    expect(live).toContain(`<strong>${UNKNOWN_JOB_LINE_BY_KIND.restored_unverified}</strong>`);
+    expect(mock).toContain(`<strong>${UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK}</strong>`);
+    expect(live).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.live}: 원고가 바뀜`);
+    expect(mock).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.mock}: 원고가 바뀜`);
+    expect(mock).toContain('복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않음');
+    expect(mock).not.toContain('채널에서 직접 확인');
+    expect(live).not.toContain('MOCK');
+    for (const c of [mock!, live!]) {
+      expect(c).not.toContain('새 계획 필요');
+      expect(c).not.toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
+    }
+  });
+
+  it('일반 UNKNOWN(부분 게시 사유 아님)은 지금 그대로: 상태 태그·작업 줄 "재확인 또는 새 계획 필요", 스냅샷 안내 "(새 계획 필요)", 실제 카드는 일반 결과 불명 안내', async () => {
+    const { ITEM_STATUS_LABEL, LIVE_UNKNOWN_GUIDANCE } = await import('./distribution');
+    state.detail = detail(unknownItem('gm', { live: false, code: 'reconcile_timeout', problems: ['content_changed'] }), unknownItem('gl', { live: true, code: null }));
+    const [mock, live] = cards(await render());
+    expect(statusTag(mock!)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
+    expect(mock).toContain('UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    expect(mock).toContain('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): 원고가 바뀜');
+    expect(statusTag(live!)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
+    expect(live).toContain(LIVE_UNKNOWN_GUIDANCE);
+  });
+});

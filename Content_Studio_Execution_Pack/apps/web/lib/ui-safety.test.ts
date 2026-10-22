@@ -69,6 +69,13 @@ const REQUIRED: Record<string, string[]> = {
     // FIX2-UICLEAN: 항목 상태 태그·작업 줄·철회 배너는 그 항목·계획 기록으로
     'itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub })',
     'jobStatusTextFor(j, pub, reason, channel, live)',
+    // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그에 최근 작업의 사유 코드를 넘기고, 스냅샷·실제 게시 결과 불명 안내도 종류별(새 계획을 권하지 않음)
+    'const unknownKind = unknownKindOf(x.item.status, latest);',
+    'verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })',
+    // FIX2-FULLREV(FX3): 스냅샷 안내는 상태 태그와 같은 기록 기준(itemIsLive)으로 모의·실제 문구를 고른다
+    'const recordLive = itemIsLive({ accountKind: x.account?.kind, pub: latestPub });',
+    "{SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordLive ? 'live' : 'mock']}: {x.problems.map(problemLabel).join",
+    '{LIVE_UNKNOWN_GUIDANCE_BY_KIND[unknownKind]}',
     'revocationNoticeFor(',
     // FIX1-FULLREV(F2): 철회 배너는 부분 게시로 UNKNOWN 에 둔 작업 수(revoked_partial)도 넘긴다
     'revocationCountParam(q.revoked_partial)',

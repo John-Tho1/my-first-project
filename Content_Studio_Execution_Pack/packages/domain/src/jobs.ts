@@ -573,6 +573,34 @@ export interface RemoteStep {
 }
 
 /**
+ * FIX2-FULLREV(Q3): 게시가 일어났다는 근거가 되는 단계 종류 — 게시된 단계(Threads publish·YouTube video·Instagram ig_publish)와 실제 Threads 의 게시 시도 표식
+ * (publish_attempt). 컨테이너·업로드 세션·부모 생성 요청 표식은 게시가 아니다.
+ */
+export const PUBLISH_EVIDENCE_STEP_KINDS: readonly RemoteStepKind[] = ['publish', 'video', 'ig_publish', 'publish_attempt'];
+
+/**
+ * FIX2-FULLREV(Q3, D18·FIX-T10·FIX-T14 후속): 복원한 작업(읽기 전용 이력 — restored_needs_review)을 취소할 때 "보내지 않음"(CANCELED not_sent)이라고
+ * 말해도 되는가 — 복원된 기록(전송 의도·단계 기록)이 아무것도 보내지 않았음을 **증명**할 때만 true. 아니면 호출자는 UNKNOWN(restored_cancel_unverified)으로 둔다.
+ * - 게시 근거 단계(PUBLISH_EVIDENCE_STEP_KINDS)가 있음 → false(전송 의도가 없어도 — 기록이 서로 맞지 않으면 증명이 아니다).
+ * - 전송 의도가 하나도 없음 → true(전송 의도는 SENDING 과 같은 트랜잭션에서 외부 호출 전에 쓰이고, 작업과 함께 복원된다 — 보낸 시도가 없다).
+ * - 결과가 채워진 확정 거절(outcome rejected — 원격이 받지 않음)이 아닌 의도가 하나라도 있음(pending·ambiguous·accepted) → false.
+ * - 단계 기록에 기대는 어댑터(일반 모의 mock_generic 이 아닌 것, 기록된 어댑터를 모르는 것 포함)의 의도인데 단계 기록이 하나도 없음 → false:
+ *   단계 기록은 migration 0031 이후 묶음에만 있다(이전 묶음은 단계 없이 복원 — FIX-T14). 한 시도 안에서 앞 게시물이 게시된 뒤 거절될 수 있으므로
+ *   그 의도의 거절만으로는 "게시 없음"을 증명할 수 없다(조회의 restored_steps_missing 과 같은 판단).
+ * - 그 밖(모든 의도가 확정 거절이고, 단계가 필요한 어댑터면 게시 근거 없는 단계 기록이 함께 있음) → true.
+ */
+export function restoredCancelNotSentProven(x: {
+  intents: ReadonlyArray<{ outcome: string; sanitizedDetails: Record<string, unknown> | null }>;
+  stepKinds: readonly string[];
+}): boolean {
+  if (x.stepKinds.some((k) => (PUBLISH_EVIDENCE_STEP_KINDS as readonly string[]).includes(k))) return false;
+  if (x.intents.length === 0) return true;
+  if (!x.intents.every((i) => i.outcome === 'rejected')) return false;
+  const stepAdapter = x.intents.some((i) => recordedAdapterIdOf(i.sanitizedDetails).id !== 'mock_generic');
+  return !(stepAdapter && x.stepKinds.length === 0);
+}
+
+/**
  * T14: 작업 처리기가 어댑터에 주는 단계 기록 창구(작업 단위). 각 호출은 **자기 짧은 트랜잭션**(원격 호출 동안 DB 잠금 없음).
  * record 는 (job, post_index, kind) 가 없으면 넣고, 있으면 같은 remote_id 일 때만 상태를 바꾼다 — 다른 remote_id 면 던진다(참조는 바뀌지 않음).
  */

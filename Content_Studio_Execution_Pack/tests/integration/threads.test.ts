@@ -975,11 +975,16 @@ describe('FIX round 1(Codex review-T14)', () => {
     }
   });
 
-  it('missed: 2번째 게시물 400 → FAILED(게시 1, 단계 목록이 보여 줌), 취소·재시도 409', async () => {
+  // FIX2-FULLREV(Q1, 사용자 결정 2026-10-22): 이미 게시된 부분이 있는 작업의 영구 거부는 FAILED("게시되지 않음" — 새 계획이 1번째를 다시 게시)가 아니라
+  // UNKNOWN(thread_partial_failed). 이전 단언(state FAILED)을 같은 강도 이상으로 바꿨다 — 상태·사유 코드·사건 모양(게시 1·not_sent:false·error_code)·항목 상태.
+  it('missed: 2번째 게시물 400 → UNKNOWN(thread_partial_failed — 게시 1, 단계 목록이 보여 줌), 취소·재시도 409', async () => {
     const x = await partialAfter429();
     api.injectFault({ op: 'publish', kind: 'invalid_parameter', userId: x.acc.external });
     await tick(2 * MIN);
-    expect((await jobOf(x.itemId)).state).toBe('FAILED');
+    const failed = await jobOf(x.itemId);
+    expect(failed).toMatchObject({ state: 'UNKNOWN', lastErrorCode: 'thread_partial_failed', lastRetryClass: 'permanent' });
+    expect((await eventDetails(failed.id)).at(-1)).toMatchObject({ transition: 'cancel_partial', cause: 'permanent_failure', error_code: 'invalid_parameter', not_sent: false, published_parts: 1 });
+    expect((await db.select().from(schema.distributionItems).where(eq(schema.distributionItems.id, x.itemId)))[0]!.status).toBe('UNKNOWN');
     expect((await stepSig(x.itemId)).filter((s) => s.startsWith('publish:'))).toEqual(['publish:0:published']);
     expect((await cancel(x.itemId)).status).toBe(409);
     expect((await retry(x.itemId)).status).toBe(409);

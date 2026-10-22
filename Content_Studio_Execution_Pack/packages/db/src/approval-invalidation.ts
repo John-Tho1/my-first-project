@@ -147,6 +147,8 @@ export async function activeApprovalsFor(tx: DbOrTx, ownerId: string, itemIds: r
  * 작업 상태 전이 + job_event(작업마다 seq = 최대+1). 다음 상태는 @cs/domain transitionJobState(전이 표 한 곳)로만 정한다 —
  * 표에 없는 전이는 IllegalJobTransitionError. 호출자가 작업 행을 잠근(항목 잠금 아래) 상태여야 한다.
  * details 는 비밀·본문 없는 코드 값만(sanitized). details.event 가 없으면 사건 이름을 넣는다. set 은 함께 바꿀 열(lease 해제 등).
+ * FIX2-FULLREV(Q4): set.cancelRequestedAt 은 **비어 있을 때만** 쓴다(coalesce) — 앞선 사용자 취소·철회가 남긴 처음 요청 시각을 뒤의 정리(보내기 직전 멈춤·
+ * 부분 게시 멈춤·취소 요청 재기록)가 지금 시각으로 덮어쓰지 않는다. 이 열을 쓰는 곳은 모두 이 함수를 거친다.
  */
 export async function transitionJob(
   tx: DbOrTx,
@@ -159,9 +161,15 @@ export async function transitionJob(
 ): Promise<JobState> {
   const to = transitionJobState(job.state, event);
   const terminal = (TERMINAL_JOB_STATES as readonly string[]).includes(to);
+  const { cancelRequestedAt, ...rest } = set;
+  // FIX2-FULLREV(Q4): 처음 요청 시각을 지킨다(위 설명). null 을 넘기는 호출자는 없지만 넘기면 그대로 비운다.
+  const cancelMark =
+    cancelRequestedAt === undefined
+      ? {}
+      : { cancelRequestedAt: cancelRequestedAt === null ? null : sql`coalesce(${jobs.cancelRequestedAt}, ${cancelRequestedAt.toISOString()}::timestamptz)` };
   const updated = await tx
     .update(jobs)
-    .set({ ...set, state: to, updatedAt: now, ...(terminal ? { doneAt: now, leaseOwner: null, leaseUntil: null } : {}) })
+    .set({ ...rest, ...cancelMark, state: to, updatedAt: now, ...(terminal ? { doneAt: now, leaseOwner: null, leaseUntil: null } : {}) })
     .where(and(eq(jobs.id, job.id), eq(jobs.ownerId, ownerId), eq(jobs.state, job.state)))
     .returning({ id: jobs.id });
   if (!updated[0]) throw new AppError('conflict', 'job_state_changed', '작업 상태가 다른 곳에서 먼저 바뀌었습니다');

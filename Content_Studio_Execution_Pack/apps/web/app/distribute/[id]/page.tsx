@@ -26,6 +26,7 @@ import {
   itemHeadline,
   LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
+  LIVE_UNKNOWN_GUIDANCE_BY_KIND,
   latestThreadsDiag,
   liveCandidateForCard,
   liveDailyLimitOf,
@@ -42,7 +43,9 @@ import {
   RESULT_KIND_LABEL,
   revocationCountParam,
   revocationNotice,
+  SNAPSHOT_PROBLEMS_PREFIX_BY_KIND,
   stepsPanelView,
+  unknownKindOf,
   USER_CONFIRMED_NOTICE,
   userConfirmCandidateForCard,
   VISIBILITY_LABEL,
@@ -414,6 +417,10 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     recordedAt: latestPub?.createdAt ?? null,
   });
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
+  // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그·작업 줄·안내가 "새 계획 필요"라고 하지 않게 최근 작업의 lastErrorCode 로 고른다
+  const unknownKind = unknownKindOf(x.item.status, latest);
+  // FIX2-FULLREV(FX3): 스냅샷 안내의 모의·실제 문구는 상태 태그와 같은 기록 기준(itemIsLive — 결과 is_mock · 계정 kind)으로 고른다
+  const recordLive = itemIsLive({ accountKind: x.account?.kind, pub: latestPub });
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
       <h3>
@@ -452,7 +459,10 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       </p>
       <p className="meta">
         {/* FIX2-UICLEAN: 상태 태그는 이 항목 기록(결과 is_mock · 계정 kind)으로 — 실제 CONFIRMED 는 "실제 게시 완료" */}
-        <span className="tag">{itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub }), verification: latestPub?.verification ?? null })}</span>
+        {/* FIX2-FULLREV(Q2): 최근 작업의 사유 코드도 넘긴다 — 부분 게시 UNKNOWN 은 "새 계획 필요"가 아닌 문구 */}
+        <span className="tag">
+          {itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub }), verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })}
+        </span>
         {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
         {publishAt ? <span className={publishAt.warn ? 'tag warn' : undefined}>{publishAt.text}</span> : null}
         {x.activeApproval ? <span className="tag">승인됨</span> : null}
@@ -480,9 +490,17 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         </div>
       </dl>
       {x.problems.length ? (
-        <p className="notice" role="alert">
-          스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): {x.problems.map(problemLabel).join(', ')}
-        </p>
+        unknownKind ? (
+          // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 항목에는 새 계획을 권하지 않는다(게시된 부분이 처음부터 다시 게시됨)
+          // FIX2-FULLREV(FX3): 실제 항목은 "일부 게시된 작업"이라고 단정하지 않는 실제 문구(recordLive)
+          <p className="notice" role="alert">
+            {SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordLive ? 'live' : 'mock']}: {x.problems.map(problemLabel).join(', ')}
+          </p>
+        ) : (
+          <p className="notice" role="alert">
+            스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): {x.problems.map(problemLabel).join(', ')}
+          </p>
+        )
       ) : null}
       <h4>나갈 내용</h4>
       <OutgoingText channel={channel} text={p.text} />
@@ -532,9 +550,16 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         <>
           <h4>{live ? '작업(실제 게시 — 실제 Threads 어댑터)' : '작업(MOCK — 모의 어댑터)'}</h4>
           {live && x.item.status === 'UNKNOWN' ? (
-            <p className="notice" role="alert">
-              {LIVE_UNKNOWN_GUIDANCE}
-            </p>
+            unknownKind ? (
+              // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 — "없을 때만 새 배포 계획으로 다시 승인" 안내 대신 직접 확인만
+              <p className="notice" role="alert">
+                {LIVE_UNKNOWN_GUIDANCE_BY_KIND[unknownKind]}
+              </p>
+            ) : (
+              <p className="notice" role="alert">
+                {LIVE_UNKNOWN_GUIDANCE}
+              </p>
+            )
           ) : null}
           {diagLine ? (
             <p className="meta" role="status">

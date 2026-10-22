@@ -20,7 +20,14 @@ import {
   requestedResultLabel,
   revocationNoticeFor,
 } from './record-labels';
-import { ITEM_STATUS_LABEL, jobStatusText, REQUESTED_RESULT_LABEL, revocationNotice } from './distribution';
+import {
+  ITEM_STATUS_LABEL,
+  jobStatusText,
+  REQUESTED_RESULT_LABEL,
+  revocationNotice,
+  UNKNOWN_JOB_LINE_PARTIAL_MOCK,
+  UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
+} from './distribution';
 
 describe('accountModeOf — 지금 계정 상태', () => {
   it('없음 · 모의만 · 실제 계정(대상 미지정) · 실제 게시 대상 있음', () => {
@@ -147,5 +154,66 @@ describe('FIX2 — 항목·작업 상태 문구를 그 항목 기록으로', () 
     expect(revocationNoticeFor(t, true)).not.toContain('MOCK');
     expect(revocationNoticeFor(t, true)).toContain('승인을 철회했습니다.');
     expect(revocationNoticeFor(t, true)).toContain('보류(BLOCKED) — 다음 전송이 차단');
+  });
+});
+
+/**
+ * FIX2-FULLREV(Q2): 부분 게시(thread_partial_*)·복원 취소 미확정(restored_cancel_unverified) UNKNOWN 의 상태 태그는 "재확인 또는 새 계획 필요"가 아니다
+ * (새 계획은 게시된 부분을 처음부터 다시 게시). 그 밖의 UNKNOWN·다른 상태·사유 코드를 넘기지 않은 호출은 지금 문구 그대로.
+ */
+describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 상태 태그', () => {
+  // FIX2-FULLREV(FX2): thread_partial_unresolved(조회 한도 — 게시된 게시물이 있음)도 같은 부분 게시 문구
+  const PARTIAL = ['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped', 'thread_partial_failed', 'thread_partial_unresolved'];
+  it('부분 게시 사유 코드 전부: 모의 = 일부 게시됨(MOCK), 실제 = 게시됐거나 게시됐을 수 있음(MOCK 없음) — "새 계획" 없음', () => {
+    for (const code of PARTIAL) {
+      const mock = itemStatusText('UNKNOWN', { live: false, lastErrorCode: code });
+      expect(mock, code).toBe('UNKNOWN · 일부 게시됨(MOCK) — 남은 부분은 보내지 않음, 자동 재전송 안 함(게시된 부분은 원격에 남음)');
+      const live = itemStatusText('UNKNOWN', { live: true, verification: null, lastErrorCode: code });
+      expect(live, code).toBe('UNKNOWN · 게시됐거나 게시됐을 수 있음 — 다시 게시하지 않음(Threads 에서 직접 확인)');
+      for (const t of [mock, live]) expect(t, code).not.toContain('새 계획');
+      expect(live, code).not.toContain('MOCK');
+    }
+  });
+  it('복원 취소 미확정: 보냈는지 확인할 수 없음 — 실제는 Threads 에서 직접 확인, 모의는 MOCK(실제 채널로 보낸 것 없음 — 채널 확인 지시 없음), "새 계획" 없음', () => {
+    // FIX2-FULLREV(FX4): 모의 항목은 확인할 곳이 없다(시뮬레이터는 복원되지 않음) — "채널에서 직접 확인"을 시키지 않는다
+    const mock = itemStatusText('UNKNOWN', { live: false, lastErrorCode: 'restored_cancel_unverified' });
+    expect(mock).toBe('UNKNOWN · 복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)');
+    expect(mock).not.toContain('채널에서 직접 확인');
+    expect(itemStatusText('UNKNOWN', { live: true, lastErrorCode: 'restored_cancel_unverified' })).toBe(
+      'UNKNOWN · 복원한 작업 — 게시됐는지 확인할 수 없음, 다시 게시하지 않음(Threads 에서 직접 확인)',
+    );
+  });
+  it('그 밖은 지금 그대로: 부분 게시가 아닌 UNKNOWN(사유 없음·다른 사유) · UNKNOWN 이 아닌 상태(사유 코드가 남아 있어도) · 실제 CONFIRMED', () => {
+    for (const code of [undefined, null, 'reconcile_timeout', 'publish_attempt_unresolved', 'restored_steps_missing', 'toString']) {
+      expect(itemStatusText('UNKNOWN', { live: false, lastErrorCode: code }), String(code)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
+      expect(itemStatusText('UNKNOWN', { live: true, lastErrorCode: code }), String(code)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
+    }
+    expect(ITEM_STATUS_LABEL.UNKNOWN).toBe('UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    for (const s of Object.keys(ITEM_STATUS_LABEL).filter((k) => k !== 'UNKNOWN' && k !== 'CONFIRMED')) {
+      for (const code of [...PARTIAL, 'restored_cancel_unverified']) expect(itemStatusText(s, { live: false, lastErrorCode: code }), `${s}/${code}`).toBe(ITEM_STATUS_LABEL[s]);
+    }
+    expect(itemStatusText('CONFIRMED', { live: true, verification: 'USER_CONFIRMED', lastErrorCode: 'thread_partial_canceled' })).toBe('CONFIRMED · 실제 게시 완료 · 사용자 확인');
+    expect(itemStatusText('CONFIRMED', { live: false, lastErrorCode: 'thread_partial_failed' })).toBe(ITEM_STATUS_LABEL.CONFIRMED);
+  });
+  it('jobStatusTextFor: 부분 게시·복원 취소 미확정 UNKNOWN 작업 줄은 모의·실제 모두 "새 계획" 없음 · 실제 = 공통 줄(jobStatusText), 모의 = 모의 줄(FX4·FX6)', () => {
+    for (const code of [...PARTIAL, 'restored_cancel_unverified']) {
+      const job = { state: 'UNKNOWN', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: code };
+      for (const live of [false, true]) {
+        const line = jobStatusTextFor(job, null, 'auth', 'threads', live);
+        // FIX2-FULLREV(FX4·FX6): 모의 항목은 모의 줄(채널 확인 지시 없음) — 실제 항목은 jobStatusText 그대로
+        if (!live) {
+          expect(line, code).toBe(code === 'restored_cancel_unverified' ? UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK : UNKNOWN_JOB_LINE_PARTIAL_MOCK);
+          expect(line).not.toBe(jobStatusText(job, null, 'auth', 'threads'));
+          expect(line).toContain('MOCK');
+          expect(line).not.toContain('채널에서 직접 확인');
+        } else {
+          expect(line, `${code}/${live}`).toBe(jobStatusText(job, null, 'auth', 'threads'));
+        }
+        expect(line, `${code}/${live}`).not.toContain('새 계획');
+      }
+    }
+    // UNKNOWN 이 아닌 작업은 사유 코드가 남아 있어도 모의 줄로 바꾸지 않는다
+    const failed = { state: 'FAILED', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: 'restored_cancel_unverified' };
+    expect(jobStatusTextFor(failed, null, null, 'threads', false)).toBe(jobStatusText(failed, null, null, 'threads'));
   });
 });

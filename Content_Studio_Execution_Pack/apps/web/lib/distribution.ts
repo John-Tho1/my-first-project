@@ -379,8 +379,12 @@ export function jobStatusText(job: JobLike, pub?: PubLike | null, blockReason?: 
       return `RETRY_WAIT · 재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})`;
     case 'RECONCILING':
       return 'RECONCILING · 등록 여부 확인 필요';
-    case 'UNKNOWN':
+    case 'UNKNOWN': {
+      // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN 은 "새 계획 필요"라고 하지 않는다(새 계획은 게시된 부분을 다시 게시) — 작업의 lastErrorCode 로 고른다
+      const kind = unknownKindOf('UNKNOWN', job);
+      if (kind) return UNKNOWN_JOB_LINE_BY_KIND[kind];
       return 'UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
+    }
     case 'CANCEL_REQUESTED':
       return 'CANCEL_REQUESTED · 취소 확인 중';
     case 'CANCELED':
@@ -640,12 +644,107 @@ export interface ItemHeadlineInput {
  * 화면의 blockReason 은 가장 최근 BLOCKED 사건의 사유(앞선 401·연결 정보 보류, 보내기 직전 멈춤의 approval_missing·attempts_exhausted 등)라 이 코드를
  * 가릴 수 있다 — 작업의 lastErrorCode 가 이 코드면 그것을 먼저 쓰고, 아니면 reason 이 이 코드인지 본다. 해당 없으면 null.
  */
-const THREAD_PARTIAL_CODES: ReadonlySet<string> = new Set(['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped']);
+// FIX2-FULLREV(Q1): thread_partial_failed — 전송 뒤 최종 실패(영구 거부·재시도 소진)인데 이미 게시된 부분이 있어 FAILED 대신 UNKNOWN
+// FIX2-FULLREV(FX2): thread_partial_unresolved — 조회 한도(재시작·컨테이너 만료 등으로 남은 게시물을 모름)로 UNKNOWN 인데 이미 게시된 게시물이 있음
+const THREAD_PARTIAL_CODES: ReadonlySet<string> = new Set([
+  'thread_partial_canceled',
+  'thread_partial_cancel_requested',
+  'thread_partial_revoked',
+  'thread_partial_stopped',
+  'thread_partial_failed',
+  'thread_partial_unresolved',
+]);
 function threadPartialCodeOf(reason: string, job: { lastErrorCode: string | null } | null): string | null {
   const last = job?.lastErrorCode ?? null;
   if (last !== null && THREAD_PARTIAL_CODES.has(last)) return last;
   return THREAD_PARTIAL_CODES.has(reason) ? reason : null;
 }
+
+/** FIX2-FULLREV(Q3): 복원한 작업 취소를 확정하지 못한 UNKNOWN(@cs/db cancelItem — 기록이 "보내지 않음"을 증명하지 못함). */
+export const RESTORED_CANCEL_UNVERIFIED_CODE = 'restored_cancel_unverified';
+
+/**
+ * FIX2-FULLREV(Q2): 새 계획을 권하면 안 되는 결과 불명(UNKNOWN)의 종류 — partial = 부분 게시 사유 코드(THREAD_PARTIAL_CODES — 새 계획은 게시된 부분을
+ * 처음부터 다시 게시한다), restored_unverified = 복원한 작업 취소를 확정하지 못함(보냈는지 모름 — 채널에서 직접 확인). 항목 상태가 UNKNOWN 일 때
+ * 그 항목의 최근 작업 lastErrorCode 로만 고른다(그 밖은 null — 지금까지의 일반 UNKNOWN 문구).
+ */
+export type UnknownKind = 'partial' | 'restored_unverified';
+export function unknownKindOf(status: string, job: { lastErrorCode: string | null } | null | undefined): UnknownKind | null {
+  if (status !== 'UNKNOWN') return null;
+  const code = job?.lastErrorCode ?? null;
+  if (code === null) return null;
+  if (THREAD_PARTIAL_CODES.has(code)) return 'partial';
+  return code === RESTORED_CANCEL_UNVERIFIED_CODE ? 'restored_unverified' : null;
+}
+
+/** FIX2-FULLREV(Q2): 항목 상태 태그(UNKNOWN 종류별 — "새 계획 필요"라고 하지 않는다). live = 실제 계정 항목(MOCK 이라는 말 없음). */
+export const UNKNOWN_STATUS_LABEL_BY_KIND: Record<UnknownKind, { mock: string; live: string }> = {
+  partial: {
+    mock: 'UNKNOWN · 일부 게시됨(MOCK) — 남은 부분은 보내지 않음, 자동 재전송 안 함(게시된 부분은 원격에 남음)',
+    live: 'UNKNOWN · 게시됐거나 게시됐을 수 있음 — 다시 게시하지 않음(Threads 에서 직접 확인)',
+  },
+  // FIX2-FULLREV(FX4): 모의 항목은 실제 채널로 보낸 적이 없고 모의 시뮬레이터는 복원되지 않는다 — "채널에서 직접 확인"(할 수 없는 일)을 시키지 않는다
+  restored_unverified: {
+    mock: 'UNKNOWN · 복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)',
+    live: 'UNKNOWN · 복원한 작업 — 게시됐는지 확인할 수 없음, 다시 게시하지 않음(Threads 에서 직접 확인)',
+  },
+};
+
+/** FIX2-FULLREV(Q2): 작업 한 줄(jobStatusText UNKNOWN — 작업의 lastErrorCode 로 고른다, 모의·실제 공통 문구). */
+export const UNKNOWN_JOB_LINE_BY_KIND: Record<UnknownKind, string> = {
+  partial: 'UNKNOWN · 일부 게시됐거나 게시 시도가 있음 — 남은 부분은 보내지 않음, 자동 재전송 안 함(재확인 또는 채널에서 직접 확인)',
+  restored_unverified: 'UNKNOWN · 복원한 작업 — 보냈는지 확인할 수 없음, 자동 재전송 안 함(채널에서 직접 확인)',
+};
+/**
+ * FIX2-FULLREV(FX4): 모의 항목의 복원 취소 미확정 작업 줄(record-labels jobStatusTextFor 가 모의 카드에서 고른다). 위 공통 줄은 기록이 실제인지 모를 때의
+ * 조심스러운 기본값(직접 확인)으로 둔다 — 실제 항목에 "실제 채널로 보낸 것 없음"이라고 말하지 않게.
+ */
+export const UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK = 'UNKNOWN · 복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)';
+/**
+ * FIX2-FULLREV(FX6): 모의 항목의 부분 게시 UNKNOWN 작업 줄(record-labels jobStatusTextFor 가 모의 카드에서 고른다) — 공통 줄의 "채널에서 직접 확인"
+ * (모의라 할 수 없음) 대신 머리줄의 "재확인만 가능"과 같은 뜻. 실제 카드는 공통 줄 그대로.
+ */
+export const UNKNOWN_JOB_LINE_PARTIAL_MOCK = 'UNKNOWN · 일부 게시됨(MOCK) — 남은 부분은 보내지 않음, 자동 재전송 안 함(재확인만 — 실제 채널로 보낸 것 없음)';
+
+/**
+ * FIX2-FULLREV(Q2): 실제 게시 항목 카드의 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE 대신) — 일반 안내의 "없을 때만 새 배포 계획으로 다시 승인"을 넣지 않는다.
+ */
+export const LIVE_UNKNOWN_GUIDANCE_BY_KIND: Record<UnknownKind, string> = {
+  partial:
+    '이미 게시됐거나 게시됐을 수 있습니다(게시 시도 기록 있음). 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 새 배포 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다.',
+  restored_unverified:
+    '복원한 작업이라 게시됐는지 이 환경에서 확인할 수 없습니다. 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요.',
+};
+
+/**
+ * FIX2-FULLREV(Q2): 스냅샷이 바뀐 카드 안내의 머리(일반 항목은 page.tsx 의 "(새 계획 필요)" 문구 그대로).
+ * FIX2-FULLREV(FX3): 모의·실제를 나눈다(상태 태그와 같은 itemIsLive 값으로 고른다) — 실제 Threads 는 단일 게시물이고 부분 게시 근거가 게시 시도 표식뿐일 수 있어
+ * "일부 게시된 작업"·"게시된 부분"이라고 단정하지 않는다(상태 태그와 같은 "게시됐거나 게시됐을 수 있음").
+ * FIX2-FULLREV(FX4): 모의 복원 작업에는 "채널에서 직접 확인"을 시키지 않는다(실제 채널로 보낸 것 없음).
+ */
+export const SNAPSHOT_PROBLEMS_PREFIX_BY_KIND: Record<UnknownKind, { mock: string; live: string }> = {
+  partial: {
+    mock: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(일부 게시된 작업 — 새 계획은 게시된 부분을 처음부터 다시 게시하므로 권하지 않음)',
+    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시됐을 수 있는 작업 — 다시 게시하지 않음, Threads 에서 직접 확인)',
+  },
+  restored_unverified: {
+    mock: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(MOCK 복원 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함, 실제 채널로 보낸 것 없음)',
+    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 게시됐는지 모름, 먼저 Threads 에서 직접 확인)',
+  },
+};
+
+/**
+ * FIX2-FULLREV(Q1): thread_partial_failed(전송 뒤 최종 실패)의 원인 — 멈출 때 남긴 BLOCKED 사건의 사유(blockReason: permanent_failure·max_attempts·
+ * retry_after_too_long — @cs/db failUnlessPartial). 조회 중 최종 실패(remote_failed·조회 시도 한도)는 BLOCKED 사건이 없어, 원인을 모르면 그중 하나라고만
+ * 말한다(일어나지 않은 원인을 단정하지 않는다).
+ */
+const PARTIAL_FAIL_CAUSE_LABEL: ReadonlyMap<string, string> = new Map([
+  ['permanent_failure', '원격 거절'],
+  ['max_attempts', '일시 오류 재시도 한도'],
+  ['retry_after_too_long', '원격 대기 요구가 너무 김'],
+  ['remote_failed', '원격 처리 실패'],
+]);
+const partialFailCauseOf = (reason: string) => PARTIAL_FAIL_CAUSE_LABEL.get(reason) ?? '원격 거절·재시도 한도·원격 처리 실패 중 하나';
 
 /**
  * FIX1-FULLREV(F2 후속2): thread_partial_stopped(작업 처리기가 보내기 전에 멈춤)의 실제 원인 — 멈출 때 남긴 BLOCKED 사건의 사유(blockReason:
@@ -700,6 +799,15 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       // FIX1-FULLREV(F2 후속2): 부분 게시 뒤 작업 처리기가 보내기 전에 멈춤(시도 한도·보내기 전 중단 반복·검증 실패) — FAILED 가 아니라 결과 불명.
       // 원인은 멈출 때의 BLOCKED 사유(reason)로 고른다(partialStopCauseOf — 검증 실패를 "시도 한도"라고 하지 않는다).
       if (partial === 'thread_partial_stopped') return `일부만 게시됨(MOCK) — 보내기 전 멈춤(${partialStopCauseOf(reason)}), 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`;
+      // FIX2-FULLREV(Q1): 보낸 뒤 남은 부분이 최종 실패(영구 거부·재시도 소진) — FAILED 가 아니라 결과 불명(게시된 부분이 있음). 원인은 멈출 때의 BLOCKED 사유.
+      if (partial === 'thread_partial_failed') return `일부만 게시됨(MOCK) — 남은 게시물 전송 실패(${partialFailCauseOf(reason)}), 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`;
+      // FIX2-FULLREV(FX2): 조회 한도까지 결과를 확인하지 못했는데 게시된 게시물이 있음 — "재확인 또는 새 계획 필요"가 아니다(새 계획은 게시된 부분을 다시 게시)
+      if (partial === 'thread_partial_unresolved')
+        return '게시된 게시물이 있음(MOCK) — 조회 한도까지 나머지 결과를 확인하지 못함, 자동 재전송 안 함, 게시된 부분은 원격에 남음(재확인만 가능)';
+      // FIX2-FULLREV(Q3): 복원한 작업 취소 — 보냈는지 기록으로 증명할 수 없어 취소를 확정하지 않음(다시 보내지 않음)
+      // FIX2-FULLREV(FX4): 모의 머리줄(실제는 liveItemHeadline) — 모의 시뮬레이터는 복원되지 않아 확인할 곳이 없다. "채널에서 직접 확인"을 시키지 않는다.
+      if (job?.lastErrorCode === RESTORED_CANCEL_UNVERIFIED_CODE)
+        return '복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)';
       return '확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
     }
     case 'CANCEL_REQUESTED':
@@ -872,6 +980,14 @@ export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string 
       // 원인은 멈출 때의 BLOCKED 사유(reason)로 고른다(partialStopCauseOf).
       if (partial === 'thread_partial_stopped')
         return `보내기 전 멈춤(${partialStopCauseOf(reason)}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`;
+      // FIX2-FULLREV(Q1): 게시된 부분이 있는데 그 뒤 최종 실패 — "게시되지 않음이 확인된 실패"(FAILED)가 아니다
+      if (partial === 'thread_partial_failed')
+        return `게시 뒤 실패(${partialFailCauseOf(reason)}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`;
+      // FIX2-FULLREV(FX2): 게시 단계가 기록됐는데 조회 한도까지 결과를 확인하지 못함
+      if (partial === 'thread_partial_unresolved') return '게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요';
+      // FIX2-FULLREV(Q3): 복원한 작업 취소를 확정하지 못함
+      if (job?.lastErrorCode === RESTORED_CANCEL_UNVERIFIED_CODE)
+        return '복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요';
       return `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
     }
     case 'CONFIRMED':

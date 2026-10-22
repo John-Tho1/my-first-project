@@ -451,3 +451,33 @@ describe('FIX-LIVEP2 resumeProvenRetryable (결과 불명 의도가 남은 보�
     expect(resumeProvenRetryable([ambiguous(), resume(), lease(), blocked('live_publish_paused'), ev({ event: 'unblock', cause: 'system' }), lease(), blocked('live_publish_paused')], 1)).toBe(false);
   });
 });
+
+describe('FIX2-FULLREV(Q3) restoredCancelNotSentProven (복원한 작업의 취소는 기록이 "보내지 않음"을 증명할 때만 not_sent)', () => {
+  const intent = (outcome: string, adapterId?: string | null) => ({ outcome, sanitizedDetails: adapterId === undefined ? { mode: 'MOCK' } : { adapter_id: adapterId } });
+  it('증명됨: 전송 의도 없음 · 일반 모의 어댑터(옛 의도 포함) 의 확정 거절만 · 단계가 필요한 어댑터는 게시 근거 없는 단계 기록이 함께 있고 모두 확정 거절', async () => {
+    const { restoredCancelNotSentProven, PUBLISH_EVIDENCE_STEP_KINDS } = await import('./jobs');
+    expect([...PUBLISH_EVIDENCE_STEP_KINDS].sort()).toEqual(['ig_publish', 'publish', 'publish_attempt', 'video']);
+    expect(restoredCancelNotSentProven({ intents: [], stepKinds: [] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [], stepKinds: ['container'] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [intent('rejected')], stepKinds: [] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [intent('rejected', null), intent('rejected', 'mock_generic')], stepKinds: [] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [intent('rejected', 'mock_threads')], stepKinds: ['container'] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [intent('rejected', 'mock_youtube')], stepKinds: ['upload_session'] })).toBe(true);
+    expect(restoredCancelNotSentProven({ intents: [intent('rejected', 'live_threads')], stepKinds: ['container'] })).toBe(true);
+  });
+  it('증명 안 됨: 게시 근거 단계 · 결과 불명·받아들여진 의도 · 단계가 필요한 어댑터인데 단계 기록 없음(0031 이전 묶음) · 기록된 어댑터를 모름', async () => {
+    const { restoredCancelNotSentProven } = await import('./jobs');
+    for (const k of ['publish', 'video', 'ig_publish', 'publish_attempt']) {
+      expect(restoredCancelNotSentProven({ intents: [intent('rejected', 'mock_threads')], stepKinds: ['container', k] }), k).toBe(false);
+      expect(restoredCancelNotSentProven({ intents: [], stepKinds: [k] }), `no intents/${k}`).toBe(false);
+    }
+    for (const o of ['pending', 'ambiguous', 'accepted']) {
+      expect(restoredCancelNotSentProven({ intents: [intent('rejected'), intent(o)], stepKinds: [] }), o).toBe(false);
+      expect(restoredCancelNotSentProven({ intents: [intent(o, 'mock_threads')], stepKinds: ['container'] }), `threads/${o}`).toBe(false);
+    }
+    for (const a of ['mock_threads', 'mock_youtube', 'mock_instagram', 'live_threads', 'live_youtube']) {
+      expect(restoredCancelNotSentProven({ intents: [intent('rejected', a)], stepKinds: [] }), a).toBe(false);
+      expect(restoredCancelNotSentProven({ intents: [intent('rejected', 'mock_generic'), intent('rejected', a)], stepKinds: [] }), `mixed/${a}`).toBe(false);
+    }
+  });
+});

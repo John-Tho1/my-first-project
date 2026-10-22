@@ -55,6 +55,7 @@ import {
   RECONCILE_MAX_ATTEMPTS,
   reconcileDelay,
   resumeProvenRetryable,
+  restoredCancelNotSentProven,
   REMOTE_POLL_MAX,
   REMOTE_POLL_MS,
   recordedAdapterIdOf,
@@ -311,6 +312,25 @@ const THREAD_PARTIAL_CANCELED_CODE = 'thread_partial_canceled';
  * 게시했거나 게시 시도 표식이 있어 FAILED("보내지 않음")가 아니라 UNKNOWN. 남은 부분은 보내지 않는다(새 계획이 처음부터 다시 게시하지 않게).
  */
 const THREAD_PARTIAL_STOPPED_CODE = 'thread_partial_stopped';
+/**
+ * FIX2-FULLREV(Q1): 전송 뒤 최종 실패(영구 거부·일시 오류 재시도 소진 — finishSend, 조회의 not_found 시도 한도·원격 처리 실패 — applyReconcile)인데
+ * 이 작업이 이미 게시한 부분(게시 단계 publish·video)이 있어 FAILED("게시되지 않음이 확인된 실패" — 화면은 새 계획을 연다)가 아니라 UNKNOWN.
+ * thread_partial_stopped("보내기 전 멈춤")와 나눈 이유: 이 작업은 보낸 뒤 원격이 남은 부분을 거절한 것이라 "보내기 전"이 아니고, 원인도 그 표(시도 한도·
+ * 중단 반복·검증 실패)에 없다. 남은 부분은 보내지 않는다(새 계획이 처음부터 다시 게시하지 않게).
+ */
+const THREAD_PARTIAL_FAILED_CODE = 'thread_partial_failed';
+/**
+ * FIX2-FULLREV(FX2): 조회 한도(확인 불가 RECONCILE_MAX_ATTEMPTS·원격 처리 REMOTE_POLL_MAX)로 UNKNOWN 이 됐는데 이 작업에 이미 게시된 스레드 게시물
+ * (publish 단계)이 있음 — 남은 부분의 결과를 모른다. 일반 UNKNOWN(앞선 어댑터 코드 그대로 — 화면은 "재확인 또는 새 계획 필요")이 아니라 이 코드로
+ * 남겨 새 계획(게시된 부분을 처음부터 다시 게시)을 권하지 않게 한다. 다시 보내지 않는다 — 사용자 재확인(조회만)은 그대로 열려 있다.
+ */
+const THREAD_PARTIAL_UNRESOLVED_CODE = 'thread_partial_unresolved';
+/**
+ * FIX2-FULLREV(Q3): 복원한 작업(읽기 전용 이력)의 사용자 취소 — 복원된 기록이 "아무것도 보내지 않음"을 증명하지 못해(@cs/domain restoredCancelNotSentProven)
+ * CANCELED(not_sent)가 아니라 UNKNOWN. 다시 보내지 않는다 — 실제 계정이면 사용자가 채널에서 직접 확인한다(FIX2-FULLREV(FX4): 모의 계정은 확인할 곳이 없어
+ * 그 말을 하지 않는다 — RESTORED_CANCEL_UNVERIFIED_MOCK_MESSAGE).
+ */
+const RESTORED_CANCEL_UNVERIFIED_CODE = 'restored_cancel_unverified';
 
 type TransitionSet = Parameters<typeof transitionJob>[6];
 
@@ -324,6 +344,9 @@ type TransitionSet = Parameters<typeof transitionJob>[6];
  * FIX1-FULLREV(F2 후속2): cancelRequestedAt 은 정말 취소인 멈춤(사용자 취소 thread_partial_canceled·취소 요청 thread_partial_cancel_requested)에만 쓴다.
  * 승인 철회·무효(thread_partial_revoked)·작업 처리기의 멈춤(thread_partial_stopped)은 아무도 취소를 요청하지 않았다 — 쓰면 나중에 사용자 확인·재확인으로
  * CONFIRMED 가 됐을 때 화면이 "취소 불가(이미 전송됨)"라고 잘못 말한다(page.tsx cancelTooLate).
+ * FIX2-FULLREV(Q4): 이미 취소 요청 시각이 있으면(앞선 사용자 취소·철회) 처음 시각을 지킨다 — transitionJob 이 cancelRequestedAt 을 비어 있을 때만 쓴다.
+ * FIX2-FULLREV(Q1): 전송 뒤 최종 실패(thread_partial_failed)도 이 함수로 — SENDING 은 LEASED 와 같은 두 단계(blocked → cancel_partial, SENDING 에는
+ * UNKNOWN 으로 가는 전이가 없다), 조회 중(RECONCILING·REMOTE_PROCESSING)은 CANCEL_REQUESTED 와 같은 reconcile_unsupported(UNKNOWN). 새 전이 없음.
  */
 async function settlePartialStop(
   tx: DbOrTx,
@@ -341,8 +364,24 @@ async function settlePartialStop(
   // FIX1-FULLREV(F2 후속2): 취소인 멈춤만 cancelRequestedAt(위 설명)
   const cancelMark = code === THREAD_PARTIAL_CANCELED_CODE || code === THREAD_PARTIAL_CANCEL_REQUESTED_CODE ? { cancelRequestedAt: now } : {};
   switch (job.state) {
+    // FIX2-FULLREV(Q1): 조회 중 최종 실패(RECONCILING·REMOTE_PROCESSING)도 같은 모양 — 멈춘 원인(reason ≠ code)은 cause 로 남긴다(취소 요청 경로는 reason = code 라 사건 모양 그대로)
     case 'CANCEL_REQUESTED':
-      return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...details, reason: code, ...counts }, now, { ...set, ...CLEAR_LEASE, lastErrorCode: code });
+    case 'RECONCILING':
+    case 'REMOTE_PROCESSING':
+      return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...details, reason: code, ...(reason !== code ? { cause: reason } : {}), ...counts }, now, {
+        ...set,
+        ...CLEAR_LEASE,
+        lastErrorCode: code,
+      });
+    case 'SENDING': {
+      // FIX2-FULLREV(Q1): 전송 결과가 최종 실패 — 첫 사건(BLOCKED)에 결과(error_code 등)·원인(reason), 둘째 사건(UNKNOWN)에도 error_code 를 남긴다.
+      const blocked = await settle(tx, ownerId, job, item, 'blocked', { ...details, reason, ...counts }, now, { ...set, ...CLEAR_LEASE, lastErrorCode: reason });
+      return settle(tx, ownerId, { id: job.id, state: blocked }, item, 'cancel_partial', { cause: reason, error_code: details.error_code ?? null, ...counts }, now, {
+        ...CLEAR_LEASE,
+        ...cancelMark,
+        lastErrorCode: code,
+      });
+    }
     case 'LEASED': {
       const blocked = await settle(tx, ownerId, job, item, 'blocked', { ...details, reason, ...counts }, now, { ...set, ...CLEAR_LEASE, lastErrorCode: reason });
       return settle(tx, ownerId, { id: job.id, state: blocked }, item, 'cancel_partial', { cause: reason, ...counts }, now, {
@@ -381,6 +420,63 @@ async function stopUnlessPartial(
   const attempts = found?.attempts ?? 0;
   if (parts === 0 && attempts === 0) return notSent();
   return settlePartialStop(tx, ownerId, job, item, stop.reason, stop.details ?? {}, { parts, attempts }, stop.code, now, stop.set);
+}
+
+/** FIX2-FULLREV(Q1): 최종 실패 판정에서 "이미 게시된 부분"으로 세는 단계(게시 시도 표식 publish_attempt 는 세지 않는다 — failUnlessPartial). */
+const PUBLISHED_PART_KINDS: readonly RemoteStepKind[] = ['publish', 'video'];
+
+/**
+ * FIX2-FULLREV(Q1): 전송 뒤 최종 실패(FAILED)의 공용 규칙 — finishSend 의 영구 거부·일시 오류 재시도 소진, applyReconcile 의 not_found 시도 한도·원격 처리 실패.
+ * 이 작업에 이미 게시된 부분(stop.kinds — 기본 publish·video 단계)이 있으면 FAILED("게시되지 않음이 확인된 실패" — 계획이 실패로 보이고 새 계획이
+ * 게시된 부분을 처음부터 다시 게시한다)가 아니라 settlePartialStop 으로 UNKNOWN(thread_partial_failed). 남은 부분은 보내지 않는다.
+ * 사건에는 not_sent:false·published_parts·publish_attempts(표식 수 — 기록만)·error_code 를 남긴다.
+ * 게시 시도 표식(publish_attempt)만 있는 작업은 세지 않는다: 실제 Threads 의 표식 뒤 확정 거부(400·403 등 — 원격이 게시를 받지 않음)는 지금처럼 FAILED
+ * (게시되지 않음이 확인됨). 결과를 모르는 표식 뒤 응답은 원래부터 FAILED 가 아니라 조회(RECONCILING → UNKNOWN)다.
+ * 게시된 부분이 없으면 failed() — 호출자가 지금까지 하던 결정 그대로(FAILED 모양 불변).
+ */
+async function failUnlessPartial(
+  tx: DbOrTx,
+  ownerId: string,
+  job: Pick<JobRow, 'id' | 'state'>,
+  item: DistributionItemRow,
+  stop: { reason: string; details: Record<string, unknown>; set?: TransitionSet; kinds?: readonly RemoteStepKind[] },
+  now: Date,
+  failed: () => Promise<JobState>,
+): Promise<JobState> {
+  const parts = await publishedStepCount(tx, ownerId, job.id, stop.kinds ?? PUBLISHED_PART_KINDS);
+  if (parts === 0) return failed();
+  const attempts = await publishedStepCount(tx, ownerId, job.id, ['publish_attempt']);
+  return settlePartialStop(tx, ownerId, job, item, stop.reason, stop.details, { parts, attempts }, THREAD_PARTIAL_FAILED_CODE, now, stop.set);
+}
+
+/**
+ * FIX2-FULLREV(FX2): 조회 한도로 UNKNOWN(reconcile_unsupported — RECONCILING·REMOTE_PROCESSING·CANCEL_REQUESTED 모두 표에 있는 전이, 새 전이 없음).
+ * 이 작업에 게시된 스레드 게시물(publish 단계)이 있으면 사유 코드 thread_partial_unresolved 와 not_sent:false·published_parts·publish_attempts 를 남긴다.
+ * publish 만 센다: 게시 시도 표식(publish_attempt)만 있는 실제 Threads 단일 게시물은 지금처럼 앞선 코드·일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE),
+ * YouTube 의 video 단계는 그 영상 하나의 처리 결과를 모르는 것이라 "부분 게시"가 아니다(T15 그대로). 게시된 게시물이 없으면 지금까지와 같은 모양.
+ */
+async function settleReconcileLimit(
+  tx: DbOrTx,
+  ownerId: string,
+  job: Pick<JobRow, 'id' | 'state'>,
+  item: DistributionItemRow,
+  details: Record<string, unknown>,
+  now: Date,
+  set: TransitionSet,
+): Promise<JobState> {
+  const parts = await publishedStepCount(tx, ownerId, job.id, ['publish']);
+  if (parts === 0) return settle(tx, ownerId, job, item, 'reconcile_unsupported', details, now, set);
+  const attempts = await publishedStepCount(tx, ownerId, job.id, ['publish_attempt']);
+  return settle(
+    tx,
+    ownerId,
+    job,
+    item,
+    'reconcile_unsupported',
+    { ...details, reason: THREAD_PARTIAL_UNRESOLVED_CODE, not_sent: false, published_parts: parts, publish_attempts: attempts },
+    now,
+    { ...set, lastErrorCode: THREAD_PARTIAL_UNRESOLVED_CODE },
+  );
 }
 
 /** LIVEP1-DIAG: 진단을 이력 필드로(허용 목록 통과분만, 없으면 빈 객체). */
@@ -1186,11 +1282,17 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
             ? decideRetryAt(countedAttempts(job), job.maxAttempts, retryAt, now)
             : decideRetry(countedAttempts(job), job.maxAttempts, result.retry_after_sec, now, random);
         if (d.retry) return settle(tx, ownerId, job, item, 'transient_failure', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
-        return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
+        // FIX2-FULLREV(Q1): 재시도 소진 — 이미 게시된 부분이 있으면 FAILED 가 아니라 UNKNOWN(thread_partial_failed, failUnlessPartial)
+        return failUnlessPartial(tx, ownerId, job, item, { reason: d.reason, details: base, set: common }, now, () =>
+          settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common),
+        );
       }
       case 'permanent_failure':
         if (cancel) return canceledUnlessPartial();
-        return settle(tx, ownerId, job, item, 'permanent_failure', base, now, common);
+        // FIX2-FULLREV(Q1): 영구 거부 — 이미 게시된 부분이 있으면(앞 게시물 게시 뒤 다음 게시물 거절) FAILED 가 아니라 UNKNOWN(thread_partial_failed)
+        return failUnlessPartial(tx, ownerId, job, item, { reason: 'permanent_failure', details: base, set: common }, now, () =>
+          settle(tx, ownerId, job, item, 'permanent_failure', base, now, common),
+        );
       case 'blocked':
         if (cancel) return canceledUnlessPartial();
         return settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'auth' }, now, common);
@@ -1300,11 +1402,13 @@ async function applyReconcile(
   if (r.status === 'failed' && !opts.manual) {
     // T15(D27): 원격이 받은 결과를 스스로 거부·처리 실패로 끝냄(YouTube uploadStatus failed/rejected) — 영구 실패, 다시 보내지 않는다.
     await fillIntent(tx, ownerId, intent, 'accepted', r, now, 'reconcile');
-    return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: 'remote_failed' }, now, {
-      ...common,
-      lastErrorCode: r.error_code ?? 'remote_failed',
-      lastRetryClass: 'permanent',
-    });
+    const failedSet = { ...common, lastErrorCode: r.error_code ?? 'remote_failed', lastRetryClass: 'permanent' };
+    // FIX2-FULLREV(Q1): 스레드 게시물(publish 단계)이 이미 게시된 작업이면 FAILED 가 아니라 UNKNOWN(thread_partial_failed). 지금 어댑터에서는 일어나지 않는
+    // 모양이다(Threads 모의·실제는 게시가 있으면 failed 를 돌려주지 않음) — 조회 보고보다 단계 기록을 믿는 방어선. YouTube 의 video 단계는 세지 않는다:
+    // 이 결과(처리 실패·거부)가 바로 그 영상에 대한 원격의 확정 판정이다(T15 D27 — FAILED 그대로).
+    return failUnlessPartial(tx, ownerId, job, item, { reason: 'remote_failed', details: base, set: failedSet, kinds: ['publish'] }, now, () =>
+      settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: 'remote_failed' }, now, failedSet),
+    );
   }
   if (opts.manual) {
     // 사용자 재확인은 조회만: 찾지 못하면 상태를 바꾸지 않는다(재전송 없음). resumable 이어도 여기서 이어 보내지 않는다.
@@ -1336,7 +1440,8 @@ async function applyReconcile(
   }
   const count = job.reconcileCount + 1;
   if (r.status === 'processing') {
-    if (count >= REMOTE_POLL_MAX) return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...base, polls: count }, now, common);
+    // FIX2-FULLREV(FX2): 한도 — 게시된 스레드 게시물이 있으면 사유 thread_partial_unresolved(settleReconcileLimit, "새 계획 필요"라고 하지 않게)
+    if (count >= REMOTE_POLL_MAX) return settleReconcileLimit(tx, ownerId, job, item, { ...base, polls: count }, now, common);
     const next = { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS), reconcileCount: count };
     if (job.state === 'RECONCILING') return settle(tx, ownerId, job, item, 'remote_accepted', base, now, next);
     if (job.state === 'REMOTE_PROCESSING') return settle(tx, ownerId, job, item, 'remote_processing', base, now, next);
@@ -1352,10 +1457,15 @@ async function applyReconcile(
     // 원격에 확실히 없음 → 다시 보내도 된다(새 시도 = 새 전송 의도). 시도 한도 안에서만.
     const d = decideRetry(countedAttempts(job), job.maxAttempts, null, now, opts.random ?? Math.random);
     if (d.retry) return settle(tx, ownerId, job, item, 'reconciled_not_found', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
-    return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
+    // FIX2-FULLREV(Q1): 시도 한도 — 단계 기록에 게시된 부분이 있으면(조회 보고와 단계 기록이 어긋남 — 지금 어댑터는 단계가 있으면 not_found 를 돌려주지 않는다)
+    // FAILED 가 아니라 UNKNOWN(thread_partial_failed). 조회 보고보다 단계 기록(취소 요청 경로와 같은 판단).
+    return failUnlessPartial(tx, ownerId, job, item, { reason: d.reason, details: base, set: common }, now, () =>
+      settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common),
+    );
   }
   // 확인 불가(read 권한 없음·판단 불가·확실하지 않은 없음): 한도까지 다시 조회, 넘으면 UNKNOWN(자동 재전송 없음).
-  if (count >= RECONCILE_MAX_ATTEMPTS) return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...base, checks: count }, now, { ...common, reconcileCount: count });
+  // FIX2-FULLREV(FX2): 게시된 스레드 게시물이 있으면 사유 thread_partial_unresolved(재시작·컨테이너 만료 뒤 3번째 게시물을 모름 — D26) — settleReconcileLimit
+  if (count >= RECONCILE_MAX_ATTEMPTS) return settleReconcileLimit(tx, ownerId, job, item, { ...base, checks: count }, now, { ...common, reconcileCount: count });
   return settle(tx, ownerId, job, item, 'reconcile_retry', { ...base, checks: count }, now, { ...common, nextRunAt: reconcileDelay(count, now), reconcileCount: count });
 }
 
@@ -1508,8 +1618,22 @@ export async function runJobsTick(db: Db, registry: ChannelAdapterRegistry, opts
 export type CancelOutcome =
   | { item_id: string; job_id: string; canceled: true; cancel_requested: false; state: 'CANCELED'; message: string }
   | { item_id: string; job_id: string; canceled: false; cancel_requested: true; state: 'CANCEL_REQUESTED'; message: string }
-  /** FIX-T14: 스레드 일부가 이미 게시된 작업의 취소 — 남은 부분은 보내지 않지만 취소 성공이라고 하지 않는다(UNKNOWN). */
-  | { item_id: string; job_id: string; canceled: false; cancel_requested: false; state: 'UNKNOWN'; published_parts: number; message: string };
+  /**
+   * FIX-T14: 스레드 일부가 이미 게시된 작업의 취소 — 남은 부분은 보내지 않지만 취소 성공이라고 하지 않는다(UNKNOWN).
+   * FIX2-FULLREV(Q3): 복원한 작업인데 기록이 "보내지 않음"을 증명하지 못한 취소도 UNKNOWN(reason restored_cancel_unverified, published_parts 0 — 모름).
+   * reason = 작업에 남긴 사유 코드(thread_partial_canceled · restored_cancel_unverified).
+   */
+  | { item_id: string; job_id: string; canceled: false; cancel_requested: false; state: 'UNKNOWN'; published_parts: number; reason: string; message: string };
+
+/** FIX2-FULLREV(Q3): 복원한 작업 취소를 확정하지 못했을 때의 응답 문구(다시 보내지 않음 — 채널에서 직접 확인). */
+const RESTORED_CANCEL_UNVERIFIED_MESSAGE =
+  '더 보내지 않습니다. 복원한 작업이라 보냈는지 이 환경에서 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명 — 다시 보내지 않음). 채널에서 직접 확인하세요.';
+/**
+ * FIX2-FULLREV(FX4): 모의 계정 항목의 같은 응답 — 모의 항목은 실제 채널로 보낸 적이 없고 모의 시뮬레이터는 복원되지 않아 확인할 곳이 없다
+ * ("채널에서 직접 확인"을 시키지 않는다). 계정 kind 를 모르면(계정 없음) 위의 조심스러운 문구.
+ */
+const RESTORED_CANCEL_UNVERIFIED_MOCK_MESSAGE =
+  'MOCK — 더 보내지 않습니다. 복원한 모의 작업이라 모의 전송 여부를 복원된 기록으로 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명 — 자동 재전송 안 함). 실제 채널로 보낸 것은 없습니다.';
 
 async function latestJobForItem(tx: DbOrTx, ownerId: string, itemId: string, lock: boolean): Promise<JobRow | null> {
   const q = tx
@@ -1555,11 +1679,52 @@ export async function cancelItem(db: Db, ownerId: string, itemId: string, now: D
             cancel_requested: false,
             state: 'UNKNOWN',
             published_parts: partial.parts,
+            reason: THREAD_PARTIAL_CANCELED_CODE,
             message: live
               ? '더 보내지 않습니다. 이 글은 실제 Threads 에 이미 게시됐거나 게시됐을 수 있습니다(취소로 되돌리지 않음 — Threads 에서 직접 확인하세요).'
               : `남은 부분은 보내지 않습니다. 이미 게시된 ${partial.parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
           };
           break;
+        }
+        // FIX2-FULLREV(Q3, D18·FIX-T10·FIX-T14 후속): 복원한 작업(읽기 전용 이력)은 복원된 기록이 "아무것도 보내지 않음"을 증명할 때만 CANCELED(not_sent).
+        // 단계 기록은 0031 이후 묶음에만 있으므로(이전 묶음은 단계 없이 복원) 단계가 없다는 것만으로는 증명이 아니다 — 증명이 없으면 UNKNOWN
+        // (restored_cancel_unverified, 다시 보내지 않음 — 사용자가 채널에서 직접 확인). 부분 게시 근거가 있는 복원 작업은 위 규칙(thread_partial_canceled) 그대로.
+        if (job.restoredNeedsReview || item.restoredNeedsReview) {
+          const intents = await listIntents(tx, ownerId, [job.id]);
+          const steps = await listRemoteSteps(tx, ownerId, job.id);
+          if (!restoredCancelNotSentProven({ intents, stepKinds: steps.map((s) => s.kind) })) {
+            // FIX2-FULLREV(FX4): 응답 문구는 항목 계정 kind 로(모의 = 실제 채널로 보낸 것 없음)
+            const mockAccount = (await accountOf(tx, ownerId, item.channelAccountId))?.kind === 'mock';
+            await settle(
+              tx,
+              ownerId,
+              job,
+              item,
+              'cancel_partial',
+              {
+                cause: 'user',
+                reason: RESTORED_CANCEL_UNVERIFIED_CODE,
+                restored: true,
+                not_sent: false,
+                intents: intents.length,
+                unresolved_intents: intents.filter((i) => i.outcome !== 'rejected').length,
+                remote_steps: steps.length,
+              },
+              now,
+              { ...CLEAR_LEASE, cancelRequestedAt: now, lastErrorCode: RESTORED_CANCEL_UNVERIFIED_CODE },
+            );
+            out = {
+              item_id: item.id,
+              job_id: job.id,
+              canceled: false,
+              cancel_requested: false,
+              state: 'UNKNOWN',
+              published_parts: 0,
+              reason: RESTORED_CANCEL_UNVERIFIED_CODE,
+              message: mockAccount ? RESTORED_CANCEL_UNVERIFIED_MOCK_MESSAGE : RESTORED_CANCEL_UNVERIFIED_MESSAGE,
+            };
+            break;
+          }
         }
         await settle(tx, ownerId, job, item, 'canceled', { cause: 'user', not_sent: true }, now, { cancelRequestedAt: now });
         out = { item_id: item.id, job_id: job.id, canceled: true, cancel_requested: false, state: 'CANCELED', message: '취소했습니다(아직 보내지 않은 작업)' };

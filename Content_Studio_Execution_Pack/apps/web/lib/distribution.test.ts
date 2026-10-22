@@ -44,6 +44,16 @@ import {
   publishAtView,
   YOUTUBE_MOCK_DISCLAIMER,
   youtubeSessionNote,
+  // FIX2-FULLREV(Q2)
+  LIVE_UNKNOWN_GUIDANCE,
+  LIVE_UNKNOWN_GUIDANCE_BY_KIND,
+  RESTORED_CANCEL_UNVERIFIED_CODE,
+  SNAPSHOT_PROBLEMS_PREFIX_BY_KIND,
+  UNKNOWN_JOB_LINE_BY_KIND,
+  UNKNOWN_JOB_LINE_PARTIAL_MOCK,
+  UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
+  UNKNOWN_STATUS_LABEL_BY_KIND,
+  unknownKindOf,
 } from './distribution';
 import { NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE } from '@cs/domain';
 
@@ -902,5 +912,148 @@ describe('LIVE-P2(D39): 즉시 중지·최근 24시간 상한 보류 문구', ()
     expect(jobStatusText(job('live_publish_daily_limit'), null, 'live_publish_daily_limit')).toBe('BLOCKED · 최근 24시간 실제 게시 상한 — 보내지 않음(창이 풀린 뒤 재시도)');
     // 기존 승인 기록 상한 문구는 그대로
     expect(liveItemHeadline({ ...base, job: job('live_publish_limit'), blockReason: 'live_publish_limit' })).toBe('보류 — 승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 다 씀(보내지 않음)');
+  });
+});
+
+describe('FIX2-FULLREV(Q1·Q2·Q3): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그·작업 줄·머리줄이 "새 계획 필요"라고 하지 않는다', () => {
+  // FIX2-FULLREV(FX2): thread_partial_unresolved(조회 한도 — 게시된 게시물이 있음)
+  const PARTIAL_CODES = ['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped', 'thread_partial_failed', 'thread_partial_unresolved'];
+  const GENERIC_UNKNOWN_LINE = 'UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
+
+  it('unknownKindOf: 항목 UNKNOWN + 최근 작업 lastErrorCode 가 부분 게시 사유면 partial, 복원 취소 미확정이면 restored_unverified, 그 밖·다른 상태는 null', () => {
+    for (const code of PARTIAL_CODES) {
+      expect(unknownKindOf('UNKNOWN', { lastErrorCode: code }), code).toBe('partial');
+      for (const s of ['CONFIRMED', 'FAILED', 'BLOCKED', 'RECONCILING', 'PLANNED']) expect(unknownKindOf(s, { lastErrorCode: code }), `${s}/${code}`).toBeNull();
+    }
+    expect(RESTORED_CANCEL_UNVERIFIED_CODE).toBe('restored_cancel_unverified');
+    expect(unknownKindOf('UNKNOWN', { lastErrorCode: 'restored_cancel_unverified' })).toBe('restored_unverified');
+    for (const code of [null, 'reconcile_timeout', 'publish_attempt_unresolved', 'restored_steps_missing', 'thread_partial', 'toString', '__proto__', '']) {
+      expect(unknownKindOf('UNKNOWN', { lastErrorCode: code }), String(code)).toBeNull();
+    }
+    expect(unknownKindOf('UNKNOWN', null)).toBeNull();
+    expect(unknownKindOf('UNKNOWN', undefined)).toBeNull();
+  });
+
+  it('jobStatusText(UNKNOWN): 부분 게시 사유 코드 전부·복원 취소 미확정 → 종류별 줄("새 계획" 없음), 그 밖은 지금까지의 줄 그대로', () => {
+    for (const code of PARTIAL_CODES) {
+      const line = jobStatusText(job('UNKNOWN', code));
+      expect(line, code).toBe(UNKNOWN_JOB_LINE_BY_KIND.partial);
+      expect(line, code).not.toContain('새 계획');
+      expect(line, code).toContain('남은 부분은 보내지 않음');
+      // 보류 사유(blockReason)가 무엇이든 작업 코드로 고른다
+      expect(jobStatusText(job('UNKNOWN', code), null, 'auth', 'threads'), code).toBe(UNKNOWN_JOB_LINE_BY_KIND.partial);
+    }
+    const restored = jobStatusText(job('UNKNOWN', 'restored_cancel_unverified'));
+    expect(restored).toBe(UNKNOWN_JOB_LINE_BY_KIND.restored_unverified);
+    expect(restored).toContain('채널에서 직접 확인');
+    expect(restored).not.toContain('새 계획');
+    for (const code of [null, 'reconcile_timeout', 'publish_attempt_unresolved']) expect(jobStatusText(job('UNKNOWN', code)), String(code)).toBe(GENERIC_UNKNOWN_LINE);
+    // UNKNOWN 이 아닌 작업은 사유 코드가 남아 있어도(뒤에 CONFIRMED 등) 그 상태의 줄
+    expect(jobStatusText(job('FAILED', 'thread_partial_failed'))).toBe('FAILED · 실패 (thread_partial_failed)');
+  });
+
+  it('thread_partial_failed 머리줄 — 원인은 멈출 때의 BLOCKED 사유(영구 거부·재시도 한도·Retry-After·원격 처리 실패), 모르면 단정하지 않음(모의·실제), "새 계획" 없음', () => {
+    const failed = job('UNKNOWN', 'thread_partial_failed');
+    const CAUSES = [
+      { reason: 'permanent_failure', says: '원격 거절' },
+      { reason: 'max_attempts', says: '일시 오류 재시도 한도' },
+      { reason: 'retry_after_too_long', says: '원격 대기 요구가 너무 김' },
+      { reason: 'remote_failed', says: '원격 처리 실패' },
+    ];
+    for (const c of CAUSES) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason: c.reason });
+      expect(mock, c.reason).toBe(`일부만 게시됨(MOCK) — 남은 게시물 전송 실패(${c.says}), 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`);
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason: c.reason });
+      expect(live, c.reason).toBe(`게시 뒤 실패(${c.says}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`);
+      for (const t of [mock, live]) {
+        expect(t).not.toContain('새 계획');
+        expect(t).not.toContain('보내기 전 멈춤');
+      }
+      expect(live).not.toContain('MOCK');
+    }
+    for (const blockReason of [null, 'thread_partial_failed', 'auth', 'toString', '__proto__', '']) {
+      expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason }), String(blockReason)).toContain(
+        '남은 게시물 전송 실패(원격 거절·재시도 한도·원격 처리 실패 중 하나)',
+      );
+    }
+    // 작업 행이 없어도(사유만) 같은 문구
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: 'thread_partial_failed' })).toContain('남은 게시물 전송 실패');
+    // 다른 부분 게시 코드 문구는 그대로(보내기 전 멈춤)
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'thread_partial_stopped'), pub: null, blockReason: 'attempts_exhausted' })).toContain('보내기 전 멈춤(시도 한도)');
+  });
+
+  it('FIX2-FULLREV(FX2) thread_partial_unresolved 머리줄 — 조회 한도까지 결과 확인 못함·게시된 게시물이 있음(모의·실제), 보류 사유가 가리지 않음, "새 계획" 없음', () => {
+    const u = job('UNKNOWN', 'thread_partial_unresolved');
+    for (const blockReason of [null, 'auth', 'thread_partial_unresolved', 'toString', '']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: u, pub: null, blockReason });
+      expect(mock, String(blockReason)).toBe('게시된 게시물이 있음(MOCK) — 조회 한도까지 나머지 결과를 확인하지 못함, 자동 재전송 안 함, 게시된 부분은 원격에 남음(재확인만 가능)');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: u, pub: null, blockReason });
+      expect(live, String(blockReason)).toBe('게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요');
+      for (const t of [mock, live]) expect(t).not.toContain('새 계획');
+      expect(live).not.toContain('MOCK');
+    }
+    // 작업 행이 없어도(사유만) 같은 문구
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: 'thread_partial_unresolved' })).toContain('조회 한도까지 나머지 결과를 확인하지 못함');
+  });
+
+  it('restored_cancel_unverified 머리줄 — 보냈는지 모름·취소 확정 안 함(실제 = Threads 에서 직접 확인, 모의 = MOCK·실제 채널로 보낸 것 없음), 부분 게시·일반 UNKNOWN 문구와 섞이지 않음', () => {
+    const r = job('UNKNOWN', 'restored_cancel_unverified');
+    for (const blockReason of [null, 'auth', 'restored_cancel_unverified']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: r, pub: null, blockReason });
+      // FIX2-FULLREV(FX4): 모의 항목은 확인할 곳이 없다(시뮬레이터는 복원되지 않음) — "채널에서 직접 확인"을 시키지 않는다
+      expect(mock, String(blockReason)).toBe('복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)');
+      expect(mock, String(blockReason)).not.toContain('채널에서 직접 확인');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: r, pub: null, blockReason });
+      expect(live, String(blockReason)).toBe('복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요');
+      for (const t of [mock, live]) {
+        expect(t).not.toContain('새 계획');
+        expect(t).not.toContain('일부만 게시됨');
+      }
+    }
+    // 일반 UNKNOWN 은 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'reconcile_timeout'), pub: null, blockReason: null })).toBe('확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: null })).toBe(`결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`);
+  });
+
+  it('종류별 상태 태그·실제 게시 안내·스냅샷 안내 문구: 어느 것도 "새 계획 필요"·"없을 때만 새 배포 계획으로 다시 승인"을 말하지 않고, 실제 문구에는 MOCK 이 없다', () => {
+    for (const kind of ['partial', 'restored_unverified'] as const) {
+      // FIX2-FULLREV(FX3): 스냅샷 안내는 모의·실제 둘 다
+      const texts = [
+        UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock,
+        UNKNOWN_STATUS_LABEL_BY_KIND[kind].live,
+        UNKNOWN_JOB_LINE_BY_KIND[kind],
+        LIVE_UNKNOWN_GUIDANCE_BY_KIND[kind],
+        SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].mock,
+        SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live,
+      ];
+      for (const t of texts) {
+        expect(t, kind).not.toContain('새 계획 필요');
+        expect(t, kind).not.toContain('다시 승인하세요');
+        expect(t, kind).toMatch(/재전송 안 함|다시 게시하지 않|권하지 않음|직접 확인/);
+      }
+      expect(UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock.startsWith('UNKNOWN · '), kind).toBe(true);
+      expect(UNKNOWN_STATUS_LABEL_BY_KIND[kind].live.startsWith('UNKNOWN · '), kind).toBe(true);
+      for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND[kind].live, LIVE_UNKNOWN_GUIDANCE_BY_KIND[kind], SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live]) expect(t, kind).not.toContain('MOCK');
+      for (const v of ['mock', 'live'] as const) expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind][v].startsWith('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다('), `${kind}/${v}`).toBe(true);
+    }
+    expect(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock).toContain('MOCK');
+    // FIX2-FULLREV(FX3): 실제 부분 게시 안내는 상태 태그처럼 "게시됐거나 게시됐을 수 있음" — 단일 게시물·표식뿐일 수 있어 "일부 게시된 작업"·"게시된 부분"이라고 단정하지 않는다
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live).toContain('게시됐거나 게시됐을 수 있는 작업');
+    for (const w of ['일부 게시된', '게시된 부분']) expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live).not.toContain(w);
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.mock).toContain('일부 게시된 작업');
+    // FIX2-FULLREV(FX4): 모의 복원 취소 미확정 문구는 MOCK·실제 채널로 보낸 것 없음 — 할 수 없는 "채널에서 직접 확인"을 시키지 않는다(실제 문구는 Threads 직접 확인 그대로)
+    // FIX2-FULLREV(FX6): 모의 부분 게시 작업 줄도 같은 규칙(머리줄의 "재확인만 가능"과 같은 뜻)
+    for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.mock, UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.mock, UNKNOWN_JOB_LINE_PARTIAL_MOCK]) {
+      expect(t).toContain('MOCK');
+      expect(t).toContain('실제 채널로 보낸 것 없음');
+      expect(t).not.toContain('직접 확인');
+      expect(t).toContain('재전송 안 함');
+    }
+    for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.live, LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.live]) {
+      expect(t).toContain('Threads');
+      expect(t).toContain('직접 확인');
+    }
+    // 일반 결과 불명 안내는 그대로(없을 때만 새 배포 계획)
+    expect(LIVE_UNKNOWN_GUIDANCE).toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
   });
 });

@@ -222,3 +222,23 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - not_run: Codex, FIX6 에 대한 7차 독립 검토, 실제 Postgres 다중 연결, 브라우저, **Windows Git Bash 에서 `corepack pnpm ledger:resolve` 실제 실행**(인용·경로 변환·corepack shim), macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
 - 확인 필요(추가, 잠정 적용): 운영 명령 앞붙임 없음, by/reason 에 `" % \ & | < > ^` 와 앞 `/` 를 쓸 수 없음(`R&D` 등도 거부), 정정 감사에 정정 전 settled_amount·resolved_at 을 남김. **사용자 PC 에서 처음 쓸 때 `corepack pnpm ledger:resolve --list` 가 Git Bash 에서 실행되는지 먼저 확인.**
 - Codex 큐 줄(추가): `1b6e4f4 FIX6-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX5 줄 다음).
+
+## 2026-10-22 — 전체 코드 Claude 독립 검토 1차·FIX1-FULLREV(클라우드 세션)
+- 사용자 지시(2026-10-21 "현재까지의 전체 코드 리뷰를 클로드 코드 리뷰로 진행해줘", "권고사항대로 진행해줘"). Claude 독립 검토이며 Codex 아님. 대상 `origin/main...a0521fe` 의 앱 전체(631 files), 기록 b533650(`FULLREV1_CLAUDE_REVIEW.md`).
+  - 지적 10 → 확정 7(F1·F2·F3 P1, F5·F6·F7·F9 P2) · 기각 3(F4 D12·D13 수용 위험, F8 작업 키로 감사 연결 유지, #10 D28·D30).
+- **FIX1-FULLREV af1d0b5**:
+  - 승인 철회 뒤 남은 보류 작업을 상한에서 세지 않음.
+  - 일부 게시 뒤 승인 철회·무효·취소·작업 처리기 멈춤은 모두 UNKNOWN 이다(다시 게시 안 함). 판정은 하나를 공유한다.
+  - 업로드 MIME 별칭 정규화, 복원 ZIP 구간 겹침 거부, mock 시험 인자 판정을 빌드 때 고정, 검색 날짜 왕복 확인.
+  - **migration 0047**(send_intents 부분 인덱스 2개).
+  - 고친 결과 반박 검토 3회 + 보완 3회(확정 1 → 10 → 2 → 0). 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(af1d0b5 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 1974 · integration 56 files / 1047**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저(.m4a 실제 업로드 포함), Windows Git Bash·macOS, `./data` **migrate(0046·0047)**·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용):
+  - 부분 게시 뒤 멈춘 항목은 "실행 전"으로 돌아가지 않고 결과 불명으로 남는다(다시 승인·실행 불가 — Threads 에서 직접 확인).
+  - 실제 계정은 게시 시도 표식 뒤 동시 취소면 UNKNOWN 이다.
+  - 사용자 PC 에서 다음에 DB 를 열면 0046 과 0047 이 함께 적용된다(서버 끈 상태, 백업 먼저).
+- Codex 큐 줄(추가): `af1d0b5 FIX1-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX6 줄 다음).

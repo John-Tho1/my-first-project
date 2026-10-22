@@ -242,3 +242,21 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - 실제 계정은 게시 시도 표식 뒤 동시 취소면 UNKNOWN 이다.
   - 사용자 PC 에서 다음에 DB 를 열면 0046 과 0047 이 함께 적용된다(서버 끈 상태, 백업 먼저).
 - Codex 큐 줄(추가): `af1d0b5 FIX1-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX6 줄 다음).
+
+## 2026-10-22 오후 — FIX2-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-22 "다 권고 사항으로 진행해줘"): FULLREV1 검토자 질문 1~4 모두 권고안이다.
+- **FIX2-FULLREV 13f29b3**:
+  - 부분 게시 뒤 최종 실패·조회 한도는 FAILED 대신 UNKNOWN(`thread_partial_failed`·`thread_partial_unresolved`)이다.
+  - 부분 게시·복원 미확정 UNKNOWN 은 상태 태그·작업 줄·안내 어디에서도 새 계획을 권하지 않는다(모의 카드는 모의 문구).
+  - 복원한 작업 취소는 기록이 증명할 때만 "보내지 않음"이다(`restored_cancel_unverified`).
+  - 취소 요청 시각은 처음 값을 유지한다.
+  - 반박 검토 2회(확정 5 → 3, 모두 P2) 뒤 보완했다. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 2".
+- 마지막 검사(13f29b3 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 1990 · integration 58 files / 1063**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용):
+  - 일부 게시된 스레드가 뒤에서 실패하면 "실패" 대신 "결과 불명"이다.
+  - 옛 묶음(0031 이전)에서 복원한 작업을 취소하면 "결과 불명"이 될 수 있다.
+- Codex 큐 줄(추가): `13f29b3 FIX2-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX1-FULLREV 줄 다음).

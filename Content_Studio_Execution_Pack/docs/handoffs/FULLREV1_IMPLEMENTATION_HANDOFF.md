@@ -72,3 +72,41 @@
 2. 부분 게시 UNKNOWN 카드의 상태 표시·작업 줄은 여전히 일반 문구("재확인 또는 새 계획 필요")다. 머리줄만 부분 게시 문구다. 상태 표시도 바꿔야 하는가?
 3. 복원된 QUEUED·RETRY_WAIT 작업(→ BLOCKED)은 묶음에 remote_steps 가 없으면 cancelItem 이 CANCELED{not_sent:true} 로 끝낸다. 복원 작업은 "보내지 않음"을 증명할 수 없으므로 UNKNOWN 으로 둬야 하는가?
 4. beginSend 취소 갈래(LEASED + cancelRequestedAt 이미 있음)는 settlePartialStop 이 처음 요청 시각을 지금 시각으로 덮어쓴다. 원래 시각을 지켜야 하는가?
+
+# FIX round 2 (FIX2-FULLREV — "검토자에게 물을 것" 1~4 사용자 결정)
+- BASE_SHA: 2915097 (FULLREV1 인계 docs) · **HEAD_SHA: 13f29b3** (`13f29b34b192f40065a2b9753a85d102b28e75de`)
+- 사용자 결정(2026-10-22 "다 권고 사항으로 진행해줘"): 위 질문 1~4 모두 권고안대로 정했다.
+- 진행:
+  - 구현 에이전트 1명이 결정 4건을 구현했다.
+  - 고친 결과를 반박 검토 3관점(상태·화면·시험, Claude — Codex 아님)으로 봤다. 확정 5(P2)·기각 2 → 보완 FX1~FX5.
+  - 보완 부분을 짧게 다시 검토했다. 확정 3(P2, 중복 1) → 오케스트레이터가 FX6 을 직접 고쳤다.
+- 결정 처리:
+  - **Q1** 이미 게시된 부분(publish·video 단계, 표식은 세지 않음)이 있는 작업의 최종 실패는 FAILED 대신 UNKNOWN(새 코드 `thread_partial_failed`)이다. 대상:
+    - finishSend: 영구 거부, 재시도 소진
+    - applyReconcile: remote_failed(publish 만 셈 — YouTube 거부는 FAILED 그대로, T15 D27), not_found 한도
+  - Q1 전이는 기존 전이만 쓴다. SENDING → blocked → cancel_partial, RECONCILING·REMOTE_PROCESSING → reconcile_unsupported 이다. 게시 0 은 FAILED 그대로다(실제 계정의 표식 뒤 확정 거부 포함 — 시험).
+  - FX2: 조회 한도(RECONCILE_MAX_ATTEMPTS·REMOTE_POLL_MAX)에 걸린 부분 게시 작업은 `thread_partial_unresolved`(게시 0 은 그대로)다.
+  - **Q2** `unknownKindOf`(partial = 부분 게시 코드 6종, restored_unverified)로 고른다. 대상은 상태 태그(`itemStatusText`), 작업 줄(`jobStatusText`·`jobStatusTextFor`), 스냅샷 안내, 실제 결과 불명 안내다.
+    - 모두 "새 계획 필요"·새 계획 권유가 없다. 일반 UNKNOWN 문구는 그대로다.
+    - 모의 카드는 "채널에서 직접 확인"(할 수 없음) 대신 모의 문구다(FX4·FX6).
+    - 실제 카드의 스냅샷 안내는 "게시됐거나 게시됐을 수 있는"이다(FX3).
+  - **Q3** 복원한 작업(작업 또는 항목의 restored_needs_review)의 취소는 `restoredCancelNotSentProven`(domain)이 증명할 때만 CANCELED not_sent 다. 증명 조건은 둘 중 하나다.
+    - 의도가 없다.
+    - 모든 의도가 rejected 이고, 게시 증거 단계가 없고, 단계 기록을 쓰는 어댑터면 단계 행이 있다.
+    - 증명하지 못하면 UNKNOWN(`restored_cancel_unverified`)이고, 다시 보내지 않는다. 0031 이전 묶음은 단계가 없을 수 있어 보수적으로 판정한다.
+  - **Q4** `transitionJob` 이 cancelRequestedAt 을 coalesce 로 쓴다. 처음 요청 시각을 지킨다.
+- 바뀐 기존 단언: `threads.test.ts` "2번째 게시물 400 → FAILED" 1곳이다. Q1 이 바꾸는 동작이라, 같은 강도 이상인 UNKNOWN·사유 코드·사건 모양·항목 상태 단언으로 바꿨다. 그 밖의 추적 시험 파일에서 지운 단언은 0(import 줄만)이다.
+- 변이 확인: 구현·보완마다 되돌려 새 시험 실패를 확인했다(FX6: 모의 부분 줄 분기 제거 → 단위 2·통합 3 실패, 복원 모의 분기 제거 → 렌더 시험 1 실패 — 이전에 늘 통과하던 단언을 `<strong>` 작업 줄로 좁힘). 모두 복원 뒤 cmp 일치했다.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 실행, 13f29b3 과 같은 코드):
+  - install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS
+  - **unit 83 files / 1990 · integration 58 files / 1063**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271
+  - 변경 파일 보이지 않는 문자 0 · `./data` 변화 없음
+- 남은 위험:
+  - Q3 는 0031 이후 묶음에서 단계 없이 끝난 작업(예: 컨테이너 생성 401)도 UNKNOWN 이다(보수적).
+  - reconcile 경로로 UNKNOWN 이 된 thread_partial_failed 는 BLOCKED 사건이 없어 머리줄 원인이 일반 문구다.
+  - 영상(video) 단계 계산 분기는 지금 어댑터로 닿지 않는다(방어용, 미시험).
+- 검토자에게 물을 것:
+  1. 복원 묶음의 migration 수준을 작업마다 기록해 0031 이후 묶음의 단계 없는 작업은 not_sent 로 끝낼 수 있게 해야 하는가?
+  2. 취소 HTML 경로가 UNKNOWN 결과(부분 게시·복원 미확정)에도 `cancel_requested=1` 로 돌아간다. 전용 안내가 없는데, 따로 둬야 하는가?
+  3. 실제 부분·복원 미확정 안내는 Threads 에 글이 실제로 없을 때의 복구 길(새 계획)을 말하지 않는다. 이 문구로 괜찮은가?

@@ -1353,6 +1353,16 @@ export const sendIntents = pgTable(
   (t) => [
     unique('send_intents_intent_key_uq').on(t.intentKey),
     unique('send_intents_job_attempt_uq').on(t.jobId, t.attempt),
+    // FIX1-FULLREV(F9, migration 0047): 실제 게시 사용 수 세기(live-publish.ts liveApprovalUsage·livePublishDailyUsage — beginSend 의 배타 advisory
+    // 잠금 아래와 홈·설정 화면에서 부른다)가 표 전체를 읽지 않게 하는 부분 색인. 실제 게시 전송 의도(live_approval_ref 가 있는 행)만 담는다.
+    // 술어는 livePublishDailyUsage 의 조건과 같은 식이고, liveApprovalUsage 의 `->>'live_approval_ref' = ref`(strict 연산자)는 이 술어를 함의하므로
+    // 두 질의 모두 결과를 바꾸지 않고 이 색인을 쓸 수 있다. 질의의 식 모양(`sanitized_details->>'live_approval_ref'`)을 바꾸면 색인을 못 쓴다.
+    index('send_intents_live_ref_job_idx')
+      .on(sql`(${t.sanitizedDetails}->>'live_approval_ref')`, t.jobId)
+      .where(sql`${t.sanitizedDetails}->>'live_approval_ref' is not null`),
+    index('send_intents_live_owner_created_idx')
+      .on(t.ownerId, t.createdAt)
+      .where(sql`${t.sanitizedDetails}->>'live_approval_ref' is not null`),
     check('send_intents_outcome_chk', sql`${t.outcome} in ('pending', 'accepted', 'rejected', 'ambiguous')`),
     check('send_intents_attempt_chk', sql`${t.attempt} >= 1`),
     check('send_intents_key_chk', sql`${t.intentKey} = ${t.jobId}::text || ':' || ${t.attempt}::text`),

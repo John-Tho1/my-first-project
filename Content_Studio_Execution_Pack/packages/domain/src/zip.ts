@@ -6,6 +6,7 @@
  * - 읽기: EOCD → central directory → 각 local header 를 따라가 바이트를 꺼내고 CRC-32 를 검사한다.
  *   `..`·절대 경로·역슬래시·드라이브 문자·빈 조각·중복 이름·압축(method≠0)·암호화·ZIP64 는 거부한다.
  *   디렉터리 항목(이름이 `/` 로 끝나고 크기 0)은 건너뛴다(다른 도구로 다시 묶은 경우 대비).
+ *   FIX1-FULLREV(F5): 파일 항목의 [local header 시작, 데이터 끝) 구간이 서로 겹치면 거부한다 — 복사·CRC 전에 검사.
  */
 import { crc32 } from 'node:zlib';
 import { AppError } from './errors';
@@ -144,7 +145,8 @@ export function readZip(input: Uint8Array): ZipEntry[] {
   if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) throw new ZipFormatError('ZIP64 는 지원하지 않습니다');
   if (cdOffset + cdSize > eocd) throw new ZipFormatError('ZIP 목록 위치가 올바르지 않습니다');
 
-  const out: ZipEntry[] = [];
+  // FIX1-FULLREV(F5): 1단계(검사만) — 항목마다 [local header 시작, 데이터 끝) 구간을 모은다. 복사·CRC 는 겹침 검사를 통과한 뒤 2단계에서.
+  const pending: { path: string; start: number; dataStart: number; end: number; crc: number }[] = [];
   const seen = new Set<string>();
   let p = cdOffset;
   for (let i = 0; i < count; i++) {
@@ -188,9 +190,22 @@ export function readZip(input: Uint8Array): ZipEntry[] {
     if (end > cdOffset) throw new ZipFormatError('ZIP 항목 크기가 올바르지 않습니다', { paths: [name] });
     const localName = buf.subarray(localOffset + 30, localOffset + 30 + lNameLen).toString('utf8');
     if (localName !== name) throw new ZipFormatError('ZIP 항목 이름이 목록과 다릅니다', { paths: [name] });
-    const bytes = new Uint8Array(buf.subarray(start, end)); // 복사
-    if (crc32(bytes) >>> 0 !== crc) throw new ZipFormatError('ZIP 항목의 CRC 가 일치하지 않습니다(파일 손상)', { paths: [name] });
-    out.push({ path: name, bytes });
+    pending.push({ path: name, start: localOffset, dataStart: start, end, crc });
+  }
+  // FIX1-FULLREV(F5): 구간이 서로 겹치면(한 항목의 데이터 안에 다른 항목이 들어 있거나 여러 레코드가 같은 바이트를 가리키면) 묶음 전체 거부 —
+  // imports.ts listZip(FIX-T18 round 2)과 같은 규칙·문구. 겹침을 받으면 항목 수 × 파일 크기만큼 복사·CRC 하게 된다. 겹치지 않으면 복사 합 ≤ 파일 크기.
+  const ranges = [...pending].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (let k = 1; k < ranges.length; k++) {
+    if (ranges[k]!.start < ranges[k - 1]!.end) {
+      throw new ZipFormatError('ZIP 항목의 데이터 구간이 겹칩니다', { paths: [ranges[k]!.path] });
+    }
+  }
+  // 2단계: 입력 순서대로 복사하고 CRC 를 검사한다.
+  const out: ZipEntry[] = [];
+  for (const e of pending) {
+    const bytes = new Uint8Array(buf.subarray(e.dataStart, e.end)); // 복사
+    if (crc32(bytes) >>> 0 !== e.crc) throw new ZipFormatError('ZIP 항목의 CRC 가 일치하지 않습니다(파일 손상)', { paths: [e.path] });
+    out.push({ path: e.path, bytes });
   }
   return out;
 }

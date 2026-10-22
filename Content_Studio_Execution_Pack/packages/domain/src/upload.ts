@@ -9,6 +9,11 @@
  */
 import { z } from 'zod';
 import { BadRequestError, PayloadTooLargeError, UnsupportedMediaTypeError } from './errors';
+import { isMediaMime, normalizeMediaMime, type MediaMime } from './media-mime';
+
+// FIX1-FULLREV(F3): 형식 목록·확장자·별칭 정규화는 의존성 없는 ./media-mime 에 둔다(브라우저 /record 도 같은 함수를 쓴다).
+// 기존 import 경로(./upload · @cs/domain)는 그대로 쓸 수 있게 다시 내보낸다.
+export { ALLOWED_MEDIA_MIME, isMediaMime, MEDIA_EXT, normalizeMediaMime, type MediaMime } from './media-mime';
 
 export const MIB = 1024 * 1024;
 export const MIN_CHUNK_BYTES = 4 * MIB;
@@ -21,29 +26,8 @@ export const SNIFF_HEAD_BYTES = 64;
 /** assets.verification_scope 기본값 — VERIFIED 가 실제로 확인한 범위 */
 export const VERIFICATION_SCOPE = 'signature_size_checksum' as const;
 
-export const ALLOWED_MEDIA_MIME = [
-  'audio/mpeg',
-  'audio/mp4',
-  'audio/wav',
-  'audio/webm',
-  'video/mp4',
-  'video/webm',
-  'video/quicktime',
-] as const;
-export type MediaMime = (typeof ALLOWED_MEDIA_MIME)[number];
 export type MediaKind = keyof typeof MAX_MEDIA_BYTES;
 
-export const MEDIA_EXT: Record<MediaMime, string> = {
-  'audio/mpeg': 'mp3',
-  'audio/mp4': 'm4a',
-  'audio/wav': 'wav',
-  'audio/webm': 'weba',
-  'video/mp4': 'mp4',
-  'video/webm': 'webm',
-  'video/quicktime': 'mov',
-};
-
-export const isMediaMime = (m: string): m is MediaMime => (ALLOWED_MEDIA_MIME as readonly string[]).includes(m);
 export const mediaKindOf = (m: string): MediaKind | null => (m.startsWith('audio/') ? 'audio' : m.startsWith('video/') ? 'video' : null);
 /** 전사할 수 있는 파일인가(음성·영상 형식) */
 export const isTranscribableMime = (m: string) => isMediaMime(m);
@@ -115,10 +99,14 @@ export interface UploadPlan {
   sha256: string | null;
 }
 
-/** 입력 → 조각 계획. 형식 415, 크기 413, 조각 크기·종류 불일치 400. */
+/**
+ * 입력 → 조각 계획. 형식 415, 크기 413, 조각 크기·종류 불일치 400.
+ * FIX1-FULLREV(F3): 신고 형식은 normalizeMediaMime 으로 정본으로 바꾼 뒤 검사·저장한다(audio/x-m4a → audio/mp4 등).
+ * 세션·asset·감사에는 정본만 남는다. 파일 이름이 없으므로 빈 형식·application/octet-stream 은 여기서 415(추정은 브라우저에서만).
+ */
 export function planUpload(input: UploadSessionCreateInput): UploadPlan {
-  const mime = input.mime.trim().toLowerCase();
-  if (!isMediaMime(mime)) throw new UnsupportedMediaError();
+  const mime = normalizeMediaMime(input.mime);
+  if (!mime) throw new UnsupportedMediaError();
   if (mediaKindOf(mime) !== input.kind) throw new BadRequestError('kind 와 mime 이 맞지 않습니다(audio 는 audio/*, video 는 video/*)');
   const max = MAX_MEDIA_BYTES[input.kind];
   if (input.bytes > max) {

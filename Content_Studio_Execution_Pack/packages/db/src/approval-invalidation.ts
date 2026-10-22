@@ -17,8 +17,9 @@
  *
  * A06: 승인 뒤 본문·첨부·원고·계정이 바뀌면 그 항목의 활성 승인을 revoke_reason='invalidated:<이유>' 로 철회하고,
  * QUEUED 작업은 BLOCKED(+ job_event), QUEUED 항목은 PLANNED 로 되돌린다(시작 전이라 외부 전송 없음). 승인 행은 지우지 않는다.
+ * FIX1-FULLREV(F2): 단, 이미 일부가 게시됐거나 게시 시도 표식이 있는 작업은 PLANNED 로 되돌리지 않고 UNKNOWN(thread_partial_revoked) — revokeActiveApprovalsLocked.
  */
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   AppError,
   canVariantTransition,
@@ -32,7 +33,7 @@ import {
   type VariantLifecycle,
 } from '@cs/domain';
 import { recordAudit, type DbOrTx } from './queries';
-import { approvals, channelAccounts, contents, distributionItems, distributionPlans, jobEvents, jobs, variants } from './schema';
+import { approvals, channelAccounts, contents, distributionItems, distributionPlans, jobEvents, jobs, remoteSteps, variants } from './schema';
 
 export type DistributionItemRow = typeof distributionItems.$inferSelect;
 export type ApprovalRow = typeof approvals.$inferSelect;
@@ -51,6 +52,7 @@ export type InvalidationReason =
  * 승인 무효화·철회가 곧바로 막는 항목 상태: 실행 전(PLANNED)·대기(QUEUED)·재시도 대기(RETRY_WAIT, T12 D19 — 다음 전송 시점이 아니라 즉시)·
  * 보류(BLOCKED — FIX-T12 P0: 편집은 보류 항목의 승인도 무효로 한다. D19(d) "재시도 재검사로만 막음"을 뒤집음, D20 후속).
  * 보류 항목의 작업은 BLOCKED 그대로 둔다(확정되지 않은 전송을 실행 가능한 상태로 되돌리지 않음) — 항목만 PLANNED(다시 승인·새 실행 키).
+ * FIX1-FULLREV(F2): 그 작업에 이미 게시된 단계·게시 시도 표식이 있으면 항목도 PLANNED 로 가지 않는다(작업·항목 UNKNOWN — revokeActiveApprovalsLocked).
  * 전송 단계(LEASED 이후)는 철회가 CANCEL_REQUESTED 로 추적한다.
  */
 export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT', 'BLOCKED'] as const;
@@ -215,12 +217,45 @@ export interface RevokedApproval {
   variantId: string;
   reason: string;
   blockedJobIds: string[];
+  /**
+   * FIX1-FULLREV(F2): 이미 원격에 일부가 게시됐거나(publish·video 단계) 실제 게시 시도 표식(publish_attempt)이 있어 BLOCKED·PLANNED 대신
+   * UNKNOWN(thread_partial_revoked)으로 둔 작업 — 이 항목은 실행 전(PLANNED)으로 돌아가지 않는다(다시 승인·실행으로 처음부터 다시 보내지 않음).
+   */
+  partialJobIds: string[];
+}
+
+/** FIX1-FULLREV(F2): 부분 게시 뒤 철회·무효로 남은 게시물을 보내지 않고 UNKNOWN 으로 둔 작업의 사유 코드(취소의 thread_partial_canceled 와 구분). */
+export const THREAD_PARTIAL_REVOKED_CODE = 'thread_partial_revoked';
+
+/**
+ * FIX1-FULLREV(F2): 작업의 원격 단계 중 게시된 단계(publish·video) 수와 게시 시도 표식(publish_attempt) 수.
+ * remote-steps.publishedStepCount 와 같은 조건 — 이 모듈은 schema·queries 만 import 하므로 여기서 직접 센다.
+ * FIX1-FULLREV(F2 후속2): "보내지 않고 멈춤"을 정하는 모든 곳(철회·무효 훅, cancelItem, 작업 처리기의 보내기 직전·결과·조회·lease 만료 복구 —
+ * jobs.ts stopUnlessPartial)이 이 판정 하나를 쓴다. 하나라도 있으면 그 수, 없으면 null. 있으면 "보내지 않음"(CANCELED·FAILED not_sent)·
+ * 실행 전(PLANNED)으로 두지 않는다 — 다시 승인·실행·새 계획의 새 작업은 단계 기록이 비어 있어 이미 게시된 부분을 처음부터 다시 게시한다(D26·A11).
+ * 컨테이너·업로드 세션 단계는 게시가 아니다(세지 않는다).
+ */
+export async function partialSendOf(tx: DbOrTx, ownerId: string, jobId: string): Promise<{ parts: number; attempts: number } | null> {
+  const rows = await tx
+    .select({
+      parts: sql<number>`count(*) filter (where ${remoteSteps.kind} in ('publish', 'video'))::int`,
+      attempts: sql<number>`count(*) filter (where ${remoteSteps.kind} = 'publish_attempt')::int`,
+    })
+    .from(remoteSteps)
+    .where(and(eq(remoteSteps.ownerId, ownerId), eq(remoteSteps.jobId, jobId)));
+  const parts = Number(rows[0]?.parts ?? 0);
+  const attempts = Number(rows[0]?.attempts ?? 0);
+  return parts > 0 || attempts > 0 ? { parts, attempts } : null;
 }
 
 /**
  * 잠근 항목들의 활성 승인을 철회한다(없으면 건너뜀). QUEUED·RETRY_WAIT 작업 → BLOCKED(+event), QUEUED·RETRY_WAIT 항목 → PLANNED
  * (아직 보내지 않았거나 보내지 않았음이 확인된 작업 — 다시 승인하거나 새 계획). T12(D19): RETRY_WAIT 도 다음 전송을 기다리지 않고 즉시 막는다(A10).
+ * FIX1-FULLREV(F2): 항목이 PLANNED 로 돌아갈 경우, 그 대기 작업(QUEUED·RETRY_WAIT, 보류 항목이면 최근 BLOCKED 작업)에 이미 게시된 단계(publish·video)나
+ * 게시 시도 표식(publish_attempt)이 있으면 cancelItem 과 같이 PLANNED 로 되돌리지 않는다 — 다시 승인·실행하면 새 작업이 이미 게시된 부분을
+ * 처음부터 다시 보내기 때문이다(D26·A11 맹목 재전송 금지). 그 작업은 cancel_partial 로 UNKNOWN(thread_partial_revoked), 항목도 UNKNOWN. 승인은 그대로 철회한다.
  * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록한다.
+ * FIX1-FULLREV(F2 후속): 단, 부분 게시가 있는 LEASED 작업의 항목은 PLANNED 로 두지 않는다(작업은 그대로 — beginSend 가 UNKNOWN 으로 정한다).
  * worker 의 전송 직전 재검사(beginSend)는 그대로 최종 방어선이다.
  */
 export async function revokeActiveApprovalsLocked(
@@ -247,27 +282,72 @@ export async function revokeActiveApprovalsLocked(
       .where(and(eq(approvals.id, a.id), eq(approvals.ownerId, ownerId), isNull(approvals.revokedAt)))
       .returning({ id: approvals.id });
     if (!updated[0]) continue;
-    const queued = await tx
+    const cause = audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated';
+    // FIX-T12(P0): 보류(BLOCKED) 항목도 PLANNED 로(작업은 BLOCKED 그대로 — retryItem 은 approval_required). 복원 표시가 있는 항목은 그대로 둔다
+    // (복원 전 결과를 이 환경에서 확인하기 전에는 다시 승인·실행하지 않는다).
+    const toPlanned = item.status === 'QUEUED' || item.status === 'RETRY_WAIT' || (item.status === 'BLOCKED' && !item.restoredNeedsReview);
+    const waiting = await tx
       .select({ id: jobs.id, state: jobs.state })
       .from(jobs)
       .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id), inArray(jobs.state, [...BLOCK_ON_REVOKE_JOB_STATES])))
       .orderBy(asc(jobs.id))
       .for('update');
-    for (const j of queued) {
-      await transitionJob(
-        tx,
-        ownerId,
-        j,
-        'blocked',
-        { event: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated', reason, approval_id: a.id, from: j.state },
-        now,
-        { leaseOwner: null, leaseUntil: null, lastErrorCode: audit.action === 'approval.revoke' ? 'approval_revoked' : 'approval_invalidated' },
-      );
+    // FIX1-FULLREV(F2): 보류 항목을 PLANNED 로 보낼 때는 그 항목의 최근 작업(BLOCKED — retryItem·cancelItem 이 보는 작업)도 부분 게시를 확인한다.
+    if (toPlanned && item.status === 'BLOCKED') {
+      const latest = await tx
+        .select({ id: jobs.id, state: jobs.state })
+        .from(jobs)
+        .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id)))
+        .orderBy(desc(jobs.createdAt), desc(jobs.id))
+        .limit(1)
+        .for('update');
+      if (latest[0]?.state === 'BLOCKED') waiting.push(latest[0]);
     }
-    // FIX-T12(P0): 보류(BLOCKED) 항목도 PLANNED 로(작업은 BLOCKED 그대로 — retryItem 은 approval_required). 복원 표시가 있는 항목은 그대로 둔다
-    // (복원 전 결과를 이 환경에서 확인하기 전에는 다시 승인·실행하지 않는다).
-    const toPlanned = item.status === 'QUEUED' || item.status === 'RETRY_WAIT' || (item.status === 'BLOCKED' && !item.restoredNeedsReview);
+    const queued: typeof waiting = [];
+    const partial: Array<{ id: string; parts: number; attempts: number }> = [];
+    for (const j of waiting) {
+      // FIX1-FULLREV(F2): cancelItem(jobs.ts) 과 같은 판정 — 이미 게시된 단계(publish·video)나 결과를 모르는 게시 시도 표식(publish_attempt)이 있으면
+      // "보내지 않음"·PLANNED(다시 승인 → 새 작업이 처음부터 다시 게시)로 두지 않는다. 남은 부분은 보내지 않고 UNKNOWN — 단계 목록이 게시된 범위를 보여 준다.
+      // 복원 표시 항목처럼 PLANNED 로 가지 않는 항목은 지금 규칙 그대로(BLOCKED 만 — 다시 승인할 길이 없다).
+      const c = toPlanned ? await partialSendOf(tx, ownerId, j.id) : null;
+      if (c) {
+        // FIX1-FULLREV(F2 후속2): cancelRequestedAt 은 사용자 철회(approval_revoked — revokeApproval 이 진행 중 작업에 취소 요청도 기록하는 그 동작)에만 쓴다.
+        // 무효(approval_invalidated — 편집·계정·브랜드 변경)는 아무도 취소를 요청하지 않았다 — 쓰면 나중에 CONFIRMED 가 됐을 때 화면이 "취소 불가(이미 전송됨)".
+        await transitionJob(
+          tx,
+          ownerId,
+          j,
+          'cancel_partial',
+          { event: cause, cause, reason, approval_id: a.id, from: j.state, not_sent: false, published_parts: c.parts, publish_attempts: c.attempts },
+          now,
+          { leaseOwner: null, leaseUntil: null, ...(cause === 'approval_revoked' ? { cancelRequestedAt: now } : {}), lastErrorCode: THREAD_PARTIAL_REVOKED_CODE },
+        );
+        partial.push({ id: j.id, ...c });
+        continue;
+      }
+      if (j.state === 'BLOCKED') continue; // 보류 작업은 BLOCKED 그대로(FIX-T12)
+      await transitionJob(tx, ownerId, j, 'blocked', { event: cause, reason, approval_id: a.id, from: j.state }, now, { leaseOwner: null, leaseUntil: null, lastErrorCode: cause });
+      queued.push(j);
+    }
+    // FIX1-FULLREV(F2 후속): lease 만 잡고 아직 보내기 전인 작업(LEASED — leaseJobs 는 항목 상태를 바꾸지 않아 항목은 QUEUED·RETRY_WAIT 로 보인다)도
+    // 부분 게시를 확인한다. 있으면 항목을 PLANNED 로 두지 않는다(그 사이 다시 승인·실행하면 새 작업이 이미 게시된 부분을 처음부터 다시 게시).
+    // 작업은 전송 단계라 여기서 건드리지 않는다 — 보내기 직전 재검사(beginSend, lease 만료 복구 뒤에도)가 UNKNOWN(thread_partial_revoked)으로 정한다.
+    // FIX1-FULLREV(F2 후속2): 보내기 전 lease 만료가 한도에 이르러도 FAILED 가 아니라 UNKNOWN(thread_partial_stopped) — jobs.ts stopUnlessPartial.
+    let leasedPartial = 0;
     if (toPlanned) {
+      const leased = await tx
+        .select({ id: jobs.id })
+        .from(jobs)
+        .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id), eq(jobs.state, 'LEASED')))
+        .orderBy(asc(jobs.id));
+      for (const j of leased) {
+        if (await partialSendOf(tx, ownerId, j.id)) leasedPartial++;
+      }
+    }
+    if (partial.length > 0) {
+      // 항목은 작업을 따른다(cancelItem 의 settle 과 같음 — UNKNOWN). 계획 상태는 호출자가 다시 계산한다.
+      await syncItemStatus(tx, ownerId, item.id, 'UNKNOWN', now);
+    } else if (toPlanned && leasedPartial === 0) {
       await tx
         .update(distributionItems)
         .set({ status: 'PLANNED', updatedAt: now })
@@ -279,10 +359,30 @@ export async function revokeActiveApprovalsLocked(
       entity: 'approval',
       entityId: a.id,
       versionOrHash: a.payloadHash,
-      details: { item_id: item.id, reason, blocked_jobs: queued.length, item_status_before: item.status },
+      details: {
+        item_id: item.id,
+        reason,
+        blocked_jobs: queued.length,
+        item_status_before: item.status,
+        // FIX1-FULLREV(F2): 부분 게시로 UNKNOWN 에 둔 작업(PLANNED 로 되돌리지 않음)
+        partial: partial.length > 0,
+        partial_jobs: partial.length,
+        published_parts: partial.reduce((n, p) => n + p.parts, 0),
+        publish_attempts: partial.reduce((n, p) => n + p.attempts, 0),
+        // FIX1-FULLREV(F2 후속): 부분 게시가 있는 lease 된(보내기 전) 작업 — 항목을 PLANNED 로 두지 않음(보내기 직전 재검사가 UNKNOWN 으로 정함)
+        leased_partial_jobs: leasedPartial,
+      },
       at: now,
     });
-    out.push({ approvalId: a.id, itemId: item.id, planId: item.planId, variantId: item.variantId, reason, blockedJobIds: queued.map((j) => j.id) });
+    out.push({
+      approvalId: a.id,
+      itemId: item.id,
+      planId: item.planId,
+      variantId: item.variantId,
+      reason,
+      blockedJobIds: queued.map((j) => j.id),
+      partialJobIds: partial.map((p) => p.id),
+    });
   }
   return out;
 }

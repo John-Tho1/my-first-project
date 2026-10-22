@@ -7,9 +7,8 @@
  * - 전사 목록: 진행 중 작업이 있으면 1.5초마다 GET(inline worker 가 그때 한 단계씩 진행).
  */
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { resumeDecision, Sha256, startPolling, type ServerSessionLike } from '../../lib/upload-client';
+import { resumeDecision, Sha256, startPolling, uploadTargetFor, type ServerSessionLike } from '../../lib/upload-client';
 
-const ALLOWED = ['audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'video/mp4', 'video/webm', 'video/quicktime'];
 const STATE_LABEL: Record<string, string> = {
   queued: '대기',
   running: '전사 중',
@@ -164,8 +163,9 @@ export default function RecordClient() {
   async function upload() {
     if (!file) return;
     setError('');
-    const mime = file.type.toLowerCase();
-    if (!ALLOWED.includes(mime)) {
+    // FIX1-FULLREV(F3): File.type 을 그대로 비교하지 않는다 — 별칭(audio/x-m4a 등)·빈 형식(확장자로 추정)을 정본으로 바꿔 보낸다.
+    const target = uploadTargetFor(file);
+    if (!target) {
       setError('지원하지 않는 음성·영상 형식입니다. MP3·M4A·WAV·WebM·MP4·MOV 파일을 고르세요.');
       return;
     }
@@ -182,7 +182,7 @@ export default function RecordClient() {
       } else {
         const created = await call<{ session: SessionView }>(
           '/api/uploads/sessions',
-          jsonInit('POST', { kind: mime.startsWith('audio/') ? 'audio' : 'video', mime, bytes: file.size, sha256, chunk_size: CHUNK_BYTES }),
+          jsonInit('POST', { kind: target.kind, mime: target.mime, bytes: file.size, sha256, chunk_size: CHUNK_BYTES }),
         );
         session = created.session;
         writeStored(key, session.id);

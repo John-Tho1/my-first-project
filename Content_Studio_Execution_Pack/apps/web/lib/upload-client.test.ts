@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { createSequencer, pollDelay, resumeDecision, Sha256, startPolling } from './upload-client';
+import { createSequencer, pollDelay, resumeDecision, Sha256, startPolling, uploadTargetFor } from './upload-client';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 const nodeSha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const bytes = (n: number, seed = 1) => {
@@ -177,5 +182,44 @@ describe('폴링 간격·루프(실패해도 계속)', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(t.q.map((x) => x.ms)).toEqual([1500]);
     p.stop();
+  });
+});
+
+describe('FIX1-FULLREV(F3): 고른 파일 → 세션 생성 형식(uploadTargetFor)', () => {
+  it('브라우저 별칭·매개변수는 서버와 같은 정본으로, 종류도 정본 기준', () => {
+    expect(uploadTargetFor({ type: 'audio/x-m4a', name: 'Voice Memo.m4a' })).toEqual({ kind: 'audio', mime: 'audio/mp4' });
+    expect(uploadTargetFor({ type: 'audio/m4a', name: 'a.m4a' })).toEqual({ kind: 'audio', mime: 'audio/mp4' });
+    expect(uploadTargetFor({ type: 'audio/x-wav', name: 'a.wav' })).toEqual({ kind: 'audio', mime: 'audio/wav' });
+    expect(uploadTargetFor({ type: 'audio/wave', name: 'a.wav' })).toEqual({ kind: 'audio', mime: 'audio/wav' });
+    expect(uploadTargetFor({ type: 'audio/vnd.wave', name: 'a.wav' })).toEqual({ kind: 'audio', mime: 'audio/wav' });
+    expect(uploadTargetFor({ type: 'audio/mp3', name: 'a.mp3' })).toEqual({ kind: 'audio', mime: 'audio/mpeg' });
+    expect(uploadTargetFor({ type: 'audio/x-mpeg', name: 'a.mp3' })).toEqual({ kind: 'audio', mime: 'audio/mpeg' });
+    expect(uploadTargetFor({ type: 'video/x-m4v', name: 'a.m4v' })).toEqual({ kind: 'video', mime: 'video/mp4' });
+    expect(uploadTargetFor({ type: 'Audio/WebM;codecs=opus', name: 'rec.weba' })).toEqual({ kind: 'audio', mime: 'audio/webm' });
+    expect(uploadTargetFor({ type: 'video/quicktime', name: 'IMG_1.MOV' })).toEqual({ kind: 'video', mime: 'video/quicktime' });
+  });
+
+  it('File.type 이 비어 있으면(또는 octet-stream) 확장자로 추정한다', () => {
+    expect(uploadTargetFor({ type: '', name: 'memo.m4a' })).toEqual({ kind: 'audio', mime: 'audio/mp4' });
+    expect(uploadTargetFor({ type: '', name: 'take.WAV' })).toEqual({ kind: 'audio', mime: 'audio/wav' });
+    expect(uploadTargetFor({ type: '', name: 'song.mp3' })).toEqual({ kind: 'audio', mime: 'audio/mpeg' });
+    expect(uploadTargetFor({ type: '', name: 'clip.mov' })).toEqual({ kind: 'video', mime: 'video/quicktime' });
+    expect(uploadTargetFor({ type: 'application/octet-stream', name: 'clip.webm' })).toEqual({ kind: 'video', mime: 'video/webm' });
+  });
+
+  it('지원하지 않는 형식은 null — 신고 형식이 목록 밖이면 확장자로 덮어쓰지 않는다', () => {
+    expect(uploadTargetFor({ type: 'image/png', name: 'x.mp3' })).toBeNull();
+    expect(uploadTargetFor({ type: 'audio/aac', name: 'x.m4a' })).toBeNull();
+    expect(uploadTargetFor({ type: 'video/x-matroska', name: 'x.webm' })).toBeNull();
+    expect(uploadTargetFor({ type: '', name: 'notes.txt' })).toBeNull();
+    expect(uploadTargetFor({ type: '', name: 'noext' })).toBeNull();
+  });
+
+  it('/record 화면은 File.type 을 직접 비교하지 않고 uploadTargetFor 의 정본을 보낸다', () => {
+    const src = readFileSync(path.join(here, '..', 'app', 'record', 'RecordClient.tsx'), 'utf8');
+    expect(src).toMatch(/uploadTargetFor\(file\)/);
+    expect(src).toMatch(/mime: target\.mime/);
+    expect(src).toMatch(/kind: target\.kind/);
+    expect(src).not.toMatch(/file\.type/);
   });
 });

@@ -156,10 +156,12 @@ export const SEARCH_TYPES = ['all', 'captures', 'contents', 'ideas'] as const;
 export const searchTypeSchema = z.enum(SEARCH_TYPES);
 export type SearchType = z.infer<typeof searchTypeSchema>;
 
-const dateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '날짜는 YYYY-MM-DD 형식입니다').refine(
-  (s) => !Number.isNaN(Date.parse(`${s}T00:00:00Z`)),
-  '날짜가 올바르지 않습니다',
-);
+// FIX1-FULLREV(F7): Date.parse 는 없는 날(2026-02-30·04-31)을 다음 달로 넘겨 NaN 을 주지 않는다 → 되읽어 같은 날짜인지 확인한다
+// (scheduleFromMsk 의 "2월 30일 거부"와 같은 엄격함). 윤년 2월 29일(2028-02-29)은 받는다.
+const dateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '날짜는 YYYY-MM-DD 형식입니다').refine((s) => {
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === s;
+}, '날짜가 올바르지 않습니다');
 
 /** GET /api/search 쿼리. 빈 문자열 값은 "지정 안 함"으로 본다(parseSearchParams). */
 export const searchQuerySchema = z

@@ -865,7 +865,14 @@ export async function revokeApproval(db: Db, ownerId: string, approvalId: string
     await settleApprovedVariants(tx, ownerId, [item.variantId], 'review', now);
     await recomputePlanStatus(tx, ownerId, item.planId, now);
     const after = await tx.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
-    return { approval: after[0]!, planId: item.planId, blockedJobIds: revoked[0]?.blockedJobIds ?? [], cancelRequestedJobIds };
+    // FIX1-FULLREV(F2): partialJobIds = 이미 일부가 게시돼(또는 게시 시도 표식) PLANNED 대신 UNKNOWN 으로 둔 작업(이 항목은 실행 전으로 돌아가지 않음).
+    return {
+      approval: after[0]!,
+      planId: item.planId,
+      blockedJobIds: revoked[0]?.blockedJobIds ?? [],
+      partialJobIds: revoked[0]?.partialJobIds ?? [],
+      cancelRequestedJobIds,
+    };
   });
 }
 

@@ -82,11 +82,13 @@ import {
   activeApprovalsFor,
   lockAccountsInOrder,
   lockItemsInOrder,
+  partialSendOf,
   recomputePlanStatus,
   requestCancelLocked,
   revokeActiveApprovalsLocked,
   settleApprovedVariants,
   syncItemStatus,
+  THREAD_PARTIAL_REVOKED_CODE,
   transitionJob,
   type DistributionItemRow,
   type JobRow,
@@ -300,6 +302,87 @@ async function settle(
 
 const CLEAR_LEASE = { leaseOwner: null, leaseUntil: null } as const;
 
+/** 취소 요청 뒤 스레드 일부가 이미 게시돼 남은 부분을 보내지 않고 UNKNOWN 으로 둔 작업의 사유 코드(조회·보내기 직전·결과·lease 만료 복구 공통). */
+const THREAD_PARTIAL_CANCEL_REQUESTED_CODE = 'thread_partial_cancel_requested';
+/** 시작 전 작업(QUEUED·RETRY_WAIT·BLOCKED)의 사용자 취소 — 스레드 일부가 이미 게시돼 남은 부분을 보내지 않고 UNKNOWN(cancelItem). */
+const THREAD_PARTIAL_CANCELED_CODE = 'thread_partial_canceled';
+/**
+ * FIX1-FULLREV(F2 후속2): 작업 처리기가 보내기 전에 스스로 멈춤(시도 한도 attempts_exhausted·보내기 전 lease 만료 한도·검증 실패) — 앞선 시도가 스레드 일부를
+ * 게시했거나 게시 시도 표식이 있어 FAILED("보내지 않음")가 아니라 UNKNOWN. 남은 부분은 보내지 않는다(새 계획이 처음부터 다시 게시하지 않게).
+ */
+const THREAD_PARTIAL_STOPPED_CODE = 'thread_partial_stopped';
+
+type TransitionSet = Parameters<typeof transitionJob>[6];
+
+/**
+ * FIX1-FULLREV(F2 후속·후속2): 부분 게시 작업을 보내지 않고 멈출 때의 결과 — 남은 부분은 보내지 않고 UNKNOWN(code, 항목도 UNKNOWN — PLANNED 덮어쓰기 없음).
+ * 상태별로 JOB_TRANSITIONS 에 이미 있는 전이만 쓴다(새 전이 없음):
+ * - CANCEL_REQUESTED → reconcile_unsupported(UNKNOWN) — 조회의 같은 경우(applyReconcile resumable)와 같은 모양, 사건의 reason 은 code.
+ * - LEASED → blocked(BLOCKED — 멈춘 사유 reason 을 이력에 남김) → cancel_partial(UNKNOWN) 두 단계(같은 트랜잭션 — LEASED 에는 cancel_partial 이 없다).
+ * - QUEUED·RETRY_WAIT·BLOCKED → cancel_partial(UNKNOWN, cause = reason). 그 밖의 상태는 전이 표가 막는다(IllegalJobTransitionError).
+ * set 은 첫 전이에 함께 바꿀 열(lease 만료 횟수 등). 사건에는 not_sent:false 와 게시된 단계·게시 시도 표식 수를 남긴다.
+ * FIX1-FULLREV(F2 후속2): cancelRequestedAt 은 정말 취소인 멈춤(사용자 취소 thread_partial_canceled·취소 요청 thread_partial_cancel_requested)에만 쓴다.
+ * 승인 철회·무효(thread_partial_revoked)·작업 처리기의 멈춤(thread_partial_stopped)은 아무도 취소를 요청하지 않았다 — 쓰면 나중에 사용자 확인·재확인으로
+ * CONFIRMED 가 됐을 때 화면이 "취소 불가(이미 전송됨)"라고 잘못 말한다(page.tsx cancelTooLate).
+ */
+async function settlePartialStop(
+  tx: DbOrTx,
+  ownerId: string,
+  job: Pick<JobRow, 'id' | 'state'>,
+  item: DistributionItemRow,
+  reason: string,
+  details: Record<string, unknown>,
+  partial: { parts: number; attempts: number },
+  code: string,
+  now: Date,
+  set: TransitionSet = {},
+): Promise<JobState> {
+  const counts = { not_sent: false, published_parts: partial.parts, publish_attempts: partial.attempts };
+  // FIX1-FULLREV(F2 후속2): 취소인 멈춤만 cancelRequestedAt(위 설명)
+  const cancelMark = code === THREAD_PARTIAL_CANCELED_CODE || code === THREAD_PARTIAL_CANCEL_REQUESTED_CODE ? { cancelRequestedAt: now } : {};
+  switch (job.state) {
+    case 'CANCEL_REQUESTED':
+      return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...details, reason: code, ...counts }, now, { ...set, ...CLEAR_LEASE, lastErrorCode: code });
+    case 'LEASED': {
+      const blocked = await settle(tx, ownerId, job, item, 'blocked', { ...details, reason, ...counts }, now, { ...set, ...CLEAR_LEASE, lastErrorCode: reason });
+      return settle(tx, ownerId, { id: job.id, state: blocked }, item, 'cancel_partial', { cause: reason, ...counts }, now, {
+        ...CLEAR_LEASE,
+        ...cancelMark,
+        lastErrorCode: code,
+      });
+    }
+    default:
+      return settle(tx, ownerId, job, item, 'cancel_partial', { ...details, cause: reason, ...counts }, now, {
+        ...set,
+        ...CLEAR_LEASE,
+        ...cancelMark,
+        lastErrorCode: code,
+      });
+  }
+}
+
+/**
+ * FIX1-FULLREV(F2 후속2): "보내지 않고 멈춤"(취소 요청·승인 철회·무효·시도 한도·보내기 전 lease 만료 한도·검증 실패)의 공용 규칙 — 작업 처리기의
+ * 모든 멈춤 결정이 이 함수 하나를 거친다. 작업에 게시된 단계(publish·video)나 게시 시도 표식(publish_attempt)이 있으면(partialSendOf — 조회가 센
+ * 게시물 수 reportedParts 도 함께) "보내지 않음"(CANCELED·FAILED not_sent)·실행 전(PLANNED)으로 두지 않고 settlePartialStop 으로 UNKNOWN(stop.code).
+ * 없으면 notSent() — 호출자가 지금까지 하던 결정 그대로(게시된 것이 없는 작업은 어디서나 전과 같다).
+ */
+async function stopUnlessPartial(
+  tx: DbOrTx,
+  ownerId: string,
+  job: Pick<JobRow, 'id' | 'state'>,
+  item: DistributionItemRow,
+  stop: { reason: string; code: string; details?: Record<string, unknown>; set?: TransitionSet; reportedParts?: number },
+  now: Date,
+  notSent: () => Promise<JobState>,
+): Promise<JobState> {
+  const found = await partialSendOf(tx, ownerId, job.id);
+  const parts = Math.max(found?.parts ?? 0, stop.reportedParts ?? 0);
+  const attempts = found?.attempts ?? 0;
+  if (parts === 0 && attempts === 0) return notSent();
+  return settlePartialStop(tx, ownerId, job, item, stop.reason, stop.details ?? {}, { parts, attempts }, stop.code, now, stop.set);
+}
+
 /** LIVEP1-DIAG: 진단을 이력 필드로(허용 목록 통과분만, 없으면 빈 객체). */
 function providerDiagDetail(d: unknown): { provider_diag?: ThreadsDiag } {
   const s = sanitizeThreadsDiag(d);
@@ -418,11 +501,16 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
           // (마지막 남은 시도도 잃지 않는다). 보내기 전에 되풀이해 죽는 작업은 별도 횟수(lease_expired_before_intent)가 한도에 이르면 FAILED.
           const expiries = job.leaseExpiredBeforeIntent + 1;
           if (expiries >= PRE_INTENT_EXPIRY_LIMIT) {
-            await settle(tx, e.ownerId, job, item, 'permanent_failure', { ...base, reason: 'lease_expired_before_intent', expiries, not_sent: true }, now, {
-              ...CLEAR_LEASE,
-              lastErrorCode: 'lease_expired_before_intent',
-              leaseExpiredBeforeIntent: expiries,
-            });
+            // FIX1-FULLREV(F2 후속2): 이번 lease 에서는 보내지 않았어도 앞선 시도가 스레드 일부를 게시했거나 게시 시도 표식이 있으면 FAILED("보내지 않음")가
+            // 아니라 UNKNOWN(thread_partial_stopped) — 남은 부분은 보내지 않고, 새 계획이 처음부터 다시 게시하지 않게(stopUnlessPartial).
+            const stop = { reason: 'lease_expired_before_intent', code: THREAD_PARTIAL_STOPPED_CODE, details: { ...base, expiries }, set: { leaseExpiredBeforeIntent: expiries } };
+            await stopUnlessPartial(tx, e.ownerId, job, item, stop, now, () =>
+              settle(tx, e.ownerId, job, item, 'permanent_failure', { ...base, reason: 'lease_expired_before_intent', expiries, not_sent: true }, now, {
+                ...CLEAR_LEASE,
+                lastErrorCode: 'lease_expired_before_intent',
+                leaseExpiredBeforeIntent: expiries,
+              }),
+            );
             return true;
           }
           await settle(tx, e.ownerId, job, item, 'lease_expired_before_intent', { ...base, expiries }, now, {
@@ -442,7 +530,11 @@ export async function recoverExpiredLeases(db: Db, opts: { now: Date; ownerId?: 
         case 'CANCEL_REQUESTED':
           // 취소 요청이 전송 시작 전(LEASED·QUEUED)에 들어왔으면 이번 lease 에서는 보내지 않았다(attempt 는 의도를 쓸 때만 오르므로 의도 유무로 판단하지 않는다).
           if (await cancelRequestedBeforeSend(tx, job.id)) {
-            await settle(tx, e.ownerId, job, item, 'canceled', { ...base, not_sent: true, cause: 'lease_expired' }, now);
+            // FIX1-FULLREV(F2 후속): 이번 lease 에서는 보내지 않았어도 앞선 시도가 스레드 일부를 게시했으면 "보내지 않음"(CANCELED)이라고 하지 않는다 — UNKNOWN.
+            const stop = { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: { ...base, cause: 'lease_expired' } };
+            await stopUnlessPartial(tx, e.ownerId, job, item, stop, now, () =>
+              settle(tx, e.ownerId, job, item, 'canceled', { ...base, not_sent: true, cause: 'lease_expired' }, now),
+            );
           } else {
             await settle(tx, e.ownerId, job, item, 'lease_expired_after_intent', base, now, { ...CLEAR_LEASE, nextRunAt: now });
           }
@@ -703,13 +795,20 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     // 취소 요청(lease 뒤, 보내기 전) → 보내지 않고 CANCELED.
     if (job.state === 'CANCEL_REQUESTED' || job.cancelRequestedAt) {
       if (job.state !== 'LEASED' && job.state !== 'CANCEL_REQUESTED') return 'lease_lost' as const;
-      return settle(tx, ownerId, job, item, 'canceled', { not_sent: true, attempt: job.attempt }, now);
+      // FIX1-FULLREV(F2 후속): 앞선 시도가 스레드 일부를 게시했으면(예: lease 와 이 재검사 사이의 사용자 철회·취소) 취소 성공이라고 하지 않는다 — UNKNOWN.
+      const stop = { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: { attempt: job.attempt } };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () => settle(tx, ownerId, job, item, 'canceled', { not_sent: true, attempt: job.attempt }, now));
     }
     if (job.state !== 'LEASED') return 'lease_lost' as const;
     const approval = active.get(item.id);
     if (!approval || approval.payloadHash !== item.payloadHash) {
       // A10: 승인이 없거나 바뀌었으면 다음 외부 전송을 막는다. 아직 보내지 않았으므로 항목은 PLANNED(다시 승인 가능, T10 과 같은 규칙).
-      return settle(tx, ownerId, job, item, 'blocked', { reason: 'approval_missing', attempt: job.attempt }, now, { ...CLEAR_LEASE, lastErrorCode: 'approval_missing' }, 'PLANNED');
+      // FIX1-FULLREV(F2 후속): 단, 앞선 시도가 스레드 일부를 게시한 작업(재개 대기 뒤 lease — 철회 훅이 lease 된 작업을 보기 전 경합 등)은
+      // PLANNED 로 두지 않는다(다시 승인·실행하면 새 작업이 처음부터 다시 게시). 남은 부분은 보내지 않고 UNKNOWN(thread_partial_revoked).
+      const stop = { reason: 'approval_missing', code: THREAD_PARTIAL_REVOKED_CODE, details: { attempt: job.attempt } };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(tx, ownerId, job, item, 'blocked', { reason: 'approval_missing', attempt: job.attempt }, now, { ...CLEAR_LEASE, lastErrorCode: 'approval_missing' }, 'PLANNED'),
+      );
     }
     // 예약 시각 경과는 예약 작업이 실행될 때 당연하므로 제외한다.
     const problems = (await snapshotProblems(tx, ownerId, item, now)).filter((p) => p !== 'schedule_passed');
@@ -717,16 +816,21 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
       const reason = invalidationReasonOf(problems);
       await revokeActiveApprovalsLocked(tx, ownerId, [item], () => `invalidated:${reason}`, now, { action: 'approval.invalidate' });
       await settleApprovedVariants(tx, ownerId, [item.variantId], reason === 'account_changed' ? 'review' : 'draft', now);
-      return settle(
-        tx,
-        ownerId,
-        job,
-        item,
-        'blocked',
-        { reason: 'snapshot_stale', problems: problems.slice(0, 8), attempt: job.attempt },
-        now,
-        { ...CLEAR_LEASE, lastErrorCode: 'snapshot_stale' },
-        'PLANNED',
+      // FIX1-FULLREV(F2 후속): 앞선 시도가 스레드 일부를 게시한 작업(조회 중 편집 → 이어 보내기 뒤 lease 등 — 진행 중 항목은 편집 훅이 승인을 두므로
+      // 여기서 처음 무효가 된다)은 PLANNED 로 두지 않는다. 승인은 위에서 무효로 하고, 남은 부분은 보내지 않고 UNKNOWN(thread_partial_revoked).
+      const stop = { reason: 'snapshot_stale', code: THREAD_PARTIAL_REVOKED_CODE, details: { problems: problems.slice(0, 8), attempt: job.attempt } };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(
+          tx,
+          ownerId,
+          job,
+          item,
+          'blocked',
+          { reason: 'snapshot_stale', problems: problems.slice(0, 8), attempt: job.attempt },
+          now,
+          { ...CLEAR_LEASE, lastErrorCode: 'snapshot_stale' },
+          'PLANNED',
+        ),
       );
     }
     // T21-P2(docs/07): 서버·작업 처리기가 오래 멈췄다 돌아온 뒤 오래 지난 예약을 자동으로 보내지 않는다 — 첫 전송(attempt 0)만, 보내지 않은 채 BLOCKED.
@@ -798,18 +902,28 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     const snapshot = snapshotOf(item, acc, vRows[0]?.channel ?? acc.platform);
     const valid = adapter.validate(snapshot);
     if (!valid.ok) {
-      return settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'validate_failed', error_code: valid.error_code }, now, {
-        ...CLEAR_LEASE,
-        lastErrorCode: valid.error_code,
-        lastRetryClass: 'permanent',
-      });
+      // FIX1-FULLREV(F2 후속2): 앞선 시도가 같은 스냅샷으로 이미 일부를 게시했는데 이제 검증이 실패(어댑터 규칙 변경 등)하면 FAILED 가 아니라
+      // UNKNOWN(thread_partial_stopped) — 실제 게시 FAILED 문구는 "게시되지 않음이 확인된 실패"라서 게시 시도 표식이 있는 작업에 맞지 않는다.
+      const stop = { reason: 'validate_failed', code: THREAD_PARTIAL_STOPPED_CODE, details: { error_code: valid.error_code, attempt: job.attempt } };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'validate_failed', error_code: valid.error_code }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: valid.error_code,
+          lastRetryClass: 'permanent',
+        }),
+      );
     }
     // FIX-T11 round 2(P1): 시도는 여기서(전송 의도와 같은 트랜잭션) 센다. 한도를 다 쓴 작업은 보내지 않고 FAILED.
+    // FIX1-FULLREV(F2 후속2): 단, 앞선 시도가 스레드 일부를 게시했거나 게시 시도 표식이 있으면(예: 마지막 시도로 이어 보내기) FAILED("보내지 않음")가 아니라
+    // UNKNOWN(thread_partial_stopped) — 남은 부분은 보내지 않고, "새 배포 계획"이 처음부터 다시 게시하지 않게(stopUnlessPartial).
     if (countedAttempts(job) >= job.maxAttempts) {
-      return settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'attempts_exhausted', not_sent: true, attempt: job.attempt }, now, {
-        ...CLEAR_LEASE,
-        lastErrorCode: 'attempts_exhausted',
-      });
+      const stop = { reason: 'attempts_exhausted', code: THREAD_PARTIAL_STOPPED_CODE, details: { attempt: job.attempt } };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(tx, ownerId, job, item, 'permanent_failure', { reason: 'attempts_exhausted', not_sent: true, attempt: job.attempt }, now, {
+          ...CLEAR_LEASE,
+          lastErrorCode: 'attempts_exhausted',
+        }),
+      );
     }
     const mockScenario = acc.kind === 'mock' ? await mockScenarioFor(tx, ownerId, item.id) : null;
     // T14(D26): 계정별 로컬 요청 제한(잠정값, capabilities.rate_limit). 넘으면 전송 의도를 만들지 않고 창이 풀리는 시각까지 RETRY_WAIT.
@@ -998,6 +1112,18 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
       ...providerDiagDetail(result.provider_diag),
     };
     const common = { ...CLEAR_LEASE, lastErrorCode: result.error_code ?? null, lastRetryClass: cls.retryClass };
+    // FIX1-FULLREV(F2 후속2): 취소 요청 중 이번 시도가 거절로 끝남 — 어댑터는 게시물 사이에서 취소를 보지 않으므로 이 시도(또는 앞선 시도)가 스레드 일부를
+    // 게시했거나 게시 시도 표식을 남겼을 수 있다. 그러면 "보내지 않음"(CANCELED)이라고 하지 않고 남은 부분은 보내지 않은 채 UNKNOWN(stopUnlessPartial).
+    const canceledUnlessPartial = () =>
+      stopUnlessPartial(
+        tx,
+        ownerId,
+        job,
+        item,
+        { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: base, set: common },
+        now,
+        () => settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common),
+      );
     const isMock = plan.adapter.kind === 'mock';
     if (!cancel && !isMock && result.status === 'rejected' && result.error_code === LIVE_PUBLISH_PAUSED_STEP_CODE) {
       // FIX-LIVEP2(D39 즉시 중지 · 리뷰 P2 jobs.ts:900): 전송 시작 뒤·게시 시도 표식 전에 중지가 커밋됨 — 표식 트랜잭션이 거절해 게시 요청을 보내지 않았다
@@ -1052,7 +1178,7 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         if (cancel) return settle(tx, ownerId, job, item, 'reconcile_retry', { ...base, remote: 'processing' }, now, { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS) });
         return settle(tx, ownerId, job, item, 'remote_accepted', base, now, { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS), reconcileCount: 0 });
       case 'transient_failure': {
-        if (cancel) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
+        if (cancel) return canceledUnlessPartial();
         // T15(D27): 원격이 정한 다음 시각(할당량 초기화 등)이 있으면 그 시각까지 기다린다(Retry-After 1시간 상한 대신, 시도 한도는 그대로).
         const retryAt = result.retry_at ? new Date(result.retry_at) : null;
         const d =
@@ -1063,10 +1189,10 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         return settle(tx, ownerId, job, item, 'permanent_failure', { ...base, reason: d.reason }, now, common);
       }
       case 'permanent_failure':
-        if (cancel) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
+        if (cancel) return canceledUnlessPartial();
         return settle(tx, ownerId, job, item, 'permanent_failure', base, now, common);
       case 'blocked':
-        if (cancel) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
+        if (cancel) return canceledUnlessPartial();
         return settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'auth' }, now, common);
       case 'ambiguous':
       default:
@@ -1189,12 +1315,12 @@ async function applyReconcile(
     // 재사용해 이어 보낸다(새 컨테이너·재게시 없음). 이미 게시된 앞부분은 다시 보내지 않는다.
     const parts = r.published_parts ?? 0;
     if (job.state === 'CANCEL_REQUESTED') {
-      if (parts === 0) return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true, published_parts: 0 }, now, common);
       // 스레드 일부가 이미 게시됨 — 취소 성공이라고 하지 않고(A11) 남은 부분도 보내지 않는다. UNKNOWN(사유 thread_partial_cancel_requested) — 사용자 확인.
-      return settle(tx, ownerId, job, item, 'reconcile_unsupported', { ...base, reason: 'thread_partial_cancel_requested', published_parts: parts }, now, {
-        ...common,
-        lastErrorCode: 'thread_partial_cancel_requested',
-      });
+      // FIX1-FULLREV(F2 후속2): 조회가 센 게시물 수(parts)와 단계 기록(게시·게시 시도 표식)을 함께 본다(stopUnlessPartial) — 어느 쪽이든 있으면 UNKNOWN.
+      const stop = { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: base, set: common, reportedParts: parts };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true, published_parts: 0 }, now, common),
+      );
     }
     if (job.state === 'RECONCILING' || job.state === 'REMOTE_PROCESSING') {
       // FIX-T14(Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING) 뒤의 재개는 장애가 아니다 — 시도 한도에서 뺀다(resume_count + 1,
@@ -1218,7 +1344,11 @@ async function applyReconcile(
   }
   if (r.status === 'not_found' && caps.definitive_not_found && job.state !== 'REMOTE_PROCESSING') {
     await fillIntent(tx, ownerId, intent, 'rejected', { error_code: 'not_found_on_remote' }, now, 'reconcile');
-    if (job.state === 'CANCEL_REQUESTED') return settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common);
+    if (job.state === 'CANCEL_REQUESTED') {
+      // FIX1-FULLREV(F2 후속2): 이번 시도의 원격 객체가 확실히 없어도 단계 기록에 게시된 단계·게시 시도 표식이 있으면 "보내지 않음"(CANCELED)이 아니라 UNKNOWN.
+      const stop = { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: base, set: common };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () => settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common));
+    }
     // 원격에 확실히 없음 → 다시 보내도 된다(새 시도 = 새 전송 의도). 시도 한도 안에서만.
     const d = decideRetry(countedAttempts(job), job.maxAttempts, null, now, opts.random ?? Math.random);
     if (d.retry) return settle(tx, ownerId, job, item, 'reconciled_not_found', { ...base, next_run_at: d.nextRunAt.toISOString() }, now, { ...common, nextRunAt: d.nextRunAt });
@@ -1314,12 +1444,16 @@ async function checkJob(db: Db, registry: ChannelAdapterRegistry, leased: JobRow
   const item = await itemRow(db, ownerId, leased.itemId!);
   if (!item) return 'lease_lost';
   // 취소 요청인데 이번 시도에서 보낸 적이 없으면(lease 뒤 전송 전) 바로 CANCELED.
+  // FIX1-FULLREV(F2 후속2): 조회 lease(CANCEL_REQUESTED 는 CHECK_LEASE_STATES — 만료 복구보다 먼저 이 경로로 올 수 있다)도 앞선 시도가 스레드 일부를
+  // 게시했거나 게시 시도 표식이 있으면 CANCELED("보내지 않음")가 아니라 UNKNOWN(thread_partial_cancel_requested, stopUnlessPartial).
   if (leased.state === 'CANCEL_REQUESTED' && (await cancelRequestedBeforeSend(db, leased.id))) {
     return db.transaction(async (tx) => {
       const it = await lockItem(tx, ownerId, leased.itemId!);
       const job = await jobForUpdate(tx, ownerId, leased.id);
       if (!job || job.leaseOwner !== opts.workerId || job.state !== 'CANCEL_REQUESTED') return 'lease_lost' as const;
-      return settle(tx, ownerId, job, it, 'canceled', { not_sent: true, attempt: job.attempt }, clock());
+      const now = clock();
+      const stop = { reason: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, code: THREAD_PARTIAL_CANCEL_REQUESTED_CODE, details: { attempt: job.attempt, cause: 'check_lease' } };
+      return stopUnlessPartial(tx, ownerId, job, it, stop, now, () => settle(tx, ownerId, job, it, 'canceled', { not_sent: true, attempt: job.attempt }, now));
     });
   }
   const { r, caps, cancel } = await remoteCheck(db, registry, leased, item, opts.submitTimeoutMs ?? 30_000, { ...opts, tryCancel: leased.state === 'CANCEL_REQUESTED' });
@@ -1408,26 +1542,22 @@ export async function cancelItem(db: Db, ownerId: string, itemId: string, now: D
       case 'BLOCKED': {
         // FIX-T14(Codex review-T14 missed case): 스레드 일부가 이미 원격에 게시됐으면(이전 시도 — 2번째 이후 게시물에서 401·429·재개 대기 등)
         // "보내지 않음"·취소 성공이라고 하지 않는다(A11). 남은 게시물은 보내지 않고 UNKNOWN(thread_partial_canceled) — 단계 목록이 게시된 범위를 보여 준다.
-        const parts = await publishedStepCount(tx, ownerId, job.id, ['publish', 'video']);
         // LIVE-P1(D38): 실제 Threads 의 게시 시도 표식(publish_attempt) — 결과를 모르는 게시 시도가 있으면 "보내지 않음"이라고 하지 않는다.
-        const attempts = await publishedStepCount(tx, ownerId, job.id, ['publish_attempt']);
-        if (parts > 0 || attempts > 0) {
-          const live = attempts > 0;
-          await settle(tx, ownerId, job, item, 'cancel_partial', { cause: 'user', not_sent: false, published_parts: parts, publish_attempts: attempts }, now, {
-            ...CLEAR_LEASE,
-            cancelRequestedAt: now,
-            lastErrorCode: 'thread_partial_canceled',
-          });
+        // FIX1-FULLREV(F2 후속2): 판정·결과는 작업 처리기의 멈춤 결정과 같은 공용 규칙(partialSendOf · settlePartialStop — cancel_partial → UNKNOWN).
+        const partial = await partialSendOf(tx, ownerId, job.id);
+        if (partial) {
+          const live = partial.attempts > 0;
+          await settlePartialStop(tx, ownerId, job, item, 'user', {}, partial, THREAD_PARTIAL_CANCELED_CODE, now);
           out = {
             item_id: item.id,
             job_id: job.id,
             canceled: false,
             cancel_requested: false,
             state: 'UNKNOWN',
-            published_parts: parts,
+            published_parts: partial.parts,
             message: live
               ? '더 보내지 않습니다. 이 글은 실제 Threads 에 이미 게시됐거나 게시됐을 수 있습니다(취소로 되돌리지 않음 — Threads 에서 직접 확인하세요).'
-              : `남은 부분은 보내지 않습니다. 이미 게시된 ${parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
+              : `남은 부분은 보내지 않습니다. 이미 게시된 ${partial.parts}개는 원격에 남아 있습니다(MOCK — 취소로 되돌리지 않음).`,
           };
           break;
         }

@@ -595,14 +595,23 @@ export function revocationCountParam(v: string | string[] | undefined): number |
   return /^\d{1,3}$/.test(t) ? Number(t) : null;
 }
 
-export function revocationNotice(blocked: number | null, cancelRequested: number | null): string {
+/**
+ * FIX1-FULLREV(F2): partial = 이미 일부가 게시됐거나 게시 시도 표식이 있어 UNKNOWN 으로 둔 작업 수(revoked_partial) — 그 항목은 실행 전으로 돌아가지 않는다.
+ * 이전 링크(revoked_partial 없음)는 null 로 받아 지금까지의 문구 그대로.
+ */
+export function revocationNotice(blocked: number | null, cancelRequested: number | null, partial: number | null = null): string {
   const parts = ['승인을 철회했습니다(MOCK).'];
-  if (blocked === null && cancelRequested === null) return parts[0]!;
+  if (blocked === null && cancelRequested === null && partial === null) return parts[0]!;
   if (blocked) parts.push(`대기·재시도 대기 중이던 작업 ${blocked}개는 보류(BLOCKED) — 다음 전송이 차단되었습니다.`);
+  if (partial) {
+    parts.push(
+      `이미 일부가 게시됐거나 게시 시도가 있었던 작업 ${partial}개는 남은 게시물을 보내지 않고 결과 불명(UNKNOWN)으로 두었습니다 — 실행 전으로 되돌리지 않으므로 다시 승인·실행으로 처음부터 다시 보내지 않습니다(게시된 부분은 원격에 남음).`,
+    );
+  }
   if (cancelRequested) {
     parts.push(`이미 전송 단계에 들어간 작업 ${cancelRequested}개는 취소 확인 중입니다 — 원격 결과를 확인한 뒤 취소됨 또는 "취소 불가(이미 전송됨)"으로 표시됩니다.`);
   }
-  if (!blocked && !cancelRequested) parts.push('대기 중이던 작업은 없었습니다.');
+  if (!blocked && !cancelRequested && !partial) parts.push('대기 중이던 작업은 없었습니다.');
   return parts.join(' ');
 }
 
@@ -625,6 +634,30 @@ export interface ItemHeadlineInput {
   /** LIVE-P2(D39): 최근 24시간 상한 보류의 상한·다시 보낼 수 있는 시각(liveDailyLimitOf) */
   liveDaily?: { limit: number; availableAt: string | null } | null;
 }
+
+/**
+ * FIX1-FULLREV(F2 후속2): 부분 게시 뒤 남은 게시물을 보내지 않고 UNKNOWN 으로 둔 작업의 사유 코드(취소·보내기 전 취소 요청·승인 철회·무효·작업 처리기의 멈춤).
+ * 화면의 blockReason 은 가장 최근 BLOCKED 사건의 사유(앞선 401·연결 정보 보류, 보내기 직전 멈춤의 approval_missing·attempts_exhausted 등)라 이 코드를
+ * 가릴 수 있다 — 작업의 lastErrorCode 가 이 코드면 그것을 먼저 쓰고, 아니면 reason 이 이 코드인지 본다. 해당 없으면 null.
+ */
+const THREAD_PARTIAL_CODES: ReadonlySet<string> = new Set(['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped']);
+function threadPartialCodeOf(reason: string, job: { lastErrorCode: string | null } | null): string | null {
+  const last = job?.lastErrorCode ?? null;
+  if (last !== null && THREAD_PARTIAL_CODES.has(last)) return last;
+  return THREAD_PARTIAL_CODES.has(reason) ? reason : null;
+}
+
+/**
+ * FIX1-FULLREV(F2 후속2): thread_partial_stopped(작업 처리기가 보내기 전에 멈춤)의 실제 원인 — 멈출 때 남긴 BLOCKED 사건의 사유(blockReason:
+ * attempts_exhausted·lease_expired_before_intent·validate_failed, jobs.ts stopUnlessPartial)로 고른다. 원인을 모르면(이력 창 밖 등) 셋 중 하나라고만 말한다
+ * (일어나지 않은 원인을 단정하지 않는다).
+ */
+const PARTIAL_STOP_CAUSE_LABEL: ReadonlyMap<string, string> = new Map([
+  ['attempts_exhausted', '시도 한도'],
+  ['lease_expired_before_intent', '작업 처리기 중단 반복'],
+  ['validate_failed', '검증 실패 — 내용이 지금 채널 규칙에 맞지 않음'],
+]);
+const partialStopCauseOf = (reason: string) => PARTIAL_STOP_CAUSE_LABEL.get(reason) ?? '시도 한도·작업 처리기 중단 반복·검증 실패 중 하나';
 
 /**
  * 항목 상태 한 줄(docs/03·docs/05 문구). 성공은 항상 MOCK 결과이며 "게시 완료"·"공개 게시 성공"이라고 하지 않는다.
@@ -657,10 +690,18 @@ export function itemHeadline(x: ItemHeadlineInput): string {
       return job ? `재시도 대기 (${job.attempt}/${job.maxAttempts}, 다음 ${mskHourMinute(job.nextRunAt)})` : '재시도 대기';
     case 'RECONCILING':
       return '등록 여부 확인 필요';
-    case 'UNKNOWN':
+    case 'UNKNOWN': {
+      // FIX1-FULLREV(F2 후속2): 부분 게시 사유 코드는 작업의 lastErrorCode 를 먼저 본다(threadPartialCodeOf — 앞선 BLOCKED 사유가 가리지 않게).
+      const partial = threadPartialCodeOf(reason, job);
       // FIX-T14: 스레드 일부가 게시된 뒤 취소(요청) — 남은 부분은 보내지 않음, 게시된 부분은 원격에 남음(취소 성공이라고 하지 않는다 A11)
-      if (reason === 'thread_partial_canceled' || reason === 'thread_partial_cancel_requested') return '일부만 게시됨(MOCK) — 취소 뒤 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음';
+      if (partial === 'thread_partial_canceled' || partial === 'thread_partial_cancel_requested') return '일부만 게시됨(MOCK) — 취소 뒤 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음';
+      // FIX1-FULLREV(F2): 부분 게시 뒤 승인 철회·무효 — 실행 전으로 되돌리지 않음(다시 승인·실행으로 처음부터 다시 보내지 않음).
+      if (partial === 'thread_partial_revoked') return '일부만 게시됨(MOCK) — 승인 철회·무효 뒤 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(다시 승인·실행 안 함)';
+      // FIX1-FULLREV(F2 후속2): 부분 게시 뒤 작업 처리기가 보내기 전에 멈춤(시도 한도·보내기 전 중단 반복·검증 실패) — FAILED 가 아니라 결과 불명.
+      // 원인은 멈출 때의 BLOCKED 사유(reason)로 고른다(partialStopCauseOf — 검증 실패를 "시도 한도"라고 하지 않는다).
+      if (partial === 'thread_partial_stopped') return `일부만 게시됨(MOCK) — 보내기 전 멈춤(${partialStopCauseOf(reason)}), 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`;
       return '확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
+    }
     case 'CANCEL_REQUESTED':
       return '취소 확인 중';
     case 'CANCELED':
@@ -820,9 +861,19 @@ export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string 
       return 'Threads 컨테이너 처리 중 — 아직 게시하지 않음(처리가 끝나면 같은 컨테이너로 게시)';
     case 'RECONCILING':
       return '게시 결과 확인 중 — 다시 게시하지 않고 조회만 합니다';
-    case 'UNKNOWN':
-      if (reason === 'thread_partial_canceled') return '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음). Threads 에서 직접 확인하세요';
+    case 'UNKNOWN': {
+      // FIX1-FULLREV(F2 후속2): 부분 게시 사유 코드는 작업의 lastErrorCode 를 먼저 본다(threadPartialCodeOf — 앞선 BLOCKED 사유가 가리지 않게).
+      const partial = threadPartialCodeOf(reason, job);
+      // FIX1-FULLREV(F2 후속2): 보내기 전 취소 요청(thread_partial_cancel_requested)도 시작 전 취소와 같은 문구
+      if (partial === 'thread_partial_canceled' || partial === 'thread_partial_cancel_requested') return '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음). Threads 에서 직접 확인하세요';
+      // FIX1-FULLREV(F2): 게시 시도 뒤 승인 철회·무효 — 다시 게시하지 않음
+      if (partial === 'thread_partial_revoked') return '승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요';
+      // FIX1-FULLREV(F2 후속2): 게시 시도 뒤 작업 처리기가 보내기 전에 멈춤(시도 한도·중단 반복·검증 실패) — "게시되지 않음이 확인된 실패"(FAILED)가 아니다.
+      // 원인은 멈출 때의 BLOCKED 사유(reason)로 고른다(partialStopCauseOf).
+      if (partial === 'thread_partial_stopped')
+        return `보내기 전 멈춤(${partialStopCauseOf(reason)}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`;
       return `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
+    }
     case 'CONFIRMED':
       return `실제 게시됨 — ${liveVerificationLabel(x.verification, x.pub?.permalink)}`;
     case 'FAILED':

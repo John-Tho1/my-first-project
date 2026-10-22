@@ -26,6 +26,7 @@ export async function liveApprovalUsage(tx: DbOrTx, ref: string, jobId: string |
   const rows = await tx
     .select({ jobId: sendIntents.jobId })
     .from(sendIntents)
+    // FIX1-FULLREV(F9): 부분 색인 send_intents_live_ref_job_idx(migration 0047)를 쓰는 모양 — 식(`->>'live_approval_ref'`)을 바꾸지 않는다(migration-0047 시험)
     .where(sql`${sendIntents.sanitizedDetails}->>'live_approval_ref' = ${ref}`)
     .groupBy(sendIntents.jobId);
   const ids = rows.map((r) => r.jobId);
@@ -33,8 +34,15 @@ export async function liveApprovalUsage(tx: DbOrTx, ref: string, jobId: string |
 }
 
 /**
- * 실행(executePlan) 때의 앞선 검사용: 실제 계정 항목의 끝나지 않은 작업 중 아직 이 승인 기록으로 보낸 적 없는 작업 수
- * (대기열에 있어 곧 게시 수를 쓸 작업). 권위 있는 검사는 전송 직전(beginSend)이다 — 이것은 사용자에게 먼저 알려 주는 용도.
+ * 실행(executePlan) 때의 앞선 검사용: 실제 계정 항목의 작업 중 **아직 전송 직전 검사(beginSend)에 닿을 수 있고** 이 승인 기록으로 보낸 적 없는 작업 수
+ * (대기열에 있거나 다시 대기열에 넣을 수 있어 곧 게시 수를 쓸 작업). 권위 있는 검사는 전송 직전(beginSend)이다 — 이것은 사용자에게 먼저 알려 주는 용도.
+ * - 끝난 작업(CONFIRMED·FAILED·CANCELED)과 결과 불명(UNKNOWN — 자동으로 다시 보내지 않음)은 세지 않는다.
+ * - 진행 중 상태(QUEUED·LEASED·SENDING·REMOTE_PROCESSING·RETRY_WAIT·RECONCILING·CANCEL_REQUESTED)는 센다.
+ * - FIX1-FULLREV(F1): 보류(BLOCKED) 작업은 retryItem 으로 다시 대기열에 넣을 수 있는 모양일 때만 센다 — 항목도 BLOCKED, 그 작업이 항목의 최근 작업
+ *   (retryItem·cancelItem 의 latestJobForItem 과 같은 순서: created_at·id 내림차순), 복원 표시(restored_needs_review)가 작업·항목 어디에도 없음.
+ *   승인 철회·무효나 beginSend 의 approval_missing·snapshot_stale 로 항목이 PLANNED 로 돌아간(또는 새 작업이 생긴) 옛 BLOCKED 작업은 재시도·취소·전송
+ *   어느 길로도 다시 보내지 않으므로 세지 않는다 — 세면 다시 승인 → 실행이 승인 기록과 관계없이 늘 429(live_publish_limit)가 된다.
+ *   시도 한도를 다 쓴 보류 작업처럼 재시도가 거절될 작업도 센다(보수적 — 항목이 BLOCKED 라 사용자가 취소로 풀 수 있다).
  */
 export async function pendingLiveJobs(tx: DbOrTx, ref: string): Promise<number> {
   const rows = await tx
@@ -48,6 +56,8 @@ export async function pendingLiveJobs(tx: DbOrTx, ref: string): Promise<number> 
         // 끝난 작업과 결과 불명(UNKNOWN — 자동으로 다시 보내지 않음)은 더 쓰지 않는다
         sql`${jobs.state} <> all(${sql.param([...TERMINAL_JOB_STATES, 'UNKNOWN'])}::text[])`,
         sql`not exists (select 1 from send_intents si where si.job_id = ${jobs.id} and si.sanitized_details->>'live_approval_ref' = ${ref})`,
+        // FIX1-FULLREV(F1): 보류 작업은 다시 보낼 수 있는(retryItem) 것만
+        sql`(${jobs.state} <> 'BLOCKED' or (${distributionItems.status} = 'BLOCKED' and not ${jobs.restoredNeedsReview} and not ${distributionItems.restoredNeedsReview} and ${jobs.id} = (select lj.id from jobs lj where lj.owner_id = ${jobs.ownerId} and lj.item_id = ${jobs.itemId} order by lj.created_at desc, lj.id desc limit 1)))`,
       ),
     );
   return rows.length;
@@ -155,6 +165,7 @@ export async function livePublishDailyUsage(
   const rows = await tx
     .select({ jobId: sendIntents.jobId, lastAt: max(sendIntents.createdAt) })
     .from(sendIntents)
+    // FIX1-FULLREV(F9): 부분 색인 send_intents_live_owner_created_idx(migration 0047)의 술어와 같은 식 — 바꾸지 않는다(migration-0047 시험)
     .where(and(eq(sendIntents.ownerId, ownerId), sql`${sendIntents.sanitizedDetails}->>'live_approval_ref' is not null`, gt(sendIntents.createdAt, since)))
     .groupBy(sendIntents.jobId);
   const others = rows.filter((r) => r.jobId !== jobId);

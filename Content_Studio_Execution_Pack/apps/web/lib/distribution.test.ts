@@ -104,6 +104,104 @@ describe('revocationNotice — 저장된 작업 결과만 말한다', () => {
     expect(revocationNotice(0, 0)).toContain('대기 중이던 작업은 없었습니다');
     expect(revocationNotice(null, null)).toBe('승인을 철회했습니다(MOCK).');
   });
+
+  it('FIX1-FULLREV(F2): 부분 게시로 UNKNOWN 에 둔 작업(revoked_partial) — "실행 전"·"대기 작업 없음"이라고 하지 않는다, 이전 링크(partial 없음)는 그대로', () => {
+    const p = revocationNotice(0, 0, 1);
+    expect(p).toContain('작업 1개는 남은 게시물을 보내지 않고 결과 불명(UNKNOWN)');
+    expect(p).toContain('실행 전으로 되돌리지 않으므로');
+    expect(p).not.toContain('대기 중이던 작업은 없었습니다');
+    expect(p).not.toContain('보류(BLOCKED)');
+    const both = revocationNotice(1, 0, 1);
+    expect(both).toContain('보류(BLOCKED) — 다음 전송이 차단');
+    expect(both).toContain('결과 불명(UNKNOWN)');
+    expect(revocationNotice(0, 0, 0)).toContain('대기 중이던 작업은 없었습니다');
+    expect(revocationNotice(null, null, null)).toBe('승인을 철회했습니다(MOCK).');
+    // 이전 링크(revoked_partial 없음): 지금까지와 같은 문구
+    expect(revocationNotice(0, 0)).toBe(revocationNotice(0, 0, null));
+    expect(revocationNotice(null, null)).toBe('승인을 철회했습니다(MOCK).');
+  });
+
+  it('FIX1-FULLREV(F2): thread_partial_revoked 항목 문구 — 보류(401) 뒤 철회라 blockReason 이 앞선 BLOCKED 사유여도 작업 코드로 고른다(모의·실제)', () => {
+    const unknown = job('UNKNOWN', 'thread_partial_revoked');
+    for (const blockReason of [null, 'auth_invalid_token', 'publish_auth_invalid_token']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+      expect(mock, String(blockReason)).toContain('승인 철회·무효 뒤 남은 게시물은 보내지 않음');
+      expect(mock).not.toContain('실행 전');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+      expect(live, String(blockReason)).toContain('승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음');
+    }
+    // 취소 경로 문구는 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'thread_partial_canceled'), pub: null, blockReason: null })).toContain('취소 뒤 남은 게시물은 보내지 않음');
+  });
+
+  it('FIX1-FULLREV(F2 후속2): 부분 게시 UNKNOWN 사유 코드 전부 — 앞선 BLOCKED 사유(401·연결 정보·보내기 직전 멈춤)가 blockReason 이어도 작업 코드로 고른다(모의·실제)', () => {
+    const OLDER_BLOCKED = [null, 'auth', 'auth_invalid_token', 'publish_auth_invalid_token', 'credential_blocked', 'approval_missing', 'snapshot_stale', 'attempts_exhausted', 'lease_expired_before_intent'];
+    // FIX1-FULLREV(F2 후속2): thread_partial_stopped 는 멈출 때의 BLOCKED 사유(blockReason)로 원인을 말한다 — 그 사유가 아니면 셋 중 하나라고만(단정 안 함)
+    const STOP_ANY = '시도 한도·작업 처리기 중단 반복·검증 실패 중 하나';
+    const cases: Array<{ code: string; mock: string; live: string; byReason?: Record<string, { mock: string; live: string }> }> = [
+      { code: 'thread_partial_canceled', mock: '취소 뒤 남은 게시물은 보내지 않음', live: '취소 요청 — 이미 게시됐거나 게시됐을 수 있음' },
+      { code: 'thread_partial_cancel_requested', mock: '취소 뒤 남은 게시물은 보내지 않음', live: '취소 요청 — 이미 게시됐거나 게시됐을 수 있음' },
+      { code: 'thread_partial_revoked', mock: '승인 철회·무효 뒤 남은 게시물은 보내지 않음', live: '승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음' },
+      {
+        code: 'thread_partial_stopped',
+        mock: `보내기 전 멈춤(${STOP_ANY}), 남은 게시물은 보내지 않음`,
+        live: `보내기 전 멈춤(${STOP_ANY}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음`,
+        byReason: {
+          attempts_exhausted: { mock: '보내기 전 멈춤(시도 한도), 남은 게시물은 보내지 않음', live: '보내기 전 멈춤(시도 한도) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음' },
+          lease_expired_before_intent: {
+            mock: '보내기 전 멈춤(작업 처리기 중단 반복), 남은 게시물은 보내지 않음',
+            live: '보내기 전 멈춤(작업 처리기 중단 반복) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음',
+          },
+        },
+      },
+    ];
+    for (const c of cases) {
+      const unknown = job('UNKNOWN', c.code);
+      for (const blockReason of OLDER_BLOCKED) {
+        const label = `${c.code}/${String(blockReason)}`;
+        const want = (blockReason !== null ? c.byReason?.[blockReason] : undefined) ?? c;
+        const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+        expect(mock, label).toContain(want.mock);
+        expect(mock, label).not.toContain('새 계획 필요');
+        const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+        expect(live, label).toContain(want.live);
+        expect(live, label).not.toContain('새 배포 계획으로 다시 승인하세요');
+        expect(live, label).not.toContain('MOCK');
+      }
+      // 작업 행이 없어도(사유만) 같은 문구
+      expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: c.code })).toContain(c.mock);
+    }
+    // 부분 게시 코드가 아니면 지금까지의 결과 불명 문구 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'reconcile_timeout'), pub: null, blockReason: 'auth' })).toBe('확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: 'credential_blocked' })).toContain('결과 불명(UNKNOWN)');
+  });
+
+  it('FIX1-FULLREV(F2 후속2): thread_partial_stopped 문구는 멈춘 실제 원인만 말한다 — 검증 실패(validate_failed)를 "시도 한도·중단 반복"이라고 하지 않음(모의·실제)', () => {
+    const stopped = job('UNKNOWN', 'thread_partial_stopped');
+    const CAUSES = [
+      { reason: 'validate_failed', says: '보내기 전 멈춤(검증 실패 — 내용이 지금 채널 규칙에 맞지 않음)', not: ['시도 한도', '중단 반복'] },
+      { reason: 'attempts_exhausted', says: '보내기 전 멈춤(시도 한도)', not: ['중단 반복', '검증 실패'] },
+      { reason: 'lease_expired_before_intent', says: '보내기 전 멈춤(작업 처리기 중단 반복)', not: ['시도 한도', '검증 실패'] },
+    ];
+    for (const c of CAUSES) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason: c.reason });
+      expect(mock, c.reason).toBe(`일부만 게시됨(MOCK) — ${c.says}, 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`);
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason: c.reason });
+      expect(live, c.reason).toBe(`${c.says} — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`);
+      for (const wrong of c.not) {
+        expect(mock, `${c.reason}/${wrong}`).not.toContain(wrong);
+        expect(live, `${c.reason}/${wrong}`).not.toContain(wrong);
+      }
+    }
+    // 원인을 모름(이력 창 밖 — blockReason 이 작업 코드 그대로, 상속 속성 이름 같은 이상한 값) → 셋 중 하나라고만
+    for (const blockReason of ['thread_partial_stopped', 'toString', '__proto__', '']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason });
+      expect(mock, blockReason).toContain('보내기 전 멈춤(시도 한도·작업 처리기 중단 반복·검증 실패 중 하나), 남은 게시물은 보내지 않음');
+      expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason }), blockReason).toContain(
+        '보내기 전 멈춤(시도 한도·작업 처리기 중단 반복·검증 실패 중 하나) — 이미 게시됐거나',
+      );
+    }
+  });
 });
 
 describe('FIX round 2 (Codex review-FIX-T11T12) P2', () => {

@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./media-mime": "./src/media-mime.ts"
   },
   "dependencies": {
     "zod": "4.6.5"

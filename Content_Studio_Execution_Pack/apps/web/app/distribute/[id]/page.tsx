@@ -773,7 +773,7 @@ export default async function PlanPage({
       ) : null}
       {q.revoked === '1' ? (
         <p className="saved" role="status">
-          {revocationNoticeFor(revocationNotice(revocationCountParam(q.revoked_blocked), revocationCountParam(q.revoked_cancel)), hasLive)}
+          {revocationNoticeFor(revocationNotice(revocationCountParam(q.revoked_blocked), revocationCountParam(q.revoked_cancel), revocationCountParam(q.revoked_partial)), hasLive)}
         </p>
       ) : null}
       {str(q.ticked) !== undefined ? (

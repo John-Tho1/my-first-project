@@ -70,6 +70,8 @@ const REQUIRED: Record<string, string[]> = {
     'itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub })',
     'jobStatusTextFor(j, pub, reason, channel, live)',
     'revocationNoticeFor(',
+    // FIX1-FULLREV(F2): 철회 배너는 부분 게시로 UNKNOWN 에 둔 작업 수(revoked_partial)도 넘긴다
+    'revocationCountParam(q.revoked_partial)',
     'requestedResultLabel(x.item.requestedResult',
     // LIVE-P2(D39): 실제 게시 최근 24시간 사용·일시 중지 한 줄, 일일 상한 보류의 상한·다시 보낼 시각
     '<strong>{liveLine}</strong>',

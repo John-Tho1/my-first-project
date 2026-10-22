@@ -105,6 +105,36 @@ describe('스키마', () => {
     expect(parseSearchParams(new URLSearchParams('limit=51')).success).toBe(false);
     expect(parseSearchParams(new URLSearchParams('unknown=1')).success).toBe(false);
   });
+
+  it('FIX1-FULLREV(F7): from·to 는 실제로 있는 날만 — 없는 날(2월 30일·4월 31일·평년 2월 29일)은 다음 달로 넘기지 않고 거부', () => {
+    const issueOf = (qs: string) => {
+      const r = parseSearchParams(new URLSearchParams(qs));
+      expect(r.success, qs).toBe(false);
+      return r.success ? null : r.error.issues[0]!;
+    };
+    for (const d of ['2026-02-30', '2026-04-31', '2026-02-29', '2026-02-31', '2026-06-31', '2100-02-29']) {
+      for (const key of ['from', 'to'] as const) {
+        const issue = issueOf(`${key}=${d}`);
+        expect(issue?.path, `${key}=${d}`).toEqual([key]);
+        expect(issue?.message, `${key}=${d}`).toBe('날짜가 올바르지 않습니다');
+      }
+    }
+    // 형식·범위 밖(이전부터 거부)은 그대로
+    expect(parseSearchParams(new URLSearchParams('from=2026-02-32')).success).toBe(false);
+    expect(parseSearchParams(new URLSearchParams('to=2026-13-01')).success).toBe(false);
+    expect(parseSearchParams(new URLSearchParams('to=2026-00-10')).success).toBe(false);
+    expect(parseSearchParams(new URLSearchParams('from=2026-2-1')).success).toBe(false);
+    // 있는 날은 받는다 — 윤년 2월 29일, 달 끝날
+    for (const qs of ['from=2028-02-29', 'to=2028-02-29', 'from=2000-02-29', 'from=2026-02-28&to=2026-03-01', 'from=2026-04-30&to=2026-12-31', 'from=2026-01-31']) {
+      const r = parseSearchParams(new URLSearchParams(qs));
+      expect(r.success, qs).toBe(true);
+    }
+    const ok = parseSearchParams(new URLSearchParams('from=2028-02-29&to=2028-03-01'));
+    expect(ok.success && ok.data).toMatchObject({ from: '2028-02-29', to: '2028-03-01' });
+    // 순서 검사는 그대로(같은 날은 받음)
+    expect(parseSearchParams(new URLSearchParams('from=2026-03-01&to=2026-03-01')).success).toBe(true);
+    expect(parseSearchParams(new URLSearchParams('from=2026-03-02&to=2026-03-01')).success).toBe(false);
+  });
 });
 
 describe('검색 보조', () => {

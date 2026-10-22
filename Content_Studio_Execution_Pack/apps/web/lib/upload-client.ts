@@ -3,7 +3,9 @@
  * - Sha256: 조각씩 넣는 증분 SHA-256(WebCrypto 는 스트림 해시가 없어 큰 파일 전체를 메모리에 올려야 하므로 직접 구현).
  * - resumeDecision: 저장해 둔 세션을 이어 올려도 되는지(같은 파일인지) 판단 — 전체 sha256·크기·받은 조각별 sha256 비교.
  * - pollDelay: 전사 목록 폴링 간격(성공·진행 중 1.5초, 성공·대기 없음 10초, 실패 2초→4초→8초→10초).
+ * - uploadTargetFor: 고른 파일의 형식(File.type·이름) → 세션 생성에 보낼 정본 { kind, mime }(FIX1-FULLREV(F3)).
  */
+import { normalizeMediaMime, type MediaMime } from '@cs/domain/media-mime';
 
 const K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -102,6 +104,17 @@ export class Sha256 {
     H[6] = (H[6]! + g!) >>> 0;
     H[7] = (H[7]! + h!) >>> 0;
   }
+}
+
+/**
+ * FIX1-FULLREV(F3): 브라우저가 알려 주는 File.type 은 별칭(.m4a → audio/x-m4a 등)이거나 비어 있을 수 있다.
+ * 서버와 같은 normalizeMediaMime(@cs/domain/media-mime)으로 정본을 구해 그 값을 세션 생성에 보낸다. 받을 수 없는 형식이면 null.
+ * 내용 확인은 서버의 완료 단계(형식 서명)가 한다 — 여기서 통과해도 내용이 다르면 서버가 거부한다.
+ */
+export function uploadTargetFor(file: { type: string; name: string }): { kind: 'audio' | 'video'; mime: MediaMime } | null {
+  const mime = normalizeMediaMime(file.type, file.name);
+  if (!mime) return null;
+  return { kind: mime.startsWith('audio/') ? 'audio' : 'video', mime };
 }
 
 export interface ServerSessionLike {

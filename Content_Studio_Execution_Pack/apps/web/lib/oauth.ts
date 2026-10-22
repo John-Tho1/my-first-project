@@ -5,6 +5,7 @@
 import { checkCredential, loadMockCredentialsForRehydration, refreshCredential, type Db, type JobRunOptions, type KeyringSource, type ProviderFor } from '@cs/db';
 import {
   AppError,
+  isDevAuthAllowedForNodeEnv,
   liveOAuthReadinessFromEnv,
   livePublishReadiness,
   oauthRedirectUri,
@@ -171,8 +172,14 @@ export function oauthEndpoint(fn: (request: Request) => Promise<Response>): (req
 
 /** D25-3: 모의 동의 화면의 시험용 매개변수 — 운영(NODE_ENV=production)에서는 거부 */
 export const MOCK_TEST_PARAMS = ['mock_user', 'mock_grant', 'mock_deny'] as const;
-export function mockTestParamsAllowed(env: Record<string, string | undefined> = process.env): boolean {
-  return env.NODE_ENV !== 'production';
+/**
+ * FIX1-FULLREV(F6): 기본값은 `NODE_ENV: process.env.NODE_ENV` 식 그대로 넘긴다 — Next 운영 빌드가 이 식을 상수(production)로 고정하므로
+ * `next start` 를 NODE_ENV=development 로 실행해도 운영으로 판정된다(lib/server.ts getConfig·dev-cert.ts 와 같은 방식).
+ * 예전 기본값(`env = process.env`)은 실행 중 값을 읽어 이 고정을 우회했다.
+ * 판정은 dev 로그인과 같은 허용 목록(isDevAuthAllowedForNodeEnv: 없음·빈 값·development·test)만 허용 — staging 등 그 밖의 값은 거부(fail closed).
+ */
+export function mockTestParamsAllowed(env: { NODE_ENV?: string } = { NODE_ENV: process.env.NODE_ENV }): boolean {
+  return isDevAuthAllowedForNodeEnv(env.NODE_ENV);
 }
 
 /** 폼 제출 실패 → 설정 화면(오류 코드만 query 에 — 값·토큰 없음) */

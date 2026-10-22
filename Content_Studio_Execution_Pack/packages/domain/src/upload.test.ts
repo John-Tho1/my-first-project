@@ -78,6 +78,41 @@ describe('조각 계획(T08)', () => {
     expect(() => planUpload({ kind: 'video', mime: 'video/webm', bytes: 10, chunk_size: 8 * MIB + 1 })).toThrow(BadRequestError);
     expect(planUpload({ kind: 'video', mime: 'video/webm', bytes: 10, sha256: 'A'.repeat(64) }).sha256).toBe('a'.repeat(64));
   });
+
+  it('FIX1-FULLREV(F3): 브라우저 별칭·매개변수는 정본으로 바꿔 계획에 담고(저장 값), 목록 밖·빈 형식은 그대로 415', () => {
+    expect(planUpload({ kind: 'audio', mime: 'audio/x-m4a', bytes: 10 }).mime).toBe('audio/mp4');
+    expect(planUpload({ kind: 'audio', mime: 'audio/m4a', bytes: 10 }).mime).toBe('audio/mp4');
+    expect(planUpload({ kind: 'audio', mime: 'Audio/X-WAV; codec=1', bytes: 10 }).mime).toBe('audio/wav');
+    expect(planUpload({ kind: 'audio', mime: 'audio/wave', bytes: 10 }).mime).toBe('audio/wav');
+    expect(planUpload({ kind: 'audio', mime: 'audio/vnd.wave', bytes: 10 }).mime).toBe('audio/wav');
+    expect(planUpload({ kind: 'audio', mime: 'audio/mp3', bytes: 10 }).mime).toBe('audio/mpeg');
+    expect(planUpload({ kind: 'audio', mime: 'audio/x-mp3', bytes: 10 }).mime).toBe('audio/mpeg');
+    expect(planUpload({ kind: 'audio', mime: 'audio/x-mpeg', bytes: 10 }).mime).toBe('audio/mpeg');
+    expect(planUpload({ kind: 'audio', mime: 'audio/mp4;codecs=mp4a.40.2', bytes: 10 }).mime).toBe('audio/mp4');
+    expect(planUpload({ kind: 'video', mime: 'video/x-m4v', bytes: 10 }).mime).toBe('video/mp4');
+    // 종류 검사는 정본 기준(audio 별칭을 video 로 신고하면 400)
+    expect(() => planUpload({ kind: 'video', mime: 'audio/x-m4a', bytes: 10 })).toThrow(BadRequestError);
+    expect(() => planUpload({ kind: 'audio', mime: 'video/x-m4v', bytes: 10 })).toThrow(BadRequestError);
+    // 서버에는 파일 이름이 없다 — octet-stream·목록 밖 형식은 415
+    for (const mime of ['application/octet-stream', 'audio/aac', 'audio/ogg', 'video/x-matroska', 'image/png', 'constructor']) {
+      expect(() => planUpload({ kind: 'audio', mime, bytes: 10 }), mime).toThrow(UnsupportedMediaTypeError);
+    }
+  });
+
+  it('FIX1-FULLREV(F3): 서명 판정은 정규화와 무관하게 그대로 — 별칭으로 신고해도 내용이 다르면 불일치', () => {
+    const declared = planUpload({ kind: 'audio', mime: 'audio/x-m4a', bytes: 10 }).mime;
+    expect(mediaMatches(declared, sniffMedia(FIXTURES.m4a))).toBe(true);
+    expect(mediaMatches(declared, sniffMedia(FIXTURES.mp4))).toBe(true);
+    expect(mediaMatches(declared, sniffMedia(FIXTURES.wav))).toBe(false);
+    expect(mediaMatches(declared, sniffMedia(FIXTURES.mp3Id3))).toBe(false);
+    expect(mediaMatches(declared, sniffMedia(FIXTURES.png))).toBe(false);
+    const wav = planUpload({ kind: 'audio', mime: 'audio/x-wav', bytes: 10 }).mime;
+    expect(mediaMatches(wav, sniffMedia(FIXTURES.wav))).toBe(true);
+    expect(mediaMatches(wav, sniffMedia(FIXTURES.m4a))).toBe(false);
+    const mp3 = planUpload({ kind: 'audio', mime: 'audio/mp3', bytes: 10 }).mime;
+    expect(mediaMatches(mp3, sniffMedia(FIXTURES.mp3Frame))).toBe(true);
+    expect(mediaMatches(mp3, sniffMedia(FIXTURES.wav))).toBe(false);
+  });
 });
 
 describe('음성·영상 형식 서명(T08)', () => {

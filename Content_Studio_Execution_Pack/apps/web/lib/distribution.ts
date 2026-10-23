@@ -17,6 +17,8 @@ import {
   sanitizeThreadsDiag,
   MOCK_SCENARIO_VALUES,
   recordedAdapterIdOf,
+  RESTORED_RETRY_RECOVERY,
+  RESTORED_RETRY_RECOVERY_MOCK,
   SCHEDULE_STALE_RETRY_MESSAGE,
   USER_CONFIRM_BUTTON,
   USER_CONFIRM_RESTORED_MESSAGE,
@@ -123,6 +125,12 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   cancel_unknown: '결과를 확인할 수 없는 항목(UNKNOWN)은 취소를 확정할 수 없습니다. 먼저 재확인하세요(자동 재전송은 하지 않습니다).',
   nothing_to_reconcile: '재확인할 작업이 없습니다(확인 중·결과 불명·원격 처리 중인 항목만 재확인합니다).',
   not_retryable: '보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.',
+  // FIX5-FULLREV(T2, 사용자 결정 2026-10-23): 복원한 작업·복원 때 진행 중이던 항목의 재시도 거절(not_retryable + restored — 폼 경로만 이 코드로, JSON 은 not_retryable 그대로).
+  // 보류 항목이라도 복원 이력이면 다시 보내지 않는다 — 복구 길은 @cs/db retryItem 문구와 같은 조건(채널에서 직접 확인해 게시물이 없을 때만 새 배포 계획 — 실제 계정·계정 kind 를 모름)
+  not_retryable_restored: `복원한 작업·복원 때 진행 중이던 항목은 다시 보내지 않습니다. ${RESTORED_RETRY_RECOVERY}`,
+  // FIX5-FULLREV(T2 후속 — 리뷰 확정 jobs.ts:1857): 같은 거절의 모의 계정 항목(details mock: true — @cs/db retryItem 이 항목 계정 kind 로 정함). 실제 채널로 보낸 것이 없으므로
+  // 채널 확인·두 번 게시 경고를 하지 않는다(FX4 모의 취소 문구와 같은 규칙). 계정 kind 를 모르면 위의 조건부 문구.
+  not_retryable_restored_mock: `MOCK — 복원한 모의 작업·복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`,
   attempts_exhausted: '시도 한도에 이르렀습니다. 새 배포 계획을 만드세요.',
   outcome_unknown: '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.',
   // FIX-LIVEP2(D36): 상한·중지 등으로 보류된 예약 항목을 예약 시각보다 60분 넘게 지나 재시도 — 대기열에 넣지 않고 확인을 한 번 더 요청
@@ -170,7 +178,10 @@ export function distributeFormFailure(e: unknown, request: Request, back: string
   if (e instanceof AppError && e.code === 'mock_rehydration_unavailable') code = 'mock_rehydration_unavailable';
   else if (res.status === 503) code = 'live_blocked';
   else if (e instanceof AppError) {
-    if (PASS.has(e.code)) code = e.code;
+    // FIX5-FULLREV(T2): 복원 이력 재시도 거절은 일반 not_retryable 문구("보류된 작업이 있는 항목만") 대신 조건부 복구 길 문구로
+    // (T2 후속) 모의 계정 항목(mock: true)은 모의 문구(채널 확인·두 번 게시 경고 없음)
+    if (e.code === 'not_retryable' && e.extra?.restored === true) code = e.extra.mock === true ? 'not_retryable_restored_mock' : 'not_retryable_restored';
+    else if (PASS.has(e.code)) code = e.code;
     else if (e.kind === 'csrf') code = 'csrf';
     else if (e.kind === 'conflict') code = 'conflict';
     else if (e.kind === 'bad_request') code = 'invalid';
@@ -757,6 +768,7 @@ export const UNKNOWN_JOB_LINE_PARTIAL_MOCK = 'UNKNOWN · 일부 게시됨(MOCK) 
  * FIX4-FULLREV(S1, 사용자 결정 2026-10-23): 실제 카드에서 조건부 복구 줄(직접 확인해 글이 없을 때만 새 배포 계획)은 **이 안내에 한 번만** 있다 — 머리줄
  * (liveItemHeadline)·스냅샷 안내(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.live)는 "다시 게시하지 않음 · Threads 에서 직접 확인"만 말한다(새 계획 권유 없음).
  * 그 둘이 보이는 실제 카드는 언제나 이 안내(또는 일반 결과 불명 안내 LIVE_UNKNOWN_GUIDANCE)도 그린다(page.tsx — 같은 기록 기준 itemRecordLive·같은 작업 조건).
+ * FIX5-FULLREV(T1): 일반 결과 불명 실제 머리줄(LIVE_UNKNOWN_HEADLINE)도 같다 — 작업이 있는 카드는 일반 안내에만 조건부 복구 줄(작업이 없는 카드는 머리줄에만).
  */
 export const LIVE_UNKNOWN_GUIDANCE_BY_KIND: Record<UnknownKind, string> = {
   partial: `이미 게시됐거나 게시됐을 수 있습니다(게시 시도 기록 있음). 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(이 카드에 「${USER_CONFIRM_BUTTON}」 버튼이 보이면 눌러 기록할 수 있음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).`,
@@ -908,6 +920,14 @@ export const LIVE_UNKNOWN_GUIDANCE =
   '게시됐는지 확인하지 못했습니다. 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 없을 때만 새 배포 계획으로 다시 승인하세요(같은 글이 두 번 올라갈 수 있으니 먼저 확인).';
 
 /**
+ * FIX5-FULLREV(T1, 사용자 결정 2026-10-23): 일반 결과 불명(부분 게시·복원 미확정 코드 아님) 실제 카드 머리줄 — 결과 불명·다시 게시하지 않음·Threads 직접 확인만
+ * 말한다(조건부 복구 줄·새 계획 권유 없음). 조건부 복구 줄(없을 때만 새 배포 계획)은 같은 카드의 일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE)에 한 번만 있다 —
+ * page.tsx 는 머리줄과 같은 값(recordLive === true · 항목 UNKNOWN)에 작업이 하나라도 있으면 그 안내를 그린다(이 머리줄이 나오면 unknownKindOf 도 null 이라 일반 안내).
+ * 작업이 없는 카드(작업 칸·안내를 그리지 않음 — 예: 작업 행 없이 복원된 항목)는 안내가 없으므로 liveItemHeadline 이 지금처럼 안내 전체를 머리줄에 싣는다.
+ */
+export const LIVE_UNKNOWN_HEADLINE = '결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요';
+
+/**
  * FIX-LIVEP1(Codex P0): 결과 불명 실제 게시의 **확인 후보**(미확인) — 작업 이력의 가장 최근 후보(조회가 남긴 candidate_external_id·candidate_permalink).
  * 이 작업의 게시물이라는 증거가 아니다. 화면은 "확인 후보(미확인)"로만 보이고 결과·VERIFIED 로 쓰지 않는다. 링크는 공식 Threads 주소만.
  */
@@ -1046,7 +1066,8 @@ export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string 
       // FIX2-FULLREV(Q3): 복원한 작업 취소를 확정하지 못함
       if (job?.lastErrorCode === RESTORED_CANCEL_UNVERIFIED_CODE)
         return '복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요';
-      return `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
+      // FIX5-FULLREV(T1): 작업이 있는 카드는 일반 결과 불명 안내가 조건부 복구 줄을 한 번 싣는다 — 머리줄은 짧게. 작업이 없으면(안내 없음) 지금처럼 안내 전체
+      return job ? LIVE_UNKNOWN_HEADLINE : `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
     }
     case 'CONFIRMED':
       return `실제 게시됨 — ${liveVerificationLabel(x.verification, x.pub?.permalink)}`;
@@ -1193,6 +1214,30 @@ export async function itemPlanBack(find: () => Promise<string | null>): Promise<
   } catch {
     return '/distribute';
   }
+}
+
+/**
+ * FIX5-FULLREV(T4, 사용자 결정 2026-10-23): 항목 폼(/api/distribution-items/{id}/ 의 취소·재시도·재확인·사용자 확인·모의 시나리오)의 되돌아갈 곳 — 취소 경로(FIX4 S4)의
+ * 규칙을 한곳에 둔다. 폼의 plan_id 숨은 필드가 있으면 그 계획 화면(조회 없음). 없으면 owner 를 확인한 뒤(ownerChecked)에만 항목의 계획 화면(itemPlanBack —
+ * owner 범위 조회, 실패·없음·UUID 아님은 /distribute). owner 확인 전(CSRF·로그인 실패)·HTML 이 아닌 요청은 조회하지 않고 /distribute.
+ * 성공 리다이렉트와 오류 리다이렉트(distributeFormFailure 의 back)가 같은 값을 쓴다. 404 는 distributeFormFailure 가 지금처럼 /distribute?missing=1.
+ */
+export function itemFormBack(html: boolean): {
+  ownerChecked: (find: () => Promise<string | null>) => void;
+  formPlanId: (planId: string | undefined) => void;
+  target: () => Promise<string>;
+} {
+  let planBack: string | null = null;
+  let find: (() => Promise<string | null>) | null = null;
+  return {
+    ownerChecked: (f) => {
+      if (html) find = f;
+    },
+    formPlanId: (planId) => {
+      if (planId) planBack = `/distribute/${encodeURIComponent(planId)}`;
+    },
+    target: async () => planBack ?? (find ? itemPlanBack(find) : '/distribute'),
+  };
 }
 
 /**

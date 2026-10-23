@@ -59,6 +59,10 @@ import {
   REMOTE_POLL_MAX,
   REMOTE_POLL_MS,
   recordedAdapterIdOf,
+  RESTORED_ITEM_RETRY_MESSAGE,
+  RESTORED_ITEM_RETRY_MOCK_MESSAGE,
+  RESTORED_JOB_RETRY_MESSAGE,
+  RESTORED_JOB_RETRY_MOCK_MESSAGE,
   SCHEDULE_STALE_RETRY_MESSAGE,
   SEND_LEASE_STATES,
   type AdapterContext,
@@ -1849,17 +1853,31 @@ async function retryItemTx(db: Db, ownerId: string, itemId: string, now: Date): 
     const item = await lockItem(tx, ownerId, itemId);
     // FIX-T11: 복원한 작업(읽기 전용 이력)은 다시 보내지 않는다 — 항목 표시가 없어도(복원 전부터 BLOCKED 였던 항목) 작업 표시로 거부.
     const restoredJob = await latestJobForItem(tx, ownerId, item.id, false);
+    // FIX5-FULLREV(T2, 사용자 결정 2026-10-23): 거절 문구의 복구 길은 무조건 "새 배포 계획을 만드세요"가 아니라 채널에서 직접 확인해 게시물이 없을 때만
+    // (USER_CONFIRM_RESTORED_MESSAGE 와 같은 조건 — @cs/domain RESTORED_RETRY_RECOVERY). 코드는 그대로.
+    // FIX5-FULLREV(T2 후속 — 리뷰 확정 :1857): 문구는 항목 계정 kind 로 고른다(FX4 cancelItem 과 같은 규칙). 모의 = 실제 채널로 보낸 것 없음 — 채널 확인·두 번 게시
+    // 경고 없이 *_MOCK_MESSAGE + details mock: true(폼 경로가 같은 모의 화면 문구를 고름). 실제·계정 kind 를 모름(계정 없음)은 조건부 문구, details 그대로.
+    // 계정 조회는 복원 이력이 있을 때만 한다.
+    const restoredMock =
+      (restoredJob?.restoredNeedsReview || item.restoredNeedsReview) && (await accountOf(tx, ownerId, item.channelAccountId))?.kind === 'mock';
+    const restoredMockDetail = restoredMock ? { mock: true } : {};
     if (restoredJob?.restoredNeedsReview && !item.restoredNeedsReview) {
-      throw new NotRetryableError('not_retryable', '복원한 작업은 다시 보내지 않습니다(원격 결과를 이 환경에서 다시 확인하세요). 새 배포 계획을 만드세요.', {
+      throw new NotRetryableError('not_retryable', restoredMock ? RESTORED_JOB_RETRY_MOCK_MESSAGE : RESTORED_JOB_RETRY_MESSAGE, {
         status: item.status,
         restored: true,
+        ...restoredMockDetail,
       });
     }
     // FIX-T10(P0): 복원 때 진행 중이던 항목(restored_needs_review)은 원격 결과를 모르므로 재시도(재전송)하지 않는다 — 결과 불명이면 outcome_unknown.
     if (item.restoredNeedsReview) {
       throw item.status === 'UNKNOWN'
         ? new NotRetryableError('outcome_unknown', '복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.', { status: item.status, restored: true })
-        : new NotRetryableError('not_retryable', '복원 때 진행 중이던 항목은 다시 보내지 않습니다. 새 배포 계획을 만드세요.', { status: item.status, restored: true });
+        : // FIX5-FULLREV(T2): 조건부 복구 길 · (T2 후속) 모의 계정은 모의 문구 + mock: true
+          new NotRetryableError('not_retryable', restoredMock ? RESTORED_ITEM_RETRY_MOCK_MESSAGE : RESTORED_ITEM_RETRY_MESSAGE, {
+            status: item.status,
+            restored: true,
+            ...restoredMockDetail,
+          });
     }
     const active = await activeApprovalsFor(tx, ownerId, [item.id]);
     const job = await latestJobForItem(tx, ownerId, item.id, true);

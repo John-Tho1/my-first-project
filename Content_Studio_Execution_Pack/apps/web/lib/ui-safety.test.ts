@@ -357,3 +357,32 @@ describe('FIX3-FULLREV(R2) — 취소 리다이렉트 쿼리는 결과 불명을
     expect(src).not.toContain("'cancel_requested=1'");
   });
 });
+
+/**
+ * FIX5-FULLREV(T4, 사용자 결정 2026-10-23): /api/distribution-items/{id}/ 의 HTML 폼 경로는 plan_id 가 없을 때 /distribute 로 돌아가지 않고 같은 규칙(lib itemFormBack —
+ * owner 확인 뒤에만 owner 범위 조회 planIdOfItem)으로 항목의 계획 화면에 돌아간다. 성공·실패(distributeFormFailure 의 back) 모두 같은 값. 예전 고정 /distribute 식이 되살아나지 않게.
+ */
+describe('FIX5-FULLREV(T4) — 항목 폼 경로의 되돌아갈 곳은 한 규칙', () => {
+  const dir = new URL('../app/api/distribution-items/[id]/', import.meta.url);
+  const routes = readdirSync(dir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort();
+  it('경로 목록(새 항목 폼 경로가 생기면 여기서 다시 본다)', () => {
+    expect(routes).toEqual(['cancel', 'mock-scenario', 'reconcile', 'retry', 'user-confirm']);
+  });
+  for (const r of routes) {
+    it(r, () => {
+      const src = read(`api/distribution-items/[id]/${r}/route.ts`);
+      expect(src).toContain('const back = itemFormBack(html);');
+      expect(src).toContain('back.ownerChecked(() => planIdOfItem(owner.db, owner.ownerId, id.toLowerCase()));');
+      expect(src).toContain('back.formPlanId(body.data.plan_id);');
+      expect(src).toContain('const to = await back.target();');
+      expect(src).toContain('return distributeFormFailure(e, request, await back.target());');
+      // owner 확인(requireOwner) 뒤에만 조회 — CSRF·로그인 실패는 조회 없이 /distribute
+      expect(src.indexOf('back.ownerChecked(')).toBeGreaterThan(src.indexOf('await requireOwner(request)'));
+      expect(src.indexOf('await requireOwner(request)')).toBeGreaterThan(src.indexOf('assertSameOrigin('));
+      for (const old of ["let back = '/distribute'", 'distributeFormFailure(e, request, back)', '${back}${back.includes']) expect(src, old).not.toContain(old);
+    });
+  }
+});

@@ -481,3 +481,46 @@ describe('FIX2-FULLREV(Q3) restoredCancelNotSentProven (복원한 작업의 취�
     }
   });
 });
+
+/**
+ * FIX5-FULLREV(T2, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘" · FULLREV1 인계 FIX round 4 "남은 것" 2): 복원 이력 재시도 거절 문구는 무조건
+ * "새 배포 계획을 만드세요"가 아니라 USER_CONFIRM_RESTORED_MESSAGE 와 같은 조건(직접 확인해 없을 때만 새 배포 계획) — 모의·실제 공통 한 문구(채널 이름·MOCK·
+ * "보낸 것 없음"을 말하지 않음).
+ */
+describe('FIX5-FULLREV(T2) — 복원 이력 재시도 거절 문구', () => {
+  it('정확한 문구 · 새 배포 계획은 "직접 확인해 게시물이 없을 때만" 조건 아래 정확히 한 번 · 무조건 문구·채널 단정 없음', async () => {
+    const { RESTORED_RETRY_RECOVERY, RESTORED_JOB_RETRY_MESSAGE, RESTORED_ITEM_RETRY_MESSAGE, USER_CONFIRM_RESTORED_MESSAGE } = await import('./index');
+    const TAIL =
+      '채널에서 이 계정의 최근 게시물을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 내용이 두 번 올라갈 수 있습니다).';
+    expect(RESTORED_RETRY_RECOVERY).toBe(TAIL);
+    expect(RESTORED_JOB_RETRY_MESSAGE).toBe(`복원한 작업은 다시 보내지 않습니다(원격 결과를 이 환경에서 다시 확인하세요). ${TAIL}`);
+    expect(RESTORED_ITEM_RETRY_MESSAGE).toBe(`복원 때 진행 중이던 항목은 다시 보내지 않습니다. ${TAIL}`);
+    for (const m of [RESTORED_JOB_RETRY_MESSAGE, RESTORED_ITEM_RETRY_MESSAGE]) {
+      expect(m.split('새 배포 계획').length - 1).toBe(1);
+      expect(m).toContain('직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요');
+      for (const w of ['새 배포 계획을 만드세요', 'MOCK', 'Threads', '보낸 것 없음', '보낸 것은 없', '보내지 않았']) expect(m, w).not.toContain(w);
+    }
+    // 같은 조건: 사용자 확인 거절 문구(실제 Threads 전용)도 "직접 확인해 … 없을 때만 새 배포 계획으로 다시 승인하세요"
+    expect(USER_CONFIRM_RESTORED_MESSAGE).toContain('직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요');
+  });
+
+  // FIX5-FULLREV(T2 후속 — 리뷰 확정 @cs/db jobs.ts:1857): 모의 계정 항목의 같은 거절 — 실제 채널로 보낸 것 없음 · 채널 확인·두 번 게시 경고 없음(FX4 규칙)
+  it('모의 계정 문구: 정확한 문구 · MOCK · 다시 보내지 않음 · 실제 채널로 보낸 것 없음 · 새 배포 계획 한 번 · 채널 확인·두 번 게시 경고 없음', async () => {
+    const { RESTORED_RETRY_RECOVERY_MOCK, RESTORED_JOB_RETRY_MOCK_MESSAGE, RESTORED_ITEM_RETRY_MOCK_MESSAGE, RESTORED_JOB_RETRY_MESSAGE, RESTORED_ITEM_RETRY_MESSAGE } =
+      await import('./index');
+    const TAIL = '실제 채널로 보낸 것은 없습니다(확인할 게시물 없음). 모의 실행을 다시 하려면 새 배포 계획을 만드세요.';
+    expect(RESTORED_RETRY_RECOVERY_MOCK).toBe(TAIL);
+    expect(RESTORED_JOB_RETRY_MOCK_MESSAGE).toBe(`MOCK — 복원한 모의 작업은 다시 보내지 않습니다(자동 재전송 안 함). ${TAIL}`);
+    expect(RESTORED_ITEM_RETRY_MOCK_MESSAGE).toBe(`MOCK — 복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). ${TAIL}`);
+    for (const m of [RESTORED_JOB_RETRY_MOCK_MESSAGE, RESTORED_ITEM_RETRY_MOCK_MESSAGE]) {
+      expect(m.startsWith('MOCK — ')).toBe(true);
+      expect(m).toContain('다시 보내지 않습니다');
+      expect(m).toContain('실제 채널로 보낸 것은 없습니다');
+      expect(m.split('새 배포 계획').length - 1).toBe(1);
+      for (const w of ['채널에서', '두 번 올라갈', '직접 확인', 'Threads', '원격 결과']) expect(m, w).not.toContain(w);
+    }
+    // 실제·kind 모름 문구와 섞이지 않는다
+    expect(RESTORED_JOB_RETRY_MOCK_MESSAGE).not.toBe(RESTORED_JOB_RETRY_MESSAGE);
+    expect(RESTORED_ITEM_RETRY_MOCK_MESSAGE).not.toBe(RESTORED_ITEM_RETRY_MESSAGE);
+  });
+});

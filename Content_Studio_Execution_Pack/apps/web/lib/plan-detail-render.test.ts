@@ -327,6 +327,26 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
     expect(mock).toContain('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): 원고가 바뀜');
     expect(statusTag(live!)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
     expect(live).toContain(LIVE_UNKNOWN_GUIDANCE);
+    // FIX5-FULLREV(T1, 사용자 결정 2026-10-23): (FIX2 까지의 "머리줄 = 결과 불명 — 안내 전체"를 바꿈) 실제 카드의 조건부 복구 줄은 일반 결과 불명 안내에만 정확히 한 번 —
+    // 머리줄은 결과 불명·다시 게시하지 않음·Threads 직접 확인만(정확한 문구), 안내는 그대로(role=alert)
+    expect(live).toContain('<strong>결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요</strong>');
+    expect(live).toContain(`<p class="notice" role="alert">${LIVE_UNKNOWN_GUIDANCE}</p>`);
+    expect(live!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
+    expect(live!.split(LIVE_UNKNOWN_GUIDANCE).length - 1).toBe(1);
+    expect(conditionalNewPlanCount(live!)).toBe(1);
+    expect(live).not.toContain('MOCK');
+  });
+
+  it('FIX5-FULLREV(T1): 작업이 없는 실제 결과 불명 카드(작업 칸·결과 불명 안내 없음)는 머리줄이 안내 전체 — 그 카드에서도 조건부 복구 줄은 정확히 한 번', async () => {
+    const { LIVE_UNKNOWN_GUIDANCE } = await import('./distribution');
+    const x = unknownItem('gn', { live: true, code: null });
+    state.detail = detail({ ...x, jobs: [] });
+    const [live] = cards(await render());
+    expect(live).not.toContain('<h4>작업');
+    expect(live).not.toContain(`<p class="notice" role="alert">${LIVE_UNKNOWN_GUIDANCE}</p>`);
+    expect(live).toContain(`<strong>결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}</strong>`);
+    expect(live!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
+    expect(conditionalNewPlanCount(live!)).toBe(1);
   });
 });
 

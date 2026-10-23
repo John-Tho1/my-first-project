@@ -2,7 +2,7 @@ import { cancelItem, planIdOfItem } from '@cs/db';
 import { assertSameOrigin, cancelSchema } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
-import { cancelRedirectQuery, distributeFormFailure, itemPlanBack, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
+import { cancelRedirectQuery, distributeFormFailure, itemFormBack, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
 import { getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
@@ -22,32 +22,30 @@ type Ctx = { params: Promise<{ id: string }> };
  * FIX4-FULLREV(S4): HTML 폼이 plan_id 없이 오면 /distribute(배너 없음) 대신 항목이 속한 계획 화면(owner 범위 조회 planIdOfItem — 실패하면 /distribute 그대로).
  * 오류 리다이렉트(distributeFormFailure 의 back)도 같다 — owner 를 확인한 뒤에만 조회하므로(CSRF·로그인 실패는 조회 없이 그대로) 다른 owner 의 항목은 찾지 못하고,
  * 404 는 지금처럼 /distribute?missing=1 이다.
+ * FIX5-FULLREV(T4): 이 규칙은 lib itemFormBack 한곳에 두고 다른 항목 폼(재시도·재확인·사용자 확인·모의 시나리오)과 함께 쓴다(동작 그대로).
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
   const html = wantsHtml(request);
   const { id } = await ctx.params;
-  let back = '/distribute';
   // FIX4-FULLREV(S4): plan_id 없는 HTML 요청의 되돌아갈 곳 — owner 를 확인한 뒤에만 정한다(항목의 계획 화면, 조회 실패면 /distribute)
-  let backOfItem: (() => Promise<string>) | null = null;
+  // FIX5-FULLREV(T4): 같은 규칙을 lib itemFormBack 으로(다른 항목 폼과 공유)
+  const back = itemFormBack(html);
   try {
     assertSameOrigin(request, getConfig());
     const owner = await requireOwner(request);
-    if (html) backOfItem = () => itemPlanBack(() => planIdOfItem(owner.db, owner.ownerId, id.toLowerCase()));
+    back.ownerChecked(() => planIdOfItem(owner.db, owner.ownerId, id.toLowerCase()));
     const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
-    if (body.kind === 'form' && body.data.plan_id) {
-      back = `/distribute/${encodeURIComponent(body.data.plan_id)}`;
-      backOfItem = null;
-    }
+    if (body.kind === 'form') back.formPlanId(body.data.plan_id);
     const parsed = cancelSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
     const r = await cancelItem(owner.db, owner.ownerId, id.toLowerCase());
     if (html) {
-      const to = backOfItem ? await backOfItem() : back;
+      const to = await back.target();
       return seeOther(`${to}${to.includes('?') ? '&' : '?'}${cancelRedirectQuery(r)}`);
     }
     return json(r);
   } catch (e) {
-    if (html) return distributeFormFailure(e, request, backOfItem ? await backOfItem() : back);
+    if (html) return distributeFormFailure(e, request, await back.target());
     return errorResponse(e, request);
   }
 }

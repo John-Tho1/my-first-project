@@ -208,6 +208,29 @@ export function isScheduleStale(scheduledAtUtc: Date | null, now: Date): boolean
 export const SCHEDULE_STALE_RETRY_MESSAGE =
   "예약 시각이 60분 넘게 지나 보내지 않았습니다(오래 지난 예약은 자동으로 보내지 않음). 지금 보내려면 '재시도'를 한 번 더 누르세요 — 그 재시도가 지난 예약을 지금 보내겠다는 확인입니다.";
 
+/**
+ * FIX5-FULLREV(T2, 사용자 결정 2026-10-23): 복원한 작업·복원 때 진행 중이던 항목의 재시도 거절(@cs/db retryItem — not_retryable + restored: true)의 복구 길.
+ * 무조건 "새 배포 계획을 만드세요"가 아니라 USER_CONFIRM_RESTORED_MESSAGE 와 같은 조건 — 채널에서 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인.
+ * 실제 계정·계정 kind 를 모를 때의 문구다(FIX5-FULLREV(T2 후속): 모의 계정은 아래 RESTORED_RETRY_RECOVERY_MOCK): 채널 이름(Threads)·MOCK 을 말하지 않고,
+ * 보낸 것이 없다고도 말하지 않는다(복원된 기록은 보냈는지를 증명하지 못함).
+ */
+export const RESTORED_RETRY_RECOVERY =
+  '채널에서 이 계정의 최근 게시물을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 내용이 두 번 올라갈 수 있습니다).';
+/** FIX5-FULLREV(T2): 복원한 작업(작업에만 복원 표시) 재시도 거절 문구 */
+export const RESTORED_JOB_RETRY_MESSAGE = `복원한 작업은 다시 보내지 않습니다(원격 결과를 이 환경에서 다시 확인하세요). ${RESTORED_RETRY_RECOVERY}`;
+/** FIX5-FULLREV(T2): 복원 때 진행 중이던 항목(결과 불명 아님) 재시도 거절 문구 */
+export const RESTORED_ITEM_RETRY_MESSAGE = `복원 때 진행 중이던 항목은 다시 보내지 않습니다. ${RESTORED_RETRY_RECOVERY}`;
+/**
+ * FIX5-FULLREV(T2 후속 — 리뷰 확정 jobs.ts:1857, 결정 "MOCK 문구는 코드가 구별할 수 있을 때만"): 모의 계정 항목의 같은 거절(@cs/db retryItem 이 항목 계정 kind 로
+ * 고른다 — details mock: true). 모의 항목은 실제 채널로 보낸 적이 없고 모의 시뮬레이터는 복원되지 않아 확인할 곳이 없으며 같은 내용이 두 번 올라갈 위험도 없다 —
+ * 채널 확인·중복 게시 경고를 하지 않는다(FX4 RESTORED_CANCEL_UNVERIFIED_MOCK_MESSAGE 와 같은 규칙). 실제 계정·계정 kind 를 모름(계정 없음)은 위의 조건부 문구.
+ */
+export const RESTORED_RETRY_RECOVERY_MOCK = '실제 채널로 보낸 것은 없습니다(확인할 게시물 없음). 모의 실행을 다시 하려면 새 배포 계획을 만드세요.';
+/** FIX5-FULLREV(T2 후속): 복원한 모의 작업(작업에만 복원 표시) 재시도 거절 문구 */
+export const RESTORED_JOB_RETRY_MOCK_MESSAGE = `MOCK — 복원한 모의 작업은 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`;
+/** FIX5-FULLREV(T2 후속): 복원 때 진행 중이던 모의 항목(결과 불명 아님) 재시도 거절 문구 */
+export const RESTORED_ITEM_RETRY_MOCK_MESSAGE = `MOCK — 복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`;
+
 /** 오래 지난 예약 확인이 가리키는 대상 — 지금의 활성 승인·내용 hash·예약 시각(ISO). */
 export interface StaleScheduleConfirmTarget {
   approvalId: string;

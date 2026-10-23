@@ -63,6 +63,9 @@ import {
   itemRecordLive,
   recordModeKey,
   UNPROVEN_CONFIRMED_LINE,
+  // FIX5-FULLREV(T1·T4)
+  LIVE_UNKNOWN_HEADLINE,
+  itemFormBack,
 } from './distribution';
 import { NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE } from '@cs/domain';
 
@@ -1036,7 +1039,11 @@ describe('FIX2-FULLREV(Q1·Q2·Q3): 부분 게시·복원 취소 미확정 UNKNO
     }
     // 일반 UNKNOWN 은 그대로
     expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'reconcile_timeout'), pub: null, blockReason: null })).toBe('확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
-    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: null })).toBe(`결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`);
+    // FIX5-FULLREV(T1, 사용자 결정 2026-10-23): (FIX2 의 "일반 실제 머리줄 = 결과 불명 — 안내 전체"를 바꿈) 작업이 있는 일반 결과 불명 실제 머리줄은 짧은 정확한 문구 —
+    // 조건부 복구 줄은 같은 카드의 일반 결과 불명 안내에 한 번만. 작업이 없는 카드(안내를 그리지 않음)는 지금처럼 안내 전체(아래 FIX5-FULLREV(T1) 시험)
+    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: null })).toBe(
+      '결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요',
+    );
   });
 
   // FIX3-FULLREV(R3, 사용자 결정 2026-10-23): 실제 게시 안내(LIVE_UNKNOWN_GUIDANCE_BY_KIND)는 다시 조건부 복구 길("직접 확인해 글이 없을 때만 새 배포 계획으로
@@ -1387,5 +1394,151 @@ describe('FIX4-FULLREV(S4) — plan_id 없는 취소 폼의 되돌아갈 곳(ite
         throw new Error('db down');
       }),
     ).toBe('/distribute');
+  });
+});
+
+/**
+ * FIX5-FULLREV(T1, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘" · FULLREV1 인계 FIX round 4 "남은 것" 1): 일반 결과 불명(부분 게시·복원 미확정 코드 아님)
+ * 실제 카드는 조건부 복구 줄("없을 때만 새 배포 계획으로 다시 승인하세요")을 일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE)에만 한 번 — 머리줄은 결과 불명·다시 게시하지 않음·
+ * Threads 직접 확인만(정확한 문구). 작업이 없는 카드는 작업 칸·안내가 없으므로(page.tsx) 머리줄이 지금처럼 안내 전체를 싣는다(그 카드에서도 한 번).
+ */
+describe('FIX5-FULLREV(T1) — 일반 결과 불명 실제 머리줄', () => {
+  const WANT = '결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요';
+  const count = (t: string) => t.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1;
+
+  it('작업이 있으면 짧은 정확한 문구(조건부 복구 줄·새 계획 권유 없음) — 앞선 BLOCKED 사유·부분 게시가 아닌 사유 코드여도 같다, 안내와 합쳐 조건부 줄은 정확히 한 번', () => {
+    expect(LIVE_UNKNOWN_HEADLINE).toBe(WANT);
+    for (const code of [null, 'reconcile_timeout', 'submit_timeout', 'remote_unknown']) {
+      for (const blockReason of [null, 'auth', 'credential_blocked', 'approval_missing']) {
+        const label = `${String(code)}/${String(blockReason)}`;
+        const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', code), pub: null, blockReason });
+        expect(live, label).toBe(WANT);
+        // 이 머리줄이 나오는 작업은 종류가 없다(unknownKindOf null) — 카드의 안내는 일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE)
+        expect(unknownKindOf('UNKNOWN', job('UNKNOWN', code)), label).toBeNull();
+        expect({ headline: count(live), guidance: count(LIVE_UNKNOWN_GUIDANCE) }, label).toEqual({ headline: 0, guidance: 1 });
+        for (const w of ['새 배포 계획', '없을 때만', '새 계획', '다시 승인', 'MOCK']) expect(live, `${label}/${w}`).not.toContain(w);
+        for (const w of ['결과 불명(UNKNOWN)', '다시 게시하지 않음', 'Threads 앱·웹에서 직접 확인하세요']) expect(live, `${label}/${w}`).toContain(w);
+      }
+    }
+  });
+
+  it('작업이 없으면(카드에 결과 불명 안내가 없음) 지금처럼 안내 전체 — 그 카드의 조건부 복구 줄은 머리줄에 정확히 한 번', () => {
+    for (const blockReason of [null, 'credential_blocked']) {
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason });
+      expect(live, String(blockReason)).toBe(`결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`);
+      expect(count(live), String(blockReason)).toBe(1);
+    }
+  });
+});
+
+/**
+ * FIX5-FULLREV(T2): 복원 이력 재시도 거절(not_retryable + restored: true — @cs/db retryItem)의 폼 경로 화면 문구도 같은 조건부 복구 길.
+ * 그 밖의 not_retryable(보류 아님)은 지금 문구 그대로, JSON 오류 코드는 바꾸지 않는다(폼 리다이렉트의 화면 문구 코드만).
+ */
+describe('FIX5-FULLREV(T2) — 복원 이력 재시도 거절의 화면 문구', () => {
+  const req = new Request('http://localhost:3000/api/distribution-items/x/retry', { method: 'POST', headers: { accept: 'text/html', origin: 'http://localhost:3000' } });
+  it('not_retryable + restored → error=not_retryable_restored(정확한 문구 — 직접 확인해 없을 때만 새 배포 계획), restored 아님 → error=not_retryable 그대로', () => {
+    for (const status of ['BLOCKED', 'QUEUED', 'UNKNOWN']) {
+      const r = distributeFormFailure(new NotRetryableError('not_retryable', '시험', { status, restored: true }), req, '/distribute/P');
+      expect(r.status, status).toBe(303);
+      expect(r.headers.get('location'), status).toBe('/distribute/P?error=not_retryable_restored');
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored).toBe(
+      '복원한 작업·복원 때 진행 중이던 항목은 다시 보내지 않습니다. 채널에서 이 계정의 최근 게시물을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 내용이 두 번 올라갈 수 있습니다).',
+    );
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored!.split('새 배포 계획').length - 1).toBe(1);
+    for (const w of ['새 배포 계획을 만드세요', 'MOCK', 'Threads']) expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored, w).not.toContain(w);
+    // restored 표시가 없거나 true 가 아니면 지금처럼
+    for (const extra of [undefined, { status: 'PLANNED' }, { restored: false }, { restored: 'true' }]) {
+      expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', extra), req, '/distribute/P').headers.get('location'), JSON.stringify(extra)).toBe(
+        '/distribute/P?error=not_retryable',
+      );
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable).toBe('보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.');
+    // 복원 전 결과 불명(outcome_unknown + restored)은 지금 코드·문구 그대로(새 계획을 말하지 않음)
+    expect(distributeFormFailure(new NotRetryableError('outcome_unknown', '시험', { status: 'UNKNOWN', restored: true }), req, '/distribute/P').headers.get('location')).toBe(
+      '/distribute/P?error=outcome_unknown',
+    );
+    expect(DISTRIBUTE_ERROR_TEXT.outcome_unknown).not.toContain('새 배포 계획');
+  });
+
+  // FIX5-FULLREV(T2 후속 — 리뷰 확정 @cs/db jobs.ts:1857): 모의 계정 항목(details mock: true)은 모의 화면 문구 — 채널 확인·두 번 게시 경고 없음
+  it('not_retryable + restored + mock: true → error=not_retryable_restored_mock(정확한 문구), mock 이 true 가 아니면 조건부 문구 코드 그대로', () => {
+    for (const status of ['BLOCKED', 'QUEUED']) {
+      const r = distributeFormFailure(new NotRetryableError('not_retryable', '시험', { status, restored: true, mock: true }), req, '/distribute/P');
+      expect(r.status, status).toBe(303);
+      expect(r.headers.get('location'), status).toBe('/distribute/P?error=not_retryable_restored_mock');
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored_mock).toBe(
+      'MOCK — 복원한 모의 작업·복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). 실제 채널로 보낸 것은 없습니다(확인할 게시물 없음). 모의 실행을 다시 하려면 새 배포 계획을 만드세요.',
+    );
+    for (const w of ['채널에서', '두 번 올라갈', '직접 확인', 'Threads']) expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored_mock, w).not.toContain(w);
+    // mock 표시가 없거나 true 가 아니면 조건부(실제·kind 모름) 문구 코드
+    for (const extra of [{ restored: true }, { restored: true, mock: false }, { restored: true, mock: 'true' }]) {
+      expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', extra), req, '/distribute/P').headers.get('location'), JSON.stringify(extra)).toBe(
+        '/distribute/P?error=not_retryable_restored',
+      );
+    }
+    // restored 가 아니면 mock 표시가 있어도 일반 not_retryable
+    expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', { mock: true }), req, '/distribute/P').headers.get('location')).toBe(
+      '/distribute/P?error=not_retryable',
+    );
+  });
+});
+
+/**
+ * FIX5-FULLREV(T4, 사용자 결정 2026-10-23 · FULLREV1 인계 FIX round 4 "남은 것" 4): 항목 폼의 되돌아갈 곳(itemFormBack) — 취소 경로(FIX4 S4)의 규칙 한곳.
+ * plan_id 숨은 필드 → 그 계획(조회 없음) · 없음 + owner 확인 → 항목의 계획(itemPlanBack) · owner 확인 전·HTML 아님 → /distribute(조회 없음).
+ */
+describe('FIX5-FULLREV(T4) — 항목 폼의 되돌아갈 곳(itemFormBack)', () => {
+  const PLAN = '11111111-2222-4333-8444-555555555555';
+  const finder = (v: string | null | Error) => {
+    const calls = { n: 0 };
+    const find = async () => {
+      calls.n++;
+      if (v instanceof Error) throw v;
+      return v;
+    };
+    return { calls, find };
+  };
+
+  it('plan_id 없음 + owner 확인 → 항목의 계획 화면 · 조회가 없음·실패·UUID 아님이면 /distribute', async () => {
+    for (const [v, want] of [
+      [PLAN, `/distribute/${PLAN}`],
+      [null, '/distribute'],
+      ['not-a-uuid', '/distribute'],
+      [`${PLAN}?x=1`, '/distribute'],
+      [new Error('db down'), '/distribute'],
+    ] as const) {
+      const f = finder(v);
+      const b = itemFormBack(true);
+      b.ownerChecked(f.find);
+      b.formPlanId(undefined);
+      b.formPlanId('');
+      expect(await b.target(), String(v)).toBe(want);
+      expect(f.calls.n, String(v)).toBe(1);
+    }
+  });
+
+  it('plan_id 숨은 필드가 있으면 그 값(인코딩) — 조회하지 않는다, 순서와 무관', async () => {
+    const f = finder(PLAN);
+    const a = itemFormBack(true);
+    a.ownerChecked(f.find);
+    a.formPlanId('p/1?x');
+    expect(await a.target()).toBe('/distribute/p%2F1%3Fx');
+    const b = itemFormBack(true);
+    b.formPlanId('P2');
+    b.ownerChecked(f.find);
+    expect(await b.target()).toBe('/distribute/P2');
+    expect(f.calls.n).toBe(0);
+  });
+
+  it('owner 확인 전(CSRF·로그인 실패)·HTML 이 아닌 요청은 조회 없이 /distribute', async () => {
+    expect(await itemFormBack(true).target()).toBe('/distribute');
+    const f = finder(PLAN);
+    const json = itemFormBack(false);
+    json.ownerChecked(f.find);
+    expect(await json.target()).toBe('/distribute');
+    expect(f.calls.n).toBe(0);
   });
 });

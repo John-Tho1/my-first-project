@@ -364,6 +364,30 @@ describe('Threads에서 확인함 — 성공', () => {
     expect((await planOf(s.planId)).status).toBe('completed');
   });
 
+  // FIX5-FULLREV(T4, 사용자 결정 2026-10-23): plan_id 없이 보낸 폼도 /distribute 가 아니라 항목의 계획 화면(owner 범위 조회 — 취소 경로와 같은 lib itemFormBack).
+  // 조회 실패·CSRF·404 는 tests/integration/fix5-fullrev.test.ts
+  it('FIX5-FULLREV(T4): plan_id 없는 화면 폼 → 303 /distribute/<계획>?user_confirmed=1, CONFIRMED·USER_CONFIRMED · 네트워크 0', async () => {
+    const s = await ambiguousLivePost('plan_id 없이 사용자 확인 시험 글.', 'UC-noplan', { candidate: true, until: 'RECONCILING' });
+    const spy = vi.fn(async () => {
+      throw new Error('네트워크 금지');
+    });
+    vi.stubGlobal('fetch', spy);
+    const res = await userConfirmPOST(
+      new Request(`${BASE}/api/distribution-items/${s.itemId}/user-confirm`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...ORIGIN_HEADERS, ...cookieHeader(token) },
+        body: new URLSearchParams({ candidate_external_id: s.candidateId }).toString(),
+      }),
+      ctx(s.itemId),
+    );
+    vi.unstubAllGlobals();
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe(`/distribute/${s.planId}?user_confirmed=1`);
+    expect(spy).not.toHaveBeenCalled();
+    expect((await itemOf(s.itemId)).status).toBe('CONFIRMED');
+    expect((await pubsOf(s.itemId))[0]).toMatchObject({ verification: 'USER_CONFIRMED', confirmedBy: 'owner' });
+  });
+
   it('동시 두 번 제출(PGlite 한 연결) → 결과 정확히 1개, 하나는 200 하나는 409, user_confirmed 이력 1개', async () => {
     const s = await ambiguousLivePost('동시 사용자 확인 시험 글.', 'UC-race', { candidate: true, until: 'UNKNOWN' });
     const spy = vi.fn(async () => {

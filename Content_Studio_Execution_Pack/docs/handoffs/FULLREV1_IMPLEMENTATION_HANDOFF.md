@@ -135,3 +135,29 @@
   2. 복원 작업 user-confirm 거부 문구(`user_confirm_restored`)가 아직 조건 없이 "새 배포 계획을 만드세요"다.
   3. 계정 없는 항목의 취소 JSON 문구(실제 쪽 조심 문구)와 카드·안내(모의 문구)가 다르다(이전부터).
   4. plan_id 없이 보낸 취소는 /distribute 로 돌아가 안내가 없다(이전부터).
+
+# FIX round 4 (FIX4-FULLREV — FIX round 3 "남은 것" 1~4 사용자 결정)
+- BASE_SHA: d3eb1f3 (FIX round 3 인계 docs) · **HEAD_SHA: fc74b3a** (`fc74b3aae5795b63c1385b84b9460757c4c249cb`)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"). 오케스트레이터가 권고안 S1~S4 를 알린 뒤 진행했다.
+- 진행: 구현 에이전트 1명이 구현했다. 반박 검토 2관점(이동·소유자 / 문구, Claude — Codex 아님)에서 지적 5건이 나왔고 확정 0·기각 5다. 기각 사유는 모두 이번 변경 밖의 원래 문구이거나 닿을 수 없는 상태다.
+- 결정 처리:
+  - **S1** 실제 카드의 조건부 복구 줄은 결과 불명 안내(`LIVE_UNKNOWN_GUIDANCE_BY_KIND`)에 한 번만 둔다.
+    - 실제 머리줄 꼬리(`LIVE_UNKNOWN_HEADLINE_RECOVERY` 제거)와 실제 스냅샷 안내에서 뺐다. 둘 다 "다시 게시하지 않음·Threads 에서 직접 확인"은 남는다.
+    - 스냅샷 안내는 결과 기록 기준, 안내는 계정 기준으로 서로 다르게 골라졌다. 이제 같은 값(recordLive)으로 고른다. 그래서 줄이 빠진 채 안내 없는 카드는 없다.
+  - **S2** `USER_CONFIRM_RESTORED_MESSAGE`(@cs/domain)와 화면 오류 문구 `user_confirm_restored` 에 "직접 확인해 글이 없을 때만 새 배포 계획" 조건을 붙였다.
+  - **S3** 항목은 계정을 잃을 수 없다. channel_account_id 는 NOT NULL 이고, 같은 owner FK 는 ON DELETE RESTRICT 이고, 열 변경·항목 삭제는 트리거가 막고, kind 는 mock·live 만 된다. 새 시험(`fix4-account-required`)으로 고정했다.
+    - 그래도 화면의 모의/실제 판정을 하나로 모았다(`itemRecordLive`). 순서는 결과 기록 is_mock → 계정 종류 → 최근 의도의 adapter_id(live_*·mock_*) → 모름(null)이다.
+    - 모름이면 MOCK·Threads·"실제 게시"·새 계획을 말하지 않는 조심 문구를 쓴다(표마다 `unknown` 칸, `UNPROVEN_CONFIRMED_LINE`). cancelItem 은 이미 같은 규칙이라 그대로다.
+  - **S4** plan_id 없이 보낸 HTML 취소의 성공·실패 이동 대상은 그 항목의 계획 화면이다(`planIdOfItem` — 소유자 범위, `itemPlanBack` — 조회 실패·UUID 아님은 /distribute). CSRF·401 은 소유자 확인 전이라 조회하지 않는다. 404 는 /distribute?missing=1 그대로다. JSON 과 plan_id 경로는 그대로다.
+- 바뀐 기존 단언: FIX3 의 실제 머리줄 정확 문구·꼬리 단언과 카드당 조건부 줄 3회 세기를 S1 결정에 따라 바꿨다. 새 정확 문구, 꼬리 없음, 카드당 정확히 1회로 교체했다. 계정 없는 항목의 배너 기대값은 S3 에 따라 mock → unknown 이다. ui-safety 의 연결 고정 줄은 새 단일 규칙 연결로 갱신했다. 그 밖의 제거 0 이고, 모의 스냅샷 안내 검사는 세 칸(mock·live·unknown) 모두로 넓혔다.
+- 변이 확인: 33개 모두 잡혔고, 복원 뒤 cmp 일치했다.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 실행, fc74b3a 와 같은 코드):
+  - install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS
+  - **unit 83 files / 2018 · integration 60 files / 1079**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271
+  - 변경 파일 보이지 않는 문자 0 · `./data` 변화 없음
+- 남은 것(손대지 않음, 모두 이번 변경 전부터):
+  1. 일반 실제 결과 불명(부분·복원 코드 아님)은 조건부 줄이 머리줄과 안내에 2번 나온다.
+  2. retryItem 의 복원 작업 거부 JSON 문구 2곳에 조건 없는 "새 배포 계획을 만드세요"가 남아 있다(HTML 은 일반 문구).
+  3. 계획 머리의 MOCK·실제 표시(hasLive·hasMock)는 계정 종류 기준이다(계정 없는 항목은 DB 가 막아 닿지 않음).
+  4. retry·reconcile·user-confirm·mock-scenario 폼도 plan_id 가 없으면 /distribute 로 돌아간다.

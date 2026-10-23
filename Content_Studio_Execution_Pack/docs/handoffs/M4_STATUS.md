@@ -273,3 +273,17 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
 - not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
 - Codex 큐 줄(추가): `a9873af FIX3-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX2-FULLREV 줄 다음).
+
+## 2026-10-23 오후 — FIX4-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 3 남은 것 1~4.
+  - S1: 실제 카드 복구 줄은 안내에 한 번만 둔다.
+  - S2: 복원 확인 거부 문구에 조건을 붙인다.
+  - S3: 계정 근거 규칙을 하나로 모은다(항목은 계정을 잃을 수 없음 — 시험 고정).
+  - S4: plan_id 없는 취소는 항목의 계획 화면으로 보낸다.
+- **FIX4-FULLREV fc74b3a**. 반박 검토 2관점: 확정 0·기각 5(모두 기존 문구·닿을 수 없는 상태). 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 4".
+- 마지막 검사(fc74b3a 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2018 · integration 60 files / 1079**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- Codex 큐 줄(추가): `fc74b3a FIX4-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX3-FULLREV 줄 다음).

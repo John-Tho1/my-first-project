@@ -1,0 +1,19 @@
+# Codex 검증 대기열 — bash scripts/codex-review-queue.sh 가 위에서부터 순서대로 검토한다(사용자 PC 전용, gpt-6-astra / xhigh).
+# 형식: <SHA> <작업명> <인계문서>[,<인계문서>...]   (경로는 앱 폴더 기준)
+# 결과: .handoffs/review-<작업명>.md (커밋 대상 아님). 이미 "## 판정" 이 있는 작업은 건너뛴다.
+# D39 (LIVE-P2 · EXPIRY-1 · LIVEL1-H2 와 Claude 독립 검토 FIX 1~6)
+ca7228e LIVEP2 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md
+5739e5a EXPIRY1 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md
+7538492 FIX1-LIVEP2 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md
+92cd026 FIX1-EXPIRY1 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md
+990fd5d LIVEL1H2 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+561bc5f FIX2-D39 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md,docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md,docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+e7c73c9 FIX3-D39 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md,docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+fb1fa58 FIX4-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+4769c4e FIX5-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+1b6e4f4 FIX6-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md
+# 전체 코드 Claude 독립 검토 1차 FIX (FULLREV1)
+af1d0b5 FIX1-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md
+13f29b3 FIX2-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md
+a9873af FIX3-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md
+fc74b3a FIX4-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md

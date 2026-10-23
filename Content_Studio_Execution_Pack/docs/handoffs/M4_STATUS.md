@@ -300,3 +300,8 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 5-4 개발 서버 확인(사용자 보고, 캡처 없음): `pnpm dev` → 로그인(AUTH_ALLOWED_IDENTITY) 성공. `/api/health`·`/`·`/api/health/details`·`/settings`·`/distribute`(계획 상세 포함)·`/ops` 화면이 모두 열렸다. 버튼 조작은 없었다. 이것으로 0046·0047 의 실제 `./data` 적용을 마쳤다.
 - 백업 폴더(`pglite-backup-20261023-before-0046`, 그 앞 `pglite.bak-2026101x-pre004x`)는 사용 확인 뒤 사용자가 정리한다.
 - not_run(남음): Codex, 실제 Postgres 다중 연결, 브라우저 자동 시험, macOS, 실제 Threads·Claude 호출, 원장 해결 행이 있는 상태의 `ledger:resolve` 미리보기·적용.
+
+## 2026-10-23 저녁 — Codex 검증 대기열 준비(사용자 PC 실행용)
+- 사용자 지시("codex 검증 진행해줘"). 클라우드 세션에는 codex CLI 가 없다(`which codex` 결과 없음). 사용자 규칙도 Codex 검증은 사용자 PC 전용·gpt-6-astra / xhigh 고정이다. 그래서 실행기와 대기열만 준비했다.
+- 대기열 `docs/handoffs/CODEX_QUEUE.txt`(14건): D39 의 LIVEP2·EXPIRY1·FIX1-LIVEP2·FIX1-EXPIRY1·LIVEL1H2·FIX2~6-D39, 그리고 FIX1~4-FULLREV 다. 실행은 `bash scripts/codex-review-queue.sh`(결과 `.handoffs/review-<작업명>.md`)다.
+- 실행기 시험 `scripts/tests/test-codex-review-queue.sh`(가짜 codex) 15/15 를 통과했다. 변이 2개(판정 없이 건너뜀·실패해도 계속)를 잡았다.

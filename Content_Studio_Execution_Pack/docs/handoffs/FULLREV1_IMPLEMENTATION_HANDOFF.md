@@ -110,3 +110,28 @@
   1. 복원 묶음의 migration 수준을 작업마다 기록해 0031 이후 묶음의 단계 없는 작업은 not_sent 로 끝낼 수 있게 해야 하는가?
   2. 취소 HTML 경로가 UNKNOWN 결과(부분 게시·복원 미확정)에도 `cancel_requested=1` 로 돌아간다. 전용 안내가 없는데, 따로 둬야 하는가?
   3. 실제 부분·복원 미확정 안내는 Threads 에 글이 실제로 없을 때의 복구 길(새 계획)을 말하지 않는다. 이 문구로 괜찮은가?
+
+# FIX round 3 (FIX3-FULLREV — FIX round 2 "검토자에게 물을 것" 1~3 사용자 결정)
+- BASE_SHA: a3af045 (FIX round 2 인계 docs) · **HEAD_SHA: a9873af** (`a9873afdf10ee09d44fae30a7addd948125f3291`)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"). 오케스트레이터가 권고안을 정해 알린 뒤 진행했다.
+- 진행: 구현 에이전트 1명이 구현했고, 반박 검토 2관점(취소 경로·안내 / 실제 계정 문구, Claude — Codex 아님)에서 지적 0건이었다.
+- 결정 처리:
+  - **R1** (질문 1, 복원 묶음 migration 수준을 작업마다 기록): **하지 않는다.** 작업마다 새 칸과 migration(0048)이 필요한데 드문 경우이고, 지금의 보수적 UNKNOWN(다시 보내지 않음)이 안전하다. 받아들인 제약이다: 0031 이후 묶음에서 단계 없이 끝난 복원 작업(예: 컨테이너 생성 401)도 취소하면 UNKNOWN(`restored_cancel_unverified`)이다.
+  - **R2** (질문 2): HTML 취소가 UNKNOWN 으로 끝나면 `cancel_unknown=1&cancel_item=<항목>&cancel_reason=<허용 목록 코드>` 로 돌아간다(`cancelRedirectQuery`).
+    - 계획 화면은 `cancelUnknownBannerOf` 로 저장된 상태를 확인한 뒤에만 전용 안내(`CANCEL_UNKNOWN_BANNER`)를 보인다. 확인 조건은 넷이다: 항목이 이 계획의 것, 항목·최근 작업이 UNKNOWN, 작업에 cancelRequestedAt 있음, 문구는 모의·실제·종류별.
+    - 질의 글은 화면에 그대로 내지 않는다. `canceled=1`·`cancel_requested=1`·JSON 응답은 그대로다.
+  - **R3** (질문 3): 실제 계정 카드에만 조건부 복구 줄을 둔다. 문구는 "Threads 에서 이 글이 없음을 직접 확인한 경우에만 새 배포 계획으로 다시 승인"이고, `LIVE_UNKNOWN_GUIDANCE_BY_KIND`, 실제 스냅샷 안내, 부분 게시 6코드·복원 미확정의 실제 머리줄 끝(`LIVE_UNKNOWN_HEADLINE_RECOVERY`)에 들어간다.
+    - 부분 게시는 「Threads에서 확인함」(카드에 보일 때)을 가리킨다. 복원 작업은 user-confirm 이 거부하므로 그 버튼을 가리키지 않는다.
+    - 모의 카드·상태 태그·작업 줄은 그대로다(모의 스레드는 여러 게시물이라 새 계획을 권하지 않음).
+- 바뀐 기존 단언: FIX2 에서 "실제 카드에 '없을 때만 새 배포 계획으로 다시 승인' 없음"을 고정한 단언과 실제 머리줄 정확 문구 단언을 R3 결정에 따라 바꿨다. 새 정확 문구 `toBe` 와 "모든 '새 배포 계획'은 '없을 때만 ' 바로 뒤에만" 세기 검사로 교체했고, 모의 카드에는 여전히 없음을 단언한다. 그 밖의 단언 제거 0 이다.
+- 변이 확인: 12개(+시험 강화 1) 모두 잡혔고, 복원 뒤 cmp 일치했다.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 실행, a9873af 와 같은 코드):
+  - install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS
+  - **unit 83 files / 2002 · integration 59 files / 1069**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271
+  - 변경 파일 보이지 않는 문자 0 · `./data` 변화 없음
+- 남은 것(구현 에이전트 질문, 손대지 않음):
+  1. 실제 머리줄에도 조건부 줄을 둘지, 안내·스냅샷 안내에만 둘지 정해야 한다. 지금은 셋 다 있어 카드에 3번 나온다.
+  2. 복원 작업 user-confirm 거부 문구(`user_confirm_restored`)가 아직 조건 없이 "새 배포 계획을 만드세요"다.
+  3. 계정 없는 항목의 취소 JSON 문구(실제 쪽 조심 문구)와 카드·안내(모의 문구)가 다르다(이전부터).
+  4. plan_id 없이 보낸 취소는 /distribute 로 돌아가 안내가 없다(이전부터).

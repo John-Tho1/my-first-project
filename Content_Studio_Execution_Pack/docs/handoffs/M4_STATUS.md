@@ -260,3 +260,16 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - 일부 게시된 스레드가 뒤에서 실패하면 "실패" 대신 "결과 불명"이다.
   - 옛 묶음(0031 이전)에서 복원한 작업을 취소하면 "결과 불명"이 될 수 있다.
 - Codex 큐 줄(추가): `13f29b3 FIX2-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX1-FULLREV 줄 다음).
+
+## 2026-10-23 — FIX3-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 2 검토자 질문 1~3.
+  - R1: 복원 묶음 migration 수준을 작업마다 기록하지 않는다(보수적 UNKNOWN 유지, 받아들인 제약).
+  - R2: 취소 결과 불명 전용 안내.
+  - R3: 실제 계정 카드에만 조건부 복구 줄.
+- **FIX3-FULLREV a9873af**: HTML 취소가 UNKNOWN 이면 `cancel_unknown` 으로 돌아가고 저장된 상태로 확인한 안내를 보인다. 실제 계정의 부분 게시·복원 미확정 안내에는 "Threads 에 없음을 직접 확인한 경우에만 새 배포 계획"이 붙는다(모의 그대로). 반박 검토 2관점 지적 0. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 3".
+- 마지막 검사(a9873af 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2002 · integration 59 files / 1069**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- Codex 큐 줄(추가): `a9873af FIX3-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX2-FULLREV 줄 다음).

@@ -248,9 +248,26 @@ fi
 # 가짜 openssl: 진짜 openssl 을 감싸되 STUB_ENDDATE 가 있으면 `x509 … -enddate` 에 그 값을, STUB_FAIL_REQ=1 이면 `req` 를 실패시킨다.
 # FIX1-EXPIRY1: STUB_CAPTURE_KEY=<경로> 면 `req` 의 -key 인수(dev-cert.sh 가 막 만든 새 개인 키 임시 파일)를 그 경로에 복사해 둔다 —
 # 실패 경로에서 dev-cert.sh 가 임시 키를 지워도 그 키가 출력에 없었는지 확인할 수 있게.
+# FIX1-CODEX: LOCK_PROBE_LOG=<파일> 이면 호출마다 "openssl <하위 명령> <-in 파일 이름 | -> held|free" 한 줄(그 순간 LOCK_PROBE 잠금 폴더가 있었는가)을
+# 남긴다 — 가짜 mv 도 같은 파일에 "mv <원본> -> <목적지> held|free" 를 남겨 시간 순서대로 섞인다. STUB_TERM_AT_FINAL=<pid 파일> 이면 두 이동 뒤 짝 검사
+# (-in 이 제자리 키 localhost-key.pem 인 pkey)에서 그 파일의 pid(가짜 mv 가 FAKE_MV_PID_FILE 에 적은 dev-cert.sh 의 pid — 가짜 openssl 은 \$(… 2>/dev/null)
+# 안이라 부모가 dev-cert.sh 가 아닌 하위 셸이다)에 TERM 을 보낸 뒤 그대로 실행한다.
+LOCK_NAME=.dev-cert-renew.lock
 STUB="$T_ROOT/stub-openssl"
 cat >"$STUB" <<EOF
 #!/usr/bin/env bash
+in_arg="-" prev=""
+for a in "\$@"; do
+  if [[ "\$prev" == -in ]]; then in_arg="\${a##*/}"; fi
+  prev="\$a"
+done
+if [[ -n "\${LOCK_PROBE_LOG:-}" ]]; then
+  if [[ -d "\${LOCK_PROBE:-}" ]]; then st=held; else st=free; fi
+  echo "openssl \$1 \$in_arg \$st" >>"\$LOCK_PROBE_LOG"
+fi
+if [[ -n "\${STUB_TERM_AT_FINAL:-}" && "\$1" == pkey && "\$in_arg" == localhost-key.pem ]]; then
+  read -r term_pid <"\$STUB_TERM_AT_FINAL" && kill -TERM "\$term_pid"
+fi
 if [[ -n "\${STUB_ENDDATE:-}" && "\$1" == x509 && " \$* " == *" -enddate "* ]]; then echo "notAfter=\$STUB_ENDDATE"; exit 0; fi
 if [[ -n "\${STUB_CAPTURE_KEY:-}" && "\$1" == req ]]; then
   prev=""
@@ -271,6 +288,20 @@ chmod +x "$STUB"
 #                           term-after-key = 새 키(.new-key.*) 이동은 진짜로 한 뒤 부모(dev-cert.sh)에 TERM 을 보내고 성공 — 두 이동 사이 중단
 #                           term-again = 되돌리기 이동(.restore-key.*)도 진짜로 한 뒤 TERM 한 번 더(두 번째 신호에도 되돌리기·정리가 끝까지 가는지)
 #                           hup-after-key·int-after-key = term-after-key 와 같되 HUP·INT(FIX2-EXPIRY1 — 터미널 닫기·Ctrl+C)
+#                           (FIX1-CODEX) restore-cert = 원본이 .restore-cert.*(두 이동 뒤 인증서 되돌리기 사본)이면 실패
+#                           (FIX1-CODEX) foreign-after-key = 새 키 이동은 진짜로 한 뒤 FAKE_FOREIGN_DIR 의 localhost-key.pem·localhost-cert.pem
+#                             (다른 renew B 의 짝)을 같은 폴더 제자리로 옮겨 넣는다 — A 키 → B 키 → B 인증서 → A 인증서 순서(짝 불일치)
+#                           (FIX1-CODEX) term-after-cert = 새 인증서(.new-cert.*) 이동은 진짜로 한 뒤 부모에 TERM(두 이동 뒤 짝 검사 전 중단)
+#                           (FIX1-CODEX) litter-lock = 새 인증서(.new-cert.*) 이동 직전에 같은 폴더의 잠금 폴더 안에 .DS_Store 를 만든다
+#                             (Finder·색인기가 잠금 폴더에 쓴 상태 — 끝날 때 rmdir 이 실패) 그 뒤 진짜 이동
+#   FAKE_MKDIR_FAIL_LOCK=1 (FIX1-CODEX) 마지막 인수의 basename 이 잠금 폴더 이름이면 만들지 않고 실패(이미 있어서가 아닌 실패 — 폴더 만들기 권한 없음 등)
+#   FAKE_MKDIR_SIG_LOCK=<TERM|HUP|INT> (FIX1-CODEX) 잠금 폴더는 진짜로 만든 뒤 부모(dev-cert.sh)에 그 신호를 보낸다 — 잠금 mkdir 도중 중단
+#     FAKE_MKDIR_SIG_SELF=1 이면 mkdir 자신에게도 보낸다(Ctrl+C·터미널 닫힘처럼 프로세스 그룹 전달)
+#   FAKE_MKDIR_LOG (FIX1-CODEX) 잠금 폴더 mkdir 호출 기록("<이름> fail" 또는 "<이름> created <신호>", 한 줄씩). 다른 mkdir 은 진짜 그대로.
+#   FAKE_MV_NESTED_LOG (FIX1-CODEX) 새 키를 옮기기 직전에 같은 폴더에서 renew 30 을 한 번 더 실행(B — 주입 변수 없이)하고 출력을 이 파일에,
+#                      종료 코드와 그 뒤 잠금 폴더가 남았는지를 <이 파일>.rc 에 적는다(rc=N, lock=held|free)
+#   LOCK_PROBE·LOCK_PROBE_LOG (FIX1-CODEX) 가짜 openssl 설명 참고
+#   FAKE_MV_PID_FILE (FIX1-CODEX) 호출마다 부모 pid(= dev-cert.sh — mv 는 바로 실행된다)를 이 파일에 적는다(가짜 openssl 의 STUB_TERM_AT_FINAL 용)
 #   FAKE_CP_DROP  (FIX2-EXPIRY1) 이 이름(basename)의 원본은 복사하지 않고 넘어간다 — 백업에 키가 빠진 상태(대소문자 무시 파일 시스템의 *.pem 누락 등)
 #   FAKE_MV_LOG  호출 기록(원본 이름 -> 목적지 이름, 한 줄씩)
 #   FAKE_DATE_STAMP  `date +%Y%m%d-%H%M%S` 에 이 값을 낸다(백업 폴더 이름 충돌을 시계와 무관하게 고정). 다른 date 호출은 진짜.
@@ -284,10 +315,35 @@ src="" dst=""
 for a in "\$@"; do src="\$dst"; dst="\$a"; done
 sb="\${src##*/}" db="\${dst##*/}"
 if [[ -n "\${FAKE_MV_LOG:-}" ]]; then echo "\$sb -> \$db" >>"\$FAKE_MV_LOG"; fi
+if [[ -n "\${LOCK_PROBE_LOG:-}" ]]; then
+  if [[ -d "\${LOCK_PROBE:-}" ]]; then st=held; else st=free; fi
+  echo "mv \$sb -> \$db \$st" >>"\$LOCK_PROBE_LOG"
+fi
+if [[ -n "\${FAKE_MV_PID_FILE:-}" ]]; then echo "\$PPID" >"\$FAKE_MV_PID_FILE"; fi
 has() { [[ ",\${FAKE_MV_FAIL:-}," == *",\$1,"* ]]; }
+if [[ -n "\${FAKE_MV_NESTED_LOG:-}" && "\$sb" == .new-key.* && "\$db" == localhost-key.pem ]]; then
+  env -u FAKE_MV_NESTED_LOG -u FAKE_MV_FAIL -u STUB_CAPTURE_KEY "$BASH_BIN" "$SCRIPT" renew 30 >"\$FAKE_MV_NESTED_LOG" 2>&1
+  echo "rc=\$?" >"\$FAKE_MV_NESTED_LOG.rc"
+  if [[ -d "\${dst%/*}/$LOCK_NAME" ]]; then echo "lock=held"; else echo "lock=free"; fi >>"\$FAKE_MV_NESTED_LOG.rc"
+fi
 if has key && [[ "\$db" == localhost-key.pem ]]; then echo "fake mv: 실패(시험) \$db" >&2; exit 1; fi
 if has cert && [[ "\$db" == localhost-cert.pem ]]; then echo "fake mv: 실패(시험) \$db" >&2; exit 1; fi
 if has restore && [[ "\$sb" == .restore-key.* ]]; then echo "fake mv: 실패(시험) \$sb" >&2; exit 1; fi
+if has restore-cert && [[ "\$sb" == .restore-cert.* ]]; then echo "fake mv: 실패(시험) \$sb" >&2; exit 1; fi
+if has foreign-after-key && [[ "\$sb" == .new-key.* && "\$db" == localhost-key.pem ]]; then
+  "$REAL_MV" "\$@" || exit 1
+  "$REAL_MV" -f -- "\$FAKE_FOREIGN_DIR/localhost-key.pem" "\${dst%/*}/localhost-key.pem" || exit 1
+  "$REAL_MV" -f -- "\$FAKE_FOREIGN_DIR/localhost-cert.pem" "\${dst%/*}/localhost-cert.pem" || exit 1
+  exit 0
+fi
+if has litter-lock && [[ "\$sb" == .new-cert.* && "\$db" == localhost-cert.pem ]]; then
+  : >"\${dst%/*}/$LOCK_NAME/.DS_Store" || exit 1
+fi
+if has term-after-cert && [[ "\$sb" == .new-cert.* && "\$db" == localhost-cert.pem ]]; then
+  "$REAL_MV" "\$@" || exit 1
+  kill -TERM "\$PPID"
+  exit 0
+fi
 for pair in TERM:term HUP:hup INT:int; do
   if has "\${pair#*:}-after-key" && [[ "\$sb" == .new-key.* && "\$db" == localhost-key.pem ]]; then
     "$REAL_MV" "\$@" || exit 1
@@ -317,7 +373,29 @@ cat >"$FAKE_BIN/date" <<EOF
 if [[ -n "\${FAKE_DATE_STAMP:-}" && \$# -eq 1 && "\$1" == "+%Y%m%d-%H%M%S" ]]; then echo "\$FAKE_DATE_STAMP"; exit 0; fi
 exec "$REAL_DATE" "\$@"
 EOF
-chmod +x "$FAKE_BIN/mv" "$FAKE_BIN/cp" "$FAKE_BIN/date"
+REAL_MKDIR="$(command -v mkdir)"
+cat >"$FAKE_BIN/mkdir" <<EOF
+#!/usr/bin/env bash
+last=""
+for a in "\$@"; do last="\$a"; done
+if [[ "\${last##*/}" == "$LOCK_NAME" ]]; then
+  if [[ "\${FAKE_MKDIR_FAIL_LOCK:-0}" == 1 ]]; then
+    if [[ -n "\${FAKE_MKDIR_LOG:-}" ]]; then echo "$LOCK_NAME fail" >>"\$FAKE_MKDIR_LOG"; fi
+    echo "fake mkdir: 실패(시험) $LOCK_NAME" >&2
+    exit 1
+  fi
+  if [[ -n "\${FAKE_MKDIR_SIG_LOCK:-}" ]]; then
+    "$REAL_MKDIR" "\$@" || exit 1
+    if [[ -n "\${FAKE_MKDIR_LOG:-}" ]]; then echo "$LOCK_NAME created \$FAKE_MKDIR_SIG_LOCK" >>"\$FAKE_MKDIR_LOG"; fi
+    kill -"\$FAKE_MKDIR_SIG_LOCK" "\$PPID"
+    # FIX1-CODEX(그룹 신호): Ctrl+C·터미널 닫힘처럼 mkdir 자신에게도 같은 신호 — 무시 상태로 실행됐으면 그대로 끝까지(exit 0)
+    if [[ "\${FAKE_MKDIR_SIG_SELF:-0}" == 1 ]]; then kill -"\$FAKE_MKDIR_SIG_LOCK" "\$\$"; fi
+    exit 0
+  fi
+fi
+exec "$REAL_MKDIR" "\$@"
+EOF
+chmod +x "$FAKE_BIN/mv" "$FAKE_BIN/cp" "$FAKE_BIN/date" "$FAKE_BIN/mkdir"
 FAKE_PATH="$FAKE_BIN:$PATH"
 
 # 인증서 공개 키 = 키의 공개 키(짝이 맞음): pair_ok <cert> <key>
@@ -739,6 +817,312 @@ for cert_mv_fail in none cert; do
     expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
     expect_true '[[ "$(dot_files "$SW")" == 0 ]]' "임시 파일 남지 않음"
     expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/swap-nobackup-cert-$cert_mv_fail-newkey.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+
+# ---- FIX1-CODEX(Codex 1차 검토 P2 dev-cert.sh:290-300): renew 에 잠금이 없어 같은 DEV_CERT_DIR 의 두 renew 가 섞이면(A 키 → B 키 → B 인증서 →
+# A 인증서) B 의 키와 A 의 인증서가 짝이 어긋난 채 남았다. (1) 아무것도 바꾸기 전에 잠금 폴더(mkdir — 원자적, flock 없음) (2) 두 이동 뒤 짝 검사 →
+# 어긋나면 백업에서 갱신 전 인증서·키로 되돌림. 잠금을 쥐었는지는 가짜 openssl·mv 의 LOCK_PROBE_LOG(호출 순간 잠금 폴더가 있었는가)로 본다. ----
+# file_mtime <path> : 수정 시각(유닉스 초, GNU stat → BSD stat). 읽지 못하면 빈 값.
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true; }
+# 폴더 바로 아래 점(.)으로 시작하는 항목 수 — 파일·폴더 모두(잠금 폴더 포함. dot_files 는 파일만 센다)
+dot_entries() { find "$1" -mindepth 1 -maxdepth 1 -name '.*' | wc -l | tr -d ' '; }
+
+t "renew: 잠금 폴더가 이미 있음(다른 renew 실행 중) → exit 1 + 안내, 아무것도 바꾸지 않음(바이트·수정 시각·폴더 목록 그대로, 키 생성·백업·임시 파일 없음), 남의 잠금은 그대로"
+if swap_setup lock-held; then
+  mkdir "$SW/$LOCK_NAME"
+  # 수정 시각을 과거로 고정(같은 초 안의 변경도 드러나게). 폴더는 마지막 — 그 안에 무엇이든 만들거나 지우면 폴더 수정 시각이 바뀐다.
+  touch -t 202001010000 "$SW/localhost-cert.pem" "$SW/localhost-key.pem" "$SW/$LOCK_NAME" "$SW"
+  lh_list="$(ls -A "$SW")"
+  lh_mt="$(file_mtime "$SW/localhost-cert.pem") $(file_mtime "$SW/localhost-key.pem") $(file_mtime "$SW/$LOCK_NAME") $(file_mtime "$SW")"
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_LOG="$T_ROOT/lock-held.mv.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-held-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$T_ROOT/lock-held.probe.log" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_contains "$OUT" "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다"
+  expect_contains "$OUT" "$SW/$LOCK_NAME"
+  expect_contains "$OUT" "아무것도 바꾸지 않았습니다"
+  expect_contains "$OUT" "rmdir --"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "기존 인증서·키 바이트 그대로"
+  if [[ -z "$(file_mtime "$SW")" ]]; then
+    skip "stat 으로 수정 시각을 읽지 못함(GNU·BSD stat 없음) — 수정 시각 확인 못 함"
+  else
+    lh_mt_after="$(file_mtime "$SW/localhost-cert.pem") $(file_mtime "$SW/localhost-key.pem") $(file_mtime "$SW/$LOCK_NAME") $(file_mtime "$SW")"
+    expect_true '[[ "$lh_mt_after" == "$lh_mt" ]]' "인증서·키·잠금·폴더 수정 시각 그대로($lh_mt → $lh_mt_after — 임시 파일도 잠깐이라도 만들지 않음)"
+  fi
+  expect_true '[[ "$(ls -A "$SW")" == "$lh_list" ]]' "폴더 목록 그대로"
+  expect_true '[[ -z "$(find "$SW" -maxdepth 1 -name "backup-*")" && "$(dot_files "$SW")" == 0 ]]' "백업 폴더·임시 파일 없음"
+  expect_true '[[ -d "$SW/$LOCK_NAME" && -z "$(ls -A "$SW/$LOCK_NAME")" ]]' "남의 잠금 폴더는 그대로(지우지 않음)"
+  expect_true '[[ ! -e "$T_ROOT/lock-held-newkey.pem" && ! -s "$T_ROOT/lock-held.probe.log" && ! -s "$T_ROOT/lock-held.mv.log" ]]' "openssl·mv 호출 없음(키 생성 등 아무것도 시작하지 않음)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+t "renew 둘이 겹침: A 가 새 키를 옮기기 직전에 같은 폴더에서 B 실행(가짜 mv) → B 는 잠금에 막혀 exit 1·A 의 잠금을 지우지 않음, A 는 끝까지(exit 0, 새 짝 맞음, 백업 1개)"
+if swap_setup lock-nested; then
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_NESTED_LOG="$T_ROOT/lock-nested.b.out" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-nested-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$T_ROOT/lock-nested.probe.log" -- renew 30
+  expect_rc 0 "$RC" "$OUT"
+  ln_b_out="$(cat "$T_ROOT/lock-nested.b.out" 2>/dev/null)"
+  ln_b_rc="$(cat "$T_ROOT/lock-nested.b.out.rc" 2>/dev/null)"
+  expect_true '[[ "$ln_b_rc" == *"rc=1"* ]]' "주입 확인: B 가 A 의 바꾸기 도중에 실행됐고 exit 1 (${ln_b_rc//$'\n'/ })"
+  expect_contains "$ln_b_out" "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다"
+  expect_contains "$ln_b_out" "아무것도 바꾸지 않았습니다"
+  expect_true '[[ "$ln_b_rc" == *"lock=held"* ]]' "B 가 끝난 뒤에도 A 의 잠금은 그대로"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem" && cmp -s "$T_ROOT/lock-nested-newkey.pem" "$SW/localhost-key.pem"' "제자리 = A 의 새 키 + 그 짝인 인증서"
+  ln_backup=("$SW"/backup-*)
+  expect_true '[[ ${#ln_backup[@]} -eq 1 ]] && cmp -s "$SW-old/localhost-key.pem" "${ln_backup[0]}/localhost-key.pem" && cmp -s "$SW-old/localhost-cert.pem" "${ln_backup[0]}/localhost-cert.pem"' "백업은 A 의 것 1개(갱신 전 짝)"
+  expect_true '[[ ! -e "$SW/$LOCK_NAME" && "$(dot_entries "$SW")" == 0 ]]' "A 가 끝나면 잠금·임시 파일 없음"
+  expect_true '! grep -q " free$" "$T_ROOT/lock-nested.probe.log" && grep -q "^mv \.new-cert\.[^ ]* -> localhost-cert\.pem held$" "$T_ROOT/lock-nested.probe.log"' "A 는 두 이동 내내 잠금을 쥠"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem"
+  expect_no_key_in "$ln_b_out" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+t "renew 정상: 키 생성·백업·두 이동·짝 검사 내내 잠금을 쥐고 끝나면 스스로 푼다 — 잠금은 백업에 들어가지 않음"
+if swap_setup lock-normal; then
+  run_dc "$SW" PATH="$FAKE_PATH" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-normal-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$T_ROOT/lock-normal.probe.log" -- renew 30
+  expect_rc 0 "$RC" "$OUT"
+  expect_true '[[ ! -e "$SW/$LOCK_NAME" && "$(dot_entries "$SW")" == 0 ]]' "잠금 폴더를 지움·점으로 시작하는 항목 없음"
+  lnm_backup=("$SW"/backup-*)
+  expect_true '[[ ${#lnm_backup[@]} -eq 1 && ! -e "${lnm_backup[0]}/$LOCK_NAME" && "$(ls -A "${lnm_backup[0]}" | tr "\n" " ")" == "localhost-cert.pem localhost-key.pem " ]]' "백업 = 기존 pem 2개뿐(잠금 폴더 없음)"
+  lnm_probe="$T_ROOT/lock-normal.probe.log"
+  expect_true 'grep -q "^openssl genpkey - held$" "$lnm_probe" && grep -q "^openssl req - held$" "$lnm_probe" && grep -q "^mv \.new-key\.[^ ]* -> localhost-key\.pem held$" "$lnm_probe" && grep -q "^mv \.new-cert\.[^ ]* -> localhost-cert\.pem held$" "$lnm_probe" && ! grep -q " free$" "$lnm_probe"' "키 생성·인증서 생성·두 이동 모두 잠금을 쥔 채"
+  expect_true 'awk "/^mv \\.new-cert\\./ { m = 1 } m && /^openssl x509 localhost-cert\\.pem held\$/ { x = 1 } m && /^openssl pkey localhost-key\\.pem held\$/ { p = 1 } END { exit !(x && p) }" "$lnm_probe"' "인증서 이동 뒤 제자리 인증서·키로 짝 검사(잠금을 쥔 채)"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem" && cmp -s "$T_ROOT/lock-normal-newkey.pem" "$SW/localhost-key.pem"' "제자리 = 새 키 + 그 짝인 인증서"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# 중간에 실패·중단해도 잠금을 푼다(되돌리기·임시 파일 정리가 끝난 뒤 — 되돌리기 이동도 잠금을 쥔 채). 실패 주입은 기존 것: req 실패(가짜 openssl)·
+# 인증서 이동 실패·두 이동 사이 TERM(가짜 mv)·인증서 자리가 폴더(잠금 직후 검사에서 멈춤).
+for spec in "req 1" "cert 1" "term 143" "dir 1"; do
+  read -r lf_how lf_rc <<<"$spec"
+  t "renew 가 중간에 실패·중단('$lf_how') → 잠금을 푼다(exit $lf_rc, 잠금·임시 파일 없음, 갱신 전 키 그대로)"
+  if swap_setup "lock-fail-$lf_how"; then
+    lf_probe="$T_ROOT/lock-fail-$lf_how.probe.log"
+    lf_env=(OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-fail-$lf_how-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$lf_probe")
+    case "$lf_how" in
+      req) lf_env+=(PATH="$FAKE_PATH" STUB_FAIL_REQ=1) ;;
+      cert) lf_env+=(PATH="$FAKE_PATH" FAKE_MV_FAIL=cert) ;;
+      term) lf_env+=(PATH="$FAKE_PATH" FAKE_MV_FAIL=term-after-key) ;;
+      dir)
+        rm -f "$SW/localhost-cert.pem"
+        mkdir "$SW/localhost-cert.pem"
+        ;;
+    esac
+    run_dc "$SW" "${lf_env[@]}" -- renew 30
+    expect_rc "$lf_rc" "$RC" "$OUT"
+    expect_true '[[ ! -e "$SW/$LOCK_NAME" && "$(dot_entries "$SW")" == 0 ]]' "잠금 폴더·임시 파일 없음"
+    expect_true 'cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 키 그대로"
+    if [[ "$lf_how" == dir ]]; then
+      expect_contains "$OUT" "일반 파일이 아닙니다"
+      expect_true '[[ ! -s "$lf_probe" ]]' "키를 만들기 전에 멈춤(openssl·mv 호출 없음)"
+    else
+      expect_true '[[ -s "$lf_probe" ]] && ! grep -q " free$" "$lf_probe"' "멈출 때까지 잠금을 쥠"
+      expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "갱신 전 짝 그대로"
+    fi
+    if [[ "$lf_how" == cert || "$lf_how" == term ]]; then
+      expect_true 'grep -q "^mv \.restore-key\.[^ ]* -> localhost-key\.pem held$" "$lf_probe"' "되돌리기(기존 키 복원)도 잠금을 쥔 채 — 잠금은 그 뒤에 푼다"
+    fi
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/lock-fail-$lf_how-newkey.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+
+# FIX1-CODEX(검토 P2 dev-cert.sh:292): 잠금 폴더를 만들지 못했는데 이미 있어서가 아니면(NTFS ACL 이 파일 만들기는 허용하고 폴더 만들기만 막음·
+# EMLINK 등) 잠금 없이 계속하지 않고 멈춘다. chmod 로는 못 만든다(root·NTFS 는 모드를 무시) — 가짜 mkdir 로 잠금 폴더만 실패시킨다.
+t "renew: 잠금 폴더를 만들지 못함(이미 있어서가 아님, 가짜 mkdir) → exit 1 + 안내, 잠금 없이 계속하지 않음(바이트·폴더 목록 그대로, 키 생성·백업·임시 파일·잠금 없음)"
+if swap_setup lock-mkfail; then
+  lmf_list="$(ls -A "$SW")"
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MKDIR_FAIL_LOCK=1 FAKE_MKDIR_LOG="$T_ROOT/lock-mkfail.mkdir.log" FAKE_MV_LOG="$T_ROOT/lock-mkfail.mv.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-mkfail-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$T_ROOT/lock-mkfail.probe.log" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_true 'grep -qxF "$LOCK_NAME fail" "$T_ROOT/lock-mkfail.mkdir.log"' "주입 확인: 잠금 폴더 mkdir 이 실패함"
+  expect_contains "$OUT" "잠금 폴더를 만들지 못했습니다: $SW/$LOCK_NAME"
+  expect_contains "$OUT" "아무것도 바꾸지 않았습니다"
+  expect_not_contains "$OUT" "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "기존 인증서·키 바이트 그대로"
+  expect_true '[[ "$(ls -A "$SW")" == "$lmf_list" ]]' "폴더 목록 그대로"
+  expect_true '[[ ! -e "$SW/$LOCK_NAME" && -z "$(find "$SW" -maxdepth 1 -name "backup-*")" && "$(dot_entries "$SW")" == 0 ]]' "잠금·백업 폴더·임시 파일 없음"
+  expect_true '[[ ! -e "$T_ROOT/lock-mkfail-newkey.pem" && ! -s "$T_ROOT/lock-mkfail.probe.log" && ! -s "$T_ROOT/lock-mkfail.mv.log" ]]' "openssl·mv 호출 없음(잠금 없이 키 생성 등을 시작하지 않음)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# FIX1-CODEX(검토 P2 dev-cert.sh:288): 잠금을 만드는 mkdir(외부 명령)이 도는 동안 신호가 오면 bash 는 mkdir 이 끝난 뒤에 trap 을 돈다 — 예전에는
+# LOCK_DIR 을 채우기 전에 exit 해 잠금이 남고 다음 renew 가 모두 거부됐다. 가짜 mkdir 이 잠금 폴더를 진짜로 만든 뒤 부모에 신호를 보낸다(결정적).
+for spec in "TERM 143 0" "HUP 129 0" "INT 130 0" "TERM 143 1" "HUP 129 1" "INT 130 1"; do
+  read -r lsg_sig lsg_rc lsg_self <<<"$spec"
+  t "renew: 잠금 폴더를 만드는 mkdir 도중 $lsg_sig(가짜 mkdir, mkdir 자신에게도=$lsg_self) → 잠금을 남기지 않음(exit $lsg_rc, 갱신 전 짝 그대로, 다음 renew 는 거부되지 않고 끝까지)"
+  if swap_setup "lock-sig-$lsg_sig-$lsg_self"; then
+    lsg_log="$T_ROOT/lock-sig-$lsg_sig-$lsg_self.mkdir.log"
+    lsg_probe="$T_ROOT/lock-sig-$lsg_sig-$lsg_self.probe.log"
+    run_dc "$SW" PATH="$FAKE_PATH" FAKE_MKDIR_SIG_LOCK="$lsg_sig" FAKE_MKDIR_SIG_SELF="$lsg_self" FAKE_MKDIR_LOG="$lsg_log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-sig-$lsg_sig-$lsg_self-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$lsg_probe" -- renew 30
+    expect_rc "$lsg_rc" "$RC" "$OUT"
+    expect_true 'grep -qxF "$LOCK_NAME created $lsg_sig" "$lsg_log"' "주입 확인: mkdir 이 잠금 폴더를 만든 뒤 $lsg_sig"
+    expect_true '[[ ! -e "$SW/$LOCK_NAME" && "$(dot_entries "$SW")" == 0 ]]' "잠금 폴더가 남지 않음(임시 파일도 없음)"
+    expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+    expect_true '[[ -z "$(find "$SW" -maxdepth 1 -name "backup-*")" && ! -s "$lsg_probe" && ! -e "$T_ROOT/lock-sig-$lsg_sig-$lsg_self-newkey.pem" ]]' "키 생성·백업 전에 멈춤(openssl 호출 없음)"
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem"
+    run_dc "$SW" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-sig-$lsg_sig-$lsg_self-next-newkey.pem" -- renew 30
+    expect_rc 0 "$RC" "$OUT"
+    expect_not_contains "$OUT" "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다"
+    expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem" && cmp -s "$T_ROOT/lock-sig-$lsg_sig-$lsg_self-next-newkey.pem" "$SW/localhost-key.pem" && [[ ! -e "$SW/$LOCK_NAME" ]]' "다음 renew 는 끝까지(새 짝 맞음·잠금 없음)"
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem"
+  else
+    ng "시험 인증서를 만들지 못함"
+  fi
+done
+
+# FIX1-CODEX(검토 P2 dev-cert.sh:264): renew 도중 잠금 폴더 안에 무언가 생기면(Finder 의 .DS_Store·색인기·백신) 끝날 때 rmdir 이 실패해 잠금이 남는다 —
+# 성공한 실행의 끝에서 그 사실을 알리는 경고가 유일한 신호다. 다음 renew 의 거부 안내도 rmdir 만으로는 지워지지 않는다는 것까지 알린다.
+t "renew: 도중에 잠금 폴더 안에 파일이 생김(가짜 mv litter-lock) → 바꾸기는 끝까지(exit 0, 새 짝 맞음) + 잠금을 지우지 못했다는 경고(비우는 안내), 다음 renew 는 exit 1·같은 안내, 안내대로 비우면 다시 renew"
+if swap_setup lock-litter; then
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=litter-lock OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-litter-newkey.pem" -- renew 30
+  expect_rc 0 "$RC" "$OUT"
+  expect_true '[[ -f "$SW/$LOCK_NAME/.DS_Store" ]]' "주입 확인: 잠금 폴더 안에 파일이 생김"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem" && cmp -s "$T_ROOT/lock-litter-newkey.pem" "$SW/localhost-key.pem"' "제자리 = 새 키 + 그 짝인 인증서"
+  expect_contains "$OUT" "잠금 폴더를 지우지 못했습니다: $SW/$LOCK_NAME"
+  expect_contains "$OUT" "그 파일부터 지운 뒤 rmdir"
+  expect_true '[[ -d "$SW/$LOCK_NAME" && "$(dot_files "$SW")" == 0 ]]' "잠금 폴더는 남음(경고가 사실과 맞음)·임시 파일 없음"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem"
+  mkdir -p "$T_ROOT/lock-litter-new"
+  cp -p "$SW"/localhost-*.pem "$T_ROOT/lock-litter-new/"
+  run_dc "$SW" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-litter-2nd-newkey.pem" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_contains "$OUT" "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다"
+  expect_contains "$OUT" "rmdir -- \"$SW/$LOCK_NAME\""
+  expect_contains "$OUT" "그 파일부터 지운 뒤 rmdir"
+  expect_true 'cmp -s "$T_ROOT/lock-litter-new/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$T_ROOT/lock-litter-new/localhost-key.pem" "$SW/localhost-key.pem" && [[ ! -e "$T_ROOT/lock-litter-2nd-newkey.pem" ]]' "막힌 renew 는 아무것도 바꾸지 않음(키 생성 없음)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem"
+  # 안내대로 잠금 폴더 안의 파일부터 지우고 rmdir 하면 다시 renew 할 수 있다
+  rm -f -- "$SW/$LOCK_NAME/.DS_Store" && rmdir -- "$SW/$LOCK_NAME"
+  run_dc "$SW" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/lock-litter-3rd-newkey.pem" -- renew 30
+  expect_rc 0 "$RC" "$OUT"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem" && cmp -s "$T_ROOT/lock-litter-3rd-newkey.pem" "$SW/localhost-key.pem" && [[ ! -e "$SW/$LOCK_NAME" ]]' "안내대로 비우면 다시 renew(새 짝 맞음·잠금 없음)"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/lock-litter-new/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# ---- FIX1-CODEX(2): 두 이동 뒤 짝 검사. 잠금 밖의 다른 쓰기(잠금이 없던 예전 renew 등)를 가짜 mv foreign-after-key 로 흉내 낸다 — A 가 새 키를
+# 옮긴 직후 B 의 짝(키·인증서)이 제자리에 들어오고, 이어 A 의 인증서 이동이 B 의 인증서를 덮어써 "B 키 + A 인증서"가 된다. ----
+D_FOREIGN_SRC="$T_ROOT/foreign-src"
+mk_cert "$D_FOREIGN_SRC" 5 foreign-localhost || true
+# mm_foreign <이름> : B 의 짝 사본을 <임시 루트>/<이름>-foreign/ 에 둔다(가짜 mv 가 옮겨 넣어 비워짐). 원본(대조용)은 D_FOREIGN_SRC.
+mm_foreign() {
+  [[ -s "$D_FOREIGN_SRC/localhost-key.pem" && -s "$D_FOREIGN_SRC/localhost-cert.pem" ]] || return 1
+  mkdir -p "$T_ROOT/$1-foreign"
+  cp -p "$D_FOREIGN_SRC"/localhost-*.pem "$T_ROOT/$1-foreign/"
+}
+
+t "renew 두 이동 뒤 짝 불일치(A 키 → B 키 → B 인증서 → A 인증서, 가짜 mv) → 감지해 exit 1, 백업에서 갱신 전 인증서 → 키 순서로 되돌림(짝 맞음·임시 파일·잠금 없음)"
+if swap_setup mm-restore && mm_foreign mm-restore; then
+  mm_probe="$T_ROOT/mm-restore.probe.log"
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=foreign-after-key FAKE_FOREIGN_DIR="$T_ROOT/mm-restore-foreign" FAKE_MV_LOG="$T_ROOT/mm-restore.mv.log" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/mm-restore-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$mm_probe" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_true '[[ -z "$(ls -A "$T_ROOT/mm-restore-foreign")" ]] && grep -q "^\.new-key\.[^ ]* -> localhost-key\.pem$" "$T_ROOT/mm-restore.mv.log" && grep -q "^\.new-cert\.[^ ]* -> localhost-cert\.pem$" "$T_ROOT/mm-restore.mv.log"' "주입 확인: B 의 짝이 끼어든 뒤 A 의 두 이동이 모두 성공"
+  expect_contains "$OUT" "짝이 맞지 않습니다"
+  expect_contains "$OUT" "되돌렸습니다: 기존 인증서를 백업"
+  expect_contains "$OUT" "되돌렸습니다: 기존 개인 키를 백업"
+  expect_contains "$OUT" "기존 파일은 그대로입니다"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+  expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+  expect_true '[[ "$(dot_entries "$SW")" == 0 ]]' "임시 파일(.restore-cert.* 포함)·잠금 없음"
+  expect_true '! grep -q " free$" "$mm_probe" && grep -q "^mv \.restore-cert\.[^ ]* -> localhost-cert\.pem held$" "$mm_probe" && grep -q "^mv \.restore-key\.[^ ]* -> localhost-key\.pem held$" "$mm_probe"' "되돌리기 이동(인증서·키) 모두 잠금을 쥔 채"
+  expect_true 'awk "/^mv \\.restore-cert\\./ { c = NR } /^mv \\.restore-key\\./ { k = NR } END { exit !(c && k && c < k) }" "$mm_probe"' "인증서를 먼저, 그다음 키를 되돌림"
+  mm_backup=("$SW"/backup-*)
+  expect_true '[[ ${#mm_backup[@]} -eq 1 ]] && cmp -s "$SW-old/localhost-key.pem" "${mm_backup[0]}/localhost-key.pem" && cmp -s "$SW-old/localhost-cert.pem" "${mm_backup[0]}/localhost-cert.pem"' "백업 폴더(갱신 전 짝)는 남김"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/mm-restore-newkey.pem" "$D_FOREIGN_SRC/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+t "renew 두 이동 뒤 짝 불일치 + 갱신 전에 키·인증서가 없던 폴더 → 제자리 인증서·키를 지워 갱신 전(빈 폴더)으로, exit 1"
+D_MME="$T_ROOT/mm-empty"
+if mkdir -p "$D_MME" && mm_foreign mm-empty; then
+  run_dc "$D_MME" PATH="$FAKE_PATH" FAKE_MV_FAIL=foreign-after-key FAKE_FOREIGN_DIR="$T_ROOT/mm-empty-foreign" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/mm-empty-newkey.pem" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  expect_true '[[ -z "$(ls -A "$T_ROOT/mm-empty-foreign")" ]]' "주입 확인: B 의 짝이 끼어듦"
+  expect_contains "$OUT" "짝이 맞지 않습니다"
+  expect_contains "$OUT" "제자리 인증서를 지웠습니다"
+  expect_contains "$OUT" "새 개인 키를 지웠습니다"
+  expect_true '[[ -z "$(ls -A "$D_MME")" ]]' "폴더가 갱신 전처럼 비어 있음(키·인증서·백업·잠금·임시 파일 없음)"
+  expect_no_key_in "$OUT" "$T_ROOT/mm-empty-newkey.pem" "$D_FOREIGN_SRC/localhost-key.pem"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+t "renew 두 이동 뒤 짝 불일치 + 인증서는 되돌렸지만 키 되돌리기 실패(가짜 mv) → exit 1, 백업의 키로 맞추는 명령 안내(남길 임시 파일 없음)"
+if swap_setup mm-keystuck && mm_foreign mm-keystuck; then
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=foreign-after-key,restore FAKE_FOREIGN_DIR="$T_ROOT/mm-keystuck-foreign" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/mm-keystuck-newkey.pem" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  mk_backup=("$SW"/backup-*)
+  expect_contains "$OUT" "되돌렸습니다: 기존 인증서를 백업"
+  expect_contains "$OUT" "기존 개인 키를 되돌리지 못했습니다"
+  expect_contains "$OUT" "인증서는 갱신 전 것으로 되돌렸지만"
+  expect_contains "$OUT" "cp -p -- \"${mk_backup[0]}/localhost-key.pem\" \"$SW/localhost-key.pem\""
+  expect_not_contains "$OUT" "남겨 두었습니다"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$D_FOREIGN_SRC/localhost-key.pem" "$SW/localhost-key.pem"' "제자리 = 갱신 전 인증서 + B 의 키(되돌리지 못함)"
+  expect_true '[[ "$(dot_entries "$SW")" == 0 ]]' "임시 파일·잠금 없음"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem" "$T_ROOT/mm-keystuck-newkey.pem"
+  # 안내대로 하면 갱신 전 짝으로 맞는다
+  "$REAL_CP" -p -- "${mk_backup[0]}/localhost-key.pem" "$SW/localhost-key.pem"
+  expect_true 'cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem" && pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "안내대로 하면 갱신 전 짝"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+t "renew 두 이동 뒤 짝 불일치 + 인증서 되돌리기 실패(가짜 mv) → exit 1, 짝이 맞지 않을 수 있다고 알리고 백업에서 되돌리는 명령 안내"
+if swap_setup mm-certstuck && mm_foreign mm-certstuck; then
+  run_dc "$SW" PATH="$FAKE_PATH" FAKE_MV_FAIL=foreign-after-key,restore-cert FAKE_FOREIGN_DIR="$T_ROOT/mm-certstuck-foreign" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/mm-certstuck-newkey.pem" -- renew 30
+  expect_rc 1 "$RC" "$OUT"
+  mc_backup=("$SW"/backup-*)
+  expect_contains "$OUT" "기존 인증서를 되돌리지 못했습니다"
+  expect_contains "$OUT" "짝이 맞지 않을 수 있습니다"
+  expect_contains "$OUT" "cp -p -- \"${mc_backup[0]}\"/*.pem \"$SW/\""
+  expect_not_contains "$OUT" "되돌렸습니다"
+  expect_true 'cmp -s "$D_FOREIGN_SRC/localhost-key.pem" "$SW/localhost-key.pem" && ! pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "제자리는 그대로 짝 불일치(B 의 키) — 안내가 사실과 맞음"
+  expect_true '[[ "$(dot_entries "$SW")" == 0 ]]' "임시 파일·잠금 없음"
+  expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$SW-old/localhost-key.pem" "$T_ROOT/mm-certstuck-newkey.pem"
+  # 안내대로 하면 갱신 전 짝으로 맞는다
+  "$REAL_CP" -p -- "${mc_backup[0]}"/*.pem "$SW/"
+  expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem" && pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "안내대로 하면 갱신 전 짝"
+else
+  ng "시험 인증서를 만들지 못함"
+fi
+
+# 두 이동 뒤 짝 검사 전·검사 중에 멈춰도(TERM) 짝 검사를 마치지 않은 바꾸기는 되돌린다 — 인증서 이동 직후(가짜 mv)·짝 검사의 pkey 도중(가짜 openssl —
+# 신호 받을 pid 는 가짜 mv 가 적어 둔 dev-cert.sh 의 pid).
+for where in mv openssl; do
+  t "renew: 두 이동 뒤 짝 검사 전·중 TERM('$where') → EXIT 정리가 인증서 → 키 순서로 백업에서 되돌림(종료 코드 143, 갱신 전 짝 그대로·임시 파일·잠금 없음)"
+  if swap_setup "mm-term-$where"; then
+    mt_probe="$T_ROOT/mm-term-$where.probe.log"
+    mt_env=(PATH="$FAKE_PATH" OPENSSL="$STUB" STUB_CAPTURE_KEY="$T_ROOT/mm-term-$where-newkey.pem" LOCK_PROBE="$SW/$LOCK_NAME" LOCK_PROBE_LOG="$mt_probe")
+    if [[ "$where" == mv ]]; then
+      mt_env+=(FAKE_MV_FAIL=term-after-cert)
+    else
+      mt_env+=(FAKE_MV_PID_FILE="$T_ROOT/mm-term-$where.pid" STUB_TERM_AT_FINAL="$T_ROOT/mm-term-$where.pid")
+    fi
+    run_dc "$SW" "${mt_env[@]}" -- renew 30
+    expect_rc 143 "$RC" "$OUT"
+    if [[ "$where" == mv ]]; then
+      expect_true 'grep -q "^mv \.new-cert\.[^ ]* -> localhost-cert\.pem held$" "$mt_probe" && ! grep -q "^openssl pkey localhost-key\.pem" "$mt_probe"' "주입 확인: 인증서 이동 뒤 짝 검사 전에 멈춤"
+    else
+      expect_true 'awk "/^mv \\.new-cert\\./ { m = 1 } m && /^openssl pkey localhost-key\\.pem held\$/ { p = 1 } END { exit !p }" "$mt_probe"' "주입 확인: 인증서 이동 뒤 짝 검사(pkey) 도중에 멈춤"
+    fi
+    expect_contains "$OUT" "중단: 키와 인증서를 바꾸는 도중에 멈췄습니다"
+    expect_contains "$OUT" "되돌렸습니다: 기존 인증서를 백업"
+    expect_contains "$OUT" "되돌렸습니다: 기존 개인 키를 백업"
+    expect_true 'cmp -s "$SW-old/localhost-cert.pem" "$SW/localhost-cert.pem" && cmp -s "$SW-old/localhost-key.pem" "$SW/localhost-key.pem"' "갱신 전 인증서·키 바이트 그대로"
+    expect_true 'pair_ok "$SW/localhost-cert.pem" "$SW/localhost-key.pem"' "짝 맞음"
+    expect_true '[[ "$(dot_entries "$SW")" == 0 ]]' "임시 파일·잠금 없음"
+    expect_true '! grep -q " free$" "$mt_probe" && grep -q "^mv \.restore-cert\.[^ ]* -> localhost-cert\.pem held$" "$mt_probe" && grep -q "^mv \.restore-key\.[^ ]* -> localhost-key\.pem held$" "$mt_probe"' "되돌리기 이동 모두 잠금을 쥔 채"
+    expect_no_key_in "$OUT" "$SW/localhost-key.pem" "$T_ROOT/mm-term-$where-newkey.pem"
   else
     ng "시험 인증서를 만들지 못함"
   fi

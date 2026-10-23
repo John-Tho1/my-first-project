@@ -21,7 +21,11 @@
 #       두 이름은 점(.)으로 시작할 수 없다(숨김 파일은 백업의 *.pem 에 잡히지 않아 예전 키가 백업 없이 덮어써진다). 백업에 바꿀 키·인증서가 없으면
 #       (대소문자 무시 파일 시스템의 다른 대소문자 확장자 등) 바꾸기 전에 멈춘다 — 되돌리기는 그 백업에 기댄다.
 #       정리·되돌리기(EXIT trap·이동 실패)는 errexit 를 끄고 SIGPIPE 를 무시한 채 끝까지 한다 — 터미널을 닫아 stderr 쓰기가 실패해도 되돌린다.
-# 종료 코드: 0 성공 · 1 실행 실패(openssl 없음·파일 없음·읽기/생성/바꾸기 실패) · 2 사용법 오류 · 129/130/143 신호로 중단(HUP/INT/TERM)
+#       FIX1-CODEX: 같은 폴더의 renew 는 한 번에 하나만 돈다 — 아무것도 바꾸기 전에(임시 파일·백업 전에) 잠금 폴더 .dev-cert-renew.lock 을 mkdir 로
+#       만들고, 이미 있으면 아무것도 바꾸지 않고 exit 1(실행 중인 renew 가 없다고 확실하면 그 폴더를 지운다). 잠금은 EXIT 정리의 맨 마지막(되돌리기·
+#       임시 파일 정리 뒤)에 푼다 — 이 프로세스가 만든 잠금만(잠금을 만드는 mkdir 동안 온 신호는 잠금을 기록한 뒤 처리해 잠금이 남지 않는다). 두 이동 뒤에는 제자리 키·인증서의 공개 키가 같은지 다시 보고, 다르거나 그 검사 중에
+#       멈추면 이동 실패처럼 백업에서 갱신 전 인증서·키로 되돌린다(인증서 먼저, 그다음 키).
+# 종료 코드: 0 성공 · 1 실행 실패(openssl 없음·파일 없음·읽기/생성/바꾸기 실패·다른 renew 의 잠금·바꾼 뒤 짝 불일치) · 2 사용법 오류 · 129/130/143 신호로 중단(HUP/INT/TERM)
 set -euo pipefail
 umask 077
 
@@ -32,6 +36,15 @@ KEY_NAME="${DEV_KEY_FILE:-localhost-key.pem}"
 WARN_DAYS=14
 DEFAULT_DAYS=90
 MAX_DAYS=825
+# FIX1-CODEX: renew 잠금 폴더 이름(DIR 안). 점으로 시작하고 .pem 으로 끝나지 않는 폴더라 백업 glob(*.pem, 일반 파일만)에 잡히지 않고,
+# DEV_CERT_FILE·DEV_KEY_FILE 은 점으로 시작할 수 없어(valid_name) 이 이름이 될 수 없다. 임시 파일 이름(.new-*·.restore-*·.openssl-*)과도 다르다.
+LOCK_NAME=".dev-cert-renew.lock"
+# 이 프로세스가 만든 잠금 폴더(만들었을 때만 채운다 — 정리는 이 값만 지운다, 다른 renew 의 잠금은 건드리지 않음)
+LOCK_DIR=""
+# FIX1-CODEX: 잠금 폴더를 만드는 동안 미뤄 둔 신호의 종료 코드(129/130/143 — 비어 있으면 없음)
+LOCK_PENDING_SIG=""
+# FIX1-CODEX: 잠금 폴더 안에 무언가 생기면(macOS Finder 의 .DS_Store·색인기·백신 등) rmdir 만으로는 지워지지 않는다 — 두 안내에 덧붙인다.
+LOCK_NONEMPTY_HINT="폴더 안에 파일(.DS_Store 등)이 생겼으면 rmdir 이 실패하니 그 파일부터 지운 뒤 rmdir"
 
 usage() {
   cat >&2 <<'EOF'
@@ -114,15 +127,20 @@ TMP_FILES=()
 KEEP_FILE=""
 
 # ---- renew 의 바꾸기(키 → 인증서 이동) 상태 — 실패·중단 시 되돌리기용 ----
-# SWAP_STATE: "" → key_moving → key_moved → cert_moving → done.  되돌리기: rolling_back → rolled_back | stuck
+# SWAP_STATE: "" → key_moving → key_moved → cert_moving → cert_moved(두 이동 끝, 짝 검사 전) → done.
+#   되돌리기: [cert_moved → rolling_back_cert →] key_moved → rolling_back → rolled_back | stuck
 SWAP_STATE=""
 SWAP_TMP_KEY="" SWAP_TMP_CERT="" SWAP_KEY="" SWAP_CERT="" SWAP_BACKUP="" SWAP_HAD_KEY=0
+# FIX1-CODEX: SWAP_HAD_CERT = 갱신 전에 인증서가 있었는가. SWAP_CERT_RESTORED = 두 이동 뒤 되돌리기에서 인증서를 먼저 갱신 전으로 돌렸는가
+# (그때는 새 인증서 임시 파일이 이미 없으니 키 되돌리기 실패 안내가 다르다).
+SWAP_HAD_CERT=0 SWAP_CERT_RESTORED=0
 
 # 이동 중(key_moving·cert_moving)에 멈췄으면 임시 파일이 아직 있는지로 실제 이동 여부를 정한다(rename 은 한 번에 일어나거나 안 일어남).
+# FIX1-CODEX: 인증서 이동이 일어났으면 done 이 아니라 cert_moved — 두 이동 뒤 짝 검사를 마쳐야 done 이다(그 전에 멈추면 되돌린다).
 swap_settle() {
   case "$SWAP_STATE" in
     key_moving) if [[ -e "$SWAP_TMP_KEY" ]]; then SWAP_STATE=""; else SWAP_STATE=key_moved; fi ;;
-    cert_moving) if [[ -e "$SWAP_TMP_CERT" ]]; then SWAP_STATE=key_moved; else SWAP_STATE=done; fi ;;
+    cert_moving) if [[ -e "$SWAP_TMP_CERT" ]]; then SWAP_STATE=key_moved; else SWAP_STATE=cert_moved; fi ;;
   esac
   return 0
 }
@@ -133,6 +151,37 @@ swap_settle() {
 # 실패 1 — 새 키가 제자리에 남았으므로 짝인 새 인증서 임시 파일을 지우지 않고(KEEP_FILE) 경로·옮길 명령을 알린다.
 rollback_swap() {
   swap_settle
+  # FIX1-CODEX: 두 이동 뒤(cert_moved — 짝 검사 실패·검사 중 멈춤)면 인증서부터 갱신 전으로 되돌린다. 기존 인증서가 있었으면 백업 사본을 같은 폴더
+  # 임시 파일로 복사한 뒤 rename, 없었으면 제자리 인증서를 지운다. 그러면 "키만 바뀐 상태(key_moved)"가 되어 아래 키 되돌리기로 이어 간다.
+  # 실패 1 — 지금 제자리 키·인증서는 짝이 맞지 않을 수 있다(우리 새 키나 새 인증서 중 하나는 이미 덮어써짐). 백업에서 둘 다 복사하라고 알린다.
+  if [[ "$SWAP_STATE" == cert_moved ]]; then
+    SWAP_STATE=rolling_back_cert
+    local tmp_cert_restore=""
+    if [[ "$SWAP_HAD_CERT" == 1 ]]; then
+      if [[ -n "$SWAP_BACKUP" && -f "$SWAP_BACKUP/$CERT_NAME" ]] &&
+        tmp_cert_restore="$(mktemp "$DIR/.restore-cert.XXXXXX")" &&
+        TMP_FILES+=("$tmp_cert_restore") &&
+        cp -p -- "$SWAP_BACKUP/$CERT_NAME" "$tmp_cert_restore" &&
+        mv -f -- "$tmp_cert_restore" "$SWAP_CERT"; then
+        SWAP_STATE=key_moved
+        echo "[dev-cert] 되돌렸습니다: 기존 인증서를 백업($SWAP_BACKUP)에서 제자리에 두었습니다." >&2
+      fi
+    elif rm -f -- "$SWAP_CERT"; then
+      SWAP_STATE=key_moved
+      echo "[dev-cert] 되돌렸습니다: 제자리 인증서를 지웠습니다(갱신 전에는 인증서 파일이 없었음)." >&2
+    fi
+    if [[ "$SWAP_STATE" != key_moved ]]; then
+      SWAP_STATE=stuck
+      echo "[dev-cert] 기존 인증서를 되돌리지 못했습니다. 지금 $SWAP_CERT 와 $SWAP_KEY 는 짝이 맞지 않을 수 있습니다." >&2
+      if [[ -n "$SWAP_BACKUP" ]]; then
+        echo "[dev-cert] 해결: cp -p -- \"$SWAP_BACKUP\"/*.pem \"$DIR/\"  (백업에서 갱신 전 파일로 되돌림 — 갱신 전에 없던 키·인증서 파일은 지우세요)" >&2
+      else
+        echo "[dev-cert] 해결: rm -f -- \"$SWAP_CERT\" \"$SWAP_KEY\"  (갱신 전에는 키·인증서 파일이 없었음)" >&2
+      fi
+      return 1
+    fi
+    SWAP_CERT_RESTORED=1
+  fi
   [[ "$SWAP_STATE" == key_moved ]] || return 0
   SWAP_STATE=rolling_back
   local tmp_restore=""
@@ -152,6 +201,16 @@ rollback_swap() {
     return 0
   fi
   SWAP_STATE=stuck
+  # FIX1-CODEX: 인증서를 먼저 되돌린 경우(두 이동 뒤 되돌리기)에는 새 인증서 임시 파일이 이미 없다 — 남길 파일 없이 백업의 키로 맞추라고 알린다.
+  if [[ "$SWAP_CERT_RESTORED" == 1 ]]; then
+    echo "[dev-cert] 기존 개인 키를 되돌리지 못했습니다. 인증서는 갱신 전 것으로 되돌렸지만 $SWAP_KEY 는 갱신 전 키가 아니어서 짝이 맞지 않습니다." >&2
+    if [[ "$SWAP_HAD_KEY" == 1 ]]; then
+      echo "[dev-cert] 해결: cp -p -- \"${SWAP_BACKUP:-<백업 폴더>}/$KEY_NAME\" \"$SWAP_KEY\"  (갱신 전 키로 맞춤)" >&2
+    else
+      echo "[dev-cert] 해결: rm -f -- \"$SWAP_KEY\"  (갱신 전에는 키 파일이 없었음)" >&2
+    fi
+    return 1
+  fi
   KEEP_FILE="$SWAP_TMP_CERT"
   echo "[dev-cert] 기존 개인 키를 되돌리지 못했습니다. 지금 $SWAP_KEY 는 새 키이고, 짝이 맞는 새 인증서를 $SWAP_TMP_CERT 에 남겨 두었습니다." >&2
   echo "[dev-cert] 해결: mv -f -- \"$SWAP_TMP_CERT\" \"$SWAP_CERT\"  (새 키·인증서로 맞춤) — 또는 ${SWAP_BACKUP:-백업 폴더}의 파일을 복사해 갱신 전으로 되돌리세요." >&2
@@ -181,20 +240,34 @@ cleanup() {
   # 정리·되돌리기는 끝까지 한다 — 그동안 들어온 신호(두 번째 Ctrl+C·TERM)는 무시(종료 코드는 처음 멈춘 이유 그대로).
   trap '' HUP INT TERM PIPE
   # 두 이동 사이에서 멈춤(신호·예상 못 한 종료) → 되돌린다. 되돌리는 도중에 멈췄으면 새 인증서를 남긴다(새 키가 제자리일 수 있음).
+  # FIX1-CODEX: cert_moved(두 이동 뒤 짝 검사 전·검사 중)에 멈춰도 되돌린다(인증서 → 키).
   case "$SWAP_STATE" in
-    key_moving | key_moved | cert_moving)
+    key_moving | key_moved | cert_moving | cert_moved)
       echo "[dev-cert] 중단: 키와 인증서를 바꾸는 도중에 멈췄습니다." >&2
       rollback_swap || true
       ;;
+    rolling_back_cert)
+      echo "[dev-cert] 중단: 인증서를 되돌리는 도중에 멈췄습니다 — 지금 키·인증서는 짝이 맞지 않을 수 있습니다. ${SWAP_BACKUP:-백업 폴더}와 비교해 직접 정리하세요." >&2
+      ;;
     rolling_back)
-      KEEP_FILE="$SWAP_TMP_CERT"
-      echo "[dev-cert] 중단: 되돌리는 도중에 멈췄습니다. 새 키와 짝인 새 인증서를 $SWAP_TMP_CERT 에 남겨 두었습니다 — ${SWAP_BACKUP:-백업 폴더}와 비교해 직접 정리하세요." >&2
+      if [[ "$SWAP_CERT_RESTORED" == 1 ]]; then
+        echo "[dev-cert] 중단: 되돌리는 도중에 멈췄습니다(인증서는 갱신 전 것으로 되돌림) — 키는 ${SWAP_BACKUP:-백업 폴더}와 비교해 직접 정리하세요." >&2
+      else
+        KEEP_FILE="$SWAP_TMP_CERT"
+        echo "[dev-cert] 중단: 되돌리는 도중에 멈췄습니다. 새 키와 짝인 새 인증서를 $SWAP_TMP_CERT 에 남겨 두었습니다 — ${SWAP_BACKUP:-백업 폴더}와 비교해 직접 정리하세요." >&2
+      fi
       ;;
   esac
   for f in "${TMP_FILES[@]+"${TMP_FILES[@]}"}"; do
     [[ -n "$KEEP_FILE" && "$f" == "$KEEP_FILE" ]] && continue
     rm -f -- "$f"
   done
+  # FIX1-CODEX: 잠금은 맨 마지막에 푼다(되돌리기·임시 파일 정리가 끝난 뒤 — 그 전에 다른 renew 가 시작하지 않게). 이 프로세스가 만든 잠금만 —
+  # 이미 있던 잠금(다른 renew)에 막혀 끝날 때는 LOCK_DIR 이 비어 있어 건드리지 않는다.
+  if [[ -n "$LOCK_DIR" ]]; then
+    rmdir -- "$LOCK_DIR" 2>/dev/null ||
+      echo "[dev-cert] 잠금 폴더를 지우지 못했습니다: $LOCK_DIR — 실행 중인 renew 가 없으면 직접 지우세요($LOCK_NONEMPTY_HINT)." >&2
+  fi
 }
 trap cleanup EXIT
 # 신호로 멈춰도 EXIT 정리(위 되돌리기 포함)를 거치게 명시한다(bash·Git Bash 공통).
@@ -211,6 +284,35 @@ cmd_renew() {
   need_openssl
 
   mkdir -p -- "$DIR" || die "인증서 폴더를 만들지 못했습니다: $DIR"
+  # FIX1-CODEX: 같은 폴더의 renew 는 한 번에 하나만 — 아무것도 바꾸기 전에(아래 검사·임시 파일·백업 전에) 잠금 폴더를 만든다. mkdir 은 이미 있으면
+  # 실패하는 한 번의 동작이라(Git Bash/NTFS·macOS 도 같음, flock 불필요) 두 renew 가 동시에 잡지 못한다. 잠금 없이 두 renew 가 섞이면
+  # (A 키 → B 키 → B 인증서 → A 인증서) B 의 키와 A 의 인증서가 짝이 어긋난 채 남는다. 푸는 것은 EXIT 정리(cleanup)의 맨 마지막.
+  # LOCK_DIR 은 이 프로세스가 잠금을 만들었을 때만 채운다 — 이미 있던 잠금(다른 renew)에 막히면 비어 있어 정리가 남의 잠금을 지우지 않는다.
+  # FIX1-CODEX: mkdir 은 외부 명령이고 bash 는 자식이 끝난 뒤에야 trap 을 돈다 — mkdir 이 도는 동안 HUP/INT/TERM 이 오면 mkdir 이 잠금을 만든 뒤
+  # LOCK_DIR 을 채우기 전에 'exit' trap 이 돌아 잠금이 남았다(그 뒤 renew 는 모두 거부). 그래서 mkdir 동안만 신호를 미뤄(종료 코드만 적어 둠)
+  # LOCK_DIR 을 채운 뒤 원래 trap 으로 되돌리고, 미룬 신호가 있으면 그 종료 코드로 끝낸다(EXIT 정리가 이 잠금을 푼다).
+  local lock="$DIR/$LOCK_NAME" lock_ok=0
+  LOCK_PENDING_SIG=""
+  trap 'LOCK_PENDING_SIG=129' HUP
+  trap 'LOCK_PENDING_SIG=130' INT
+  trap 'LOCK_PENDING_SIG=143' TERM
+  # FIX1-CODEX(검토 P2, 그룹 신호): Ctrl+C·터미널 닫힘은 프로세스 그룹 전체(=mkdir 자식 포함)에 간다 — mkdir 이 잠금을 만든 직후 그 신호로 죽으면
+  # 실패로 보여 LOCK_DIR 이 비고 잠금이 남는다. 그래서 잠금 mkdir 은 세 신호를 무시한 채 돌린다(무시는 exec 뒤에도 이어짐 — Linux·macOS·MSYS).
+  # trap '' 전에 온 신호는 mkdir 이 돌기 전에 하위 셸을 끝내므로 잠금이 생기지 않는다. bash 쪽 신호는 위 trap 이 미룬다.
+  if (trap '' HUP INT TERM; exec mkdir -- "$lock") 2>/dev/null; then
+    LOCK_DIR="$lock"
+    lock_ok=1
+  fi
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  [[ -z "$LOCK_PENDING_SIG" ]] || exit "$LOCK_PENDING_SIG"
+  if [[ "$lock_ok" != 1 ]]; then
+    if [[ -e "$lock" || -L "$lock" ]]; then
+      die "다른 renew 가 같은 폴더에서 실행 중일 수 있습니다(잠금 폴더가 있음: $lock). 아무것도 바꾸지 않았습니다. 실행 중인 renew 가 없다고 확실하면 잠금 폴더를 지운 뒤 다시 실행하세요: rmdir -- \"$lock\" ($LOCK_NONEMPTY_HINT)"
+    fi
+    die "잠금 폴더를 만들지 못했습니다: $lock. 아무것도 바꾸지 않았습니다."
+  fi
   local cert="$DIR/$CERT_NAME" key="$DIR/$KEY_NAME" target
   # 자리가 폴더 등 일반 파일이 아니면 mv 가 그 안으로 옮겨 버린다 — 아무것도 만들기 전에 멈춘다.
   for target in "$key" "$cert"; do
@@ -288,12 +390,21 @@ EOF
   fi
 
   # 5) 바꾸기(같은 폴더 안 rename — 키 먼저, 그다음 인증서). 둘째 이동이 실패하거나 그 사이에 멈추면 rollback_swap 이 되돌린다.
-  SWAP_TMP_KEY="$tmp_key" SWAP_TMP_CERT="$tmp_cert" SWAP_KEY="$key" SWAP_CERT="$cert" SWAP_BACKUP="$backup" SWAP_HAD_KEY=0
+  SWAP_TMP_KEY="$tmp_key" SWAP_TMP_CERT="$tmp_cert" SWAP_KEY="$key" SWAP_CERT="$cert" SWAP_BACKUP="$backup" SWAP_HAD_KEY=0 SWAP_HAD_CERT=0
   if [[ -f "$key" ]]; then SWAP_HAD_KEY=1; fi
+  if [[ -f "$cert" ]]; then SWAP_HAD_CERT=1; fi
   SWAP_STATE=key_moving
   mv -f -- "$tmp_key" "$key" || swap_fail "새 개인 키를 제자리에 두지 못했습니다."
   SWAP_STATE=cert_moving
   mv -f -- "$tmp_cert" "$cert" || swap_fail "새 인증서를 제자리에 두지 못했습니다."
+  SWAP_STATE=cert_moved
+  # 6) FIX1-CODEX: 두 이동 뒤 제자리 키·인증서의 짝을 다시 본다(3)과 같은 공개 키 비교 — 개인 키는 출력하지 않음). 그 사이 잠금 밖의 다른 프로그램이
+  # 같은 이름의 파일을 바꿨으면 짝이 어긋난다 — 이동 실패와 같이 swap_fail 로 백업에서 갱신 전 인증서·키를 되돌리고 exit 1.
+  local final_pub_cert final_pub_key
+  final_pub_cert="$("$OPENSSL_BIN" x509 -in "$cert" -noout -pubkey 2>/dev/null)" || final_pub_cert=""
+  final_pub_key="$("$OPENSSL_BIN" pkey -in "$key" -pubout 2>/dev/null)" || final_pub_key=""
+  [[ -n "$final_pub_cert" && "$final_pub_cert" == "$final_pub_key" ]] ||
+    swap_fail "바꾼 뒤 확인해 보니 제자리 인증서와 개인 키의 짝이 맞지 않습니다(다른 프로그램이 같은 폴더의 파일을 동시에 바꿨을 수 있음)."
   SWAP_STATE=done
   chmod 600 -- "$key" 2>/dev/null || true
   chmod 644 -- "$cert" 2>/dev/null || true

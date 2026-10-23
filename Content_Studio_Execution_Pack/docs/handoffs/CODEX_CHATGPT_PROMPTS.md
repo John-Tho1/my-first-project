@@ -1,6 +1,6 @@
 # Codex 검증 — ChatGPT(Codex 웹)용 프롬프트
 
-- 같은 검증을 로컬 CLI 대신 ChatGPT 의 Codex(웹)에서 돌릴 때 쓴다. 대기열은 `CODEX_QUEUE.txt` 와 같다(위에서부터, 16건 — 15번 FIX5-FULLREV·16번 FIX1-CODEX 는 2026-10-23 추가). 프롬프트 내용은 `scripts/codex-review-commit.sh` 의 리뷰 지시와 같고, 웹에서는 Codex 가 저장소를 직접 읽도록 바꿨다.
+- 같은 검증을 로컬 CLI 대신 ChatGPT 의 Codex(웹)에서 돌릴 때 쓴다. 대기열은 `CODEX_QUEUE.txt` 와 같다(위에서부터, 17건 — 15번 FIX5-FULLREV·16번 FIX1-CODEX·17번 FIX2-CODEX 는 2026-10-23 추가). 프롬프트 내용은 `scripts/codex-review-commit.sh` 의 리뷰 지시와 같고, 웹에서는 Codex 가 저장소를 직접 읽도록 바꿨다.
 - **Claude 가 만든 준비물이며 Codex 판정이 아니다.** 결과는 사용자가 받아 와야 Codex 검증으로 기록한다.
 
 ## 진행 방법(사용자)
@@ -684,6 +684,50 @@ PASS 또는 CHANGES_REQUESTED 중 하나.
 2. 인계 문서: `docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md`
    — 이 커밋을 HEAD_SHA 로 적은 절을 중심으로 읽고, 그 절의 "검토자에게 물을 것"(또는 Questions)에 답하라.
 3. 변경분: `git show d88c31a -- Content_Studio_Execution_Pack ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/drizzle/meta/*_snapshot.json'`
+   (커밋을 찾지 못하면 `git fetch origin content-studio/m4` 뒤 다시 시도.)
+
+규칙:
+- 파일을 수정하지 마라. 커밋·브랜치·PR 을 만들지 말고, 변경 제안(diff)도 만들지 마라 — 리포트만 출력한다.
+- 읽기·grep·git log/show/diff 는 써도 된다. 테스트를 실행했다면 실제 명령과 결과를 그대로 적고, 실행하지 않았으면 실행했다고 주장하지 마라.
+- 외부 서비스 호출·실계정·비밀값은 쓰지 마라.
+- 이 커밋 뒤의 같은 브랜치 커밋이 이미 고친 문제는 `git log` 로 확인해 "이후 커밋 <SHA> 에서 해결됨"이라고 표시하라.
+- 추측을 사실처럼 쓰지 마라. 확인하지 못한 것은 '미확인'으로 표시하라.
+- 취향 문제(포매팅, 네이밍 선호)는 적지 마라. 동작·정확성·규칙 위반만 적어라.
+
+다음 형식의 마크다운 리포트만 출력하라. 서론·칭찬·요약 인사말은 쓰지 마라.
+
+## 판정
+PASS 또는 CHANGES_REQUESTED 중 하나.
+
+## 지적 사항
+각 항목을 아래 형식으로. 없으면 '없음'이라고만 쓴다.
+- [P0|P1|P2] 파일:줄 — 문제 한 줄 요약
+  - 재현/실패 시나리오: 어떤 입력·상태에서 어떻게 잘못되는가
+  - 제안: 구체적인 수정 방향
+(P0 = 불변 조건 위반·데이터 손상·보안, P1 = 기능 오류·명세 불일치, P2 = 경계값·품질)
+
+## Codex 질문에 대한 답
+인계 문서의 질문 각 항목에 번호를 붙여 답하라. 질문이 없으면 '해당 없음'.
+
+## 놓친 케이스
+테스트나 수동 확인에서 빠졌을 가능성이 높은 입력·경계값 목록.
+
+## 실행 정보
+- 화면에 보이는 모델·추론 강도, 검토한 커밋 SHA, 실제로 실행한 명령 목록
+```
+
+## 17. FIX2-CODEX — `c189319`
+
+```text
+당신은 GitHub 저장소 `john-tho1/my-first-project` 안의 Content Studio 앱(`Content_Studio_Execution_Pack/`)을 검토하는 독립 코드 리뷰어다. 구현자는 다른 에이전트(Claude Code)이며, 당신의 역할은 동의가 아니라 검증이다.
+
+대상: 브랜치 `content-studio/m4` 의 커밋 `c1893197ac5e58c6686f04720743a4c8bd6a35e0`(짧은 SHA `c189319`, 작업명 `FIX2-CODEX`) 1개.
+
+먼저 읽을 것:
+1. `Content_Studio_Execution_Pack/AGENTS.md` — 프로젝트 규칙과 불변 조건(Invariants). 위반 여부를 반드시 확인하라.
+2. 인계 문서: `docs/handoffs/FIX2CODEX_IMPLEMENTATION_HANDOFF.md`
+   — 이 커밋을 HEAD_SHA 로 적은 절을 중심으로 읽고, 그 절의 "검토자에게 물을 것"(또는 Questions)에 답하라.
+3. 변경분: `git show c189319 -- Content_Studio_Execution_Pack ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/drizzle/meta/*_snapshot.json'`
    (커밋을 찾지 못하면 `git fetch origin content-studio/m4` 뒤 다시 시도.)
 
 규칙:

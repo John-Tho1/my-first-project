@@ -350,3 +350,19 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - shellcheck 미설치, 실제 renew·Windows Git Bash·macOS 미실행.
 - 이로써 Codex 14건의 현재 남은 지적 2건(P2)을 모두 고쳤다(39aa665·d88c31a). Codex 재확인 대상은 대기열·ChatGPT 프롬프트 15·16번이다.
 - 다음: FIX2-CODEX(부분 복원 원장 누락 경고, D39 재시도 집계 문구, 기본 무시 문자만인 by/reason 거부, 복원 결과 불명 재시도 거부의 모의 문구).
+
+## 2026-10-23 밤 — FIX2-CODEX(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): Codex 14건 제안 7건 중 3건 + FIX5 후속 1건. 역사적 해결 항목은 다시 고치지 않았다.
+- **FIX2-CODEX c189319**:
+  - U1 복원 미리보기 경고 `ledger_history_incomplete`(건수만, 복원은 막지 않음): 들어가지 않고 이 계정에도 남지 않는 비용 원장 행 + 원장 없는 AI 실행·전사 작업. `different`·`unique` 충돌은 이 계정 행이 남아 세지 않는다.
+  - U2 D39 명확화(코드 변경 없음): 같은 작업의 재시도는 24시간 창 안에서는 한 번만 세고, 창이 지나면 다시 센다(DECISIONS·README·.env.example).
+  - U3 `ledger:resolve` 의 `--by`·`--reason` 이 공백·기본 무시 문자만이면 `text_blank` 거부(복원 검사는 그대로).
+  - U4 복원 때 결과 불명이던 모의 항목 재시도 거절은 모의 문구 + `mock: true`(코드 그대로).
+  - 반박 검토 확정 1(P2, U1 이 different 도 셈) → 보완, 보완 재검토 지적 1(P2) 기각. 인계: `docs/handoffs/FIX2CODEX_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(c189319 와 같은 파일, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2034 · integration 62 files / 1120**
+  - drill:mock 위반 0 · test-dev-cert.sh 472/472 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근(스냅숏 전후 같음)
+- Codex 대기열·ChatGPT 프롬프트에 17번 `c189319 FIX2-CODEX` 를 추가했다. **Codex 재확인 대상: 15·16·17번**(39aa665·d88c31a·c189319).
+- 보류(사용자 결정): 미래 의도 진단, 만료 경고 계정 이름, 유효·전체 시도 표시, 반쯤 끝난 행 값 감사.
+- not_run: Codex(15~17), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, 실제 Threads·Claude, 0008 이전 실제 묶음 복원.

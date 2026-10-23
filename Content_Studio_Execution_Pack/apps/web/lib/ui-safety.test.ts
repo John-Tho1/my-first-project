@@ -83,6 +83,10 @@ const REQUIRED: Record<string, string[]> = {
     // LIVE-P2(D39): 실제 게시 최근 24시간 사용·일시 중지 한 줄, 일일 상한 보류의 상한·다시 보낼 시각
     '<strong>{liveLine}</strong>',
     'liveDaily: live ? liveDailyLimitOf(x.events) : null',
+    // FIX3-FULLREV(R2): 취소 결과 불명(UNKNOWN — 부분 게시·복원 미확정) 전용 배너 — 접힌 곳 밖, 저장된 상태·허용 목록 사유 코드로 고른 문구(취소 확인 중 배너와 따로)
+    'const cancelUnknown = cancelUnknownBannerOf(q, d);',
+    '{cancelUnknown ? (',
+    '{cancelUnknown}',
   ],
   'distribute/new/page.tsx': [
     '<strong>실제로 게시</strong>',
@@ -217,6 +221,9 @@ describe('UI-CLEAN 안전 표시 — "자세히" 밖에 남아 있다', () => {
       'ExpiryNoticeList',
       'EXPIRY_ACCOUNT_TAG_TEXT',
       'EXPIRY_LEVEL_LABEL',
+      // FIX3-FULLREV(R2)
+      'cancelUnknown',
+      'CANCEL_UNKNOWN_BANNER',
     ];
     for (const file of Object.keys(REQUIRED)) {
       const src = read(file);
@@ -327,5 +334,18 @@ describe('DESIGN-A — 실제 게시 태그와 MOCK 태그를 섞지 않는다',
       [...src.matchAll(/className="tag live">([^<]*)</g)].filter((m) => m[1]!.includes('MOCK') || m[1]!.includes('모의')).map((m) => `${file}: ${m[0]}`),
     );
     expect(liveWithMock).toEqual([]);
+  });
+});
+
+/**
+ * FIX3-FULLREV(R2): 취소 HTML 경로는 결과 불명(UNKNOWN) 결과를 "취소 확인 중"(cancel_requested=1)으로 보내지 않는다 — 리다이렉트 쿼리는 lib 의
+ * cancelRedirectQuery 하나가 정한다(단위 시험 distribution.test.ts, 통합 시험 fix3-cancel-unknown-route.test.ts). 예전 두 갈래 식이 되살아나지 않게.
+ */
+describe('FIX3-FULLREV(R2) — 취소 리다이렉트 쿼리는 결과 불명을 따로 보낸다', () => {
+  it('cancel route: cancelRedirectQuery(r) 로만 정하고, 예전 두 갈래(canceled=1 아니면 cancel_requested=1) 식이 없다', () => {
+    const src = read('api/distribution-items/[id]/cancel/route.ts');
+    expect(src).toContain('${cancelRedirectQuery(r)}');
+    expect(src).not.toContain("r.canceled ? 'canceled=1' : 'cancel_requested=1'");
+    expect(src).not.toContain("'cancel_requested=1'");
   });
 });

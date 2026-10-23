@@ -205,8 +205,16 @@ describe('LIVE-P2(D39) — 계획 화면의 실제 게시 한 줄·보류 문구
 
 /**
  * FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN 항목 — 페이지가 최근 작업의 사유 코드(lastErrorCode)를 상태 태그·작업 줄·안내에 넘겨
- * 카드 어디에서도 "새 계획 필요"(새 계획은 게시된 부분을 처음부터 다시 게시)·"없을 때만 새 배포 계획으로 다시 승인"을 말하지 않는다. 일반 UNKNOWN 은 그대로.
+ * 카드 어디에서도 "새 계획 필요"(새 계획은 게시된 부분을 처음부터 다시 게시)를 말하지 않는다. 일반 UNKNOWN 은 그대로.
+ * FIX3-FULLREV(R3, 사용자 결정 2026-10-23): 실제 카드(단일 게시물)는 조건부 복구 길("직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요")을
+ * 다시 말한다 — FIX2 의 "실제 카드에 없음" 단언은 정확한 새 문구·모든 "새 배포 계획"이 조건 아래에만 있음으로 바꿨다. 모의 카드는 그대로(새 계획 권유 없음).
  */
+/** FIX3-FULLREV(R3): 카드 안 "새 배포 계획"이 모두 "없을 때만 " 조건 바로 뒤에만 나오는지(무조건 새 계획 권유 없음) — 나온 횟수 */
+const conditionalNewPlanCount = (html: string) => {
+  const parts = html.split('새 배포 계획');
+  for (const before of parts.slice(0, -1)) expect(before.endsWith('없을 때만 '), before.slice(-40)).toBe(true);
+  return parts.length - 1;
+};
 describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권하지 않는다', () => {
   const unknownItem = (name: string, o: { live: boolean; code: string | null; reason?: string; problems?: string[] }) => {
     const x = item({ live: o.live, verification: o.live ? 'UNVERIFIED' : 'MOCK', withPub: false, name });
@@ -237,9 +245,12 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
     expect(card).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.mock}: 원고가 바뀜`);
     expect(card).not.toContain('새 계획 필요');
     expect(card).not.toContain('재확인 또는 새 계획');
+    // FIX3-FULLREV(R3): 모의 카드는 그대로 — 조건부 복구 길도 새 배포 계획 권유도 없다(모의 스레드는 여러 게시물, 새 계획은 게시된 부분을 다시 게시)
+    expect(card).not.toContain('없을 때만');
+    expect(card).not.toContain('새 배포 계획');
   });
 
-  it('실제 부분 게시(thread_partial_revoked): 상태 태그(MOCK 없음)·결과 불명 안내가 부분 게시 문구 — "없을 때만 새 배포 계획으로 다시 승인" 없음', async () => {
+  it('실제 부분 게시(thread_partial_revoked): 상태 태그(MOCK 없음)·결과 불명 안내가 부분 게시 문구 — FIX3-FULLREV(R3): 새 계획은 "직접 확인해 글이 없을 때만"(조건부)', async () => {
     const { LIVE_UNKNOWN_GUIDANCE_BY_KIND, UNKNOWN_STATUS_LABEL_BY_KIND, UNKNOWN_JOB_LINE_BY_KIND, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND } = await import('./distribution');
     state.detail = detail(unknownItem('lp', { live: true, code: 'thread_partial_revoked', problems: ['content_changed'] }));
     const [card] = cards(await render());
@@ -250,7 +261,14 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
     expect(card).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live}: 원고가 바뀜`);
     expect(card).not.toContain('일부 게시된');
     expect(card).not.toContain('게시된 부분');
-    expect(card).not.toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
+    // FIX3-FULLREV(R3): (FIX2 의 "없을 때만 새 배포 계획으로 다시 승인하세요 없음"을 바꿈) 실제 카드는 조건부 복구 길을 정확한 문구로 말하고 —
+    // 결과 불명 안내(1)·머리줄(1)·스냅샷 안내(1) — 모든 "새 배포 계획"이 "없을 때만" 조건 아래에만 있다. 무조건 "새 계획 필요"는 없다.
+    expect(card).toContain(
+      'Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(이 카드에 「Threads에서 확인함」 버튼이 보이면 눌러 기록할 수 있음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
+    );
+    expect(card!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
+    expect(card).toContain('<strong>승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요(글이 없을 때만 새 배포 계획으로 다시 승인)</strong>');
+    expect(conditionalNewPlanCount(card!)).toBe(3);
     expect(card).not.toContain('새 계획 필요');
     expect(card).not.toContain('MOCK');
   });
@@ -275,10 +293,18 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
     expect(mock).toContain('복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않음');
     expect(mock).not.toContain('채널에서 직접 확인');
     expect(live).not.toContain('MOCK');
-    for (const c of [mock!, live!]) {
-      expect(c).not.toContain('새 계획 필요');
-      expect(c).not.toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
-    }
+    for (const c of [mock!, live!]) expect(c).not.toContain('새 계획 필요');
+    // FIX3-FULLREV(R3): (FIX2 의 두 카드 모두 "없을 때만 새 배포 계획으로 다시 승인하세요 없음"을 나눔) 모의 카드는 그대로 없음(새 배포 계획 권유 자체가 없음),
+    // 실제 카드는 조건부 복구 길 — 결과 불명 안내(1)·머리줄(1)·스냅샷 안내(1), 모두 "없을 때만" 조건 아래. 복원한 작업은 사용자 확인이 거절되므로 버튼을 가리키지 않는다.
+    expect(mock).not.toContain('없을 때만');
+    expect(mock).not.toContain('새 배포 계획');
+    expect(live).toContain(
+      'Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(복원한 작업은 이 환경에서 사용자 확인으로 기록하지 않음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
+    );
+    expect(live!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
+    expect(live).toContain('<strong>복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요(글이 없을 때만 새 배포 계획으로 다시 승인)</strong>');
+    expect(conditionalNewPlanCount(live!)).toBe(3);
+    expect(live).not.toContain('Threads에서 확인함');
   });
 
   it('일반 UNKNOWN(부분 게시 사유 아님)은 지금 그대로: 상태 태그·작업 줄 "재확인 또는 새 계획 필요", 스냅샷 안내 "(새 계획 필요)", 실제 카드는 일반 결과 불명 안내', async () => {
@@ -290,5 +316,98 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
     expect(mock).toContain('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): 원고가 바뀜');
     expect(statusTag(live!)).toBe(ITEM_STATUS_LABEL.UNKNOWN);
     expect(live).toContain(LIVE_UNKNOWN_GUIDANCE);
+  });
+});
+
+/**
+ * FIX3-FULLREV(R2, 사용자 결정 2026-10-23): 취소(HTML)가 결과 불명(UNKNOWN — 부분 게시·복원 미확정)으로 끝나면 계획 화면은 "취소 확인 중"이 아니라 전용 배너.
+ * 배너는 리다이렉트 쿼리(cancel_unknown=1 + 항목 + 허용 목록 사유 코드)가 가리키는 이 계획의 항목이 저장된 상태로 "취소 요청·결과 불명"일 때만이고,
+ * 모의·실제 문구는 그 항목 계정으로 고른다. 사유 값이 이상하면 사유를 단정하지 않는 일반 배너(쿼리 글자는 그리지 않음). 기존 취소 배너는 그대로.
+ */
+describe('FIX3-FULLREV(R2) — 취소 결과 불명 배너', () => {
+  const U1 = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const U2 = 'bbbbbbbb-2222-4222-8222-222222222222';
+  const canceledUnknown = (name: string, o: { live: boolean; code: string; id: string }) => {
+    const x = item({ live: o.live, verification: o.live ? 'UNVERIFIED' : 'MOCK', withPub: false, name });
+    return { ...x, item: { ...x.item, id: o.id, status: 'UNKNOWN' }, jobs: [{ ...x.jobs[0]!, state: 'UNKNOWN', lastErrorCode: o.code, cancelRequestedAt: T }] };
+  };
+  const inState = (name: string, state: string, id?: string) => {
+    const x = item({ live: false, verification: 'MOCK', withPub: false, name });
+    return { ...x, item: { ...x.item, ...(id ? { id } : {}), status: state }, jobs: [{ ...x.jobs[0]!, state, lastErrorCode: 'thread_partial_canceled', cancelRequestedAt: T }] };
+  };
+  const cancelQ = (id: string, reason?: string) => ({ cancel_unknown: '1', cancel_item: id, ...(reason === undefined ? {} : { cancel_reason: reason }) });
+  const OLD_CANCELED = '<p class="saved" role="status">취소했습니다(아직 보내지 않은 작업).</p>';
+  const OLD_REQUESTED =
+    '<p class="notice" role="status">취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.</p>';
+  const shownUnknownBanners = async (html: string) => {
+    const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    return Object.values(CANCEL_UNKNOWN_BANNER)
+      .flatMap((b) => [b.mock, b.live])
+      .filter((t) => html.includes(t));
+  };
+
+  it('모의 부분 게시 취소(thread_partial_canceled): 전용 배너(모의 — 실제 채널로 보낸 것 없음), 취소됨·취소 확인 중 배너 없음', async () => {
+    const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    state.detail = detail(canceledUnknown('mp', { live: false, code: 'thread_partial_canceled', id: U1 }));
+    const html = await render(cancelQ(U1, 'thread_partial_canceled'));
+    expect(html).toContain(`<p class="notice" role="alert">${CANCEL_UNKNOWN_BANNER.partial.mock}</p>`);
+    expect(await shownUnknownBanners(html)).toEqual([CANCEL_UNKNOWN_BANNER.partial.mock]);
+    expect(html).not.toContain('취소 확인 중 — 이미 전송 단계');
+    expect(html).not.toContain('취소했습니다(아직 보내지 않은 작업)');
+  });
+
+  it('실제 복원 미확정 취소(restored_cancel_unverified): 실제 문구(Threads 직접 확인, MOCK 없음) — 섞인 계획에서도 쿼리가 가리킨 항목의 계정으로 고른다', async () => {
+    const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    state.detail = detail(
+      canceledUnknown('mp', { live: false, code: 'thread_partial_canceled', id: U1 }),
+      canceledUnknown('lr', { live: true, code: 'restored_cancel_unverified', id: U2 }),
+    );
+    const live = await render(cancelQ(U2, 'restored_cancel_unverified'));
+    expect(live).toContain(`<p class="notice" role="alert">${CANCEL_UNKNOWN_BANNER.restored_unverified.live}</p>`);
+    expect(await shownUnknownBanners(live)).toEqual([CANCEL_UNKNOWN_BANNER.restored_unverified.live]);
+    const mock = await render(cancelQ(U1, 'thread_partial_canceled'));
+    expect(await shownUnknownBanners(mock)).toEqual([CANCEL_UNKNOWN_BANNER.partial.mock]);
+    // 사유 코드를 바꿔 끼워도(저장된 작업 코드와 다름) 그 사유를 주장하지 않는다 — 일반 문구
+    expect(await shownUnknownBanners(await render(cancelQ(U2, 'thread_partial_canceled')))).toEqual([CANCEL_UNKNOWN_BANNER.generic.live]);
+    for (const html of [live, mock]) {
+      expect(html).not.toContain('취소 확인 중 — 이미 전송 단계');
+      expect(html).not.toContain('취소했습니다(아직 보내지 않은 작업)');
+    }
+  });
+
+  it('사유 값이 허용 목록 밖·이상한 값: 일반 배너(사유 단정 없음)이고 쿼리 글자는 화면에 없다 · 사유가 없어도 일반 배너', async () => {
+    const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    state.detail = detail(canceledUnknown('mp', { live: false, code: 'thread_partial_canceled', id: U1 }));
+    const weird = '<img src=x onerror=alert(1)>';
+    const html = await render(cancelQ(U1, weird));
+    expect(await shownUnknownBanners(html)).toEqual([CANCEL_UNKNOWN_BANNER.generic.mock]);
+    expect(html).not.toContain('onerror');
+    expect(html).not.toContain('&lt;img');
+    expect(await shownUnknownBanners(await render(cancelQ(U1)))).toEqual([CANCEL_UNKNOWN_BANNER.generic.mock]);
+    expect(await shownUnknownBanners(await render(cancelQ(U1, 'thread_partial_failed')))).toEqual([CANCEL_UNKNOWN_BANNER.generic.mock]);
+  });
+
+  it('배너 없음: 이 계획에 없는 항목·형식이 틀린 항목·쿼리 없음 · 예전 리다이렉트(cancel_requested=1)도 결과 불명 항목에 "취소 확인 중"을 띄우지 않는다', async () => {
+    state.detail = detail(canceledUnknown('mp', { live: false, code: 'thread_partial_canceled', id: U1 }));
+    const queries: Array<Record<string, string>> = [cancelQ(U2, 'thread_partial_canceled'), cancelQ('i-mp', 'thread_partial_canceled'), {}, { cancel_requested: '1' }, { canceled: '1' }];
+    for (const q of queries) {
+      const html = await render(q);
+      expect(await shownUnknownBanners(html), JSON.stringify(q)).toEqual([]);
+      expect(html, JSON.stringify(q)).not.toContain('취소 확인 중 — 이미 전송 단계');
+      expect(html, JSON.stringify(q)).not.toContain('취소했습니다(아직 보내지 않은 작업)');
+    }
+  });
+
+  it('기존 취소 배너는 그대로: canceled=1(CANCELED 항목) · cancel_requested=1(CANCEL_REQUESTED 항목) — 결과 불명 배너 없음', async () => {
+    state.detail = detail(inState('c', 'CANCELED', U1), inState('r', 'CANCEL_REQUESTED', U2));
+    const canceled = await render({ canceled: '1' });
+    expect(canceled).toContain(OLD_CANCELED);
+    expect(canceled).not.toContain('취소 확인 중 — 이미 전송 단계');
+    const requested = await render({ cancel_requested: '1' });
+    expect(requested).toContain(OLD_REQUESTED);
+    expect(requested).not.toContain(OLD_CANCELED);
+    for (const html of [canceled, requested]) expect(await shownUnknownBanners(html)).toEqual([]);
+    // 결과 불명 쿼리로 취소됨·취소 확인 중 항목을 가리켜도(쿼리만 바꿈) 결과 불명 배너는 없다 — 저장된 상태가 UNKNOWN 이 아니다
+    for (const id of [U1, U2]) expect(await shownUnknownBanners(await render(cancelQ(id, 'thread_partial_canceled'))), id).toEqual([]);
   });
 });

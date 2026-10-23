@@ -20,6 +20,7 @@ import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import {
   bannersFromState,
   blockInfoOf,
+  cancelUnknownBannerOf,
   DISTRIBUTE_ERROR_TEXT,
   instagramProgressLine,
   instagramStepLine,
@@ -551,7 +552,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           <h4>{live ? '작업(실제 게시 — 실제 Threads 어댑터)' : '작업(MOCK — 모의 어댑터)'}</h4>
           {live && x.item.status === 'UNKNOWN' ? (
             unknownKind ? (
-              // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 — "없을 때만 새 배포 계획으로 다시 승인" 안내 대신 직접 확인만
+              // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 — 종류별 안내(직접 확인 먼저)
+              // FIX3-FULLREV(R3): 실제 항목(단일 게시물)은 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인(조건부 복구 길) — 모의 카드에는 이 안내가 없다
               <p className="notice" role="alert">
                 {LIVE_UNKNOWN_GUIDANCE_BY_KIND[unknownKind]}
               </p>
@@ -720,6 +722,8 @@ export default async function PlanPage({
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
   const banners = bannersFromState(q, d);
+  // FIX3-FULLREV(R2): 취소가 결과 불명(UNKNOWN — 부분 게시·복원 미확정)으로 끝남 — "취소 확인 중"이 아닌 전용 배너(저장된 상태·허용 목록 사유 코드로만 고름)
+  const cancelUnknown = cancelUnknownBannerOf(q, d);
   // LIVE-P1(D38): 실제 계정 항목이 있는 계획 — 실제 게시 안내(모의 항목은 그대로 MOCK)
   const hasLive = d.items.some((x) => x.account?.kind === 'live');
   const hasMock = d.items.some((x) => x.account?.kind !== 'live');
@@ -816,6 +820,11 @@ export default async function PlanPage({
       {banners.cancelRequested ? (
         <p className="notice" role="status">
           취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.
+        </p>
+      ) : null}
+      {cancelUnknown ? (
+        <p className="notice" role="alert">
+          {cancelUnknown}
         </p>
       ) : null}
       {banners.retried ? (

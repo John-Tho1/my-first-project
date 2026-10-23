@@ -47,7 +47,20 @@ import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as tickPOST } from '../../apps/web/app/api/worker/tick/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
-import { latestThreadsDiag, liveCandidateFromEvents, liveItemHeadline, UNKNOWN_JOB_LINE_BY_KIND, UNKNOWN_STATUS_LABEL_BY_KIND } from '../../apps/web/lib/distribution';
+import {
+  latestThreadsDiag,
+  liveCandidateFromEvents,
+  liveItemHeadline,
+  UNKNOWN_JOB_LINE_BY_KIND,
+  UNKNOWN_STATUS_LABEL_BY_KIND,
+  // FIX3-FULLREV(R2·R3)
+  bannersFromState,
+  CANCEL_UNKNOWN_BANNER,
+  cancelUnknownBannerOf,
+  LIVE_UNKNOWN_GUIDANCE_BY_KIND,
+  unknownKindOf,
+  userConfirmCandidateForCard,
+} from '../../apps/web/lib/distribution';
 import { itemStatusText, jobStatusTextFor } from '../../apps/web/lib/record-labels';
 import { GET as planGET } from '../../apps/web/app/api/distribution-plans/[id]/route';
 import { GET as jobGET } from '../../apps/web/app/api/jobs/[id]/route';
@@ -610,6 +623,48 @@ describe('FIX2-FULLREV(FX4): 실제 계정의 복원 작업 취소 미확정은 
       expect(t).toContain('직접 확인');
       for (const w of ['MOCK', '실제 채널로 보낸 것']) expect(t).not.toContain(w);
     }
+  });
+
+  it('FIX3-FULLREV(R2·R3): 같은 실제 복원 작업을 HTML 폼으로 취소 → cancel_unknown=1 + 항목 + restored_cancel_unverified(cancel_requested 아님) · 계획 화면 배너는 실제 문구 · 카드 안내는 조건부 새 계획, 사용자 확인 버튼 후보 없음(복원)', async () => {
+    const TEXT = '복원 취소 미확정 실제 글(HTML 취소).';
+    const p = await planApproved([TEXT]);
+    const config = fullCfg('FIX3-R2-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    const fx = publishFixture((ids) => ({
+      ...happy(TEXT)(ids),
+      [P(ids).create]: () => jsonRes(401, { error: { message: 'Error validating access token', type: 'OAuthException', code: 190 } }),
+    }));
+    expect((await tick(registryWith(fx.fetch, config), config)).results).toEqual({ BLOCKED: 1 });
+    const item = p.items[0]!;
+    const job = await jobOf(item.id);
+    expect(job).toMatchObject({ state: 'BLOCKED', lastRetryClass: 'auth' });
+    await db.update(schema.jobs).set({ restoredNeedsReview: true }).where(eq(schema.jobs.id, job.id));
+    const res = await rec(
+      await cancelPOST(
+        new Request(`${BASE}/api/distribution-items/${item.id}/cancel`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', origin: BASE, ...cookieHeader(token) },
+          body: new URLSearchParams({ plan_id: p.planId }).toString(),
+        }),
+        ctx(item.id),
+      ),
+    );
+    expect(res.status).toBe(303);
+    const loc = res.headers.get('location')!;
+    expect(loc).toBe(`/distribute/${p.planId}?cancel_unknown=1&cancel_item=${item.id}&cancel_reason=restored_cancel_unverified`);
+    expect(await jobOf(item.id)).toMatchObject({ state: 'UNKNOWN', lastErrorCode: 'restored_cancel_unverified' });
+    // 계획 화면과 같은 판정(저장된 상세): 전용 배너는 실제 문구, 예전 취소 배너는 없음
+    const q = Object.fromEntries(new URL(loc, BASE).searchParams.entries());
+    const d = (await getPlanDetail(db, owner, p.planId))!;
+    expect(cancelUnknownBannerOf(q, d)).toBe(CANCEL_UNKNOWN_BANNER.restored_unverified.live);
+    expect(bannersFromState(q, d)).toMatchObject({ canceled: false, cancelRequested: false });
+    // FIX3-FULLREV(R3): 실제 카드 안내는 조건부 복구 길 — 복원한 작업은 사용자 확인이 거절되므로 버튼 후보도 없고 안내도 버튼을 가리키지 않는다
+    const x = d.items[0]!;
+    expect(unknownKindOf(x.item.status, x.jobs.at(-1))).toBe('restored_unverified');
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified).toContain('직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요');
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified).not.toContain('Threads에서 확인함');
+    expect(userConfirmCandidateForCard(x)).toBeNull();
+    expect(fx.calls.filter((c) => c.url.pathname.endsWith('threads_publish'))).toHaveLength(0);
   });
 });
 

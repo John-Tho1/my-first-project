@@ -2,7 +2,7 @@ import { cancelItem } from '@cs/db';
 import { assertSameOrigin, cancelSchema } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
-import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
+import { cancelRedirectQuery, distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
 import { getConfig } from '../../../../../lib/server';
 import { requireOwner } from '../../../../../lib/session';
 
@@ -17,6 +17,8 @@ type Ctx = { params: Promise<{ id: string }> };
  * - 이미 전송 단계(LEASED·SENDING·REMOTE_PROCESSING·RECONCILING): { cancel_requested: true, state: 'CANCEL_REQUESTED', message: '취소 확인 중' }
  *   — 원격 취소를 주장하지 않는다(A11). worker 가 원격 결과를 확인해 CANCELED 또는 CONFIRMED(취소 불가, 이미 전송됨)로 정한다.
  * UNKNOWN 409 cancel_unknown, 끝난·실행 전 항목 409 not_cancellable, 다른 owner 404.
+ * FIX3-FULLREV(R2): HTML 폼은 취소됨 → canceled=1, 취소 확인 중 → cancel_requested=1(지금 그대로), 결과 불명(state UNKNOWN — 부분 게시·복원 미확정) →
+ * cancel_unknown=1 + 항목 + 허용 목록 사유 코드(cancelRedirectQuery — 화면은 저장된 상태로 전용 배너). JSON 응답은 그대로.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
   const html = wantsHtml(request);
@@ -30,7 +32,7 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const parsed = cancelSchema.safeParse(body.kind === 'form' ? {} : body.data);
     if (!parsed.success) throw validationError(parsed.error);
     const r = await cancelItem(owner.db, owner.ownerId, id.toLowerCase());
-    if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}${r.canceled ? 'canceled=1' : 'cancel_requested=1'}`);
+    if (html) return seeOther(`${back}${back.includes('?') ? '&' : '?'}${cancelRedirectQuery(r)}`);
     return json(r);
   } catch (e) {
     if (html) return distributeFormFailure(e, request, back);

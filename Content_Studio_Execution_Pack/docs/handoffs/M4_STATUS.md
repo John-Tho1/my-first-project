@@ -306,3 +306,21 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 대기열 `docs/handoffs/CODEX_QUEUE.txt`(14건): D39 의 LIVEP2·EXPIRY1·FIX1-LIVEP2·FIX1-EXPIRY1·LIVEL1H2·FIX2~6-D39, 그리고 FIX1~4-FULLREV 다. 실행은 `bash scripts/codex-review-queue.sh`(결과 `.handoffs/review-<작업명>.md`)다.
 - 실행기 시험 `scripts/tests/test-codex-review-queue.sh`(가짜 codex) 15/15 를 통과했다. 변이 2개(판정 없이 건너뜀·실패해도 계속)를 잡았다.
 - (추가) 사용자 지시("codex 검증 ChatGPT에서 받아서 진행할 수 있도록 해줘"): ChatGPT 의 Codex(웹)용 프롬프트 14개를 `docs/handoffs/CODEX_CHATGPT_PROMPTS.md` 로 만들었다. 대기열과 같은 순서이고, 리뷰 지시는 `codex-review-commit.sh` 와 같다. 웹에서는 Codex 가 저장소를 직접 읽는다. 결과는 대화에 붙이거나 `.handoffs/review-<작업명>.md` 로 저장하면 로컬 실행기와 섞어 쓸 수 있다.
+
+## 2026-10-23 밤 — Codex 14건 결과(ChatGPT Codex 웹, 사용자 실행)
+- 원문: `docs/handoffs/CODEX_14_REVIEWS_2026-10-23.md`(사용자 전달본 그대로). 기준은 docs HEAD 52f3a09·제품 코드 fc74b3a 이고 FIX5-FULLREV 는 포함하지 않았다.
+- **실제 모델 ID·추론 설정은 노출되지 않았다** — 요청값은 gpt-6-astra / xhigh 이고 준수 확인은 불가하다. Codex 도 그렇게 실행했다고 주장하지 않는다.
+- 판정: 현재 HEAD 기준 **CHANGES_REQUESTED, P2 2건**. 작업별로는 PASS 2(FIX6-D39·FIX4-FULLREV), 나머지 12 CHANGES_REQUESTED 다. 12건의 P0·P1·P2 는 모두 이후 커밋에서 해결로 표시됐다(해결 SHA 는 원문). 다시 고치지 않는다.
+- 남은 유효 지적과 처리:
+  1. [P2] `scripts/dev-cert.sh:294,296` 같은 폴더 동시 renew 가 섞여 키·인증서 짝이 어긋날 수 있다. Claude 확인 결과 잠금이 없다 [확실]. → FIX1-CODEX 가 진행 중이다(폴더 잠금 + 교체 뒤 짝 확인, 별도 작업 공간).
+  2. [P2] `packages/db/src/jobs.ts:1853,1862` 복원 작업 retryItem 거부 문구에 조건 없는 "새 배포 계획을 만드세요"가 있다. → FIX5-FULLREV T2 로 고쳤고 커밋 전이다(검토·보완 중).
+- 결함이 아닌 제안(결정 전, 고치지 않음):
+  - 부분 복원으로 비용 원장이 빠질 때 예산 이력 완전성 경고 보강(LIVEL1H2 Q5). 지금 미리보기에는 통화 불일치 경고는 있지만 원장 누락 영향 경고는 없다.
+  - D39 "재시도는 새로 세지 않음"을 창 안 중복 제거로 문서에 명시(LIVEP2 Q2).
+  - 미래 시각 의도 운영 진단(LIVEP2 Q6).
+  - 실제 계정이 여럿일 때 만료 경고에 계정 이름(EXPIRY1 Q4).
+  - 유효 시도·전체 시도 구분 표시(FIX2-D39 Q2).
+  - 기본 무시 문자만으로 된 by/reason 을 CLI 에서 거부(FIX6-D39 Q4).
+  - 반쯤 끝난 행의 버리는 값 표시·감사(FIX6-D39 Q1).
+- Codex 독립 실행 범위(원문 그대로): 메모리 내 단언 67(함수 58 + ZIP 9)·TS 149 문법 변환·셸 9 `bash -n`.
+- Codex 미실행: 설치·lint·typecheck·build·Vitest 전체·통합·drill·mutation·실제 인증서·production 빌드·PostgreSQL 동시성·실제 DB·브라우저·Windows/Git Bash·외부 호출. 구현자 PASS 수치는 Codex 가 독립 실행 결과로 인용하지 않았다.

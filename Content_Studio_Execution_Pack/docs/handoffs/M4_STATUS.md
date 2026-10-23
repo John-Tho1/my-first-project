@@ -305,3 +305,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 사용자 지시("codex 검증 진행해줘"). 클라우드 세션에는 codex CLI 가 없다(`which codex` 결과 없음). 사용자 규칙도 Codex 검증은 사용자 PC 전용·gpt-6-astra / xhigh 고정이다. 그래서 실행기와 대기열만 준비했다.
 - 대기열 `docs/handoffs/CODEX_QUEUE.txt`(14건): D39 의 LIVEP2·EXPIRY1·FIX1-LIVEP2·FIX1-EXPIRY1·LIVEL1H2·FIX2~6-D39, 그리고 FIX1~4-FULLREV 다. 실행은 `bash scripts/codex-review-queue.sh`(결과 `.handoffs/review-<작업명>.md`)다.
 - 실행기 시험 `scripts/tests/test-codex-review-queue.sh`(가짜 codex) 15/15 를 통과했다. 변이 2개(판정 없이 건너뜀·실패해도 계속)를 잡았다.
+- (추가) 사용자 지시("codex 검증 ChatGPT에서 받아서 진행할 수 있도록 해줘"): ChatGPT 의 Codex(웹)용 프롬프트 14개를 `docs/handoffs/CODEX_CHATGPT_PROMPTS.md` 로 만들었다. 대기열과 같은 순서이고, 리뷰 지시는 `codex-review-commit.sh` 와 같다. 웹에서는 Codex 가 저장소를 직접 읽는다. 결과는 대화에 붙이거나 `.handoffs/review-<작업명>.md` 로 저장하면 로컬 실행기와 섞어 쓸 수 있다.

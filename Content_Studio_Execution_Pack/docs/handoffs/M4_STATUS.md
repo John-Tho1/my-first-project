@@ -287,3 +287,16 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
 - not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
 - Codex 큐 줄(추가): `fc74b3a FIX4-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX3-FULLREV 줄 다음).
+
+## 2026-10-23 저녁 — 사용자 PC 확인(Windows 10 · Git Bash · Node 24.21.0, 브랜치 8166e52)
+- 사용자가 직접 실행했고, 결과는 화면 캡처로 받았다. 클라우드 세션은 실행하지 않았다.
+  1. `corepack pnpm ledger:resolve`: 사용법 출력·exit=2. Git Bash 에서 corepack shim 이 정상 시작한다(FIX6 의 [추정] 위험 해소).
+  2. 없는 DB 폴더로 `--list`: "DB 폴더가 없습니다 … 아무것도 만들지 않았습니다"·exit=1. 새 폴더 없음.
+  3. 실제 DB 복사본(`data/pglite-check-20261023`):
+     - `--list` 결과는 후보 0행·아직 provider_unstorable 0행·exit=0 이다. 손으로 해결할 원장 행이 없다.
+     - `drill:restore` 결과는 PASS·exit=0 이다(37표 133행 same, 파일 2, 검색 found). 확인 뒤 복사본을 지웠다.
+  4. Git Bash 인자 변환 확인: `node -e … '/ops 시험 한글'` → `"C:/Program Files/Git/ops 시험 한글"`. 앞 `/` 값은 MSYS 가 먼저 바꾼다(확인됨). Git Bash 에서는 `text_shell_unsafe` 의 앞 `/` 거부가 아니라 미리보기 `reason:` 표시가 실제 보호다(FIX6 남은 위험과 같음).
+  5. 실제 DB 적용: 백업 `data/pglite-backup-20261023-before-0046`(폴더 복사) 뒤 `corepack pnpm db:migrate` 는 `{"ok":true,…,"database":"./data/pglite"}`·exit=0 이다(0046·0047 적용). `drill:restore` 는 PASS·exit=0 이다(복사본과 같은 표).
+- 확인 대기: 개발 서버를 켠 뒤 홈·설정·배포 화면 열림(5-4).
+- 백업 폴더(`pglite-backup-20261023-before-0046`, 그 앞 `pglite.bak-2026101x-pre004x`)는 사용 확인 뒤 사용자가 정리한다.
+- not_run(남음): Codex, 실제 Postgres 다중 연결, 브라우저 자동 시험, macOS, 실제 Threads·Claude 호출, 원장 해결 행이 있는 상태의 `ledger:resolve` 미리보기·적용.

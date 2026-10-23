@@ -339,3 +339,14 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Codex 대기열·ChatGPT 프롬프트에 15번 `39aa665 FIX5-FULLREV` 를 추가했다.
 - Codex 14건 제안 7건 처리(사용자 "다 권고 사항으로", Claude 권고): 원장 누락 경고·D39 문구·기본 무시 문자만인 by/reason 거부는 FIX2-CODEX 로 한다. 미래 의도 진단·만료 경고 계정 이름·유효/전체 시도 표시·반쯤 끝난 행 값 감사는 보류한다(효과가 작거나 지금 쓰일 일 없음). FIX2-CODEX 에는 복원 결과 불명 재시도 거부의 모의 문구도 함께 넣는다.
 - not_run: Codex(FIX5), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, 실제 Threads·Claude.
+
+## 2026-10-23 밤 — FIX1-CODEX(클라우드 세션)
+- **FIX1-CODEX d88c31a**: Codex 14건 남은 지적 1(P2 `dev-cert.sh:294,296` 동시 renew 짝 어긋남)을 **해결**했다.
+  - renew 단일 실행 잠금(`.dev-cert-renew.lock`, 원자적 mkdir, 그룹 신호에도 잠금 남기지 않음)과 교체 뒤 키·인증서 짝 확인을 넣었다. 어긋나면 백업에서 되돌린다.
+  - 반박 검토 확정 3 → 보완, 보완 재검토 확정 1 → 오케스트레이터 수정. 인계: `EXPIRY1_IMPLEMENTATION_HANDOFF.md` "FIX round 4".
+- 검사:
+  - 그룹 신호 수정 직전 상태에서 전체 PASS: unit 2034·integration 1101·drill:mock 0·dev-cert 442.
+  - 수정 뒤: test-dev-cert.sh **472/472**, `bash -n`, 보이지 않는 문자 0.
+  - shellcheck 미설치, 실제 renew·Windows Git Bash·macOS 미실행.
+- 이로써 Codex 14건의 현재 남은 지적 2건(P2)을 모두 고쳤다(39aa665·d88c31a). Codex 재확인 대상은 대기열·ChatGPT 프롬프트 15·16번이다.
+- 다음: FIX2-CODEX(부분 복원 원장 누락 경고, D39 재시도 집계 문구, 기본 무시 문자만인 by/reason 거부, 복원 결과 불명 재시도 거부의 모의 문구).

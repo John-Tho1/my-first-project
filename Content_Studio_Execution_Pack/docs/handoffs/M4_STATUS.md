@@ -297,6 +297,6 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
      - `drill:restore` 결과는 PASS·exit=0 이다(37표 133행 same, 파일 2, 검색 found). 확인 뒤 복사본을 지웠다.
   4. Git Bash 인자 변환 확인: `node -e … '/ops 시험 한글'` → `"C:/Program Files/Git/ops 시험 한글"`. 앞 `/` 값은 MSYS 가 먼저 바꾼다(확인됨). Git Bash 에서는 `text_shell_unsafe` 의 앞 `/` 거부가 아니라 미리보기 `reason:` 표시가 실제 보호다(FIX6 남은 위험과 같음).
   5. 실제 DB 적용: 백업 `data/pglite-backup-20261023-before-0046`(폴더 복사) 뒤 `corepack pnpm db:migrate` 는 `{"ok":true,…,"database":"./data/pglite"}`·exit=0 이다(0046·0047 적용). `drill:restore` 는 PASS·exit=0 이다(복사본과 같은 표).
-- 확인 대기: 개발 서버를 켠 뒤 홈·설정·배포 화면 열림(5-4).
+- 5-4 개발 서버 확인(사용자 보고, 캡처 없음): `pnpm dev` → 로그인(AUTH_ALLOWED_IDENTITY) 성공. `/api/health`·`/`·`/api/health/details`·`/settings`·`/distribute`(계획 상세 포함)·`/ops` 화면이 모두 열렸다. 버튼 조작은 없었다. 이것으로 0046·0047 의 실제 `./data` 적용을 마쳤다.
 - 백업 폴더(`pglite-backup-20261023-before-0046`, 그 앞 `pglite.bak-2026101x-pre004x`)는 사용 확인 뒤 사용자가 정리한다.
 - not_run(남음): Codex, 실제 Postgres 다중 연결, 브라우저 자동 시험, macOS, 실제 Threads·Claude 호출, 원장 해결 행이 있는 상태의 `ledger:resolve` 미리보기·적용.

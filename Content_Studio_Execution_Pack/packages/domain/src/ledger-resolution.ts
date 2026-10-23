@@ -5,7 +5,8 @@
  * 규칙을 SQL 이나 CLI 로 옮겨 적지 않는다 — 검증기가 유일한 기준이다. CLI 에만 있는 더 엄격한 규칙(아래 LEDGER_RESOLUTION_MESSAGES)은
  * `actual_format`·`none_actual`, DB 가 담을 수 없는 문자 `text_encoding`, 그리고 FIX5(5차 Claude 검토)의 `already_valid`(이미 복원 검사를 통과하는 행의
  * 정정은 `overwriteValid` 가 있어야 함)·`text_shell_unsafe`(--by·--reason 의 셸 문자 — 아래 LEDGER_SHELL_UNSAFE_TEXT_RE), FIX6(6차 Claude 검토 FIX5 Q2)의
- * `overwrite_not_needed`(복원 검사에서 거부되는 행에 `overwriteValid` — 그 플래그는 이미 통과하는 행에만)뿐이다.
+ * `overwrite_not_needed`(복원 검사에서 거부되는 행에 `overwriteValid` — 그 플래그는 이미 통과하는 행에만), FIX2-CODEX(U3, Codex review-FIX6-D39 Q4)의
+ * `text_blank`(--by·--reason 이 공백·기본 무시 문자만 — 아래 isLedgerBlankText)뿐이다.
  *
  * 분류(classifyLedgerRow):
  * - resolve: state settled · usage_source provider_unstorable · 최상위 reported_* 세 개가 FIX4 형식. resolution 이 이미 붙은 "반쯤 끝난" H2 이전 행도
@@ -110,6 +111,7 @@ export type LedgerResolutionError =
   | 'actual_format'
   | 'text_encoding'
   | 'text_shell_unsafe'
+  | 'text_blank'
   | `resolution:${ResolutionProblem}`
   | 'row_integrity'
   | 'row_schema'
@@ -137,6 +139,15 @@ const isUnstorableText = (v: string) => v.includes('\u0000') || LONE_SURROGATE_R
  * `"` 에서의 끊김, Git Bash 의 경로 변환은 프로그램이 시작하기 전에 그 문자를 없애거나 바꾸므로 이 정규식이 아니라 미리보기의 `resolved_by:`·`reason:` 표시에서만 보인다.
  */
 export const LEDGER_SHELL_UNSAFE_TEXT_RE = /["%\\&|<>^]|^\//;
+/**
+ * FIX2-CODEX(U3 — Codex review-FIX6-D39 Q4, 사용자 결정 2026-10-23): 공백(JS trim() 이 지우는 문자·\p{White_Space})과 기본 무시 문자(\p{Default_Ignorable_Code_Point} —
+ * 한글 채움 U+3164·U+115F·U+1160·U+FFA0, 폭 없는 공백 U+200B, 단어 잇기 U+2060, 변이 선택자 등)**만으로** 된 --by·--reason 은 받지 않는다(`text_blank` — 운영 기록
+ * 품질, 이 명령만의 규칙). 보이는 글자가 하나라도 있으면(섞인 값) 지금처럼 받고 미리보기가 \u 로 보여 준다.
+ * JS trim() 으로 이미 빈 값(빈 값·공백만)은 이 검사가 아니라 지금처럼 복원 검사와 같은 `resolution:resolved_by`·`resolution:reason` 으로 거부한다(코드 그대로 —
+ * 이 검사는 trim() 이 남기는 문자가 있을 때만). 복원 검사(bundle.ts isValidResolution)는 바꾸지 않는다: 이미 저장된 묶음의 채움 문자만인 값은 그대로 유효하다.
+ */
+const LEDGER_BLANK_TEXT_RE = /^[\s\p{White_Space}\p{Default_Ignorable_Code_Point}]+$/u;
+export const isLedgerBlankText = (v: string): boolean => v.trim() !== '' && LEDGER_BLANK_TEXT_RE.test(v);
 
 export function planLedgerResolution(current: LedgerBundleRow, input: LedgerResolutionInput): { ok: true; plan: LedgerResolutionPlan } | { ok: false; code: LedgerResolutionError } {
   const cls = classifyLedgerRow(current);
@@ -148,6 +159,7 @@ export function planLedgerResolution(current: LedgerBundleRow, input: LedgerReso
   if (!LEDGER_ACTUAL_INPUT_RE.test(input.actual)) return { ok: false, code: 'actual_format' };
   if (isUnstorableText(input.resolvedBy) || isUnstorableText(input.reason)) return { ok: false, code: 'text_encoding' };
   if (LEDGER_SHELL_UNSAFE_TEXT_RE.test(input.resolvedBy) || LEDGER_SHELL_UNSAFE_TEXT_RE.test(input.reason)) return { ok: false, code: 'text_shell_unsafe' };
+  if (isLedgerBlankText(input.resolvedBy) || isLedgerBlankText(input.reason)) return { ok: false, code: 'text_blank' };
 
   const snap = structuredClone(current.pricing_snapshot);
   const resolvedAt = input.now.toISOString();
@@ -218,6 +230,8 @@ export const LEDGER_RESOLUTION_MESSAGES: Record<LedgerResolutionError, string> =
     '--by·--reason 에 큰따옴표(")·퍼센트(%)·역슬래시(\\)·&·|·<·>·^ 를 쓸 수 없고 값을 / 로 시작할 수 없습니다 — 같은 명령 글이 어느 셸에서나 같게 도착하게 하는 이 명령만의 규칙입니다' +
     '(명령 글은 셸을 두 번 지납니다: Git Bash, 그다음 pnpm 의 스크립트 셸. Linux·macOS 에서는 고정한 pnpm 이 이 문자를 그대로 넘기지만, Windows cmd.exe [미확인] 의 %VAR% 확장·" 에서의 끊김·& | < > ^ 처리와' +
     ' Git Bash 의 / 경로 변환은 프로그램이 시작하기 전에 글을 바꿀 수 있습니다 — 그런 변형은 이 거부가 아니라 미리보기의 resolved_by:·reason: 줄에서만 보입니다). 다른 말로 바꿔 적습니다',
+  text_blank:
+    '--by·--reason 이 공백과 보이지 않는 문자(한글 채움 문자 U+3164·폭 없는 공백 U+200B 같은 기본 무시 문자)만으로 되어 있습니다 — 누가·왜 해결했는지 보이는 글자로 적습니다(이 명령만의 규칙 — 복원 검사는 그대로)',
   'resolution:usage_source': '--source 는 provider 또는 none 입니다',
   'resolution:keys': '만든 resolution 의 키가 6개가 아닙니다(내부 오류)',
   'resolution:resolved_at': '만든 resolved_at 이 UTC(Z) 시각 형식이 아닙니다(내부 오류)',

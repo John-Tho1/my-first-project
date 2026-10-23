@@ -63,6 +63,7 @@ import {
   RESTORED_ITEM_RETRY_MOCK_MESSAGE,
   RESTORED_JOB_RETRY_MESSAGE,
   RESTORED_JOB_RETRY_MOCK_MESSAGE,
+  RESTORED_UNKNOWN_RETRY_MOCK_MESSAGE,
   SCHEDULE_STALE_RETRY_MESSAGE,
   SEND_LEASE_STATES,
   type AdapterContext,
@@ -1871,7 +1872,13 @@ async function retryItemTx(db: Db, ownerId: string, itemId: string, now: Date): 
     // FIX-T10(P0): 복원 때 진행 중이던 항목(restored_needs_review)은 원격 결과를 모르므로 재시도(재전송)하지 않는다 — 결과 불명이면 outcome_unknown.
     if (item.restoredNeedsReview) {
       throw item.status === 'UNKNOWN'
-        ? new NotRetryableError('outcome_unknown', '복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.', { status: item.status, restored: true })
+        ? // FIX2-CODEX(U4): 모의 계정은 모의 문구 + mock: true(실제 채널로 보낸 것 없음 — 원격 확인을 시키지 않음, 옆 not_retryable 모의 분기와 같은 규칙).
+          // 실제 계정·계정 kind 를 모름은 지금 문구·details 그대로. 코드는 그대로(outcome_unknown · restored: true).
+          new NotRetryableError(
+            'outcome_unknown',
+            restoredMock ? RESTORED_UNKNOWN_RETRY_MOCK_MESSAGE : '복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.',
+            { status: item.status, restored: true, ...restoredMockDetail },
+          )
         : // FIX5-FULLREV(T2): 조건부 복구 길 · (T2 후속) 모의 계정은 모의 문구 + mock: true
           new NotRetryableError('not_retryable', restoredMock ? RESTORED_ITEM_RETRY_MOCK_MESSAGE : RESTORED_ITEM_RETRY_MESSAGE, {
             status: item.status,

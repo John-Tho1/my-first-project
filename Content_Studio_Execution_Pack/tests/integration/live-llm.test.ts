@@ -1592,10 +1592,18 @@ describe('LIVEL1-H2 — 복원한 원장과 대상의 이번 달(MSK) 예산', (
         expect(res.conflicts).toEqual(expect.arrayContaining(dropped));
         const ids = (await h.db.select({ id: schema.usageLedger.id }).from(schema.usageLedger).where(eq(schema.usageLedger.ownerId, target))).map((x) => x.id);
         expect(ids).toEqual([r1.ledger.id]);
-        // 대상의 이번 달 사용액에는 L1 만 — 원본은 L1 + L2. (미리보기에 금액 경고는 없다: 남은 위험으로 기록)
+        // 대상의 이번 달 사용액에는 L1 만 — 원본은 L1 + L2. FIX2-CODEX(U1, 사용자 결정 2026-10-23 — 이전: 미리보기 경고 없음, 남은 위험으로 기록):
+        // 미리보기가 빠지는 원장 1건을 경고한다(건수만 — 금액·ID 없음). 복원은 그대로 된다(위 커밋).
         expect((await monthlyUsage(h.db, target)).byCurrency.map((u) => u.used)).toEqual([r1.ledger.actualAmount]);
         expect((await monthlyUsage(db, owner)).byCurrency.map((u) => u.used)).toEqual([fromMicro(toMicro(r1.ledger.actualAmount!) + toMicro(r2.ledger.actualAmount!))]);
-        expect(pv.preview.warnings.map((w) => w.code)).toEqual([]);
+        expect(pv.preview.warnings).toEqual([
+          {
+            code: 'ledger_history_incomplete',
+            message:
+              'AI 비용 이력이 완전하지 않습니다: "없는 항목만 추가"로 복원해도 묶음의 비용 원장 1건은 들어가지 않습니다(충돌·의존성 — 기존 행은 덮어쓰지 않음). 복원은 되지만, 이 계정의 월 비용 이력과 예산 합계가 실제 사용보다 적게 잡힐 수 있습니다.',
+          },
+        ]);
+        for (const v of [r2.ledger.id, r2.run.id, r2.ledger.actualAmount!]) expect(pv.preview.warnings[0]!.message).not.toContain(v);
       } finally {
         await h.close();
       }

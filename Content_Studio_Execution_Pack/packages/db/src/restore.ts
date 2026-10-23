@@ -654,18 +654,85 @@ export function ledgerCurrencyWarnings(bundle: ParsedBundle, budgetCurrency: str
     : [];
 }
 
+/**
+ * FIX2-CODEX(U1, Codex review-LIVEL1H2 Q5 · 사용자 결정 2026-10-23): 복원 뒤 이 owner 의 AI 비용 원장이 묶음의 비용 이력보다 빠지는 건수(건수만 — 금액·ID 없음).
+ * 미리보기가 applyBundle 을 실행한 같은 트랜잭션에서, 되돌리기 전에 센다(커밋과 같은 계산 — 복원 뒤 상태 그대로).
+ */
+export interface LedgerHistoryGap {
+  /**
+   * 묶음의 usage_ledger 행 중 이번 복원으로 들어가지 않고, 그 비용의 원장 행이 이 owner 에 남지도 않는 행 — 다른 계정이 쓰는 ID(id_in_use)·의존성(dependency) 충돌.
+   * "없는 항목만 추가"는 기존 행을 덮어쓰지 않고 건너뛰므로 그대로 빠진다("빈 환경에만 복원"은 충돌이 하나라도 있으면 커밋을 거부한다).
+   * FIX2-CODEX(U1 fixup): 표 미리보기의 usage_ledger "충돌" 수 전체가 아니다 — 같은 ID 원장이 이미 이 owner 에 있는 'different'(내보낸 뒤 정산·취소·
+   * ledger:resolve 로 바뀐 행, 복원 커밋이 전사 예약을 확정한 행 등)와 같은 실행·전사 작업의 원장이 이미 이 owner 에 있는 'unique'(usage_ledger_run_uq·
+   * usage_ledger_transcription_job_uq — 같은 owner FK 라 그 행은 이 owner 의 것)는 그 행이 남아 월 합계(monthlyUsedMicro)에 들어가므로 세지 않는다
+   * (충돌 목록에는 그대로 나온다).
+   */
+  ledgerNotRestored: number;
+  /**
+   * 복원 뒤 이 owner 에 있는 묶음의 AI 실행(generation_runs) 중 비용 원장 행이 하나도 없는 것 — 원장 도입(0008) 전에 만든 실행, 0008 이전 묶음(원장 표 파일 없음 →
+   * 빈 표로 읽음), 실행은 들어갔지만 그 원장만 충돌로 빠진 경우.
+   */
+  runsWithoutLedger: number;
+  /** 같은 기준의 전사 작업(transcription_jobs) */
+  transcriptionsWithoutLedger: number;
+}
+
+async function ledgerHistoryGap(tx: DbOrTx, ownerId: string, bundle: ParsedBundle, report: ApplyReport): Promise<LedgerHistoryGap> {
+  const missing = async (table: 'generation_runs' | 'transcription_jobs', ledgerCol: 'run_id' | 'transcription_job_id', ids: string[]): Promise<number> => {
+    if (ids.length === 0) return 0;
+    const res = await tx.execute(
+      sql`select count(*)::int as n from ${sql.identifier(table)} where ${sql.identifier(table)}."owner_id" = ${ownerId}::uuid and ${idIn(table, ids)}
+        and not exists (select 1 from usage_ledger l where l.${sql.identifier(ledgerCol)} = ${sql.identifier(table)}."id" and l.owner_id = ${ownerId}::uuid)`,
+    );
+    return Number((res as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0);
+  };
+  return {
+    // FIX2-CODEX(U1 fixup): 잘리지 않은 전체 충돌 목록에서, 이 owner 에 그 비용의 원장 행이 남는 이유(different·unique)는 뺀다
+    ledgerNotRestored: report.conflicts.filter((c) => c.table === 'usage_ledger' && c.reason !== 'different' && c.reason !== 'unique').length,
+    runsWithoutLedger: await missing('generation_runs', 'run_id', bundle.tables.generation_runs.map((r) => r.id)),
+    transcriptionsWithoutLedger: await missing('transcription_jobs', 'transcription_job_id', bundle.tables.transcription_jobs.map((j) => j.id)),
+  };
+}
+
+/**
+ * FIX2-CODEX(U1): 복원 뒤 비용 이력이 빠지는 경우의 미리보기 경고(복원은 허용 — 지금 허용되는 복원을 막지 않는다). 빠지는 것이 없으면 경고 없음.
+ * 월 합계(monthlyUsedMicro)는 이 owner 의 원장 행만 더하므로 빠진 행·원장 없는 실행의 비용은 그 달 사용액·예산 판정에 들어가지 않는다.
+ */
+export function ledgerHistoryWarnings(g: LedgerHistoryGap): BundleManifest['warnings'] {
+  const parts: string[] = [];
+  if (g.ledgerNotRestored > 0) {
+    parts.push(`"없는 항목만 추가"로 복원해도 묶음의 비용 원장 ${g.ledgerNotRestored}건은 들어가지 않습니다(충돌·의존성 — 기존 행은 덮어쓰지 않음)`);
+  }
+  const subjects = [
+    g.runsWithoutLedger > 0 ? `AI 실행 ${g.runsWithoutLedger}건` : null,
+    g.transcriptionsWithoutLedger > 0 ? `전사 작업 ${g.transcriptionsWithoutLedger}건` : null,
+  ].filter((s): s is string => s !== null);
+  if (subjects.length > 0) parts.push(`복원 뒤에도 비용 원장이 없는 ${subjects.join('·')}이 남습니다`);
+  if (parts.length === 0) return [];
+  return [
+    {
+      code: 'ledger_history_incomplete',
+      message: `AI 비용 이력이 완전하지 않습니다: ${parts.join('. ')}. 복원은 되지만, 이 계정의 월 비용 이력과 예산 합계가 실제 사용보다 적게 잡힐 수 있습니다.`,
+    },
+  ];
+}
+
 export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBundle, budgetCurrency?: string): Promise<RestorePreview> {
   const target = await ownerScopeCounts(db, ownerId);
   let report: ApplyReport | null = null;
+  let gap: LedgerHistoryGap | null = null;
   try {
     await db.transaction(async (tx) => {
       report = await applyBundle(tx, ownerId, bundle);
+      // FIX2-CODEX(U1): 되돌리기 전, 복원 뒤 상태로 비용 원장 누락을 센다
+      gap = await ledgerHistoryGap(tx, ownerId, bundle, report);
       throw new DryRunRollback();
     });
   } catch (e) {
     if (!(e instanceof DryRunRollback)) throw e;
   }
   const r = report as unknown as ApplyReport;
+  const g = gap as unknown as LedgerHistoryGap;
   const m = bundle.manifest;
   const tables: RestorePreview['tables'] = {};
   for (const [name, meta] of Object.entries(m.tables)) {
@@ -701,7 +768,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     target,
     can_commit_empty_only: target.empty && r.conflicts.length === 0,
     can_commit_add_missing: true,
-    warnings: [...m.warnings, ...ledgerCurrencyWarnings(bundle, budgetCurrency)],
+    warnings: [...m.warnings, ...ledgerCurrencyWarnings(bundle, budgetCurrency), ...ledgerHistoryWarnings(g)],
   };
 }
 

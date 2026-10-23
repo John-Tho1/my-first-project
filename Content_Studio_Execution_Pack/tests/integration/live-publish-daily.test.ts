@@ -528,6 +528,35 @@ describe('최근 24시간 실제 게시 상한(PUBLISH_LIVE_DAILY_MAX)', () => {
     expect(fake.publishes()).toBe(4);
   });
 
+  // FIX2-CODEX(U2 — Codex review-LIVEP2 Q2, 사용자 결정 2026-10-23): D39 의 "같은 작업의 재시도·이어 보내기는 새로 세지 않음"은 최근 24시간 창 안의 중복 제거다 —
+  // 그 작업의 가장 최근 실제 전송 의도가 창 밖이 된 뒤 다시 보내면 새 게시로 다시 센다(DECISIONS D39 명확화·README·.env.example 문구의 근거 — 코드 변경 없음).
+  it('D39 명확화: 같은 작업의 재시도는 창 안에서는 한 번만 세고(위 시험 — 상한이 차도 막지 않음), 그 작업의 마지막 실제 전송 의도가 창 밖이 되면 다시 센다(상한이면 보류)', async () => {
+    const config = cfg('1');
+    const fake = fakeThreads({ failCreateOnce: new Set(['창 지난 재시도 A 글.']) });
+    const reg = registryWith(fake.fetch, config);
+    frozen = clockNow().getTime();
+    const a = await planApproved(['창 지난 재시도 A 글.']);
+    await execute(a.planId);
+    expect((await tick(reg, config, { planId: a.planId })).results).toEqual({ RETRY_WAIT: 1 }); // 컨테이너 생성 5xx — 부작용 없는 일시 실패, 실제 전송 의도 1
+    const aJob = await jobOf(a.items[0]!.id);
+    const [i1] = await intentsOf(aJob.id);
+    expect(i1!.sanitizedDetails).toMatchObject({ mode: 'LIVE', live_approval_ref: 'D39-it' });
+    const tA = i1!.createdAt.getTime();
+    // 창 안(그 의도 + 24h 직전): A 는 이미 센 작업 — 재시도는 새로 세지 않는다
+    expect(await livePublishDailyUsage(db, owner, aJob.id, new Date(tA + DAY - 1))).toMatchObject({ used: 0, thisJobCounted: true });
+    // 정확히 + 24h: 창(created_at > now − 24h) 밖 — A 를 다시 보내면 새 게시로 센다
+    expect(await livePublishDailyUsage(db, owner, aJob.id, new Date(tA + DAY))).toMatchObject({ used: 0, thisJobCounted: false });
+    // 창이 지난 뒤 다른 작업 B 가 상한(1)을 쓰면 A 의 재시도는 보류(창 안이었다면 상한이 차도 보냈다)
+    frozen = tA + DAY + MIN;
+    const b = await planApproved(['창 지난 재시도 B 글.']);
+    await execute(b.planId);
+    expect((await tick(reg, config, { planId: b.planId })).results).toEqual({ CONFIRMED: 1 });
+    expect((await tick(reg, config, { planId: a.planId })).results).toEqual({ BLOCKED: 1 });
+    expect(await lastBlocked(aJob.id)).toMatchObject({ reason: 'live_publish_daily_limit', used: 1, limit: 1 });
+    expect(await intentsOf(aJob.id)).toHaveLength(1); // 새 전송 의도 없음
+    expect(fake.publishes()).toBe(1);
+  });
+
   it('PUBLISH_LIVE_DAILY_MAX 없음 = 일일 상한 없음(이전 동작): 24시간 안에 4건 모두 게시', async () => {
     const config = cfg('');
     expect(config.PUBLISH_LIVE_DAILY_MAX).toBeUndefined();

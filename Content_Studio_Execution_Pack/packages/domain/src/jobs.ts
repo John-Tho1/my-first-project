@@ -230,6 +230,12 @@ export const RESTORED_RETRY_RECOVERY_MOCK = '실제 채널로 보낸 것은 없�
 export const RESTORED_JOB_RETRY_MOCK_MESSAGE = `MOCK — 복원한 모의 작업은 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`;
 /** FIX5-FULLREV(T2 후속): 복원 때 진행 중이던 모의 항목(결과 불명 아님) 재시도 거절 문구 */
 export const RESTORED_ITEM_RETRY_MOCK_MESSAGE = `MOCK — 복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`;
+/**
+ * FIX2-CODEX(U4 — FIX5 후속 검토, 사용자 결정 2026-10-23): 복원 때 결과 불명(UNKNOWN)이던 **모의** 항목의 재시도 거절(@cs/db retryItem — outcome_unknown + restored: true +
+ * mock: true, 코드는 그대로). 모의 항목은 실제 채널로 보낸 적이 없으므로 "원격에서 결과를 확인하세요"를 말하지 않는다(위 *_MOCK_MESSAGE 와 같은 규칙). 실제 계정·계정
+ * kind 를 모름(계정 없음)은 지금 문구('복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.') 그대로.
+ */
+export const RESTORED_UNKNOWN_RETRY_MOCK_MESSAGE = `MOCK — 복원 전 모의 전송 결과를 알 수 없어 다시 보내지 않습니다(자동 재전송 안 함). ${RESTORED_RETRY_RECOVERY_MOCK}`;
 
 /** 오래 지난 예약 확인이 가리키는 대상 — 지금의 활성 승인·내용 hash·예약 시각(ISO). */
 export interface StaleScheduleConfirmTarget {

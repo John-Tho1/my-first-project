@@ -1417,11 +1417,147 @@ describe('FIX5-LIVEL1H2 — 5차 검토 #4·#5·Q1: --by·--reason 을 받은 �
       expect(lines, label).toContain(`reason: "${VISIBLE}${escOf(cp)}${VISIBLE}"`); // 공백·한글·이모지는 그대로
       expect(r.out.includes(ch), `${label} 가 글자 그대로 출력됨`).toBe(false);
     }
-    // 한글 채움 문자만으로 된 by: JS trim() 이 지우지 않아 검사는 통과하지만, 표시는 공백처럼 보이지 않고 \u3164 로
+    // FIX2-CODEX(U3, 사용자 결정 2026-10-23 — 이전: 한글 채움 문자만인 by 는 JS trim() 이 지우지 않아 받고 \u3164 로 표시): 채움 문자만인 by 는 이제
+    // 거부(text_blank — stdout 없음). 보이는 글자와 섞인 채움 문자는 지금처럼 받고, 표시는 공백처럼 보이지 않고 \u3164 로
     const filler = await cli(argvOf({ ...fillFor(ledgerId, owner), by: '\u3164\u3164' }));
-    expect(filler.code, filler.err).toBe(0);
-    expect(filler.out.split('\n')).toContain('resolved_by: "\\u3164\\u3164"');
-    expect(await ownerLedger(owner)).toEqual(before); // 미리보기만 — 아무것도 바뀌지 않음
+    expect(filler.code).toBe(1);
+    expect(filler.err).toContain('거부(text_blank)');
+    expect(filler.out).toBe('');
+    const mixedFiller = await cli(argvOf({ ...fillFor(ledgerId, owner), by: '\u3164\u3164op' }));
+    expect(mixedFiller.code, mixedFiller.err).toBe(0);
+    expect(mixedFiller.out.split('\n')).toContain('resolved_by: "\\u3164\\u3164op"');
+    expect(await ownerLedger(owner)).toEqual(before); // 미리보기·거부만 — 아무것도 바뀌지 않음
+  });
+});
+
+describe('FIX2-CODEX(U3 — Codex review-FIX6-D39 Q4): 공백·기본 무시 문자만으로 된 --by·--reason 거부(text_blank) — CLI 만, 복원 검사는 그대로', () => {
+  /**
+   * 구현의 정규식을 베끼지 않은 **명시 목록**(코드 포인트는 \u 이스케이프로만): 한글 채움 U+3164·U+115F·U+1160·U+FFA0, 폭 없는 공백·비결합자·결합자 U+200B·U+200C·U+200D,
+   * 단어 잇기 U+2060, 결합 자소 결합자 U+034F, 변이 선택자 U+FE0F·U+E0100, 몽골 모음 구분자 U+180E, SHY U+00AD, 태그 U+E0041, 그리고 JS trim() 은 남기지만
+   * 유니코드 공백인 NEL U+0085 — 그리고 이것들과 공백(스페이스·탭·줄바꿈·전각 공백·NBSP·BOM)을 섞은 값.
+   */
+  const BLANK: Array<[string, string]> = [
+    ['U+3164 한글 채움', '\u3164'],
+    ['U+3164 두 개', '\u3164\u3164'],
+    ['U+115F 한글 초성 채움', '\u115F'],
+    ['U+1160 한글 중성 채움', '\u1160'],
+    ['U+FFA0 반각 한글 채움', '\uFFA0'],
+    ['U+200B 폭 없는 공백', '\u200B'],
+    ['U+200B·U+200C·U+200D', '\u200B\u200C\u200D'],
+    ['U+2060 단어 잇기', '\u2060'],
+    ['U+034F 결합 자소 결합자', '\u034F'],
+    ['U+FE0F 변이 선택자', '\uFE0F'],
+    ['U+E0100 변이 선택자(BMP 밖)', '\u{E0100}'],
+    ['U+180E 몽골 모음 구분자', '\u180E'],
+    ['U+00AD SHY', '\u00AD'],
+    ['U+E0041 태그', '\u{E0041}'],
+    ['U+0085 NEL(JS trim() 이 남김)', '\u0085'],
+    ['스페이스 + U+3164 + 스페이스', ' \u3164 '],
+    ['탭 + U+200B + 줄바꿈', '\t\u200B\n'],
+    ['전각 공백 + U+3164 + NBSP', '\u3000\u3164\u00A0'],
+    ['BOM + U+200B(BOM 은 trim() 이 지우고 U+200B 가 남음)', '\uFEFF\u200B'],
+    ['NEL + U+3164', '\u0085\u3164'],
+  ];
+
+  it('사용법이 보이는 글자로 적으라고 알린다(공백·보이지 않는 문자만인 값은 받지 않음) — 명령 줄은 그대로 2개', () => {
+    expect(LEDGER_RESOLVE_USAGE).toContain('(--by·--reason 은 보이는 글자로 적는다 — 공백·보이지 않는 문자(한글 채움 문자 등)만으로 된 값은 받지 않는다)');
+    expect(LEDGER_RESOLVE_USAGE.split('\n').filter((l) => l.includes('ledger:resolve'))).toHaveLength(2);
+  });
+
+  it('공백·기본 무시 문자만인 --by·--reason → 거부(text_blank), 미리보기·--confirm·정정(--correct --overwrite-valid) 모두 exit 1·stdout 없음·행 그대로·감사 없음', async () => {
+    const { owner, ledgerId } = await unstorableRun(db, 'fix2-codex-u3-blank@example.local');
+    const corrId = await addUnstorable(db, owner);
+    await handResolve(corrId); // 이미 복원 검사를 통과하는 해결 행(정정 — --correct --overwrite-valid)
+    const before = await ownerLedger(owner);
+    const audits0 = await resolveAudits();
+    for (const [label, v] of BLANK) {
+      for (const field of ['by', 'reason'] as const) {
+        for (const [target, flags] of [
+          [ledgerId, []],
+          [ledgerId, ['--expect', DUMMY_FP, '--confirm']],
+          [corrId, ['--correct', '--overwrite-valid']],
+          [corrId, ['--correct', '--overwrite-valid', '--expect', DUMMY_FP, '--confirm']],
+        ] as Array<[string, string[]]>) {
+          const r = await cli(argvOf({ ...fillFor(target, owner), [field]: v }, ...flags));
+          const at = `${label} ${field} ${flags.join(' ')}`;
+          expect(r.code, at).toBe(1);
+          expect(r.err, at).toContain('거부(text_blank)');
+          expect(r.err, at).toContain('아무것도 바꾸지 않았습니다');
+          expect(r.out, at).toBe('');
+        }
+      }
+    }
+    expect(await ownerLedger(owner)).toEqual(before);
+    expect(await resolveAudits()).toBe(audits0);
+    expect(await hasUnresolvedLiveUsage(db, owner)).toBe(true);
+  });
+
+  it('경계·순서: JS trim() 으로 빈 값은 지금처럼 resolution:resolved_by·reason, NUL·서로게이트(text_encoding)·셸 문자(text_shell_unsafe)·--actual 형식이 먼저, 보이는 글자와 섞이면 받는다', async () => {
+    const { owner, ledgerId } = await unstorableRun(db, 'fix2-codex-u3-order@example.local');
+    const before = await ownerLedger(owner);
+    const good = fillFor(ledgerId, owner);
+    for (const [over, code] of [
+      [{ by: '' }, 'resolution:resolved_by'],
+      [{ by: '\uFEFF\u3000 \t' }, 'resolution:resolved_by'],
+      [{ reason: '\u2028\u00A0' }, 'resolution:reason'],
+      [{ by: '\u3164', reason: 'x\uD800y' }, 'text_encoding'],
+      [{ by: 'a\u0000b', reason: '\u200B' }, 'text_encoding'],
+      [{ by: '\u3164', reason: '실제 청구 9.95% 할인' }, 'text_shell_unsafe'],
+      [{ by: '/\u3164' }, 'text_shell_unsafe'],
+      [{ by: '\u3164', actual: '9.95' }, 'actual_format'],
+      [{ by: 'op', reason: '\u3164' }, 'text_blank'],
+    ] as Array<[Partial<Fill>, string]>) {
+      const r = await cli(argvOf({ ...good, ...over }));
+      expect([r.code, r.err.includes(`거부(${code})`), r.out], JSON.stringify(over)).toEqual([1, true, '']);
+    }
+    expect(await ownerLedger(owner)).toEqual(before);
+    // 섞인 값: 보이는 글자가 하나라도 있으면 지금처럼 받는다(표시는 이스케이프, 지문 공식 그대로) → 적용 1행, 저장은 받은 그대로
+    const mixed: Fill = { ...good, by: '\u3164op\u200B', reason: `\u200B${REASON}\u3164` };
+    const fp0 = await expectedFp(mixed, 'resolve'); // 적용 전 행으로(지문 공식 그대로)
+    const r = await apply(argvOf(mixed));
+    expect(r.preview.code, r.preview.err).toBe(0);
+    expect(r.preview.out.split('\n')).toContain('resolved_by: "\\u3164op\\u200b"');
+    expect(r.preview.out.split('\n')).toContain(`reason: "\\u200b${JSON.stringify(REASON).slice(1, -1)}\\u3164"`);
+    expect(r.fp).toBe(fp0);
+    expect(r.code, r.err).toBe(0);
+    expect(r.out.split('\n')).toContain('updated 1');
+    const res = ((await rowOf(db, ledgerId)).pricingSnapshot as Snap).resolution;
+    expect([res.resolved_by, res.reason]).toEqual([mixed.by, mixed.reason]);
+  });
+
+  it('복원 검사(묶음 검증기)는 그대로: 이미 저장된 채움 문자만인 resolved_by·reason 행은 bundle:check·복원 미리보기를 통과하고 --list 도 "복원 검사 통과" — 그 행의 정정도 보이는 글자만 받는다', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'cs-fix2-codex-u3-'));
+    try {
+      const { owner, ledgerId } = await unstorableRun(db, 'fix2-codex-u3-stored@example.local');
+      await handResolve(ledgerId);
+      const snap = (await rowOf(db, ledgerId)).pricingSnapshot as Snap;
+      // 이 변경 전(또는 손 작업)에 저장된 모양: resolved_by·reason 이 기본 무시 문자만
+      await setSnap(db, ledgerId, { ...snap, resolution: { ...snap.resolution, resolved_by: '\u3164\u3164', reason: '\u200B\u2060' } });
+      const zip = await exportZip(db, owner, tmp, 'u3');
+      expect(await checkBundleZip(zip)).toMatchObject({ ok: true, unresolved_live_usage: 0 });
+      const h2 = await createTestDb();
+      try {
+        const target = (await ensureOwner(h2.db, 'restore-fix2-codex-u3@example.local')).id;
+        const pv = await createRestorePreview(h2.db, target, zip, { restoresDir: path.join(tmp, 'restores'), source: 'upload' });
+        expect(pv.preview.tables.usage_ledger).toMatchObject({ in_bundle: 1, new: 1, existing_different: 0 });
+      } finally {
+        await h2.close();
+      }
+      const lst = await cli(['--list', '--owner', owner]);
+      expect(lst.code, lst.err).toBe(0);
+      expect(lst.out).toContain('해결 기록 있음(복원 검사 통과)');
+      expect(lst.out).toContain('정정만(--correct --overwrite-valid — 이미 복원 검사 통과)');
+      // 그 행을 정정할 때: 채움 문자만은 거부, 보이는 글자는 받는다(정정 미리보기 — 아무것도 바뀌지 않음)
+      const before = await ownerLedger(owner);
+      const blank = await cli(argvOf({ ...fillFor(ledgerId, owner), by: '\u3164\u3164' }, '--correct', '--overwrite-valid'));
+      expect([blank.code, blank.err.includes('거부(text_blank)'), blank.out]).toEqual([1, true, '']);
+      const ok = await cli(argvOf(fillFor(ledgerId, owner), '--correct', '--overwrite-valid'));
+      expect(ok.code, ok.err).toBe(0);
+      expect(ok.out).toContain('지금 행의 복원 검사: 통과');
+      expect(await ownerLedger(owner)).toEqual(before);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1655,7 +1791,7 @@ describe('FIX4-LIVEL1H2 — 인계 문서의 명령 그대로·실제 스크립�
       expect(doc).not.toMatch(/MSYS_NO_PATHCONV=1\s+(corepack\s+)?pnpm/);
       expect(doc.split('\n').filter((l) => l.includes('MSYS_NO_PATHCONV')).every((l) => l.includes('붙이지 않는다') || l.includes('없앴다'))).toBe(true);
       // FIX6(6차 검토 #1·#5): 4단계 표 — --by·--reason 의 쓰지 못하는 문자(표 칸 안의 | 는 \| 로)
-      expectAll(step('   | `--by` |'), '4단계 --by', ['`"`', '`%`', '`\\`', '`&`·`\\|`·`<`·`>`·`^`', '`/` 로 시작할 수 없다', '`text_shell_unsafe`']);
+      expectAll(step('   | `--by` |'), '4단계 --by', ['`"`', '`%`', '`\\`', '`&`·`\\|`·`<`·`>`·`^`', '`/` 로 시작할 수 없다', '`text_shell_unsafe`', '`text_blank`']);
       expectAll(step('   | `--reason` |'), '4단계 --reason', ['`&`·`\\|`·`<`·`>`·`^`', '`/` 로 시작하는 값']);
       const s2 = step('2. **확인');
       expectAll(s2, '2단계', ['원장 행·감사 기록은 바꾸지 않는다', 'migration', '범위 밖:', '거부(owner_not_exported)', 'AUTH_ALLOWED_IDENTITY=<그 owner 의 로그인 identity>', 'DB 폴더가 없습니다(DATABASE_URL 확인) — 아무것도 만들지 않았습니다.', '정정만(--correct --overwrite-valid — 이미 복원 검사 통과)']);
@@ -1690,7 +1826,7 @@ describe('FIX4-LIVEL1H2 — 인계 문서의 명령 그대로·실제 스크립�
       expectAll(step('   - **② 적용'), '6-②', ['` --expect <확인 지문> --confirm`', '`거부(expect_mismatch)`', '트랜잭션을 열기 전에', '`updated 1` 뒤에 exit 1', '`거부(needs_correct)`', '모두 되돌린다', '`settled_amount_before`·`resolved_at_before`']);
       expect(step('   - **② 적용')).not.toContain('미리보기 때와 같은지'); // FIX4 의 사실과 다르던 문구(같은 실행 안에서만 비교)
       expectAll(step('   - **이미 `resolution`'), '6-정정', ['`거부(already_valid)`', '`--correct --overwrite-valid`', '`거부(overwrite_not_needed)`', '이전 `resolved_by`·`reason` 은 1단계 백업 묶음에만 남고']);
-      expectAll(step('   - 입력 거부 코드'), '6-코드', ['`text_shell_unsafe`', '`"`·`%`·`\\`·`&`·`|`·`<`·`>`·`^` 또는 `/` 로 시작', '`already_valid`', '`overwrite_not_needed`', '`owner_not_exported`', '`expect_mismatch`']);
+      expectAll(step('   - 입력 거부 코드'), '6-코드', ['`text_shell_unsafe`', '`"`·`%`·`\\`·`&`·`|`·`<`·`>`·`^` 또는 `/` 로 시작', '`already_valid`', '`overwrite_not_needed`', '`owner_not_exported`', '`expect_mismatch`', '`text_blank`']);
       expectAll(step('   ④ '), '7-④', ['성공은 exit 0', '`"ok":true`']);
       const tpl = docCommand();
       const { owner, ledgerId } = await unstorableRun(db, 'fix4-lr-doc@example.local');

@@ -7,6 +7,8 @@
  *  - T4: 재시도·재확인·사용자 확인·모의 시나리오 HTML 폼이 plan_id 없이 오면 /distribute 대신 항목의 계획 화면(취소 경로와 같은 lib itemFormBack — owner 확인 뒤에만
  *    owner 범위 조회 planIdOfItem). 성공·오류 리다이렉트 모두. 조회 실패(예외·없음)면 /distribute, plan_id 가 있으면 그 값(조회 없음), CSRF·로그인 실패는 조회 없이
  *    그대로, 404 는 /distribute?missing=1.
+ *  - FIX2-CODEX(U4, 같은 사용자 결정): 복원 때 결과 불명(UNKNOWN)이던 항목의 재시도 거절(outcome_unknown + restored: true)도 모의 계정은 모의 문구 + mock: true
+ *    (원격 확인을 시키지 않음), 실제 계정은 지금 문구 그대로. 폼 경로는 코드 그대로 error=outcome_unknown(채널·원격을 말하지 않는 일반 문구 — 모의 변형 없음).
  * 취소 경로(FIX4 S4)도 같은 lib 로 옮겼으므로 같은 시험을 함께 돌린다. 조회 실패는 @cs/db 의 planIdOfItem 만 감싸서 흉내 낸다(나머지는 실제 모듈 — 기본은 실제 조회). 모의 어댑터만 — **네트워크 호출 0**(fetch 0 확인).
  */
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -403,5 +405,94 @@ describe('FIX5-FULLREV(T4): plan_id 없는 항목 폼 → 항목의 계획 화�
     const after = await jobsOf(x.itemId);
     expect(after).toHaveLength(1);
     expect(after[0]).toMatchObject({ id: before!.id, state: 'QUEUED' });
+  });
+});
+
+describe('FIX2-CODEX(U4 — FIX5 후속 검토, 사용자 결정 2026-10-23): 복원 때 결과 불명(UNKNOWN)이던 항목의 재시도 거절 — 모의 계정은 모의 문구 + mock, 실제 계정은 그대로(코드 outcome_unknown 그대로), 아무것도 바꾸지 않음', () => {
+  const LIVE_UNKNOWN_MSG = '복원 전 전송 결과를 알 수 없어 다시 보내지 않습니다. 원격에서 결과를 확인하세요.';
+  const UNKNOWN_MOCK_MSG = `MOCK — 복원 전 모의 전송 결과를 알 수 없어 다시 보내지 않습니다(자동 재전송 안 함). ${MOCK_TAIL}`;
+  /** 폼 경로(코드 outcome_unknown)의 화면 문구 — 채널·원격을 말하지 않는 일반 문구라 모의·실제 모두에 맞다(모의 변형을 만들지 않음) */
+  const FORM_UNKNOWN = '마지막 전송 결과를 알 수 없어 다시 보내지 않았습니다. 재확인을 먼저 하세요.';
+
+  /**
+   * 모의 결과 불명(보내지 않음) → RECONCILING 뒤, 복원 묶음에서 결과 불명으로 들어온 모양(항목 UNKNOWN + 복원 표시 · 작업 UNKNOWN + 복원 표시, lease 없음)으로 둔다.
+   * live=true 면 이 시험만의 계정 행(기본 모의 계정과 같은 값)으로 만든 뒤 그 행을 실제 Threads 계정(시험 행 — 연결 정보 없음)으로 바꾼다(T2 의 blockedOnLiveAccount 와 같은 방식).
+   */
+  async function restoredUnknown(body: string, live: boolean) {
+    let accountId: string | undefined;
+    if (live) {
+      const [base] = await db.select().from(schema.channelAccounts).where(eq(schema.channelAccounts.id, seedThreads));
+      const [acc] = await db
+        .insert(schema.channelAccounts)
+        .values({
+          ownerId: owner,
+          platform: 'threads',
+          kind: 'mock',
+          externalAccountId: `mock:fix2-codex-${randomUUID()}`,
+          displayName: 'FIX2-CODEX 시험 계정',
+          state: base!.state,
+          capabilitySnapshot: base!.capabilitySnapshot,
+          credentialState: 'none',
+        })
+        .returning();
+      accountId = acc!.id;
+    }
+    const x = await planned(body, { scenario: 'ambiguous_not_sent', accountId });
+    await tickPlan(x.planId);
+    const [job] = await jobsOf(x.itemId);
+    expect(job!.state).toBe('RECONCILING');
+    if (accountId) {
+      await db
+        .update(schema.channelAccounts)
+        .set({ kind: 'live', externalAccountId: `fix2-codex-live-${randomUUID()}`, state: 'connected', credentialState: 'linked' })
+        .where(eq(schema.channelAccounts.id, accountId));
+    }
+    await db.update(schema.jobs).set({ state: 'UNKNOWN', restoredNeedsReview: true, leaseOwner: null, leaseUntil: null }).where(eq(schema.jobs.id, job!.id));
+    await db.update(schema.distributionItems).set({ status: 'UNKNOWN', restoredNeedsReview: true }).where(eq(schema.distributionItems.id, x.itemId));
+    return { ...x, jobId: job!.id, intents: (await intentsOf(job!.id)).length };
+  }
+  async function expectUntouched(x: { itemId: string; jobId: string; intents: number }) {
+    const js = await jobsOf(x.itemId);
+    expect(js.map((j) => [j.id, j.state, j.restoredNeedsReview])).toEqual([[x.jobId, 'UNKNOWN', true]]);
+    expect(await intentsOf(x.jobId)).toHaveLength(x.intents);
+    expect(await itemOf(x.itemId)).toMatchObject({ status: 'UNKNOWN', restoredNeedsReview: true });
+  }
+
+  it('모의 계정: JSON 409 outcome_unknown + restored + mock(정확한 모의 문구 — 원격·채널 확인을 시키지 않음) · 폼(plan_id 있음·없음) → error=outcome_unknown(일반 문구 그대로)', async () => {
+    const x = await restoredUnknown('복원 때 결과 불명이던 모의 항목 글.', false);
+    const res = await retryPOST(post(`/api/distribution-items/${x.itemId}/retry`), ctx(x.itemId));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { message: string };
+    expect(body).toEqual({ status: 'UNKNOWN', restored: true, mock: true, error: 'outcome_unknown', message: UNKNOWN_MOCK_MSG });
+    for (const w of [...LIVE_ONLY_WORDS, '원격에서', '결과를 확인하세요']) expect(body.message, w).not.toContain(w);
+    expect(body.message.startsWith('MOCK — ')).toBe(true);
+    expect(location(await form('retry', x.itemId, { plan_id: x.planId }))).toBe(`/distribute/${x.planId}?error=outcome_unknown`);
+    expect(location(await form('retry', x.itemId))).toBe(`/distribute/${x.planId}?error=outcome_unknown`);
+    expect(DISTRIBUTE_ERROR_TEXT.outcome_unknown).toBe(FORM_UNKNOWN);
+    for (const w of ['채널', 'Threads', '원격', '새 배포 계획', 'MOCK']) expect(DISTRIBUTE_ERROR_TEXT.outcome_unknown, w).not.toContain(w);
+    await expectUntouched(x);
+    expect((await tickPlan(x.planId)).leased).toBe(0);
+    await expectUntouched(x);
+  });
+
+  it('실제 계정: JSON 409 outcome_unknown + restored(지금 문구 그대로, mock 없음) · 폼 → error=outcome_unknown — 외부 호출 0', async () => {
+    const x = await restoredUnknown('복원 때 결과 불명이던 실제 계정 항목 글.', true);
+    const res = await retryPOST(post(`/api/distribution-items/${x.itemId}/retry`), ctx(x.itemId));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ status: 'UNKNOWN', restored: true, error: 'outcome_unknown', message: LIVE_UNKNOWN_MSG });
+    expect(location(await form('retry', x.itemId, { plan_id: x.planId }))).toBe(`/distribute/${x.planId}?error=outcome_unknown`);
+    expect(location(await form('retry', x.itemId))).toBe(`/distribute/${x.planId}?error=outcome_unknown`);
+    await expectUntouched(x);
+    expect(fetchCalls).toBe(0);
+  });
+
+  it('그대로: 같은 모의 항목이라도 복원 때 결과 불명이 아닌(보류) 항목은 T2 후속의 not_retryable 모의 문구, 작업에만 복원 표시면 작업 문구', async () => {
+    const x = await restoredUnknown('복원 표시가 붙은 모의 항목 — 상태만 BLOCKED 로.', false);
+    await db.update(schema.distributionItems).set({ status: 'BLOCKED' }).where(eq(schema.distributionItems.id, x.itemId));
+    const item = await retryPOST(post(`/api/distribution-items/${x.itemId}/retry`), ctx(x.itemId));
+    expect(await item.json()).toEqual({ status: 'BLOCKED', restored: true, mock: true, error: 'not_retryable', message: ITEM_MOCK_MSG });
+    await db.update(schema.distributionItems).set({ status: 'UNKNOWN', restoredNeedsReview: false }).where(eq(schema.distributionItems.id, x.itemId));
+    const job = await retryPOST(post(`/api/distribution-items/${x.itemId}/retry`), ctx(x.itemId));
+    expect(await job.json()).toEqual({ status: 'UNKNOWN', restored: true, mock: true, error: 'not_retryable', message: JOB_MOCK_MSG });
   });
 });

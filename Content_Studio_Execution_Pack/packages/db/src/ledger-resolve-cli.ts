@@ -24,6 +24,8 @@
  *   감사 기록·--list 에는 나오지 않는다(정정 전 by·reason 은 어디에도 나오지 않는다). 보고값(--list 제외)·다른 스냅숏 값·DB 오류 메시지 본문은 쓰지 않는다
  *   (오류는 secrets-cli 와 같은 describeErrorSafely). --by·--reason 의 `"`·`%`·`\`·`&`·`|`·`<`·`>`·`^` 와 `/` 로 시작하는 값은 받지 않는다(`text_shell_unsafe` —
  *   어느 셸에서나 같은 글이 되게 하는 일관성 규칙. 프로그램이 시작하기 전에 셸이 없앤 문자는 이 거부가 볼 수 없어 표시 줄에서만 보인다 — FIX6 #1·#5).
+ *   FIX2-CODEX(U3, Codex review-FIX6-D39 Q4): 공백과 기본 무시 문자(한글 채움 U+3164·폭 없는 공백 U+200B 등)만으로 된 --by·--reason 도 받지 않는다(`text_blank` —
+ *   이 명령만의 규칙, 복원 검사는 그대로. JS trim() 으로 이미 빈 값은 지금처럼 `resolution:resolved_by`·`resolution:reason`).
  * - 종료 코드: 0 성공(미리보기·적용·목록) · 1 거부(DB 폴더 없음·범위 밖 owner·대상 없음·형식·검사·모양·지문·경쟁)·DB 잠금(dev 서버가 열고 있음)·예상하지 못한 오류·
  *   DB 닫기 실패 · 2 사용법(DB 를 열지 않음).
  */
@@ -71,6 +73,7 @@ export const LEDGER_RESOLVE_USAGE = [
   '  (기본은 미리보기 — 원장 행·감사 기록은 바꾸지 않는다. 적용은 같은 명령 끝에 미리보기 마지막 줄의 --expect <확인 지문> --confirm.',
   '   이미 resolution 이 있는 행의 정정은 --correct, 그 행이 이미 복원 검사를 통과할 때만 --correct --overwrite-valid)',
   '  (--by·--reason 은 셸을 두 번 지난다 — " % \\ & | < > ^ 와 줄바꿈을 쓰지 않고 / 로 시작하지 않으며, 미리보기의 resolved_by:·reason: 줄이 뜻한 글과 같은지 본다)',
+  '  (--by·--reason 은 보이는 글자로 적는다 — 공백·보이지 않는 문자(한글 채움 문자 등)만으로 된 값은 받지 않는다)',
 ].join('\n');
 
 const REQUIRED_VALUE_FLAGS = ['owner', 'ledger', 'source', 'actual', 'settled', 'by', 'reason'] as const;

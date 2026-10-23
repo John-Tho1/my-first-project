@@ -324,3 +324,18 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - 반쯤 끝난 행의 버리는 값 표시·감사(FIX6-D39 Q1).
 - Codex 독립 실행 범위(원문 그대로): 메모리 내 단언 67(함수 58 + ZIP 9)·TS 149 문법 변환·셸 9 `bash -n`.
 - Codex 미실행: 설치·lint·typecheck·build·Vitest 전체·통합·drill·mutation·실제 인증서·production 빌드·PostgreSQL 동시성·실제 DB·브라우저·Windows/Git Bash·외부 호출. 구현자 PASS 수치는 Codex 가 독립 실행 결과로 인용하지 않았다.
+
+## 2026-10-23 밤 — FIX5-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 4 남은 것 중 T1·T2·T4 를 고치고 T3 는 그대로 둔다. T2 = Codex 14건 남은 지적 2번.
+- **FIX5-FULLREV 39aa665**:
+  - 일반 실제 결과 불명 머리줄을 줄이고 조건부 줄은 카드당 1회로 했다.
+  - 복원 재시도 거부 문구에 조건을 붙였고 모의 계정은 모의 문구다(**Codex 지적 2 해결**).
+  - 항목 폼 다섯 경로가 plan_id 없이 오면 항목의 계획 화면으로 간다.
+  - 반박 검토 확정 1(P2)을 보완했고, 보완 재검토는 확정 0 이다. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 5".
+- 마지막 검사(39aa665 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2034 · integration 61 files / 1101**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- Codex 대기열·ChatGPT 프롬프트에 15번 `39aa665 FIX5-FULLREV` 를 추가했다.
+- Codex 14건 제안 7건 처리(사용자 "다 권고 사항으로", Claude 권고): 원장 누락 경고·D39 문구·기본 무시 문자만인 by/reason 거부는 FIX2-CODEX 로 한다. 미래 의도 진단·만료 경고 계정 이름·유효/전체 시도 표시·반쯤 끝난 행 값 감사는 보류한다(효과가 작거나 지금 쓰일 일 없음). FIX2-CODEX 에는 복원 결과 불명 재시도 거부의 모의 문구도 함께 넣는다.
+- not_run: Codex(FIX5), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, 실제 Threads·Claude.

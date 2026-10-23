@@ -161,3 +161,26 @@
   2. retryItem 의 복원 작업 거부 JSON 문구 2곳에 조건 없는 "새 배포 계획을 만드세요"가 남아 있다(HTML 은 일반 문구).
   3. 계획 머리의 MOCK·실제 표시(hasLive·hasMock)는 계정 종류 기준이다(계정 없는 항목은 DB 가 막아 닿지 않음).
   4. retry·reconcile·user-confirm·mock-scenario 폼도 plan_id 가 없으면 /distribute 로 돌아간다.
+
+# FIX round 5 (FIX5-FULLREV — FIX round 4 "남은 것" 1~4 사용자 결정)
+- BASE_SHA: b9bac60 (Codex 14건 결과 docs, 그 앞 코드 fc74b3a) · **HEAD_SHA: 39aa665** (`39aa665d5f8e708a20fb926801e8e789f1bb8a25`)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): T1·T2·T4 는 고치고 T3 는 그대로 둔다. T2 는 Codex 14건 결과의 현재 남은 지적 2번(`jobs.ts:1853,1862`)과 같다.
+- 진행: 구현 에이전트 1명이 구현했다. 반박 검토 2관점(경로 / 문구, Claude — Codex 아님)에서 확정 1(P2)이 나왔다. 복원 mock 항목의 재시도 거부가 "채널에서 직접 확인·두 번 올라갈 수 있음"이라고 했던 것이다. 이를 보완했고, 보완을 짧게 다시 검토한 결과 지적 1·확정 0 이었다(기존 결과 불명 문구, 다음 묶음으로 넘김).
+- 처리:
+  - **T1** 일반 실제 결과 불명 카드에서 작업이 있으면 머리줄은 `LIVE_UNKNOWN_HEADLINE`(다시 게시하지 않음·Threads 직접 확인)이고, 조건부 복구 줄은 일반 안내에 한 번 둔다. 작업이 없는 카드(복원 묶음에 작업 행이 없음)는 안내가 없으므로 머리줄에 전체 안내를 둔다. 어느 쪽이든 카드당 1회다.
+  - **T2** retryItem 의 복원 작업·복원 항목 거부 문구를 `RESTORED_JOB_RETRY_MESSAGE`·`RESTORED_ITEM_RETRY_MESSAGE`(@cs/domain)로 바꿨다. 꼬리 `RESTORED_RETRY_RECOVERY` 는 직접 확인해 게시물이 없을 때만 새 계획이다.
+    - 모의 계정은 같은 트랜잭션에서 계정 종류를 읽어(복원 이력이 있을 때만) 모의 문구 `RESTORED_*_RETRY_MOCK_MESSAGE` 와 `mock: true` 를 쓴다.
+    - JSON 코드 `not_retryable`·`restored: true` 는 그대로다. HTML 은 `error=not_retryable_restored`(모의는 `_mock`)다.
+  - **T3** 변경이 없다.
+  - **T4** distribution-items 의 cancel·retry·reconcile·user-confirm·mock-scenario 다섯 폼 경로가 공용 `itemFormBack(html)` 을 쓴다. plan_id 가 있으면 조회 없이 그대로, 없으면 소유자 확인 뒤 `planIdOfItem` 이고, 조회 실패·결과 없음·UUID 아님은 /distribute 다. 성공 이동과 실패 이동 모두다. CSRF → `/distribute?error=csrf`, 로그인 없음 → /login, 404 → `?missing=1` 은 그대로다.
+- 바뀐 기존 단언: `distribution.test.ts` 일반 실제 결과 불명 머리줄의 정확 문구 1곳을 T1 결정에 따라 새 정확 문구로 바꿨다. 그 밖의 제거는 0 이다.
+- 변이 확인: 구현 15(14 + 소스 고정 1)와 보완 10 이 모두 잡혔고, 복원 뒤 cmp 일치했다.
+- 명령(클라우드 Node 22.22.2, 오케스트레이터 순차 실행, 39aa665 와 같은 코드):
+  - install --frozen-lockfile(lockfile 불변 `8db0ef8abda74fda`) · lint · typecheck · build PASS
+  - **unit 83 files / 2034 · integration 61 files / 1101**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271
+  - 변경 파일 보이지 않는 문자 0 · `./data` 변화 없음
+- 남은 것(손대지 않음):
+  1. 복원된 결과 불명 항목의 재시도 거부(`outcome_unknown`)가 모의 계정에도 "원격에서 결과를 확인하세요"다(FIX2-CODEX 로 넘김).
+  2. 계획 화면이 복원 항목에도 재시도 버튼을 보인다(서버는 거부함).
+  3. approvals revoke·distribution-plans·worker tick 의 plan_id 없는 폼은 /distribute 그대로다.

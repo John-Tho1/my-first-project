@@ -534,6 +534,20 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
 
 // ---- 조회 ----
 
+/**
+ * FIX4-FULLREV(S4): 항목이 속한 계획 ID(owner 범위 — 다른 owner·없는 항목·형식이 틀린 ID 는 null, 읽기 전용).
+ * 화면 폼(취소)이 plan_id 없이 왔을 때 되돌아갈 계획 화면을 찾는다 — 판정·실행에는 쓰지 않는다.
+ */
+export async function planIdOfItem(db: DbOrTx, ownerId: string, itemId: string): Promise<string | null> {
+  if (!isUuid(itemId)) return null;
+  const rows = await db
+    .select({ planId: distributionItems.planId })
+    .from(distributionItems)
+    .where(and(eq(distributionItems.id, itemId), eq(distributionItems.ownerId, ownerId)))
+    .limit(1);
+  return rows[0]?.planId ?? null;
+}
+
 async function getPlanRow(db: DbOrTx, ownerId: string, planId: string): Promise<DistributionPlanRow | null> {
   if (!isUuid(planId)) return null;
   const rows = await db

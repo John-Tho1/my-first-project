@@ -5,6 +5,8 @@
 import { describe, expect, it } from 'vitest';
 import { canTransitionJob, JOB_TRANSITIONS, PUBLICATION_VERIFICATIONS, transitionJobState } from './jobs';
 import {
+  USER_CONFIRM_CODES,
+  USER_CONFIRM_RESTORED_MESSAGE,
   USER_CONFIRM_WARNING,
   USER_CONFIRMABLE_JOB_STATES,
   UserConfirmError,
@@ -121,5 +123,34 @@ describe('입력·전이·문구', () => {
   });
   it('경고 문구', () => {
     expect(USER_CONFIRM_WARNING).toBe('후보 링크를 열어 내 글인지 직접 확인한 뒤 누르세요. 앱이 검증한 것은 아닙니다');
+  });
+});
+
+/**
+ * FIX4-FULLREV(S2, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘"): 복원한 작업 거절(user_confirm_restored)은 무조건 "새 배포 계획을 만드세요"가 아니라
+ * 카드의 결과 불명 안내와 같은 조건 — Threads 에서 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인.
+ */
+describe('FIX4-FULLREV(S2) — 복원한 작업 거절 문구의 조건부 복구 길', () => {
+  const RESTORED =
+    '복원한 작업(읽기 전용 이력)은 이 환경에서 사용자 확인으로 기록하지 않습니다(다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).';
+  it('user_confirm_restored 거절(409): 정확한 문구 — 조건(직접 확인해 글이 없을 때만) 아래에서만 새 배포 계획', () => {
+    expect(USER_CONFIRM_RESTORED_MESSAGE).toBe(RESTORED);
+    const e = new UserConfirmError('user_confirm_restored');
+    expect(e.kind).toBe('conflict');
+    expect(e.code).toBe('user_confirm_restored');
+    expect(e.message).toBe(RESTORED);
+    expect(e.message).not.toContain('새 배포 계획을 만드세요');
+    const parts = e.message.split('새 배포 계획');
+    expect(parts).toHaveLength(2);
+    expect(parts[0]!.endsWith('직접 확인해 글이 없을 때만 ')).toBe(true);
+  });
+  it('어느 거절 문구도 조건 없이 새 배포 계획을 권하지 않는다("새 배포 계획"은 "글이 없을 때만 " 바로 뒤에만)', () => {
+    for (const code of USER_CONFIRM_CODES) {
+      const m = new UserConfirmError(code).message;
+      expect(m, code).toBeTruthy();
+      const parts = m.split('새 배포 계획');
+      for (const before of parts.slice(0, -1)) expect(before.endsWith('글이 없을 때만 '), code).toBe(true);
+      expect(m, code).not.toContain('새 배포 계획을 만드세요');
+    }
   });
 });

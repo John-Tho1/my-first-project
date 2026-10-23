@@ -19,6 +19,7 @@ import {
   recordedAdapterIdOf,
   SCHEDULE_STALE_RETRY_MESSAGE,
   USER_CONFIRM_BUTTON,
+  USER_CONFIRM_RESTORED_MESSAGE,
   USER_CONFIRMED_LABEL,
   userConfirmCandidateFromEvents,
   userConfirmProblem,
@@ -130,7 +131,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   user_confirm_not_live: '실제 Threads 계정 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(모의 결과는 해당 없음).',
   user_confirm_already_published: '이미 결과가 기록된 항목입니다(다시 기록하지 않았습니다).',
   user_confirm_not_pending: '결과 불명·확인 중 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(지금 상태에서는 기록하지 않았습니다).',
-  user_confirm_restored: '복원한 작업은 이 환경에서 사용자 확인으로 기록하지 않습니다. 새 배포 계획을 만드세요.',
+  // FIX4-FULLREV(S2): 도메인 거절 문구와 같은 조건부 복구 길(Threads 에서 직접 확인해 글이 없을 때만 새 배포 계획) — 무조건 "새 배포 계획을 만드세요"가 아니다
+  user_confirm_restored: USER_CONFIRM_RESTORED_MESSAGE,
   user_confirm_no_attempt: '게시를 시도한 기록이 없는 작업이라 사용자 확인으로 기록하지 않았습니다.',
   user_confirm_publish_recorded: '게시 기록(미디어 ID)이 이미 있습니다 — 재확인으로 결과를 확정하세요.',
   user_confirm_no_candidate: '가장 최근 재확인에 확인 후보 링크가 없어 기록하지 않았습니다. 재확인하거나 Threads 에서 직접 확인하세요.',
@@ -679,16 +681,55 @@ export function unknownKindOf(status: string, job: { lastErrorCode: string | nul
   return code === RESTORED_CANCEL_UNVERIFIED_CODE ? 'restored_unverified' : null;
 }
 
-/** FIX2-FULLREV(Q2): 항목 상태 태그(UNKNOWN 종류별 — "새 계획 필요"라고 하지 않는다). live = 실제 계정 항목(MOCK 이라는 말 없음). */
-export const UNKNOWN_STATUS_LABEL_BY_KIND: Record<UnknownKind, { mock: string; live: string }> = {
+/**
+ * FIX4-FULLREV(S3, 사용자 결정 2026-10-23): 항목 기록이 모의·실제를 **증명**하는가 — 화면의 모의·실제 문구(카드 머리줄·상태 태그·작업 줄·스냅샷 안내·
+ * 결과 불명 안내·취소 결과 불명 배너)를 모두 이 한 규칙으로 고른다.
+ *  - 결과 기록(publications.is_mock)이 있으면 그것(DB 트리거 publications_account_guard 로 계정 kind 와 같은 값)
+ *  - 없으면 항목 계정 kind(live → 실제, mock → 모의)
+ *  - 계정 행이 없거나 kind 를 모르면 가장 최근 전송 의도에 **기록된** 어댑터(adapter_id — 기록 없는 옛 의도는 증명 아님): live_* → 실제, mock_* → 모의
+ *  - 그 밖은 null(증명 못 함) — 화면은 MOCK·"실제 채널로 보낸 것 없음"도, 실제 게시도 단정하지 않는 조심스러운 문구(다시 보내지 않음·채널에서 직접 확인)
+ * 배포 항목은 계정 없이 남을 수 없다(channel_account_id NOT NULL + 같은 owner FK ON DELETE restrict + 스냅샷 열 바꾸기 금지 트리거 + kind CHECK —
+ * tests/integration/fix4-account-required.test.ts) — null 은 화면 자료형(account: … | null)의 방어 기본값이다.
+ */
+export function itemRecordLive(x: {
+  accountKind: string | null | undefined;
+  pub: { isMock: boolean } | null | undefined;
+  intent?: { sanitizedDetails: Record<string, unknown> | null } | null;
+}): boolean | null {
+  if (x.pub) return !x.pub.isMock;
+  if (x.accountKind === 'live') return true;
+  if (x.accountKind === 'mock') return false;
+  if (!x.intent) return null;
+  const recorded = recordedAdapterIdOf(x.intent.sanitizedDetails);
+  if (recorded.id === null || recorded.legacy) return null;
+  return recorded.id.startsWith('live_');
+}
+
+/** FIX4-FULLREV(S3): itemRecordLive 값 → 문구 표의 열 이름(true = live, false = mock, null = unknown). */
+export type RecordModeKey = 'mock' | 'live' | 'unknown';
+export const recordModeKey = (live: boolean | null): RecordModeKey => (live === null ? 'unknown' : live ? 'live' : 'mock');
+
+/**
+ * FIX4-FULLREV(S3): 기록으로 모의·실제를 증명하지 못한 항목(itemRecordLive null)의 CONFIRMED 상태 태그·작업 줄(결과 기록이 없을 때) —
+ * 모의 기본 문구("MOCK 확인")·실제 문구("실제 게시 완료")를 쓰지 않는다.
+ */
+export const UNPROVEN_CONFIRMED_LINE = 'CONFIRMED · 결과 기록 없음(모의·실제 여부를 기록으로 확인할 수 없음 — 채널에서 직접 확인)';
+
+/**
+ * FIX2-FULLREV(Q2): 항목 상태 태그(UNKNOWN 종류별 — "새 계획 필요"라고 하지 않는다). live = 실제 계정 항목(MOCK 이라는 말 없음).
+ * FIX4-FULLREV(S3): unknown = 기록으로 모의·실제를 증명하지 못한 항목(itemRecordLive null) — 모의·실제를 단정하지 않고 다시 보내지 않음·채널에서 직접 확인.
+ */
+export const UNKNOWN_STATUS_LABEL_BY_KIND: Record<UnknownKind, Record<RecordModeKey, string>> = {
   partial: {
     mock: 'UNKNOWN · 일부 게시됨(MOCK) — 남은 부분은 보내지 않음, 자동 재전송 안 함(게시된 부분은 원격에 남음)',
     live: 'UNKNOWN · 게시됐거나 게시됐을 수 있음 — 다시 게시하지 않음(Threads 에서 직접 확인)',
+    unknown: 'UNKNOWN · 게시됐거나 게시 시도가 있었을 수 있음 — 다시 보내지 않음(모의·실제 여부를 기록으로 확인할 수 없음 — 채널에서 직접 확인)',
   },
   // FIX2-FULLREV(FX4): 모의 항목은 실제 채널로 보낸 적이 없고 모의 시뮬레이터는 복원되지 않는다 — "채널에서 직접 확인"(할 수 없는 일)을 시키지 않는다
   restored_unverified: {
     mock: 'UNKNOWN · 복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)',
     live: 'UNKNOWN · 복원한 작업 — 게시됐는지 확인할 수 없음, 다시 게시하지 않음(Threads 에서 직접 확인)',
+    unknown: 'UNKNOWN · 복원한 작업 — 보냈는지 확인할 수 없음, 다시 보내지 않음(모의·실제 여부를 기록으로 확인할 수 없음 — 채널에서 직접 확인)',
   },
 };
 
@@ -713,6 +754,9 @@ export const UNKNOWN_JOB_LINE_PARTIAL_MOCK = 'UNKNOWN · 일부 게시됨(MOCK) 
  * FIX3-FULLREV(R3, 사용자 결정 2026-10-23): 실제 Threads 항목은 단일 게시물이라 새 계획이 "게시된 부분"을 다시 올리지 않는다 — 일반 안내와 같은 조건부 복구 길을
  * 다시 넣는다: 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인, 있으면 그대로(부분 게시는 카드에 사용자 확인 버튼이 보일 때만 그 버튼 — 복원한 작업은
  * 사용자 확인이 거절되므로(user_confirm_restored) 버튼을 가리키지 않는다). 모의 카드에는 이 안내가 없다(모의 스레드는 여러 게시물 — 새 계획은 게시된 부분을 다시 게시).
+ * FIX4-FULLREV(S1, 사용자 결정 2026-10-23): 실제 카드에서 조건부 복구 줄(직접 확인해 글이 없을 때만 새 배포 계획)은 **이 안내에 한 번만** 있다 — 머리줄
+ * (liveItemHeadline)·스냅샷 안내(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.live)는 "다시 게시하지 않음 · Threads 에서 직접 확인"만 말한다(새 계획 권유 없음).
+ * 그 둘이 보이는 실제 카드는 언제나 이 안내(또는 일반 결과 불명 안내 LIVE_UNKNOWN_GUIDANCE)도 그린다(page.tsx — 같은 기록 기준 itemRecordLive·같은 작업 조건).
  */
 export const LIVE_UNKNOWN_GUIDANCE_BY_KIND: Record<UnknownKind, string> = {
   partial: `이미 게시됐거나 게시됐을 수 있습니다(게시 시도 기록 있음). 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(이 카드에 「${USER_CONFIRM_BUTTON}」 버튼이 보이면 눌러 기록할 수 있음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).`,
@@ -721,26 +765,25 @@ export const LIVE_UNKNOWN_GUIDANCE_BY_KIND: Record<UnknownKind, string> = {
 };
 
 /**
- * FIX3-FULLREV(R3): 실제 게시 부분·복원 미확정 머리줄 끝의 조건부 복구 길(위 안내·일반 결과 불명 안내와 같은 뜻 — 무조건 "새 계획 필요"가 아니다).
- * 모의 머리줄(itemHeadline)에는 붙이지 않는다.
- */
-export const LIVE_UNKNOWN_HEADLINE_RECOVERY = '(글이 없을 때만 새 배포 계획으로 다시 승인)';
-
-/**
  * FIX2-FULLREV(Q2): 스냅샷이 바뀐 카드 안내의 머리(일반 항목은 page.tsx 의 "(새 계획 필요)" 문구 그대로).
  * FIX2-FULLREV(FX3): 모의·실제를 나눈다(상태 태그와 같은 itemIsLive 값으로 고른다) — 실제 Threads 는 단일 게시물이고 부분 게시 근거가 게시 시도 표식뿐일 수 있어
  * "일부 게시된 작업"·"게시된 부분"이라고 단정하지 않는다(상태 태그와 같은 "게시됐거나 게시됐을 수 있음").
  * FIX2-FULLREV(FX4): 모의 복원 작업에는 "채널에서 직접 확인"을 시키지 않는다(실제 채널로 보낸 것 없음).
  */
-export const SNAPSHOT_PROBLEMS_PREFIX_BY_KIND: Record<UnknownKind, { mock: string; live: string }> = {
+export const SNAPSHOT_PROBLEMS_PREFIX_BY_KIND: Record<UnknownKind, Record<RecordModeKey, string>> = {
   // FIX3-FULLREV(R3): 실제 문구에만 조건부 복구 길(직접 확인해 글이 없을 때만 새 계획) — 모의 문구는 그대로
+  // FIX4-FULLREV(S1): 실제 문구에서 조건부 복구 길을 뺐다(실제 카드의 결과 불명 안내 LIVE_UNKNOWN_GUIDANCE_BY_KIND 에 한 번만) — 다시 게시하지 않음·Threads 직접 확인은 그대로
+  // FIX4-FULLREV(S3): unknown = 기록(결과 is_mock·계정 kind·기록된 어댑터)으로 모의·실제를 증명하지 못한 항목(itemRecordLive null) — MOCK·"실제 채널로 보낸 것 없음"도,
+  // "실제 Threads"도 단정하지 않고 다시 보내지 않음·채널에서 직접 확인만(@cs/db cancelItem 의 조심스러운 응답 문구와 같은 뜻)
   partial: {
     mock: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(일부 게시된 작업 — 새 계획은 게시된 부분을 처음부터 다시 게시하므로 권하지 않음)',
-    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시됐을 수 있는 작업 — 다시 게시하지 않음, 먼저 Threads 에서 직접 확인하고 글이 없을 때만 새 배포 계획으로 다시 승인)',
+    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시됐을 수 있는 작업 — 다시 게시하지 않음, 먼저 Threads 에서 직접 확인)',
+    unknown: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시 시도가 있었을 수 있는 작업 — 모의·실제 여부를 기록으로 확인할 수 없음, 다시 보내지 않음, 채널에서 직접 확인)',
   },
   restored_unverified: {
     mock: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(MOCK 복원 작업 — 모의 전송 여부를 기록으로 확인할 수 없음, 자동 재전송 안 함, 실제 채널로 보낸 것 없음)',
-    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 게시됐는지 모름, 먼저 Threads 에서 직접 확인하고 글이 없을 때만 새 배포 계획으로 다시 승인)',
+    live: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 게시됐는지 모름, 다시 게시하지 않음, 먼저 Threads 에서 직접 확인)',
+    unknown: '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 보냈는지 모름, 모의·실제 여부를 기록으로 확인할 수 없음, 다시 보내지 않음, 채널에서 직접 확인)',
   },
 };
 
@@ -983,24 +1026,26 @@ export function liveItemHeadline(x: ItemHeadlineInput & { verification?: string 
     case 'UNKNOWN': {
       // FIX1-FULLREV(F2 후속2): 부분 게시 사유 코드는 작업의 lastErrorCode 를 먼저 본다(threadPartialCodeOf — 앞선 BLOCKED 사유가 가리지 않게).
       const partial = threadPartialCodeOf(reason, job);
-      // FIX3-FULLREV(R3): 아래 부분 게시·복원 미확정 머리줄은 모두 조건부 복구 길(LIVE_UNKNOWN_HEADLINE_RECOVERY — 글이 없을 때만 새 계획)로 끝난다
-      const tail = LIVE_UNKNOWN_HEADLINE_RECOVERY;
+      // FIX4-FULLREV(S1, 사용자 결정 2026-10-23): 아래 부분 게시·복원 미확정 머리줄은 "다시 게시하지 않음 · Threads 에서 직접 확인"만 말한다 — FIX3(R3)의
+      // 조건부 복구 길 꼬리(글이 없을 때만 새 배포 계획)는 뺐다. 그 줄은 같은 카드의 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE_BY_KIND)에 한 번만 있다.
       // FIX1-FULLREV(F2 후속2): 보내기 전 취소 요청(thread_partial_cancel_requested)도 시작 전 취소와 같은 문구
-      if (partial === 'thread_partial_canceled' || partial === 'thread_partial_cancel_requested') return `취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음). Threads 에서 직접 확인하세요${tail}`;
+      // FIX4-FULLREV(S1): 취소 머리줄도 "다시 게시하지 않음"을 말한다(다른 부분 게시 머리줄과 같게)
+      if (partial === 'thread_partial_canceled' || partial === 'thread_partial_cancel_requested')
+        return '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음, 다시 게시하지 않음). Threads 에서 직접 확인하세요';
       // FIX1-FULLREV(F2): 게시 시도 뒤 승인 철회·무효 — 다시 게시하지 않음
-      if (partial === 'thread_partial_revoked') return `승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요${tail}`;
+      if (partial === 'thread_partial_revoked') return '승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요';
       // FIX1-FULLREV(F2 후속2): 게시 시도 뒤 작업 처리기가 보내기 전에 멈춤(시도 한도·중단 반복·검증 실패) — "게시되지 않음이 확인된 실패"(FAILED)가 아니다.
       // 원인은 멈출 때의 BLOCKED 사유(reason)로 고른다(partialStopCauseOf).
       if (partial === 'thread_partial_stopped')
-        return `보내기 전 멈춤(${partialStopCauseOf(reason)}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요${tail}`;
+        return `보내기 전 멈춤(${partialStopCauseOf(reason)}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`;
       // FIX2-FULLREV(Q1): 게시된 부분이 있는데 그 뒤 최종 실패 — "게시되지 않음이 확인된 실패"(FAILED)가 아니다
       if (partial === 'thread_partial_failed')
-        return `게시 뒤 실패(${partialFailCauseOf(reason)}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요${tail}`;
+        return `게시 뒤 실패(${partialFailCauseOf(reason)}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`;
       // FIX2-FULLREV(FX2): 게시 단계가 기록됐는데 조회 한도까지 결과를 확인하지 못함
-      if (partial === 'thread_partial_unresolved') return `게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요${tail}`;
+      if (partial === 'thread_partial_unresolved') return '게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요';
       // FIX2-FULLREV(Q3): 복원한 작업 취소를 확정하지 못함
       if (job?.lastErrorCode === RESTORED_CANCEL_UNVERIFIED_CODE)
-        return `복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요${tail}`;
+        return '복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요';
       return `결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`;
     }
     case 'CONFIRMED':
@@ -1138,22 +1183,42 @@ export function cancelRedirectQuery(r: { item_id: string; canceled: boolean; sta
 }
 
 /**
+ * FIX4-FULLREV(S4, 사용자 결정 2026-10-23): 취소 폼이 plan_id 없이 왔을 때 되돌아갈 곳 — 항목이 속한 계획 화면(find = owner 범위 조회, @cs/db planIdOfItem).
+ * 조회가 실패(예외)하거나 없거나 UUID 가 아니면 지금처럼 /distribute(배너 없음). 계획 화면의 취소 배너는 그 화면이 저장된 상태로 다시 확인한다.
+ */
+export async function itemPlanBack(find: () => Promise<string | null>): Promise<string> {
+  try {
+    const planId = await find();
+    return typeof planId === 'string' && isUuid(planId) ? `/distribute/${planId}` : '/distribute';
+  } catch {
+    return '/distribute';
+  }
+}
+
+/**
  * FIX3-FULLREV(R2): 취소 결과 불명 배너 문구 — 종류(부분 게시·복원 미확정·일반) × 계정(모의·실제). 어느 것도 "취소했습니다"·"취소 확인 중"이라고 하지 않고,
  * 더 보내지 않음·다시 보내지 않음을 말한다. 모의 = 실제 채널로 보낸 것 없음(확인할 곳이 없음), 실제 = Threads 에서 직접 확인.
  * generic: 사유 코드가 없거나 허용 목록 밖이거나 저장된 작업 코드와 다를 때 — 저장된 상태(취소 요청한 작업이 UNKNOWN)가 말하는 것만 말한다(사유를 단정하지 않음).
+ * FIX4-FULLREV(S3): unknown = 기록으로 모의·실제를 증명하지 못한 항목(itemRecordLive null — 계정 행 없음·모르는 kind, 결과·기록된 어댑터도 없음) —
+ * MOCK·"실제 채널로 보낸 것 없음"도 "실제 Threads"도 단정하지 않고, 다시 보내지 않음·채널에서 직접 확인(@cs/db cancelItem 의 조심스러운 응답 문구와 같은 뜻).
  */
-export const CANCEL_UNKNOWN_BANNER: Record<UnknownKind | 'generic', { mock: string; live: string }> = {
+export const CANCEL_UNKNOWN_BANNER: Record<UnknownKind | 'generic', Record<RecordModeKey, string>> = {
   partial: {
     mock: '취소: 남은 부분은 보내지 않습니다. 이미 일부가 게시된 작업이라 취소를 확정하지 않았습니다(결과 불명 — 일부 게시됨, MOCK). 게시된 부분은 되돌리지 않고, 아무것도 다시 보내지 않습니다. 실제 채널로 보낸 것은 없습니다.',
     live: '취소: 더 보내지 않습니다. 이 글은 실제 Threads 에 이미 게시됐거나 게시됐을 수 있어 취소를 확정하지 않았습니다(결과 불명). 취소로 되돌리지 않고, 다시 게시하지 않습니다. Threads 앱·웹에서 직접 확인하세요(아래 항목 카드 안내).',
+    unknown:
+      '취소: 더 보내지 않습니다. 이미 게시됐거나 게시 시도가 있었을 수 있어 취소를 확정하지 않았습니다(결과 불명 — 모의·실제 여부를 기록으로 확인할 수 없음). 취소로 되돌리지 않고, 다시 보내지 않습니다. 채널에서 직접 확인하세요.',
   },
   restored_unverified: {
     mock: '취소: 더 보내지 않습니다. 복원한 모의 작업이라 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명). 아무것도 다시 보내지 않습니다(MOCK — 실제 채널로 보낸 것 없음).',
     live: '취소: 더 보내지 않습니다. 복원한 작업이라 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명). 다시 게시하지 않습니다. Threads 앱·웹에서 직접 확인하세요(아래 항목 카드 안내).',
+    unknown:
+      '취소: 더 보내지 않습니다. 복원한 작업이라 보냈는지 이 환경에서 확인할 수 없어 취소를 확정하지 않았습니다(결과 불명 — 모의·실제 여부를 기록으로 확인할 수 없음). 다시 보내지 않습니다. 채널에서 직접 확인하세요.',
   },
   generic: {
     mock: '취소: 더 보내지 않습니다. 취소 결과를 확정하지 못했습니다(결과 불명). 아무것도 다시 보내지 않습니다 — 아래 항목 카드의 안내를 보세요(MOCK — 실제 채널로 보낸 것 없음).',
     live: '취소: 더 보내지 않습니다. 취소 결과를 확정하지 못했습니다(결과 불명). 다시 게시하지 않습니다 — 아래 항목 카드의 안내를 보고 Threads 앱·웹에서 직접 확인하세요.',
+    unknown: '취소: 더 보내지 않습니다. 취소 결과를 확정하지 못했습니다(결과 불명 — 모의·실제 여부를 기록으로 확인할 수 없음). 다시 보내지 않습니다 — 채널에서 직접 확인하세요.',
   },
 };
 
@@ -1161,7 +1226,10 @@ export interface CancelUnknownBannerInput {
   items: ReadonlyArray<{
     item: { id: string; status: string };
     account: { kind: string } | null;
-    jobs: ReadonlyArray<{ state: string; lastErrorCode: string | null; cancelRequestedAt: Date | null }>;
+    jobs: ReadonlyArray<{ id?: string; state: string; lastErrorCode: string | null; cancelRequestedAt: Date | null }>;
+    /** FIX4-FULLREV(S3): 모의·실제 증명(itemRecordLive)에 쓰는 결과 기록·가장 최근 전송 의도 — 없으면 계정 kind 만 */
+    publications?: ReadonlyArray<{ jobId: string | null; isMock: boolean }>;
+    latestIntent?: { sanitizedDetails: Record<string, unknown> | null } | null;
   }>;
 }
 
@@ -1170,6 +1238,7 @@ export interface CancelUnknownBannerInput {
  * 그 항목이 이 계획에 있으며 저장된 상태가 "취소를 요청했고 결과 불명"(항목·가장 최근 작업 UNKNOWN, 작업에 취소 요청 시각)일 때만 문구, 아니면 null.
  * 종류: cancel_reason 이 허용 목록에 있고 작업의 lastErrorCode 와 같을 때만 부분 게시·복원 미확정, 아니면 일반 문구(사유 값이 이상해도 배너는 안전한 일반 문구 —
  * 상태가 뒷받침하는 결과 불명은 알리고, 쿼리 글자는 화면에 옮기지 않는다). 모의·실제는 항목 카드와 같은 기준(계정 kind = live 면 실제).
+ * FIX4-FULLREV(S3): 모의·실제는 카드와 같은 한 규칙(itemRecordLive — 결과 is_mock·계정 kind·기록된 어댑터, 카드와 같은 결과 고르기)으로 고르고, 증명이 없으면 unknown 문구.
  */
 export function cancelUnknownBannerOf(q: Record<string, string | string[] | undefined>, d: CancelUnknownBannerInput): string | null {
   if (q.cancel_unknown !== '1') return null;
@@ -1181,7 +1250,10 @@ export function cancelUnknownBannerOf(q: Record<string, string | string[] | unde
   const reason = typeof q.cancel_reason === 'string' ? q.cancel_reason : '';
   const claimed = CANCEL_UNKNOWN_REASON_KIND.get(reason);
   const kind = claimed !== undefined && job.lastErrorCode === reason ? claimed : 'generic';
-  return CANCEL_UNKNOWN_BANNER[kind][x.account?.kind === 'live' ? 'live' : 'mock'];
+  // FIX4-FULLREV(S3): 카드(page.tsx ItemCard)와 같은 결과 고르기 — 최근 작업의 결과, 없으면 항목의 마지막 결과
+  const pubs = x.publications ?? [];
+  const pub = (job.id !== undefined ? pubs.find((p) => p.jobId === job.id) : undefined) ?? pubs.at(-1) ?? null;
+  return CANCEL_UNKNOWN_BANNER[kind][recordModeKey(itemRecordLive({ accountKind: x.account?.kind, pub, intent: x.latestIntent ?? null }))];
 }
 
 

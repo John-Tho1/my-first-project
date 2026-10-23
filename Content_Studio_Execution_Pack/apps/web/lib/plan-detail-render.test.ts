@@ -267,8 +267,14 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
       'Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(이 카드에 「Threads에서 확인함」 버튼이 보이면 눌러 기록할 수 있음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
     );
     expect(card!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
-    expect(card).toContain('<strong>승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요(글이 없을 때만 새 배포 계획으로 다시 승인)</strong>');
-    expect(conditionalNewPlanCount(card!)).toBe(3);
+    // FIX4-FULLREV(S1, 사용자 결정 2026-10-23): (FIX3 R3 의 "안내(1)·머리줄(1)·스냅샷 안내(1) = 3"을 바꿈) 조건부 복구 줄은 결과 불명 안내에만 정확히 한 번 —
+    // 머리줄·스냅샷 안내는 다시 게시하지 않음·Threads 직접 확인만(정확한 문구)
+    expect(card).toContain('<strong>승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요</strong>');
+    expect(card).toContain(
+      '<p class="notice" role="alert">스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시됐을 수 있는 작업 — 다시 게시하지 않음, 먼저 Threads 에서 직접 확인): 원고가 바뀜</p>',
+    );
+    expect(conditionalNewPlanCount(card!)).toBe(1);
+    expect(card!.split('없을 때만').length - 1).toBe(1);
     expect(card).not.toContain('새 계획 필요');
     expect(card).not.toContain('MOCK');
   });
@@ -302,8 +308,13 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 카드는 새 계획을 권
       'Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(복원한 작업은 이 환경에서 사용자 확인으로 기록하지 않음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
     );
     expect(live!.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1).toBe(1);
-    expect(live).toContain('<strong>복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요(글이 없을 때만 새 배포 계획으로 다시 승인)</strong>');
-    expect(conditionalNewPlanCount(live!)).toBe(3);
+    // FIX4-FULLREV(S1): (FIX3 R3 의 3번을 바꿈) 조건부 복구 줄은 결과 불명 안내에만 정확히 한 번 — 머리줄·스냅샷 안내는 정확한 새 문구
+    expect(live).toContain('<strong>복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요</strong>');
+    expect(live).toContain(
+      '<p class="notice" role="alert">스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 게시됐는지 모름, 다시 게시하지 않음, 먼저 Threads 에서 직접 확인): 원고가 바뀜</p>',
+    );
+    expect(conditionalNewPlanCount(live!)).toBe(1);
+    expect(live!.split('없을 때만').length - 1).toBe(1);
     expect(live).not.toContain('Threads에서 확인함');
   });
 
@@ -341,8 +352,9 @@ describe('FIX3-FULLREV(R2) — 취소 결과 불명 배너', () => {
     '<p class="notice" role="status">취소 확인 중 — 이미 전송 단계에 들어간 작업입니다. 원격 결과를 확인한 뒤 취소됨 또는 &quot;취소 불가(이미 전송됨)&quot;으로 표시됩니다.</p>';
   const shownUnknownBanners = async (html: string) => {
     const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    // FIX4-FULLREV(S3): 모든 문구 열(mock·live·unknown)을 본다(그전에는 mock·live 둘)
     return Object.values(CANCEL_UNKNOWN_BANNER)
-      .flatMap((b) => [b.mock, b.live])
+      .flatMap((b) => Object.values(b))
       .filter((t) => html.includes(t));
   };
 
@@ -409,5 +421,104 @@ describe('FIX3-FULLREV(R2) — 취소 결과 불명 배너', () => {
     for (const html of [canceled, requested]) expect(await shownUnknownBanners(html)).toEqual([]);
     // 결과 불명 쿼리로 취소됨·취소 확인 중 항목을 가리켜도(쿼리만 바꿈) 결과 불명 배너는 없다 — 저장된 상태가 UNKNOWN 이 아니다
     for (const id of [U1, U2]) expect(await shownUnknownBanners(await render(cancelQ(id, 'thread_partial_canceled'))), id).toEqual([]);
+  });
+});
+
+/**
+ * FIX4-FULLREV(S3, 사용자 결정 2026-10-23): 카드의 모의·실제 문구는 한 규칙(itemRecordLive — 결과 is_mock · 계정 kind · 기록된 어댑터)으로 고른다.
+ * 계정 행이 없는 항목(저장된 기록으로는 생길 수 없다 — tests/integration/fix4-account-required)에서도 모의임이 증명되지 않으면 MOCK·"실제 채널로 보낸 것 없음"을
+ * 말하지 않고, 실제임이 증명되지 않으면 실제 게시도 말하지 않는다(조심스러운 문구 — 다시 보내지 않음·채널에서 직접 확인). 증명되면 그 문구.
+ */
+describe('FIX4-FULLREV(S3) — 계정 없는 항목 카드의 모의·실제 문구', () => {
+  const U3 = 'cccccccc-3333-4333-8333-333333333333';
+  const accountless = (
+    name: string,
+    o: { status?: string; code: string | null; pub?: 'mock' | 'live'; adapter?: string; problems?: string[]; id?: string; cancelAt?: Date | null },
+  ) => {
+    const x = item({ live: o.pub === 'live', verification: o.pub === 'live' ? 'UNVERIFIED' : 'MOCK', withPub: o.pub !== undefined, name });
+    const status = o.status ?? 'UNKNOWN';
+    return {
+      ...x,
+      item: { ...x.item, ...(o.id ? { id: o.id } : {}), status, requestedResult: 'public_publish' },
+      account: null,
+      jobs: [{ ...x.jobs[0]!, state: status, lastErrorCode: o.code, cancelRequestedAt: o.cancelAt ?? null }],
+      latestIntent: o.adapter ? { attempt: 1, sanitizedDetails: { adapter_id: o.adapter } } : null,
+      problems: o.problems ?? [],
+    };
+  };
+  /** 항목 카드 section 하나만(마지막 카드 뒤의 계획 단위 승인·실행 section 은 빼고 — 계획 단위 문구는 계정 kind 기준 그대로) */
+  const cardsOnly = (html: string) => cards(html).map((c) => c.slice(0, c.indexOf('</section>')));
+  const heading = (card: string) => /<h4>(작업[^<]*)<\/h4>/.exec(card)?.[1] ?? '';
+  const headlineOf = (card: string) => /<p class="status-line" role="status"><strong>([^<]*)<\/strong>/.exec(card)?.[1] ?? '';
+
+  it('증명 없음(계정·결과·기록된 어댑터 없음): 부분 게시·복원 미확정 — 머리줄·상태 태그·작업 제목·작업 줄·스냅샷 안내 모두 unknown 문구, MOCK·실제 게시·새 계획 없음', async () => {
+    const { UNKNOWN_STATUS_LABEL_BY_KIND, UNKNOWN_JOB_LINE_BY_KIND, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND, LIVE_UNKNOWN_GUIDANCE, LIVE_UNKNOWN_GUIDANCE_BY_KIND } = await import('./distribution');
+    state.detail = detail(
+      accountless('np', { code: 'thread_partial_canceled', problems: ['content_changed'] }),
+      accountless('nr', { code: 'restored_cancel_unverified', problems: ['content_changed'] }),
+    );
+    const [p, r] = cardsOnly(await render());
+    for (const [card, kind] of [
+      [p!, 'partial'],
+      [r!, 'restored_unverified'],
+    ] as const) {
+      expect(statusTag(card), kind).toBe(UNKNOWN_STATUS_LABEL_BY_KIND[kind].unknown);
+      expect(headlineOf(card), kind).toBe(UNKNOWN_STATUS_LABEL_BY_KIND[kind].unknown);
+      expect(heading(card), kind).toBe('작업(모의·실제 여부를 기록으로 확인할 수 없음)');
+      expect(card, kind).toContain(`<strong>${UNKNOWN_JOB_LINE_BY_KIND[kind]}</strong>`);
+      expect(card, kind).toContain(`${SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].unknown}: 원고가 바뀜`);
+      for (const w of ['MOCK', '모의 작업', '실제 채널로 보낸 것', '실제 게시', '실제 Threads', '없을 때만', '새 배포 계획', '새 계획 필요', '(계정 없음) <span']) expect(card, `${kind}/${w}`).not.toContain(w);
+      // 결과 불명 안내(실제 카드 전용)는 그리지 않는다 — 실제임이 증명되지 않음
+      for (const g of [LIVE_UNKNOWN_GUIDANCE, LIVE_UNKNOWN_GUIDANCE_BY_KIND.partial, LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified]) expect(card, kind).not.toContain(g);
+      expect(card, kind).toContain('채널에서 직접 확인');
+    }
+  });
+
+  it('증명 없음: CONFIRMED(결과 기록 없음)도 "MOCK 확인"·"실제 발행 실적 아님" 표시·"MOCK 결과 확인" 작업 줄이 아니다', async () => {
+    const { UNPROVEN_CONFIRMED_LINE } = await import('./distribution');
+    state.detail = detail(accountless('nc', { status: 'CONFIRMED', code: null }));
+    const [card] = cardsOnly(await render());
+    expect(statusTag(card!)).toBe(UNPROVEN_CONFIRMED_LINE);
+    expect(headlineOf(card!)).toBe(UNPROVEN_CONFIRMED_LINE);
+    expect(card).toContain(`<strong>${UNPROVEN_CONFIRMED_LINE}</strong> · 시도`);
+    for (const w of ['MOCK', '실제 발행 실적 아님', '실제 게시']) expect(card, w).not.toContain(w);
+  });
+
+  it('계정이 없어도 기록이 증명하면 그 문구: 결과 is_mock=true·기록된 모의 어댑터 → 모의 문구, 결과 is_mock=false → 실제 문구(결과 불명 안내에 조건부 복구 줄 한 번)', async () => {
+    const { UNKNOWN_STATUS_LABEL_BY_KIND, UNKNOWN_JOB_LINE_PARTIAL_MOCK, UNKNOWN_JOB_LINE_BY_KIND, LIVE_UNKNOWN_GUIDANCE_BY_KIND } = await import('./distribution');
+    state.detail = detail(
+      accountless('pm', { code: 'thread_partial_failed', pub: 'mock' }),
+      accountless('am', { code: 'thread_partial_failed', adapter: 'mock_threads' }),
+      accountless('pl', { code: 'thread_partial_revoked', pub: 'live' }),
+      accountless('al', { code: 'thread_partial_revoked', adapter: 'live_threads' }),
+    );
+    const [pm, am, pl, al] = cardsOnly(await render());
+    for (const card of [pm!, am!]) {
+      expect(statusTag(card)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock);
+      expect(heading(card)).toBe('작업(MOCK — 모의 어댑터)');
+      expect(card).toContain(`<strong>${UNKNOWN_JOB_LINE_PARTIAL_MOCK}</strong>`);
+      expect(headlineOf(card)).toContain('일부만 게시됨(MOCK)');
+    }
+    for (const card of [pl!, al!]) {
+      expect(statusTag(card)).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.live);
+      expect(heading(card)).toBe('작업(실제 게시 — 실제 Threads 어댑터)');
+      expect(card).toContain(`<strong>${UNKNOWN_JOB_LINE_BY_KIND.partial}</strong>`);
+      expect(headlineOf(card)).toBe('승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요');
+      expect(card).toContain(LIVE_UNKNOWN_GUIDANCE_BY_KIND.partial);
+      expect(conditionalNewPlanCount(card)).toBe(1);
+      expect(card).not.toContain('MOCK');
+    }
+  });
+
+  it('취소 결과 불명 배너: 계정 없는 항목은 카드와 같은 규칙 — 증명 없음이면 unknown 문구(모의 문구 아님)', async () => {
+    const { CANCEL_UNKNOWN_BANNER } = await import('./distribution');
+    state.detail = detail(accountless('nb', { code: 'thread_partial_canceled', id: U3, cancelAt: T }));
+    const html = await render({ cancel_unknown: '1', cancel_item: U3, cancel_reason: 'thread_partial_canceled' });
+    expect(html).toContain(`<p class="notice" role="alert">${CANCEL_UNKNOWN_BANNER.partial.unknown}</p>`);
+    const shown = Object.values(CANCEL_UNKNOWN_BANNER)
+      .flatMap((b) => Object.values(b))
+      .filter((t) => html.includes(t));
+    expect(shown).toEqual([CANCEL_UNKNOWN_BANNER.partial.unknown]);
+    expect(html).not.toContain(CANCEL_UNKNOWN_BANNER.partial.mock);
   });
 });

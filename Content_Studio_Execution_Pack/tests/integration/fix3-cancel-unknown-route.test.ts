@@ -18,10 +18,12 @@ import {
   closeDb,
   createContent,
   createVariantDraft,
+  ensureOwner,
   getDb,
   getPlanDetail,
   leaseJobs,
   listChannelAccounts,
+  planIdOfItem,
   runJobsTick,
   schema,
   seed,
@@ -276,5 +278,79 @@ describe('FIX3-FULLREV(R2): 취소 HTML 리다이렉트 — 결과마다 다른 
     expect(loc.pathname).toBe(`/distribute/${x.planId}`);
     expect(loc.searchParams.get('error')).toBe('cancel_unknown');
     expect(loc.searchParams.has('cancel_unknown')).toBe(false);
+  });
+});
+
+/**
+ * FIX4-FULLREV(S4, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘" · FULLREV1 인계 FIX round 3 "남은 것" 4): plan_id 없이 보낸 HTML 취소는 /distribute(배너 없음)
+ * 대신 항목이 속한 계획 화면으로 돌아간다(owner 범위 조회 — 조회 실패면 /distribute 그대로, lib 단위 시험 itemPlanBack). 오류 리다이렉트도 같다(owner 확인 뒤에만 조회).
+ * 404·CSRF 는 지금 그대로(/distribute?missing=1 · /distribute?error=csrf).
+ */
+describe('FIX4-FULLREV(S4): plan_id 없는 HTML 취소 → 항목의 계획 화면', () => {
+  const cancelNoPlan = (itemId: string, headers: Record<string, string> = ORIGIN_HEADERS) =>
+    cancelPOST(
+      new Request(`${BASE}/api/distribution-items/${itemId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', ...headers, ...cookieHeader(token) },
+        body: '',
+      }),
+      ctx(itemId),
+    );
+
+  it('취소됨 → /distribute/<계획>?canceled=1 · 취소됨 배너(그 계획 화면이 저장된 상태로 확인)', async () => {
+    const x = await executed(seedThreads, 'plan_id 없이 취소하는 글.');
+    const q = redirectQuery(await cancelNoPlan(x.itemId), x.planId, 'canceled=1');
+    expect((await jobOf(x.itemId)).state).toBe('CANCELED');
+    expect((await bannersFor(x.planId, q)).old).toMatchObject({ canceled: true, cancelRequested: false });
+  });
+
+  it('결과 불명(부분 게시) → /distribute/<계획>?cancel_unknown=1&cancel_item=…&cancel_reason=… · 전용 배너가 나온다(예전에는 /distribute — 배너 없음)', async () => {
+    const x = await partialThread();
+    const q = redirectQuery(await cancelNoPlan(x.itemId), x.planId, `cancel_unknown=1&cancel_item=${x.itemId}&cancel_reason=thread_partial_canceled`);
+    expect((await bannersFor(x.planId, q)).unknown).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(api.postsOf(x.external)).toHaveLength(1);
+  });
+
+  it('취소 확인 중(lease 된 작업) → /distribute/<계획>?cancel_requested=1', async () => {
+    const x = await executed(seedThreads, 'plan_id 없이 취소 — 처리기가 가져간 글.');
+    expect((await leaseJobs(db, { workerId: 'fix4-s4-lease', now: new Date(), limit: 1, ownerId: owner, planId: x.planId })).map((j) => j.itemId)).toEqual([x.itemId]);
+    redirectQuery(await cancelNoPlan(x.itemId), x.planId, 'cancel_requested=1');
+  });
+
+  it('오류(409)도 항목의 계획 화면으로: 결과 불명 항목 다시 취소 → error=cancel_unknown · 실행 전 항목 → error=not_cancellable', async () => {
+    const x = await restoredBlocked();
+    redirectQuery(await cancelNoPlan(x.itemId), x.planId, `cancel_unknown=1&cancel_item=${x.itemId}&cancel_reason=restored_cancel_unverified`);
+    redirectQuery(await cancelNoPlan(x.itemId), x.planId, 'error=cancel_unknown');
+    // 실행 전(PLANNED) 항목 — 승인·실행 없이 계획만
+    const { content } = await createContent(db, owner, { title: `FIX4 S4 ${randomUUID().slice(0, 6)}`, body: '실행 전 글.' });
+    const { variant } = await createVariantDraft(db, owner, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, owner, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const res = await plansPOST(post('/api/distribution-plans', { items: [{ variant_id: variant.id, channel_account_id: seedThreads }] }));
+    const p = (await res.json()) as { plan: { id: string }; items: Array<{ id: string }> };
+    redirectQuery(await cancelNoPlan(p.items[0]!.id), p.plan.id, 'error=not_cancellable');
+  });
+
+  it('planIdOfItem: owner 범위 — 내 항목이면 그 계획, 다른 owner·없는 항목·형식이 틀린 ID 는 null(오류 없이)', async () => {
+    const x = await executed(seedThreads, '계획 찾기 글.');
+    expect(await planIdOfItem(db, owner, x.itemId)).toBe(x.planId);
+    const other = await ensureOwner(db, `fix4-s4-other-${randomUUID().slice(0, 6)}@example.local`);
+    expect(await planIdOfItem(db, other.id, x.itemId)).toBeNull();
+    expect(await planIdOfItem(db, owner, randomUUID())).toBeNull();
+    for (const bad of ['not-a-uuid', '', `${x.itemId}x`, "x' or '1'='1"]) expect(await planIdOfItem(db, owner, bad), bad).toBeNull();
+  });
+
+  it('그대로: 없는 항목(404) → /distribute?missing=1 · 형식이 틀린 ID → /distribute?missing=1 · CSRF(출처 없음) → /distribute?error=csrf(owner 확인 전 — 조회 없음) · plan_id 가 있으면 그 값', async () => {
+    for (const id of [randomUUID(), 'not-a-uuid']) {
+      const res = await cancelNoPlan(id);
+      expect(res.status, id).toBe(303);
+      expect(res.headers.get('location'), id).toBe('/distribute?missing=1');
+    }
+    const x = await executed(seedThreads, 'CSRF 로 막히는 취소.');
+    const csrf = await cancelNoPlan(x.itemId, {});
+    expect(csrf.status).toBe(303);
+    expect(csrf.headers.get('location')).toBe('/distribute?error=csrf');
+    expect((await jobOf(x.itemId)).state).toBe('QUEUED');
+    // plan_id 숨은 필드가 있으면 지금처럼 그 값(조회하지 않음)
+    redirectQuery(await cancelForm(x.itemId, x.planId), x.planId, 'canceled=1');
   });
 });

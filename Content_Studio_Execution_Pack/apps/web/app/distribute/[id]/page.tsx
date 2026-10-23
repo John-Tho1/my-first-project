@@ -25,6 +25,7 @@ import {
   instagramProgressLine,
   instagramStepLine,
   itemHeadline,
+  itemRecordLive,
   LIVE_CANDIDATE_LABEL,
   LIVE_UNKNOWN_GUIDANCE,
   LIVE_UNKNOWN_GUIDANCE_BY_KIND,
@@ -40,6 +41,7 @@ import {
   problemLabel,
   publishAtView,
   reconciledNotice,
+  recordModeKey,
   remoteStepLine,
   RESULT_KIND_LABEL,
   revocationCountParam,
@@ -55,7 +57,6 @@ import {
   youtubeSessionNote,
 } from '../../../lib/distribution';
 import {
-  itemIsLive,
   itemStatusText,
   jobStatusTextFor,
   mixedResultSuffix,
@@ -386,6 +387,11 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const block = blockInfoOfItem(x);
   // LIVE-P1(D38): 실제 계정 항목 — 실제 게시 문구(MOCK 문구와 섞지 않음)
   const live = x.account?.kind === 'live';
+  // FIX2-FULLREV(FX3): 스냅샷 안내의 모의·실제 문구는 상태 태그와 같은 기록 기준(결과 is_mock · 계정 kind)으로 고른다
+  // FIX4-FULLREV(S3, 사용자 결정 2026-10-23): 카드의 모의·실제 문구(머리줄·상태 태그·작업 제목·작업 줄·스냅샷 안내·결과 불명 안내·MOCK 확인 표시)는 모두 한 규칙
+  // (itemRecordLive — 결과 is_mock · 계정 kind · 기록된 어댑터)으로 고른다. null = 기록으로 증명하지 못함(계정 행 없음·모르는 kind) — MOCK·"실제 채널로 보낸 것 없음"도
+  // 실제 게시도 단정하지 않는 조심스러운 문구. live(계정 kind)는 계정 자체가 있어야 하는 실제 계정 전용 표시(게시 안내·확인 후보·사용자 확인·공개 범위·일일 상한)에만.
+  const recordLive = itemRecordLive({ accountKind: x.account?.kind, pub: latestPub, intent: x.latestIntent });
   const headlineInput = {
     status: x.item.status,
     channel,
@@ -408,7 +414,13 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const pubTag = live ? liveVerificationTag(latestPub?.verification) : null;
   // LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 숫자만) — 판정 코드만으로는 원인을 알 수 없을 때
   const diagLine = live ? latestThreadsDiag(x.events) : null;
-  const headline = live ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null }) : itemHeadline(headlineInput);
+  // FIX4-FULLREV(S3): 증명 못 한 항목의 머리줄은 상태 태그와 같은 조심스러운 문구(모의 머리줄의 MOCK·실제 머리줄의 실제 게시를 쓰지 않음)
+  const headline =
+    recordLive === true
+      ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null })
+      : recordLive === false
+        ? itemHeadline(headlineInput)
+        : itemStatusText(x.item.status, { live: null, lastErrorCode: latest?.lastErrorCode ?? null });
   // M4 화면 FIX(S5): 요청한 예약 공개 시각과 원격이 보고한 결과(D27)를 구분
   // M4UI FIX1: PUBLISHED 는 기록 시각(created_at)이 예약 시각 전일 때만 "적용하지 않음" — 그 밖은 중립 문구
   const publishAt = publishAtView({
@@ -420,8 +432,6 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그·작업 줄·안내가 "새 계획 필요"라고 하지 않게 최근 작업의 lastErrorCode 로 고른다
   const unknownKind = unknownKindOf(x.item.status, latest);
-  // FIX2-FULLREV(FX3): 스냅샷 안내의 모의·실제 문구는 상태 태그와 같은 기록 기준(itemIsLive — 결과 is_mock · 계정 kind)으로 고른다
-  const recordLive = itemIsLive({ accountKind: x.account?.kind, pub: latestPub });
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
       <h3>
@@ -437,7 +447,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       ) : null}
       <p className="status-line" role="status">
         <strong>{headline}</strong>
-        {x.item.status === 'CONFIRMED' && !live ? (
+        {/* FIX4-FULLREV(S3): MOCK 확인 표시는 모의임이 기록으로 증명될 때만 */}
+        {x.item.status === 'CONFIRMED' && recordLive === false ? (
           <>
             {' '}
             <span className="tag mock">MOCK</span> <strong>실제 발행 실적 아님</strong>
@@ -462,7 +473,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         {/* FIX2-UICLEAN: 상태 태그는 이 항목 기록(결과 is_mock · 계정 kind)으로 — 실제 CONFIRMED 는 "실제 게시 완료" */}
         {/* FIX2-FULLREV(Q2): 최근 작업의 사유 코드도 넘긴다 — 부분 게시 UNKNOWN 은 "새 계획 필요"가 아닌 문구 */}
         <span className="tag">
-          {itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub }), verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })}
+          {/* FIX4-FULLREV(S3): 한 규칙(recordLive — 모의·실제·증명 못 함) */}
+          {itemStatusText(x.item.status, { live: recordLive, verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })}
         </span>
         {x.item.restoredNeedsReview ? <span className="tag warn">복원됨 — 자동 실행·재시도 안 함, 결과 확인 필요</span> : null}
         {publishAt ? <span className={publishAt.warn ? 'tag warn' : undefined}>{publishAt.text}</span> : null}
@@ -494,8 +506,9 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
         unknownKind ? (
           // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 항목에는 새 계획을 권하지 않는다(게시된 부분이 처음부터 다시 게시됨)
           // FIX2-FULLREV(FX3): 실제 항목은 "일부 게시된 작업"이라고 단정하지 않는 실제 문구(recordLive)
+          // FIX4-FULLREV(S1·S3): 실제 문구에는 새 계획 권유가 없다(조건부 복구 줄은 아래 결과 불명 안내에 한 번만 — 같은 recordLive 로 그 안내도 그린다), 증명 못 함 = unknown 문구
           <p className="notice" role="alert">
-            {SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordLive ? 'live' : 'mock']}: {x.problems.map(problemLabel).join(', ')}
+            {SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {x.problems.map(problemLabel).join(', ')}
           </p>
         ) : (
           <p className="notice" role="alert">
@@ -549,8 +562,10 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
       ) : null}
       {x.jobs.length ? (
         <>
-          <h4>{live ? '작업(실제 게시 — 실제 Threads 어댑터)' : '작업(MOCK — 모의 어댑터)'}</h4>
-          {live && x.item.status === 'UNKNOWN' ? (
+          {/* FIX4-FULLREV(S3): 작업 제목·결과 불명 안내도 한 규칙(recordLive) — 증명 못 함이면 모의·실제를 단정하지 않는 제목 */}
+          <h4>{recordLive === true ? '작업(실제 게시 — 실제 Threads 어댑터)' : recordLive === false ? '작업(MOCK — 모의 어댑터)' : '작업(모의·실제 여부를 기록으로 확인할 수 없음)'}</h4>
+          {/* FIX4-FULLREV(S1): 실제 카드의 조건부 복구 줄(직접 확인해 글이 없을 때만 새 배포 계획)은 이 안내에 한 번만 — 머리줄·스냅샷 안내에는 없다 */}
+          {recordLive === true && x.item.status === 'UNKNOWN' ? (
             unknownKind ? (
               // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 — 종류별 안내(직접 확인 먼저)
               // FIX3-FULLREV(R3): 실제 항목(단일 게시물)은 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인(조건부 복구 길) — 모의 카드에는 이 안내가 없다
@@ -599,7 +614,7 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               const reason = block.code;
               return (
                 <li key={j.id} className="hash">
-                  <strong>{jobStatusTextFor(j, pub, reason, channel, live)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
+                  <strong>{jobStatusTextFor(j, pub, reason, channel, recordLive)}</strong> · 시도 {j.attempt}/{j.maxAttempts}
                   {j.state === 'QUEUED' ? ` · 예정 ${formatMsk(j.nextRunAt)}` : ''}
                   {j.cancelRequestedAt && j.state === 'CONFIRMED' ? (channel === 'youtube' ? ' · 취소 불가 — 업로드됨, 삭제는 별도 동작(범위 밖)' : ' · 취소 불가(이미 전송됨)') : ''} ·{' '}
                   <a href={`/api/jobs/${j.id}`}>작업 JSON</a>

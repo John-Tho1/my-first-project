@@ -6,12 +6,15 @@
  */
 import {
   ITEM_STATUS_LABEL,
+  itemRecordLive,
   jobStatusText,
+  recordModeKey,
   REQUESTED_RESULT_LABEL,
   UNKNOWN_JOB_LINE_PARTIAL_MOCK,
   UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
   UNKNOWN_STATUS_LABEL_BY_KIND,
   unknownKindOf,
+  UNPROVEN_CONFIRMED_LINE,
 } from './distribution';
 
 export type AccountMode = 'none' | 'mock_only' | 'live_no_target' | 'live_target';
@@ -118,10 +121,12 @@ export function planStatusText(label: string, mock: boolean): string {
 
 // ---- FIX2-UICLEAN(브라우저 확인): 항목·작업 상태 문구도 그 항목 기록으로 ----
 
-/** 실제 항목인가: 결과 기록(publications.is_mock)이 있으면 그것, 없으면 항목 계정 kind(둘은 DB 트리거 publications_kind_guard 로 같은 값). */
+/**
+ * 실제 항목인가: 결과 기록(publications.is_mock)이 있으면 그것, 없으면 항목 계정 kind(둘은 DB 트리거 publications_kind_guard 로 같은 값).
+ * FIX4-FULLREV(S3): 판정은 한 규칙(lib/distribution itemRecordLive — 모의·실제·증명 못 함)으로 — 이 함수는 "실제임이 증명됨"만 true.
+ */
 export function itemIsLive(x: { accountKind: string | null | undefined; pub: { isMock: boolean } | null | undefined }): boolean {
-  if (x.pub) return !x.pub.isMock;
-  return x.accountKind === 'live';
+  return itemRecordLive(x) === true;
 }
 
 const LIVE_VERIFICATION_SHORT: Record<string, string> = { VERIFIED: '앱 확인(VERIFIED)', USER_CONFIRMED: '사용자 확인' };
@@ -131,11 +136,14 @@ const LIVE_VERIFICATION_SHORT: Record<string, string> = { VERIFIED: '앱 확인(
  * 모의 항목·다른 상태는 ITEM_STATUS_LABEL 그대로(모의 CONFIRMED = "CONFIRMED · MOCK 확인(실제 발행 아님)").
  * FIX2-FULLREV(Q2): UNKNOWN 인데 최근 작업의 lastErrorCode 가 부분 게시 사유(thread_partial_*)·복원 취소 미확정(restored_cancel_unverified)이면
  * 일반 UNKNOWN 문구("재확인 또는 새 계획 필요" — 새 계획은 게시된 부분을 다시 게시) 대신 그 종류의 문구(unknownKindOf). lastErrorCode 를 넘기지 않으면 지금 그대로.
+ * FIX4-FULLREV(S3): live 는 itemRecordLive 값 — null(기록으로 모의·실제를 증명하지 못함)이면 종류별 unknown 문구, CONFIRMED 는 UNPROVEN_CONFIRMED_LINE
+ * (모의 기본 문구 "MOCK 확인"·실제 문구를 쓰지 않는다).
  */
-export function itemStatusText(status: string, rec: { live: boolean; verification?: string | null; lastErrorCode?: string | null }): string {
-  if (status === 'CONFIRMED' && rec.live) return `CONFIRMED · 실제 게시 완료 · ${LIVE_VERIFICATION_SHORT[rec.verification ?? ''] ?? '확인 전'}`;
+export function itemStatusText(status: string, rec: { live: boolean | null; verification?: string | null; lastErrorCode?: string | null }): string {
+  if (status === 'CONFIRMED' && rec.live === true) return `CONFIRMED · 실제 게시 완료 · ${LIVE_VERIFICATION_SHORT[rec.verification ?? ''] ?? '확인 전'}`;
+  if (status === 'CONFIRMED' && rec.live === null) return UNPROVEN_CONFIRMED_LINE;
   const kind = unknownKindOf(status, { lastErrorCode: rec.lastErrorCode ?? null });
-  if (kind) return rec.live ? UNKNOWN_STATUS_LABEL_BY_KIND[kind].live : UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock;
+  if (kind) return UNKNOWN_STATUS_LABEL_BY_KIND[kind][recordModeKey(rec.live)];
   return ITEM_STATUS_LABEL[status] ?? status;
 }
 
@@ -144,10 +152,19 @@ export function itemStatusText(status: string, rec: { live: boolean; verificatio
  * 결과 기록이 있으면 그 기록(is_mock)대로 jobStatusText 그대로.
  * FIX2-FULLREV(FX4): 모의 항목의 복원 취소 미확정(restored_cancel_unverified) UNKNOWN 은 "채널에서 직접 확인"(모의라 할 수 없음) 대신 모의 문구.
  * FIX2-FULLREV(FX6): 모의 항목의 부분 게시(thread_partial_*) UNKNOWN 도 같은 이유로 모의 문구.
+ * FIX4-FULLREV(S3): live 는 itemRecordLive 값 — 모의 문구는 모의임이 증명될 때(false)만. null(증명 못 함)이면 공통 줄(UNKNOWN_JOB_LINE_BY_KIND — 채널에서 직접 확인)이고,
+ * 결과 기록 없는 CONFIRMED 는 UNPROVEN_CONFIRMED_LINE(모의 기본 "MOCK 결과 확인"이 아님).
  */
-export function jobStatusTextFor(job: Parameters<typeof jobStatusText>[0], pub: Parameters<typeof jobStatusText>[1], reason: string | null | undefined, channel: string | undefined, live: boolean): string {
-  if (live && job.state === 'CONFIRMED' && !pub) return 'CONFIRMED · 실제 게시(이 작업의 결과 기록 없음 — 항목 상태·원격 결과에서 확인)';
-  const kind = live ? null : unknownKindOf(job.state, job);
+export function jobStatusTextFor(
+  job: Parameters<typeof jobStatusText>[0],
+  pub: Parameters<typeof jobStatusText>[1],
+  reason: string | null | undefined,
+  channel: string | undefined,
+  live: boolean | null,
+): string {
+  if (live === true && job.state === 'CONFIRMED' && !pub) return 'CONFIRMED · 실제 게시(이 작업의 결과 기록 없음 — 항목 상태·원격 결과에서 확인)';
+  if (live === null && job.state === 'CONFIRMED' && !pub) return UNPROVEN_CONFIRMED_LINE;
+  const kind = live === false ? unknownKindOf(job.state, job) : null;
   if (kind === 'restored_unverified') return UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK;
   if (kind === 'partial') return UNKNOWN_JOB_LINE_PARTIAL_MOCK;
   return jobStatusText(job, pub, reason, channel);

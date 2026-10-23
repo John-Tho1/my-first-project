@@ -92,11 +92,20 @@ export function userConfirmProblem(f: UserConfirmFacts, requested: string | null
   return null;
 }
 
+/**
+ * FIX4-FULLREV(S2, 사용자 결정 2026-10-23): 복원한 작업 거절(user_confirm_restored)의 복구 길 — 무조건 "새 배포 계획을 만드세요"가 아니라 카드의 결과 불명 안내와
+ * 같은 조건(Threads 에서 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인). 이 거절은 실제 Threads 계정 항목에만 나온다(모의 계정은 user_confirm_not_live 가 먼저).
+ * 화면 폼 오류 문구(apps/web DISTRIBUTE_ERROR_TEXT.user_confirm_restored)도 이 문구를 그대로 쓴다.
+ */
+export const USER_CONFIRM_RESTORED_MESSAGE =
+  '복원한 작업(읽기 전용 이력)은 이 환경에서 사용자 확인으로 기록하지 않습니다(다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).';
+
 const USER_CONFIRM_MESSAGE: Record<UserConfirmCode, string> = {
   user_confirm_not_live: '실제 Threads 계정 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(모의 결과는 해당 없음).',
   user_confirm_already_published: '이미 결과가 기록된 항목입니다(다시 기록하지 않음).',
   user_confirm_not_pending: '결과 불명(UNKNOWN)·확인 중(RECONCILING) 항목만 "Threads에서 확인함"으로 기록할 수 있습니다.',
-  user_confirm_restored: '복원한 작업(읽기 전용 이력)은 이 환경에서 사용자 확인으로 기록하지 않습니다. 새 배포 계획을 만드세요.',
+  // FIX4-FULLREV(S2): 조건부 복구 길(직접 확인해 글이 없을 때만 새 배포 계획)
+  user_confirm_restored: USER_CONFIRM_RESTORED_MESSAGE,
   user_confirm_no_attempt: '게시를 시도한 기록이 없는 작업입니다(사용자 확인 대상 아님).',
   user_confirm_publish_recorded: '게시 기록(미디어 ID)이 이미 있습니다 — 재확인으로 결과를 확정하세요.',
   user_confirm_no_candidate: '가장 최근 재확인에 확인 후보(링크)가 없습니다. 재확인을 다시 하거나 Threads 에서 직접 확인하세요.',

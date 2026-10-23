@@ -27,6 +27,10 @@ import {
   revocationNotice,
   UNKNOWN_JOB_LINE_PARTIAL_MOCK,
   UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
+  // FIX4-FULLREV(S3)
+  UNKNOWN_JOB_LINE_BY_KIND,
+  UNKNOWN_STATUS_LABEL_BY_KIND,
+  UNPROVEN_CONFIRMED_LINE,
 } from './distribution';
 
 describe('accountModeOf — 지금 계정 상태', () => {
@@ -215,5 +219,69 @@ describe('FIX2-FULLREV(Q2) — 부분 게시 UNKNOWN 상태 태그', () => {
     // UNKNOWN 이 아닌 작업은 사유 코드가 남아 있어도 모의 줄로 바꾸지 않는다
     const failed = { state: 'FAILED', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: 'restored_cancel_unverified' };
     expect(jobStatusTextFor(failed, null, null, 'threads', false)).toBe(jobStatusText(failed, null, null, 'threads'));
+  });
+});
+
+/**
+ * FIX4-FULLREV(S3, 사용자 결정 2026-10-23): 상태 태그·작업 줄의 모의·실제 선택은 한 규칙(itemRecordLive — true 실제 · false 모의 · null 증명 못 함).
+ * 모의 문구(MOCK·"실제 채널로 보낸 것 없음")는 모의임이 증명될 때만. 증명 못 함(계정 없음 등)은 조심스러운 문구(다시 보내지 않음·채널에서 직접 확인).
+ */
+describe('FIX4-FULLREV(S3) — 증명 못 한 항목(live = null)의 상태 태그·작업 줄', () => {
+  const PARTIAL = ['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped', 'thread_partial_failed', 'thread_partial_unresolved'];
+  const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode });
+
+  it('itemIsLive: 계정도 결과도 없으면 false(실제임이 증명되지 않음) — 지금 값 그대로', () => {
+    expect(itemIsLive({ accountKind: null, pub: null })).toBe(false);
+    expect(itemIsLive({ accountKind: undefined, pub: undefined })).toBe(false);
+    expect(itemIsLive({ accountKind: 'other', pub: null })).toBe(false);
+  });
+
+  it('상태 태그: 부분 게시·복원 미확정은 unknown 문구, CONFIRMED 는 UNPROVEN_CONFIRMED_LINE — 모의·실제 문구 아님', () => {
+    for (const code of PARTIAL) {
+      const t = itemStatusText('UNKNOWN', { live: null, lastErrorCode: code });
+      expect(t, code).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.unknown);
+      expect(t).not.toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock);
+      expect(t).not.toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.live);
+    }
+    expect(itemStatusText('UNKNOWN', { live: null, lastErrorCode: 'restored_cancel_unverified' })).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.unknown);
+    expect(itemStatusText('CONFIRMED', { live: null, verification: 'VERIFIED' })).toBe(UNPROVEN_CONFIRMED_LINE);
+    for (const t of [
+      itemStatusText('UNKNOWN', { live: null, lastErrorCode: 'thread_partial_failed' }),
+      itemStatusText('UNKNOWN', { live: null, lastErrorCode: 'restored_cancel_unverified' }),
+      itemStatusText('CONFIRMED', { live: null }),
+    ]) {
+      for (const w of ['MOCK', '실제 채널로 보낸 것', '실제 게시']) expect(t, w).not.toContain(w);
+      expect(t).toContain('채널에서 직접 확인');
+    }
+    // 그 밖의 상태는 ITEM_STATUS_LABEL 그대로(그 문구에는 MOCK 이 없다 — CONFIRMED 만 MOCK 문구라 위에서 따로)
+    for (const s of Object.keys(ITEM_STATUS_LABEL).filter((k) => k !== 'CONFIRMED')) {
+      expect(itemStatusText(s, { live: null }), s).toBe(ITEM_STATUS_LABEL[s]);
+      expect(itemStatusText(s, { live: null }), s).not.toContain('MOCK');
+    }
+    // 증명된 모의·실제는 지금 그대로
+    expect(itemStatusText('UNKNOWN', { live: false, lastErrorCode: 'thread_partial_failed' })).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock);
+    expect(itemStatusText('UNKNOWN', { live: true, lastErrorCode: 'thread_partial_failed' })).toBe(UNKNOWN_STATUS_LABEL_BY_KIND.partial.live);
+    expect(itemStatusText('CONFIRMED', { live: false })).toBe(ITEM_STATUS_LABEL.CONFIRMED);
+  });
+
+  it('작업 줄: 부분 게시·복원 미확정은 공통 줄(채널에서 직접 확인 — 모의 줄 아님), 결과 기록 없는 CONFIRMED 는 UNPROVEN_CONFIRMED_LINE("MOCK 결과 확인" 아님)', () => {
+    for (const code of PARTIAL) {
+      const line = jobStatusTextFor(job('UNKNOWN', code), null, 'auth', 'threads', null);
+      expect(line, code).toBe(UNKNOWN_JOB_LINE_BY_KIND.partial);
+      expect(line, code).not.toBe(UNKNOWN_JOB_LINE_PARTIAL_MOCK);
+    }
+    const restored = jobStatusTextFor(job('UNKNOWN', 'restored_cancel_unverified'), null, null, 'threads', null);
+    expect(restored).toBe(UNKNOWN_JOB_LINE_BY_KIND.restored_unverified);
+    expect(restored).not.toBe(UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK);
+    expect(jobStatusTextFor(job('CONFIRMED', null), null, null, 'threads', null)).toBe(UNPROVEN_CONFIRMED_LINE);
+    for (const t of [restored, jobStatusTextFor(job('UNKNOWN', 'thread_partial_canceled'), null, null, 'threads', null), jobStatusTextFor(job('CONFIRMED', null), null, null, 'threads', null)]) {
+      for (const w of ['MOCK', '실제 채널로 보낸 것']) expect(t, w).not.toContain(w);
+      expect(t).toContain('채널에서 직접 확인');
+    }
+    // 결과 기록이 있으면 그 기록대로(jobStatusText)
+    const pub = { isMock: true, resultKind: 'PUBLISHED', verification: 'MOCK', permalink: null } as never;
+    expect(jobStatusTextFor(job('CONFIRMED', null) as never, pub, null, 'threads', null)).toBe(jobStatusText(job('CONFIRMED', null) as never, pub, null, 'threads'));
+    // 그 밖의 상태는 jobStatusText 그대로
+    for (const st of ['QUEUED', 'SENDING', 'FAILED', 'CANCELED', 'BLOCKED']) expect(jobStatusTextFor(job(st, null), null, null, 'threads', null), st).toBe(jobStatusText(job(st, null), null, null, 'threads'));
   });
 });

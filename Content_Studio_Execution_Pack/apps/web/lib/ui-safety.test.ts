@@ -67,15 +67,23 @@ const REQUIRED: Record<string, string[]> = {
     'planCreatedBanner(hasLive)',
     'retriedBanner(hasLive)',
     // FIX2-UICLEAN: 항목 상태 태그·작업 줄·철회 배너는 그 항목·계획 기록으로
-    'itemStatusText(x.item.status, { live: itemIsLive({ accountKind: x.account?.kind, pub: latestPub })',
-    'jobStatusTextFor(j, pub, reason, channel, live)',
+    // FIX4-FULLREV(S3): (FIX2 의 itemIsLive·계정 kind 인자를 바꿈) 상태 태그·작업 줄은 한 규칙(recordLive = itemRecordLive — 모의·실제·증명 못 함)으로
+    'itemStatusText(x.item.status, { live: recordLive, verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })',
+    'jobStatusTextFor(j, pub, reason, channel, recordLive)',
     // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그에 최근 작업의 사유 코드를 넘기고, 스냅샷·실제 게시 결과 불명 안내도 종류별(새 계획을 권하지 않음)
     'const unknownKind = unknownKindOf(x.item.status, latest);',
     'verification: latestPub?.verification ?? null, lastErrorCode: latest?.lastErrorCode ?? null })',
-    // FIX2-FULLREV(FX3): 스냅샷 안내는 상태 태그와 같은 기록 기준(itemIsLive)으로 모의·실제 문구를 고른다
-    'const recordLive = itemIsLive({ accountKind: x.account?.kind, pub: latestPub });',
-    "{SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordLive ? 'live' : 'mock']}: {x.problems.map(problemLabel).join",
+    // FIX2-FULLREV(FX3): 스냅샷 안내는 상태 태그와 같은 기록 기준으로 모의·실제 문구를 고른다
+    // FIX4-FULLREV(S3): (FIX2 의 itemIsLive·두 열 선택을 바꿈) 기록 기준은 한 규칙 itemRecordLive(결과 is_mock · 계정 kind · 기록된 어댑터), 열은 mock·live·unknown
+    'const recordLive = itemRecordLive({ accountKind: x.account?.kind, pub: latestPub, intent: x.latestIntent });',
+    '{SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {x.problems.map(problemLabel).join',
     '{LIVE_UNKNOWN_GUIDANCE_BY_KIND[unknownKind]}',
+    // FIX4-FULLREV(S1·S3): 머리줄·작업 제목·결과 불명 안내·MOCK 확인 표시도 같은 recordLive — 실제 머리줄·스냅샷 안내가 보이는 카드는 결과 불명 안내도 그린다
+    "recordLive === true\n      ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null })",
+    ": itemStatusText(x.item.status, { live: null, lastErrorCode: latest?.lastErrorCode ?? null });",
+    "{recordLive === true && x.item.status === 'UNKNOWN' ? (",
+    "{x.item.status === 'CONFIRMED' && recordLive === false ? (",
+    "'작업(모의·실제 여부를 기록으로 확인할 수 없음)'",
     'revocationNoticeFor(',
     // FIX1-FULLREV(F2): 철회 배너는 부분 게시로 UNKNOWN 에 둔 작업 수(revoked_partial)도 넘긴다
     'revocationCountParam(q.revoked_partial)',

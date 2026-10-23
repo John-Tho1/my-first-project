@@ -459,9 +459,11 @@ describe('FIX2-FULLREV(FX2): 조회 한도로 UNKNOWN 인데 게시된 게시물
     expect(s.line).toBe(UNKNOWN_JOB_LINE_PARTIAL_MOCK);
     for (const t of [s.headline, s.tag, s.line]) expect(t).not.toContain('직접 확인');
     const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job, pub: null, blockReason: null });
-    // FIX3-FULLREV(R3): 실제 머리줄은 조건부 복구 길(글이 없을 때만 새 배포 계획)로 끝난다 — 모의 머리줄·태그·작업 줄에는 없다
-    expect(live).toBe('게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요(글이 없을 때만 새 배포 계획으로 다시 승인)');
-    for (const t of [s.headline, s.tag, s.line]) expect(t).not.toContain('없을 때만');
+    // FIX4-FULLREV(S1, 사용자 결정 2026-10-23): (FIX3 R3 의 조건부 복구 꼬리를 뺌) 실제 머리줄은 다시 게시하지 않음·Threads 직접 확인만 — 조건부 복구 줄은
+    // 실제 카드의 결과 불명 안내에 한 번만. 모의 머리줄·태그·작업 줄에도 그대로 없다
+    expect(live).toBe('게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요');
+    for (const t of [s.headline, s.tag, s.line, live]) expect(t).not.toContain('없을 때만');
+    expect(live).not.toContain('새 배포 계획');
     for (const t of [s.headline, s.tag, s.line, live]) expect(t).not.toContain('새 계획');
     await expectNoRepublish(x, 2);
   }

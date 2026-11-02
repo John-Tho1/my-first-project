@@ -374,3 +374,26 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - P1: G1 `pnpm dev` 0.0.0.0 바인드로 비밀번호 없는 dev 로그인이 같은 망에 노출, G2 다른 계획에서 이미 게시·결과 불명인 글의 중복 게시 경고 없음(docs/03), G3 복원 PARENTS 두 FK 누락으로 add_missing 미리보기·복원 500, G4 409 충돌 화면 no-referrer 로 다시 저장 CSRF 403.
 - 시험·빌드·dev 서버·`./data` 는 쓰지 않았다(정적 검토). 이 컨테이너의 `corepack pnpm` 은 깨져 있어 pnpm 12.6.0 을 직접 경로로 썼다(install --frozen-lockfile, lockfile 불변).
 - 다음: 권고 FIX 묶음 3개와 결정 5건(G2·G9·G16·G20·G29)을 사용자에게 묻는다. 코드는 아직 고치지 않았다.
+
+## 2026-11-02 — FIX1-FULLREV2(클라우드 세션)
+- 사용자 결정 D40("권고대로") + G17 앞당김(사용자 요청 2026-11-02). 커밋·푸시는 사용자 승인("커밋하고 푸시해줘") 뒤에 했다.
+- **FIX1-FULLREV2 d641ac4**:
+  - G1 dev 루프백 바인드
+  - G2 중복 게시 경고·실제 계정 확인 필수(D40-1)
+  - G3 복원 PARENTS FK 2개
+  - G4 충돌 화면 same-origin
+  - G5 폴링·불명 횟수 분리
+  - G6 이미 쓴 게시물 ID 후보 제외
+  - G7 finished 컨테이너 다시 읽기
+  - G8 진행 중 승인 철회 + 보류 시 PLANNED
+  - G17 로그인 multipart boundary 보존
+- 반박 검토 확정 1(P2, G8 막다른 BLOCKED) → 보완. 보완 재검토는 확정 0. 인계: `docs/handoffs/FULLREV2_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(d641ac4 와 같은 트리, 순차):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 84 / 2069 · integration 67 / 1169**
+  - drill:mock 위반 0 · dev-cert 472/472
+- 실제 Chromium E2E(로컬 dev·합성 PGlite·모의 설정): G17 multipart 로그인과 G4 충돌 화면 다시 저장 통과. 수정을 되돌린 대조에서는 두 결함이 재현됐다.
+- 독립 검증 스냅샷: zip SHA256 `ceec7e4b0ba5…3fa46`, 트리 `3f8001e2…`. 커밋 트리와 같다.
+- Codex 대기열·ChatGPT 프롬프트에 18번 `d641ac4 FIX1-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15·16·17·18번.**
+- not_run: Codex, 실제 Postgres 다중 연결, Safari·Firefox·Windows·macOS, 실제 Threads·실계정.
+- 다음: FIX2-FULLREV2(G9·G13–G16·G18·G19·G33), FIX3-FULLREV2. 사용자 결정 대기.

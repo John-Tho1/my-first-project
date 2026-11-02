@@ -81,6 +81,7 @@ export class LivePublishTargetError extends AppError {
  * "실제 게시 계정으로 사용"(enabled=true → connected) / "사용 중지"(false → disconnected). 외부 호출 없음.
  * 사용 조건: 실제(live) Threads 계정 · 프로필 ID 에 묶임(pending: 아님) · 연결 정보가 지금 쓸 수 있음(연결됨·곧 만료).
  * 상태가 바뀌면 setChannelAccountState 가 그 계정의 활성 승인을 철회한다(사용 → 다시 승인 필요가 없는 처음 상태지만, 규칙은 같게).
+ * FIX1-FULLREV2(G8): 진행 중 항목(원격 처리 중·확인 중 등)의 승인도 철회한다 — 사용 중지 → 다시 사용 뒤 그 항목의 다음 전송은 다시 승인해야 한다.
  */
 export async function setLivePublishTarget(db: Db, ownerId: string, accountId: string, enabled: boolean, now: Date = new Date()) {
   if (!isUuid(accountId)) throw new NotFoundError('배포 계정을 찾을 수 없습니다');

@@ -55,17 +55,18 @@ AI 생성은 input_version을 고정한다. 생성 중 원고가 바뀌어도 �
 | 채널 변환 | POST /api/contents/{id}/variants | 채널별 버전 생성 |
 | 파일 등록 | POST /api/assets/uploads | 제한된 업로드 권한; 완료 검증 후 VERIFIED |
 | 배포계획 | POST /api/distribution-plans | 채널별 불변 스냅샷 후보 |
-| 승인 | POST /api/distribution-plans/{id}/approve | item IDs+예상 hash, 명시 확인 |
-| 실행 | POST /api/distribution-plans/{id}/execute | approval+command key 필수, jobs 생성 |
+| 승인 | POST /api/distribution-plans/{id}/approve | item IDs+예상 hash, 명시 확인. 같은 owner 의 다른 계획에 같은 글(같은 채널 초안 버전+같은 계정 또는 같은 payload_hash)이 이미 게시됨(결과 기록, USER_CONFIRMED 포함)·결과 불명·진행 중(QUEUED·SENDING·REMOTE_PROCESSING·RETRY_WAIT·RECONCILING·CANCEL_REQUESTED·BLOCKED)이면 실제 계정 항목은 acknowledge_duplicate: true(JSON boolean) 필요 — 없으면 409 duplicate_publish_unacknowledged(아무것도 바꾸지 않음), 모의 계정은 경고만(200 duplicate_warnings). PLANNED·CANCELED·FAILED 는 세지 않음(FIX1-FULLREV2 G2, D40-1) |
+| 실행 | POST /api/distribution-plans/{id}/execute | approval+command key 필수, jobs 생성. 승인과 같은 중복 규칙을 실행 때 다시 조회(실제 게시 항목은 acknowledge_duplicate: true, 없으면 409 — 대기열·실행 키 그대로). 실행 뒤 전송 전에 생긴 중복은 막지 않음(화면 경고만) |
+| 계획 상세 | GET /api/distribution-plans/{id} | 항목마다 duplicate_publishes(다른 계획의 같은 글 — plan_id·item_id·status·kind published/unknown/in_progress·mock·verification)·duplicate_ack_required(실행 전 실제 계정 항목에 중복) |
 | 취소 | POST /api/distribution-items/{id}/cancel | 취소 완료와 확인 중을 구분 |
 | 작업 조회 | GET /api/jobs/{id} | 비밀 제거, 실제 상태 반환 |
 | 계정 연결 | POST /api/channel-accounts/{id}/connect, GET /api/oauth/callback | state 1회용·PKCE·redirect 정확 일치, 토큰은 서버 암호화 저장(D24·D25) |
 | 연결 상태·갱신·철회 | GET /api/channel-accounts/{id}/health, POST …/refresh·/check·/revoke | 비밀 제거, 다른 owner 404, 철회 시 해당 계정 승인 무효. 실제 Threads 는 철회 API 없음 → remote_revoke=unsupported + 로컬 삭제(LIVE-T1) |
-| 실제 게시 계정 사용(LIVE-P1, D38) | POST /api/channel-accounts/{id}/publish-target { enabled } | 실제 Threads 계정만(묶임·쓸 수 있는 연결 정보일 때 connected, 사용 중지는 disconnected + 그 계정 활성 승인 철회). 외부 호출 없음. 실제 게시는 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS·서버 승인(hash)이 모두 있을 때만 |
+| 실제 게시 계정 사용(LIVE-P1, D38) | POST /api/channel-accounts/{id}/publish-target { enabled } | 실제 Threads 계정만(묶임·쓸 수 있는 연결 정보일 때 connected, 사용 중지는 disconnected + 그 계정 활성 승인 철회 — 보내는 중·원격 처리 중·확인 중 항목 포함, 작업 상태는 그대로이고 다음 전송은 다시 승인 필요 — 보내는 중 시도가 보류(즉시 중지·인증 거절)로 끝나면 항목 PLANNED(다시 승인 가능), 스레드 일부가 게시됐으면 UNKNOWN(FIX1-FULLREV2 G8)). 외부 호출 없음. 실제 게시는 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS·서버 승인(hash)이 모두 있을 때만 |
 | 실제 게시 즉시 중지·재개(LIVE-P2, D39) | POST /api/live-publish/pause · POST /api/live-publish/resume { confirm_text: '재개' } | 로그인·같은 출처. owner 당 live_publish_controls 한 행(없으면 중지 아님, 내보내기 제외). 중지는 확인 없이 바로, 재개는 확인 문구 필요. 전송 직전(beginSend) 같은 트랜잭션에서 확인 → BLOCKED live_publish_paused(보내지 않음). 감사 live_publish_paused·resumed. 외부 호출 없음. 최근 24시간 상한 PUBLISH_LIVE_DAILY_MAX(없으면 상한 없음) → BLOCKED live_publish_daily_limit |
 | 실제 Threads 계정 행(연결 전) | POST /api/channel-accounts (platform=threads, kind=live) | LIVE-T1(D31): owner 범위·같은 출처·멱등, external_account_id `pending:<uuid>` → 첫 실제 연결이 프로필 ID 로 묶음, state disconnected(게시 불가), 외부 호출 없음 |
 | 원격 재확인 | POST /api/distribution-items/{id}/reconcile | 기존 결과 조회만 수행 |
-| Threads에서 확인함(LIVEP1-USERCONFIRM) | POST /api/distribution-items/{id}/user-confirm { candidate_external_id } | 결과 불명 실제 Threads 게시(UNKNOWN·RECONCILING, 게시 시도 표식 있음, 결과 없음)의 가장 최근 재확인 후보를 사용자가 직접 확인했다는 기록 — 요청 ID = 그 후보일 때만. 결과 verification USER_CONFIRMED(앱 검증 VERIFIED 아님)·confirmed_by owner·confirmed_at, 작업 CONFIRMED. 외부 호출·재게시 없음, 아니면 409 user_confirm_* |
+| Threads에서 확인함(LIVEP1-USERCONFIRM) | POST /api/distribution-items/{id}/user-confirm { candidate_external_id } | 결과 불명 실제 Threads 게시(UNKNOWN·RECONCILING, 게시 시도 표식 있음, 결과 없음)의 가장 최근 재확인 후보를 사용자가 직접 확인했다는 기록 — 요청 ID = 그 후보일 때만. 결과 verification USER_CONFIRMED(앱 검증 VERIFIED 아님)·confirmed_by owner·confirmed_at, 작업 CONFIRMED. 외부 호출·재게시 없음, 아니면 409 user_confirm_*. 후보 외부 ID 가 같은 owner 의 다른 항목 결과·다른 작업 게시 기록으로 이미 있으면 409 user_confirm_candidate_claimed(글 하나를 두 항목의 게시로 기록하지 않음 — 작업 처리기의 재확인도 그런 글은 후보로 남기지 않는다, FIX1-FULLREV2 G6) |
 | 가져오기 | POST /api/imports/preview, /api/imports/{id}/commit | 범위→차이→확정, 외부 원본 보존 |
 | 내보내기 | POST /api/exports | Markdown/JSON/assets, 인증 비밀 제외 |
 | 복원 미리보기 | POST /api/restores/preview | 버전·checksum·충돌 검사 |

@@ -33,13 +33,16 @@ const MAX_LOGIN_BODY = 8 * 1024;
 
 async function parseIdentity(request: Request): Promise<string> {
   const bytes = await readBodyCapped(request, MAX_LOGIN_BODY);
-  const type = (request.headers.get('content-type') ?? '').toLowerCase();
+  // FIX1-FULLREV2(G17): 미디어 유형 판별만 대소문자를 무시한다. 파싱에는 원래 Content-Type 을 그대로 넘긴다 — multipart 의 boundary 값은
+  // 대소문자를 구분하므로(Chrome·Safari `----WebKitFormBoundary…`) 소문자로 바꾸면 본문과 맞지 않아 맞는 식별자도 400·실패 1회가 됐다.
+  const rawType = request.headers.get('content-type') ?? '';
+  const type = rawType.toLowerCase();
   let raw: unknown;
   try {
     if (type.startsWith('application/json')) {
       raw = JSON.parse(new TextDecoder().decode(bytes));
     } else if (type.startsWith('application/x-www-form-urlencoded') || type.startsWith('multipart/form-data')) {
-      const form = await new Response(bytes, { headers: { 'content-type': type } }).formData();
+      const form = await new Response(bytes, { headers: { 'content-type': rawType } }).formData();
       raw = { identity: form.get('identity') };
     } else {
       throw new BadRequestError();

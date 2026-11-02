@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { canTransitionJob, JOB_TRANSITIONS, PUBLICATION_VERIFICATIONS, transitionJobState } from './jobs';
 import {
+  USER_CONFIRM_CLAIMED_MESSAGE,
   USER_CONFIRM_CODES,
   USER_CONFIRM_RESTORED_MESSAGE,
   USER_CONFIRM_WARNING,
@@ -64,6 +65,7 @@ const ok: UserConfirmFacts = {
   publishSteps: 0,
   publications: 0,
   candidate: { external_id: ID, permalink: LINK },
+  candidateClaimed: false,
 };
 
 describe('userConfirmProblem — 허용 조건이 모두 있을 때만 null', () => {
@@ -87,6 +89,9 @@ describe('userConfirmProblem — 허용 조건이 모두 있을 때만 null', ()
     ['게시 시도 표식 없음', { publishAttempts: 0 }, ID, 'user_confirm_no_attempt'],
     ['게시 기록(미디어 ID)이 이미 있음 — 재확인으로 확정', { publishSteps: 1 }, ID, 'user_confirm_publish_recorded'],
     ['후보 없음', { candidate: null }, ID, 'user_confirm_no_candidate'],
+    // FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과(글 하나를 두 항목의 게시로 기록하지 않음) — 요청이 그 후보 ID 를 그대로 보내도 거절
+    ['후보가 이미 다른 항목의 결과', { candidateClaimed: true }, ID, 'user_confirm_candidate_claimed'],
+    ['후보가 다른 항목의 결과 + 요청 후보도 다름 → 먼저 claimed', { candidateClaimed: true }, 'threads:18000000000999999', 'user_confirm_candidate_claimed'],
     ['요청한 후보가 다름(낡은 화면)', {}, 'threads:18000000000999999', 'user_confirm_candidate_mismatch'],
     ['요청한 후보 없음', {}, null, 'user_confirm_candidate_mismatch'],
   ])('%s → %s', (_, patch, requested, code) => {
@@ -94,6 +99,19 @@ describe('userConfirmProblem — 허용 조건이 모두 있을 때만 null', ()
   });
   it('모의 계정은 다른 조건이 다 맞아 보여도 실제가 아님이 먼저(모의 결과는 사용자 확인이 될 수 없음)', () => {
     expect(userConfirmProblem({ ...ok, account: { kind: 'mock', platform: 'threads' }, publications: 1, jobState: 'CONFIRMED' }, ID)).toBe('user_confirm_not_live');
+  });
+  it('FIX1-FULLREV2(G6): user_confirm_candidate_claimed — 409, 다른 항목의 결과라는 사실 + 조건부 복구 길(직접 확인해 글이 없을 때만 새 배포 계획) · 코드 순서는 후보 없음 뒤·후보 다름 앞', () => {
+    expect(USER_CONFIRM_CODES.indexOf('user_confirm_candidate_claimed')).toBe(USER_CONFIRM_CODES.indexOf('user_confirm_no_candidate') + 1);
+    expect(USER_CONFIRM_CODES.indexOf('user_confirm_candidate_mismatch')).toBe(USER_CONFIRM_CODES.indexOf('user_confirm_candidate_claimed') + 1);
+    const e = new UserConfirmError('user_confirm_candidate_claimed');
+    expect(e.kind).toBe('conflict');
+    expect(e.code).toBe('user_confirm_candidate_claimed');
+    expect(e.message).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+    expect(e.message).toBe(
+      '이 확인 후보 글은 이미 다른 배포 항목의 게시 결과로 기록돼 있어 이 항목의 결과로 기록하지 않습니다(글 하나를 두 항목의 게시로 기록하지 않음 — 다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 이 항목의 글이 따로 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요.',
+    );
+    // 후보 없음이 먼저(후보가 없으면 claimed 판정 대상이 아님)
+    expect(userConfirmProblem({ ...ok, candidate: null, candidateClaimed: true }, ID)).toBe('user_confirm_no_candidate');
   });
   it('UserConfirmError 는 409 conflict + 코드', () => {
     const e = new UserConfirmError('user_confirm_no_candidate');

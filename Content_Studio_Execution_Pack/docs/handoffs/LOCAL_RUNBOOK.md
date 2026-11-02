@@ -22,8 +22,9 @@ corepack pnpm install --frozen-lockfile
 cp .env.example .env.local
 corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm test:integration
 corepack pnpm db:seed                    # 10 inserted / 10 total
-corepack pnpm dev                        # http://localhost:3000
+corepack pnpm dev                        # http://localhost:3000 (이 PC 에서만 — 아래 참고)
 ```
+`pnpm dev` 는 hostname 을 주지 않으면 이 PC(loopback)에서만 듣는다(FIX1-FULLREV2 G1 — `APP_BASE_URL` 호스트가 `127.0.0.1` 이면 `127.0.0.1`, 그 밖은 `localhost`). 같은 망의 다른 기기에서 열어야 할 때만 `corepack pnpm dev --hostname <주소>` 로 직접 주고, loopback 이 아니면 비밀번호 없는 개발용 로그인이 그 망에 열린다는 경고 한 줄이 나온다(README_KO "설치·실행").
 문제가 나면 그 출력 그대로 로컬 Claude Code 세션에 붙여 넣는다(예상 지점: `tools/env.sh`의 cygpath, `process.loadEnvFile`, PGlite 잠금 `process.kill(pid,0)` Windows 동작, eslint 10 peer 경고).
 
 ## 2. Codex 검증 (작업별 커밋 1개 = 리뷰 1회)

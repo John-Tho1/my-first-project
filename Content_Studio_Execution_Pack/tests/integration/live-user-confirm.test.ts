@@ -28,7 +28,7 @@ import {
   setVariantLifecycle,
   type Db,
 } from '@cs/db';
-import { checkIntegrity, livePublishReadiness, loadConfig, type AppConfig, type Channel } from '@cs/domain';
+import { checkIntegrity, livePublishReadiness, loadConfig, USER_CONFIRM_CLAIMED_MESSAGE, type AppConfig, type Channel } from '@cs/domain';
 import {
   createMockAdapterRegistry,
   LiveCapableAdapterRegistry,
@@ -49,7 +49,7 @@ import { POST as retryPOST } from '../../apps/web/app/api/distribution-items/[id
 import { POST as reconcilePOST } from '../../apps/web/app/api/distribution-items/[id]/reconcile/route';
 import { POST as cancelPOST } from '../../apps/web/app/api/distribution-items/[id]/cancel/route';
 import { POST as userConfirmPOST } from '../../apps/web/app/api/distribution-items/[id]/user-confirm/route';
-import { liveCandidateForCard, liveItemHeadline, liveVerificationLabel, userConfirmCandidateForCard } from '../../apps/web/lib/distribution';
+import { liveCandidateForCard, liveItemHeadline, liveVerificationLabel, userConfirmCandidateForCard, userConfirmClaimedNotice } from '../../apps/web/lib/distribution';
 import { jobCredentials } from '../../apps/web/lib/oauth';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
@@ -585,5 +585,177 @@ describe('Threads에서 확인함 — 409(아무것도 바꾸지 않음, 네트�
     // 확인 기록이 남은 감사 없음
     const audit = await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.action, 'item.user_confirm'), eq(schema.auditEvents.entityId, s.itemId))).orderBy(desc(schema.auditEvents.at));
     expect(audit).toHaveLength(0);
+  });
+});
+
+/**
+ * FIX1-FULLREV2(G6): 같은 승인된 채널 초안·같은 실제 Threads 계정의 두 계획(D17(a) — approved 파생본으로 새 계획)에서 글 하나가 두 항목의 결과로 기록되지 않는다.
+ * - 작업 처리기의 재확인은 이미 다른 항목의 결과(또는 다른 작업의 게시 기록)인 글을 이 항목의 확인 후보로 남기지 않는다(candidate_claimed).
+ * - 후보를 남긴 뒤에 다른 항목이 그 글을 결과로 가지면, 사용자 확인은 409 user_confirm_candidate_claimed(아무것도 쓰지 않음)·카드는 버튼 대신 이유.
+ * 네트워크 0(fixture fetch 만), 재게시 0.
+ */
+describe('FIX1-FULLREV2(G6): 다른 항목의 결과로 이미 기록된 글은 사용자 확인 후보가 되지 못한다', () => {
+  const MAX = '100';
+  /** 게시 시간 초과(표식 뒤) → RECONCILING. 목록 재확인은 posts() 가 그때 돌려주는 글(시험이 바꿔 끼움). */
+  async function ambiguousWithList(text: string, ref: string, posts: () => Array<Record<string, unknown>>) {
+    const { planId, itemId } = await planApproved(text);
+    const config = fullCfg(ref, MAX);
+    expect((await execute(planId)).status).toBe(200);
+    const fx = publishFixture((ids) => ({
+      [`POST /v1.0/${PROFILE_ID}/threads`]: () => jsonRes(200, { id: ids.ct }),
+      [`GET /v1.0/${ids.ct}`]: () => jsonRes(200, { status: 'FINISHED', id: ids.ct }),
+      [`POST /v1.0/${PROFILE_ID}/threads_publish`]: timeoutErr(),
+      [`GET /v1.0/${PROFILE_ID}/threads`]: () => jsonRes(200, { data: posts() }),
+    }));
+    const reg = registryWith(fx.fetch, config);
+    expect((await tick(reg, config, planId)).results).toEqual({ RECONCILING: 1 });
+    const attemptAt = (await db.select().from(schema.remoteSteps).where(and(eq(schema.remoteSteps.itemId, itemId), eq(schema.remoteSteps.kind, 'publish_attempt'))))[0]!.createdAt.getTime();
+    setGates({});
+    return { planId, itemId, fx, reg, config, attemptAt };
+  }
+  const pubsWith = (externalId: string) => db.select().from(schema.publications).where(eq(schema.publications.externalId, externalId));
+  const lastEventOf = async (itemId: string) => (await eventsOf((await jobOf(itemId)).id)).at(-1)!;
+  const confirmAudits = (itemId: string) =>
+    db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.action, 'item.user_confirm'), eq(schema.auditEvents.entityId, itemId)));
+
+  it('(a) 같은 본문 두 계획: A 결과 불명(표식 뒤 시간 초과) · B 정상 게시(VERIFIED) → A 재확인 목록의 같은 본문 글이 B 의 글 하나 → 후보로 남기지 않음(candidate_claimed) · 카드 후보·버튼 없음 · 확인 요청 409 · A 결과 0, 그 글의 결과는 B 하나', async () => {
+    const TEXT = 'FULLREV2 G6 같은 본문 두 계획 — 한쪽 정상 게시 글.';
+    let listed: Array<Record<string, unknown>> = [];
+    const a = await ambiguousWithList(TEXT, 'G6-a', () => listed);
+    // B: 같은 본문을 같은 계정에 새 계획으로 — 정상 게시(A 의 표식 시각 +30초)
+    const b = await planApproved(TEXT);
+    const cfgB = fullCfg('G6-a-b', MAX);
+    expect((await execute(b.planId)).status).toBe(200);
+    const fxB = publishFixture((ids) => ({
+      [`POST /v1.0/${PROFILE_ID}/threads`]: () => jsonRes(200, { id: ids.ct }),
+      [`GET /v1.0/${ids.ct}`]: () => jsonRes(200, { status: 'FINISHED', id: ids.ct }),
+      [`POST /v1.0/${PROFILE_ID}/threads_publish`]: () => jsonRes(200, { id: ids.media }),
+      [`GET /v1.0/${ids.media}`]: () => jsonRes(200, { id: ids.media, permalink: permalinkOf(ids.media), text: TEXT, timestamp: ts(a.attemptAt + 30_000), media_type: 'TEXT_POST' }),
+    }));
+    expect((await tick(registryWith(fxB.fetch, cfgB), cfgB, b.planId)).results).toEqual({ CONFIRMED: 1 });
+    setGates({});
+    const bId = `threads:${fxB.ids.media}`;
+    expect((await pubsOf(b.itemId))[0]).toMatchObject({ externalId: bId, verification: 'VERIFIED' });
+
+    // A 재확인: 최근 글 목록에는 B 의 글 하나뿐(같은 본문·A 의 표식 ±2분)
+    listed = [{ id: fxB.ids.media, text: TEXT, timestamp: ts(a.attemptAt + 30_000), permalink: permalinkOf(fxB.ids.media) }];
+    expect((await tick(a.reg, a.config, a.planId, 20 * MIN)).results).toEqual({ RECONCILING: 1 });
+    const ev = await lastEventOf(a.itemId);
+    expect(ev.sanitizedDetails).toMatchObject({ reconcile: 'unknown', error_code: 'publish_unconfirmed_candidate_claimed', candidate_claimed: true });
+    expect(ev.sanitizedDetails).not.toHaveProperty('candidate_external_id');
+    expect(ev.sanitizedDetails).not.toHaveProperty('candidate_permalink');
+    const d = (await getPlanDetail(db, owner, a.planId))!.items[0]!;
+    expect(liveCandidateForCard(d)).toBeNull();
+    expect(userConfirmCandidateForCard(d)).toBeNull();
+    expect(d.candidateClaimed).toBe(false); // 남긴 후보가 없다
+    const r = await confirmJson(a.itemId, bId);
+    expect(r.res.status, JSON.stringify(r.body)).toBe(409);
+    expect(r.body.error).toBe('user_confirm_no_candidate');
+    expect(r.fetchCalls).toBe(0);
+    expect(await pubsOf(a.itemId)).toHaveLength(0);
+    expect((await jobOf(a.itemId)).state).toBe('RECONCILING');
+    expect(await pubsWith(bId)).toHaveLength(1);
+    expect(await confirmAudits(a.itemId)).toHaveLength(0);
+    // 재게시 없음(A 의 게시 요청은 처음 1번뿐)
+    expect(a.fx.calls.filter((c) => c.endsWith('threads_publish'))).toHaveLength(1);
+  });
+
+  it('(b) 같은 본문 두 계획이 모두 결과 불명이고 글은 하나 → 둘 다 같은 후보 → B 를 "Threads에서 확인함" → A 카드는 버튼 대신 이유 · A 확인 409 user_confirm_candidate_claimed(아무것도 쓰지 않음) · A 의 다음 재확인은 그 글을 후보로 남기지 않음', async () => {
+    const TEXT = 'FULLREV2 G6 둘 다 결과 불명인 같은 본문 글.';
+    let listed: Array<Record<string, unknown>> = [];
+    const a = await ambiguousWithList(TEXT, 'G6-b', () => listed);
+    const b = await ambiguousWithList(TEXT, 'G6-b2', () => listed);
+    const media = nextId();
+    const cid = `threads:${media}`;
+    listed = [{ id: media, text: TEXT, timestamp: ts(a.attemptAt + 30_000), permalink: permalinkOf(media) }];
+    for (const x of [a, b]) expect((await tick(x.reg, x.config, x.planId, 20 * MIN)).results).toEqual({ RECONCILING: 1 });
+    for (const x of [a, b]) {
+      const d = (await getPlanDetail(db, owner, x.planId))!.items[0]!;
+      expect(d.candidateClaimed).toBe(false);
+      expect(userConfirmCandidateForCard(d)).toEqual({ external_id: cid, permalink: permalinkOf(media) });
+      expect(userConfirmClaimedNotice(d, true, true)).toBeNull();
+    }
+    const rb = await confirmJson(b.itemId, cid);
+    expect(rb.res.status, JSON.stringify(rb.body)).toBe(200);
+    expect(rb.body).toMatchObject({ state: 'CONFIRMED', verification: 'USER_CONFIRMED', external_id: cid });
+
+    // A 카드: 후보(미확인)는 보이지만 버튼 대신 이유 — 서버 거절과 같은 문구
+    const dA = (await getPlanDetail(db, owner, a.planId))!.items[0]!;
+    expect(dA.candidateClaimed).toBe(true);
+    expect(liveCandidateForCard(dA)).toEqual({ externalId: cid, permalink: permalinkOf(media) });
+    expect(userConfirmCandidateForCard(dA)).toBeNull();
+    expect(userConfirmClaimedNotice(dA, true, true)).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+    const jobBefore = await jobOf(a.itemId);
+    const eventsBefore = (await eventsOf(jobBefore.id)).length;
+    const ra = await confirmJson(a.itemId, cid);
+    expect(ra.res.status, JSON.stringify(ra.body)).toBe(409);
+    expect(ra.body).toMatchObject({ error: 'user_confirm_candidate_claimed', message: USER_CONFIRM_CLAIMED_MESSAGE });
+    expect(ra.fetchCalls).toBe(0);
+    expect(await pubsOf(a.itemId)).toHaveLength(0);
+    expect(await jobOf(a.itemId)).toMatchObject({ state: jobBefore.state, attempt: jobBefore.attempt });
+    expect((await itemOf(a.itemId)).status).toBe('RECONCILING');
+    expect(await eventsOf(jobBefore.id)).toHaveLength(eventsBefore);
+    expect(await pubsWith(cid)).toHaveLength(1);
+    expect((await pubsWith(cid))[0]!.itemId).toBe(b.itemId);
+    expect(await confirmAudits(a.itemId)).toHaveLength(0);
+
+    // A 의 다음 재확인(작업 처리기): 이제 B 의 결과인 글 — 후보로 남기지 않는다
+    expect((await tick(a.reg, a.config, a.planId, 20 * MIN)).results).toEqual({ RECONCILING: 1 });
+    const ev = await lastEventOf(a.itemId);
+    expect(ev.sanitizedDetails).toMatchObject({ error_code: 'publish_unconfirmed_candidate_claimed', candidate_claimed: true });
+    expect(ev.sanitizedDetails).not.toHaveProperty('candidate_external_id');
+    const dA2 = (await getPlanDetail(db, owner, a.planId))!.items[0]!;
+    expect(liveCandidateForCard(dA2)).toBeNull();
+    expect(userConfirmCandidateForCard(dA2)).toBeNull();
+    for (const x of [a, b]) expect(x.fx.calls.filter((c) => c.endsWith('threads_publish'))).toHaveLength(1);
+  });
+
+  it('(c) B 가 게시한 직후 응답을 잃음(게시 기록 publish 단계는 있고 결과 행은 아직 없음 — RECONCILING) → A 재확인은 그 글을 후보로 남기지 않음 · B 는 재확인으로 CONFIRMED(그 글의 결과는 B 하나)', async () => {
+    const TEXT = 'FULLREV2 G6 게시 기록만 있고 결과는 아직 없는 같은 본문 글.';
+    let listed: Array<Record<string, unknown>> = [];
+    const a = await ambiguousWithList(TEXT, 'G6-c', () => listed);
+    const b = await planApproved(TEXT);
+    const cfgB = fullCfg('G6-c-b', MAX);
+    expect((await execute(b.planId)).status).toBe(200);
+    const fxB = publishFixture((ids) => ({
+      [`POST /v1.0/${PROFILE_ID}/threads`]: () => jsonRes(200, { id: ids.ct }),
+      [`GET /v1.0/${ids.ct}`]: () => jsonRes(200, { status: 'FINISHED', id: ids.ct }),
+      [`POST /v1.0/${PROFILE_ID}/threads_publish`]: () => jsonRes(200, { id: ids.media }),
+      [`GET /v1.0/${ids.media}`]: () => jsonRes(200, { id: ids.media, permalink: permalinkOf(ids.media), text: TEXT, timestamp: ts(a.attemptAt + 30_000), media_type: 'TEXT_POST' }),
+    }));
+    const regB = registryWith(fxB.fetch, cfgB);
+    const liveB = regB.getAdapterById('live_threads')!;
+    // 게시·게시 기록까지 끝난 뒤 응답을 잃는다(작업 처리기는 결과를 모름 → 결과 불명 RECONCILING, 결과 행 없음)
+    const original = liveB.submit.bind(liveB);
+    const lost = vi.spyOn(liveB, 'submit').mockImplementationOnce(async (prepared, c) => {
+      await original(prepared, c);
+      throw new Error('FULLREV2 G6 시험: 게시 뒤 응답 유실');
+    });
+    try {
+      expect((await tick(regB, cfgB, b.planId)).results).toEqual({ RECONCILING: 1 });
+    } finally {
+      lost.mockRestore();
+    }
+    setGates({});
+    const bId = `threads:${fxB.ids.media}`;
+    expect(await pubsOf(b.itemId)).toHaveLength(0);
+    expect((await db.select().from(schema.remoteSteps).where(and(eq(schema.remoteSteps.itemId, b.itemId), eq(schema.remoteSteps.kind, 'publish'))))[0]!.remoteId).toBe(`threads:post:${fxB.ids.media}`);
+
+    listed = [{ id: fxB.ids.media, text: TEXT, timestamp: ts(a.attemptAt + 30_000), permalink: permalinkOf(fxB.ids.media) }];
+    expect((await tick(a.reg, a.config, a.planId, 20 * MIN)).results).toEqual({ RECONCILING: 1 });
+    const ev = await lastEventOf(a.itemId);
+    expect(ev.sanitizedDetails).toMatchObject({ error_code: 'publish_unconfirmed_candidate_claimed', candidate_claimed: true });
+    expect(ev.sanitizedDetails).not.toHaveProperty('candidate_external_id');
+    const dA = (await getPlanDetail(db, owner, a.planId))!.items[0]!;
+    expect(liveCandidateForCard(dA)).toBeNull();
+    expect(userConfirmCandidateForCard(dA)).toBeNull();
+    expect((await confirmJson(a.itemId, bId)).body.error).toBe('user_confirm_no_candidate');
+    expect(await pubsOf(a.itemId)).toHaveLength(0);
+
+    // B 는 자기 게시 기록으로 확인(재게시 없음)
+    expect((await tick(regB, cfgB, b.planId, 30 * MIN)).results).toEqual({ CONFIRMED: 1 });
+    expect(await pubsWith(bId)).toHaveLength(1);
+    expect((await pubsWith(bId))[0]!.itemId).toBe(b.itemId);
+    expect(fxB.calls.filter((c) => c.endsWith('threads_publish'))).toHaveLength(1);
   });
 });

@@ -184,11 +184,17 @@ export const FORM_ERROR_TEXT: Record<string, string> = {
 export const esc = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-const CONFLICT_HEADERS = {
+/**
+ * 409 비교 화면(원고 본문·원고 정보·카드, 소재 긴 입력 — captures/[id] route 도 이 값을 쓴다)의 응답 헤더.
+ * FIX1-FULLREV2(G4): Referrer-Policy 는 same-origin — 이 화면의 재저장 폼은 같은 출처로 POST 한다. no-referrer 면 브라우저가 그 POST 를
+ * `Origin: null`·Referer 없이 보내(Fetch "append a request Origin header") assertSameOrigin 이 CSRF 로 거부했다(A02 재저장 불가).
+ * same-origin 은 같은 출처 요청에만 Origin·Referer 를 보내고 다른 출처로는 Referer 를 보내지 않는다. 서버의 `Origin: null` 거부는 그대로다.
+ */
+export const CONFLICT_HTML_HEADERS = {
   'content-type': 'text/html; charset=utf-8',
   'cache-control': 'no-store',
   'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
-  'referrer-policy': 'no-referrer',
+  'referrer-policy': 'same-origin',
 } as const;
 
 const PAGE_STYLE = `body{font-family:system-ui,sans-serif;max-width:1080px;margin:0 auto;padding:16px;line-height:1.5}
@@ -248,7 +254,7 @@ ${renderDiffHtml(diffLines(current.body, yours.body))}
 <p><button type="submit">내 본문으로 새 버전 저장(현재 버전 ${current.version} 기준)</button> <a href="/contents/${id}">저장하지 않고 돌아가기</a></p>
 </form>`,
   );
-  return new Response(html, { status: 409, headers: CONFLICT_HEADERS });
+  return new Response(html, { status: 409, headers: CONFLICT_HTML_HEADERS });
 }
 
 export interface ConflictField {
@@ -298,7 +304,7 @@ ${inputs}
 <p><button type="submit">내 입력으로 다시 저장(현재 수정 ${opts.currentRevision} 기준)</button> <a href="${esc(opts.backHref)}">저장하지 않고 돌아가기</a></p>
 </form>`,
   );
-  return new Response(html, { status: 409, headers: CONFLICT_HEADERS });
+  return new Response(html, { status: 409, headers: CONFLICT_HTML_HEADERS });
 }
 
 export const tagsText = (tags: unknown) => (Array.isArray(tags) ? tags.join(', ') : '');

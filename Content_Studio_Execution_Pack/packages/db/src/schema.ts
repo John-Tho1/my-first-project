@@ -1213,7 +1213,8 @@ export const approvals = pgTable(
  * DB 작업(docs/04 jobs) = transactional outbox 의 작업 행. T10 은 execute 에서 QUEUED 로 만들고, T11(D18) 작업 처리기가 처리한다.
  * idempotency_key = 'publish:<item>:<approval>' unique. 같은 항목의 진행 중 작업(ACTIVE_JOB_STATES)은 1개(부분 unique).
  * 상태 전이는 @cs/domain jobs.ts JOB_TRANSITIONS 로만. lease_owner·lease_until 은 전송·조회 lease(짧은 트랜잭션), heartbeat_at 은 연장 시각.
- * attempt = 전송 시도 횟수(전송 lease 마다 +1), reconcile_count = 이번 시도의 원격 조회 확인 불가·처리 중 횟수.
+ * attempt = 전송 시도 횟수(전송 lease 마다 +1), reconcile_count = 이번 시도의 원격 조회 **연속** 확인 불가 횟수.
+ * FIX1-FULLREV2(G5): 원격 처리 중(processing) 조회는 이 열을 0 으로 되돌리고, 처리 중 조회 수(REMOTE_POLL_MAX 한도)는 job_events 에서 따로 센다(jobs.ts).
  */
 export const jobs = pgTable(
   'jobs',

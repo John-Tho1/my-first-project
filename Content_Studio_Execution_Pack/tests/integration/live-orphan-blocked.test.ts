@@ -3,6 +3,9 @@
  * 승인 철회·무효나 beginSend approval_missing·snapshot_stale 로 항목이 PLANNED 로 돌아간 옛 BLOCKED 작업(고아)은 재시도·취소·전송 어느 길로도 보내지 않으므로
  * 세지 않는다 — 세면 PUBLISH_LIVE_MAX_POSTS=1 에서 다시 승인 → 실행이 승인 기록과 관계없이 늘 429 가 된다. 다시 보낼 수 있는 보류 작업은 지금처럼 센다.
  * + FIX1-FULLREV(F2) 실제 게시 변형: 게시 시도 표식(publish_attempt) 뒤 401 로 보류된 작업의 철회는 PLANNED 가 아니라 UNKNOWN.
+ * + FIX1-FULLREV2(G7): 컨테이너 finished 기록 뒤 24시간 넘게 보류된 작업의 재시도는 표식 전에 상태를 다시 읽어 EXPIRED 면 표식·게시 없이 FAILED.
+ * + FIX1-FULLREV2(G8): 원격 처리 중 "실제 게시 계정으로 사용" 중지 → 다시 사용은 그 항목의 승인도 철회 — 재개 뒤 다시 승인 없이 게시하지 않음.
+ * + FIX1-FULLREV2(G8 후속): 보내는 중 같은 토글 뒤 그 시도가 표식 전 즉시 중지로 보류돼도 막다른 길(BLOCKED — 재시도·다시 승인 둘 다 409)이 아니라 항목 PLANNED(다시 승인 가능).
  * **실제 네트워크 호출 0**: OAuth 는 fixture(globalThis.fetch 교체), 게시 어댑터에는 fixture fetch 주입. 토큰·시크릿은 가짜(FAKE_…), ID 는 가짜 숫자.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -80,7 +83,7 @@ interface Call {
 }
 let idSeq = 500;
 const nextId = () => `18000000000${String(++idSeq).padStart(6, '0')}`;
-function publishFixture(routes: (ids: { ct: string; media: string }) => Record<string, () => Response>) {
+function publishFixture(routes: (ids: { ct: string; media: string }) => Record<string, () => Response | Promise<Response>>) {
   const ids = { ct: nextId(), media: nextId() };
   const calls: Call[] = [];
   const table = routes(ids);
@@ -574,5 +577,210 @@ describe('FIX1-FULLREV(F2 후속2) 실제 게시 변형: 게시 시도 표식 �
     expect(latest).toMatchObject({ id: stopped!.id, state: 'CONFIRMED', cancelRequestedAt: null });
     expect(!!latest.cancelRequestedAt && latest.state === 'CONFIRMED').toBe(false);
     expect(publishesOf(x.fx.calls)).toHaveLength(1);
+  });
+});
+
+/** FIX1-FULLREV2: 작업 처리기 시계를 앞으로 민 tick(이 계획의 작업만) */
+async function tickAt(registry: LiveCapableAdapterRegistry, config: AppConfig, planId: string, aheadMs: number) {
+  return runJobsTick(db, registry, { ...runOpts(config), planId, clock: () => new Date(Date.now() + aheadMs) });
+}
+const stepsOf = (itemId: string) => db.select().from(schema.remoteSteps).where(eq(schema.remoteSteps.itemId, itemId)).orderBy(asc(schema.remoteSteps.stepIndex));
+const intentsOf = (jobId: string) => db.select().from(schema.sendIntents).where(eq(schema.sendIntents.jobId, jobId)).orderBy(asc(schema.sendIntents.attempt));
+const HOUR = 3600_000;
+
+describe('FIX1-FULLREV2(G7) 실제 게시 변형: 컨테이너 finished 기록 뒤 24시간 넘게 보류 → 재시도 → 표식 전 상태 다시 읽기', () => {
+  it('표식 직전 즉시 중지(live_publish_paused — 컨테이너 finished 기록, 표식 없음, BLOCKED) → 재개 → 25시간 뒤 재시도 → 상태 EXPIRED → 게시 시도 표식·threads_publish 없이 FAILED(container_expired) — 결과 불명(UNKNOWN) 아님', async () => {
+    const TEXT = 'FULLREV2 G7 컨테이너 만료 뒤 재시도 글.';
+    const p = await planApproved(TEXT);
+    const cfg = fullCfg('G7-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    let containerStatus = 'FINISHED';
+    let pauseOnRead = true;
+    const fx = publishFixture((ids) => {
+      const r = P(ids);
+      return {
+        [r.create]: () => jsonRes(200, { id: ids.ct }),
+        // 첫 상태 읽기(FINISHED) 직후 사용자가 "실제 게시 일시 중지" — 표식 트랜잭션이 중지를 보고 거절한다
+        [r.status]: async () => {
+          if (pauseOnRead) {
+            pauseOnRead = false;
+            await setLivePublishPaused(db, owner, true);
+          }
+          return jsonRes(200, { status: containerStatus, id: ids.ct });
+        },
+        // 만료된 컨테이너로 게시를 보내면 Threads 가 정확히 400/[100] 이 아닌 오류로 거절한다(옛 동작에서는 결과 불명 → UNKNOWN)
+        [r.publish]: () => jsonRes(400, { error: { message: 'The media container has expired', type: 'OAuthException', code: 24 } }),
+      };
+    });
+    const reg = registryWith(fx.fetch, cfg);
+    try {
+      expect((await tickAt(reg, cfg, p.planId, 0)).results).toEqual({ BLOCKED: 1 });
+    } finally {
+      await setLivePublishPaused(db, owner, false);
+    }
+    const [blocked] = await jobsOf(p.item.id);
+    expect(blocked).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'live_publish_paused' });
+    expect((await stepsOf(p.item.id)).map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']);
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    const statusReads = () => fx.calls.filter((c) => c.method === 'GET' && c.url.pathname === `/v1.0/${fx.ids.ct}`).length;
+    expect(statusReads()).toBe(1);
+
+    // 25시간 뒤(컨테이너는 24시간 안에 게시하지 않으면 EXPIRED) 재개 상태에서 '재시도'
+    containerStatus = 'EXPIRED';
+    const rt = await retry(p.item.id);
+    expect(rt.status, await rt.clone().text()).toBe(200);
+    expect((await tickAt(reg, cfg, p.planId, 25 * HOUR)).results).toEqual({ FAILED: 1 });
+    // 기록된 finished 컨테이너도 표식 전에 상태를 한 번 다시 읽었다 → EXPIRED → 표식·게시 없음
+    expect(statusReads()).toBe(2);
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    expect(fx.calls.filter((c) => c.method === 'POST' && c.url.pathname === `/v1.0/${PROFILE_ID}/threads`)).toHaveLength(1); // 새 컨테이너 없음
+    const steps = await stepsOf(p.item.id);
+    expect(steps.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:error']);
+    const [job] = await jobsOf(p.item.id);
+    expect(job).toMatchObject({ id: blocked!.id, state: 'FAILED', lastErrorCode: 'container_expired', lastRetryClass: 'permanent', leaseOwner: null });
+    expect((await intentsOf(job!.id)).map((i) => i.outcome)).toEqual(['rejected', 'rejected']);
+    const last = (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job!.id)).orderBy(asc(schema.jobEvents.eventSeq))).at(-1)!;
+    expect(last).toMatchObject({ stateBefore: 'SENDING', stateAfter: 'FAILED' });
+    expect(last.sanitizedDetails).toMatchObject({ transition: 'permanent_failure', status: 'rejected', error_code: 'container_expired' });
+    expect((await itemOf(p.item.id)).status).toBe('FAILED');
+    // 더 돌려도 보내지 않는다
+    expect((await tickAt(reg, cfg, p.planId, 26 * HOUR)).results).toEqual({});
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+  });
+});
+
+describe('FIX1-FULLREV2(G8) 실제 게시 변형: 원격 처리 중 "실제 게시 계정으로 사용" 중지 → 다시 사용 → 재개해도 다시 승인 없이 게시하지 않음', () => {
+  it('REMOTE_PROCESSING(컨테이너 IN_PROGRESS) → 사용 중지(승인 invalidated:account_changed — 작업·항목 상태 그대로) → 다시 사용(승인 되살아나지 않음) → 조회 FINISHED·표식 없음 → 재개 → 보내기 직전 approval_missing → 작업 BLOCKED·항목 PLANNED · threads_publish 0 · 다시 승인 가능', async () => {
+    const TEXT = 'FULLREV2 G8 원격 처리 중 계정 사용 중지 글.';
+    const p = await planApproved(TEXT);
+    const cfg = fullCfg('G8-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    let containerStatus = 'IN_PROGRESS';
+    const fx = publishFixture((ids) => {
+      const r = P(ids);
+      return {
+        ...happy(TEXT)(ids),
+        [r.status]: () => jsonRes(200, { status: containerStatus, id: ids.ct }),
+      };
+    });
+    const reg = registryWith(fx.fetch, cfg);
+    expect((await tickAt(reg, cfg, p.planId, 0)).results).toEqual({ REMOTE_PROCESSING: 1 });
+    const [rp] = await jobsOf(p.item.id);
+    expect(rp).toMatchObject({ state: 'REMOTE_PROCESSING', attempt: 1 });
+    expect((await itemOf(p.item.id)).status).toBe('REMOTE_PROCESSING');
+    const approvalId = await activeApprovalId(p.item.id);
+
+    const off = await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: false }), ctx(liveAccount));
+    try {
+      expect(off.status, await off.clone().text()).toBe(200);
+      const ap = (await db.select().from(schema.approvals).where(eq(schema.approvals.id, approvalId)))[0]!;
+      expect(ap.revokedAt).not.toBeNull();
+      expect(ap.revokeReason).toBe('invalidated:account_changed');
+      // 진행 중 작업은 건드리지 않는다(원격 처리 결과는 계속 확인 — 취소 요청도 아님)
+      expect((await jobsOf(p.item.id))[0]).toMatchObject({ id: rp!.id, state: 'REMOTE_PROCESSING', cancelRequestedAt: null });
+      expect((await itemOf(p.item.id)).status).toBe('REMOTE_PROCESSING');
+    } finally {
+      const on = await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: true }), ctx(liveAccount));
+      expect(on.status, await on.clone().text()).toBe(200);
+    }
+    // 다시 사용해도 옛 승인은 되살아나지 않는다(활성 승인 0)
+    expect(await db.select().from(schema.approvals).where(and(eq(schema.approvals.distributionItemId, p.item.id), isNull(schema.approvals.revokedAt)))).toHaveLength(0);
+
+    // 컨테이너 처리 끝 + 게시 시도 표식 없음 → 조회 resumable → 재개(RETRY_WAIT) → 다음 전송의 보내기 직전 재검사가 승인 없음으로 멈춘다
+    containerStatus = 'FINISHED';
+    expect((await tickAt(reg, cfg, p.planId, 16_000)).results).toEqual({ RETRY_WAIT: 1 });
+    expect((await tickAt(reg, cfg, p.planId, 17_000)).results).toEqual({ BLOCKED: 1 });
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    const [job] = await jobsOf(p.item.id);
+    expect(job).toMatchObject({ id: rp!.id, state: 'BLOCKED', lastErrorCode: 'approval_missing', leaseOwner: null });
+    const last = (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job!.id)).orderBy(asc(schema.jobEvents.eventSeq))).at(-1)!;
+    expect(last).toMatchObject({ stateBefore: 'LEASED', stateAfter: 'BLOCKED' });
+    expect(last.sanitizedDetails).toMatchObject({ transition: 'blocked', reason: 'approval_missing' });
+    expect((await itemOf(p.item.id)).status).toBe('PLANNED');
+    expect((await stepsOf(p.item.id)).map((s) => s.kind)).toEqual(['container']); // 게시 시도 표식 없음
+    // 고아 BLOCKED(항목 PLANNED)는 더 보내지 않는다 — 계속 돌려도 게시 0
+    expect((await tickAt(reg, cfg, p.planId, 20 * 60_000)).results).toEqual({});
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    // 복구 길: 다시 승인(새 승인 기록) — 실행은 사용자가 정한다
+    const re = await approve(p.planId, p.item);
+    expect(re.status, await re.clone().text()).toBe(200);
+  });
+});
+
+describe('FIX1-FULLREV2(G8 후속) 실제 게시 변형: 보내는 중 "실제 게시 계정으로 사용" 중지 → 다시 사용 → 그 시도가 표식 전 즉시 중지로 보류돼도 다시 승인할 수 있다', () => {
+  it('컨테이너 FINISHED 읽기 도중 사용 중지·다시 사용(승인 invalidated:account_changed) + 즉시 중지 → 표식 트랜잭션 거절(live_publish_paused) → 작업 BLOCKED(approval_missing, 원래 원인 기록)·항목 PLANNED(BLOCKED 아님) · 표식·threads_publish 0 → 재개 → 재시도는 "다시 승인" 409 → 다시 승인 200 → 실행 → 게시 1번', async () => {
+    const TEXT = 'FULLREV2 G8 보내는 중 계정 사용 중지 글.';
+    const p = await planApproved(TEXT);
+    const cfg = fullCfg('G8b-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    const approvalId = await activeApprovalId(p.item.id);
+    let toggleOnRead = true;
+    const fx = publishFixture((ids) => {
+      const r = P(ids);
+      return {
+        ...happy(TEXT)(ids),
+        // 첫 상태 읽기 도중(작업 처리기는 DB 잠금 없음) 사용자가 계정 사용 중지 → 다시 사용, 이어서 "실제 게시 일시 중지" — 표식 트랜잭션이 중지를 보고 거절한다
+        [r.status]: async () => {
+          if (toggleOnRead) {
+            toggleOnRead = false;
+            expect((await itemOf(p.item.id)).status).toBe('SENDING');
+            const off = await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: false }), ctx(liveAccount));
+            try {
+              expect(off.status, await off.clone().text()).toBe(200);
+            } finally {
+              const on = await targetPOST(post(`/api/channel-accounts/${liveAccount}/publish-target`, { enabled: true }), ctx(liveAccount));
+              expect(on.status, await on.clone().text()).toBe(200);
+            }
+            await setLivePublishPaused(db, owner, true);
+          }
+          return jsonRes(200, { status: 'FINISHED', id: ids.ct });
+        },
+      };
+    });
+    const reg = registryWith(fx.fetch, cfg);
+    try {
+      expect((await tickAt(reg, cfg, p.planId, 0)).results).toEqual({ BLOCKED: 1 });
+    } finally {
+      await setLivePublishPaused(db, owner, false);
+    }
+    expect(toggleOnRead).toBe(false);
+    const ap = (await db.select().from(schema.approvals).where(eq(schema.approvals.id, approvalId)))[0]!;
+    expect(ap.revokeReason).toBe('invalidated:account_changed');
+    const [job] = await jobsOf(p.item.id);
+    expect(job).toMatchObject({ state: 'BLOCKED', lastErrorCode: 'approval_missing', leaseOwner: null });
+    const last = (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job!.id)).orderBy(asc(schema.jobEvents.eventSeq))).at(-1)!;
+    expect(last).toMatchObject({ stateBefore: 'SENDING', stateAfter: 'BLOCKED' });
+    expect(last.sanitizedDetails).toMatchObject({
+      transition: 'blocked',
+      reason: 'approval_missing',
+      cause: 'live_publish_paused',
+      not_sent: true,
+      stage: 'before_publish_attempt',
+      error_code: 'live_publish_paused',
+    });
+    // 막다른 길이 아니다: 항목은 실행 전(PLANNED)
+    expect((await itemOf(p.item.id)).status).toBe('PLANNED');
+    expect((await stepsOf(p.item.id)).map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']); // 게시 시도 표식 없음
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    // 재개한 뒤 재시도는 다시 승인 안내(승인 없음 보류 — 항목 PLANNED)
+    const rt = await retry(p.item.id);
+    expect(rt.status).toBe(409);
+    const rtBody = (await rt.json()) as { error: string; message: string };
+    expect(rtBody.error).toBe('approval_required');
+    expect(rtBody.message).toContain('다시 승인한 뒤 실행');
+    // 옛 작업은 더 보내지 않는다(고아 BLOCKED — 실행 앞선 검사에서도 세지 않음)
+    expect((await tickAt(reg, cfg, p.planId, 60_000)).results).toEqual({});
+    expect(await pendingLiveJobs(db, 'G8b-live')).toBe(0);
+    // 복구 길: 다시 승인(새 승인 기록) → 실행 → 새 작업이 게시
+    const re = await approve(p.planId, p.item);
+    expect(re.status, await re.clone().text()).toBe(200);
+    expect((await execute(p.planId)).status).toBe(200);
+    // 새 작업 = 새 컨테이너(새 원격 ID — 새 fixture)
+    const fx2 = publishFixture(happy(TEXT));
+    expect((await tickAt(registryWith(fx2.fetch, cfg), cfg, p.planId, 0)).results).toEqual({ CONFIRMED: 1 });
+    expect(publishesOf(fx2.calls)).toHaveLength(1);
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    expect(await jobsOf(p.item.id)).toHaveLength(2);
+    expect((await itemOf(p.item.id)).status).toBe('CONFIRMED');
   });
 });

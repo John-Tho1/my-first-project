@@ -22,6 +22,7 @@ import {
   blockInfoOf,
   cancelUnknownBannerOf,
   DISTRIBUTE_ERROR_TEXT,
+  DUPLICATE_ACK_LABEL,
   instagramProgressLine,
   instagramStepLine,
   itemHeadline,
@@ -51,6 +52,7 @@ import {
   unknownKindOf,
   USER_CONFIRMED_NOTICE,
   userConfirmCandidateForCard,
+  userConfirmClaimedNotice,
   VISIBILITY_LABEL,
   YOUTUBE_STEP_LABEL,
   youtubeProgressLine,
@@ -66,6 +68,7 @@ import {
   retriedBanner,
   revocationNoticeFor,
 } from '../../../lib/record-labels';
+import { DuplicatePublishWarning } from '../../../lib/duplicate-warning';
 import { getAppDb, getConfig, getStorage } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -411,6 +414,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const candidate = live && ['UNKNOWN', 'RECONCILING'].includes(x.item.status) ? liveCandidateForCard(x) : null;
   // LIVEP1-USERCONFIRM: "Threads에서 확인함" — 서버와 같은 판정으로 버튼을 보일 후보(모의 항목은 항상 null)
   const confirmable = live && candidate ? userConfirmCandidateForCard(x) : null;
+  // FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과면 버튼 대신 이유(서버 409 user_confirm_candidate_claimed 와 같은 문구)
+  const claimedNotice = userConfirmClaimedNotice(x, live, candidate !== null);
   const pubTag = live ? liveVerificationTag(latestPub?.verification) : null;
   // LIVEP1-DIAG: 실제 Threads 오류 진단(허용 목록 숫자만) — 판정 코드만으로는 원인을 알 수 없을 때
   const diagLine = live ? latestThreadsDiag(x.events) : null;
@@ -608,6 +613,11 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
               </span>
             </form>
           ) : null}
+          {claimedNotice ? (
+            <p className="notice" role="note">
+              {claimedNotice}
+            </p>
+          ) : null}
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
@@ -733,7 +743,13 @@ export default async function PlanPage({
   const d = await getPlanDetail(db, session.ownerId, id.toLowerCase(), undefined, { media: getStorage() });
   if (!d) notFound();
   const approvable = d.items.filter((x) => x.item.status === 'PLANNED' && !x.activeApproval && x.problems.length === 0);
-  const executable = d.items.some((x) => x.item.status === 'PLANNED' && x.activeApproval);
+  const executableItems = d.items.filter((x) => x.item.status === 'PLANNED' && x.activeApproval);
+  const executable = executableItems.length > 0;
+  // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글(이미 게시됨·결과 불명·진행 중) 경고 — 실제 계정 항목에 있으면 확인 체크박스를 보인다(그때만). 판정은 서버가 승인·실행 때 다시 한다.
+  const hasDup = (x: PlanItemDetail) => (x.duplicates ?? []).length > 0;
+  const approveDup = approvable.filter(hasDup);
+  const executeDup = executableItems.filter(hasDup);
+  const dupHeading = (x: PlanItemDetail) => `${CHANNEL_LABEL[(x.variant?.channel ?? x.payload.channel) as Channel] ?? x.payload.channel} — ${x.account?.displayName ?? '(계정 없음)'}:`;
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
   const banners = bannersFromState(q, d);
@@ -891,6 +907,15 @@ export default async function PlanPage({
                 {LIVE_THREADS_VISIBILITY_TEXT}). 승인 뒤 내용·계정이 바뀌면 승인은 무효가 됩니다.
               </p>
             ) : null}
+            {approveDup.map((x) => (
+              <DuplicatePublishWarning key={`dup-a-${x.item.id}`} dups={x.duplicates} stage="approve" heading={dupHeading(x)} />
+            ))}
+            {approveDup.some((x) => x.account?.kind === 'live') ? (
+              <label className="choice">
+                <input type="checkbox" name="acknowledge_duplicate" value="yes" />
+                {DUPLICATE_ACK_LABEL}
+              </label>
+            ) : null}
             {new Set(approvable.map((x) => x.item.requestedResult)).size > 1 ? (
               <p className="note">
                 이 계획에는 요청 결과가 다른 항목이 섞여 있습니다. 고른 항목은 각자 카드에 보인 요청 결과(
@@ -910,8 +935,17 @@ export default async function PlanPage({
 
       <section className="card archive" aria-labelledby="execute-title">
         <h3 id="execute-title">{hasLive ? '실행(실제 게시 포함)' : '실행(MOCK)'}</h3>
+        {executeDup.map((x) => (
+          <DuplicatePublishWarning key={`dup-e-${x.item.id}`} dups={x.duplicates} stage="execute" heading={dupHeading(x)} />
+        ))}
         <form className="form inline" method="post" action={`/api/distribution-plans/${d.plan.id}/execute`}>
           <input type="hidden" name="command_key" value={randomUUID()} />
+          {executeDup.some((x) => x.account?.kind === 'live') ? (
+            <label className="choice">
+              <input type="checkbox" name="acknowledge_duplicate" value="yes" />
+              {DUPLICATE_ACK_LABEL}
+            </label>
+          ) : null}
           <button type="submit" disabled={!executable}>
             {hasLive ? '지금 실행(대기열 — 실제 게시 항목 포함)' : '지금 실행(MOCK — 대기열)'}
           </button>

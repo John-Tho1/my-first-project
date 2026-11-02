@@ -11,7 +11,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CHANNELS, renderVariantText, type Channel } from './channel';
 import { AppError } from './errors';
-import { planStatusFrom } from './jobs';
+import { PLAN_IN_FLIGHT_ITEM_STATUSES, planStatusFrom } from './jobs';
 import { isUuid } from './media';
 
 // ---- 상태·열거 ----
@@ -445,6 +445,8 @@ export const approveSchema = z
     confirm: z.literal(true, { error: '내용을 확인했다는 표시(confirm)가 필요합니다' }),
     purpose: z.enum(REQUESTED_RESULTS).optional(),
     purposes: z.record(z.string(), z.enum(REQUESTED_RESULTS)).optional(),
+    // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글이 이미 게시됨·결과 불명·진행 중인 실제 계정 항목을 그래도 승인한다는 확인값(JSON boolean 만 — 문자열은 400)
+    acknowledge_duplicate: z.boolean().optional(),
   })
   .superRefine((v, ctx) => {
     if (new Set(v.item_ids).size !== v.item_ids.length) ctx.addIssue({ code: 'custom', message: '같은 항목을 두 번 고를 수 없습니다', path: ['item_ids'] });
@@ -497,6 +499,8 @@ export const COMMAND_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;
 export const executeSchema = z.object({
   command_key: z.string().regex(COMMAND_KEY_RE, 'command_key 는 영문·숫자·_·- 8~64자입니다'),
   item_ids: z.array(uuidStr).min(1).max(MAX_PLAN_ITEMS).optional(),
+  // FIX1-FULLREV2(G2, D40-1): 실행 때도 같은 확인값(실제 계정 항목에 그때 중복이 있으면 필요)
+  acknowledge_duplicate: z.boolean().optional(),
 });
 export type ExecuteInput = z.infer<typeof executeSchema>;
 
@@ -547,6 +551,44 @@ export class ChannelMismatchError extends AppError {
 export class AccountNotReadyError extends AppError {
   constructor() {
     super('conflict', 'account_not_ready', '배포 계정이 준비된 상태가 아닙니다');
+  }
+}
+
+// ---- 같은 글 중복 게시 경고(FIX1-FULLREV2(G2), D40-1 — docs/03 "동일 본문 재게시는 경고 후 새 승인") ----
+
+/**
+ * FIX1-FULLREV2(G2): 같은 owner 의 **다른** 계획에 있는 같은 글 항목(같은 채널 초안 버전 + 같은 계정, 또는 같은 payload_hash)이 "중복"으로 세지는 상태.
+ * - published(이미 게시됨): 결과 기록(publications — VERIFIED·UNVERIFIED·MANUAL_REPORTED·USER_CONFIRMED·MOCK)이 있거나 항목 CONFIRMED·PARTIAL(레거시 일부 게시).
+ * - unknown(결과 불명): UNKNOWN — 원격에 있을 수 있고 자동으로 움직이지 않는다.
+ * - in_progress(진행 중): 작업이 자동으로 움직이는 항목 상태(PLAN_IN_FLIGHT_ITEM_STATUSES: QUEUED·SENDING·REMOTE_PROCESSING·RETRY_WAIT·RECONCILING·
+ *   CANCEL_REQUESTED — CANCEL_REQUESTED 는 원격이 이미 받았으면 CONFIRMED 로 끝난다) + BLOCKED(보류 — 끝난 상태가 아니다: 재개·재시도하면 unblock → QUEUED 로
+ *   다시 보내고, 복원한 보류 항목은 묶음을 만든 환경에서 이미 보냈을 수 있다).
+ * - 세지 않음: PLANNED(작업 없음 — 아무것도 보내지 않았다. 두 계획을 모두 실행하면 나중 실행의 검사가 먼저 실행된 쪽을 진행 중으로 잡는다)·
+ *   CANCELED·FAILED(끝남 — 보내지 않았거나(not_sent) 원격이 거부했다. 일부라도 게시됐으면 이 상태가 아니라 UNKNOWN 으로 남기는 규칙 — jobs.ts settlePartialStop·
+ *   failUnlessPartial). 결과 기록이 있으면 상태와 관계없이 published.
+ */
+export const DUPLICATE_IN_PROGRESS_ITEM_STATUSES: readonly string[] = [...PLAN_IN_FLIGHT_ITEM_STATUSES, 'BLOCKED'];
+export const DUPLICATE_PUBLISHED_ITEM_STATUSES: readonly string[] = ['CONFIRMED', 'PARTIAL'];
+export type DuplicatePublishKind = 'published' | 'unknown' | 'in_progress';
+
+/** 다른 계획 항목의 상태·결과 기록 유무 → 중복 종류(세지 않으면 null). */
+export function duplicatePublishKindOf(status: string, hasPublication: boolean): DuplicatePublishKind | null {
+  if (hasPublication || DUPLICATE_PUBLISHED_ITEM_STATUSES.includes(status)) return 'published';
+  if (status === 'UNKNOWN') return 'unknown';
+  if (DUPLICATE_IN_PROGRESS_ITEM_STATUSES.includes(status)) return 'in_progress';
+  return null;
+}
+
+export const DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE =
+  '같은 글(같은 채널 초안 버전·같은 실제 계정)이 다른 배포 계획에서 이미 게시됐거나 결과 불명이거나 진행 중입니다. 다시 승인·실행하면 같은 글이 한 번 더 게시될 수 있습니다 — 확인했다면 acknowledge_duplicate: true 로 다시 요청하세요(아무것도 바꾸지 않았습니다).';
+
+/**
+ * FIX1-FULLREV2(G2, D40-1): 실제 계정(kind live) 항목에 그때 중복이 있는데 확인값(acknowledge_duplicate: true)이 없음 — 409, 아무것도 바꾸지 않는다.
+ * items = 항목마다 중복으로 잡힌 다른 계획 항목(이 owner 의 자료만).
+ */
+export class DuplicatePublishUnacknowledgedError extends AppError {
+  constructor(items: Array<{ item_id: string; duplicates: unknown[] }>) {
+    super('conflict', 'duplicate_publish_unacknowledged', DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE, { items });
   }
 }
 

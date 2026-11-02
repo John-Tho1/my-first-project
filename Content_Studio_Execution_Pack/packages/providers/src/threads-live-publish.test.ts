@@ -342,6 +342,71 @@ describe('컨테이너 상태', () => {
     }
   });
 
+  // FIX1-FULLREV2(G7): 기록된 'finished' 는 앞선 시도·lease·조회가 읽은 값 — 24시간 뒤 EXPIRED 일 수 있다. 표식을 쓰기 전에 이번 submit 이 상태를 다시 읽는다.
+  describe('FIX1-FULLREV2(G7): 앞선 시도의 finished 기록 → 표식 전에 상태 다시 읽기', () => {
+    const finishedEarlier = () => {
+      const s = memSteps();
+      // 앞선 시도(다른 lease)가 남긴 기록 — 하루 전 시각
+      const at = new Date(NOW.getTime() - 25 * 3600_000).toISOString();
+      s.rows.push({ kind: 'container', post_index: 0, remote_id: liveThreadsStepId.container(CT), status: 'finished', received_bytes: null, total_bytes: null, resume_count: 0, step_index: 0, created_at: at, updated_at: at });
+      return s;
+    };
+    const calls = (seen: Seen[], key: string) => seen.filter((s) => `${s.method} ${s.url.pathname}` === key).length;
+
+    it.each([
+      ['EXPIRED', 'container_expired'],
+      ['ERROR', 'container_error'],
+    ] as const)('상태 %s → 표식·게시 없이 확정 실패(%s, permanent → FAILED), 단계 error, 조회도 failed(결과 불명 아님)', async (st, code) => {
+      const { a, seen } = adapterWith({ ...happyRoutes(), [P.status]: ok({ status: st, id: CT, error_message: 'UNKNOWN' }) });
+      const steps = finishedEarlier();
+      const c = ctxOf(steps, { intentKey: 'job-1:2', attempt: 2 });
+      const r = await a.submit(await a.prepare(snapshot(), c), c);
+      expect(r).toEqual({ status: 'rejected', retry_class: 'permanent', error_code: code });
+      expect(classifyOutcome(r).event).toBe('permanent_failure');
+      expect(classifyOutcome(r).intentOutcome).toBe('rejected');
+      expect(seen.map((s) => `${s.method} ${s.url.pathname}`)).toEqual([P.status]);
+      expect(calls(seen, P.publish)).toBe(0);
+      expect(calls(seen, P.create)).toBe(0); // 새 컨테이너 없음
+      expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:error']); // 게시 시도 표식 없음
+      expect(await a.reconcile({ platform: 'threads', intent_key: 'job-1:2', external_id: null, provider_request_id: null }, c)).toEqual({ status: 'failed', error_code: 'container_error' });
+    });
+
+    it('상태 FINISHED → 다시 읽기 1회 뒤 같은 컨테이너로 게시(새 컨테이너 없음, finished 기록은 다시 쓰지 않음)', async () => {
+      const { a, seen } = adapterWith(happyRoutes());
+      const steps = finishedEarlier();
+      const before = { ...steps.rows[0]! };
+      const c = ctxOf(steps, { intentKey: 'job-1:2', attempt: 2 });
+      expect(await a.submit(await a.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted', external_id: `threads:${MEDIA}` });
+      expect(seen.map((s) => `${s.method} ${s.url.pathname}`)).toEqual([P.status, P.publish, P.read]);
+      expect(steps.rows[0]).toEqual(before);
+      expect(steps.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished', 'publish_attempt:created', 'publish:published']);
+    });
+
+    it('상태 읽기 실패 → 지금 폴링 분류 그대로(시간 초과 = ambiguous container_status_unreadable, 401 = auth) — 표식·게시 없음', async () => {
+      const r1 = adapterWith({ ...happyRoutes(), [P.status]: timeoutErr() });
+      const s1 = finishedEarlier();
+      const c1 = ctxOf(s1);
+      expect(await r1.a.submit(await r1.a.prepare(snapshot(), c1), c1)).toMatchObject({ status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_status_unreadable' });
+      expect(calls(r1.seen, P.publish)).toBe(0);
+      expect(s1.rows.map((s) => `${s.kind}:${s.status}`)).toEqual(['container:finished']);
+      const r2 = adapterWith({ ...happyRoutes(), [P.status]: ok({ error: { code: 190, message: SECRET_MSG } }, 401) });
+      const s2 = finishedEarlier();
+      const c2 = ctxOf(s2);
+      expect(await r2.a.submit(await r2.a.prepare(snapshot(), c2), c2)).toMatchObject({ status: 'rejected', retry_class: 'auth', error_code: 'status_auth_invalid_token' });
+      expect(calls(r2.seen, P.publish)).toBe(0);
+      expect(s2.rows.map((s) => s.kind)).toEqual(['container']);
+    });
+
+    it('이번 submit 이 컨테이너를 만들고 FINISHED 를 읽은 경로는 그대로 — 상태 GET 1회(추가 읽기 없음)', async () => {
+      const { a, seen } = adapterWith(happyRoutes());
+      const steps = memSteps();
+      const c = ctxOf(steps);
+      expect(await a.submit(await a.prepare(snapshot(), c), c)).toMatchObject({ status: 'accepted' });
+      expect(seen.map((s) => `${s.method} ${s.url.pathname}`)).toEqual([P.create, P.status, P.publish, P.read]);
+      expect(calls(seen, P.status)).toBe(1);
+    });
+  });
+
   it('상태 읽기 실패 → 조회로(ambiguous, 게시 시도 없음), 401 → auth', async () => {
     const r1 = adapterWith({ [P.create]: ok({ id: CT }), [P.status]: timeoutErr() });
     const s1 = memSteps();
@@ -899,24 +964,32 @@ describe('FIX-LIVEP1-TIMEOUT: lease 확인·표식 저장 지연이 게시 호�
     expect(publishes(seen)).toBe(0);
   });
 
-  it('경계(시계 주입): 남은 시간 = 게시 호출 + 표식 몫 + 여유 정확히 → 게시, 1ms 모자라면 멈춤 · heartbeat 가 시계를 1ms 넘게 밀면 표식 전에 멈춤', async () => {
+  // FIX1-FULLREV2(G7): 기록된 'finished' 컨테이너도 표식 전에 상태를 한 번 다시 읽는다(그 읽기 앞의 lease 확인 heartbeat 1회 + 표식 전 heartbeat 1회 = 2회).
+  // 경계는 그대로 "표식 직전 남은 시간 ≥ 게시 호출 + 표식 몫 + 여유"이고, 두 heartbeat 의 시계 지연이 모두 남은 시간에서 빠진다(옛 시험의 heartbeat 1회 경계를 2회로 바꿔 같은 엄격도로).
+  it('경계(시계 주입): 남은 시간 = 게시 호출 + 표식 몫 + 여유 정확히 → 게시, 1ms 모자라면 멈춤 · heartbeat(상태 다시 읽기 앞·표식 앞) 가 시계를 1ms 넘게 밀면 표식 전에 멈춤', async () => {
     const need = PUB_MS + MARKER_MS + 2_000;
     for (const [ahead, hbMs, expectPub] of [
       [need, 0, true],
       [need - 1, 0, false],
-      [need + 5, 5, true],
-      [need + 5, 6, false],
+      [need + 10, 5, true],
+      [need + 10, 6, false],
+      [need + 5, 5, false],
     ] as const) {
       let t = 1_000_000;
+      let beats = 0;
       const { a, seen } = adapter({ nowMs: () => t });
       const c = ctxOf(finishedSteps(), {
         deadline: t + ahead,
         heartbeat: async () => {
+          beats++;
           t += hbMs;
         },
       });
       const r = await a.submit(await a.prepare(snapshot(), c), c);
       expect(publishes(seen), `${ahead}/${hbMs}`).toBe(expectPub ? 1 : 0);
+      // 상태 다시 읽기 앞 heartbeat 1회 → 첫 남은 시간 검사를 통과하면 표식 앞 heartbeat 1회 더
+      expect(beats, `${ahead}/${hbMs}`).toBe(ahead - hbMs >= need ? 2 : 1);
+      expect(seen.filter((s) => `${s.method} ${s.url.pathname}` === P.status), `${ahead}/${hbMs}`).toHaveLength(1);
       if (!expectPub) expect(r).toEqual({ status: 'rejected', retry_class: 'transient_no_side_effect', error_code: 'publish_budget_insufficient' });
     }
   });

@@ -432,34 +432,36 @@ export class LiveThreadsPublishAdapter implements ChannelAdapter {
     }
     const containerId = liveThreadsStepRaw(ct.remote_id);
     if (!containerId) return { status: 'rejected', retry_class: 'permanent', error_code: 'container_step_malformed' };
-    if (ct.status !== 'finished') {
-      let status: ContainerStatus = 'IN_PROGRESS';
-      for (let polls = 0; polls < this.#pollBudget; polls++) {
-        if (polls > 0 && this.#pollIntervalMs > 0) await sleep(this.#pollIntervalMs, ctx.signal);
-        await ctx.heartbeat();
-        try {
-          status = await this.#containerStatus(containerId, token, ctx.signal);
-        } catch (e) {
-          if (e instanceof LeaseLostError) throw e;
-          // 읽기 실패는 부작용이 없다 — 인증만 그대로(BLOCKED), 나머지는 조회로(컨테이너 참조는 남아 있고 게시 시도 표식은 없다).
-          const d = diagOf(e);
-          if (e instanceof LiveThreadsApiError && liveErrorVerdict(e) === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: 'status_auth_invalid_token', ...d };
-          return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_status_unreadable', ...d };
-        }
-        if (status !== 'IN_PROGRESS') break;
+    // FIX1-FULLREV2(G7): 기록된 'finished' 는 앞선 시도·lease(또는 조회)가 읽은 값이다 — 그 뒤 24시간이 지나면 컨테이너는 EXPIRED 가 된다(파일 머리).
+    // 그래서 이번 submit 이 상태를 읽지 않은 컨테이너는 'finished' 기록이어도 표식을 쓰기 전에 한 번 더 읽는다(같은 폴링 경로 — EXPIRED·ERROR 면 표식·게시 없이
+    // 확정 실패 container_expired·container_error, 읽기 실패는 지금 분류 그대로). 이번 submit 이 방금 읽어 FINISHED 를 본 경로는 그대로(추가 GET 없음).
+    const recordedFinished = ct.status === 'finished';
+    let status: ContainerStatus = 'IN_PROGRESS';
+    for (let polls = 0; polls < this.#pollBudget; polls++) {
+      if (polls > 0 && this.#pollIntervalMs > 0) await sleep(this.#pollIntervalMs, ctx.signal);
+      await ctx.heartbeat();
+      try {
+        status = await this.#containerStatus(containerId, token, ctx.signal);
+      } catch (e) {
+        if (e instanceof LeaseLostError) throw e;
+        // 읽기 실패는 부작용이 없다 — 인증만 그대로(BLOCKED), 나머지는 조회로(컨테이너 참조는 남아 있고 게시 시도 표식은 없다).
+        const d = diagOf(e);
+        if (e instanceof LiveThreadsApiError && liveErrorVerdict(e) === 'auth') return { status: 'rejected', retry_class: 'auth', error_code: 'status_auth_invalid_token', ...d };
+        return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_status_unreadable', ...d };
       }
-      if (status === 'IN_PROGRESS') return { status: 'processing', error_code: 'container_in_progress' };
-      if (status === 'PUBLISHED') {
-        // 게시 시도 표식 없이 원격이 게시됐다고 한다(있을 수 없는 상태) — 다시 게시하지 않고 조회로(UNKNOWN 가능)
-        return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_published_without_attempt' };
-      }
-      if (status === 'ERROR' || status === 'EXPIRED') {
-        // 게시하지 않은 컨테이너가 실패·만료됨 — 게시물은 없다(게시 시도 없음). 새 컨테이너는 만들지 않는다(게시물당 컨테이너 1개) → 확정 실패.
-        await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'error' });
-        return { status: 'rejected', retry_class: 'permanent', error_code: status === 'ERROR' ? 'container_error' : 'container_expired' };
-      }
-      await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'finished' });
+      if (status !== 'IN_PROGRESS') break;
     }
+    if (status === 'IN_PROGRESS') return { status: 'processing', error_code: 'container_in_progress' };
+    if (status === 'PUBLISHED') {
+      // 게시 시도 표식 없이 원격이 게시됐다고 한다(있을 수 없는 상태) — 다시 게시하지 않고 조회로(UNKNOWN 가능)
+      return { status: 'ambiguous', retry_class: 'transient_unknown_side_effect', error_code: 'container_published_without_attempt' };
+    }
+    if (status === 'ERROR' || status === 'EXPIRED') {
+      // 게시하지 않은 컨테이너가 실패·만료됨 — 게시물은 없다(게시 시도 없음). 새 컨테이너는 만들지 않는다(게시물당 컨테이너 1개) → 확정 실패.
+      await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'error' });
+      return { status: 'rejected', retry_class: 'permanent', error_code: status === 'ERROR' ? 'container_error' : 'container_expired' };
+    }
+    if (!recordedFinished) await steps.record({ kind: 'container', post_index: 0, remote_id: ct.remote_id, status: 'finished' });
     // LIVEP1-TIMEOUT + FIX-LIVEP1-TIMEOUT(Codex P1 :455): 표식을 쓰기 전에 남은 시간 확인 — 게시 호출 시간 제한 + 표식 저장 몫 + 여유보다 적으면
     // 표식·게시 없이 멈춘다(보내지 않음 → 재시도 시 같은 컨테이너로 이어 게시). 검사는 두 번: lease 확인(heartbeat) 전과 **뒤**(heartbeat 지연이
     // 게시 호출 몫을 먹지 않게). 표식 저장은 몫 안에서만 기다리고, 넘으면 이 실행은 게시하지 않는다.

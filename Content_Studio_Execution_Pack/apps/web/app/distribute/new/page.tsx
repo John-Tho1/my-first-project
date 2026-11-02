@@ -1,5 +1,13 @@
 import { notFound, redirect } from 'next/navigation';
-import { getContentRow, getLivePublishPaused, listChannelAccounts, reviewVariantsOfContent, variantReviewBlockers, accountReady } from '@cs/db';
+import {
+  accountReady,
+  duplicatePublishesForVariantVersions,
+  getContentRow,
+  getLivePublishPaused,
+  listChannelAccounts,
+  reviewVariantsOfContent,
+  variantReviewBlockers,
+} from '@cs/db';
 import { adapterIdFor, CHANNEL_LABEL, isUuid, VISIBILITIES, type Channel } from '@cs/domain';
 import { getSession } from '../../../lib/auth';
 import { Breadcrumbs } from '../../../lib/breadcrumbs';
@@ -15,6 +23,7 @@ import {
   type PlanFormDefaults,
   type PlanResultSelect,
 } from '../../../lib/distribution';
+import { DuplicatePublishWarning } from '../../../lib/duplicate-warning';
 import { getAppDb, getConfig } from '../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -114,8 +123,22 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
   if (!content) notFound();
   const vs = await reviewVariantsOfContent(db, session.ownerId, content.id);
   const accounts = (await listChannelAccounts(db, session.ownerId)).filter(accountReady);
+  // FIX1-FULLREV2(G2, D40-1): 채널 초안의 현재 버전이 다른 계획에서 이미 게시됨·결과 불명·진행 중이면 그 줄에 경고(계정 무관 — 같은 계정을 고르면 같은 글).
+  // 표시용 — 서버는 승인·실행 때 다시 조회하고 실제 계정 항목은 확인값을 받는다.
+  const dupByVersion = await duplicatePublishesForVariantVersions(
+    db,
+    session.ownerId,
+    vs.flatMap((v) => (v.currentVersionId ? [v.currentVersionId] : [])),
+  );
   const rows = [];
-  for (const v of vs) rows.push({ v, blockers: await variantReviewBlockers(db, session.ownerId, v.id), accounts: accounts.filter((a) => a.platform === v.channel) });
+  for (const v of vs) {
+    rows.push({
+      v,
+      blockers: await variantReviewBlockers(db, session.ownerId, v.id),
+      accounts: accounts.filter((a) => a.platform === v.channel),
+      duplicates: v.currentVersionId ? (dupByVersion.get(v.currentVersionId) ?? []) : [],
+    });
+  }
   const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // 화면 확인 D10: 오류로 돌아온 경우에만 입력값을 되살린다(오류 없이 연 화면은 기본 선택 없음 — docs/03).
   const prev = err ? planFormDefaults(q) : planFormDefaults({});
@@ -160,10 +183,11 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
       ) : (
         <form className="form" method="post" action="/api/distribution-plans">
           <input type="hidden" name="content_id" value={content.id} />
-          {rows.map(({ v, blockers, accounts: accs }) => (
+          {rows.map(({ v, blockers, accounts: accs, duplicates }) => (
             <fieldset key={v.id} className="card archive">
               <legend>{CHANNEL_LABEL[v.channel as Channel] ?? v.channel}</legend>
               {blockers.length ? <p className="notice">배포 조건을 채우지 못했습니다: {blockers.join(', ')}</p> : null}
+              <DuplicatePublishWarning dups={duplicates} stage="plan" />
               {accs.length === 0 ? (
                 <p className="empty-text">이 플랫폼의 준비된 모의 계정이 없습니다.</p>
               ) : (

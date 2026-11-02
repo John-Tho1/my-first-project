@@ -21,6 +21,7 @@ import {
   RESTORED_RETRY_RECOVERY_MOCK,
   SCHEDULE_STALE_RETRY_MESSAGE,
   USER_CONFIRM_BUTTON,
+  USER_CONFIRM_CLAIMED_MESSAGE,
   USER_CONFIRM_RESTORED_MESSAGE,
   USER_CONFIRMED_LABEL,
   userConfirmCandidateFromEvents,
@@ -83,6 +84,9 @@ export function problemLabel(p: string): string {
   return PROBLEM_LABEL[p] ?? p;
 }
 
+/** FIX1-FULLREV2(G2, D40-1): 승인·실행 폼의 중복 게시 확인 체크박스 문구(실제 계정 항목에 다른 계획의 같은 글이 있을 때만 보인다). */
+export const DUPLICATE_ACK_LABEL = '같은 글이 한 번 더 게시될 수 있음을 확인했습니다';
+
 export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   hash_mismatch: '화면에서 본 내용과 서버의 배포 내용(hash)이 다릅니다. 새로 고친 뒤 다시 확인하세요.',
   snapshot_stale: '계획 이후 본문·미디어·원고·계정·일정이 바뀌어 승인·실행하지 않았습니다. 새 배포 계획을 만드세요.',
@@ -106,6 +110,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   schedule_in_past: '예약 시각(실행 예약·예약 공개)은 지금부터 1분 뒤 이후여야 합니다(모스크바 시각).',
   invalid_schedule: '예약 날짜·시각(실행 예약·예약 공개) 형식을 확인하세요(모스크바 시각). 예약 공개를 골랐으면 예약 공개 날짜·시각을 모두 넣으세요.',
   duplicate_item: '같은 채널 초안·계정 조합이 두 번 들어 있습니다.',
+  // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글이 이미 게시됨·결과 불명·진행 중인 실제 계정 항목 — 확인 체크 없이 승인·실행하려 함(아무것도 바꾸지 않음)
+  duplicate_publish_unacknowledged: `같은 글이 다른 배포 계획에서 이미 게시됐거나 결과 불명이거나 진행 중이라 승인·실행하지 않았습니다(아무것도 바꾸지 않음). 아래 경고를 확인하고 "${DUPLICATE_ACK_LABEL}"를 체크한 뒤 다시 누르세요 — 다시 승인·실행하면 같은 글이 한 번 더 게시될 수 있습니다.`,
   asset_deleted: '원본을 지운 첨부 파일이 있어 배포할 수 없습니다.',
   csrf: '요청 출처를 확인할 수 없어 거부했습니다.',
   invalid: '입력값을 확인하세요.',
@@ -144,6 +150,8 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   user_confirm_no_attempt: '게시를 시도한 기록이 없는 작업이라 사용자 확인으로 기록하지 않았습니다.',
   user_confirm_publish_recorded: '게시 기록(미디어 ID)이 이미 있습니다 — 재확인으로 결과를 확정하세요.',
   user_confirm_no_candidate: '가장 최근 재확인에 확인 후보 링크가 없어 기록하지 않았습니다. 재확인하거나 Threads 에서 직접 확인하세요.',
+  // FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과 — 도메인 거절 문구 그대로(조건부 복구 길)
+  user_confirm_candidate_claimed: USER_CONFIRM_CLAIMED_MESSAGE,
   user_confirm_candidate_mismatch: '화면의 확인 후보가 지금 기록된 후보와 달라 기록하지 않았습니다. 새로 고친 뒤 다시 확인하세요.',
   not_mock_account: '모의 시나리오는 모의(MOCK) 계정 항목에만 정할 수 있습니다.',
   item_finished: '이미 끝난 항목은 모의 시나리오를 바꿀 수 없습니다.',
@@ -310,11 +318,17 @@ export function formToApprove(f: Record<string, string>) {
     confirm: f.confirm === 'yes',
     ...(f.purpose !== undefined ? { purpose: f.purpose } : {}),
     ...(Object.keys(purposes).length ? { purposes } : {}),
+    // FIX1-FULLREV2(G2, D40-1): 중복 게시 확인 체크박스(acknowledge_duplicate=yes, 필요할 때만 화면에 있다) → JSON boolean. 다른 값은 false(서버가 409).
+    ...(f.acknowledge_duplicate !== undefined ? { acknowledge_duplicate: f.acknowledge_duplicate === 'yes' } : {}),
   };
 }
 
 export function formToExecute(f: Record<string, string>) {
-  return { command_key: f.command_key ?? '' };
+  return {
+    command_key: f.command_key ?? '',
+    // FIX1-FULLREV2(G2): 실행 폼의 같은 확인 체크박스
+    ...(f.acknowledge_duplicate !== undefined ? { acknowledge_duplicate: f.acknowledge_duplicate === 'yes' } : {}),
+  };
 }
 
 /** 결과 종류 → 화면 문구(CONFIRMED ≠ 공개: 비공개 업로드·예약·게시를 구분한다, A12). */
@@ -994,6 +1008,8 @@ export function userConfirmCandidateForCard(x: {
   remoteSteps: ReadonlyArray<{ jobId: string; kind: string }>;
   publications: ReadonlyArray<unknown>;
   latestReconcileEvent: LatestReconcileEvent;
+  /** FIX1-FULLREV2(G6): 후보가 이미 다른 항목의 결과(PlanItemDetail.candidateClaimed — 서버와 같은 판정) */
+  candidateClaimed: boolean;
 }): UserConfirmCandidate | null {
   const job = x.jobs.at(-1) ?? null;
   const steps = job ? x.remoteSteps.filter((s) => s.jobId === job.id) : [];
@@ -1007,10 +1023,61 @@ export function userConfirmCandidateForCard(x: {
       publishSteps: steps.filter((s) => s.kind === 'publish').length,
       publications: x.publications.length,
       candidate,
+      candidateClaimed: x.candidateClaimed,
     },
     candidate?.external_id ?? null,
   );
   return problem ? null : candidate;
+}
+
+/**
+ * FIX1-FULLREV2(G6): 확인 후보가 이미 다른 항목의 결과라 "Threads에서 확인함" 버튼을 보이지 않는 이유(카드 안내 — 아니면 null). 실제 항목·후보가 있을 때만.
+ * 문구는 서버 거절(409 user_confirm_candidate_claimed)과 같다.
+ */
+export function userConfirmClaimedNotice(x: { candidateClaimed: boolean }, live: boolean, hasCandidate: boolean): string | null {
+  return live && hasCandidate && x.candidateClaimed ? USER_CONFIRM_CLAIMED_MESSAGE : null;
+}
+
+// ---- FIX1-FULLREV2(G2, D40-1): 같은 글 중복 게시 경고(문구 — 그리기는 lib/duplicate-warning.tsx) ----
+
+/** 다른 계획에서 찾은 같은 글 항목(@cs/db DuplicatePublish 중 화면에 쓰는 값). */
+export interface DuplicatePublishLike {
+  itemId: string;
+  planId: string;
+  planSummary: string;
+  status: string;
+  kind: 'published' | 'unknown' | 'in_progress';
+  mock: boolean;
+  verification: string | null;
+  accountDisplayName: string | null;
+}
+
+/** 경고가 붙는 곳: approve(승인 카드·항목) · execute(실행 구역) · plan(배포 계획 만들기 — 계정을 아직 고르지 않음). */
+export type DuplicateWarningStage = 'approve' | 'execute' | 'plan';
+
+/** 계획 이름(따옴표) — 이름이 없으면 "이름 없음". */
+export const duplicatePlanName = (d: Pick<DuplicatePublishLike, 'planSummary'>) => `「${d.planSummary.trim() || '이름 없음'}」`;
+
+/** 그 항목의 상태 문구. 모의 기록은 "게시"라고 하지 않는다(MOCK — 실제 게시 아님). */
+export function duplicateStateLabel(d: Pick<DuplicatePublishLike, 'kind' | 'mock' | 'status' | 'verification'>): string {
+  if (d.mock) return d.kind === 'published' ? '모의 처리됨(MOCK — 실제 게시 아님)' : d.kind === 'unknown' ? '결과 불명(MOCK)' : `진행 중(MOCK · ${d.status})`;
+  if (d.kind === 'published') return d.verification === 'USER_CONFIRMED' ? '이미 게시됨(사용자 확인)' : '이미 게시됨';
+  if (d.kind === 'unknown') return '결과 불명(UNKNOWN — 게시됐을 수 있음)';
+  return `진행 중(${d.status})`;
+}
+
+/** 경고 뒤 문구(무엇을 하면 같은 글이 한 번 더 나가는지). */
+export function duplicateWarningTail(stage: DuplicateWarningStage, mock: boolean): string {
+  if (mock) return `${stage === 'execute' ? '실행하면' : stage === 'plan' ? '같은 계정으로 다시 계획·승인하면' : '다시 승인하면'} 같은 글이 한 번 더 모의 처리됩니다(MOCK — 실제 게시 아님)`;
+  if (stage === 'execute') return '실행하면 같은 글이 한 번 더 게시될 수 있습니다';
+  if (stage === 'plan') return '같은 계정으로 다시 계획·승인하면 같은 글이 한 번 더 게시될 수 있습니다';
+  return '다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다';
+}
+
+/** 한 줄 전체(텍스트 — 화면은 계획 이름을 그 계획 링크로 그린다). plan 단계는 계정 이름도(그 계정을 고르면 같은 글). */
+export function duplicateWarningLine(d: DuplicatePublishLike, stage: DuplicateWarningStage): string {
+  const account = stage === 'plan' && d.accountDisplayName ? `(계정 ${d.accountDisplayName})` : '';
+  return `이 글은 계획 ${duplicatePlanName(d)}${account} 에서 ${duplicateStateLabel(d)} — ${duplicateWarningTail(stage, d.mock)}`;
 }
 
 /** LIVEP1-USERCONFIRM: 실제 결과 확인 상태 배지(문구·색 — VERIFIED 와 USER_CONFIRMED 는 다른 색). */

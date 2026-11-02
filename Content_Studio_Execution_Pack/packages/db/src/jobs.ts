@@ -108,6 +108,7 @@ import { credentialGate, readAccessTokenForSend, type KeyringSource } from './oa
 import { accountRateSnapshot, listRemoteSteps, publishedStepCount, remoteStepsPort, type RateInflightJob } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
 import { channelAccounts, distributionItems, jobEvents, jobs, publications, sendIntents, variants } from './schema';
+import { liveExternalIdClaimedElsewhere } from './user-confirm';
 
 export type SendIntentRow = typeof sendIntents.$inferSelect;
 export type PublicationRow = typeof publications.$inferSelect;
@@ -286,6 +287,28 @@ async function cancelRequestedBeforeSend(tx: DbOrTx, jobId: string): Promise<boo
     .orderBy(desc(jobEvents.eventSeq))
     .limit(1);
   return rows[0]?.before === 'LEASED' || rows[0]?.before === 'QUEUED';
+}
+
+/**
+ * FIX1-FULLREV2(G5): 이번 시도(attempt)에서 작업 처리기가 기록한 원격 처리 중(processing) 조회 수 — applyReconcile 의 조회 이력(details.reconcile·attempt)에서
+ * 센다. 사용자 재확인(manual — 상태를 바꾸지 않는 기록)은 세지 않는다. 확인 불가 연속 횟수(jobs.reconcile_count)와 따로 세어
+ * REMOTE_POLL_MAX(처리 중 조회)·RECONCILE_MAX_ATTEMPTS(확인 불가) 두 한도가 서로의 횟수를 쓰지 않게 한다(D18). 새 시도(재개·재시도)는 0 부터.
+ * migration 없음 — 끝나지 않은 작업의 이력은 보존 정리(retention, 끝난 작업만) 대상이 아니다.
+ */
+async function remotePollsThisAttempt(tx: DbOrTx, ownerId: string, jobId: string, attempt: number): Promise<number> {
+  const rows = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(jobEvents)
+    .where(
+      and(
+        eq(jobEvents.ownerId, ownerId),
+        eq(jobEvents.jobId, jobId),
+        sql`${jobEvents.sanitizedDetails}->>'reconcile' = 'processing'`,
+        sql`${jobEvents.sanitizedDetails}->>'attempt' = ${String(attempt)}`,
+        sql`${jobEvents.sanitizedDetails}->'manual' is null`,
+      ),
+    );
+  return Number(rows[0]?.n ?? 0);
 }
 
 /** 전이 + 항목 상태 동기화 + 계획 재계산(같은 트랜잭션). */
@@ -1180,6 +1203,8 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
   const cls = classifyOutcome(result);
   return db.transaction(async (tx) => {
     const item = await lockItem(tx, ownerId, plan.job.itemId!);
+    // FIX1-FULLREV2(G8 후속): 보류 결과의 승인 확인용(아래 blockedUnlessApprovalGone) — 잠금 순서는 beginSend 와 같다(항목 → 승인 → 작업).
+    const active = await activeApprovalsFor(tx, ownerId, [item.id]);
     const job = await jobForUpdate(tx, ownerId, plan.job.id);
     const intent = await intentFor(tx, ownerId, plan.job.id, plan.job.attempt, true);
     await fillIntent(tx, ownerId, intent, cls.intentOutcome, result, now, 'submit');
@@ -1225,6 +1250,19 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         now,
         () => settle(tx, ownerId, job, item, 'canceled', { ...base, not_sent: true }, now, common),
       );
+    // FIX1-FULLREV2(G8 후속): 이 시도 중(SENDING — DB 잠금 없이 외부 호출) 계정 무효화(사용 중지·연결 해제 — IN_FLIGHT_ITEM_STATUSES)가 승인을 철회했는데
+    // 결과가 보류(표식 전 즉시 중지 거절·auth)면 작업·항목 BLOCKED 로 두지 않는다 — 재시도는 승인이 없어 409 approval_required, 다시 승인은 PLANNED 항목만 받아
+    // 409 item_not_planned 인 막다른 길이 된다. beginSend 의 approval_missing 과 같은 규칙(stopUnlessPartial): 게시된 단계·게시 시도 표식이 없으면 작업 BLOCKED·
+    // 항목 PLANNED(다시 승인 → 실행), 있으면 남은 부분은 보내지 않고 UNKNOWN(thread_partial_revoked). 사건에는 원래 보류 원인(cause)을 남긴다.
+    // 승인이 그대로면 blocked() — 지금까지 하던 보류(재개 뒤 '재시도') 그대로.
+    const blockedUnlessApprovalGone = (cause: string, details: Record<string, unknown>, set: TransitionSet, blocked: () => Promise<JobState>) => {
+      const approval = active.get(item.id);
+      if (approval && approval.payloadHash === item.payloadHash) return blocked();
+      const stop = { reason: 'approval_missing', code: THREAD_PARTIAL_REVOKED_CODE, details: { ...details, cause }, set };
+      return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
+        settle(tx, ownerId, job, item, 'blocked', { ...details, reason: 'approval_missing', cause }, now, { ...set, lastErrorCode: 'approval_missing' }, 'PLANNED'),
+      );
+    };
     const isMock = plan.adapter.kind === 'mock';
     if (!cancel && !isMock && result.status === 'rejected' && result.error_code === LIVE_PUBLISH_PAUSED_STEP_CODE) {
       // FIX-LIVEP2(D39 즉시 중지 · 리뷰 P2 jobs.ts:900): 전송 시작 뒤·게시 시도 표식 전에 중지가 커밋됨 — 표식 트랜잭션이 거절해 게시 요청을 보내지 않았다
@@ -1234,15 +1272,11 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
       // (max_attempts)에서 멈춰도 화면이 약속한 "재개 뒤 '재시도'"가 409 attempts_exhausted 막다른 길이 되지 않고, 의도 전 중지(beginSend — 시도 없음)와 같아진다.
       // 자동 재시도는 늘지 않는다: 이 보류는 BLOCKED 라 사용자가 중지한 뒤 재개하고 '재시도'를 눌러야만 다음 시도가 생긴다(시도마다 사용자 동작 2개).
       const free = job.resumeCount < job.attempt;
-      return settle(
-        tx,
-        ownerId,
-        job,
-        item,
-        'blocked',
-        { ...base, reason: 'live_publish_paused', not_sent: true, stage: 'before_publish_attempt', counted: !free },
-        now,
-        { ...common, lastErrorCode: 'live_publish_paused', ...(free ? { resumeCount: job.resumeCount + 1 } : {}) },
+      const set = { ...common, lastErrorCode: 'live_publish_paused', ...(free ? { resumeCount: job.resumeCount + 1 } : {}) };
+      const details = { ...base, not_sent: true, stage: 'before_publish_attempt', counted: !free };
+      // FIX1-FULLREV2(G8 후속): 이 시도 중 승인이 철회됐으면 보류가 아니라 approval_missing(위 blockedUnlessApprovalGone)
+      return blockedUnlessApprovalGone('live_publish_paused', details, set, () =>
+        settle(tx, ownerId, job, item, 'blocked', { ...details, reason: 'live_publish_paused' }, now, set),
       );
     }
     if (!cancel && cls.event === 'remote_accepted' && result.upload_yield && !result.external_id) {
@@ -1300,7 +1334,8 @@ async function finishSend(db: Db, plan: SendPlan, result: AdapterResult, opts: J
         );
       case 'blocked':
         if (cancel) return canceledUnlessPartial();
-        return settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'auth' }, now, common);
+        // FIX1-FULLREV2(G8 후속): 이 시도 중 승인이 철회됐으면 보류가 아니라 approval_missing(위 blockedUnlessApprovalGone)
+        return blockedUnlessApprovalGone('auth', base, common, () => settle(tx, ownerId, job, item, 'blocked', { ...base, reason: 'auth' }, now, common));
       case 'ambiguous':
       default:
         if (cancel) return settle(tx, ownerId, job, item, 'reconcile_retry', { ...base, remote: 'unknown' }, now, { ...common, nextRunAt: addMs(now, RECONCILE_BASE_MS), reconcileCount: 0 });
@@ -1372,11 +1407,18 @@ async function applyReconcile(
   const ownerId = job.ownerId;
   const intent = job.attempt > 0 ? await intentFor(tx, ownerId, job.id, job.attempt, true) : null;
   // FIX-LIVEP1(Codex P0): 확인 후보(미확인)는 작업 이력에만 남긴다 — 결과(publication)·게시 단계·VERIFIED 를 만들지 않는다. 형식이 맞는 값만(외부 ID threads:<숫자>, 공식 링크).
+  const offered = r.status === 'unknown' && r.candidate && LIVE_THREADS_EXTERNAL_ID_RE.test(r.candidate.external_id) ? r.candidate : null;
+  // FIX1-FULLREV2(G6): 그 글이 이미 같은 owner 의 다른 항목 결과(또는 다른 작업의 게시 기록)면 이 항목의 후보로 남기지 않는다 — 같은 본문의 다른 계획이 올린 글이
+  // 이 항목의 후보로 잡힌 것(글 하나를 두 항목의 게시로 기록하지 않게). 이력에는 후보 없음 + 사유 코드(publish_unconfirmed_candidate_claimed)만.
+  const claimed = offered ? await liveExternalIdClaimedElsewhere(tx, ownerId, offered.external_id, item.id) : false;
   const candidate =
-    r.status === 'unknown' && r.candidate && LIVE_THREADS_EXTERNAL_ID_RE.test(r.candidate.external_id)
-      ? { candidate_external_id: r.candidate.external_id, ...(isAllowedThreadsPermalink(r.candidate.permalink) ? { candidate_permalink: r.candidate.permalink } : {}) }
-      : {};
-  const base = { attempt: job.attempt, reconcile: r.status, error_code: r.error_code ?? null, manual: opts.manual || undefined, ...candidate, ...providerDiagDetail(r.provider_diag) };
+    offered && !claimed
+      ? { candidate_external_id: offered.external_id, ...(isAllowedThreadsPermalink(offered.permalink) ? { candidate_permalink: offered.permalink } : {}) }
+      : claimed
+        ? { candidate_claimed: true }
+        : {};
+  const errorCode = claimed ? 'publish_unconfirmed_candidate_claimed' : (r.error_code ?? null);
+  const base = { attempt: job.attempt, reconcile: r.status, error_code: errorCode, manual: opts.manual || undefined, ...candidate, ...providerDiagDetail(r.provider_diag) };
   const common = { ...CLEAR_LEASE };
   if (cancelResult?.status === 'canceled' && job.state === 'CANCEL_REQUESTED') {
     return settle(tx, ownerId, job, item, 'canceled', { ...base, remote_canceled: true }, now, common);
@@ -1443,11 +1485,13 @@ async function applyReconcile(
       });
     }
   }
-  const count = job.reconcileCount + 1;
   if (r.status === 'processing') {
+    // FIX1-FULLREV2(G5): 원격 처리 중 조회 한도(REMOTE_POLL_MAX)는 이번 시도의 processing 조회 수(job_events)로만 센다 — 확인 불가 횟수와 섞지 않는다(D18).
+    // processing 은 원격이 응답한 결과라 연속 확인 불가 횟수(reconcile_count)를 0 으로 되돌린다.
+    const polls = (await remotePollsThisAttempt(tx, ownerId, job.id, job.attempt)) + 1;
     // FIX2-FULLREV(FX2): 한도 — 게시된 스레드 게시물이 있으면 사유 thread_partial_unresolved(settleReconcileLimit, "새 계획 필요"라고 하지 않게)
-    if (count >= REMOTE_POLL_MAX) return settleReconcileLimit(tx, ownerId, job, item, { ...base, polls: count }, now, common);
-    const next = { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS), reconcileCount: count };
+    if (polls >= REMOTE_POLL_MAX) return settleReconcileLimit(tx, ownerId, job, item, { ...base, polls }, now, { ...common, reconcileCount: 0 });
+    const next = { ...common, nextRunAt: addMs(now, REMOTE_POLL_MS), reconcileCount: 0 };
     if (job.state === 'RECONCILING') return settle(tx, ownerId, job, item, 'remote_accepted', base, now, next);
     if (job.state === 'REMOTE_PROCESSING') return settle(tx, ownerId, job, item, 'remote_processing', base, now, next);
     return settle(tx, ownerId, job, item, 'reconcile_retry', base, now, next);
@@ -1469,6 +1513,9 @@ async function applyReconcile(
     );
   }
   // 확인 불가(read 권한 없음·판단 불가·확실하지 않은 없음): 한도까지 다시 조회, 넘으면 UNKNOWN(자동 재전송 없음).
+  // FIX1-FULLREV2(G5): count = 마지막 processing·재개(resume)·전송 결과 이후 **연속** 확인 불가 횟수(reconcile_count — processing 이 0 으로 되돌린다).
+  // 원격 처리 중 조회 수는 세지 않는다(그 한도는 위 processing 갈래의 REMOTE_POLL_MAX) — D18 "확인 불가 3회째 UNKNOWN".
+  const count = job.reconcileCount + 1;
   // FIX2-FULLREV(FX2): 게시된 스레드 게시물이 있으면 사유 thread_partial_unresolved(재시작·컨테이너 만료 뒤 3번째 게시물을 모름 — D26) — settleReconcileLimit
   if (count >= RECONCILE_MAX_ATTEMPTS) return settleReconcileLimit(tx, ownerId, job, item, { ...base, checks: count }, now, { ...common, reconcileCount: count });
   return settle(tx, ownerId, job, item, 'reconcile_retry', { ...base, checks: count }, now, { ...common, nextRunAt: reconcileDelay(count, now), reconcileCount: count });

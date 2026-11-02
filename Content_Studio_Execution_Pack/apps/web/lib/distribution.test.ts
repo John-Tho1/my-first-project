@@ -15,7 +15,13 @@ import {
   blockInfoOf,
   DISTRIBUTE_ERROR_TEXT,
   distributeFormFailure,
+  // FIX1-FULLREV2(G2)
+  DUPLICATE_ACK_LABEL,
+  duplicateStateLabel,
+  duplicateWarningLine,
+  duplicateWarningTail,
   formToApprove,
+  formToExecute,
   formToPlanCreate,
   instagramProgressLine,
   instagramStepLine,
@@ -29,6 +35,7 @@ import {
   liveVerificationLabel,
   liveVerificationTag,
   userConfirmCandidateForCard,
+  userConfirmClaimedNotice,
   threadsDiagLine,
   mockScenarioOptionsFor,
   planAccountLabel,
@@ -67,7 +74,7 @@ import {
   LIVE_UNKNOWN_HEADLINE,
   itemFormBack,
 } from './distribution';
-import { NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE } from '@cs/domain';
+import { DuplicatePublishUnacknowledgedError, NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE, USER_CONFIRM_CLAIMED_MESSAGE, USER_CONFIRM_CODES } from '@cs/domain';
 
 const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
 const ev = (details: Record<string, unknown>) => [
@@ -827,6 +834,8 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
     publications: [] as unknown[],
     // FIX-LIVEP1-USERCONFIRM: 서버와 같은 조회의 가장 최근 재확인 이력(화면 이력 10개와 무관)
     latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } as Record<string, unknown> } as { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null,
+    // FIX1-FULLREV2(G6): 후보 글이 다른 항목의 결과인지(getPlanDetail 이 서버 판정으로 채움)
+    candidateClaimed: false,
     ...over,
   });
   it('조건이 모두 맞으면 후보(버튼), RECONCILING 도', () => {
@@ -844,6 +853,8 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
     ['링크 없는 후보', { latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } } }],
     ['최근 재확인에 후보 없음(낡은 후보는 조회가 고르지 않음)', { latestReconcileEvent: { eventSeq: 5, sanitizedDetails: { reconcile: 'unknown' } } }],
     ['재확인 이력 없음', { latestReconcileEvent: null }],
+    // FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과(서버도 409 user_confirm_candidate_claimed)
+    ['후보가 이미 다른 항목의 결과', { candidateClaimed: true }],
   ])('%s → 버튼 없음', (_, over) => {
     expect(userConfirmCandidateForCard(card(over))).toBeNull();
   });
@@ -883,9 +894,19 @@ describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', ()
     expect(jobStatusText(job, { permalink: null, resultKind: 'PUBLISHED', isMock: true, verification: 'MOCK' })).toContain('MOCK');
   });
   it('거절 코드마다 화면 문구가 있다(폼 오류가 "서버 오류"로 뭉개지지 않음)', () => {
-    for (const code of ['user_confirm_not_live', 'user_confirm_already_published', 'user_confirm_not_pending', 'user_confirm_restored', 'user_confirm_no_attempt', 'user_confirm_publish_recorded', 'user_confirm_no_candidate', 'user_confirm_candidate_mismatch']) {
+    for (const code of ['user_confirm_not_live', 'user_confirm_already_published', 'user_confirm_not_pending', 'user_confirm_restored', 'user_confirm_no_attempt', 'user_confirm_publish_recorded', 'user_confirm_no_candidate', 'user_confirm_candidate_claimed', 'user_confirm_candidate_mismatch']) {
       expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
     }
+    // FIX1-FULLREV2(G6): 도메인의 모든 거절 코드에 화면 문구가 있다 · claimed 는 도메인 문구 그대로
+    for (const code of USER_CONFIRM_CODES) expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
+    expect(DISTRIBUTE_ERROR_TEXT.user_confirm_candidate_claimed).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+  });
+  it('FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과면 버튼 대신 이유(서버 거절과 같은 문구) — 실제 항목·후보가 있을 때만', () => {
+    expect(userConfirmCandidateForCard(card({ candidateClaimed: true }))).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, true, true)).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+    expect(userConfirmClaimedNotice({ candidateClaimed: false }, true, true)).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, false, true)).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, true, false)).toBeNull();
   });
 });
 
@@ -1540,5 +1561,61 @@ describe('FIX5-FULLREV(T4) — 항목 폼의 되돌아갈 곳(itemFormBack)', ()
     json.ownerChecked(f.find);
     expect(await json.target()).toBe('/distribute');
     expect(f.calls.n).toBe(0);
+  });
+});
+
+describe('FIX1-FULLREV2(G2, D40-1) — 같은 글 중복 게시 경고 문구·확인 체크박스 폼', () => {
+  const P = '33333333-3333-4333-8333-333333333333';
+  const dup = (o: Partial<Parameters<typeof duplicateWarningLine>[0]> = {}) => ({
+    itemId: 'i',
+    planId: P,
+    planSummary: 'Threads 1',
+    status: 'CONFIRMED',
+    kind: 'published' as const,
+    mock: false,
+    verification: null,
+    accountDisplayName: '@tester',
+    ...o,
+  });
+  it('실제: "이 글은 계획 … 에서 이미 게시됨/결과 불명/진행 중 — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다"', () => {
+    expect(duplicateWarningLine(dup(), 'approve')).toBe('이 글은 계획 「Threads 1」 에서 이미 게시됨 — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다');
+    expect(duplicateWarningLine(dup({ verification: 'USER_CONFIRMED' }), 'approve')).toBe('이 글은 계획 「Threads 1」 에서 이미 게시됨(사용자 확인) — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다');
+    expect(duplicateWarningLine(dup({ kind: 'unknown', status: 'UNKNOWN' }), 'approve')).toBe(
+      '이 글은 계획 「Threads 1」 에서 결과 불명(UNKNOWN — 게시됐을 수 있음) — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다',
+    );
+    expect(duplicateWarningLine(dup({ kind: 'in_progress', status: 'QUEUED' }), 'execute')).toBe('이 글은 계획 「Threads 1」 에서 진행 중(QUEUED) — 실행하면 같은 글이 한 번 더 게시될 수 있습니다');
+    // 배포 계획 만들기: 계정 이름(그 계정을 고르면 같은 글)
+    expect(duplicateWarningLine(dup({ kind: 'in_progress', status: 'BLOCKED' }), 'plan')).toBe(
+      '이 글은 계획 「Threads 1」(계정 @tester) 에서 진행 중(BLOCKED) — 같은 계정으로 다시 계획·승인하면 같은 글이 한 번 더 게시될 수 있습니다',
+    );
+    expect(duplicateWarningLine(dup({ planSummary: '  ' }), 'approve')).toContain('계획 「이름 없음」');
+  });
+  it('모의 기록은 "게시"라고 하지 않는다(MOCK — 실제 게시 아님)', () => {
+    for (const stage of ['approve', 'execute', 'plan'] as const) {
+      const line = duplicateWarningLine(dup({ mock: true, verification: 'MOCK' }), stage);
+      expect(line).toContain('모의 처리됨(MOCK — 실제 게시 아님)');
+      expect(line).toContain('한 번 더 모의 처리됩니다(MOCK — 실제 게시 아님)');
+      expect(line).not.toContain('게시됨');
+      expect(line).not.toContain('게시될 수 있습니다');
+    }
+    expect(duplicateStateLabel(dup({ mock: true, kind: 'unknown', status: 'UNKNOWN' }))).toBe('결과 불명(MOCK)');
+    expect(duplicateStateLabel(dup({ mock: true, kind: 'in_progress', status: 'QUEUED' }))).toBe('진행 중(MOCK · QUEUED)');
+    expect(duplicateWarningTail('approve', true)).toBe('다시 승인하면 같은 글이 한 번 더 모의 처리됩니다(MOCK — 실제 게시 아님)');
+  });
+  it('폼: 확인 체크박스(acknowledge_duplicate=yes)만 true, 다른 값은 false, 없으면 넣지 않음(승인·실행)', () => {
+    const I = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes', acknowledge_duplicate: 'yes' })).toMatchObject({ acknowledge_duplicate: true });
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes', acknowledge_duplicate: 'on' })).toMatchObject({ acknowledge_duplicate: false });
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes' })).not.toHaveProperty('acknowledge_duplicate');
+    expect(formToExecute({ command_key: 'k-12345678', acknowledge_duplicate: 'yes' })).toEqual({ command_key: 'k-12345678', acknowledge_duplicate: true });
+    expect(formToExecute({ command_key: 'k-12345678', acknowledge_duplicate: 'true' })).toEqual({ command_key: 'k-12345678', acknowledge_duplicate: false });
+    expect(formToExecute({ command_key: 'k-12345678' })).toEqual({ command_key: 'k-12345678' });
+  });
+  it('폼 오류 코드 duplicate_publish_unacknowledged 는 허용 목록 문구로 되돌아간다(서버 오류·충돌로 뭉개지지 않음)', () => {
+    expect(DISTRIBUTE_ERROR_TEXT.duplicate_publish_unacknowledged).toContain(DUPLICATE_ACK_LABEL);
+    expect(DISTRIBUTE_ERROR_TEXT.duplicate_publish_unacknowledged).toContain('아무것도 바꾸지 않음');
+    const res = distributeFormFailure(new DuplicatePublishUnacknowledgedError([]), new Request('http://localhost:3000/x'), '/distribute/p');
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/distribute/p?error=duplicate_publish_unacknowledged');
   });
 });

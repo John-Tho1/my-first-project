@@ -10,8 +10,13 @@ import {
   canonicalPayloadProblems,
   canVariantTransition,
   computePlanStatus,
+  DUPLICATE_IN_PROGRESS_ITEM_STATUSES,
+  DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE,
+  duplicatePublishKindOf,
+  DuplicatePublishUnacknowledgedError,
   executeSchema,
   InvalidScheduleError,
+  ITEM_STATUSES,
   payloadHash,
   planCreateSchema,
   restoredItemStatus,
@@ -20,6 +25,7 @@ import {
   ScheduleInPastError,
   zonedWallTimeToUtc,
   type CanonicalPayloadInput,
+  type DuplicatePublishKind,
 } from './distribution';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -372,5 +378,49 @@ describe('T15(D27) provider_metadata.publish_at', () => {
     expect(problemsT15({ ...c, provider_metadata: { publish_at: '2026-10-09T09:00:00.000Z', extra: 1 } })).not.toEqual([]);
     const t = buildT15({ ...base, channel: 'threads', metadata: { text: '제목', thread_parts: ['제목'] } });
     expect(problemsT15({ ...t, provider_metadata: { publish_at: '2026-10-09T09:00:00.000Z' } })).not.toEqual([]);
+  });
+});
+
+describe('FIX1-FULLREV2(G2, D40-1) duplicatePublishKindOf — 다른 계획의 같은 글이 중복으로 세지는 상태', () => {
+  // 항목 상태 전부(ITEM_STATUSES)를 표로 고정한다 — 새 상태가 생기면 이 표에서 정해야 한다
+  const TABLE: Record<(typeof ITEM_STATUSES)[number], DuplicatePublishKind | null> = {
+    PLANNED: null,
+    QUEUED: 'in_progress',
+    SENDING: 'in_progress',
+    REMOTE_PROCESSING: 'in_progress',
+    CONFIRMED: 'published',
+    RETRY_WAIT: 'in_progress',
+    BLOCKED: 'in_progress',
+    RECONCILING: 'in_progress',
+    UNKNOWN: 'unknown',
+    CANCEL_REQUESTED: 'in_progress',
+    CANCELED: null,
+    FAILED: null,
+    PARTIAL: 'published',
+  };
+  it('결과 기록이 없을 때: 진행 중(대기·전송·원격 처리·재시도 대기·확인 중·취소 확인 중·보류) · 결과 불명 · 게시됨(CONFIRMED·레거시 PARTIAL) · 세지 않음(PLANNED·CANCELED·FAILED)', () => {
+    expect(Object.keys(TABLE).sort()).toEqual([...ITEM_STATUSES].sort());
+    for (const st of ITEM_STATUSES) expect({ st, kind: duplicatePublishKindOf(st, false) }).toEqual({ st, kind: TABLE[st] });
+    expect([...DUPLICATE_IN_PROGRESS_ITEM_STATUSES].sort()).toEqual(['BLOCKED', 'CANCEL_REQUESTED', 'QUEUED', 'RECONCILING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'SENDING']);
+  });
+  it('결과 기록(USER_CONFIRMED 포함)이 있으면 상태와 관계없이 게시됨', () => {
+    for (const st of ITEM_STATUSES) expect({ st, kind: duplicatePublishKindOf(st, true) }).toEqual({ st, kind: 'published' });
+  });
+  it('승인·실행 입력의 acknowledge_duplicate 는 JSON boolean 만(문자열 거부), 없으면 그대로 없음', () => {
+    const ok = { item_ids: [U1], expected_hashes: { [U1]: H }, confirm: true, purpose: 'mock_publish' };
+    expect(approveSchema.parse({ ...ok, acknowledge_duplicate: true }).acknowledge_duplicate).toBe(true);
+    expect(approveSchema.parse({ ...ok, acknowledge_duplicate: false }).acknowledge_duplicate).toBe(false);
+    expect(approveSchema.parse(ok).acknowledge_duplicate).toBeUndefined();
+    for (const bad of ['yes', 'true', 1]) expect(approveSchema.safeParse({ ...ok, acknowledge_duplicate: bad }).success).toBe(false);
+    const ex = { command_key: 'k-12345678' };
+    expect(executeSchema.parse({ ...ex, acknowledge_duplicate: true }).acknowledge_duplicate).toBe(true);
+    expect(executeSchema.parse(ex).acknowledge_duplicate).toBeUndefined();
+    for (const bad of ['yes', 'true', 1]) expect(executeSchema.safeParse({ ...ex, acknowledge_duplicate: bad }).success).toBe(false);
+  });
+  it('409 오류: 코드·문구·항목 목록', () => {
+    const e = new DuplicatePublishUnacknowledgedError([{ item_id: U1, duplicates: [{ plan_id: U2 }] }]);
+    expect(e).toMatchObject({ kind: 'conflict', code: 'duplicate_publish_unacknowledged', message: DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE, extra: { items: [{ item_id: U1, duplicates: [{ plan_id: U2 }] }] } });
+    expect(DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE).toContain('한 번 더 게시될 수 있습니다');
+    expect(DUPLICATE_PUBLISH_UNACKNOWLEDGED_MESSAGE).toContain('acknowledge_duplicate: true');
   });
 });

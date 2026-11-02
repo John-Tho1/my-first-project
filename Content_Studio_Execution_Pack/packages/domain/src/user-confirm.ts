@@ -11,6 +11,8 @@
  *  - 가장 최근 작업이 UNKNOWN 또는 RECONCILING, 복원한 읽기 전용 이력이 아님
  *  - 그 작업에 게시 시도 표식(publish_attempt)이 있고, 게시 기록(publish — 결정적 미디어 ID)은 없음(있으면 재확인으로 확정)
  *  - 가장 최근 재확인 이력이 형식이 맞는 후보 하나(threads:<숫자> + 공식 Threads 링크)를 남겼고, 요청이 **그 후보 ID 를 그대로** 보냄(낡은 화면 방지)
+ *  - FIX1-FULLREV2(G6): 그 후보 외부 ID 가 같은 owner 의 **다른 항목**의 결과(publication)·게시 기록(publish 단계)으로 이미 기록돼 있지 않음
+ *    (글 하나를 두 항목의 게시로 기록하지 않는다 — 같은 본문의 두 계획에서 다른 항목이 올린 글이 후보로 잡힌 경우)
  */
 import { z } from 'zod';
 import { AppError } from './errors';
@@ -28,6 +30,8 @@ export const USER_CONFIRM_CODES = [
   'user_confirm_no_attempt',
   'user_confirm_publish_recorded',
   'user_confirm_no_candidate',
+  // FIX1-FULLREV2(G6): 후보 외부 ID 가 이미 다른 항목의 결과로 기록됨
+  'user_confirm_candidate_claimed',
   'user_confirm_candidate_mismatch',
 ] as const;
 export type UserConfirmCode = (typeof USER_CONFIRM_CODES)[number];
@@ -77,6 +81,11 @@ export interface UserConfirmFacts {
   /** 항목의 결과(publications) 수 */
   publications: number;
   candidate: UserConfirmCandidate | null;
+  /**
+   * FIX1-FULLREV2(G6): candidate.external_id 가 같은 owner 의 다른 항목 결과(publications)나 다른 작업의 게시 기록(remote_steps publish)으로 이미 있음.
+   * 서버(@cs/db userConfirmItem — 잠금 안)와 화면(getPlanDetail → 카드 버튼)이 같은 사실(@cs/db liveExternalIdClaimedElsewhere)로 채운다.
+   */
+  candidateClaimed: boolean;
 }
 
 /** 허용이면 null, 아니면 첫 번째로 걸린 거절 코드. requested = 요청이 보낸 후보 외부 ID. */
@@ -88,6 +97,7 @@ export function userConfirmProblem(f: UserConfirmFacts, requested: string | null
   if (f.publishAttempts < 1) return 'user_confirm_no_attempt';
   if (f.publishSteps > 0) return 'user_confirm_publish_recorded';
   if (!f.candidate) return 'user_confirm_no_candidate';
+  if (f.candidateClaimed) return 'user_confirm_candidate_claimed';
   if (typeof requested !== 'string' || requested !== f.candidate.external_id) return 'user_confirm_candidate_mismatch';
   return null;
 }
@@ -100,6 +110,14 @@ export function userConfirmProblem(f: UserConfirmFacts, requested: string | null
 export const USER_CONFIRM_RESTORED_MESSAGE =
   '복원한 작업(읽기 전용 이력)은 이 환경에서 사용자 확인으로 기록하지 않습니다(다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).';
 
+/**
+ * FIX1-FULLREV2(G6): 후보 글이 이미 다른 배포 항목의 결과로 기록된 경우의 거절 문구(409 user_confirm_candidate_claimed). 같은 본문의 다른 계획이 올린 글이
+ * 이 항목의 후보로 잡힌 것이라 이 항목의 글은 없을 가능성이 크다 — 복구 길은 USER_CONFIRM_RESTORED_MESSAGE 와 같은 조건(직접 확인해 글이 없을 때만 새 배포 계획).
+ * 화면(버튼 대신 보이는 안내·폼 오류 문구)도 이 문구를 그대로 쓴다.
+ */
+export const USER_CONFIRM_CLAIMED_MESSAGE =
+  '이 확인 후보 글은 이미 다른 배포 항목의 게시 결과로 기록돼 있어 이 항목의 결과로 기록하지 않습니다(글 하나를 두 항목의 게시로 기록하지 않음 — 다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 이 항목의 글이 따로 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요.';
+
 const USER_CONFIRM_MESSAGE: Record<UserConfirmCode, string> = {
   user_confirm_not_live: '실제 Threads 계정 항목만 "Threads에서 확인함"으로 기록할 수 있습니다(모의 결과는 해당 없음).',
   user_confirm_already_published: '이미 결과가 기록된 항목입니다(다시 기록하지 않음).',
@@ -109,6 +127,8 @@ const USER_CONFIRM_MESSAGE: Record<UserConfirmCode, string> = {
   user_confirm_no_attempt: '게시를 시도한 기록이 없는 작업입니다(사용자 확인 대상 아님).',
   user_confirm_publish_recorded: '게시 기록(미디어 ID)이 이미 있습니다 — 재확인으로 결과를 확정하세요.',
   user_confirm_no_candidate: '가장 최근 재확인에 확인 후보(링크)가 없습니다. 재확인을 다시 하거나 Threads 에서 직접 확인하세요.',
+  // FIX1-FULLREV2(G6): 조건부 복구 길(직접 확인해 글이 없을 때만 새 배포 계획) — USER_CONFIRM_CLAIMED_MESSAGE
+  user_confirm_candidate_claimed: USER_CONFIRM_CLAIMED_MESSAGE,
   user_confirm_candidate_mismatch: '화면의 확인 후보가 지금 기록된 후보와 다릅니다. 새로 고친 뒤 다시 확인하세요.',
 };
 

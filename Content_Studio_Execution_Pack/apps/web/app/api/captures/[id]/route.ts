@@ -11,6 +11,7 @@ import {
 } from '@cs/domain';
 import { apiHandler, errorResponse, json, seeOther } from '../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../lib/body';
+import { CONFLICT_HTML_HEADERS } from '../../../../lib/contents';
 import {
   captureView,
   conflictRedirectLocation,
@@ -119,15 +120,8 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
       const location = conflictRedirectLocation(id.toLowerCase(), yours);
       if (location) return seeOther(location);
       const current = e.extra!.current as Parameters<typeof renderConflictHtml>[1];
-      return new Response(renderConflictHtml(id.toLowerCase(), current, yours), {
-        status: 409,
-        headers: {
-          'content-type': 'text/html; charset=utf-8',
-          'cache-control': 'no-store',
-          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
-          'referrer-policy': 'no-referrer',
-        },
-      });
+      // FIX1-FULLREV2(G4): 원고 충돌 화면과 같은 헤더(Referrer-Policy same-origin — 이 화면의 재저장 폼 POST 가 Origin: null 로 CSRF 거부되지 않게)
+      return new Response(renderConflictHtml(id.toLowerCase(), current, yours), { status: 409, headers: CONFLICT_HTML_HEADERS });
     }
     const res = errorResponse(e, request);
     if (res.status === 401) {

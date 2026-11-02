@@ -182,6 +182,9 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'brand_profile_id', table: 'brand_profiles' },
     { col: 'input_version_id', table: 'content_versions' },
     { col: 'output_ref', table: 'content_versions' },
+    // FIX1-FULLREV2(G3): 채널 초안 AI 실행(mode=variant)은 그 파생본 밑의 기록 — FK generation_runs_variant_same_owner_fk(0009, 같은 owner 복합).
+    // 빠져 있으면 파생본이 unique·다름으로 들어가지 못했는데 run 만 넣다가 원시 FK 오류로 미리보기·복원 전체가 500 으로 끝났다.
+    { col: 'variant_id', table: 'variants', owned: true },
   ],
   claim_confirmations: [
     { col: 'run_id', table: 'generation_runs', owned: true },
@@ -191,6 +194,9 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
   claims: [
     { col: 'content_version_id', table: 'content_versions' },
     { col: 'run_id', table: 'generation_runs', owned: true },
+    // FIX1-FULLREV2(G3): 파생본 제안 버전의 claim — FK claims_variant_version_id_variant_versions_id_fk(0009, 단일 열). 그 버전이 들어가지
+    // 못하면(unique·의존성 — run 은 들어가도) claim 도 의존성 충돌로 남긴다(원시 FK 오류로 중단하지 않음).
+    { col: 'variant_version_id', table: 'variant_versions' },
   ],
   claim_sources: [
     { col: 'claim_id', table: 'claims', owned: true },
@@ -253,6 +259,12 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
   ],
   recommendation_dismissals: [{ col: 'capture_id', table: 'captures' }],
 };
+
+/**
+ * FIX1-FULLREV2(G3): 시험용 읽기 전용 보기 — DB 의 모든 FK 가 여기(또는 사후 검사 목록)에 있는지 대조한다
+ * (tests/integration/fullrev2-restore-parents.test.ts). applyBundle 이 쓰는 것과 같은 객체다.
+ */
+export const RESTORE_PARENTS: Readonly<typeof PARENTS> = PARENTS;
 
 type Avail = 'inserted' | 'same' | 'different';
 

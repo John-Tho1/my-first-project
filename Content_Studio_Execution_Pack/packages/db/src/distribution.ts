@@ -15,7 +15,7 @@
  *   FIX-T10: 계획 생성·승인·실행은 관련 계정을 FOR SHARE 로 먼저 잠그고(계정 상태 변경은 FOR UPDATE), 계획 생성은 원고·파생본도 INSERT 전에 잠근다.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   AccountCredentialBlockedError,
   AccountNotReadyError,
@@ -31,6 +31,7 @@ import {
   CHANNEL_LABEL,
   ChannelMismatchError,
   CHANNELS,
+  DuplicatePublishUnacknowledgedError,
   GoneError,
   HashMismatchError,
   isThreadsNumericId,
@@ -75,13 +76,14 @@ import {
   type JobRow,
 } from './approval-invalidation';
 import type { Db } from './client';
+import { duplicatePublishesForItems, duplicatePublishView, type DuplicatePublish } from './duplicate-publish';
 import { keysetBefore, microsText, type TimeCursor } from './ideas';
 import { mockScenariosForItems, mockScenarioView, type MockScenarioRow } from './mock-scenarios';
 import { credentialGate, getAccountHealth, LIVE_ACCOUNT_SNAPSHOT_CONNECT_ONLY, type AccountHealthView } from './oauth';
 import { LIVE_ACCOUNT_SNAPSHOT_PUBLISH_TARGET, liveApprovalUsage, pendingLiveJobs } from './live-publish';
 import { listRemoteStepsForItems, remoteStepView, type RemoteStepRow } from './remote-steps';
 import { recordAudit, type DbOrTx } from './queries';
-import { latestReconcileEvent } from './user-confirm';
+import { latestReconcileEvent, liveExternalIdClaimedElsewhere } from './user-confirm';
 import {
   approvals,
   assets,
@@ -181,6 +183,17 @@ async function getChannelAccount(db: DbOrTx, ownerId: string, id: string): Promi
     .where(and(eq(channelAccounts.id, id), eq(channelAccounts.ownerId, ownerId)))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/** FIX1-FULLREV2(G2): 계정 ID → kind('mock'|'live') — owner 범위(잠금 없음, 호출자가 이미 계정을 잠갔다). */
+async function accountKindsOf(db: DbOrTx, ownerId: string, accountIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(accountIds)].filter((id) => isUuid(id));
+  if (ids.length === 0) return new Map();
+  const rows = await db
+    .select({ id: channelAccounts.id, kind: channelAccounts.kind })
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.ownerId, ownerId), inArray(channelAccounts.id, ids)));
+  return new Map(rows.map((r) => [r.id, r.kind]));
 }
 
 export function accountReady(a: Pick<ChannelAccountRow, 'kind' | 'state'>): boolean {
@@ -588,6 +601,16 @@ export interface PlanItemDetail {
    * 화면 이력(events, 최근 10개)과 따로 읽어 카드의 확인 후보·"Threads에서 확인함" 버튼이 서버 판정과 어긋나지 않게 한다. 읽기 전용.
    */
   latestReconcileEvent: { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null;
+  /**
+   * FIX1-FULLREV2(G6): 그 재확인 이력의 확인 후보 외부 ID 가 같은 owner 의 다른 항목 결과·다른 작업 게시 기록으로 이미 있음(사용자 확인 route 와 같은 판정 —
+   * liveExternalIdClaimedElsewhere). 후보가 없으면 false. 카드는 이때 "Threads에서 확인함" 버튼 대신 이유를 보인다. 읽기 전용.
+   */
+  candidateClaimed: boolean;
+  /**
+   * FIX1-FULLREV2(G2, D40-1): 같은 owner 의 **다른** 계획에서 같은 글(같은 채널 초안 버전 + 같은 계정, 또는 같은 payload_hash) 항목이 이미 게시됨(결과 기록 —
+   * USER_CONFIRMED 포함)·결과 불명·진행 중인 것(duplicate-publish.ts, 새 것부터). 승인·실행 화면의 경고용 — 서버는 승인·실행 때 다시 조회한다(실제 계정 항목은 확인값 필요).
+   */
+  duplicates: DuplicatePublish[];
 }
 
 export interface PlanDetail {
@@ -637,6 +660,8 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
     items.filter((i) => i.status === 'PLANNED').map((i) => i.id),
     opts.media,
   );
+  // FIX1-FULLREV2(G2): 다른 계획의 같은 글(이미 게시됨·결과 불명·진행 중) — 한 번의 조회로 모든 항목
+  const duplicates = await duplicatePublishesForItems(db, ownerId, items);
   const out: PlanItemDetail[] = [];
   for (const item of items) {
     const mineJobs = allJobs.filter((j) => j.itemId === item.id);
@@ -664,6 +689,8 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       .where(and(eq(variants.id, item.variantId), eq(variants.ownerId, ownerId)))
       .limit(1);
     const mine = allApprovals.filter((a) => a.distributionItemId === item.id);
+    const lastReconcile = latestJob ? await latestReconcileEvent(db, ownerId, latestJob.id) : null;
+    const candidateId = lastReconcile?.sanitizedDetails.candidate_external_id;
     out.push({
       item,
       payload: item.payloadJson as unknown as CanonicalPayload,
@@ -679,7 +706,9 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       remoteSteps: allSteps.filter((r) => r.itemId === item.id),
       connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
       latestIntent: intentRows[0] ?? null,
-      latestReconcileEvent: latestJob ? await latestReconcileEvent(db, ownerId, latestJob.id) : null,
+      latestReconcileEvent: lastReconcile,
+      candidateClaimed: typeof candidateId === 'string' ? await liveExternalIdClaimedElsewhere(db, ownerId, candidateId, item.id) : false,
+      duplicates: duplicates.get(item.id) ?? [],
     });
   }
   return { plan, items: out };
@@ -735,6 +764,40 @@ export async function listRecentPlans(db: DbOrTx, ownerId: string, limit: number
 export interface ApproveResult {
   plan: DistributionPlanRow;
   approvals: ApprovalRow[];
+  /** FIX1-FULLREV2(G2): 승인한 항목 중 다른 계획에 같은 글이 있던 것(모의 = 경고만, 실제 = 확인값을 받고 승인함). 없으면 []. */
+  duplicateWarnings: DuplicateWarning[];
+}
+
+/** FIX1-FULLREV2(G2, D40-1): 항목 하나의 중복 경고(live = 실제 계정 항목 — 확인값 필요). */
+export interface DuplicateWarning {
+  itemId: string;
+  live: boolean;
+  duplicates: DuplicatePublish[];
+}
+
+/** 응답 모양(승인·실행 JSON 의 duplicate_warnings 원소). */
+export function duplicateWarningView(w: DuplicateWarning) {
+  return { item_id: w.itemId, mode: w.live ? ('LIVE' as const) : ('MOCK' as const), duplicates: w.duplicates.map(duplicatePublishView) };
+}
+
+/**
+ * FIX1-FULLREV2(G2, D40-1): 항목들의 중복 경고(다른 계획의 같은 글 — 이미 게시됨·결과 불명·진행 중). 호출자의 트랜잭션 안에서 부른다(승인·실행의 다른 검사와 같은 잠금 아래).
+ * liveItemIds = 실제 계정(kind live) 항목 — 그 항목의 경고는 확인값이 있어야 통과한다(assertDuplicatesAcknowledged).
+ */
+async function duplicateWarningsFor(tx: DbOrTx, ownerId: string, items: readonly DistributionItemRow[], liveItemIds: ReadonlySet<string>): Promise<DuplicateWarning[]> {
+  const found = await duplicatePublishesForItems(tx, ownerId, items);
+  return items.flatMap((i) => {
+    const duplicates = found.get(i.id) ?? [];
+    return duplicates.length ? [{ itemId: i.id, live: liveItemIds.has(i.id), duplicates }] : [];
+  });
+}
+
+/** 실제 계정 항목에 중복이 있는데 확인값이 없으면 409 duplicate_publish_unacknowledged(트랜잭션 안에서 던진다 — 아무것도 바꾸지 않음). 모의 항목은 경고만. */
+function assertDuplicatesAcknowledged(warnings: readonly DuplicateWarning[], acknowledged: boolean | undefined): void {
+  const unacked = warnings.filter((w) => w.live);
+  if (unacked.length && acknowledged !== true) {
+    throw new DuplicatePublishUnacknowledgedError(unacked.map((w) => ({ item_id: w.itemId, duplicates: w.duplicates.map(duplicatePublishView) })));
+  }
 }
 
 /**
@@ -802,6 +865,15 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
       }
       return { refused };
     }
+    // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글(이미 게시됨·결과 불명·진행 중)을 같은 트랜잭션·잠금 아래에서 다시 조회한다(화면 경고는 참고용 — 판정은 여기).
+    // 실제 계정 항목에 중복이 있으면 확인값(acknowledge_duplicate: true)이 있어야 승인한다 — 없으면 409(트랜잭션 안에서 던져 승인·감사·상태 모두 그대로). 모의 계정 항목은 경고만.
+    const accountKinds = await accountKindsOf(
+      tx,
+      ownerId,
+      items.map((i) => i.channelAccountId),
+    );
+    const duplicateWarnings = await duplicateWarningsFor(tx, ownerId, items, new Set(items.filter((i) => accountKinds.get(i.channelAccountId) === 'live').map((i) => i.id)));
+    assertDuplicatesAcknowledged(duplicateWarnings, input.acknowledge_duplicate);
     const created: ApprovalRow[] = [];
     for (const item of items) {
       const rows = await tx
@@ -817,13 +889,19 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
         })
         .returning();
       created.push(rows[0]!);
+      // FIX1-FULLREV2(G2): 다른 계획의 같은 글이 있던 승인은 그 수와 확인값을 감사에 남긴다(의도한 재게시 기록)
+      const dup = duplicateWarnings.find((w) => w.itemId === item.id);
       await recordAudit(tx, {
         ownerId,
         action: 'approval.grant',
         entity: 'approval',
         entityId: rows[0]!.id,
         versionOrHash: item.payloadHash,
-        details: { item_id: item.id, payload_hash: item.payloadHash },
+        details: {
+          item_id: item.id,
+          payload_hash: item.payloadHash,
+          ...(dup ? { duplicates: dup.duplicates.length, duplicate_acknowledged: input.acknowledge_duplicate === true } : {}),
+        },
         at: now,
       });
     }
@@ -846,7 +924,7 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
       }
     }
     await recomputePlanStatus(tx, ownerId, plan.id, now);
-    return { plan: (await getPlanRow(tx, ownerId, plan.id))!, approvals: created };
+    return { plan: (await getPlanRow(tx, ownerId, plan.id))!, approvals: created, duplicateWarnings };
   });
   if ('refused' in out && out.refused) throw new SnapshotStaleError(out.refused);
   return out as ApproveResult;
@@ -900,6 +978,11 @@ export interface ExecuteResult {
   mode: 'MOCK' | 'LIVE';
   notice: string;
   idempotent_replay: boolean;
+  /**
+   * FIX1-FULLREV2(G2): 대기열에 넣은 항목 중 다른 계획에 같은 글(이미 게시됨·결과 불명·진행 중)이 있던 것 — 모의 = 경고만, 실제 = 확인값을 받고 실행함. 없으면 [].
+   * 이 변경 전에 저장된 실행 결과(같은 command_key 재호출)에는 없다.
+   */
+  duplicate_warnings?: Array<ReturnType<typeof duplicateWarningView>>;
 }
 
 type StoredExecute = Omit<ExecuteResult, 'idempotent_replay'>;
@@ -940,7 +1023,7 @@ export async function executePlan(
   db: Db,
   ownerId: string,
   planId: string,
-  input: { commandKey: string; itemIds?: readonly string[] },
+  input: { commandKey: string; itemIds?: readonly string[]; acknowledgeDuplicate?: boolean },
   config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>,
   now: Date = new Date(),
 ): Promise<ExecuteResult> {
@@ -1047,6 +1130,13 @@ export async function executePlan(
         const pending = await pendingLiveJobs(tx, ref);
         if (used + pending + liveCount > max) throw new LivePublishLimitError({ limit: max, used: used + pending });
       }
+      // FIX1-FULLREV2(G2, D40-1): 실행 때 다시 조회한다(승인 뒤 다른 계획이 실행·게시됐을 수 있다). 실제 게시 항목에 중복이 있으면 확인값(acknowledge_duplicate: true)이
+      // 있어야 한다 — 없으면 409(트랜잭션 안에서 던져 대기열·실행 키·감사 모두 그대로). 모의 항목은 경고만(결과 duplicate_warnings).
+      // 실제 게시 항목이 있으면 owner 단위 트랜잭션 advisory 잠금 뒤에 조회한다 — 같은 글을 담은 다른 계획의 동시 실행과 직렬화(먼저 커밋한 쪽의 QUEUED 를 뒤 쪽이 본다).
+      // 실행 뒤 전송 전에 생긴 중복은 다시 막지 않는다(D40 결과 — 화면 경고만).
+      if (liveCount > 0) await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs.duplicate-publish:${ownerId}`}))`);
+      const duplicateWarnings = await duplicateWarningsFor(tx, ownerId, selected, new Set(selected.filter((i) => modes.get(i.id) === 'LIVE').map((i) => i.id)));
+      assertDuplicatesAcknowledged(duplicateWarnings, input.acknowledgeDuplicate);
       for (const item of selected) {
         const approval = active.get(item.id)!;
         const mode = modes.get(item.id)!;
@@ -1085,7 +1175,13 @@ export async function executePlan(
       }
       await recomputePlanStatus(tx, ownerId, plan.id, now);
       const anyLive = queued.some((q) => q.mode === 'LIVE');
-      const stored: StoredExecute = { plan_id: plan.id, queued, mode: anyLive ? 'LIVE' : 'MOCK', notice: anyLive ? LIVE_EXECUTE_NOTICE : MOCK_EXECUTE_NOTICE };
+      const stored: StoredExecute = {
+        plan_id: plan.id,
+        queued,
+        mode: anyLive ? 'LIVE' : 'MOCK',
+        notice: anyLive ? LIVE_EXECUTE_NOTICE : MOCK_EXECUTE_NOTICE,
+        duplicate_warnings: duplicateWarnings.map(duplicateWarningView),
+      };
       await tx.insert(executeCommands).values({
         ownerId,
         planId: plan.id,
@@ -1099,7 +1195,14 @@ export async function executePlan(
         entity: 'distribution_plan',
         entityId: plan.id,
         versionOrHash: commandHash(input.commandKey),
-        details: { command_key_sha256: commandHash(input.commandKey), queued: queued.length, mode: stored.mode, live: queued.filter((q) => q.mode === 'LIVE').length },
+        details: {
+          command_key_sha256: commandHash(input.commandKey),
+          queued: queued.length,
+          mode: stored.mode,
+          live: queued.filter((q) => q.mode === 'LIVE').length,
+          // FIX1-FULLREV2(G2): 다른 계획에 같은 글이 있던 항목 수와 확인값(의도한 재게시 기록)
+          ...(duplicateWarnings.length ? { duplicate_items: duplicateWarnings.length, duplicate_acknowledged: input.acknowledgeDuplicate === true } : {}),
+        },
         at: now,
       });
       return { result: { ...stored, idempotent_replay: false } };
@@ -1267,6 +1370,10 @@ export function planDetailView(d: PlanDetail) {
       connection: x.connection
         ? { status: x.connection.status, status_label: x.connection.status_label, usable_for_execution: x.connection.usable_for_execution, credential_state: x.connection.credential_state, mock: x.connection.mock }
         : null,
+      // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글(이미 게시됨·결과 불명·진행 중). 실행 전(PLANNED) 실제 계정 항목이면 승인·실행에 acknowledge_duplicate: true 필요
+      // (서버가 그때 다시 조회해 정한다 — 이 값은 지금 조회 기준의 안내).
+      duplicate_publishes: x.duplicates.map(duplicatePublishView),
+      duplicate_ack_required: x.item.status === 'PLANNED' && x.account?.kind === 'live' && x.duplicates.length > 0,
     })),
   };
 }

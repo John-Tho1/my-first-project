@@ -56,6 +56,18 @@ export type InvalidationReason =
  * 전송 단계(LEASED 이후)는 철회가 CANCEL_REQUESTED 로 추적한다.
  */
 export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT', 'BLOCKED'] as const;
+/**
+ * FIX1-FULLREV2(G8): 계정 상태·연결 변경(invalidateApprovalsForAccount — "실제 게시 계정으로 사용"·사용 중지·연결 해제)이 **추가로** 활성 승인을 철회하는
+ * 진행 중 항목 상태(LEASED 작업의 항목은 QUEUED 로 보여 위 목록에 이미 있다). 작업·항목 상태는 건드리지 않는다 — 지금 시도는 그대로 결과를 기록하고,
+ * 다음 전송(재개·not_found 뒤 재시도)의 보내기 직전 재검사(beginSend)가 approval_missing 으로 멈춘다(stopUnlessPartial: 게시된 것이 없으면 PLANNED, 있으면 UNKNOWN).
+ * FIX1-FULLREV2(G8 후속): SENDING 시도가 보류(표식 전 즉시 중지·auth)로 끝나면 finishSend 가 같은 규칙으로 정한다(blockedUnlessApprovalGone — 승인 없는 BLOCKED 항목은
+ * 재시도·다시 승인 둘 다 막혀 막다른 길이 되므로).
+ * 이유: beginSend 의 스냅샷 재검사는 "지금" 계정 상태만 본다 — 사용 중지 → 다시 사용처럼 되돌린 계정 변경은 잡지 못해, 진행 중이던 항목만 다시 승인 없이
+ * 다음 시도를 보낼 수 있었다(같은 변경에서 대기 항목은 다시 승인해야 함). 편집 훅(원고·파생본·브랜드)은 그대로 — 그 변경은 단조라 beginSend 가 잡는다.
+ * UNKNOWN 은 넣지 않는다(재전송 경로가 없다).
+ */
+const IN_FLIGHT_ITEM_STATUSES = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED'] as const;
+const ACCOUNT_INVALIDATION_ITEM_STATUSES: readonly string[] = [...REVOCABLE_ITEM_STATUSES, ...IN_FLIGHT_ITEM_STATUSES];
 /** 철회 시 BLOCKED 로 막는 작업 상태(아직 보내지 않은 대기 작업). */
 const BLOCK_ON_REVOKE_JOB_STATES = ['QUEUED', 'RETRY_WAIT'] as const;
 const isRevocable = (status: string) => (REVOCABLE_ITEM_STATUSES as readonly string[]).includes(status);
@@ -264,6 +276,8 @@ export async function partialSendOf(tx: DbOrTx, ownerId: string, jobId: string):
  * 처음부터 다시 보내기 때문이다(D26·A11 맹목 재전송 금지). 그 작업은 cancel_partial 로 UNKNOWN(thread_partial_revoked), 항목도 UNKNOWN. 승인은 그대로 철회한다.
  * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록한다.
  * FIX1-FULLREV(F2 후속): 단, 부분 게시가 있는 LEASED 작업의 항목은 PLANNED 로 두지 않는다(작업은 그대로 — beginSend 가 UNKNOWN 으로 정한다).
+ * FIX1-FULLREV2(G8): 계정 무효화는 진행 중 항목(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)도 넘긴다 — 승인만 철회하고 작업·항목 상태는 그대로다
+ * (대기 작업이 없으므로 위 갈래에 걸리지 않음).
  * worker 의 전송 직전 재검사(beginSend)는 그대로 최종 방어선이다.
  */
 export async function revokeActiveApprovalsLocked(
@@ -457,7 +471,10 @@ export async function settleApprovedVariants(
   return changed;
 }
 
-/** 공통: 조건에 맞는 항목(활성 승인 있음, PLANNED·QUEUED·RETRY_WAIT)을 잠그고 철회 → 계획 재계산 → 파생본 정리. */
+/**
+ * 공통: 조건에 맞는 항목(활성 승인 있음, 기본 REVOCABLE_ITEM_STATUSES)을 잠그고 철회 → 계획 재계산 → 파생본 정리.
+ * FIX1-FULLREV2(G8): statuses = 잠근 뒤 다시 거르는 항목 상태(계정 무효화만 진행 중 상태를 더한다).
+ */
 async function invalidateWhere(
   tx: DbOrTx,
   ownerId: string,
@@ -465,13 +482,14 @@ async function invalidateWhere(
   reason: InvalidationReason,
   variantTarget: 'review' | 'draft',
   now: Date,
+  statuses: readonly string[] = REVOCABLE_ITEM_STATUSES,
 ): Promise<RevokedApproval[]> {
   if (itemIds.length === 0) return [];
   const items = await lockItemsInOrder(tx, ownerId, itemIds);
   const revoked = await revokeActiveApprovalsLocked(
     tx,
     ownerId,
-    items.filter((i) => isRevocable(i.status)),
+    items.filter((i) => statuses.includes(i.status)),
     () => `invalidated:${reason}`,
     now,
     { action: 'approval.invalidate' },
@@ -487,13 +505,18 @@ async function invalidateWhere(
   return revoked;
 }
 
-async function itemsWithActiveApproval(tx: DbOrTx, ownerId: string, where: ReturnType<typeof and>): Promise<string[]> {
+async function itemsWithActiveApproval(
+  tx: DbOrTx,
+  ownerId: string,
+  where: ReturnType<typeof and>,
+  statuses: readonly string[] = REVOCABLE_ITEM_STATUSES,
+): Promise<string[]> {
   const rows = await tx
     .selectDistinct({ id: distributionItems.id })
     .from(distributionItems)
     .innerJoin(approvals, and(eq(approvals.distributionItemId, distributionItems.id), eq(approvals.ownerId, distributionItems.ownerId), isNull(approvals.revokedAt)))
     .innerJoin(variants, and(eq(variants.id, distributionItems.variantId), eq(variants.ownerId, distributionItems.ownerId)))
-    .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, [...REVOCABLE_ITEM_STATUSES]), where));
+    .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.status, [...statuses]), where));
   return rows.map((r) => r.id);
 }
 
@@ -521,10 +544,16 @@ export async function invalidateApprovalsForContent(tx: DbOrTx, ownerId: string,
   return invalidateWhere(tx, ownerId, ids, 'content_changed', 'draft', now);
 }
 
-/** A06 훅(계정): 계정 상태·연결이 바뀌면 그 계정을 쓰는 항목의 활성 승인을 철회한다. 파생본 내용은 그대로라 승인됨 → review. */
+/**
+ * A06 훅(계정): 계정 상태·연결이 바뀌면 그 계정을 쓰는 항목의 활성 승인을 철회한다. 파생본 내용은 그대로라 승인됨 → review.
+ * 호출자: setChannelAccountStateTx(상태가 실제로 바뀔 때만 — "실제 게시 계정으로 사용"·사용 중지 포함), revokeCredentialOp(연결 해제).
+ * 토큰 갱신·같은 계정 재연결은 이 훅을 부르지 않는다(D25-1 승인 유지 그대로).
+ * FIX1-FULLREV2(G8): 진행 중 항목(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)의 활성 승인도 철회한다(작업·항목 상태는 그대로 —
+ * IN_FLIGHT_ITEM_STATUSES 설명). 그래서 사용 중지 → 다시 사용 뒤에도 그 항목의 다음 전송은 다시 승인해야 한다(D25-1·docs/04 "사용 중지 = 활성 승인 철회").
+ */
 export async function invalidateApprovalsForAccount(tx: DbOrTx, ownerId: string, accountId: string, now: Date): Promise<RevokedApproval[]> {
-  const ids = await itemsWithActiveApproval(tx, ownerId, eq(distributionItems.channelAccountId, accountId));
-  return invalidateWhere(tx, ownerId, ids, 'account_changed', 'review', now);
+  const ids = await itemsWithActiveApproval(tx, ownerId, eq(distributionItems.channelAccountId, accountId), ACCOUNT_INVALIDATION_ITEM_STATUSES);
+  return invalidateWhere(tx, ownerId, ids, 'account_changed', 'review', now, ACCOUNT_INVALIDATION_ITEM_STATUSES);
 }
 
 /**

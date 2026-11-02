@@ -95,6 +95,11 @@ const REQUIRED: Record<string, string[]> = {
     'const cancelUnknown = cancelUnknownBannerOf(q, d);',
     '{cancelUnknown ? (',
     '{cancelUnknown}',
+    // FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글 경고(승인 카드·실행 구역)와 확인 체크박스는 접힌 곳 밖
+    '<DuplicatePublishWarning key={`dup-a-${x.item.id}`} dups={x.duplicates} stage="approve" heading={dupHeading(x)} />',
+    '<DuplicatePublishWarning key={`dup-e-${x.item.id}`} dups={x.duplicates} stage="execute" heading={dupHeading(x)} />',
+    '<input type="checkbox" name="acknowledge_duplicate" value="yes" />',
+    '{DUPLICATE_ACK_LABEL}',
   ],
   'distribute/new/page.tsx': [
     '<strong>실제로 게시</strong>',
@@ -107,6 +112,8 @@ const REQUIRED: Record<string, string[]> = {
     // FIX-LIVEP2(계획 3(b)): 실제 게시 준비 안내 옆 즉시 중지 표시
     'getLivePublishPaused(db, session.ownerId)',
     '<strong>지금은 실제 게시 일시 중지됨 — 재개 전에는 게시하지 않습니다.</strong>',
+    // FIX1-FULLREV2(G2, D40-1): 채널 초안 줄의 중복 게시 경고는 접힌 곳 밖
+    '<DuplicatePublishWarning dups={duplicates} stage="plan" />',
   ],
   'distribute/page.tsx': [
     MOCK_TAG,

@@ -18,7 +18,8 @@ const RESUME = '원인이 해결되고 재개 조건이 갖춰지면 작업 처�
 export const REVOKE_INCOMPLETE_TEXT: Record<RevokeIncompleteCodeView | 'unknown', string> = {
   revoke_current_no_key: `연결 해제가 끝나지 않았습니다 — 서버 비밀 암호화 키(SECRETS_MASTER_KEY)가 설정되지 않아 저장된 연결 정보를 열지 못했습니다. ${BLOCKED} 키를 설정하면 ${RESUME}`,
   revoke_current_unreadable: `연결 해제가 끝나지 않았습니다 — 저장된 연결 정보를 지금 키로 열 수 없습니다(키 버전을 모르거나 키가 맞지 않음). ${BLOCKED} 연결 정보를 봉인한 키(이전 키 버전 포함)를 설정하면 ${RESUME}`,
-  revoke_provider_unavailable: `연결 해제가 끝나지 않았습니다 — 이 계정의 연결 공급자를 지금 쓸 수 없어 원격 철회를 하지 못했습니다. ${BLOCKED} 공급자를 쓸 수 있게 되면 ${RESUME}`,
+  // FIX2-FULLREV2(G13): 실제 Threads 계정은 원격 철회 API 가 없어 공급자 설정이 빠져도 로컬 삭제로 끝난다 — 이 이유는 원격 철회가 있는 계정(모의 공급자 등)에만 남는다.
+  revoke_provider_unavailable: `연결 해제가 끝나지 않았습니다 — 이 계정의 연결 공급자를 만들 수 없어(공급자 설정이 빠졌거나 이 계정 종류를 지원하지 않음) 원격 철회가 필요한 토큰을 철회하지 못했습니다. ${BLOCKED} 공급자 설정을 갖추면 ${RESUME}`,
   revoke_current_seal_failed: `연결 해제가 끝나지 않았습니다 — 철회 기록을 저장하지 못했습니다. ${BLOCKED} 잠시 뒤 연결 해제를 다시 누르세요. ${RESUME}`,
   unknown: `연결 해제가 끝나지 않았습니다. ${BLOCKED} 잠시 뒤 연결 해제를 다시 누르세요. ${RESUME}`,
 };

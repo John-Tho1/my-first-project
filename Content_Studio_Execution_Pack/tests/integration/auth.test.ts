@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { closeDb, createSession, getDb, schema, seed, type Db } from '@cs/db';
-import { generateSessionToken, hashSessionToken, loadConfig } from '@cs/domain';
+import { generateSessionToken, hashSessionToken, loadConfig, sessionPolicyFingerprint } from '@cs/domain';
 import * as loginRoute from '../../apps/web/app/api/auth/login/route';
 import * as logoutRoute from '../../apps/web/app/api/auth/logout/route';
 import { GET as assetGET } from '../../apps/web/app/api/assets/[id]/route';
@@ -165,6 +165,8 @@ describe('세션 만료·폐기', () => {
       expiresAt: over.expiresAt,
       userAgentHash: null,
       now: over.lastSeenAt ?? now,
+      // FIX2-FULLREV2(G16): 지금 정책의 지문(로그인 route 와 같은 값) — 만료·폐기·갱신만 시험한다
+      policyFingerprint: sessionPolicyFingerprint(loadConfig(), process.env),
     });
     if (over.revokedAt) {
       await db.update(schema.sessions).set({ revokedAt: over.revokedAt }).where(eq(schema.sessions.id, row.id));

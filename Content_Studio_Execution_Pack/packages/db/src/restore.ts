@@ -55,8 +55,9 @@ function compareHash(name: RestoredTable, row: Record<string, unknown>): string 
 }
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
 import { variantReviewBlockers } from './variants';
-import { recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
+import { invalidateApprovalsForBrandProfile, invalidateApprovalsForRisk, recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
 import { snapshotProblems } from './distribution';
+import { getCurrentBrandProfile } from './writing';
 import { assets, captures, contents, distributionItems, ideas, jobs, publications, restoreRuns, sources } from './schema';
 
 export type RestoreMode = 'empty_only' | 'add_missing';
@@ -109,7 +110,11 @@ export interface RestoreConflict {
   table: RestoredTable;
   id: string;
   /** different: 같은 owner 의 같은 ID 가 내용이 다름 / id_in_use: 다른 owner 가 쓰는 ID / dependency: 부모 행이 복원되지 않음 / unique: 다른 unique 값 충돌 / version_exists: 같은 버전의 브랜드 프로필이 다름 */
-  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version' | 'snapshot_referenced';
+  /**
+   * existing_parent(FIX2-FULLREV2 G18): 승인·작업·전송 의도·원격 결과·원격 단계 행의 부모(배포 항목·작업·의도)가 이 환경에 이미 있던(동일) 행이라
+   * 넣지 않음 — 기존 항목에 승인·실행 이력을 덧붙이지 않는다(D6 기존 행 UPDATE 없음 — 계획 상태·파생본 lifecycle 을 다시 맞추지 않으므로).
+   */
+  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version' | 'snapshot_referenced' | 'existing_parent';
 }
 
 export interface DowngradedVariant {
@@ -136,6 +141,13 @@ export interface ApplyReport {
   /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
   revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
   /**
+   * FIX2-FULLREV2(G19, D19-a): 복원으로 더 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌어, 이 환경에 **이미 있던** 활성 승인을
+   * `invalidated:brand_changed` 로 무효로 한 것(새 브랜드 버전 훅 invalidateApprovalsForBrandProfile 과 같은 규칙 — 대기 작업 BLOCKED, 항목 PLANNED).
+   * revokedApprovals(묶음에서 들어온 승인의 restore_stale)와 따로 둔다 — 복원 훈련은 revokedApprovals 를 묶음 기대값과 정확히 대조한다.
+   * FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효로 한 기존 승인도 여기에(reasons ['risk_needs_check']).
+   */
+  invalidatedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[]; blocked_job_ids: string[] }>;
+  /**
    * FIX-T13(Codex review-T13 P1 #4): 복원 뒤 "다시 연결 필요"가 된 계정 — 새로 넣은 연결 이력 계정(linked → needs_reconnect)과,
    * 이미 있던(동일) 계정 중 로컬이 none 인데 묶음이 linked·needs_reconnect 인 계정(연결 이력을 잃지 않게 needs_reconnect 로 올림).
    * 로컬이 linked·needs_reconnect 이면 그대로 둔다(로컬의 유효한 연결을 묶음이 덮지 않음).
@@ -154,8 +166,13 @@ export interface ReconnectLabel {
 
 const MAX_CONFLICTS_LISTED = 200;
 
-/** 묶음의 부모 참조(같은 owner 에 있어야 삽입 가능). owned=true 는 부모가 "이번에 넣었거나 동일"일 때만(기존 다른 행에 덧붙이지 않음). */
-const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: RestoredTable; owned?: boolean }>>> = {
+/**
+ * 묶음의 부모 참조(같은 owner 에 있어야 삽입 가능). owned=true 는 부모가 "이번에 넣었거나 동일"일 때만(기존 다른 행에 덧붙이지 않음).
+ * fresh=true(FIX2-FULLREV2 G18)는 부모가 **이번 복원에서 넣은** 행일 때만 — 이미 있던(동일) 부모면 existing_parent 충돌로 남긴다(owned 와 별개 플래그,
+ * 다른 표의 owned 의미는 그대로). 승인·작업·전송 의도·원격 결과·원격 단계: 이미 있던 배포 항목에 새 활성 승인을 붙이면 그 계획 상태·파생본 lifecycle 은
+ * 다시 계산되지 않아(D6 — 기존 행 UPDATE 없음) 계획은 '초안'인데 실행 폼은 대기열에 넣고 재승인은 already_approved 가 된다.
+ */
+const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: RestoredTable; owned?: boolean; fresh?: boolean }>>> = {
   source_versions: [{ col: 'source_id', table: 'sources', owned: true }],
   // T08: 전사에서 만든 소재는 그 전사 버전이 이번에 들어갔거나 같은 행일 때만.
   captures: [
@@ -225,19 +242,21 @@ const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: Restore
     { col: 'content_version_id', table: 'content_versions' },
     { col: 'brand_profile_id', table: 'brand_profiles' },
   ],
-  approvals: [{ col: 'distribution_item_id', table: 'distribution_items', owned: true }],
+  // FIX2-FULLREV2(G18): 승인은 그 항목이 이번에 들어갔을 때만(fresh) — 이미 있던(동일) 항목이면 existing_parent 충돌(다시 승인은 이 환경에서).
+  approvals: [{ col: 'distribution_item_id', table: 'distribution_items', owned: true, fresh: true }],
   // FIX-T11: 작업·전송 의도·원격 결과는 읽기 전용 이력 — 그 항목·작업이 이번에 들어갔을 때만(기존 항목에 이력을 덧붙이지 않는다).
-  jobs: [{ col: 'item_id', table: 'distribution_items', owned: true }],
-  send_intents: [{ col: 'job_id', table: 'jobs', owned: true }],
+  // FIX2-FULLREV2(G18): 주석의 "이번에 들어갔을 때만"을 코드로(fresh) — 전에는 동일 부모에도 붙었다.
+  jobs: [{ col: 'item_id', table: 'distribution_items', owned: true, fresh: true }],
+  send_intents: [{ col: 'job_id', table: 'jobs', owned: true, fresh: true }],
   publications: [
-    { col: 'item_id', table: 'distribution_items', owned: true },
-    { col: 'job_id', table: 'jobs', owned: true },
+    { col: 'item_id', table: 'distribution_items', owned: true, fresh: true },
+    { col: 'job_id', table: 'jobs', owned: true, fresh: true },
   ],
   // FIX-T14(Codex review-T14 P1): 원격 단계 기록도 읽기 전용 이력 — 그 작업·의도·항목이 이번에 들어갔을 때만(기존 작업에 단계를 덧붙이지 않는다).
   remote_steps: [
-    { col: 'job_id', table: 'jobs', owned: true },
-    { col: 'intent_id', table: 'send_intents', owned: true },
-    { col: 'item_id', table: 'distribution_items', owned: true },
+    { col: 'job_id', table: 'jobs', owned: true, fresh: true },
+    { col: 'intent_id', table: 'send_intents', owned: true, fresh: true },
+    { col: 'item_id', table: 'distribution_items', owned: true, fresh: true },
   ],
   // T18(D32 제안): 가져오기 원장 항목은 그 실행이 이번에 들어갔거나 같을 때만(기존 실행에 항목을 덧붙이지 않는다), 대상(소재·출처·버전)이 있을 때만.
   import_items: [
@@ -284,6 +303,8 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   const insertedVariants: Array<{ id: string; currentVersionId: string | null }> = [];
   const blockedItems: string[] = [];
   const unknownItems: string[] = [];
+  // FIX2-FULLREV2(G19): 복원 전 현재 브랜드(최대 version) — 복원 뒤 바뀌었으면 기존 활성 승인을 브랜드 훅과 같이 무효로 한다.
+  const brandBefore = (await getCurrentBrandProfile(tx, ownerId))?.id ?? null;
 
   for (const name of RESTORED_TABLES) {
     const rows = bundle.tables[name] as unknown as Array<Record<string, unknown> & { id: string }>;
@@ -325,6 +346,15 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
       });
       if (!parentsOk) {
         conflict(row.id, 'dependency');
+        continue;
+      }
+      // FIX2-FULLREV2(G18): fresh 부모(배포 항목·작업·의도)가 이번 복원에서 넣은 행이 아니라 이미 있던(동일) 행이면 넣지 않는다.
+      const staleParent = (PARENTS[name] ?? []).some((p) => {
+        const v = row[p.col];
+        return p.fresh === true && v !== null && v !== undefined && avail[p.table]?.get(String(v)) === 'same';
+      });
+      if (staleParent) {
+        conflict(row.id, 'existing_parent');
         continue;
       }
       // FIX-T09 round 2(P1): 이미 있던(동일) 파생본 버전에 첨부를 새로 붙이지 않는다 — 버전은 불변이고, 붙이면 검토 조건(미디어)이 바뀐다.
@@ -521,6 +551,34 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     );
     revokedApprovals.push({ approval_id: a.id, item_id: a.distribution_item_id, reasons });
   }
+  // FIX2-FULLREV2(G19, D19-a): add_missing 으로 더 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌었으면, 옛 브랜드를 가리키는 활성 승인
+  // (이 환경에 이미 있던 승인 — 묶음 승인은 위 재검사가 brand_changed 로 이미 철회)을 새 브랜드 버전 훅과 같은 규칙으로 무효로 한다
+  // (대기 작업 BLOCKED, 항목 PLANNED, 계획 재계산, 파생본 approved → review). 기존 행 UPDATE 의 예외(D6) — 실행을 막는 쪽으로만 바꾸고
+  // 미리보기·결과에 보고한다(FIX-T13 연결 이력 규칙과 같은 선례). 전에는 예약 시각에야 beginSend 가 brand_changed 로 조용히 막았다.
+  const invalidatedApprovals: ApplyReport['invalidatedApprovals'] = [];
+  const brandAfter = await getCurrentBrandProfile(tx, ownerId);
+  if (brandAfter && brandAfter.id !== brandBefore) {
+    for (const r of await invalidateApprovalsForBrandProfile(tx, ownerId, brandAfter.id, restoreNow)) {
+      invalidatedApprovals.push({ approval_id: r.approvalId, item_id: r.itemId, reasons: ['brand_changed'], blocked_job_ids: r.blockedJobIds });
+    }
+  }
+  // FIX2-FULLREV2(G9 fixup, D40-2): add_missing 이 이미 있던(동일) 원고에 위험 표시 '확인 필요' 소재를 잇는 content_captures 행을 넣으면, 그 원고의
+  // 기존 활성 승인을 소재 위험 표시 훅(invalidateApprovalsForRisk)과 같은 규칙으로 무효로 한다(invalidated:risk_needs_check — 대기 작업 BLOCKED,
+  // 항목 PLANNED, 계획 재계산, 파생본 approved → review). 미리보기는 같은 트랜잭션을 되돌리므로 보고만 한다.
+  // 아이디어는 해당 없음: contents.idea_id 는 원고 행의 열이라 기존 원고에는 복원이 바꾸지 않고(UPDATE 없음), 새로 넣은 원고의 승인은 위 재검사가 맡는다.
+  const riskLinkedContents = new Set<string>();
+  for (const cc of bundle.tables.content_captures as unknown as Array<{ id: string; content_id: string; capture_id: string }>) {
+    if (avail.content_captures!.get(cc.id) !== 'inserted' || avail.contents!.get(cc.content_id) !== 'same') continue;
+    const cap = await tx
+      .select({ risk: captures.risk })
+      .from(captures)
+      .where(and(eq(captures.id, cc.capture_id), eq(captures.ownerId, ownerId)))
+      .limit(1);
+    if (cap[0]?.risk === 'needs_check') riskLinkedContents.add(cc.content_id);
+  }
+  for (const r of await invalidateApprovalsForRisk(tx, ownerId, { contentIds: [...riskLinkedContents].sort() }, restoreNow)) {
+    invalidatedApprovals.push({ approval_id: r.approvalId, item_id: r.itemId, reasons: ['risk_needs_check'], blocked_job_ids: r.blockedJobIds });
+  }
   await settleApprovedVariants(
     tx,
     ownerId,
@@ -561,6 +619,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     unknownItems,
     unverifiedConfirmedItems,
     revokedApprovals,
+    invalidatedApprovals,
     reconnectRequiredAccounts,
     reconnectRequiredLabels,
   };
@@ -642,6 +701,8 @@ export interface RestorePreview {
   unverified_confirmed_items: string[];
   /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
   revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX2-FULLREV2(G19): 복원하면 현재 브랜드가 바뀌어 invalidated:brand_changed 로 무효가 될 이 환경의 기존 승인 */
+  invalidated_approvals: ApplyReport['invalidatedApprovals'];
   /** FIX-T13: 복원하면 "다시 연결 필요"가 될 계정 */
   reconnect_required_accounts: string[];
   /** FIX2-T13: 같은 계정의 화면 표시용 이름(ID 없음) */
@@ -774,6 +835,7 @@ export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBund
     unknown_items: r.unknownItems,
     unverified_confirmed_items: r.unverifiedConfirmedItems,
     revoked_approvals: r.revokedApprovals,
+    invalidated_approvals: r.invalidatedApprovals,
     reconnect_required_accounts: r.reconnectRequiredAccounts,
     reconnect_required_labels: r.reconnectRequiredLabels,
     assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
@@ -957,6 +1019,8 @@ export interface CommitResult {
   /** FIX-T11 */
   unverified_confirmed_items: string[];
   revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX2-FULLREV2(G19): 현재 브랜드가 바뀌어 invalidated:brand_changed 로 무효가 된 이 환경의 기존 승인 */
+  invalidated_approvals: ApplyReport['invalidatedApprovals'];
   /** FIX-T13: 복원 뒤 다시 연결이 필요한 계정 */
   reconnect_required_accounts: string[];
   /** FIX2-T13: 화면 표시용 이름(ID 없음) */
@@ -1066,6 +1130,7 @@ export async function commitRestore(
         unknown_items: report.unknownItems,
         unverified_confirmed_items: report.unverifiedConfirmedItems,
         revoked_approvals: report.revokedApprovals,
+        invalidated_approvals: report.invalidatedApprovals,
         reconnect_required_accounts: report.reconnectRequiredAccounts,
         reconnect_required_labels: report.reconnectRequiredLabels,
         assets_written: written,

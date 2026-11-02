@@ -1,4 +1,4 @@
-import { consumeOidcLoginState, countRecentLoginFailures, createSession, ensureOwner, recordAudit, withLoginAttemptLock } from '@cs/db';
+import { consumeOidcLoginState, countRecentLoginDenials, countRecentLoginFailures, createSession, ensureOwner, recordAudit, withLoginAttemptLock } from '@cs/db';
 import {
   AppError,
   assertLoginNotRateLimited,
@@ -11,6 +11,8 @@ import {
   LOGIN_FAILURE_REASONS,
   LOGIN_FAILURE_WINDOW_MS,
   OIDC_FLOW_COOKIE_NAME,
+  OIDC_CANCEL_AUDIT_MAX,
+  OIDC_CANCEL_AUDIT_WINDOW_MS,
   OidcCancelledError,
   oidcClientSettings,
   OidcIdentityDeniedError,
@@ -24,10 +26,12 @@ import {
   readCookie,
   requestRedirectTarget,
   requireSecretKeyring,
+  sessionPolicyFingerprint,
   sessionTtlMs,
 } from '@cs/domain';
 import { OidcLoginFailure } from '@cs/providers';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
+import { warnAuthDenialThrottled } from '../../../../../lib/auth-log';
 import { withOAuthResponseHeaders } from '../../../../../lib/oauth';
 import { getOidcLoginClient } from '../../../../../lib/oidc';
 import { getAppDb, getConfig } from '../../../../../lib/server';
@@ -128,6 +132,16 @@ export async function GET(request: Request): Promise<Response> {
     const outcome = await withLoginAttemptLock(db, limit, async (tx, { now, failures, seq }) => {
       assertLoginNotRateLimited(failures); // 던지면 아무것도 쓰지 않은 채 되돌려진다
       if (failure) {
+        // FIX2-FULLREV2(G15): IdP 취소(callback?error=…)는 인증 없이 시작→callback 으로 반복할 수 있다. 24시간 창 안 기록이 상한에 닿으면
+        // 더 쓰지 않는다(응답은 같은 401, 서버 로그에 이름만 1분 1회). 잠금 안에서 세므로 상한은 정확하다. 실패 횟수(429)에는 계속 세지 않는다.
+        if (
+          failure.reason === 'oidc_cancelled' &&
+          (await countRecentLoginDenials(tx, { now, windowMs: OIDC_CANCEL_AUDIT_WINDOW_MS, reason: 'oidc_cancelled' })) >= OIDC_CANCEL_AUDIT_MAX
+        ) {
+          warnAuthDenialThrottled('oidc_cancelled');
+          // FIX2-FULLREV2(G15 fixup): 상한 뒤에는 위의 1분 1회 줄만 남긴다 — 아래 요청마다의 oidc_login_denied 줄은 건너뛴다(capped)
+          return { kind: 'failed' as const, failure, capped: true };
+        }
         await recordAudit(tx, {
           ownerId: null,
           action: 'auth.login_denied',
@@ -136,7 +150,7 @@ export async function GET(request: Request): Promise<Response> {
           details: { reason: failure.reason, check: failure.check, mode: 'oidc' },
           at: now,
         });
-        return { kind: 'failed' as const, failure };
+        return { kind: 'failed' as const, failure, capped: false };
       }
       const owner = await ensureOwner(tx, cfg.AUTH_ALLOWED_IDENTITY);
       const token = generateSessionToken();
@@ -146,6 +160,8 @@ export async function GET(request: Request): Promise<Response> {
         expiresAt: new Date(now.getTime() + sessionTtlMs(cfg)),
         userAgentHash: hashUserAgent(request.headers.get('user-agent')),
         now,
+        // FIX2-FULLREV2(G16): 지금 인증 정책(AUTH_MODE·issuer·허용 sub·허용 email)의 지문 — 바뀌면 이 세션은 거부된다
+        policyFingerprint: sessionPolicyFingerprint(cfg, process.env),
       });
       await recordAudit(tx, {
         ownerId: owner.id,
@@ -159,7 +175,7 @@ export async function GET(request: Request): Promise<Response> {
       return { kind: 'ok' as const, token, session };
     });
     if (outcome.kind === 'failed') {
-      console.warn(`[auth] oidc_login_denied: ${outcome.failure.reason}/${outcome.failure.check}`);
+      if (!outcome.capped) console.warn(`[auth] oidc_login_denied: ${outcome.failure.reason}/${outcome.failure.check}`);
       throw outcome.failure.error;
     }
     const headers = new Headers();

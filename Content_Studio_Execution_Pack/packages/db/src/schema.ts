@@ -741,16 +741,21 @@ export const variantAssets = pgTable(
  * 감사 기록. owner_id 는 인증 전 이벤트(예: auth.login_denied — 아직 owner 가 확인되지 않음)에 한해 null(T02).
  * owner 범위 조회는 owner_id 로 필터하므로 null 행은 어떤 owner 의 목록에도 나타나지 않는다.
  */
-export const auditEvents = pgTable('audit_events', {
-  id: id(),
-  ownerId: uuid('owner_id').references(() => users.id, { onDelete: 'restrict' }),
-  action: text('action').notNull(),
-  entity: text('entity').notNull(),
-  entityId: uuid('entity_id'),
-  versionOrHash: text('version_or_hash'),
-  at: ts('at').notNull().defaultNow(),
-  sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
-});
+export const auditEvents = pgTable(
+  'audit_events',
+  {
+    id: id(),
+    ownerId: uuid('owner_id').references(() => users.id, { onDelete: 'restrict' }),
+    action: text('action').notNull(),
+    entity: text('entity').notNull(),
+    entityId: uuid('entity_id'),
+    versionOrHash: text('version_or_hash'),
+    at: ts('at').notNull().defaultNow(),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  // FIX2-FULLREV2(G15): 로그인 판정(countRecentLoginFailures·취소 기록 상한)이 (action, 시간 창)으로 이 표를 훑는다 — 전체 스캔 대신 색인 범위.
+  (t) => [index('audit_events_action_at_idx').on(t.action, t.at)],
+);
 
 /**
  * 로그인 세션(T02, 결정 D3). 토큰 원문은 쿠키에만 있고 DB 에는 sha256 hex(token_hash)만 저장한다.
@@ -770,6 +775,11 @@ export const sessions = pgTable(
     lastSeenAt: ts('last_seen_at').notNull().defaultNow(),
     revokedAt: ts('revoked_at'),
     userAgentHash: text('user_agent_hash'),
+    /**
+     * FIX2-FULLREV2(G16, D40-3): 만들 때의 인증 정책 지문(sessionPolicyFingerprint). 검증 때 현재 정책 지문과 다르면 거부한다.
+     * null = 이 열이 생기기 전 세션 — 언제나 거부(migration 0048 뒤 1회 재로그인).
+     */
+    policyFingerprint: text('policy_fingerprint'),
   },
   (t) => [index('sessions_owner_idx').on(t.ownerId)],
 );

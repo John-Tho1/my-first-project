@@ -21,9 +21,11 @@ import {
   loginInputSchema,
   LoginRateLimitedError,
   LoginSequenceExhaustedError,
+  sessionPolicyFingerprint,
   sessionTtlMs,
 } from '@cs/domain';
 import { errorResponse, json, readBodyCapped, seeOther, wantsHtml } from '../../../../lib/api';
+import { warnAuthDenialThrottled } from '../../../../lib/auth-log';
 import { getAppDb, getConfig } from '../../../../lib/server';
 
 export const dynamic = 'force-dynamic';
@@ -86,14 +88,17 @@ export async function POST(request: Request): Promise<Response> {
     }
     const config = getConfig();
     assertSameOrigin(request, config);
-    const { db } = await getAppDb(config);
-
+    // FIX2-FULLREV2(G15): 설정 때문에 거부되는 경우(identity_login_disabled·dev_login_not_allowed·dev_login_refused_in_production)는
+    // 감사 행을 쓰지 않는다 — 요청 내용과 무관한 거부라 인증 없는 반복 요청이 audit_events 를 무제한으로 키울 수 있었다.
+    // 대신 사유 이름만 서버 로그에 1분 1회 남긴다. 실패 횟수(429)에 세지 않는 것은 그대로(전에도 LOGIN_FAILURE_REASONS 밖).
+    // DB 도 열지 않는다(거부 판정은 설정만 본다).
     try {
       assertLoginAvailable(config, process.env.NODE_ENV);
     } catch (e) {
-      if (e instanceof AppError) await recordAudit(db, denied(e.code, new Date()));
+      if (e instanceof AppError) warnAuthDenialThrottled(e.code);
       throw e;
     }
+    const { db } = await getAppDb(config);
 
     const limit = { windowMs: LOGIN_FAILURE_WINDOW_MS, reasons: LOGIN_FAILURE_REASONS };
     // T21-P1a: 전역 시도 횟수 제한 — 식별자를 보기 전에 판정하므로 맞는 식별자든 틀린 식별자든 같은 429(식별자 존재 여부 비노출).
@@ -131,6 +136,8 @@ export async function POST(request: Request): Promise<Response> {
         expiresAt: new Date(now.getTime() + sessionTtlMs(config)),
         userAgentHash: hashUserAgent(request.headers.get('user-agent')),
         now,
+        // FIX2-FULLREV2(G16): 지금 인증 정책의 지문 — 정책이 바뀌면 이 세션은 검증에서 거부된다
+        policyFingerprint: sessionPolicyFingerprint(config, process.env),
       });
       await recordAudit(tx, {
         ownerId: owner.id,

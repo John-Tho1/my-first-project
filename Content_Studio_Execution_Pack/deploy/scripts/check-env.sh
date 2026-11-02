@@ -84,6 +84,14 @@ elif ! root_real="$(realpath -e -- "$DATA_ROOT" 2>/dev/null)" || [[ ! -d "$root_
   bad "데이터 루트가 없거나 폴더가 아닙니다: $DATA_ROOT"
   root_real=""
 fi
+# FIX2-FULLREV2(G33): 데이터 볼륨 표시(<데이터 루트의 부모>/.data-must-be-mount)가 있으면 데이터 루트가 **지금** 마운트 지점이어야 한다 —
+# 볼륨이 빠진 채 루트 디스크의 빈 마운트 지점 폴더에 새 DB 를 만들고 쓰지 않게(§7-4·§8 의 'check-env → start' 도 이 검사를 거친다).
+# 백업·복원과 같은 함수(lib/common.sh refuse_if_must_be_mount_but_not)를 쓴다. 그 함수는 die 로 끝나므로 하위 셸에서 부르고 결과만 모은다.
+# systemd unit 도 같은 표시를 ExecStartPre 로 확인하고 RequiresMountsFor= 로 마운트를 요구한다(deploy/content-studio.service).
+DATA_PARENT="$(dirname -- "${DATA_ROOT%/}")"
+if ! (refuse_if_must_be_mount_but_not "$DATA_PARENT" "${DATA_ROOT%/}"); then
+  bad "데이터 볼륨 표시(.data-must-be-mount)가 있는데 데이터 루트가 지금 마운트 지점이 아닙니다(또는 확인 실패): $DATA_ROOT — 볼륨을 먼저 마운트하세요"
+fi
 under_root() { # under_root <정규 경로> — 데이터 루트 자체는 아니고 그 아래인가
   [[ -n "$root_real" && "$1" == "$root_real"/* ]]
 }

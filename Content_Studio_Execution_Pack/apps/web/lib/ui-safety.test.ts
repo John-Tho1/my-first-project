@@ -76,7 +76,9 @@ const REQUIRED: Record<string, string[]> = {
     // FIX2-FULLREV(FX3): 스냅샷 안내는 상태 태그와 같은 기록 기준으로 모의·실제 문구를 고른다
     // FIX4-FULLREV(S3): (FIX2 의 itemIsLive·두 열 선택을 바꿈) 기록 기준은 한 규칙 itemRecordLive(결과 is_mock · 계정 kind · 기록된 어댑터), 열은 mock·live·unknown
     'const recordLive = itemRecordLive({ accountKind: x.account?.kind, pub: latestPub, intent: x.latestIntent });',
-    '{SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {x.problems.map(problemLabel).join',
+    // FIX2-FULLREV2(G9): 스냅샷 안내는 위험 표시(risk_needs_check — 따로 '확인 필요' 안내)를 뺀 목록(snapProblems)을 보인다
+    'const snapProblems = x.problems.filter((p) => p !== RISK_NEEDS_CHECK_PROBLEM);',
+    '{SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {snapProblems.map(problemLabel).join',
     '{LIVE_UNKNOWN_GUIDANCE_BY_KIND[unknownKind]}',
     // FIX4-FULLREV(S1·S3): 머리줄·작업 제목·결과 불명 안내·MOCK 확인 표시도 같은 recordLive — 실제 머리줄·스냅샷 안내가 보이는 카드는 결과 불명 안내도 그린다
     "recordLive === true\n      ? liveItemHeadline({ ...headlineInput, verification: latestPub?.verification ?? null })",

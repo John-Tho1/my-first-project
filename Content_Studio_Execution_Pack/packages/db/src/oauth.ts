@@ -374,6 +374,9 @@ export async function startOAuthConnect(
   await db.transaction(async (tx) => {
     // FIX2-T13: 발급 시점의 해제 세대를 계정 잠금 아래에서 읽어 기록한다(해제 시작과 직렬화).
     const { cred } = await lockAccountCredential(tx, input.ownerId, account.id);
+    // FIX2-FULLREV2(G14): 해제가 끝나지 않은(revoking) 연결 정보에는 연결 요청을 만들지 않는다. 콜백 저장이 반드시 credential_busy 로 거부되므로,
+    // 인증 창으로 보내면 실제 Threads 에서는 철회할 수 없는 장기 토큰만 발급받고 버리게 된다. state 행·감사·authorize URL 없이 409.
+    if (cred?.status === 'revoking') throw new CredentialBusyError();
     await tx
       .delete(oauthStates)
       .where(and(eq(oauthStates.ownerId, input.ownerId), or(lte(oauthStates.expiresAt, now), isNotNull(oauthStates.usedAt))));
@@ -1763,6 +1766,14 @@ async function revokeCredentialOp(
   } catch {
     provider = null;
   }
+  // FIX2-FULLREV2(G13): 실제 Threads 계정(kind live·platform threads)은 공급자에 토큰 철회 API 가 없다(LiveThreadsOAuthProvider.revoke 는
+  // 네트워크 없이 항상 unsupported). 그래서 live OAuth 준비 설정(OAUTH_MODE·앱 ID·시크릿·redirect·마스터 키·승인 기록)이 빠져 공급자를 만들지
+  // 못해도 원격 철회는 'unsupported' 로 보고 로컬 삭제(암호문·키 버전 삭제·revoked_at)를 마친다 — 준비된 실제 해제와 같은 최종 상태.
+  // 현재 토큰을 열 필요도 없다(철회할 곳이 없으므로 암호문이 철회 의무를 지지 않는다). 다른 플랫폼·종류는 그대로(공급자 없음 = 미완료).
+  // FIX2-FULLREV2(G13 fixup): 공급자를 만들 수 있어도 마찬가지다 — 실제 Threads 토큰은 원격 철회가 정의상 없으므로 현재 토큰을 열지 않고
+  // (키가 없거나 바뀌어 열 수 없어도 막히지 않음) 로컬 삭제를 마친다. liveProviderUnavailable 은 감사 표시용(공급자를 못 만든 경우만).
+  const noRemoteRevoke = account.kind === 'live' && account.platform === 'threads';
+  const liveProviderUnavailable = noRemoteRevoke && !provider;
   const marked = await db.transaction(async (tx) => {
     const { account: acc, cred } = await lockAccountCredential(tx, input.ownerId, account.id);
     if (expect) {
@@ -1817,8 +1828,8 @@ async function revokeCredentialOp(
       .where(and(eq(oauthStates.ownerId, input.ownerId), eq(oauthStates.channelAccountId, acc.id), isNull(oauthStates.usedAt)));
     const revoked = await invalidateApprovalsForAccount(tx, input.ownerId, acc.id, now);
     let tokens: StoredOAuthTokens | null = null;
-    let skip: RevokeResult['remoteRevoke'] | null = provider ? null : 'skipped_unsupported';
-    if (provider) {
+    let skip: RevokeResult['remoteRevoke'] | null = noRemoteRevoke ? 'unsupported' : provider ? null : 'skipped_unsupported';
+    if (provider && !noRemoteRevoke) {
       try {
         const ring = input.keyring();
         tokens = decodeTokens(openSecret(ring, cred.encryptedToken!, cred.keyVersion!, tokenAad(input.ownerId, acc.id)));
@@ -1834,17 +1845,19 @@ async function revokeCredentialOp(
       .where(and(eq(oauthPendingTokens.ownerId, input.ownerId), eq(oauthPendingTokens.channelAccountId, acc.id)))
       .orderBy(asc(oauthPendingTokens.createdAt), asc(oauthPendingTokens.id))
       .for('update');
-    const pendings: Array<{ id: string; revision: number; kind: string; tokens: StoredOAuthTokens | null }> = [];
+    const pendings: Array<{ id: string; revision: number; kind: string; tokens: StoredOAuthTokens | null; sealed: boolean }> = [];
     for (const p of pendingRows) {
       let t: StoredOAuthTokens | null = null;
-      if (provider && p.sealedToken && p.keyVersion !== null) {
+      // FIX2-FULLREV2(G13 재검토): 실제 Threads 는 정리 대기 행도 열지 않는다(철회할 곳이 없어 봉인이 철회 의무를 지지 않음 — 키 교체로 열 수 없어도
+      // 아래에서 unsupported 로 보고 삭제한다. 열 수 없는 행이 영구히 남아 다시 연결을 막지 않게).
+      if (provider && !noRemoteRevoke && p.sealedToken && p.keyVersion !== null) {
         try {
           t = decodeTokens(openSecret(input.keyring(), p.sealedToken, p.keyVersion, pendingAad(input.ownerId, acc.id)));
         } catch {
           t = null;
         }
       }
-      pendings.push({ id: p.id, revision: p.revision, kind: p.kind, tokens: t });
+      pendings.push({ id: p.id, revision: p.revision, kind: p.kind, tokens: t, sealed: p.sealedToken !== null });
     }
     const hadCiphertext = cred.encryptedToken !== null && cred.keyVersion !== null;
     return { generation: cred.tokenGeneration, tokens, hadCiphertext, pendings, skip, revokedApprovals: revoked.length, credId: cred.id, opId: opId!, epoch, joined };
@@ -1858,7 +1871,11 @@ async function revokeCredentialOp(
   let remoteCode: string | null = null;
   const pendingResults = new Map<string, { result: RemoteRevoke; code: string | null }>();
   for (const p of marked.pendings) {
-    if (provider && p.tokens) pendingResults.set(p.id, await revokeAtProvider(provider, p.tokens, now));
+    // FIX2-FULLREV2(G13): 준비된 실제 공급자가 돌려줄 결과와 같다(외부 호출 없음) — 정리 대기 행은 준비된 해제처럼 정리된다.
+    // FIX2-FULLREV2(G13 재검토): 행을 열지 않으므로(위) 봉인이 있는 행이면 열 수 있든 없든 unsupported(삭제).
+    if (noRemoteRevoke) {
+      if (p.kind !== 'verify_current' && p.sealed) pendingResults.set(p.id, { result: 'unsupported', code: null });
+    } else if (provider && p.tokens) pendingResults.set(p.id, await revokeAtProvider(provider, p.tokens, now));
   }
   // 감사용 요약: 없음 · 모두 철회 확인 · 하나라도 실패/불명 · 열 수 없는 행 있음
   const withToken = marked.pendings.filter((p) => p.kind !== 'verify_current');
@@ -1885,7 +1902,8 @@ async function revokeCredentialOp(
   // FIX6-T13(Codex review-FIX5-T13 P1 :1541): 키가 없거나 열 수 없거나 공급자가 없어 C 를 읽지·철회하지 못한 경우(skipped_*)는 철회 확인이 아니다 —
   // 암호문(봉인 그대로)·키 버전을 지우지 않고 revoking(차단)으로 남긴다(outcome incomplete, last_error_code = 이유). 이 암호문이 곧 철회 의무다:
   // 키가 다시 설정되면(키 교체가 다시 봉인해도 같은 토큰) worker 가 같은 해제 작업에 합류해 철회하고 마무리한다(refreshExpiringCredentials).
-  const currentUnreadable = marked.hadCiphertext && !marked.tokens;
+  // FIX2-FULLREV2(G13): 실제 Threads 의 공급자 없음은 "읽지 못함"이 아니다 — 원격 철회가 정의상 없으므로 암호문을 남길 이유가 없다.
+  const currentUnreadable = marked.hadCiphertext && !marked.tokens && !noRemoteRevoke;
   const currentRevokeConfirmed =
     !marked.tokens ||
     !cleanupFailed(remote as RemoteRevoke) ||
@@ -2018,6 +2036,8 @@ async function revokeCredentialOp(
         pending_tokens_revoked: results.length - failedPending.length,
         current_token_record: currentRecord,
         incomplete_code: incompleteCode,
+        // FIX2-FULLREV2(G13): 실제 Threads — live 준비 설정이 빠져 공급자 없이 로컬 삭제만 했음(값 없이 표시만)
+        ...(liveProviderUnavailable ? { live_provider_unavailable: true } : {}),
       },
       at: now,
     });
@@ -2133,9 +2153,18 @@ export async function refreshExpiringCredentials(
   };
   for (const c of stuckRevokes) {
     try {
-      const ring = input.keyring();
-      openSecret(ring, c.encryptedToken!, c.keyVersion!, tokenAad(c.ownerId, c.channelAccountId));
-      input.providerFor(await ownedAccount(db, c.ownerId, c.channelAccountId));
+      const acct = await ownedAccount(db, c.ownerId, c.channelAccountId);
+      let providerOk = true;
+      try {
+        input.providerFor(acct);
+      } catch (e) {
+        // FIX2-FULLREV2(G13): 실제 Threads 는 공급자(live 준비 설정) 없이도 해제를 마칠 수 있다(원격 철회 API 없음 — 키도 필요 없음).
+        // 그 밖의 계정은 그대로 — 공급자가 없으면 미룬다.
+        if (!(acct.kind === 'live' && acct.platform === 'threads')) throw e;
+        providerOk = false;
+      }
+      // FIX2-FULLREV2(G13 fixup): 실제 Threads 는 공급자가 있어도 현재 토큰을 열지 않는다(해제가 토큰을 쓰지 않음 — 키를 잃어도 마무리)
+      if (providerOk && !(acct.kind === 'live' && acct.platform === 'threads')) openSecret(input.keyring(), c.encryptedToken!, c.keyVersion!, tokenAad(c.ownerId, c.channelAccountId));
     } catch {
       revokeWaiting++;
       await deferResume(c);

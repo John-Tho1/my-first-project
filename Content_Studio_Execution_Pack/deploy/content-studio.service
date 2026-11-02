@@ -12,6 +12,9 @@
 Description=Content Studio web (Next.js, inline worker)
 After=network-online.target
 Wants=network-online.target
+# FIX2-FULLREV2(G33): 데이터 폴더(볼륨 마운트일 수 있음)가 마운트된 뒤에만 시작한다(Requires=·After= 를 그 경로의 마운트 unit 에 건다).
+# fstab 에 nofail 을 달아도 이 서비스는 마운트를 요구한다 — 마운트가 실패하면 시작하지 않는다. 데이터가 일반 폴더면 상위 마운트(/ 등)만 요구하므로 무해하다.
+RequiresMountsFor=/srv/content-studio/data
 
 [Service]
 Type=simple
@@ -27,6 +30,10 @@ EnvironmentFile=/etc/content-studio/env
 
 # pnpm·corepack 을 거치지 않고 Node 로 직접 실행한다(apps/web/scripts/next.mjs = 텔레메트리 끔 + SIGTERM 전달, 상대 경로 = 위 WorkingDirectory 기준).
 # Node 경로는 설치 방법에 맞춘다(`command -v node`). 127.0.0.1 에서만 듣는다 — 외부 노출은 Caddy 만.
+# FIX2-FULLREV2(G33): 데이터 볼륨 표시(/srv/content-studio/.data-must-be-mount — README §2)가 있으면 데이터 폴더가 지금 마운트 지점일 때만 시작한다
+# (백업·복원·check-env.sh 와 같은 규칙). 볼륨이 빠진 채 루트 디스크의 빈 폴더에 새 DB 를 만들지 않게. mountpoint 가 없거나 오류여도 시작하지 않는다.
+# `+` = 이 검사만 root·보호 설정 밖에서 실행(읽기만 — 표시 파일을 권한 문제로 "없음"으로 잘못 보지 않게).
+ExecStartPre=+/bin/sh -c 'test ! -e /srv/content-studio/.data-must-be-mount || mountpoint -q /srv/content-studio/data'
 ExecStart=/usr/bin/node apps/web/scripts/next.mjs start --hostname 127.0.0.1 --port 3000
 
 Restart=on-failure

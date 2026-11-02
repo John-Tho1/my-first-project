@@ -9,6 +9,7 @@ import {
   livePublishReadiness,
   livePublishStatusLine,
   providerMetadataOf,
+  RISK_NEEDS_CHECK_PROBLEM,
   USER_CONFIRM_BUTTON,
   USER_CONFIRM_WARNING,
   type AdapterId,
@@ -40,6 +41,7 @@ import {
   mockScenarioOptionsFor,
   PLAN_STATUS_LABEL,
   problemLabel,
+  riskNoticeOf,
   publishAtView,
   reconciledNotice,
   recordModeKey,
@@ -403,7 +405,8 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
     blockReason: block.code,
     blockDetail: block.detail,
     activeApproval: x.activeApproval !== null,
-    needsNewPlan: x.problems.length > 0,
+    // FIX2-FULLREV2(G9): 위험 표시만 있으면 새 계획이 아니라 '확인 필요' 해제(아래 위험 안내)
+    needsNewPlan: x.problems.some((p) => p !== RISK_NEEDS_CHECK_PROBLEM),
     publishAt: providerMetadataOf(p).publish_at ?? null,
     cancelTooLate: !!latest?.cancelRequestedAt && latest.state === 'CONFIRMED',
     // LIVE-P2(D39): 최근 24시간 상한 보류면 상한·다시 보낼 수 있는 시각(모스크바)
@@ -437,6 +440,9 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
   const retryable = x.item.status === 'BLOCKED' && latest?.state === 'BLOCKED' && x.activeApproval !== null;
   // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그·작업 줄·안내가 "새 계획 필요"라고 하지 않게 최근 작업의 lastErrorCode 로 고른다
   const unknownKind = unknownKindOf(x.item.status, latest);
+  // FIX2-FULLREV2(G9, D40-2): 위험 표시('확인 필요')는 새 계획이 아니라 해제가 필요하다 — 스냅샷 문제 줄과 따로 보인다(접힌 칸 밖, 항목 상태와 무관).
+  const riskNotice = riskNoticeOf(x.risk);
+  const snapProblems = x.problems.filter((p) => p !== RISK_NEEDS_CHECK_PROBLEM);
   return (
     <section className="card archive" aria-label={`${CHANNEL_LABEL[channel as Channel] ?? channel} 항목`}>
       <h3>
@@ -507,17 +513,28 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           </dd>
         </div>
       </dl>
-      {x.problems.length ? (
+      {riskNotice ? (
+        <p className="notice" role="alert" data-testid="risk-needs-check">
+          <span className="tag warn">확인 필요</span> {riskNotice.text}{' '}
+          {riskNotice.links.map((l, i) => (
+            <span key={l.href}>
+              {i > 0 ? ' · ' : null}
+              <a href={l.href}>{l.label}</a>
+            </span>
+          ))}
+        </p>
+      ) : null}
+      {snapProblems.length ? (
         unknownKind ? (
           // FIX2-FULLREV(Q2): 부분 게시·복원 취소 미확정 항목에는 새 계획을 권하지 않는다(게시된 부분이 처음부터 다시 게시됨)
           // FIX2-FULLREV(FX3): 실제 항목은 "일부 게시된 작업"이라고 단정하지 않는 실제 문구(recordLive)
           // FIX4-FULLREV(S1·S3): 실제 문구에는 새 계획 권유가 없다(조건부 복구 줄은 아래 결과 불명 안내에 한 번만 — 같은 recordLive 로 그 안내도 그린다), 증명 못 함 = unknown 문구
           <p className="notice" role="alert">
-            {SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {x.problems.map(problemLabel).join(', ')}
+            {SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[unknownKind][recordModeKey(recordLive)]}: {snapProblems.map(problemLabel).join(', ')}
           </p>
         ) : (
           <p className="notice" role="alert">
-            스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): {x.problems.map(problemLabel).join(', ')}
+            스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(새 계획 필요): {snapProblems.map(problemLabel).join(', ')}
           </p>
         )
       ) : null}

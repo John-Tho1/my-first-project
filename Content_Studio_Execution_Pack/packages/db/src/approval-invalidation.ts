@@ -33,7 +33,7 @@ import {
   type VariantLifecycle,
 } from '@cs/domain';
 import { recordAudit, type DbOrTx } from './queries';
-import { approvals, channelAccounts, contents, distributionItems, distributionPlans, jobEvents, jobs, remoteSteps, variants } from './schema';
+import { approvals, channelAccounts, contentCaptures, contents, distributionItems, distributionPlans, jobEvents, jobs, remoteSteps, variants } from './schema';
 
 export type DistributionItemRow = typeof distributionItems.$inferSelect;
 export type ApprovalRow = typeof approvals.$inferSelect;
@@ -46,6 +46,8 @@ export type InvalidationReason =
   | 'account_changed'
   | 'brand_changed'
   | 'schedule_passed'
+  // FIX2-FULLREV2(G9, D40-2): 원고의 아이디어 또는 연결 소재에 위험 표시 '확인 필요'(risk='needs_check')
+  | 'risk_needs_check'
   | 'snapshot_changed';
 
 /**
@@ -568,6 +570,35 @@ export async function invalidateApprovalsForBrandProfile(tx: DbOrTx, ownerId: st
     sql`${distributionItems.brandProfileId} is distinct from ${currentBrandProfileId}::uuid`,
   );
   return invalidateWhere(tx, ownerId, ids, 'brand_changed', 'review', now);
+}
+
+/**
+ * FIX2-FULLREV2(G9, D40-2) A06 훅(위험 표시): 아이디어 또는 소재의 위험 표시를 '확인 필요'(needs_check)로 바꾼 트랜잭션 안에서 부른다.
+ * 그 아이디어로 만든 원고(contents.idea_id) 또는 그 소재를 연결한 원고(content_captures)의 파생본을 담은 항목의 활성 승인을
+ * `invalidated:risk_needs_check` 로 철회한다(QUEUED 작업 → BLOCKED, 항목 → PLANNED — 다른 편집 훅과 같은 규칙). 본문은 그대로라 승인됨 → review.
+ * '확인 필요'를 해제해도 철회한 승인은 되살리지 않는다(다시 승인). 훅을 거치지 않은 변경은 snapshotProblems(risk_needs_check)가 승인·실행·전송 직전에 막는다.
+ */
+export async function invalidateApprovalsForRisk(
+  tx: DbOrTx,
+  ownerId: string,
+  // FIX2-FULLREV2(G9 fixup): contentIds — 복원(add_missing)이 기존 원고에 '확인 필요' 소재 연결을 넣은 경우 그 원고들만
+  source: { ideaId: string } | { captureId: string } | { contentIds: readonly string[] },
+  now: Date,
+): Promise<RevokedApproval[]> {
+  if ('contentIds' in source) {
+    if (source.contentIds.length === 0) return [];
+    const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, [...source.contentIds]));
+    return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now);
+  }
+  const contentIds =
+    'ideaId' in source
+      ? tx.select({ id: contents.id }).from(contents).where(and(eq(contents.ownerId, ownerId), eq(contents.ideaId, source.ideaId)))
+      : tx
+          .select({ id: contentCaptures.contentId })
+          .from(contentCaptures)
+          .where(and(eq(contentCaptures.ownerId, ownerId), eq(contentCaptures.captureId, source.captureId)));
+  const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, contentIds));
+  return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now);
 }
 
 /** 실행 시점 재검사에서 stale 로 판정된 항목(별도 트랜잭션): 사유별로 철회한다. */

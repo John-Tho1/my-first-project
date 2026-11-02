@@ -138,6 +138,8 @@ export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   oauth_bad_request: '연결 응답 형식이 올바르지 않습니다.',
   oauth_account_mismatch: '연결한 계정이 이 배포 계정과 달라 저장하지 않았습니다.',
   credential_not_connected: '이 계정에는 저장된 연결 정보가 없습니다.',
+  // FIX2-FULLREV2(G14): 해제가 끝나지 않은 계정의 연결 시작(인증 창으로 보내지 않음)·갱신 거부
+  credential_busy: '연결 해제 미완료 — 해제가 끝나기 전에는 다시 연결하거나 갱신할 수 없습니다. 외부로 아무것도 보내지 않았습니다. "연결 해제"를 다시 누르거나 작업 처리기가 마무리할 때까지 기다리세요.',
   credential_refresh_failed: '연결 정보를 갱신하지 못했습니다. 다시 연결하세요.',
   credential_unreadable: '저장된 연결 정보를 읽을 수 없습니다. 다시 연결하세요.',
   mock_rehydration_unavailable: '모의 연결 정보를 아직 다시 불러오지 못했습니다. 연결 상태는 바꾸지 않았습니다. 잠시 뒤 다시 시도하세요.',

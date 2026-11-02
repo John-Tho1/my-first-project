@@ -129,6 +129,47 @@ export function oidcSettingsFingerprint(s: Pick<OidcClientSettings, 'issuer' | '
   return createHash('sha256').update(`oidc/v1\n${s.issuer}\n${s.clientId}\n${s.redirectUri}\n${s.scopes.join(' ')}`, 'utf8').digest('hex');
 }
 
+// ---- 세션 정책 지문(FIX2-FULLREV2(G16), D40-3) ----
+
+export type SessionPolicyConfig = Pick<AppConfig, 'AUTH_MODE' | 'AUTH_ALLOWED_IDENTITY' | 'AUTH_ALLOWED_SUBJECT' | 'OIDC_ISSUER_URL'>;
+
+/** issuer 표기 정리: URL 정규화(호스트 소문자 등) 뒤 끝의 '/' 하나만 뗀다. 형식이 틀리면(설정 검증이 먼저 막지만) 원문 그대로. */
+function normalizeIssuer(raw: string | undefined): string | null {
+  if (!raw) return null;
+  try {
+    return new URL(raw.trim()).href.replace(/\/$/, '');
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * FIX2-FULLREV2(G16): 세션을 만들 때의 인증 정책 지문(sha256 hex). 세션 행(policy_fingerprint)에 저장하고, 요청마다 현재 정책의 지문과
+ * 같을 때만 세션을 받아들인다 — 허용 sub·issuer·허용 email·AUTH_MODE 를 바꾸면 기존 세션이 모두 끊긴다(D40-3).
+ * - dev: AUTH_MODE + AUTH_ALLOWED_IDENTITY(그대로 — dev 로그인과 owner 키가 정확 일치로 비교한다). OIDC 설정은 dev 세션에 영향이 없다.
+ * - oidc: AUTH_MODE + 정규화한 issuer + 허용 sub(없으면 null) + 허용 email(환경에 명시했을 때만, trim·소문자 — checkOidcIdentity 와 같은 규칙,
+ *   아니면 null) + owner 키(AUTH_ALLOWED_IDENTITY 그대로).
+ * 비밀(클라이언트 시크릿·키)은 넣지 않는다. 지문 값은 응답·감사·로그에 내보내지 않는다.
+ */
+export function sessionPolicyFingerprint(config: SessionPolicyConfig, env: Record<string, string | undefined>): string {
+  const parts =
+    config.AUTH_MODE === 'oidc'
+      ? (() => {
+          const policy = oidcIdentityPolicy(config, env);
+          return [
+            'session-policy/v1',
+            'oidc',
+            normalizeIssuer(config.OIDC_ISSUER_URL),
+            policy.subject,
+            policy.email === null ? null : policy.email.trim().toLowerCase(),
+            config.AUTH_ALLOWED_IDENTITY,
+          ];
+        })()
+      : ['session-policy/v1', 'dev', config.AUTH_ALLOWED_IDENTITY];
+  // JSON 배열로 직렬화한다 — 구분자가 값 안에 있어도, null 과 빈 문자열도 서로 다른 지문이 된다.
+  return createHash('sha256').update(JSON.stringify(parts), 'utf8').digest('hex');
+}
+
 // ---- 허용 신원 ----
 
 /** 라이브러리가 검증한 ID token 의 클레임 중 판정에 쓰는 것. */

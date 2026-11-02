@@ -219,4 +219,50 @@ else
   expect_contains "$r_out" "root:root 600"
 fi
 
+echo "check-env.sh 데이터 볼륨 표시(FIX2-FULLREV2 G33)"
+# 표시 파일은 데이터 루트의 부모(운영 /srv/content-studio/.data-must-be-mount, 시험 $T_ROOT/.data-must-be-mount). 마운트 여부는 가짜 mountpoint.
+MARKER="$T_ROOT/.data-must-be-mount"
+check_mp() { # check_mp [VAR=값...] — 가짜 mountpoint 로 check-env 실행
+  local om
+  om="$(stat -c '%U:%G %a' "$ENV_FILE")"
+  env PATH="$STUB_BIN:$PATH" CS_MOUNTPOINT_CMD="$STUB_BIN/mountpoint" "$@" CS_ENV_FILE="$ENV_FILE" CS_DATA_ROOT="$DATA_ROOT" CS_ENV_OWNER_MODE="$om" bash "$SCRIPTS_DIR/check-env.sh"
+}
+write_env
+rm -f "$MARKER"
+t "표시 없음 + 데이터 루트가 마운트 아님 → OK(일반 폴더 구성)"
+run_capture r check_mp
+expect_rc 0 "$r_rc" "$r_out"
+expect_contains "$r_out" "[check-env] OK"
+: >"$MARKER"
+t "표시 있음 + 데이터 루트가 마운트 아님(볼륨 빠짐) → 거부"
+run_capture r check_mp
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" ".data-must-be-mount"
+expect_contains "$r_out" "볼륨을 먼저 마운트하세요"
+expect_not_contains "$r_out" "[check-env] OK"
+t "표시 있음 + 데이터 루트가 마운트 지점 → OK"
+run_capture r check_mp STUB_MOUNTPOINT="$DATA_ROOT"
+expect_rc 0 "$r_rc" "$r_out"
+expect_contains "$r_out" "[check-env] OK"
+t "표시 있음 + 데이터 루트 아래 다른 폴더만 마운트 → 거부(데이터 루트 자체여야 함)"
+run_capture r check_mp STUB_MOUNTPOINT="$DATA_ROOT/pglite"
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" ".data-must-be-mount"
+t "표시 있음 + mountpoint 오류 → 거부(마운트로 가정하지 않음)"
+run_capture r check_mp STUB_MOUNTPOINT="$DATA_ROOT" STUB_MOUNTPOINT_FAIL=1
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "마운트 여부 확인에 실패했습니다"
+t "표시 있음 + mountpoint 명령 없음 → 거부"
+run_capture r check_mp CS_MOUNTPOINT_CMD="$T_ROOT/no-such-mountpoint"
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "mountpoint 명령을 찾을 수 없습니다"
+t "표시 있음 + 문제는 모아서 보고(다른 문제와 함께 — 첫 문제에서 멈추지 않음)"
+write_env "LLM_MODE=live"
+run_capture r check_mp
+expect_nonzero "$r_rc" "$r_out"
+expect_contains "$r_out" "중복 키: LLM_MODE"
+expect_contains "$r_out" ".data-must-be-mount"
+rm -f "$MARKER"
+write_env
+
 finish

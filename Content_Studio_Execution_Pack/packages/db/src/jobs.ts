@@ -939,7 +939,8 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     if (problems.length) {
       const reason = invalidationReasonOf(problems);
       await revokeActiveApprovalsLocked(tx, ownerId, [item], () => `invalidated:${reason}`, now, { action: 'approval.invalidate' });
-      await settleApprovedVariants(tx, ownerId, [item.variantId], reason === 'account_changed' ? 'review' : 'draft', now);
+      // FIX2-FULLREV2(G9): 위험 표시('확인 필요')는 본문을 바꾸지 않으므로 계정 변경과 같이 review 로(훅 invalidateApprovalsForRisk 와 같은 결과)
+      await settleApprovedVariants(tx, ownerId, [item.variantId], reason === 'account_changed' || reason === 'risk_needs_check' ? 'review' : 'draft', now);
       // FIX1-FULLREV(F2 후속): 앞선 시도가 스레드 일부를 게시한 작업(조회 중 편집 → 이어 보내기 뒤 lease 등 — 진행 중 항목은 편집 훅이 승인을 두므로
       // 여기서 처음 무효가 된다)은 PLANNED 로 두지 않는다. 승인은 위에서 무효로 하고, 남은 부분은 보내지 않고 UNKNOWN(thread_partial_revoked).
       const stop = { reason: 'snapshot_stale', code: THREAD_PARTIAL_REVOKED_CODE, details: { problems: problems.slice(0, 8), attempt: job.attempt } };

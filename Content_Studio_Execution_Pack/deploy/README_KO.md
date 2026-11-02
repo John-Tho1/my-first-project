@@ -42,7 +42,7 @@ sudo -u content-studio -H git clone <저장소 URL> /srv/content-studio/repo
 test -f /srv/content-studio/repo/Content_Studio_Execution_Pack/pnpm-workspace.yaml   # 앱 루트 확인
 ```
 - `/srv/content-studio/data` 는 재시작·재배포·서버 재생성 뒤에도 남는 디스크여야 한다(공급자 볼륨을 쓰면 여기에 마운트).
-- FIX4: 데이터를 **볼륨 마운트**로 둘 때는 `sudo touch /srv/content-studio/.data-must-be-mount` 로 표시한다 — 백업·복원 스크립트가 데이터 폴더가 지금 마운트가 아니면(볼륨이 빠진 채 빈 폴더) 거부한다. 데이터 폴더 **아래**에 또 다른 마운트(bind 포함)를 두지 않는다 — 두면 백업·복원이 거부한다.
+- FIX4: 데이터를 **볼륨 마운트**로 둘 때는 `sudo touch /srv/content-studio/.data-must-be-mount` 로 표시한다 — 백업·복원 스크립트가 데이터 폴더가 지금 마운트가 아니면(볼륨이 빠진 채 빈 폴더) 거부한다. FIX2-FULLREV2(G33): 같은 표시를 `check-env.sh` 와 서비스 시작(unit 의 `ExecStartPre`)도 확인한다 — 표시가 있는데 마운트가 아니면 서비스가 시작하지 않는다(루트 디스크의 빈 폴더에 새 DB 를 만들지 않게). unit 은 `RequiresMountsFor=/srv/content-studio/data` 로 마운트를 요구하므로, fstab 에 `nofail` 을 달아도 마운트가 실패하면 서비스는 시작하지 않는다(재부팅 뒤 볼륨이 늦게 붙으면 붙은 뒤 `sudo systemctl start content-studio`). 데이터 폴더 **아래**에 또 다른 마운트(bind 포함)를 두지 않는다 — 두면 백업·복원이 거부한다.
 - 데이터 폴더 안에는 일반 파일·폴더만 둔다(심볼릭 링크·하드링크·소켓·FIFO·장치, 이름에 줄바꿈·제어 문자·역슬래시·UTF-8 아닌 바이트가 있으면 백업이 거부한다). 백업과 복원은 같은 검사 함수(`lib/common.sh` `validate_tree`·`validate_archive`)를 쓰고, 백업은 쓴 사본이 복원 검사를 통과해야 성공한다(아니면 그 사본을 지운다).
 - 배포 스크립트(`build-release.sh`·`backup-data.sh`·`restore-data.sh`)는 `/srv/content-studio/deploy.lock` 에 `flock` 을 잡는다 — 둘을 동시에 돌리면 뒤의 것이 거부된다. `flock`·`mountpoint` 는 util-linux 에 있다.
 - 방화벽: 22 = 사용자 IP 만, 80·443 공개. **3000 은 열지 않는다**(web 은 127.0.0.1 에서만 듣는다).
@@ -80,7 +80,7 @@ sudo bash "$APP_ROOT/deploy/scripts/check-env.sh"           # 파일 존재·roo
 ### 4.1 OIDC 로그인 설정(T21-P1b — 사용자 단계, 별도 승인 필요)
 앱은 IdP 를 정하지 않는다(일반 OpenID Connect, 라이브러리 `openid-client` 6.8.8). 아래는 **사용자가 승인한 뒤** 사용자가 직접 한다 — IdP 계정·콘솔 작업과 실제 로그인은 외부 연결이다.
 1. IdP 를 고른다(예: Google). IdP 콘솔에서 "웹 애플리케이션" OAuth/OIDC 클라이언트를 만들고 **승인된 redirect URI** 에 `https://<도메인>/api/auth/oidc/callback` 을 글자 그대로 넣는다(끝의 `/`·대소문자·포트까지 같아야 한다).
-2. `/etc/content-studio/env` 에 넣는다(값은 이 파일에만): `OIDC_ISSUER_URL`(IdP 의 issuer, https — 예: Google 은 `https://accounts.google.com`), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI=https://<도메인>/api/auth/oidc/callback`(= `APP_BASE_URL` + 이 경로), `OIDC_SCOPES=openid email`(기본값), 허용 신원 `AUTH_ALLOWED_IDENTITY=<본인 이메일>`(ID token 의 email 이 같고 IdP 가 `email_verified=true` 로 보내야 함) — 선택으로 `AUTH_ALLOWED_SUBJECT=<IdP 의 sub>`(이메일 재할당에 강함, 둘 다 넣으면 둘 다 맞아야 함). `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION` 도 필요하다(로그인 요청의 PKCE verifier·nonce 를 10분 봉인).
+2. `/etc/content-studio/env` 에 넣는다(값은 이 파일에만): `OIDC_ISSUER_URL`(IdP 의 issuer, https — 예: Google 은 `https://accounts.google.com`), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI=https://<도메인>/api/auth/oidc/callback`(= `APP_BASE_URL` + 이 경로), `OIDC_SCOPES=openid email`(기본값), 허용 신원 `AUTH_ALLOWED_IDENTITY=<본인 이메일>`(ID token 의 email 이 같고 IdP 가 `email_verified=true` 로 보내야 함) — 선택으로 `AUTH_ALLOWED_SUBJECT=<IdP 의 sub>`(이메일 재할당에 강함, 둘 다 넣으면 둘 다 맞아야 함). 이 값들(또는 `OIDC_ISSUER_URL`·`AUTH_MODE`)을 바꾸고 재시작하면 기존 세션이 모두 끊긴다(세션 정책 지문 — FIX2-FULLREV2 G16). 계정 탈취가 의심되면 허용 sub 를 바꾸는 것으로 기존 세션을 끊을 수 있다. `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION` 도 필요하다(로그인 요청의 PKCE verifier·nonce 를 10분 봉인).
 3. 서비스를 다시 시작하고 `/login` 의 **OIDC로 로그인** 을 누른다. 설정이 빠졌으면 화면에는 "설정이 준비되지 않았습니다"만 나오고, 빠진 **이름**은 `journalctl -u content-studio` 의 `[auth] oidc_not_configured: …` 한 줄에 있다(값 없음). 로그인 후에는 설정 화면 "로그인(인증)"·`/api/health/details` 의 `auth` 에서도 본다.
 - `check-env.sh` 는 OIDC_* 값을 아직 검사하지 않는다(앱이 시작·로그인 때 이름만 알려 준다).
 - 로그인 실패(state 오류·검증 실패·허용 신원 불일치)는 식별자 로그인과 같은 전역 15분·10회 창에서 센다. 막히면 15분 동안 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로) — 프록시 수준 요청 제한은 여전히 없다.
@@ -91,6 +91,8 @@ set -eu
 APP_ROOT=/srv/content-studio/repo/Content_Studio_Execution_Pack
 sudo install -o root -g root -m 644 "$APP_ROOT/deploy/content-studio.service" /etc/systemd/system/content-studio.service
 sudo systemd-analyze verify /etc/systemd/system/content-studio.service
+sudo bash "$APP_ROOT/deploy/scripts/check-env.sh"                   # FIX2-FULLREV2(G33): 데이터 볼륨 표시가 있으면 지금 마운트인지도 본다
+test ! -e /srv/content-studio/.data-must-be-mount || findmnt /srv/content-studio/data   # 볼륨 구성이면 마운트 확인(출력 없음·실패면 멈춘다)
 sudo systemctl daemon-reload
 sudo systemctl enable --now content-studio
 systemctl is-active content-studio
@@ -100,6 +102,7 @@ curl -fsS http://127.0.0.1:3000/api/health
 기대 결과
 - 로그에 `[inline-worker] 주기 처리 시작: 30초 간격(...)` 한 줄. 설정 오류면 `[startup] 서버를 시작하지 않습니다`(dev 로그인) 또는 `[inline-worker] ... config_invalid` 이 남는다(값은 로그에 없음).
 - health 응답 키는 정확히 `{ status, app, time_utc, db_ok }`, `status: "ok"`, `db_ok: true`.
+- FIX2-FULLREV2(G33): 표시(`.data-must-be-mount`)가 있는데 데이터 폴더가 마운트가 아니면 시작이 실패한다 — `journalctl` 에 `ExecStartPre` 실패(`status=32`, mountpoint 의 "마운트 아님")가 남고 앱은 뜨지 않는다. 마운트가 실패하면(`RequiresMountsFor`) 의존성 실패로 시작하지 않는다. 볼륨을 붙이고(`findmnt /srv/content-studio/data`) 다시 시작한다. 빈 앱이 보이면 볼륨이 빠졌는지 먼저 본다.
 - `/srv/content-studio/data/pglite` 가 생기고 소유자가 `content-studio` 다. `apps/web/.next` 밖에 쓰려다 실패한 기록(`EROFS`·`EACCES`)이 로그에 없어야 한다 — 있으면 `ReadWritePaths` 를 다시 본다(실서버 미검증).
 
 ## 6. Caddy(HTTPS)
@@ -121,6 +124,7 @@ sudo systemctl restart caddy
 
 ## 7. 업그레이드(새 SHA)
 migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적용, down migration 없음). 그래서 업그레이드 전에 반드시 백업한다. 각 단계는 앞 단계가 성공했을 때만 한다.
+- migration 0048(FIX2-FULLREV2 G16) 이 들어간 SHA 로 올리면 기존 로그인 세션이 모두 거부된다(세션 정책 지문 없음) — 업그레이드 뒤 한 번 다시 로그인한다. export 를 화면으로 받으려면 1단계(백업)는 업그레이드 **전**에 한다.
 1. **앱 export ZIP(정본 백업)** — 화면 `/ops` 또는 `POST /api/exports`(로그인 필요 — 4.1 OIDC 설정 이후). 만든 ZIP 을 서버 밖(사용자 PC 등, T21-P4 에서 정한 위치)으로 옮긴다.
    - 로그인할 수 없으면 CLI(서비스를 멈춘 뒤 — PGlite 잠금):
      ```sh
@@ -138,12 +142,12 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
    ```
    스크립트는 root 확인 → 서비스 정지 확인 → `/srv/content-studio-backup`(root 700) 생성 → `data-<UTC 시각>-<SHA>.<고유>.tar.gz`(600, mktemp 로 배타적 생성 — 덮어쓰지 않음, 데이터 폴더가 심볼릭 링크면 거부) → 다시 읽기 확인. 이 사본도 서버 밖으로 옮겨야 디스크 고장에 대비된다(G5·T21-P4).
 3. 코드 갱신·빌드: §3 `build-release.sh <새 SHA>`(서비스 정지 상태). 종료 코드가 0 이 아니면 4 로 가지 않는다 — §8 로 되돌린다.
-4. `sudo bash $APP_ROOT/deploy/scripts/check-env.sh` → `sudo systemctl start content-studio` → §5 확인(health·로그). 첫 연결에서 migration 이 적용된다.
+4. `sudo bash $APP_ROOT/deploy/scripts/check-env.sh` → `sudo systemctl start content-studio` → §5 확인(health·로그). 첫 연결에서 migration 이 적용된다. FIX2-FULLREV2(G33): `check-env.sh` 는 데이터 볼륨 표시가 있으면 데이터 폴더가 지금 마운트인지도 본다(아니면 종료 코드 1 — 시작하지 않는다). unit 도 같은 표시를 시작 전에 확인한다(`ExecStartPre`).
 5. 결과(이전·새 SHA, 명령, pass/fail)를 기록한다.
 
 ## 8. 되돌리기
 - **코드만 되돌리지 않는다.** 새 migration 이 이미 적용된 DB 를 이전 코드로 열면 안 된다(지원하지 않음).
-- 순서: 서비스 정지 → `build-release.sh <이전 SHA>` → 데이터를 §7-2 사본으로 되돌림 → `check-env.sh` → 시작 → §5 확인.
+- 순서: 서비스 정지 → `build-release.sh <이전 SHA>` → 데이터를 §7-2 사본으로 되돌림 → `check-env.sh`(볼륨 구성이면 마운트 확인 포함 — FIX2-FULLREV2 G33) → 시작 → §5 확인.
 - 데이터 되돌리기는 `deploy/scripts/restore-data.sh` 로 한다(FIX3 — 임시 폴더에 먼저 풀고 검증한 뒤 교체, 실패하면 되돌림).
 
   ```sh
@@ -169,7 +173,7 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
   ```
   (또는 `data.replaced-*/data` 를 직접 `/srv/content-studio/data` 로 되돌려도 된다 — 같은 파일 시스템 안의 이름 바꾸기)
 - 마운트 지점에서 자동 복구까지 실패하면 데이터 폴더(마운트)는 남아 있지만 내용이 불완전하다. 원인을 해결한 뒤 직전 사본으로 같은 명령(표시 없이)을 다시 실행한다.
-- **공급자 볼륨 스냅숏**으로 되돌릴 때(마운트 구성에서 선택): 서비스 정지 → 공급자 화면·CLI 로 데이터 볼륨을 업그레이드 전 스냅숏으로 복구(볼륨 분리·재연결이 필요하면 그 절차대로, 마운트 경로는 `/srv/content-studio/data` 유지) → `findmnt /srv/content-studio/data` 로 마운트 확인 → 시작. 스냅숏은 서비스가 멈춘 상태에서 만든 것만 쓴다(실행 중 스냅숏은 PGlite 일관성 미보장). 공급자 절차는 공급자를 정한 뒤 기록한다(미정).
+- **공급자 볼륨 스냅숏**으로 되돌릴 때(마운트 구성에서 선택): 서비스 정지 → 공급자 화면·CLI 로 데이터 볼륨을 업그레이드 전 스냅숏으로 복구(볼륨 분리·재연결이 필요하면 그 절차대로, 마운트 경로는 `/srv/content-studio/data` 유지) → `findmnt /srv/content-studio/data` 로 마운트 확인 → `check-env.sh` → 시작. 볼륨이 분리된 동안에는 표시(`.data-must-be-mount`)·`RequiresMountsFor` 때문에 서비스가 시작하지 않는다(FIX2-FULLREV2 G33 — 분리 중 실수로 시작해도 루트 디스크에 새 DB 를 만들지 않음). 재부팅 때 마운트가 실패하면(의존성 실패) `enable` 된 서비스는 시작 실패로 남는다. 표시 검사(`ExecStartPre`) 실패는 `Restart=on-failure` 에 따라 5초마다 다시 시도될 수 있다(실서버 미검증). 어느 쪽이든 볼륨을 붙인 뒤 `sudo systemctl start content-studio` 로 시작한다. 스냅숏은 서비스가 멈춘 상태에서 만든 것만 쓴다(실행 중 스냅숏은 PGlite 일관성 미보장). 공급자 절차는 공급자를 정한 뒤 기록한다(미정).
 - 정지 상태 사본이 없으면: 이전 SHA + 빈 데이터 폴더로 시작 → export ZIP 을 복원(`/ops` 복원 미리보기 → `empty_only` 확정). 원격 SNS 게시물은 없다(게시 disabled).
 - 스크립트의 `CS_*` 환경변수(경로·systemctl 바꿔치기 등)는 시험 실행기(`deploy/scripts/tests/`)용이며, 시험 표식이 없거나 root 로 실행하면 무시된다 — 운영에서는 설정하지 않는다.
 
@@ -181,6 +185,6 @@ migration 은 **앞으로만** 적용된다(G8 — 첫 DB 연결 때 자동 적�
 ## 10. 하지 않은 것·남은 위험
 - 실제 서버·Caddy·systemd·인증서·방화벽에서 한 번도 실행하지 않았다. 스크립트는 `deploy/scripts/tests/run-all.sh`(가짜 systemctl·mountpoint·id 로 동작 확인, pnpm 불필요)로만 시험했다. unit 의 보호 설정(`ProtectSystem=strict`·`ReadWritePaths`)이 PGlite·Next 와 맞는지 실측하지 않았다 — 처음 시작 때 `journalctl` 로 확인한다. `SystemCallFilter` 는 넣지 않았다. shellcheck 는 이 PC 에 없어 돌리지 않았다(bash -n 만).
 - OIDC 로그인은 프로세스 안 가짜 IdP 로만 시험했다 — 실제 IdP(discovery 문서·키 교체·시계 오차·email_verified 표기)와의 동작은 확인하지 않았다(not_run).
-- CSP 헤더 없음(Next 인라인 스크립트 nonce 필요). 프록시 수준 요청 제한(rate limit) 없음 — 로그인 횟수 제한은 앱(T21-P1a/b)에 있다.
+- CSP 헤더 없음(Next 인라인 스크립트 nonce 필요). 프록시 수준 요청 제한(rate limit) 없음 — 로그인 횟수 제한은 앱(T21-P1a/b)에 있다. 인증 없는 로그인 요청이 감사 표를 키우는 경로는 설정 거부 무기록·취소 기록 상한으로 묶었다(FIX2-FULLREV2 G15). 요청 자체(CPU·로그)는 프록시 제한이 없어 막지 않는다.
 - 주기 처리는 웹 요청과 같은 프로세스에서 돈다. 부하에서의 응답 지연은 측정하지 않았다(T21_DEPLOY_REVIEW §5-5).
 - 서버 밖 백업 위치는 아직 정하지 않았다(T21-P4).

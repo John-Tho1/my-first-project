@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { asc, eq, inArray } from 'drizzle-orm';
-import { loadConfig, requireSecretKeyring, scheduleFromMsk, type MockScenarioValue } from '@cs/domain';
+import { loadConfig, requireSecretKeyring, sessionPolicyFingerprint, scheduleFromMsk, type MockScenarioValue } from '@cs/domain';
 import {
   LocalStorageAdapter,
   MockChannelAdapter,
@@ -304,6 +304,8 @@ export async function runYouTubeDrill(): Promise<YouTubeDrillResult> {
       expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
       userAgentHash: null,
       now: new Date(),
+      // FIX2-FULLREV2(G16): 필수 열. 이 세션 토큰은 HTTP 검증에 쓰지 않는다(작업 기록의 세션 참조용).
+      policyFingerprint: sessionPolicyFingerprint(config, {}),
     });
     const c: Ctx = {
       db: handle.db,

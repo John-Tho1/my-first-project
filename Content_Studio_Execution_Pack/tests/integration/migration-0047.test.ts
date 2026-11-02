@@ -200,19 +200,23 @@ describe('0047 migration: 실제 게시 사용 수 세기용 send_intents 부분
     // 0046 까지만 있는 migration 폴더(이전 앱) — drizzle 기록(__drizzle_migrations)까지 실제 migrator 로 남긴다
     const old = path.join(tmp, 'drizzle-0046');
     cpSync(migrationsFolder(), old, { recursive: true });
-    rmSync(path.join(old, `${TAG_0047}.sql`));
-    rmSync(path.join(old, 'meta', '0047_snapshot.json'));
+    // FIX2-FULLREV2(G15·G16): 0047 뒤 migration(0048~)도 이전 앱에는 없다 — 0047 이상을 모두 뺀다
+    const later = tags.filter((t) => t >= '0047');
+    for (const t of later) {
+      rmSync(path.join(old, `${t}.sql`));
+      rmSync(path.join(old, 'meta', `${t.slice(0, 4)}_snapshot.json`));
+    }
     const j = JSON.parse(readFileSync(path.join(old, 'meta', '_journal.json'), 'utf8')) as { entries: Array<{ tag: string; when: number }> };
     const when = (prefix: string) => j.entries.find((e) => e.tag.startsWith(prefix))!.when;
     // drizzle migrator 는 마지막으로 적용한 migration 의 시각보다 when 이 큰 것만 적용한다 — 작으면 0046 DB 에서 0047 을 조용히 건너뛴다
     expect(when('0047')).toBeGreaterThan(when('0046'));
-    j.entries = j.entries.filter((e) => e.tag !== TAG_0047);
+    j.entries = j.entries.filter((e) => !later.includes(e.tag));
     writeFileSync(path.join(old, 'meta', '_journal.json'), JSON.stringify(j));
     const h = createDb({ driver: 'pglite', url: 'memory://' });
     try {
       await pgliteMigrate(h.db, { migrationsFolder: old });
       const applied = async () => (await h.client.query<{ n: number }>(`select count(*)::int as n from drizzle.__drizzle_migrations`)).rows[0]!.n;
-      expect(await applied()).toBe(tags.length - 1);
+      expect(await applied()).toBe(tags.length - later.length);
       expect(await liveIndexes(h.client)).toEqual([]);
       await migrate(h);
       expect(await applied()).toBe(tags.length);
@@ -248,7 +252,9 @@ describe('0047 migration: 실제 게시 사용 수 세기용 send_intents 부분
     const parsed = await parseBundleZip(zip47);
     expect(parsed.manifest.format_version).toBe(BUNDLE_FORMAT_VERSION);
     expect(parsed.manifest.schema_migrations).toEqual(tags);
-    expect(parsed.manifest.schema_migrations.at(-1)).toBe(TAG_0047);
+    // FIX2-FULLREV2: 0048 이 생겨 목록 끝은 더 이상 0047 이 아니다 — 0047 이 들어 있고 0046 바로 뒤인지로 같은 내용을 확인한다(목록 전체는 위 toEqual(tags))
+    const mig = parsed.manifest.schema_migrations;
+    expect(mig[mig.indexOf(TAG_0047) - 1]).toBe(tags.find((t) => t.startsWith('0046')));
     expect(parsed.tables.send_intents).toHaveLength(7); // owner A 의 전송 의도(모의 1 + 실제 6) — 색인은 묶음에 들어가지 않는다
 
     // 0046 앱(목록 끝이 0046)은 0047 묶음을 거부 — 다른 migration 과 같은 기존 규칙

@@ -524,9 +524,23 @@ export class HashMismatchError extends AppError {
   }
 }
 
+/**
+ * FIX2-FULLREV2(G9, D40-2): 스냅샷 재검사 문제 코드 — 원고의 아이디어 또는 연결 소재에 위험 표시 '확인 필요'(risk='needs_check')가 있다.
+ * 승인·실행·전송 직전(beginSend)이 모두 막는다. 스냅샷(hash) 밖의 값이라 해제하면 같은 계획에서 다시 승인할 수 있다.
+ */
+export const RISK_NEEDS_CHECK_PROBLEM = 'risk_needs_check';
+
+/** FIX2-FULLREV2(G9): 위험 표시로 막힌 승인·실행 409 안내 문구 */
+export const RISK_NEEDS_CHECK_MESSAGE =
+  "원고의 아이디어 또는 연결 소재에 위험 표시 '확인 필요'가 있어 승인·실행하지 않았습니다. 그 아이디어·소재에서 '확인 필요'를 해제한 뒤 다시 승인하세요.";
+
 export class SnapshotStaleError extends AppError {
   constructor(items: Array<{ item_id: string; reasons: string[] }>) {
-    super('conflict', 'snapshot_stale', '승인 이후(또는 계획 이후) 본문·미디어·계정·원고·일정이 바뀌었습니다. 새 배포 계획을 만들어 다시 승인하세요.', { items });
+    // FIX2-FULLREV2(G9): 위험 표시만으로 막혔으면 새 계획이 아니라 '확인 필요' 해제를 안내한다(코드는 snapshot_stale 그대로 — 기존 화면·클라이언트 처리 유지).
+    const risk = items.some((i) => i.reasons.includes(RISK_NEEDS_CHECK_PROBLEM));
+    const other = items.some((i) => i.reasons.some((r) => r !== RISK_NEEDS_CHECK_PROBLEM));
+    const stale = '승인 이후(또는 계획 이후) 본문·미디어·계정·원고·일정이 바뀌었습니다. 새 배포 계획을 만들어 다시 승인하세요.';
+    super('conflict', 'snapshot_stale', risk ? (other ? `${RISK_NEEDS_CHECK_MESSAGE} ${stale}` : RISK_NEEDS_CHECK_MESSAGE) : stale, { items });
   }
 }
 

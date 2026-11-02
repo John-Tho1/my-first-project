@@ -337,6 +337,13 @@
       "when": 1792616216122,
       "tag": "0047_fullrev_fix1_live_intent_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1793641128843,
+      "tag": "0048_fullrev2_fix2_session_policy_audit_idx",
+      "breakpoints": true
     }
   ]
 }

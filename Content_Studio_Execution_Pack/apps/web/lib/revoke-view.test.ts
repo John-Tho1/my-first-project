@@ -31,6 +31,10 @@ describe('M4UI FIX1 — 연결 해제 HTML 폼 결과(revokeRedirectPath·revoke
     }
     expect(REVOKE_INCOMPLETE_TEXT.revoke_current_no_key).toContain('키를 설정하면');
     expect(REVOKE_INCOMPLETE_TEXT.revoke_current_unreadable).toContain('이전 키 버전');
+    // FIX2-FULLREV2(G13): 공급자 없음은 실제 원인(공급자 설정 누락·미지원)을 말하고, "공급자를 쓸 수 있게 되면" 같은 막연한 문구를 쓰지 않는다
+    expect(REVOKE_INCOMPLETE_TEXT.revoke_provider_unavailable).toContain('공급자 설정이 빠졌거나');
+    expect(REVOKE_INCOMPLETE_TEXT.revoke_provider_unavailable).toContain('공급자 설정을 갖추면');
+    expect(REVOKE_INCOMPLETE_TEXT.revoke_provider_unavailable).not.toContain('공급자를 쓸 수 있게 되면');
   });
 
   it('incomplete + 코드 없음·허용 목록 밖 값 → 코드 없이 리다이렉트, 일반 미완료 문구(원문 값을 싣지 않음)', () => {

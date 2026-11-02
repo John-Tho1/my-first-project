@@ -409,6 +409,8 @@ export default async function SettingsPage({
                   // LIVE-T1(D31): 실제 Threads 계정 — 준비 상태가 모두 갖춰졌을 때만 실제 연결(아니면 빠진 이름만 보인다)
                   const liveThreads = !a.mock && a.platform === 'threads';
                   const hasCredential = a.connected_at !== null && a.revoked_at === null;
+                  // FIX2-FULLREV2(G14): 연결 정보 행의 원래 상태가 revoking(해제 진행 중·미완료)
+                  const revoking = a.credential_status === 'revoking';
                   // EXPIRY-1(D39): 실제 Threads 연결 정보의 만료 14일 이내·만료 표시(다시 연결은 이 행의 기존 연결 버튼)
                   const exp = accountExpiryNotice(a, now);
                   return (
@@ -441,7 +443,12 @@ export default async function SettingsPage({
                       </td>
                       <td>{a.last_checked_at ? formatMsk(new Date(a.last_checked_at)) : '—'}</td>
                       <td>
-                        {connectable ? (
+                        {/* FIX2-FULLREV2(G14): 해제가 끝나지 않은(revoking) 계정은 연결 시작이 409 credential_busy 로 거부된다 — 다시 연결 버튼 대신 안내 */}
+                        {revoking ? (
+                          <span className="muted-text" role="note">
+                            연결 해제 미완료 — 해제가 끝나기 전에는 다시 연결할 수 없습니다. 아래 &quot;연결 해제&quot;를 다시 누르거나 작업 처리기가 마무리할 때까지 기다리세요.
+                          </span>
+                        ) : connectable ? (
                           <form method="post" action={`/api/channel-accounts/${a.account_id}/connect`}>
                             <button type="submit" className="link-button" disabled={!oauth.secrets.configured}>
                               {a.connected_at ? '다시 연결(모의)' : '연결(모의)'}

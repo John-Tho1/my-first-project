@@ -22,6 +22,7 @@ import {
 import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
+import { invalidateApprovalsForRisk } from './approval-invalidation';
 import { captureRevisions, captures, sources, sourceVersions } from './schema';
 
 export type CaptureRow = typeof captures.$inferSelect;
@@ -231,6 +232,9 @@ export async function updateCapture(
       changedAt: now,
       changedBy: 'owner',
     });
+    // FIX2-FULLREV2(G9, D40-2): 위험 표시를 '확인 필요'로 바꾸면 이 소재를 연결한 원고(content_captures)의 배포 항목 활성 승인을 철회한다.
+    // '확인 필요' 해제는 승인을 되살리지 않는다.
+    if (patch.risk === 'needs_check') await invalidateApprovalsForRisk(tx, ownerId, { captureId: updated.id }, now);
     await recordAudit(tx, {
       ownerId,
       action: 'capture.update',

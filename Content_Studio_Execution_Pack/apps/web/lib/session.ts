@@ -2,6 +2,8 @@
  * 세션 검증(서버 전용). Next 내부 API 에 의존하지 않으므로 route handler 와 통합 테스트에서 그대로 쓴다.
  * - 쿠키 원문 → 형식 검사 → sha256 → DB 의 유효 세션(expires_at > now, revoked_at IS NULL) 조회
  * - 세션 owner 의 식별자가 현재 AUTH_ALLOWED_IDENTITY 와 다르면 거부(allowlist 가 바뀌면 기존 세션도 무효)
+ * - FIX2-FULLREV2(G16, D40-3): 세션을 만들 때 저장한 인증 정책 지문이 현재 정책(AUTH_MODE·OIDC issuer·허용 sub·허용 email·owner 키)의
+ *   지문과 다르면 거부. 지문이 없는(null — migration 0048 전) 세션도 거부한다(1회 재로그인). 거부는 다른 무효 세션과 같다(401 + 쿠키 삭제).
  * - last_seen_at 은 5분에 한 번만 갱신
  */
 import { findActiveSession, touchSession, type Db } from '@cs/db';
@@ -11,6 +13,8 @@ import {
   isWellFormedSessionToken,
   readCookie,
   SESSION_COOKIE_NAME,
+  sessionPolicyFingerprint,
+  type SessionPolicyConfig,
   shouldTouchSession,
   UnauthorizedError,
   type AppConfig,
@@ -28,13 +32,16 @@ export interface OwnerSession {
 export async function validateSessionToken(
   db: Db,
   token: string | null | undefined,
-  config: Pick<AppConfig, 'AUTH_ALLOWED_IDENTITY'>,
+  config: SessionPolicyConfig,
   now: Date = new Date(),
+  env: Record<string, string | undefined> = process.env,
 ): Promise<OwnerSession | null> {
   if (!token || !isWellFormedSessionToken(token)) return null;
   const row = await findActiveSession(db, hashSessionToken(token), now);
   if (!row) return null;
   if (!identityMatches(row.identity, config.AUTH_ALLOWED_IDENTITY)) return null;
+  // FIX2-FULLREV2(G16): 정책 지문(비밀 아님 — 일반 비교). null(옛 세션)은 언제나 다르다.
+  if (row.policyFingerprint === null || row.policyFingerprint !== sessionPolicyFingerprint(config, env)) return null;
   if (shouldTouchSession(row.lastSeenAt, now)) await touchSession(db, row.sessionId, now);
   return { ownerId: row.ownerId, sessionId: row.sessionId, expiresAt: row.expiresAt, identity: row.identity };
 }
@@ -43,7 +50,7 @@ export async function validateSessionToken(
 export async function validateSessionCookie(
   db: Db,
   cookieHeader: string | null | undefined,
-  config: Pick<AppConfig, 'AUTH_ALLOWED_IDENTITY'>,
+  config: SessionPolicyConfig,
   now: Date = new Date(),
 ): Promise<OwnerSession | null> {
   return validateSessionToken(db, readCookie(cookieHeader, SESSION_COOKIE_NAME), config, now);

@@ -13,6 +13,7 @@ import {
   oidcIdentityPolicy,
   oidcLoginReadiness,
   oidcSettingsFingerprint,
+  sessionPolicyFingerprint,
 } from './oidc';
 import { isValidOidcIssuerUrl, isValidOidcScopes, parseOidcScopes } from './oidc-format';
 import { OidcNotConfiguredError } from './errors';
@@ -182,5 +183,32 @@ describe('흐름 쿠키', () => {
     expect(buildClearedOidcFlowCookie({ AUTH_COOKIE_SECURE: 'auto', APP_BASE_URL: 'http://localhost:3000' })).toBe(
       'cs_oidc_flow=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0',
     );
+  });
+});
+
+describe('FIX2-FULLREV2(G16): 세션 정책 지문', () => {
+  const fp = (env: Record<string, string | undefined>) => sessionPolicyFingerprint(loadConfig(env), env);
+  it('oidc: 허용 sub·issuer·허용 email(명시 여부 포함)·AUTH_MODE 가 바뀌면 다르다, 같으면 같다(64자 hex, 값 원문 없음)', () => {
+    const base = fp(READY_ENV);
+    expect(base).toMatch(/^[0-9a-f]{64}$/);
+    expect(fp({ ...READY_ENV })).toBe(base);
+    expect(fp({ ...READY_ENV, AUTH_ALLOWED_SUBJECT: 'sub-a' })).not.toBe(base);
+    expect(fp({ ...READY_ENV, AUTH_ALLOWED_SUBJECT: 'sub-a' })).not.toBe(fp({ ...READY_ENV, AUTH_ALLOWED_SUBJECT: 'sub-b' }));
+    expect(fp({ ...READY_ENV, OIDC_ISSUER_URL: 'https://idp2.test' })).not.toBe(base);
+    expect(fp({ ...READY_ENV, AUTH_ALLOWED_IDENTITY: 'other@example.com' })).not.toBe(base);
+    // owner 키가 기본값과 같아도 email 명시 여부가 다르면 다른 정책
+    const sub = { ...READY_ENV, AUTH_ALLOWED_SUBJECT: 'sub-a', AUTH_ALLOWED_IDENTITY: 'owner@example.local' };
+    expect(fp(sub)).not.toBe(fp({ ...sub, AUTH_ALLOWED_IDENTITY: undefined }));
+    expect(fp({ ...READY_ENV, AUTH_MODE: 'dev', APP_BASE_URL: 'http://localhost:3000' })).not.toBe(base);
+  });
+  it('oidc: 정책과 무관한 값(client·scope·redirect·시크릿)과 issuer 끝의 /·호스트 대소문자는 같은 지문', () => {
+    const base = fp(READY_ENV);
+    expect(fp({ ...READY_ENV, OIDC_CLIENT_ID: 'client-2', OIDC_SCOPES: 'openid email profile', OIDC_CLIENT_SECRET: `${SECRET}x` })).toBe(base);
+    expect(fp({ ...READY_ENV, OIDC_ISSUER_URL: 'https://IDP.test/' })).toBe(base);
+  });
+  it('dev: AUTH_ALLOWED_IDENTITY 만 본다(OIDC 설정은 dev 세션에 영향 없음)', () => {
+    const dev = { AUTH_MODE: 'dev', AUTH_ALLOWED_IDENTITY: 'owner@example.local' };
+    expect(fp({ ...dev, OIDC_ISSUER_URL: 'https://idp.test', AUTH_ALLOWED_SUBJECT: 'x' })).toBe(fp(dev));
+    expect(fp({ ...dev, AUTH_ALLOWED_IDENTITY: 'other@example.local' })).not.toBe(fp(dev));
   });
 });

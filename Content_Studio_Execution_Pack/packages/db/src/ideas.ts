@@ -8,6 +8,7 @@ import type { PgColumn, PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { ConflictError, isUuid, NotFoundError, type IdeaCreateInput, type IdeaPatchInput } from '@cs/domain';
 import type { Db } from './client';
 import { recordAudit, type DbOrTx } from './queries';
+import { invalidateApprovalsForRisk } from './approval-invalidation';
 import { captures, contentCaptures, contents, ideaCaptures, ideas } from './schema';
 
 export type IdeaRow = typeof ideas.$inferSelect;
@@ -176,6 +177,9 @@ export async function updateIdea(
       if (!current) throw new NotFoundError('카드를 찾을 수 없습니다');
       throw new ConflictError({ current: ideaCurrentView(current), yours: { expected_revision: expectedRevision, ...patch } });
     }
+    // FIX2-FULLREV2(G9, D40-2): 위험 표시를 '확인 필요'로 바꾸면 이 아이디어로 만든 원고의 배포 항목 활성 승인을 철회한다(편집 훅과 같은 규칙).
+    // '확인 필요' 해제는 승인을 되살리지 않는다.
+    if (patch.risk === 'needs_check') await invalidateApprovalsForRisk(tx, ownerId, { ideaId: updated.id }, now);
     if (captureIds) {
       await tx
         .delete(ideaCaptures)

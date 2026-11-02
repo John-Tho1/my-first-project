@@ -35,6 +35,8 @@ const REASON_LABEL: Record<string, string> = {
   version_exists: '같은 버전이 이미 있음(내용 다름)',
   immutable_version: '이미 확정된(지나간) 채널 초안 버전에는 첨부를 보충하지 않음',
   snapshot_referenced: '배포 스냅샷이 쓰는 채널 초안 버전에는 첨부를 보충하지 않음',
+  // FIX2-FULLREV2(G18)
+  existing_parent: '이미 있던 배포 항목·작업에는 승인·실행 이력을 덧붙이지 않음(필요하면 이 환경에서 다시 승인)',
 };
 
 /** 복원 미리보기 → (확인) → 복원 결과. 결과가 있으면 표별 복원 건수와 파일 checksum 확인 결과를 보여 준다. */
@@ -58,6 +60,11 @@ export default async function RestorePage({
   const committed = run.status === 'committed' && result;
   // FIX2-T13: 복원으로 "다시 연결 필요"가 되는 배포 계정(이름·플랫폼만)
   const reconnect = reconnectNotice(committed ? result : p, Boolean(committed));
+  // FIX2-FULLREV2(G19): 현재 브랜드가 바뀌어 무효가 된(될) 이 환경의 기존 승인 수(옛 미리보기·결과에는 칸이 없다 → 0)
+  const invalidated = (committed ? result.invalidated_approvals : p.invalidated_approvals) ?? [];
+  const brandInvalidated = invalidated.filter((a) => a.reasons.includes('brand_changed')).length;
+  // FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효가 된(될) 기존 승인 수
+  const riskInvalidated = invalidated.filter((a) => a.reasons.includes('risk_needs_check')).length;
 
   return (
     <main className="container">
@@ -127,6 +134,20 @@ export default async function RestorePage({
           </li>
           <li>DB migration: {p.schema_migrations.join(', ')}</li>
         </ul>
+        {brandInvalidated ? (
+          <p className="notice" role="alert">
+            {committed
+              ? `복원으로 브랜드 프로필 새 버전이 들어와, 이 환경에 있던 승인 ${brandInvalidated}건을 무효로 했습니다(대기 중이던 실행은 보류, 항목은 실행 전으로). 배포 계획에서 새 브랜드로 다시 계획·승인하세요.`
+              : `복원하면 브랜드 프로필 새 버전이 들어와, 이 환경에 있는 승인 ${brandInvalidated}건이 무효가 됩니다(대기 중인 실행은 보류, 항목은 실행 전으로).`}
+          </p>
+        ) : null}
+        {riskInvalidated ? (
+          <p className="notice" role="alert" data-testid="restore-risk-invalidated">
+            {committed
+              ? `복원으로 이 환경의 원고에 위험 표시 '확인 필요' 소재가 연결되어, 그 원고의 승인 ${riskInvalidated}건을 무효로 했습니다(대기 중이던 실행은 보류, 항목은 실행 전으로). 소재의 '확인 필요'를 해제한 뒤 다시 승인하세요.`
+              : `복원하면 이 환경의 원고에 위험 표시 '확인 필요' 소재가 연결되어, 그 원고의 승인 ${riskInvalidated}건이 무효가 됩니다(대기 중인 실행은 보류, 항목은 실행 전으로).`}
+          </p>
+        ) : null}
         {reconnect ? (
           <>
             <h3>배포 계정 다시 연결 필요</h3>

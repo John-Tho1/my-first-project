@@ -10,7 +10,7 @@
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { and, asc, eq, inArray } from 'drizzle-orm';
-import { loadConfig, requireSecretKeyring, type MockScenarioValue } from '@cs/domain';
+import { loadConfig, requireSecretKeyring, sessionPolicyFingerprint, type MockScenarioValue } from '@cs/domain';
 import {
   MockChannelAdapter,
   MockChannelAdapterRegistry,
@@ -229,6 +229,8 @@ export async function runThreadsDrill(): Promise<ThreadsDrillResult> {
       expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
       userAgentHash: null,
       now: new Date(),
+      // FIX2-FULLREV2(G16): 필수 열. 이 세션 토큰은 HTTP 검증에 쓰지 않는다(작업 기록의 세션 참조용).
+      policyFingerprint: sessionPolicyFingerprint(config, {}),
     });
     const c: Ctx = {
       db: handle.db,

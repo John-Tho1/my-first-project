@@ -70,6 +70,13 @@ export const LOGIN_MAX_FAILURES = 10;
 export const LOGIN_FAILURE_REASONS = ['identity_mismatch', 'invalid_request', 'oidc_invalid', 'oidc_identity_mismatch'] as const;
 
 /**
+ * FIX2-FULLREV2(G15): 인증 없이 반복할 수 있는 OIDC 취소(oidc_cancelled — callback?error=…)의 감사 기록 상한. 24시간 창 안에 이만큼 쌓이면
+ * 더 기록하지 않는다(응답은 같은 401). 실패 횟수(429)에는 계속 세지 않는다 — 사용자 취소가 owner 로그인을 막지 않게.
+ */
+export const OIDC_CANCEL_AUDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const OIDC_CANCEL_AUDIT_MAX = 20;
+
+/**
  * 전역(식별자·IP 와 무관) 시간 창 제한. IP 는 프록시 헤더로 위조할 수 있고 식별자별로 세면 다른 식별자를 계속 바꿔 넣을 수 있으므로
  * 전체 실패 수로 센다. 마지막 성공 로그인 이전의 실패는 세지 않는다(호출 측이 그렇게 센 값을 넘긴다).
  * 대가: 시간 창 안에서는 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로). 창이 지나면 풀린다.

@@ -13,6 +13,7 @@ import {
   closeDb,
   commitRestore,
   createContent,
+  createSession,
   createRestorePreview,
   createTestDb,
   createVariantDraft,
@@ -39,11 +40,14 @@ import {
 import {
   buildAssetKey,
   buildBundle,
+  generateSessionToken,
+  hashSessionToken,
   loadConfig,
   OAuthProviderError,
   openSecret,
   requireSecretKeyring,
   sealSecret,
+  sessionPolicyFingerprint,
   sha256Hex,
   writeZip,
   type BundleTables,
@@ -740,7 +744,7 @@ describe('FIX P1 #2 — 옛 토큰의 확인 결과가 새 연결을 덮지 않�
 });
 
 describe('FIX P1 #3 — 연결 해제는 철회한 세대만 지운다', () => {
-  it('해제 진행 중(revoking): 갱신 409 credential_busy, 다시 연결 저장도 거부(받은 토큰 철회), 실행 차단 → 해제 완료 ok, 해제 전 연결 요청은 늦게 와도 거부', async () => {
+  it('해제 진행 중(revoking): 갱신 409 credential_busy, 다시 연결 시작도 409(연결 요청 행 없음), 실행 차단 → 해제 완료 ok, 해제 전 연결 요청은 늦게 와도 거부', async () => {
     const accountId = await newThreadsAccount();
     await connectFully(accountId);
     const late = await begin(accountId); // 해제 전에 만든 연결 요청
@@ -750,10 +754,13 @@ describe('FIX P1 #3 — 연결 해제는 철회한 세대만 지운다', () => {
       const rf = await refresh(accountId);
       expect(rf.status).toBe(409);
       expect((await rf.json()).error).toBe('credential_busy');
-      const b = await begin(accountId);
-      const cb = await callback(b.location!);
-      expect(cb.status).toBe(409);
-      expect((await cb.json()).error).toBe('credential_busy');
+      // FIX2-FULLREV2(G14): 이전에는 연결 시작을 허용하고 콜백 저장에서 409 로 거부했다(받은 토큰 철회). 이제 연결 시작 자체가 409 —
+      // 인증 창으로 보내지 않으므로 토큰이 발급되지 않는다(실제 Threads 는 철회 API 가 없다). 연결 요청 행도 만들지 않는다.
+      const statesBefore = (await db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, accountId))).length;
+      const c = await connect(accountId);
+      expect(c.status).toBe(409);
+      expect((await c.json()).error).toBe('credential_busy');
+      expect((await db.select().from(schema.oauthStates).where(eq(schema.oauthStates.channelAccountId, accountId))).length).toBe(statesBefore);
     };
     const rv = await revoke(accountId);
     expect(await rv.json()).toMatchObject({ remote_revoke: 'ok', account: { status: 'revoked' } });
@@ -762,6 +769,38 @@ describe('FIX P1 #3 — 연결 해제는 철회한 세대만 지운다', () => {
     expect(lateRes.status).toBe(400);
     expect(['oauth_state_used', 'oauth_state_invalid']).toContain((await lateRes.json()).error);
     expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+  });
+
+  // FIX2-FULLREV2(G14): 위 시험에서 옮긴 콜백 저장 거부 검사 — 연결 시작은 해제 전에 통과했고, 콜백이 토큰을 받은 뒤 저장 직전에 해제 1단계가 커밋된 경우.
+  it('연결 시작 뒤 콜백 저장 직전에 해제가 진행 중(revoking)이 되면 저장 409 credential_busy, 받은 토큰 철회 → 해제 완료', async () => {
+    const accountId = await newThreadsAccount();
+    await connectFully(accountId);
+    const b = await begin(accountId);
+    let markedResolve!: () => void;
+    const marked = new Promise<void>((r) => (markedResolve = r));
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let revoking: Promise<Response> | null = null;
+    oauthTestHooks.beforeCallbackStore = async () => {
+      delete oauthTestHooks.beforeCallbackStore;
+      oauthTestHooks.afterRevokeMarked = async () => {
+        delete oauthTestHooks.afterRevokeMarked;
+        markedResolve();
+        await released;
+      };
+      revoking = revoke(accountId);
+      await marked;
+      expect((await credRow(accountId))!.status).toBe('revoking');
+    };
+    const cb = await callback(b.location!);
+    expect(cb.status).toBe(409);
+    expect((await cb.json()).error).toBe('credential_busy');
+    release();
+    const rv = await revoking!;
+    expect(await rv.json()).toMatchObject({ outcome: 'revoked', account: { status: 'revoked' } });
+    expect(await liveProviderTokens(accountId)).toBe(0);
+    expect((await credRow(accountId))!.revokedAt).not.toBeNull();
+    expect((await auditDetails(accountId, 'oauth.callback_rejected')).some((d) => d.issued_token_revoke === 'ok')).toBe(true);
   });
 
   it('해제가 읽은 뒤 세대가 바뀌면 지우지 않고 incomplete(계속 차단), 다시 해제하면 마무리', async () => {
@@ -871,17 +910,28 @@ describe('D25-3 — 모의 시험 매개변수는 운영에서 거부', () => {
     const accountId = await newThreadsAccount();
     vi.stubEnv('NODE_ENV', 'production');
     // T21-P1a(G1a): 운영 빌드는 AUTH_MODE=dev 설정을 거부하므로(설정 읽기 실패) 운영에서 가능한 유일한 설정(oidc)으로 확인한다.
-    // 세션 검증은 AUTH_MODE 와 무관 — 앞에서 만든 세션으로 계속 요청한다(D25-3 판정 자체는 그대로).
+    // FIX2-FULLREV2(G16, D40-3): 세션 검증이 인증 정책 지문을 보므로 dev 로 만든 세션은 AUTH_MODE=oidc 에서 401 이다(D40 결과).
+    // 그래서 oidc 정책 지문의 owner A 세션을 만들어 요청한다(OIDC callback 이 만드는 세션과 같은 지문 — D25-3 판정 자체는 그대로).
     vi.stubEnv('AUTH_MODE', 'oidc');
     try {
+      expect((await connect(accountId)).status).toBe(401); // dev 세션은 정책이 바뀌어 거부
+      const oidcToken = generateSessionToken();
+      await createSession(db, {
+        ownerId: ownerA,
+        tokenHash: hashSessionToken(oidcToken),
+        expiresAt: new Date(Date.now() + 3_600_000),
+        userAgentHash: null,
+        now: new Date(),
+        policyFingerprint: sessionPolicyFingerprint(loadConfig(), process.env),
+      });
       for (const p of [{ mock_user: 'mock:threads:other' }, { mock_grant: 'threads_basic' }, { mock_deny: '1' }] as Array<Record<string, string>>) {
-        const url = (await (await connect(accountId)).json()).authorize_url as string;
-        const r = await authorize(url, p);
+        const url = (await (await connect(accountId, oidcToken)).json()).authorize_url as string;
+        const r = await authorize(url, p, oidcToken);
         expect(r.status).toBe(400);
         expect((await r.json()).error).toBe('mock_params_not_allowed');
       }
-      const url = (await (await connect(accountId)).json()).authorize_url as string;
-      expect((await authorize(url)).status).toBe(303);
+      const url = (await (await connect(accountId, oidcToken)).json()).authorize_url as string;
+      expect((await authorize(url, {}, oidcToken)).status).toBe(303);
     } finally {
       vi.stubEnv('NODE_ENV', 'test');
       vi.stubEnv('AUTH_MODE', 'dev');

@@ -19,6 +19,8 @@ import {
   recordedAdapterIdOf,
   RESTORED_RETRY_RECOVERY,
   RESTORED_RETRY_RECOVERY_MOCK,
+  RISK_NEEDS_CHECK_MESSAGE,
+  RISK_NEEDS_CHECK_PROBLEM,
   SCHEDULE_STALE_RETRY_MESSAGE,
   USER_CONFIRM_BUTTON,
   USER_CONFIRM_CLAIMED_MESSAGE,
@@ -75,7 +77,27 @@ export const PROBLEM_LABEL: Record<string, string> = {
   schedule_passed: '예약 시각이 지남',
   brand_changed: '브랜드 프로필이 새 버전으로 바뀜',
   publish_at_passed: '예약 공개 시각(publishAt)이 지남',
+  // FIX2-FULLREV2(G9, D40-2)
+  [RISK_NEEDS_CHECK_PROBLEM]: "아이디어·연결 소재에 위험 표시 '확인 필요'",
 };
+
+/**
+ * FIX2-FULLREV2(G9, D40-2): 승인 카드의 위험 표시 안내(없으면 null). 아이디어·연결 소재 중 '확인 필요'인 것과, 해제해야 승인·실행할 수 있다는 안내.
+ * links: 화면이 그 아이디어·소재로 가는 링크를 그린다(href·label).
+ */
+export function riskNoticeOf(risk: { ideaId: string | null; captureIds: readonly string[] } | null | undefined): {
+  text: string;
+  links: Array<{ href: string; label: string }>;
+} | null {
+  if (!risk || (!risk.ideaId && risk.captureIds.length === 0)) return null;
+  const links: Array<{ href: string; label: string }> = [];
+  if (risk.ideaId) links.push({ href: `/ideas/${risk.ideaId}`, label: '아이디어' });
+  risk.captureIds.forEach((id, i) => links.push({ href: `/captures/${id}`, label: risk.captureIds.length > 1 ? `연결 소재 ${i + 1}` : '연결 소재' }));
+  return {
+    text: "위험 표시 '확인 필요' — 이 원고의 아이디어 또는 연결 소재에 '확인 필요'가 있어 승인·실행할 수 없습니다(예약된 전송도 보내기 직전에 막힙니다). 내용을 확인하고 '확인 필요'를 해제한 뒤 다시 승인하세요.",
+    links,
+  };
+}
 
 export function problemLabel(p: string): string {
   if (p.startsWith('blocked:')) return `검토 차단: ${p.slice('blocked:'.length)}`;
@@ -90,6 +112,8 @@ export const DUPLICATE_ACK_LABEL = '같은 글이 한 번 더 게시될 수 있�
 export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
   hash_mismatch: '화면에서 본 내용과 서버의 배포 내용(hash)이 다릅니다. 새로 고친 뒤 다시 확인하세요.',
   snapshot_stale: '계획 이후 본문·미디어·원고·계정·일정이 바뀌어 승인·실행하지 않았습니다. 새 배포 계획을 만드세요.',
+  // FIX2-FULLREV2(G9, D40-2): 위험 표시만으로 막힌 승인·실행(서버 snapshot_stale 의 reasons 가 risk_needs_check 뿐)
+  risk_needs_check: RISK_NEEDS_CHECK_MESSAGE,
   confirm_required: '"내용을 확인했습니다"를 체크해야 승인할 수 있습니다.',
   no_items: '승인할 항목을 하나 이상 고르세요(기본 선택 없음).',
   already_approved: '이미 승인한 항목입니다.',
@@ -172,6 +196,15 @@ export const DISTRIBUTE_ERROR_TEXT: Record<string, string> = {
 
 const PASS = new Set(Object.keys(DISTRIBUTE_ERROR_TEXT));
 
+/** FIX2-FULLREV2(G9): snapshot_stale 의 항목 사유가 모두 risk_needs_check 뿐인가 */
+function riskOnlyStale(items: unknown): boolean {
+  if (!Array.isArray(items) || items.length === 0) return false;
+  return items.every((i) => {
+    const reasons = (i as { reasons?: unknown })?.reasons;
+    return Array.isArray(reasons) && reasons.length > 0 && reasons.every((r) => r === RISK_NEEDS_CHECK_PROBLEM);
+  });
+}
+
 /** 폼 실패: 401 → /login, 404 → notFoundHref, 그 밖 → back?error=<code>. */
 export function distributeFormFailure(e: unknown, request: Request, back: string, notFoundHref = '/distribute?missing=1'): Response {
   const res = errorResponse(e, request);
@@ -189,6 +222,8 @@ export function distributeFormFailure(e: unknown, request: Request, back: string
     // FIX5-FULLREV(T2): 복원 이력 재시도 거절은 일반 not_retryable 문구("보류된 작업이 있는 항목만") 대신 조건부 복구 길 문구로
     // (T2 후속) 모의 계정 항목(mock: true)은 모의 문구(채널 확인·두 번 게시 경고 없음)
     if (e.code === 'not_retryable' && e.extra?.restored === true) code = e.extra.mock === true ? 'not_retryable_restored_mock' : 'not_retryable_restored';
+    // FIX2-FULLREV2(G9): 위험 표시('확인 필요')만으로 막혔으면 새 계획이 아니라 해제를 안내한다
+    else if (e.code === 'snapshot_stale' && riskOnlyStale(e.extra?.items)) code = 'risk_needs_check';
     else if (PASS.has(e.code)) code = e.code;
     else if (e.kind === 'csrf') code = 'csrf';
     else if (e.kind === 'conflict') code = 'conflict';

@@ -10,7 +10,8 @@
  *    (publications)가 없으면 UNKNOWN + restored_needs_review=true.
  *  - jobs: state = restoredJobState(원본), lease_owner·lease_until·heartbeat_at = null, restored_needs_review = true.
  *    위의 "근거 없는 CONFIRMED" 항목은 그 항목의 (변환 뒤) CONFIRMED 작업 중 가장 최근 것이 UNKNOWN, done_at = null.
- *  - approvals: 활성 승인의 스냅샷 문제(파생본 버전·lifecycle·원고 버전·첨부·계정·재계산 hash·브랜드·예약 시각 ≤ 판정 시각·검토 차단)가 있으면
+ *  - approvals: 활성 승인의 스냅샷 문제(파생본 버전·lifecycle·원고 버전·첨부·계정·재계산 hash·브랜드·예약 시각 ≤ 판정 시각·검토 차단·
+ *    원고의 아이디어·연결 소재 위험 표시 '확인 필요' — FIX2-FULLREV2 G9)가 있으면
  *    revoked_at = 판정 시각, revoke_reason = restore_stale(이 집합 = 기대 철회 집합). FIX round 4: 판정 시각은 훈련이 복원에 넘긴 같은 시각이라
  *    철회 여부가 정해진다(모호한 분기 없음).
  *  - variants(이어서): 원본 approved 이고 강등되지 않았는데 기대 활성 승인(그 파생본의 현재 버전을 가리키는 항목)이 없으면 review(updated_at = 원본 또는 복원 시각).
@@ -78,6 +79,12 @@ export function deriveRestoreTransforms(t: BundleTables, decisionAt: Date): Deri
   const assets = byId(rows(t, 'assets'));
   const accounts = byId(rows(t, 'channel_accounts'));
   const items = byId(rows(t, 'distribution_items'));
+  // FIX2-FULLREV2(G9, D40-2): 원고의 아이디어·연결 소재 위험 표시('확인 필요') — snapshotProblems 의 risk_needs_check 와 같은 규칙
+  const ideasById = byId(rows(t, 'ideas'));
+  const capturesById = byId(rows(t, 'captures'));
+  const contentRisk = (contentId: string): boolean =>
+    ideasById.get(String(contents.get(contentId)?.idea_id))?.risk === 'needs_check' ||
+    rows(t, 'content_captures').some((cc) => String(cc.content_id) === contentId && capturesById.get(String(cc.capture_id))?.risk === 'needs_check');
   const runs = rows(t, 'generation_runs');
   const confirmations = rows(t, 'claim_confirmations').map((c) => ({
     runId: String(c.run_id),
@@ -194,6 +201,7 @@ export function deriveRestoreTransforms(t: BundleTables, decisionAt: Date): Deri
     if (payloadHash(item.payload_json as Record<string, unknown>) !== item.payload_hash) problems.push('payload_changed');
     if (str(brand?.id) !== str(item.brand_profile_id)) problems.push('brand_changed');
     if (variant && (blockersOf.get(String(variant.id)) ?? []).length) problems.push('blocked');
+    if (variant && contentRisk(String(variant.content_id))) problems.push('risk_needs_check');
     if (item.scheduled_at_utc && Date.parse(String(item.scheduled_at_utc)) <= decisionAt.getTime()) problems.push('schedule_passed');
     const publishAt = providerMetadataOf(item.payload_json).publish_at;
     if (publishAt && Date.parse(publishAt) <= decisionAt.getTime()) problems.push('publish_at_passed');

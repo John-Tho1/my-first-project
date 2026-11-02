@@ -123,6 +123,8 @@ export interface NewSession {
   expiresAt: Date;
   userAgentHash: string | null;
   now: Date;
+  /** FIX2-FULLREV2(G16): 만들 때의 인증 정책 지문(@cs/domain sessionPolicyFingerprint) — 필수(모든 생성 경로가 넘긴다). */
+  policyFingerprint: string;
 }
 
 export async function createSession(db: DbOrTx, s: NewSession) {
@@ -135,6 +137,7 @@ export async function createSession(db: DbOrTx, s: NewSession) {
       lastSeenAt: s.now,
       expiresAt: s.expiresAt,
       userAgentHash: s.userAgentHash,
+      policyFingerprint: s.policyFingerprint,
     })
     .returning();
   const row = rows[0];
@@ -145,6 +148,7 @@ export async function createSession(db: DbOrTx, s: NewSession) {
 /**
  * token_hash 로 "유효한" 세션만 찾는다: expires_at > now AND revoked_at IS NULL.
  * owner 의 허용 식별자도 함께 반환해 호출자가 현재 allowlist 와 대조하게 한다.
+ * FIX2-FULLREV2(G16): 저장된 정책 지문(policyFingerprint, 옛 세션은 null)도 돌려준다 — 호출자가 현재 정책 지문과 대조한다.
  */
 export async function findActiveSession(db: Db, tokenHash: string, now: Date) {
   const rows = await db
@@ -153,6 +157,7 @@ export async function findActiveSession(db: Db, tokenHash: string, now: Date) {
       ownerId: sessions.ownerId,
       expiresAt: sessions.expiresAt,
       lastSeenAt: sessions.lastSeenAt,
+      policyFingerprint: sessions.policyFingerprint,
       identity: users.allowedIdentity,
     })
     .from(sessions)
@@ -347,6 +352,28 @@ export async function countRecentLoginFailures(
         sql`${auditEvents.at} <= ${nowIso}::timestamptz`,
         inArray(sql<string>`${auditEvents.sanitizedDetails}->>'reason'`, [...opts.reasons]),
         afterLastOk,
+      ),
+    );
+  return row?.n ?? 0;
+}
+
+/**
+ * FIX2-FULLREV2(G15): 시간 창(windowStart < at <= now) 안의 `auth.login_denied` 중 details.reason 이 reason 인 행 수(전역).
+ * 횟수 제한과 달리 마지막 성공과 무관하다 — 인증 없이 만들 수 있는 거부 사유(oidc_cancelled)의 기록 상한에 쓴다.
+ * (action, at) 색인(audit_events_action_at_idx) 범위로 읽는다.
+ */
+export async function countRecentLoginDenials(db: DbOrTx, opts: { now: Date; windowMs: number; reason: string }): Promise<number> {
+  const nowIso = opts.now.toISOString();
+  const startIso = new Date(opts.now.getTime() - opts.windowMs).toISOString();
+  const [row] = await db
+    .select({ n: count() })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.action, 'auth.login_denied'),
+        sql`${auditEvents.at} > ${startIso}::timestamptz`,
+        sql`${auditEvents.at} <= ${nowIso}::timestamptz`,
+        sql`${auditEvents.sanitizedDetails}->>'reason' = ${opts.reason}`,
       ),
     );
   return row?.n ?? 0;

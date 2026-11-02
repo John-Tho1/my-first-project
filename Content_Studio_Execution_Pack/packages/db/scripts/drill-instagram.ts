@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
-import { AppError, loadConfig, MOCK_PUBLIC_MEDIA_PREFIX, requireSecretKeyring, type MockScenarioValue } from '@cs/domain';
+import { AppError, loadConfig, MOCK_PUBLIC_MEDIA_PREFIX, requireSecretKeyring, sessionPolicyFingerprint, type MockScenarioValue } from '@cs/domain';
 import {
   INSTAGRAM_PROVISIONAL_RATE_LIMIT,
   InstagramMockApi,
@@ -307,6 +307,8 @@ export async function runInstagramDrill(): Promise<InstagramDrillResult> {
       expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
       userAgentHash: null,
       now: new Date(),
+      // FIX2-FULLREV2(G16): 필수 열. 이 세션 토큰은 HTTP 검증에 쓰지 않는다(작업 기록의 세션 참조용).
+      policyFingerprint: sessionPolicyFingerprint(config, {}),
     });
     const c: Ctx = {
       db: handle.db,

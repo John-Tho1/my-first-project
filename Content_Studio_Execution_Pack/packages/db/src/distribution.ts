@@ -48,6 +48,7 @@ import {
   scheduleFromMsk,
   SCHEDULE_TIMEZONE,
   SnapshotStaleError,
+  RISK_NEEDS_CHECK_PROBLEM,
   type AccountState,
   type AppConfig,
   type ApproveInput,
@@ -87,11 +88,14 @@ import { latestReconcileEvent, liveExternalIdClaimedElsewhere } from './user-con
 import {
   approvals,
   assets,
+  captures,
   channelAccounts,
+  contentCaptures,
   contents,
   distributionItems,
   distributionPlans,
   executeCommands,
+  ideas,
   jobEvents,
   jobs,
   publications,
@@ -280,11 +284,82 @@ function blockerError(blockers: string[]): AppError {
   return new AppError('conflict', 'variant_blocked', '채널 초안이 배포 조건을 채우지 못했습니다', { blockers });
 }
 
+/** FIX2-FULLREV2(G9, D40-2): 원고의 위험 표시 출처 — 아이디어(contents.idea_id)·연결 소재(content_captures) 중 risk='needs_check' 인 것. */
+export interface ContentRiskFlags {
+  /** '확인 필요'인 아이디어 ID(없으면 null) */
+  ideaId: string | null;
+  /** '확인 필요'인 연결 소재 ID(정렬) */
+  captureIds: string[];
+}
+
+/**
+ * FIX2-FULLREV2(G9, D40-2): 원고의 아이디어·연결 소재 중 위험 표시 '확인 필요'(needs_check)인 것. 없으면 null.
+ * snapshotProblems(risk_needs_check)와 계획 화면 승인 카드가 같은 조회를 쓴다. 'none' 외의 다른 값은 '확인 필요'가 아니다.
+ */
+export async function contentRiskFlags(tx: DbOrTx, ownerId: string, contentId: string): Promise<ContentRiskFlags | null> {
+  const idea = await tx
+    .select({ id: ideas.id })
+    .from(contents)
+    .innerJoin(ideas, and(eq(ideas.id, contents.ideaId), eq(ideas.ownerId, contents.ownerId)))
+    .where(and(eq(contents.id, contentId), eq(contents.ownerId, ownerId), eq(ideas.risk, 'needs_check')))
+    .limit(1);
+  const caps = await tx
+    .select({ id: captures.id })
+    .from(contentCaptures)
+    .innerJoin(captures, and(eq(captures.id, contentCaptures.captureId), eq(captures.ownerId, contentCaptures.ownerId)))
+    .where(and(eq(contentCaptures.contentId, contentId), eq(contentCaptures.ownerId, ownerId), eq(captures.risk, 'needs_check')))
+    .orderBy(asc(captures.id));
+  if (!idea[0] && caps.length === 0) return null;
+  return { ideaId: idea[0]?.id ?? null, captureIds: caps.map((c) => c.id) };
+}
+
+/**
+ * FIX2-FULLREV2(G9 fixup): 승인·실행이 위험 표시를 읽기 전에, 대상 항목 원고의 아이디어(contents.idea_id)·연결 소재(content_captures) 행을
+ * FOR SHARE 로 잠근다(아이디어 id 순 → 소재 id 순). 위험 표시를 '확인 필요'로 바꾸는 UPDATE(updateIdea·updateCapture)와 직렬화되어:
+ * - UPDATE 가 먼저면 이 잠금이 그 커밋을 기다린 뒤 새 값을 읽어(READ COMMITTED — 다음 문장은 새 스냅샷) contentRiskFlags 가 막는다.
+ * - 이 잠금이 먼저면 UPDATE 가 승인·실행 커밋을 기다리고, 그 뒤 훅(invalidateApprovalsForRisk)이 커밋된 승인을 보고 철회한다.
+ * 잠금 순서: 호출자는 계정(FOR SHARE) 다음, **항목·원고·파생본·계획 잠금 전**에 부른다. 훅 쪽 순서는 아이디어/소재(UPDATE) → 원고 → 파생본 →
+ * 계획 → 항목(lockItemsInOrder)이므로 같은 방향이다 — 항목을 쥔 채 아이디어를 기다리는 경로가 없어 교착이 생기지 않는다(훅은 계정을 잠그지 않음).
+ * 항목을 먼저 잠그는 전송 직전(beginSend)은 이 잠금을 쓰지 않는다: 거기서 아이디어를 잠그면 훅(아이디어 → 항목)과 순서가 뒤집힌다. 전송 직전의
+ * 승인은 이미 커밋돼 있으므로 훅이 그 항목 잠금을 기다렸다가 철회한다(경합이 없다).
+ * 항목의 variant_id·파생본의 content_id 는 바뀌지 않으므로 잠금 없이 읽어도 된다. FOR SHARE 는 바깥 FROM(ideas / captures)에만 걸린다.
+ */
+export async function lockContentRiskSourcesForItems(tx: DbOrTx, ownerId: string, itemIds: readonly string[]): Promise<void> {
+  if (itemIds.length === 0) return;
+  const contentIds = tx
+    .select({ id: variants.contentId })
+    .from(distributionItems)
+    .innerJoin(variants, and(eq(variants.id, distributionItems.variantId), eq(variants.ownerId, distributionItems.ownerId)))
+    .where(and(eq(distributionItems.ownerId, ownerId), inArray(distributionItems.id, [...itemIds])));
+  const ideaIds = tx
+    .select({ id: contents.ideaId })
+    .from(contents)
+    .where(and(eq(contents.ownerId, ownerId), inArray(contents.id, contentIds)));
+  await tx
+    .select({ id: ideas.id })
+    .from(ideas)
+    .where(and(eq(ideas.ownerId, ownerId), inArray(ideas.id, ideaIds)))
+    .orderBy(asc(ideas.id))
+    .for('share');
+  const captureIds = tx
+    .select({ id: contentCaptures.captureId })
+    .from(contentCaptures)
+    .where(and(eq(contentCaptures.ownerId, ownerId), inArray(contentCaptures.contentId, contentIds)));
+  await tx
+    .select({ id: captures.id })
+    .from(captures)
+    .where(and(eq(captures.ownerId, ownerId), inArray(captures.id, captureIds)))
+    .orderBy(asc(captures.id))
+    .for('share');
+}
+
 /**
  * 항목의 스냅샷이 지금의 실제 행과 같은지 다시 검사한다. 문제 코드 목록(없으면 []):
  * variant_changed(현재 버전이 다름) · variant_not_review · content_changed · assets_changed(첨부 checksum·순서·삭제) ·
  * account_changed(없음·준비 안 됨·외부 ID/플랫폼 변경) · brand_changed(T12 D19: 현재 브랜드 프로필 버전 ≠ 스냅샷의 brand_profile_version_id —
- * hash 에 들어가는 값) · payload_changed(재계산 hash 불일치) · schedule_passed · blocked:<검토 차단 사유>.
+ * hash 에 들어가는 값) · payload_changed(재계산 hash 불일치) · schedule_passed · blocked:<검토 차단 사유> ·
+ * risk_needs_check(FIX2-FULLREV2 G9, D40-2: 원고의 아이디어·연결 소재에 위험 표시 '확인 필요' — 승인·실행·전송 직전 모두 막는다. 스냅샷 밖의 값이라
+ * hash 와 무관하고, 해제하면 같은 계획에서 다시 승인할 수 있다).
  */
 export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: DistributionItemRow, now: Date): Promise<string[]> {
   const problems: string[] = [];
@@ -353,6 +428,8 @@ export async function snapshotProblems(tx: DbOrTx, ownerId: string, item: Distri
   if (variant) {
     const blockers = await variantReviewBlockers(tx, ownerId, variant.id);
     for (const b of blockers) problems.push(`blocked:${b}`);
+    // FIX2-FULLREV2(G9, D40-2): docs/03 "실행 직전 … risk … 다시 검사" — 아이디어·연결 소재의 위험 표시 '확인 필요'
+    if (await contentRiskFlags(tx, ownerId, variant.contentId)) problems.push(RISK_NEEDS_CHECK_PROBLEM);
   }
   return [...new Set(problems)];
 }
@@ -364,6 +441,7 @@ export function invalidationReasonOf(problems: readonly string[]): InvalidationR
   if (problems.includes('variant_changed')) return 'body_changed';
   if (problems.includes('account_changed')) return 'account_changed';
   if (problems.includes('brand_changed')) return 'brand_changed';
+  if (problems.includes(RISK_NEEDS_CHECK_PROBLEM)) return 'risk_needs_check';
   if (problems.includes('schedule_passed') || problems.includes('publish_at_passed')) return 'schedule_passed';
   return 'snapshot_changed';
 }
@@ -585,6 +663,11 @@ export interface PlanItemDetail {
   events: JobEventRow[];
   /** 지금 다시 검사한 스냅샷 문제(없으면 []) — 승인·실행 전 화면 안내용(서버는 승인·실행 때 다시 검사한다). */
   problems: string[];
+  /**
+   * FIX2-FULLREV2(G9, D40-2): 원고의 아이디어·연결 소재 중 위험 표시 '확인 필요'인 것(없으면 null) — 항목 상태와 무관하게 승인 카드에 보인다.
+   * 승인·실행·전송 직전 재검사(risk_needs_check)와 같은 조회. 읽기 전용.
+   */
+  risk: ContentRiskFlags | null;
   /** T12: 개발용 모의 시나리오(모의 계정 항목, 없으면 null) — 승인 스냅샷 밖 */
   mockScenario: MockScenarioRow | null;
   /** T14(D26): 원격 단계 기록(Threads 모의 — 게시물별 컨테이너·게시 ID, 모의 ID 만) */
@@ -702,6 +785,7 @@ export async function getPlanDetail(db: DbOrTx, ownerId: string, planId: string,
       publications: allPubs.filter((p) => p.itemId === item.id),
       events,
       problems: item.status === 'PLANNED' ? [...new Set([...(await snapshotProblems(db, ownerId, item, now)), ...(specProblems.get(item.id) ?? [])])] : [],
+      risk: vRows[0] ? await contentRiskFlags(db, ownerId, vRows[0].contentId) : null,
       mockScenario: scenarios.get(item.id) ?? null,
       remoteSteps: allSteps.filter((r) => r.itemId === item.id),
       connection: account ? await getAccountHealth(db, ownerId, account.id, now).catch(() => null) : null,
@@ -833,6 +917,8 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
       accountIds.map((a) => a.id),
       'share',
     );
+    // FIX2-FULLREV2(G9 fixup): 위험 표시 출처(아이디어·소재) FOR SHARE — 항목 잠금 전(훅과 같은 순서, lockContentRiskSourcesForItems 주석)
+    await lockContentRiskSourcesForItems(tx, ownerId, ids);
     const items = await lockItemsInOrder(tx, ownerId, ids);
     const notPlanned = items.filter((i) => i.status !== 'PLANNED');
     if (notPlanned.length) {
@@ -1043,6 +1129,16 @@ export async function executePlan(
         ownerId,
         planAccounts.map((a) => a.id),
         'share',
+      );
+      // FIX2-FULLREV2(G9 fixup): 위험 표시 출처(아이디어·소재) FOR SHARE — 계획·항목 잠금 전(훅과 같은 순서). 계획의 항목 집합은 바뀌지 않는다.
+      const planItemIds = await tx
+        .select({ id: distributionItems.id })
+        .from(distributionItems)
+        .where(and(eq(distributionItems.ownerId, ownerId), eq(distributionItems.planId, planId)));
+      await lockContentRiskSourcesForItems(
+        tx,
+        ownerId,
+        planItemIds.map((i) => i.id),
       );
       const planRows = await tx
         .select()
@@ -1365,6 +1461,8 @@ export function planDetailView(d: PlanDetail) {
       jobs: x.jobs.map((j) => jobView(j, x.account?.kind)),
       publications: x.publications.map(publicationViewOf),
       problems: x.problems,
+      // FIX2-FULLREV2(G9, D40-2): 원고의 아이디어·연결 소재 위험 표시 '확인 필요'(없으면 null) — 있으면 승인·실행·전송 직전이 막힌다
+      risk_needs_check: x.risk ? { idea_id: x.risk.ideaId, capture_ids: x.risk.captureIds } : null,
       mock_scenario: x.mockScenario ? mockScenarioView(x.mockScenario) : null,
       remote_steps: x.remoteSteps.map(remoteStepView),
       connection: x.connection

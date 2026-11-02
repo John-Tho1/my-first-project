@@ -106,3 +106,110 @@
 ### 이후(사용자 결정 대기)
 - FIX2-FULLREV2: G9·G13·G14·G15·G16(migration)·G18·G19·G33.
 - FIX3-FULLREV2: G10–G12·G20–G32.
+
+## FIX round 2 — FIX2-FULLREV2 (G9·G13·G14·G15·G16·G18·G19·G33)
+
+- BASE_SHA: 32719be (FIX1 docs) · **HEAD_SHA: 6d54488** (`6d544887b0a51e6f307b31cd371878f5c626954d`)
+- 출처: `FULLREV2_CLAUDE_REVIEW.md` 의 G9·G13–G16·G18·G19·G33(G17 은 FIX round 1). 결정은 D40-2(G9)·D40-3(G16)이고, 사용자 지시는 "FIX2-FULLREV2 진행해줘"(2026-11-02).
+- G18 의 수정 방향은 오케스트레이터가 골랐다. D6 '기존 행 UPDATE 없음'에 맞춰, 부모 항목이 이번에 들어갔을 때만 승인·작업·전송 이력을 넣고 기존 항목이면 `existing_parent` 충돌로 둔다. 이력까지 넓힌 것은 구현자 판단이다.
+- 진행:
+  - 구현 에이전트 3명이 차례로 고쳤다(auth: G16·G15 / approval-restore: G9·G18·G19 / oauth-deploy: G13·G14·G33).
+  - 오케스트레이터가 `ui-safety` 문구 토큰 1건을 G9 에 맞췄다.
+  - 반박 검토(Claude 2명 — Codex 아님)에서 확정 4(P2), P0·P1 0이었다.
+    - G13: provider 가 있어도 키 교체로 토큰을 열 수 없으면 해제가 멈춘다.
+    - G15: 상한 뒤에도 요청마다 경고 로그가 남는다.
+    - G9: 승인과 위험 표시 변경이 동시에 들어오면 경쟁이 생긴다.
+    - G9: 복원으로 기존 원고가 needs_check 소재와 이어진다.
+  - 보완 에이전트가 4건을 고쳤다.
+  - 보완 재검토에서 확정 1(P2)이 나왔다: 실제 Threads 해제가 정리 대기 행은 여전히 열어야만 지운다. 오케스트레이터가 직접 고쳤다(행을 열지 않고 unsupported 로 삭제). 새 시험 1건, 변이 확인 1건.
+
+### 처리
+- **G9**(D40-2):
+  - `snapshotProblems` 에 `risk_needs_check` 를 더했다(원고의 아이디어, 연결 소재 `content_captures`). 승인·실행 409 이고 오류 코드는 `snapshot_stale`, 문구는 '확인 필요'를 풀라는 안내다.
+  - 전송 직전 재검사는 승인을 철회하고 PLANNED(부분이면 UNKNOWN)로 둔다. 파생본은 review 로 간다.
+  - `updateIdea`·`updateCapture` 가 needs_check 로 저장하면 `invalidateApprovalsForRisk` 가 승인을 무효화한다(`invalidated:risk_needs_check`).
+  - 승인·실행은 아이디어·소재 행을 FOR SHARE 로 잡는다. 순서는 계정 잠금 뒤, 항목 잠금 앞(id 순)으로 훅과 같다. `beginSend` 는 잡지 않는다(주석에 근거).
+  - 계획 화면 항목 카드에 '확인 필요' 안내를 보인다(`<details>` 밖).
+  - 복원 add_missing 이 기존 원고에 needs_check 소재 연결을 넣으면 무효화하고 `invalidated_approvals` 에 보고한다.
+  - 표시를 지워도 승인은 되살아나지 않는다.
+- **G16**(D40-3):
+  - `sessions.policy_fingerprint` 를 더했다. sha256 이고, 들어가는 값은 oidc 는 AUTH_MODE·정규화 issuer·AUTH_ALLOWED_SUBJECT·명시 허용 email·owner 키, dev 는 AUTH_MODE·AUTH_ALLOWED_IDENTITY 다.
+  - `validateSessionToken` 은 값이 없거나 다르면 401 + 쿠키 삭제다.
+  - migration `0048_fullrev2_fix2_session_policy_audit_idx` 는 drizzle-kit 으로 생성했고, `audit_events(action, at)` 색인도 같이 넣었다. 적용 뒤에는 모두 한 번 다시 로그인해야 한다.
+- **G15**:
+  - 설정 때문인 거부(identity_login_disabled·dev_login_not_allowed·dev_login_refused_in_production)는 감사 행을 쓰지 않는다. 대신 사유 이름만 1분 1회 서버 로그로 남긴다(`apps/web/lib/auth-log.ts`).
+  - `oidc_cancelled` 는 24시간 20건까지 쓴다(전역 로그인 잠금 안에서 셈). 넘으면 응답은 같고 로그만 1분 1회다.
+- **G13** 실제 Threads(kind live·platform threads) 해제:
+  - 공급자 설정·키와 상관없이 현재 토큰과 정리 대기 행을 열지 않는다. 원격 철회는 `unsupported`, 로컬 삭제는 끝까지 한다.
+  - worker 재개도 열지 않고 마무리한다.
+  - `live_provider_unavailable` 감사 표시는 공급자를 못 만든 경우만 붙는다.
+  - `revoke_provider_unavailable` 안내 문구를 실제 사유로 고쳤다.
+- **G14**:
+  - `startOAuthConnect` 는 revoking 이면 잠금 트랜잭션 안에서 409 `credential_busy` 다. state·감사·인증 주소는 만들지 않는다.
+  - 설정 화면은 '연결 해제 미완료' 안내를 보이고 연결·다시 연결 폼은 숨긴다(모의·실제).
+- **G18**: PARENTS 에 `fresh` 플래그를 더했다(`owned` 와 별개). approvals·jobs·send_intents·publications·remote_steps 는 부모가 이번에 들어갔을 때만 넣고, 아니면 `existing_parent` 충돌이다. 복원 화면 문구도 더했다.
+- **G19**: 복원 전 현재 브랜드를 기억해 둔다. 바뀌었으면 `invalidateApprovalsForBrandProfile`(D6 예외 — 실행만 막음)을 부르고 `invalidated_approvals`(미리보기·결과) 에 보고한다. 기존 `revoked_approvals` 와는 섞지 않는다(drill 정확 비교).
+- **G33**:
+  - `content-studio.service` `[Unit]` 에 `RequiresMountsFor=/srv/content-studio/data` 를 넣었다.
+  - `ExecStartPre=+/bin/sh -c 'test ! -e …/.data-must-be-mount || mountpoint -q …/data'` 를 넣었다.
+  - `check-env.sh` 도 같은 검사를 하고, deploy/README_KO §2·§5·§7-4·§8 을 고쳤다.
+
+### 시험
+- 신규:
+  - `fullrev2-session-policy` 10
+  - `fullrev2-login-audit` 6
+  - `fullrev2-risk-needs-check` 19(MOCK·LIVE)
+  - `fullrev2-restore-approvals` 7
+  - `fullrev2-live-revoke-connect` 12
+  - unit `settings-revoking-render`
+  - deploy `test-service-unit.sh` 12, `test-check-env.sh` 마운트 절 7
+- 보강: `oidc.test.ts` 지문 3, `revoke-view.test.ts`.
+- 바뀐 기존 단언(결정·새 동작에 따른 교체이고, 반박 검토에서 약화가 아님을 확인했다):
+  - `oauth.test.ts` 해제 중 연결: '시작 뒤 콜백 409' 가 '시작 409' 가 됐다. 콜백 거부는 새 경쟁 시험(시작 뒤 해제 → 콜백 409·받은 토큰 철회)으로 유지한다.
+  - `oauth.test.ts` D25-3: dev 세션이 oidc 에서 401 인 것을 먼저 단언하고, oidc 지문 세션으로 원래 단언을 그대로 돌린다.
+  - `migration-0047.test.ts`: '0047 = 마지막' 가정을 0047 이상 모두로 일반화했다. `toEqual(tags)` 는 그대로다.
+  - `ui-safety.test.ts`: 문구 토큰을 `snapProblems` 로 바꾸고 필터 줄 토큰을 더했다.
+  - `auth.test.ts`: fixture 에 지문을 더했다.
+- 변이 확인(제품 변경마다 되돌려 새 시험 실패 → cmp 원복):
+  - auth 6, approval-restore 9, oauth-deploy 10, 보완 7, 재검토 보완 1.
+  - G9 잠금 순서는 SQL 순서 단언으로 확인했다(PGlite 단일 연결이라 실제 경쟁은 재현할 수 없다).
+- deploy 셸 시험은 구현자가 `nobody` 로 실행했다(test-check-env 75/75, test-service-unit 12/12). `pnpm` 검사 묶음에는 들어 있지 않다.
+
+### 명령
+클라우드 Node 22.22.x, 순차 실행. 6d54488 과 같은 트리이고, 검사 중 바뀐 파일은 없다.
+- install --frozen-lockfile(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: 모두 exit 0
+- **unit 85 files / 2073 · integration 72 files / 1224**: 실패 0
+- drill:mock: 불변식 위반 0
+- test-dev-cert.sh: 472/472
+- 보이지 않는 문자: 0
+- `./data`: 없음
+- not_run:
+  - Codex
+  - 실제 Postgres 다중 연결(G9 잠금·G15 상한)
+  - 실제 systemd(`systemd-analyze`·재부팅)
+  - deploy `run-all.sh` 전체
+  - 브라우저
+  - 실제 Threads·실계정·실제 OIDC IdP
+
+### 남은 위험
+- G16:
+  - 정책을 바꿨다가 원래대로 되돌리면 만료 전 옛 세션이 다시 유효해진다. 일괄 폐기 버튼·CLI 는 없다.
+  - `oidc_provider_error` 에는 상한이 없다.
+  - `audit_events` 보존 정리가 없다.
+- G9:
+  - 승인·실행이 같은 아이디어·소재의 동시 편집을 잠깐 기다리게 한다.
+  - `idea_captures`(원고에 잇지 않은 아이디어 소재)는 보지 않는다.
+- G19: D6 예외(기존 승인 행 변경)는 DECISIONS 에 기록하지 않았다. 사용자 결정 대상이다.
+- G33: `Restart=on-failure` 이면 ExecStartPre 실패가 5초마다 다시 시도될 수 있다. 실제 서버에서는 확인하지 않았다.
+- 구현자가 deploy 시험을 `nobody` 로 돌리려고 이 클라우드 작업 트리에 `chmod -R a+rX` 를 했다. git 모드 변경은 없다.
+- (범위 밖, 재검토 메모) `beginSend` 의 brand_changed 무효화는 파생본을 draft 로 보낸다. 훅은 review 로 보낸다.
+
+### 검토자에게 물을 것
+1. G18 이 승인 외 작업·전송·게시 이력까지 `existing_parent` 로 막는 것이 D6·이력 보존에 맞는가?
+2. G9 잠금 순서(계정 → 아이디어 → 소재 → 원고·파생본·계획·항목)에 교착 경로가 없는가? `beginSend` 에 잠금을 두지 않은 근거가 맞는가?
+3. G16 지문 구성(oidc 에서 명시 허용 email 이 있을 때만 포함, client id 제외)이 D40-3 에 맞는가?
+4. G13 이 실제 Threads 의 봉인 토큰을 열지 않고 지우는 것(원격 철회 없음 전제)이 철회 의무 규칙(FIX5/6-T13)과 충돌하지 않는가?
+5. G33 ExecStartPre 의 `+`(root 실행)와 `mountpoint` 부재 시 시작 거부가 운영 의도에 맞는가?
+
+### 이후
+- FIX3-FULLREV2: G10–G12·G20–G32(G20·G29 는 D40-4·5). 사용자 결정 대기.

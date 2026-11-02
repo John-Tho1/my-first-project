@@ -397,3 +397,24 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Codex 대기열·ChatGPT 프롬프트에 18번 `d641ac4 FIX1-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15·16·17·18번.**
 - not_run: Codex, 실제 Postgres 다중 연결, Safari·Firefox·Windows·macOS, 실제 Threads·실계정.
 - 다음: FIX2-FULLREV2(G9·G13–G16·G18·G19·G33), FIX3-FULLREV2. 사용자 결정 대기.
+
+## 2026-11-02 저녁 — FIX2-FULLREV2(클라우드 세션)
+- 사용자 지시 "FIX2-FULLREV2 진행해줘", 결정은 D40-2·D40-3.
+- **FIX2-FULLREV2 6d54488**:
+  - G9 '확인 필요' 게시 게이트·승인 무효화
+  - G13 실제 Threads 해제 로컬 완료
+  - G14 해제 중 연결 거부
+  - G15 로그인 감사 상한
+  - G16 세션 정책 지문(migration 0048)
+  - G18 복원 기존 항목 이력 미부착
+  - G19 복원 브랜드 변경 승인 무효화
+  - G33 데이터 볼륨 마운트 확인
+- 반박 검토에서 확정 4(P2) → 보완, 보완 재검토에서 확정 1(P2) → 직접 보완. P0·P1 은 0. 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 2.
+- 마지막 검사(6d54488 과 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 85 / 2073 · integration 72 / 1224**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 19번 `6d54488 FIX2-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15–19번.**
+- 업그레이드 주의: 0048 적용 뒤에는 모두 한 번 다시 로그인해야 한다(D40-3).
+- not_run: Codex, 실제 Postgres 다중 연결, 실제 systemd, 브라우저, 실제 Threads·OIDC IdP.
+- 다음: FIX3-FULLREV2(G10–G12·G20–G32). 사용자 결정 대기.

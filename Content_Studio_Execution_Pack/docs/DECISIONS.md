@@ -539,3 +539,26 @@
   - G20: 확인할 경험 claim 이 늘 수 있다(오탐은 막는 쪽).
   - G29: 메모만 바꾸는 저장은 할 수 없다.
 - 시행: FIX1-FULLREV2(G2) → FIX2-FULLREV2(G9·G16) → FIX3-FULLREV2(G20·G29). 각 묶음은 Claude 반박 검토 → 전체 검사 → 커밋, Codex 검증은 사용자 PC.
+
+## D41 — 복원(add_missing)이 기존 활성 승인을 무효화하는 D6 예외 (2026-11-03)
+- Decision ID / date: D41 / 2026-11-03 (Europe/Moscow)
+- Context:
+  - D6 은 복원이 기존 행을 UPDATE 하지 않는다고 정했다(예외: 이번에 넣은 원고의 current_version_id).
+  - FULLREV2 G19 를 FIX2-FULLREV2(6d54488)에서 고쳤다. add_missing 으로 이 환경보다 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌면, 기존 활성 승인을 무효화한다.
+  - 같은 묶음 보완(G9 복원 경로)도 같은 성격이다. 이미 있던 원고에 '확인 필요'(needs_check) 소재 연결이 새로 들어오면 그 원고 항목의 활성 승인을 무효화한다.
+  - 두 경우 모두 기존 approvals·jobs·distribution_items·variants 행을 바꾼다. 인계(FULLREV2_IMPLEMENTATION_HANDOFF FIX round 2)의 남은 위험에 "DECISIONS 미기록"으로 남아 있었다.
+- Decision (사용자 결정 2026-11-03 "G19 D6 예외 DECISIONS에 기록해줘"): D6 의 예외로 인정한다.
+  1. 복원 전 현재 브랜드와 복원 뒤 현재 브랜드가 다르면 `invalidateApprovalsForBrandProfile`(`packages/db/src/restore.ts`)을 부른다. 새 브랜드 버전 훅과 같은 규칙이다: `invalidated:brand_changed`, 대기 작업 BLOCKED, 항목 PLANNED.
+  2. add_missing 이 기존('same') 원고에 needs_check 소재 연결(content_captures)을 넣으면 `invalidateApprovalsForRisk` 를 부른다. 위험 표시 훅과 같은 규칙이다(`invalidated:risk_needs_check`).
+  3. 범위: 실행을 막는 쪽으로만 바꾼다(승인 철회·대기 작업 보류·항목 PLANNED·파생본 review). 승인을 새로 주거나 되살리거나, 게시·삭제를 하지는 않는다. 그 밖의 기존 행 UPDATE 금지(D6)는 그대로다.
+  4. 무효로 한 승인은 복원 미리보기와 결과의 `invalidated_approvals` 에 보고한다. 묶음 승인의 `restore_stale` 철회(`revoked_approvals`)와는 섞지 않는다(drill 정확 비교). 미리보기는 rollback 되는 같은 트랜잭션이라 아무것도 바꾸지 않는다.
+- Why: 복원으로 '현재 브랜드'나 원고의 위험 사실이 바뀌었는데 기존 승인을 그대로 두면 상태가 어긋난다. 예약 시각에 전송 직전 재검사(beginSend)가 그때서야 막고, 예약 게시는 조용히 BLOCKED 가 된다. 같은 변경을 앱 화면에서 하면 즉시 철회·보고하므로 복원도 같은 규칙을 따른다(D19 승인 무효화 훅과 일치).
+- Consequences:
+  - add_missing 복원 뒤 기존 예약·실행 대기 항목이 다시 승인이 필요한 상태(PLANNED)가 될 수 있다. 미리보기에서 그 목록을 먼저 보여 준다.
+  - D6 의 "기존 행 UPDATE 없음"은 이 두 실행 차단 경로를 뺀 나머지에만 적용된다.
+- Evidence: `tests/integration/fullrev2-restore-approvals.test.ts`.
+  - G19: 높은 브랜드 버전 묶음 → 기존 승인 brand_changed·항목 PLANNED·작업 BLOCKED, 미리보기는 변경 없이 보고만 한다. 높은 버전이 없으면 무효화 0.
+  - G9 보완: needs_check 소재 연결 → 무효화. risk none 이면 0.
+- Reversible?: 예. 규칙은 `packages/db/src/restore.ts` 한 곳이다. 되돌리면 전송 직전 재검사만 남는다(실행은 여전히 막힌다).
+- User decision required?: 아니오(이 결정으로 기록).
+- Exact authorized scope (if applicable): 해당 없음(로컬 DB 복원 규칙, 외부 호출 없음).

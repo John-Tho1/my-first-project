@@ -322,7 +322,7 @@
 
 ## 후속 — 쿼리 문구 조회 방어(ownText)
 
-- BASE_SHA: 5104059 (FIX3 docs) · **HEAD_SHA: abdc5d9** (`abdc5d935c785bb4e88e12b1a68aa48f0a63b6f8`)
+- BASE_SHA: 5104059 (FIX3 docs) · **HEAD_SHA: abdc5d9** (`abdc5d90607c66f7c6b3ccf9c6c46e4a8dc16fef`)
 - 출처: FIX3-FULLREV2 반박 검토에서 범위 밖으로 남긴 지적. 사용자 지시는 "계속 진행해줘"(2026-11-03). Codex 대기열 21번 추가는 사용자 요청이다.
 
 ### 처리

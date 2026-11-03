@@ -897,7 +897,7 @@ PASS 또는 CHANGES_REQUESTED 중 하나.
 ```text
 당신은 GitHub 저장소 `john-tho1/my-first-project` 안의 Content Studio 앱(`Content_Studio_Execution_Pack/`)을 검토하는 독립 코드 리뷰어다. 구현자는 다른 에이전트(Claude Code)이며, 당신의 역할은 동의가 아니라 검증이다.
 
-대상: 브랜치 `content-studio/m4` 의 커밋 `abdc5d935c785bb4e88e12b1a68aa48f0a63b6f8`(짧은 SHA `abdc5d9`, 작업명 `OWNTEXT`) 1개.
+대상: 브랜치 `content-studio/m4` 의 커밋 `abdc5d90607c66f7c6b3ccf9c6c46e4a8dc16fef`(짧은 SHA `abdc5d9`, 작업명 `OWNTEXT`) 1개.
 
 먼저 읽을 것:
 1. `Content_Studio_Execution_Pack/AGENTS.md` — 프로젝트 규칙과 불변 조건(Invariants). 위반 여부를 반드시 확인하라.

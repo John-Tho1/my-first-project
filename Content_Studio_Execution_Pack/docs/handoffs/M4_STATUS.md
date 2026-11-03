@@ -444,3 +444,15 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - drill:mock 위반 0 · dev-cert 472/472
 - Codex 대기열·ChatGPT 프롬프트에 20번 `4f6b71b FIX3-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15–20번.**
 - not_run: Codex, 브라우저(녹음 화면 등), 실제 Postgres 다중 연결, 실제 LLM·실계정.
+
+## 2026-11-03 — 쿼리 문구 조회 결함(FIX3 검토의 범위 밖 지적, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘". FIX3-FULLREV2 검토에서 범위 밖으로 남긴 결함을 고쳤다.
+- **abdc5d9**:
+  - `?error=__proto__` 같은 쿼리 값이 문구 표의 프로토타입 속성을 꺼내 렌더가 깨지던 것을 막았다.
+  - `apps/web/lib/lookup.ts` 의 `ownText`(자기 키·문자열만)로 화면 17개 파일 24곳을 바꿨다.
+  - 시험 `lookup.test.ts` 4건: 프로토타입 키, 원본 가드, 화면 연결. 원고 화면을 되돌리면 실패한다(변이 확인).
+- 마지막 검사(abdc5d9 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 88 / 2198 · integration 75 / 1278**
+  - drill:mock 위반 0 · dev-cert 472/472
+- not_run: 브라우저, Codex. Codex 대기열 추가 대상이 아니다(작은 방어 수정). 원하면 21번으로 넣는다.

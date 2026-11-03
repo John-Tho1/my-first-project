@@ -455,4 +455,4 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - install(lockfile 불변) · lint · typecheck · build PASS
   - **unit 88 / 2198 · integration 75 / 1278**
   - drill:mock 위반 0 · dev-cert 472/472
-- not_run: 브라우저, Codex. Codex 대기열 추가 대상이 아니다(작은 방어 수정). 원하면 21번으로 넣는다.
+- not_run: 브라우저, Codex. 사용자 요청으로 Codex 대기열·ChatGPT 프롬프트 21번 `abdc5d9 OWNTEXT` 를 추가했다(인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` '후속 — 쿼리 문구 조회 방어'). **Codex 재확인 대상: 15–21번.**

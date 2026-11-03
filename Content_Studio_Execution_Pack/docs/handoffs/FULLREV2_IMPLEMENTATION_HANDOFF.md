@@ -319,3 +319,37 @@
 
 ### 이후
 - FULLREV2 확정 33건 처리를 마쳤다. Codex 재확인은 대기열 15–20번이다(사용자 PC).
+
+## 후속 — 쿼리 문구 조회 방어(ownText)
+
+- BASE_SHA: 5104059 (FIX3 docs) · **HEAD_SHA: abdc5d9** (`abdc5d935c785bb4e88e12b1a68aa48f0a63b6f8`)
+- 출처: FIX3-FULLREV2 반박 검토에서 범위 밖으로 남긴 지적. 사용자 지시는 "계속 진행해줘"(2026-11-03). Codex 대기열 21번 추가는 사용자 요청이다.
+
+### 처리
+- 결함: 화면이 `?error=`·`?upload=`·`?account_error=` 등의 쿼리 값을 문구 표에 대괄호로 바로 썼다. `__proto__`·`constructor` 같은 값이면 Object.prototype 의 속성(문자열 아님)이 나와, 렌더가 깨지거나 기본 문구로 넘어가지 않았다.
+- `apps/web/lib/lookup.ts` 에 `ownText(table, key)` 를 두었다. `Object.hasOwn` 이고 값이 문자열일 때만 돌려주고, 아니면 undefined 를 돌려 호출부의 기본 문구로 넘어간다.
+- 화면 17개 파일 24곳을 바꿨다: 로그인, 홈, 원고·원고 목록, 브랜드, 설정·복원, 운영, 수집·수집 실행, 가져오기·가져오기 상세, 아이디어·아이디어 상세, 소재 상세, 배포 만들기·배포 상세.
+
+### 시험
+- 새 `apps/web/lib/lookup.test.ts` 4건:
+  - 프로토타입 키 6종(`__proto__`·`constructor`·`toString`·`hasOwnProperty`·`valueOf`·`isPrototypeOf`)이 undefined 다. 대조로, 대괄호 조회는 문자열이 아닌 값을 낸다.
+  - `app/**` 원본에 쿼리 값 대괄호 조회 꼴이 없다(원본 가드).
+  - 대표 화면 연결.
+- 변이 확인: 원고 화면을 수정 전으로 되돌리면 2건이 실패한다. cmp 로 원복했다.
+- 바뀐 기존 단언: 없음.
+
+### 명령
+클라우드 Node 22.22.0, abdc5d9 와 같은 트리.
+- install(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: PASS
+- **unit 88 files / 2198 · integration 75 files / 1278**
+- drill:mock: 위반 0
+- dev-cert: 472/472
+- not_run: Codex, 브라우저.
+
+### 남은 위험
+- 원본 가드는 `TABLE[q.x]`·`TABLE[str(q.x)!]`·`TABLE[params.x]` 꼴만 찾는다. 다른 이름의 변수에 쿼리 값을 담아 조회하면 잡지 못한다(예: `const code = q.error; TABLE[code]` — 로그인 화면은 고쳤다).
+- `lib/collector.ts` 의 `COLLECTOR_ERROR_LABEL[code]` 는 DB 에 저장된 코드라 바꾸지 않았다.
+
+### 검토자에게 물을 것
+1. 쿼리·사용자 입력으로 고정 문구 표를 찾는 곳 중 남은 것이 있는가(lib 함수 안 포함)?
+2. 원본 가드의 정규식 범위가 충분한가?

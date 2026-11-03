@@ -17,6 +17,7 @@ import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { formatBytes } from '../../../lib/backup';
 import { IMPORT_ERROR_TEXT, IMPORT_STATUS_LABEL } from '../../../lib/imports';
 import { getAppDb, getConfig } from '../../../lib/server';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,7 +50,7 @@ export default async function ImportRunPage({
   const preview0 = run.status === 'preview';
   // FIX-T18 round 2(P1): 원본 파일이 빠진(0039 이전에 가져온) 동일 항목 — "원본 보충" 을 고를 수 있다.
   const backfillable = preview0 ? await listBackfillableImportItemIds(db, session.ownerId, items) : new Set<string>();
-  const err = str(q.error) ? (IMPORT_ERROR_TEXT[str(q.error)!] ?? IMPORT_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(IMPORT_ERROR_TEXT, str(q.error)!) ?? IMPORT_ERROR_TEXT.server) : undefined;
   const preview = preview0;
   const groups = groupByFolder(items);
   const c = run.counts;

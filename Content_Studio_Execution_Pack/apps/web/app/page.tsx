@@ -24,6 +24,7 @@ import { ExpiryNoticeList } from '../lib/expiry-view';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../lib/labels';
 import { planRowTag, planStatusText } from '../lib/record-labels';
 import { getAppDb, getConfig } from '../lib/server';
+import { ownText } from '../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -96,11 +97,11 @@ export default async function TodayPage({
   const captures = await listCaptures(handle.db, session.ownerId);
   const assets = await listAssets(handle.db, session.ownerId);
   const params = await searchParams;
-  const uploadMsg = typeof params.upload === 'string' ? UPLOAD_TEXT[params.upload] : undefined;
-  const uploadErr = typeof params.upload_error === 'string' ? (UPLOAD_ERROR_TEXT[params.upload_error] ?? UPLOAD_ERROR_TEXT.server) : undefined;
+  const uploadMsg = typeof params.upload === 'string' ? ownText(UPLOAD_TEXT, params.upload) : undefined;
+  const uploadErr = typeof params.upload_error === 'string' ? (ownText(UPLOAD_ERROR_TEXT, params.upload_error) ?? UPLOAD_ERROR_TEXT.server) : undefined;
   const captureErr =
     typeof params.capture_error === 'string'
-      ? (CAPTURE_ERROR_TEXT[params.capture_error] ?? CAPTURE_ERROR_TEXT.server)
+      ? (ownText(CAPTURE_ERROR_TEXT, params.capture_error) ?? CAPTURE_ERROR_TEXT.server)
       : undefined;
   const recent = await listCapturesPage(handle.db, session.ownerId, { limit: 10 });
   const draft = await latestDraft(handle.db, session.ownerId);

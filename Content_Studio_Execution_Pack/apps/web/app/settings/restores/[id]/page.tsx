@@ -6,6 +6,7 @@ import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT } from '../../../../lib/backup';
 import { reconnectNotice } from '../../../../lib/restore-view';
 import { getAppDb, getConfig } from '../../../../lib/server';
+import { ownText } from '../../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -56,7 +57,7 @@ export default async function RestorePage({
   if (!run) notFound();
   const p = run.preview as unknown as RestorePreview;
   const result = run.result as unknown as CommitResult | null;
-  const err = str(q.error) ? (BACKUP_ERROR_TEXT[str(q.error)!] ?? BACKUP_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(BACKUP_ERROR_TEXT, str(q.error)!) ?? BACKUP_ERROR_TEXT.server) : undefined;
   const committed = run.status === 'committed' && result;
   // FIX2-T13: 복원으로 "다시 연결 필요"가 되는 배포 계정(이름·플랫폼만)
   const reconnect = reconnectNotice(committed ? result : p, Boolean(committed));

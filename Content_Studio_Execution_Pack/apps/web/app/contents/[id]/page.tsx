@@ -30,6 +30,7 @@ import { preview } from '../../../lib/labels';
 import { exportsDir } from '../../../lib/backup';
 import { getAppDb, getConfig } from '../../../lib/server';
 import { VariantsPanel } from './variants-panel';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -61,7 +62,7 @@ export default async function ContentPage({
   const { content: c, current, versions } = d;
   const lc = contentLifecycleSchema.safeParse(c.lifecycle);
   const options = lc.success ? allowedLifecycleOptions(lc.data) : [];
-  const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(FORM_ERROR_TEXT, str(q.error)!) ?? ownText(WRITING_ERROR_TEXT, str(q.error)!) ?? FORM_ERROR_TEXT.server) : undefined;
   // FIX3-FULLREV2(G21): AI 실패 원인 코드(허용 목록만) — 채널 초안 AI 실패도 원인·영구 실패 안내를 보인다.
   const failure = formFailureCode(str(q.error), str(q.failure));
   // 조회와 선택에 같은 정규화 값(소문자 UUID 또는 'none')을 쓴다(FIX-T06 round 2).

@@ -32,6 +32,7 @@ import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { oidcReadinessView } from '../../lib/oidc';
 import { revokeNotice } from '../../lib/revoke-view';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -66,13 +67,13 @@ export default async function SettingsPage({
   const exports = await listExportRuns(db, session.ownerId, 20);
   const restores = await listRestoreRuns(db, session.ownerId, 10);
   const exported = str(q.exported) ? exports.find((e) => e.id === str(q.exported)) : undefined;
-  const err = str(q.error) ? (BACKUP_ERROR_TEXT[str(q.error)!] ?? BACKUP_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(BACKUP_ERROR_TEXT, str(q.error)!) ?? BACKUP_ERROR_TEXT.server) : undefined;
   // T13: 계정 연결 상태(토큰·암호문 없음 — 상태·만료·scope 이름만)
   const accounts = await listAccountHealth(db, session.ownerId);
   const oauth = oauthReadinessView(config);
   // T21-P1b: 로그인(인증) 방식·OIDC 준비 상태 — 설정 이름만(값 없음)
   const authView = oidcReadinessView(config);
-  const accountErr = str(q.account_error) ? (ACCOUNT_ERROR_TEXT[str(q.account_error)!] ?? ACCOUNT_ERROR_TEXT.server) : undefined;
+  const accountErr = str(q.account_error) ? (ownText(ACCOUNT_ERROR_TEXT, str(q.account_error)!) ?? ACCOUNT_ERROR_TEXT.server) : undefined;
   // M4UI FIX1: 연결 해제 결과는 revokeNotice — 끝나지 않은 해제(revoke=incomplete&revoke_code=허용 코드)는 경고로, "해제했습니다"라고 하지 않는다
   const revokeMsg = revokeNotice({ revoked: str(q.revoked), revoke: str(q.revoke), code: str(q.revoke_code) });
   const accountDone = q.live_target === 'on'
@@ -94,7 +95,7 @@ export default async function SettingsPage({
   const liveSwitch = livePublishSwitchLabel({ publishEnabled: config.PUBLISH_MODE === 'enabled', ready: oauth.livePublish.ready, paused: liveCtl.paused });
   // FIX3-FULLREV2(G11): 완료 배너는 쿼리만이 아니라 저장된 스위치(liveCtl.paused)와 맞을 때만 — 맞지 않으면 중립 문구
   const liveDone = livePublishDoneBanner(str(q.live_publish), liveCtl.paused);
-  const liveErr = str(q.live_error) ? (LIVE_PUBLISH_ERROR_TEXT[str(q.live_error)!] ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
+  const liveErr = str(q.live_error) ? (ownText(LIVE_PUBLISH_ERROR_TEXT, str(q.live_error)!) ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
   // EXPIRY-1(D39): 실제 Threads 연결·로컬 인증서(개발 모드만 읽음) 만료 14일 전부터 경고. 다시 연결은 아래 배포 계정 연결의 기존 연결 흐름(토큰 갱신 API 호출 없음 — D31).
   const now = new Date();
   const devCert = readDevCertExpiry();

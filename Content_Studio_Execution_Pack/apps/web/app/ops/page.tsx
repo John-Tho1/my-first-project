@@ -21,6 +21,7 @@ import { oauthReadinessView } from '../../lib/oauth';
 import { OPS_ERROR_TEXT } from '../../lib/ops';
 import { accountModeOf, opsAccountsNote, opsJobsTag, opsJobsTagClass } from '../../lib/record-labels';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -59,7 +60,7 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
   const accounts = await listAccountHealth(db, session.ownerId);
   const jobsTag = opsJobsTag(s.jobs.byKind);
   const plan = await planRetention(db, session.ownerId, config, exportsDir(config), now);
-  const err = str(q.error) ? (OPS_ERROR_TEXT[str(q.error)!] ?? OPS_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(OPS_ERROR_TEXT, str(q.error)!) ?? OPS_ERROR_TEXT.server) : undefined;
   const live = liveLlmReadiness(config, process.env);
   const sttLive = sttLiveReadiness(config);
   const oauth = oauthReadinessView(config);

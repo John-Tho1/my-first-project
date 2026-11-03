@@ -16,6 +16,7 @@ import { getSession } from '../../../../lib/auth';
 import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { COLLECT_ERROR_TEXT, runErrorText } from '../../../../lib/collector';
 import { getAppDb, getConfig } from '../../../../lib/server';
+import { ownText } from '../../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -39,7 +40,7 @@ export default async function CollectRunPage({
   const source = await getCollectorSource(db, session.ownerId, run.sourceId);
   const items = await listCollectedItems(db, session.ownerId, run.id);
   const open = run.status === 'preview';
-  const err = str(q.error) ? (COLLECT_ERROR_TEXT[str(q.error)!] ?? COLLECT_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(COLLECT_ERROR_TEXT, str(q.error)!) ?? COLLECT_ERROR_TEXT.server) : undefined;
 
   return (
     <main className="container">

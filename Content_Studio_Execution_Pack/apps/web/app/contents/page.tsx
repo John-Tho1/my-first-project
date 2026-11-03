@@ -14,6 +14,7 @@ import { getSession } from '../../lib/auth';
 import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../lib/contents';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -45,7 +46,7 @@ export default async function ContentsPage({
   if (lifecycle) filterQuery.set('lifecycle', lifecycle);
   const next = page.next ? encodeCaptureCursor(page.next.at, page.next.id) : null;
   const nextHref = next ? `/contents?${new URLSearchParams({ ...Object.fromEntries(filterQuery), cursor: next })}` : null;
-  const err = str(params.error) ? (FORM_ERROR_TEXT[str(params.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  const err = str(params.error) ? (ownText(FORM_ERROR_TEXT, str(params.error)!) ?? FORM_ERROR_TEXT.server) : undefined;
 
   return (
     <main className="container">

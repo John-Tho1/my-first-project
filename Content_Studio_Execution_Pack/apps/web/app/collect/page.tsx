@@ -15,6 +15,7 @@ import { getSession } from '../../lib/auth';
 import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { COLLECT_ERROR_TEXT, runErrorText } from '../../lib/collector';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -34,7 +35,7 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
   const runs = await listCollectorRuns(db, session.ownerId, 30);
   const accepted = await acceptedCountsBySource(db, session.ownerId);
   const readiness = collectorReadiness(config);
-  const err = str(q.error) ? (COLLECT_ERROR_TEXT[str(q.error)!] ?? COLLECT_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(COLLECT_ERROR_TEXT, str(q.error)!) ?? COLLECT_ERROR_TEXT.server) : undefined;
   const sourceName = new Map(sources.map((s) => [s.id, s.label ?? s.host]));
 
   return (

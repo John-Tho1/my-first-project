@@ -7,6 +7,7 @@ import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { formatBytes } from '../../lib/backup';
 import { IMPORT_ERROR_TEXT, IMPORT_STATUS_LABEL } from '../../lib/imports';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,7 +25,7 @@ export default async function ImportsPage({ searchParams }: { searchParams: Prom
   const config = getConfig();
   const { db } = await getAppDb(config);
   const runs = await listImportRuns(db, session.ownerId, 30);
-  const err = str(q.error) ? (IMPORT_ERROR_TEXT[str(q.error)!] ?? IMPORT_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(IMPORT_ERROR_TEXT, str(q.error)!) ?? IMPORT_ERROR_TEXT.server) : undefined;
   const mock = config.IMPORT_CONNECTOR_MODE === 'mock';
 
   return (

@@ -7,6 +7,7 @@ import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { INPUT_TYPE_LABEL, preview, RISK_LABEL } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -62,9 +63,9 @@ export default async function CaptureDetailPage({
   const saved = str(q.saved);
   const updatedRev = Number(str(q.updated));
   const updatedRow = Number.isInteger(updatedRev) ? revisions.find((r) => r.revision === updatedRev) : undefined;
-  const extractMsg = str(q.extract) ? (EXTRACT_TEXT[str(q.extract)!] ?? EXTRACT_TEXT.server) : undefined;
-  const formErr = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
-  const editErr = str(q.edit_error) ? (EDIT_ERROR_TEXT[str(q.edit_error)!] ?? EDIT_ERROR_TEXT.server) : undefined;
+  const extractMsg = str(q.extract) ? (ownText(EXTRACT_TEXT, str(q.extract)!) ?? EXTRACT_TEXT.server) : undefined;
+  const formErr = str(q.error) ? (ownText(FORM_ERROR_TEXT, str(q.error)!) ?? FORM_ERROR_TEXT.server) : undefined;
+  const editErr = str(q.edit_error) ? (ownText(EDIT_ERROR_TEXT, str(q.edit_error)!) ?? EDIT_ERROR_TEXT.server) : undefined;
 
   // 409 충돌: 리다이렉트 query 에 실려 온 "내가 입력한 내용"(yours). 폼 기본값으로 다시 채워 입력을 잃지 않게 한다.
   const conflict = str(q.conflict) === '1';

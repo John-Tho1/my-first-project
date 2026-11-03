@@ -7,6 +7,7 @@ import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT } from '../../lib/contents';
 import { preview, RISK_LABEL } from '../../lib/labels';
 import { getAppDb, getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,7 +25,7 @@ export default async function IdeasPage({
   const { db } = await getAppDb(getConfig());
   const page = await listIdeas(db, session.ownerId, { cursor: c ? { at: c.receivedAt, id: c.id } : null, limit: 20 });
   const next = page.next ? encodeCaptureCursor(page.next.at, page.next.id) : null;
-  const err = typeof params.error === 'string' ? (FORM_ERROR_TEXT[params.error] ?? FORM_ERROR_TEXT.server) : undefined;
+  const err = typeof params.error === 'string' ? (ownText(FORM_ERROR_TEXT, params.error) ?? FORM_ERROR_TEXT.server) : undefined;
 
   return (
     <main className="container">

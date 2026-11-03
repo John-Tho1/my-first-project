@@ -5,6 +5,7 @@ import { getSession } from '../../lib/auth';
 import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { getAppDb, getConfig } from '../../lib/server';
 import { WRITING_ERROR_TEXT } from '../../lib/writing';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,7 +27,7 @@ export default async function BrandPage({
   const versions = await listBrandProfiles(db, session.ownerId);
   const current = versions[0] ?? null;
   const saved = str(q.saved);
-  const err = str(q.error) ? (WRITING_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(WRITING_ERROR_TEXT, str(q.error)!) ?? WRITING_ERROR_TEXT.server) : undefined;
 
   return (
     <main className="container">

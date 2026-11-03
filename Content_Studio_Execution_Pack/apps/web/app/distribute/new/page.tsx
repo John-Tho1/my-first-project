@@ -25,6 +25,7 @@ import {
 } from '../../../lib/distribution';
 import { DuplicatePublishWarning } from '../../../lib/duplicate-warning';
 import { getAppDb, getConfig } from '../../../lib/server';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -139,7 +140,7 @@ export default async function NewPlanPage({ searchParams }: { searchParams: Prom
       duplicates: v.currentVersionId ? (dupByVersion.get(v.currentVersionId) ?? []) : [],
     });
   }
-  const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(DISTRIBUTE_ERROR_TEXT, str(q.error)!) ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // 화면 확인 D10: 오류로 돌아온 경우에만 입력값을 되살린다(오류 없이 연 화면은 기본 선택 없음 — docs/03).
   const prev = err ? planFormDefaults(q) : planFormDefaults({});
   // FIX-LIVEP2(리뷰 확정 distribute/new:129 · 계획 3(b)): 실제 게시 계정이 있어도 즉시 중지 중이면 "실제로 게시됩니다" 옆에 일시 중지됨을 함께 보인다(표시용 — 판정은 전송 직전 서버).

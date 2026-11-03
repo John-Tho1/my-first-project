@@ -72,6 +72,7 @@ import {
 } from '../../../lib/record-labels';
 import { DuplicatePublishWarning } from '../../../lib/duplicate-warning';
 import { getAppDb, getConfig, getStorage } from '../../../lib/server';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -769,7 +770,7 @@ export default async function PlanPage({
   const approveDup = approvable.filter(hasDup);
   const executeDup = executableItems.filter(hasDup);
   const dupHeading = (x: PlanItemDetail) => `${CHANNEL_LABEL[(x.variant?.channel ?? x.payload.channel) as Channel] ?? x.payload.channel} — ${x.account?.displayName ?? '(계정 없음)'}:`;
-  const err = str(q.error) ? (DISTRIBUTE_ERROR_TEXT[str(q.error)!] ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(DISTRIBUTE_ERROR_TEXT, str(q.error)!) ?? DISTRIBUTE_ERROR_TEXT.server) : undefined;
   // M3 화면 FIX(D5): 승인·실행·취소·재시도 배너는 저장된 상태가 뒷받침할 때만, 수는 상태에서 센다(쿼리만으로 주장하지 않음).
   const banners = bannersFromState(q, d);
   // FIX3-FULLREV(R2): 취소가 결과 불명(UNKNOWN — 부분 게시·복원 미확정)으로 끝남 — "취소 확인 중"이 아닌 전용 배너(저장된 상태·허용 목록 사유 코드로만 고름)

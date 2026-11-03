@@ -7,6 +7,7 @@ import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
 import { preview, RISK_LABEL } from '../../../lib/labels';
 import { getAppDb, getConfig } from '../../../lib/server';
+import { ownText } from '../../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -28,7 +29,7 @@ export default async function IdeaPage({
   const d = await getIdea(db, session.ownerId, id.toLowerCase());
   if (!d) notFound();
   const { idea: i } = d;
-  const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  const err = str(q.error) ? (ownText(FORM_ERROR_TEXT, str(q.error)!) ?? FORM_ERROR_TEXT.server) : undefined;
   const updated = str(q.updated) === String(i.revision);
 
   const fields: Array<[string, string, string | null]> = [

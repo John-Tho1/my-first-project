@@ -3,6 +3,7 @@ import { isLocalhostBaseUrl, OIDC_START_PATH, oidcLoginReadiness } from '@cs/dom
 import { getSession } from '../../lib/auth';
 import { warnOidcNotConfigured } from '../../lib/oidc';
 import { getConfig } from '../../lib/server';
+import { ownText } from '../../lib/lookup';
 
 export const dynamic = 'force-dynamic';
 
@@ -30,7 +31,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const config = getConfig();
   const params = await searchParams;
   const code = typeof params.error === 'string' ? params.error : null;
-  const errorText = code ? (ERROR_TEXT[code] ?? ERROR_TEXT.denied) : null;
+  const errorText = code ? (ownText(ERROR_TEXT, code) ?? ERROR_TEXT.denied) : null;
   const devAllowed = config.AUTH_MODE === 'dev' && isLocalhostBaseUrl(config.APP_BASE_URL);
   // T21-P1b: 준비 여부만 본다(빠진 설정 이름은 로그인 전 화면에 보여 주지 않는다 — 서버 로그·로그인 후 설정 화면).
   const oidcReadiness = config.AUTH_MODE === 'oidc' ? oidcLoginReadiness(config, process.env) : null;

@@ -729,3 +729,36 @@ describe('FIX-T07 round 4: 구조화 인용만 — 자유문 출처 표기는 �
     expect(citationLabel(ids, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd')).toBeNull();
   });
 });
+
+// FIX3-FULLREV2(G21): 실패 코드 허용 목록·영구 실패 안내·JSON extra.
+describe('FIX3-FULLREV2(G21) — aiRunFailureView / LlmFailedError', () => {
+  it('허용 목록 코드 → 고정 문구, 영구 실패 표시; 목록 밖·null → code null + 일반 문구', async () => {
+    const { aiRunFailureView, AI_FAILURE_GENERIC_TEXT, LIVE_LLM_FAILURE_TEXT, PERMANENT_AI_FAILURE_CODES } = await import('./writing');
+    for (const code of ['llm_auth_failed', 'llm_permission_denied', 'llm_not_found', 'llm_bad_request', 'llm_max_tokens', 'llm_request_invalid', 'unverifiable_citation']) {
+      expect(aiRunFailureView(code)).toMatchObject({ code, permanent: true });
+    }
+    for (const code of ['llm_rate_limited', 'llm_server_error', 'llm_timeout', 'llm_refusal', 'input_version_mismatch', 'proposal_too_large', 'mock_injected_failure', 'provider_error', 'invalid_output']) {
+      expect(aiRunFailureView(code)).toMatchObject({ code, permanent: false });
+    }
+    expect(PERMANENT_AI_FAILURE_CODES.size).toBe(7);
+    expect(aiRunFailureView('llm_auth_failed').text).toBe(LIVE_LLM_FAILURE_TEXT.llm_auth_failed);
+    for (const raw of ['원문 메시지', '__proto__', 'toString', 'constructor', '', null, undefined]) {
+      expect(aiRunFailureView(raw)).toEqual({ code: null, text: AI_FAILURE_GENERIC_TEXT, permanent: false });
+    }
+  });
+
+  it('LlmFailedError: 코드 없음은 기존 문구 그대로, 영구 실패는 다시 시도 대신 예약액 확정 안내, extra 는 run_id·허용 코드만', async () => {
+    const { LlmFailedError, AI_PERMANENT_FAILURE_GUIDANCE } = await import('./writing');
+    const plain = new LlmFailedError();
+    expect(plain.message).toBe('AI 제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다. 잠시 뒤 다시 시도하세요.');
+    expect(plain.extra).toBeUndefined();
+    expect(plain.code).toBe('llm_failed');
+    const perm = new LlmFailedError({ runId: 'r1', failureCode: 'llm_not_found' });
+    expect(perm.extra).toEqual({ run_id: 'r1', failure_code: 'llm_not_found', permanent: true });
+    expect(perm.message).toContain(AI_PERMANENT_FAILURE_GUIDANCE);
+    expect(perm.message).not.toContain('잠시 뒤 다시 시도');
+    const raw = new LlmFailedError({ runId: 'r2', failureCode: 'UPSTREAM 원문' });
+    expect(raw.extra).toEqual({ run_id: 'r2' });
+    expect(raw.message).not.toContain('UPSTREAM');
+  });
+});

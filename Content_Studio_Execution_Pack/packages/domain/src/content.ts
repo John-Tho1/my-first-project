@@ -18,6 +18,9 @@ export const MAX_TAGS = 10;
 export const MAX_TAG = 30;
 export const MAX_VERSION_NOTE = 500;
 export const MAX_SEARCH_Q = 200;
+/** FIX3-FULLREV2(G32): 검색어를 공백으로 나눈 고유 조각의 상한. 넘으면 400(조용히 자르지 않는다 — D5 '조각이 모두 포함'). */
+export const MAX_SEARCH_TERMS = 8;
+export const SEARCH_TERMS_LIMIT_MESSAGE = `검색어는 공백으로 나눈 조각 ${MAX_SEARCH_TERMS}개까지 쓸 수 있습니다. 단어를 줄여 다시 검색하세요.`;
 export const MAX_LINKED_CAPTURES = 20;
 
 export const CONTENT_LIFECYCLES = ['draft', 'review', 'ready', 'archived'] as const;
@@ -185,6 +188,10 @@ export const searchQuerySchema = z
     if (v.from && v.to && v.from > v.to) {
       ctx.addIssue({ code: 'custom', path: ['from'], message: '시작일이 종료일보다 늦습니다' });
     }
+    // FIX3-FULLREV2(G32): 고유 조각이 상한을 넘으면 거부한다(앞 8개만 쓰면 9번째 이후 단어가 없는 결과가 섞인다).
+    if (v.q !== undefined && uniqueSearchTerms(v.q).length > MAX_SEARCH_TERMS) {
+      ctx.addIssue({ code: 'custom', path: ['q'], message: SEARCH_TERMS_LIMIT_MESSAGE });
+    }
   });
 export type SearchQuery = z.infer<typeof searchQuerySchema>;
 
@@ -200,9 +207,15 @@ export function parseSearchParams(params: URLSearchParams) {
  * 한국어는 형태소 분석 없이 부분 문자열로 찾는다(조사 붙은 "주재원으로" 도 "주재원" 으로 찾음).
  */
 export function searchTerms(q: string | undefined): string[] {
+  // FIX3-FULLREV2(G32): searchQuerySchema 가 상한 초과를 400 으로 막으므로 여기 slice 는 스키마를 거치지 않은 호출의 방어선일 뿐이다.
+  return uniqueSearchTerms(q).slice(0, MAX_SEARCH_TERMS);
+}
+
+/** 공백 분리·NFC·중복 제거(자르지 않음). */
+function uniqueSearchTerms(q: string | undefined): string[] {
   if (!q) return [];
   const terms = q.normalize('NFC').trim().split(/\s+/u).filter(Boolean);
-  return [...new Set(terms)].slice(0, 8);
+  return [...new Set(terms)];
 }
 
 /** ILIKE 패턴 escape(\, %, _). ESCAPE '\' 와 함께 쓴다. */

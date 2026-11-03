@@ -542,3 +542,34 @@ describe('FIX4-FULLREV(S3) — 계정 없는 항목 카드의 모의·실제 문
     expect(html).not.toContain(CANCEL_UNKNOWN_BANNER.partial.mock);
   });
 });
+
+describe('FIX3-FULLREV2(G12) — 작업 목록의 옛 작업 줄은 자기 보류 사유(lastErrorCode)로', () => {
+  /** 옛 작업1 = 승인 철회로 BLOCKED(approval_revoked), 새 작업2 = 다른 사유로 BLOCKED(사건은 최근 작업 것만 — getPlanDetail 과 같음) */
+  const twoJobs = (name: string, live: boolean, newCode: string) => {
+    const x = item({ live, verification: live ? 'UNVERIFIED' : 'MOCK', withPub: false, name });
+    const base = x.jobs[0]!;
+    return {
+      ...x,
+      item: { ...x.item, status: 'BLOCKED' },
+      activeApproval: { id: 'a2', payloadHash: 'a'.repeat(64) },
+      jobs: [
+        { ...base, id: `j1-${name}`, state: 'BLOCKED', attempt: 0, lastErrorCode: 'approval_revoked' },
+        { ...base, id: `j2-${name}`, state: 'BLOCKED', attempt: 1, lastErrorCode: newCode },
+      ],
+      events: [{ id: `e-${name}`, eventSeq: 5, at: T, stateBefore: 'LEASED', stateAfter: 'BLOCKED', sanitizedDetails: { event: 'blocked', not_sent: true, reason: newCode } }],
+    };
+  };
+  const jobLines = (card: string) => [...card.matchAll(/<li class="hash"><strong>([^<]*)<\/strong>/g)].map((m) => m[1]);
+
+  it('모의: 옛 작업 "BLOCKED · 승인 철회됨", 새 작업 "BLOCKED · 계정 인증 필요" — 옛 줄이 새 사유로 보이지 않음', async () => {
+    state.detail = detail(twoJobs('mock2', false, 'auth'));
+    const [card] = cards(await render());
+    expect(jobLines(card!)).toEqual(['BLOCKED · 승인 철회됨', 'BLOCKED · 계정 인증 필요(자동 재시도 안 함)']);
+  });
+
+  it('실제: 옛 작업 "BLOCKED · 승인 철회됨", 새 작업 "BLOCKED · 실제 게시 일시 중지됨"', async () => {
+    state.detail = detail(twoJobs('live2', true, 'live_publish_paused'));
+    const [card] = cards(await render());
+    expect(jobLines(card!)).toEqual(['BLOCKED · 승인 철회됨', 'BLOCKED · 실제 게시 일시 중지됨 — 보내지 않음(재개 뒤 재시도)']);
+  });
+});

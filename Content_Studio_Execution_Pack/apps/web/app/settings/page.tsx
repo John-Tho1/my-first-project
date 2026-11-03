@@ -27,7 +27,7 @@ import { Breadcrumbs } from '../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT, formatBytes } from '../../lib/backup';
 import { readDevCertExpiry } from '../../lib/dev-cert';
 import { ExpiryNoticeList } from '../../lib/expiry-view';
-import { LIVE_PUBLISH_DONE_TEXT, LIVE_PUBLISH_ERROR_TEXT } from '../../lib/live-publish';
+import { LIVE_PUBLISH_ERROR_TEXT, livePublishDoneBanner } from '../../lib/live-publish';
 import { ACCOUNT_ERROR_TEXT, oauthReadinessView } from '../../lib/oauth';
 import { oidcReadinessView } from '../../lib/oidc';
 import { revokeNotice } from '../../lib/revoke-view';
@@ -92,7 +92,8 @@ export default async function SettingsPage({
   // FIX-LIVEP2(A): 상한을 넘겨 쓰는 중(상한을 줄임 등)이면 "다음 게시 가능"은 상한 아래로 내려가는 시각(상한을 넘겨 준다), 표시는 분 단위 올림
   const liveCtl = await livePublishOverview(db, session.ownerId, new Date(), liveDailyLimit);
   const liveSwitch = livePublishSwitchLabel({ publishEnabled: config.PUBLISH_MODE === 'enabled', ready: oauth.livePublish.ready, paused: liveCtl.paused });
-  const liveDone = str(q.live_publish) ? LIVE_PUBLISH_DONE_TEXT[str(q.live_publish)!] : undefined;
+  // FIX3-FULLREV2(G11): 완료 배너는 쿼리만이 아니라 저장된 스위치(liveCtl.paused)와 맞을 때만 — 맞지 않으면 중립 문구
+  const liveDone = livePublishDoneBanner(str(q.live_publish), liveCtl.paused);
   const liveErr = str(q.live_error) ? (LIVE_PUBLISH_ERROR_TEXT[str(q.live_error)!] ?? LIVE_PUBLISH_ERROR_TEXT.server) : undefined;
   // EXPIRY-1(D39): 실제 Threads 연결·로컬 인증서(개발 모드만 읽음) 만료 14일 전부터 경고. 다시 연결은 아래 배포 계정 연결의 기존 연결 흐름(토큰 갱신 API 호출 없음 — D31).
   const now = new Date();
@@ -204,8 +205,8 @@ export default async function SettingsPage({
       <section className="card archive" id="live-publish" aria-labelledby="live-publish-title">
         <h3 id="live-publish-title">실제 게시</h3>
         {liveDone ? (
-          <p className="saved" role="status">
-            {liveDone}
+          <p className={liveDone.stale ? 'notice' : 'saved'} role="status">
+            {liveDone.text}
           </p>
         ) : null}
         {liveErr ? (

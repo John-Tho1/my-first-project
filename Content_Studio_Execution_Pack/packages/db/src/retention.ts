@@ -20,6 +20,7 @@
  *  ③ 감사 retention.files(실제 삭제·실패 수, 오류 코드). ③이 실패해도 ①의 계획 기록이 남아 "계획은 있는데 결과 기록이 없음"으로 보인다.
  * 원문 소재·출처·원고 버전·파생본·승인·결과 등 다른 표는 읽지도 지우지도 않는다. 업로드 세션(24시간)은 기존 worker 만료 정리(D15) 그대로.
  * 미리보기(planRetention)는 아무것도 바꾸지 않는다. 적용(applyRetention)은 confirm === true 일 때만. 같은 입력으로 두 번 돌리면 두 번째는 0건(멱등).
+ * FIX3-FULLREV2(G30): 수동 적용은 미리보기의 계획 지문(fingerprint)을 받아 ① 에서 새 계획과 비교한다 — 다르면 아무것도 지우지 않고 409 plan_changed.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
@@ -63,7 +64,24 @@ export interface RetentionPlan {
   exportsKept: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string }>;
   /** 검증되지 않은 기록(ZIP 없음·손상·읽기 실패) — 보존 개수에 세지 않는다. dirPresent = 풀어 둔 폴더는 남아 있음 */
   exportsMissingFile: Array<{ id: string; createdAt: Date; zipBytes: number; manifestSha256: string; dirPresent: boolean; zipState: Exclude<ZipState, 'verified'> }>;
+  /**
+   * FIX3-FULLREV2(G30): 계획 지문 — 삭제 대상 목록(작업 id·배포 파일 id·내보내기 run id·kind)을 정렬해 sha256(hex 64자).
+   * 미리보기(화면 폼 hidden·JSON 미리보기)가 이 값을 보이고, 수동 적용은 이 값을 받아 ① 트랜잭션에서 새로 세운 계획의 지문과 비교한다.
+   */
+  fingerprint: string;
 }
+
+/** FIX3-FULLREV2(G30): 삭제 대상 목록의 지문(순서·개수·kind 를 모두 반영). 시각·바이트·정책 숫자는 넣지 않는다 — 지울 것이 같으면 같은 값. */
+export function retentionPlanFingerprint(p: Pick<RetentionPlan, 'jobEvents' | 'packages' | 'exports'>): string {
+  const lines = [
+    ...p.jobEvents.jobIds.map((id) => `job_events:${id}`),
+    ...p.packages.map((x) => `package:${x.contentId ?? '-'}:${x.id}`),
+    ...p.exports.map((x) => `export:${x.kind}:${x.id}`),
+  ].sort();
+  return createHash('sha256').update(`cs.retention.plan.v1\n${lines.join('\n')}`).digest('hex');
+}
+
+export const RETENTION_PLAN_FINGERPRINT_RE = /^[0-9a-f]{64}$/u;
 
 async function eligibleJobIds(db: DbOrTx, ownerId: string, cutoff: Date): Promise<Array<{ id: string; n: number }>> {
   const rows = await db
@@ -222,15 +240,18 @@ export async function planRetention(
   const jobCut = cutoffDays(now, policy.RETENTION_JOB_EVENTS_DAYS);
   const eligible = await eligibleJobIds(db, ownerId, jobCut);
   const ex = await exportsBeyondKeep(db, exportsDir, ownerId, policy.RETENTION_EXPORT_RUNS_KEEP, opts.zipFs);
+  const jobEventsPlan = { jobs: eligible.length, events: eligible.reduce((a, b) => a + b.n, 0), jobIds: eligible.map((e) => e.id) };
+  const packages = await expiredPackages(exportsDir, ownerId, now, policy.RETENTION_PACKAGES_DAYS);
   return {
     policy: { jobEventsDays: policy.RETENTION_JOB_EVENTS_DAYS, packagesDays: policy.RETENTION_PACKAGES_DAYS, exportsKeep: policy.RETENTION_EXPORT_RUNS_KEEP },
     cutoffs: { jobEvents: jobCut, packages: cutoffDays(now, policy.RETENTION_PACKAGES_DAYS) },
-    jobEvents: { jobs: eligible.length, events: eligible.reduce((a, b) => a + b.n, 0), jobIds: eligible.map((e) => e.id) },
-    packages: await expiredPackages(exportsDir, ownerId, now, policy.RETENTION_PACKAGES_DAYS),
+    jobEvents: jobEventsPlan,
+    packages,
     exports: ex.prune,
     exportsExisting: ex.existing,
     exportsMissingFile: ex.missing,
     exportsKept: ex.kept,
+    fingerprint: retentionPlanFingerprint({ jobEvents: jobEventsPlan, packages, exports: ex.prune }),
   };
 }
 
@@ -333,7 +354,24 @@ async function syncFile(file: string): Promise<void> {
  * ① 트랜잭션(owner advisory lock): 계획 → 작업 행 잠금·재확인 → 보관(fsync·sha256 되읽기 확인) → 이력 삭제 → 감사 retention.sweep(계획 포함) → 커밋.
  * ② 파일 삭제(트랜잭션 밖, 하나 실패해도 계속). ③ 감사 retention.files(실제 결과).
  */
-type ApplyOpts = { confirm: boolean; now?: Date; trigger?: 'ui' | 'api' | 'worker'; fs?: Partial<RetentionFs>; zipFs?: ZipFs };
+type ApplyOpts = {
+  confirm: boolean;
+  now?: Date;
+  trigger?: 'ui' | 'api' | 'worker';
+  fs?: Partial<RetentionFs>;
+  zipFs?: ZipFs;
+  /**
+   * FIX3-FULLREV2(G30): 사용자가 확인한 미리보기의 계획 지문. 주면 ① 트랜잭션에서 새로 세운 계획의 지문과 비교해 다르면 아무것도 지우지 않고
+   * 409 plan_changed. 수동 경로(POST /api/ops/retention — 화면 폼·JSON)는 이 값을 필수로 넘긴다. auto(worker)는 사람이 본 미리보기가 없어 넘기지 않는다.
+   */
+  expectedFingerprint?: string;
+};
+
+export class RetentionPlanChangedError extends AppError {
+  constructor() {
+    super('conflict', 'plan_changed', '미리보기를 연 뒤 지울 목록이 바뀌어 아무것도 지우지 않았습니다. 새 미리보기를 확인한 뒤 다시 적용하세요.');
+  }
+}
 
 const globalForSweep = globalThis as typeof globalThis & { __csRetentionLocks?: Map<string, Promise<unknown>> };
 
@@ -375,6 +413,9 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
   const plan = await db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cs.retention:${ownerId}`}))`);
     const p = await planRetention(tx, ownerId, policy, exportsDir, now, { zipFs: opts.zipFs });
+    // FIX3-FULLREV2(G30): 확인한 미리보기와 지울 목록이 다르면(새 내보내기로 백업 ZIP 이 keep 밖으로 밀림·시간이 지나 기준을 넘은 파일·이력 등)
+    // 보관 파일도 쓰기 전에 거절한다 — 트랜잭션이 롤백되고 ② 파일 삭제는 시작하지 않는다. 아래의 삭제 직전 재검증(작업 재확인·ZIP noCache)은 그대로.
+    if (opts.expectedFingerprint !== undefined && p.fingerprint !== opts.expectedFingerprint) throw new RetentionPlanChangedError();
     if (p.jobEvents.jobIds.length) {
       const cut = p.cutoffs.jobEvents;
       await tx.execute(
@@ -446,6 +487,8 @@ async function applyRetentionLocked(db: Db, ownerId: string, policy: RetentionPo
           job_events_days: p.policy.jobEventsDays,
           packages_days: p.policy.packagesDays,
           exports_keep: p.policy.exportsKeep,
+          // FIX3-FULLREV2(G30): 지운 계획의 지문(수동 적용이면 사용자가 확인한 미리보기의 지문과 같다)
+          plan_fingerprint: p.fingerprint,
         },
         at: now,
       });

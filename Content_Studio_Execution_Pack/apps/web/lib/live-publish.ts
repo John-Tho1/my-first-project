@@ -18,6 +18,19 @@ export const LIVE_PUBLISH_DONE_TEXT: Record<string, string> = {
   resumed: "실제 게시를 재개했습니다 — 보류된 항목은 '재시도'를 눌러야 다시 보냅니다.",
 };
 
+/** FIX3-FULLREV2(G11): 쿼리와 저장된 스위치가 맞지 않을 때(다른 탭에서 바꿈·뒤로 가기) 완료 문구 대신 쓰는 중립 문구. */
+export const LIVE_PUBLISH_DONE_STALE_TEXT = "실제 게시 스위치가 그 뒤 다시 바뀌었습니다 — 지금 상태는 아래 '상태'를 보세요.";
+
+/**
+ * FIX3-FULLREV2(G11, D21 원칙): 쿼리(?live_publish=)는 "보여 달라"는 신호일 뿐 — 완료 문구는 저장된 스위치와 맞을 때만(paused ∧ 중지 중, resumed ∧ 켜짐).
+ * 맞지 않으면 중립 문구(stale), 모르는 값·없음은 undefined(아무것도 안 그림).
+ */
+export function livePublishDoneBanner(query: string | undefined, paused: boolean): { text: string; stale: boolean } | undefined {
+  if (query !== 'paused' && query !== 'resumed') return undefined;
+  const matches = query === 'paused' ? paused : !paused;
+  return matches ? { text: LIVE_PUBLISH_DONE_TEXT[query]!, stale: false } : { text: LIVE_PUBLISH_DONE_STALE_TEXT, stale: true };
+}
+
 /** 폼 실패 → 설정 화면 "실제 게시" 구역으로(로그인 없으면 로그인 화면). */
 export function livePublishFormFailure(e: unknown): Response {
   if (e instanceof AppError && e.kind === 'unauthorized') return seeOther('/login');

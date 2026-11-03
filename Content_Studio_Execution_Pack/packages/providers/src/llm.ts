@@ -52,15 +52,43 @@ export interface MockLlmOptions {
   fail?: boolean;
 }
 
-/** 1인칭 경험 표현(한국어). 걸리면 experience + 사용자 확인 필요로 분류한다. */
-const FIRST_PERSON = /(^|[\s,.'"“])(나는|내가|나의|내 |저는|제가|저의|제 |우리는|우리가|직접 )/;
+/**
+ * 1인칭 경험 표현. 걸리면 experience + 사용자 확인 필요로 분류한다.
+ * FIX3-FULLREV2(G20, D40-4): 어휘와 앞 경계를 넓힌다.
+ * - 어휘: 저희·우리+조사(는/가/의/도/에게)·우리+공백(우리 팀/회사 등)·저도/나도·제게/내게/저에게/나에게·저 역시/나 역시·필자·본인,
+ *   영어 I/my/we/our(앞뒤가 문자·숫자가 아닌 온전한 단어 — 'AI'·'web'·'IT' 안의 글자는 잡지 않는다).
+ * - FIX3-FULLREV2(G20 보강): 목적격·기타 조사 저를/나를/우리를·저와/나와/우리와·저한테/나한테/우리한테·저만/나만/우리만·
+ *   저로서는/나로서는/우리로서는. '내 '·'제 '·'직접 '·'저 역시' 의 공백은 리터럴 ASCII 공백이 아니라 \s(줄바꿈·NBSP 등 포함).
+ *   '저만큼'·'저만치'(지시어)와 '나와서'·'나와야'·'나와요'(동사 나오다)는 뺀다. 영어는 아래 FIRST_PERSON_EN·_CASED.
+ * - 앞 경계: 문자·숫자가 아닌 모든 문자 또는 문자열 시작(`(?<![\p{L}\p{N}])`, u 플래그) — 괄호·꺾쇠·「」·‘’·강조 기호(*) 뒤 대명사도 잡는다.
+ *   '문제가'·'하나도' 처럼 단어 안에 든 글자는 앞이 한글이라 잡지 않는다.
+ * - '우리나라'(붙여 쓴 한 단어)는 잡지 않는다 — 우리 뒤에 조사나 공백이 있어야 한다. 국가 일반을 가리키는 흔한 표현이라 경험 주장으로 보지 않는다.
+ * - '본인'·'우리 ' 는 3인칭·일반 서술에도 쓰여 오탐이 생길 수 있다 — D40 은 확인 대상만 늘리는 쪽을 받아들였다.
+ * 정규식 휴리스틱이라는 한계(주어 생략 등을 놓침, LIVEL1 남은 위험)는 그대로다. 고정 길이 lookbehind + 문자열 상수 선택지뿐이라
+ * 역추적이 입력 길이에 선형이다(중첩 반복 없음).
+ */
+const FIRST_PERSON =
+  /(?<![\p{L}\p{N}])(?:나는|내가|나의|내\s|나를|나와(?![서야요])|나한테|나만|나로서는|저는|제가|저의|제\s|저를|저와|저한테|저만(?![큼치])|저로서는|우리는|우리가|우리의|우리도|우리에게|우리를|우리와|우리한테|우리만|우리로서는|우리\s|저희|저도|나도|제게|내게|저에게|나에게|저\s역시|나\s역시|필자|본인|직접\s)/u;
+/**
+ * FIX3-FULLREV2(G20, D40-4 보강): 영어 1인칭 — 앞뒤가 문자·숫자가 아닌 온전한 단어만, 대소문자 무시(MY·We·OUR 등).
+ * 'me'·'us' 는 소문자·첫 글자 대문자만 잡는다 — 'ME'(중동)·'US'(미국)는 이 앱 주제(해외 영업)에서 흔한 약어라 1인칭으로 보지 않는다.
+ */
+const FIRST_PERSON_EN = /(?<![\p{L}\p{N}])(?:my|we|our|ours|myself|ourselves|mine)(?![\p{L}\p{N}])/iu;
+/**
+ * FIX3-FULLREV2(G20): 'I'(대문자)와 단독 소문자 'i' 도 온전한 단어일 때만. 'i.e.'(i 뒤 '.' + 글자)와 목록 번호 '(i)'·'i)'(뒤에 ')')는 빼 오탐을 줄인다.
+ * 고정 길이 lookaround + 상수 선택지뿐이라 선형이다.
+ */
+const FIRST_PERSON_EN_CASED = /(?<![\p{L}\p{N}])(?:I|i(?!\.\p{L}|\))|[Mm]e|[Uu]s)(?![\p{L}\p{N}])/u;
 /**
  * LIVE-L1: live 출력에도 같은 규칙(1인칭 표현이 있는 claim → experience + 사용자 확인 필요)을 적용한다.
  * LIVEL1-H1: 판별 전에 NFC 로 정규화한다 — 분해형(NFD) 한글 "저는" 도 같은 표현으로 잡는다(원문은 바꾸지 않음).
  * LIVEL1-H2: 모의 provider(MockLlmProvider)도 이 함수로 판별한다 — live 와 같은 판정. NFC 는 순수 함수라 결정성은 그대로이고,
  * NFC 입력의 모의 출력은 전과 같다(바뀌는 것은 NFC 가 아닌 입력의 claim 종류뿐 — 확인이 필요한 쪽으로).
  */
-export const hasFirstPersonExpression = (text: string): boolean => FIRST_PERSON.test(text.normalize('NFC'));
+export const hasFirstPersonExpression = (text: string): boolean => {
+  const t = text.normalize('NFC');
+  return FIRST_PERSON.test(t) || FIRST_PERSON_EN.test(t) || FIRST_PERSON_EN_CASED.test(t);
+};
 
 export function splitSentences(text: string): string[] {
   return text

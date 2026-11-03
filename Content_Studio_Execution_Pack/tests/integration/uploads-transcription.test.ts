@@ -53,6 +53,17 @@ import { POST as sessionsPOST } from '../../apps/web/app/api/uploads/sessions/ro
 import { DELETE as sessionDELETE, GET as sessionGET } from '../../apps/web/app/api/uploads/sessions/[id]/route';
 import { PUT as chunkPUT } from '../../apps/web/app/api/uploads/sessions/[id]/chunks/[index]/route';
 import { POST as completePOST } from '../../apps/web/app/api/uploads/sessions/[id]/complete/route';
+import {
+  assetGoneMessage,
+  draftSaveBody,
+  draftStatus,
+  editDraft,
+  rebaseDraft,
+  storedSessionAction,
+  STALE_TRANSCRIPT_NOTICE,
+  transcribeFailureAction,
+  withConflict,
+} from '../../apps/web/lib/record-client';
 import { assetGet, BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
@@ -719,19 +730,27 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
     expect(sha(bytes!)).toBe(sha(f));
   });
 
-  it('P0 쓰기 진행 0 → assembly_failed(rejected·asset 없음), 쓴 척만 하는 핸들(크기 불일치)도 거부', async () => {
+  // FIX3-FULLREV2(G24): 쓰기 진행 0·쓴 척(닫은 뒤 크기 불일치)은 서버 쪽 쓰기 문제다 — 예전엔 assembly_failed(rejected·조각 삭제)였다.
+  // 이제 503 upload_assembly_io_error + 세션 open + 조각 행·파일 유지 + asset 없음이고, 정상 핸들로 다시 완료하면 같은 파일이 된다.
+  it('P0 쓰기 진행 0 → 503 upload_assembly_io_error(세션 open·조각 유지·asset 없음), 쓴 척만 하는 핸들(크기 불일치)도 같음 — 다시 완료하면 성공', async () => {
+    const store = uploadStoreFor(loadConfig());
     const f = media('mp3', 9000, 62);
     const id = await openSession(f);
     const stuck = async (file: string): Promise<WriteHandle> => {
       const fh = await realOpen(file);
       return { write: async () => ({ bytesWritten: 0 }), close: () => fh.close() };
     };
-    await expect(completeUploadSession(db, uploadStoreFor(loadConfig()), storage(), ownerA, id, new Date(), { openWrite: stuck })).rejects.toMatchObject({
-      code: 'upload_rejected',
-      extra: { reason: 'assembly_failed' },
+    await expect(completeUploadSession(db, store, storage(), ownerA, id, new Date(), { openWrite: stuck })).rejects.toMatchObject({
+      kind: 'service_unavailable',
+      code: 'upload_assembly_io_error',
     });
-    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!.state).toBe('rejected');
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!).toMatchObject({ state: 'open', rejectReason: null, assetId: null });
+    expect(await db.select().from(schema.uploadChunks).where(eq(schema.uploadChunks.sessionId, id))).toHaveLength(1);
+    expect(await store.chunkExists(ownerA, id, 0)).toBe(true);
+    expect(existsSync(path.join(store.dirFor(ownerA, id), 'assembled.part'))).toBe(false);
     expect(await assetsWith(sha(f))).toHaveLength(0);
+    const ok = await completeUploadSession(db, store, storage(), ownerA, id);
+    expect(ok.asset).toMatchObject({ checksum: sha(f), bytes: f.byteLength });
 
     const g = media('mp3', 9000, 63);
     const id2 = await openSession(g);
@@ -745,10 +764,107 @@ describe('FIX-T08 round 1(Codex review-T08)', () => {
         close: () => fh.close(),
       };
     };
-    await expect(completeUploadSession(db, uploadStoreFor(loadConfig()), storage(), ownerA, id2, new Date(), { openWrite: liar })).rejects.toMatchObject({
-      extra: { reason: 'assembly_failed' },
+    await expect(completeUploadSession(db, store, storage(), ownerA, id2, new Date(), { openWrite: liar })).rejects.toMatchObject({
+      code: 'upload_assembly_io_error',
     });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id2)))[0]!.state).toBe('open');
     expect(await assetsWith(sha(g))).toHaveLength(0);
+    expect((await completeUploadSession(db, store, storage(), ownerA, id2)).asset.checksum).toBe(sha(g));
+  });
+
+  it('FIX3-FULLREV2(G24) 조립 파일 열기 ENOSPC·쓰기 중 EMFILE·닫기 오류 → 503(라우트), 세션 open·조각 유지, 같은 세션으로 다시 완료하면 성공', async () => {
+    const store = uploadStoreFor(loadConfig());
+    const ioErr = (code: string) => Object.assign(new Error(`${code}: 합성 오류`), { code });
+    const f = media('mp3', CHUNK + 3000, 71);
+    const id = await openSession(f);
+    // 1) 열기 실패(ENOSPC) — 주입 지점(openWrite)으로 서버 쪽 오류를 낸다
+    await expect(
+      completeUploadSession(db, store, storage(), ownerA, id, new Date(), {
+        openWrite: async () => {
+          throw ioErr('ENOSPC');
+        },
+      }),
+    ).rejects.toMatchObject({ kind: 'service_unavailable', code: 'upload_assembly_io_error', extra: { retryable: true } });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!.state).toBe('open');
+    // 2) 두 번째 조각을 쓰는 중 EMFILE(진행 일부 있음)
+    let writes = 0;
+    await expect(
+      completeUploadSession(db, store, storage(), ownerA, id, new Date(), {
+        openWrite: async (file) => {
+          const fh = await realOpen(file);
+          return {
+            write: async (buf, off, len) => {
+              if (++writes > 1) throw ioErr('EMFILE');
+              return fh.write(buf, off, len);
+            },
+            close: () => fh.close(),
+          };
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'upload_assembly_io_error' });
+    expect(existsSync(path.join(store.dirFor(ownerA, id), 'assembled.part'))).toBe(false);
+    // 3) 닫기 실패(EIO)
+    await expect(
+      completeUploadSession(db, store, storage(), ownerA, id, new Date(), {
+        openWrite: async (file) => {
+          const fh = await realOpen(file);
+          return {
+            write: (buf, off, len) => fh.write(buf, off, len),
+            close: async () => {
+              await fh.close();
+              throw ioErr('EIO');
+            },
+          };
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'upload_assembly_io_error' });
+    const s = (await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!;
+    expect(s).toMatchObject({ state: 'open', rejectReason: null, assetId: null });
+    expect(await db.select().from(schema.uploadChunks).where(eq(schema.uploadChunks.sessionId, id))).toHaveLength(2);
+    expect(await store.chunkExists(ownerA, id, 0)).toBe(true);
+    expect(await store.chunkExists(ownerA, id, 1)).toBe(true);
+    expect(await assetsWith(sha(f))).toHaveLength(0);
+    // 4) 라우트로 다시 완료 → 200 verified, 같은 파일
+    const res = await complete(id);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.session.state).toBe('verified');
+    expect(body.asset.checksum).toBe(sha(f));
+  });
+
+  it('FIX3-FULLREV2(G24) 라우트: 서버 I/O 오류는 503 upload_assembly_io_error(조각 유지)', async () => {
+    const store = uploadStoreFor(loadConfig());
+    const f = media('mp3', 5000, 72);
+    const id = await openSession(f);
+    // 라우트는 주입 지점을 받지 않는다 — 조립 파일 자리에 디렉터리를 두어 실제 open(file,'w') 이 EISDIR 로 실패하게 한다(서버 쪽 I/O).
+    const part = path.join(store.dirFor(ownerA, id), 'assembled.part');
+    mkdirSync(part);
+    writeFileSync(path.join(part, 'x'), 'x'); // 비어 있지 않은 디렉터리: rm(force) 로도 지워지지 않음
+    const res = await complete(id);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: 'upload_assembly_io_error' });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!.state).toBe('open');
+    expect(await store.chunkExists(ownerA, id, 0)).toBe(true);
+    rmSync(part, { recursive: true, force: true });
+    const again = await complete(id);
+    expect(again.status).toBe(200);
+  });
+
+  it('FIX3-FULLREV2(G24) 조각 파일 없음·조각 내용 바뀜은 그대로 assembly_failed(rejected·조각 삭제)', async () => {
+    const store = uploadStoreFor(loadConfig());
+    const f = media('mp3', 6000, 73);
+    const id = await openSession(f);
+    rmSync(store.chunkPath(ownerA, id, 0));
+    await expect(completeUploadSession(db, store, storage(), ownerA, id)).rejects.toMatchObject({ code: 'upload_rejected', extra: { reason: 'assembly_failed' } });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!).toMatchObject({ state: 'rejected', rejectReason: 'assembly_failed' });
+    expect(await db.select().from(schema.uploadChunks).where(eq(schema.uploadChunks.sessionId, id))).toHaveLength(0);
+
+    const g = media('mp3', 6000, 74);
+    const id2 = await openSession(g);
+    writeFileSync(store.chunkPath(ownerA, id2, 0), media('mp3', 6000, 75));
+    await expect(completeUploadSession(db, store, storage(), ownerA, id2)).rejects.toMatchObject({ code: 'upload_rejected', extra: { reason: 'assembly_failed' } });
+    expect((await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id2)))[0]!.state).toBe('rejected');
+    expect(await store.chunkExists(ownerA, id2, 0)).toBe(false);
   });
 
   it('P1 완료 중 만료: 조립 뒤 만료되면 asset 을 만들지 않고 세션은 expired(409 upload_expired), 옮긴 파일 없음', async () => {
@@ -1053,5 +1169,237 @@ describe('FIX-T08 round 4(Codex review-FIX3-T08): 정리 순서·동시성', () 
     expect(row.pendingDeleteNextAt).not.toBeNull();
     expect(row.pendingDeleteNextAt!.getTime()).toBeGreaterThanOrEqual(before);
     await cleanupPendingDeletes(db, new LocalStorageAdapter(storageDir), new Date(Date.now() + 3600_000));
+  });
+});
+
+describe('FIX3-FULLREV2(G23·G25) — /record 화면 판단 함수 × 실제 라우트', () => {
+  /** 올리고 전사 요청 → 모의 전사가 끝날 때까지 tick → { assetId, sessionId, jobId } */
+  async function transcribed(seedN: number) {
+    const f = media('mp3', 9000, seedN);
+    const { res, sessionId } = await uploadAll(f);
+    expect(res.status).toBe(200);
+    const assetId = (await res.json()).asset.id as string;
+    const tr = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(tr.status).toBe(202);
+    const jobId = (await tr.json()).job.id as string;
+    for (let i = 0; i < 10 && (await jobOf(jobId)).state !== 'succeeded'; i++) await tickJobs(1);
+    expect((await jobOf(jobId)).state).toBe('succeeded');
+    return { assetId, sessionId, jobId };
+  }
+  /** 화면 폴링과 같은 조회: GET /api/transcription-jobs 의 그 작업 */
+  async function polled(jobId: string) {
+    const r = await jobsGET(get('/api/transcription-jobs'), undefined as never);
+    const j = ((await r.json()).jobs as Array<{ id: string; latest_transcript: { id: string; version: number; text: string } }>).find((x) => x.id === jobId)!;
+    return j.latest_transcript;
+  }
+
+  it('G23 탭 A 가 v1 에서 고치는 동안 탭 B 가 v2 저장 → 폴링으로 최신이 v2 여도 A 의 저장은 base 1 → 409 stale_transcript, 경고·최신 본문 표시, 비교 뒤 다시 저장하면 v3', async () => {
+    const { jobId } = await transcribed(91);
+    const v1 = await polled(jobId);
+    expect(v1.version).toBe(1);
+    // 탭 A: v1 을 보며 입력 시작(초안 base = 1)
+    let draftA = editDraft(undefined, v1, `${v1.text} (탭 A 수정)`);
+    draftA = editDraft(draftA, v1, `${v1.text} (탭 A 수정 계속)`);
+    expect(draftA.base).toBe(1);
+    // 탭 B: 같은 전사를 고쳐 v2 저장
+    const b = await post(versionsPOST, `/api/transcripts/${v1.id}/versions`, v1.id, draftSaveBody(editDraft(undefined, v1, '탭 B 가 고친 본문'), v1));
+    expect(b.status).toBe(201);
+    // 탭 A 의 폴링: 최신 v2 — 초안이 있는 동안 경고
+    const latest = await polled(jobId);
+    expect(latest.version).toBe(2);
+    const st = draftStatus(draftA, latest);
+    expect(st).toMatchObject({ stale: true, latestVersion: 2, latestText: '탭 B 가 고친 본문' });
+    expect(st.stale && st.notice).toContain(STALE_TRANSCRIPT_NOTICE);
+    // 탭 A 저장: base_version 은 초안을 시작한 1(최신 2 가 아님) → 서버 잠금이 막는다
+    const body = draftSaveBody(draftA, latest);
+    expect(body).toEqual({ base_version: 1, text: `${v1.text} (탭 A 수정 계속)` });
+    const a = await post(versionsPOST, `/api/transcripts/${latest.id}/versions`, latest.id, body);
+    expect(a.status).toBe(409);
+    const err = await a.json();
+    expect(err).toMatchObject({ error: 'stale_transcript', current_version: 2 });
+    // 409 뒤: 초안 본문은 그대로, 최신 본문과 함께
+    const withC = withConflict(draftA, { version: err.current_version, text: null });
+    expect(withC.text).toBe(draftA.text);
+    expect(draftStatus(withC, latest)).toMatchObject({ stale: true, latestVersion: 2, latestText: '탭 B 가 고친 본문' });
+    expect((await db.select().from(schema.transcripts).where(eq(schema.transcripts.jobId, jobId))).map((t) => t.version).sort()).toEqual([1, 2]);
+    // 비교했음 — 내 초안을 최신 기준으로 → 저장 201 v3(A 본문), v2 는 이력에 그대로
+    const rebased = rebaseDraft(withC, 2);
+    expect(draftStatus(rebased, latest)).toEqual({ stale: false });
+    const a2 = await post(versionsPOST, `/api/transcripts/${latest.id}/versions`, latest.id, draftSaveBody(rebased, latest));
+    expect(a2.status).toBe(201);
+    expect((await a2.json()).transcript).toMatchObject({ version: 3, text: `${v1.text} (탭 A 수정 계속)` });
+  });
+
+  it('G25 업로드 완료 뒤 전사 요청만 실패(409 transcription_in_progress) → 저장된 세션은 verified+asset_id → 다시 올리지 않고 같은 asset 에 전사만 다시 요청', async () => {
+    const f = media('mp3', 9000, 92);
+    const { res, sessionId } = await uploadAll(f);
+    const assetId = (await res.json()).asset.id as string;
+    const first = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(first.status).toBe(202);
+    const firstJob = (await first.json()).job.id as string;
+    // 같은 asset 에 다시 요청(진행 중) → 전사 요청 실패
+    const fail = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(fail.status).toBe(409);
+    expect((await fail.json()).error).toBe('transcription_in_progress');
+    // 화면이 남겨 둔 이어 올리기 키(세션 ID)로 세션을 다시 보면: 전사만 다시 요청(새 세션·재업로드 없음)
+    const sessionsBefore = await n(schema.uploadSessions);
+    const sv = (await (await sessionGET(get(`/api/uploads/sessions/${sessionId}`), ctx(sessionId))).json()).session;
+    expect(sv).toMatchObject({ state: 'verified', asset_id: assetId });
+    expect(storedSessionAction(sv, false)).toEqual({ kind: 'transcribe_only', assetId });
+    // 원인을 없앤 뒤(진행 중 작업 취소) 같은 asset 에 다시 요청 → 202
+    expect((await cancelPOST(bare(`/api/transcription-jobs/${firstJob}/cancel`, tokenA), ctx(firstJob))).status).toBe(200);
+    const retry = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(retry.status).toBe(202);
+    expect(await n(schema.uploadSessions)).toBe(sessionsBefore);
+    // open 세션은 이어 올리기, 그 밖(rejected·만료·없음)은 새 세션
+    expect(storedSessionAction({ state: 'open', asset_id: null }, true)).toEqual({ kind: 'resume' });
+    expect(storedSessionAction({ state: 'open', asset_id: null }, false)).toEqual({ kind: 'new' });
+    expect(storedSessionAction({ state: 'rejected', asset_id: null }, false)).toEqual({ kind: 'new' });
+    expect(storedSessionAction(null, false)).toEqual({ kind: 'new' });
+  });
+});
+
+describe('FIX3-FULLREV2 fixup(G24·G25 보강) — 전사 대상 파일이 사라짐 · 세션 폴더 없음 · 실패 정리 순서', () => {
+  const storage = () => new LocalStorageAdapter(storageDir);
+  async function openSession(file: Uint8Array<ArrayBuffer>) {
+    const s = await (await createSession({ kind: 'audio', mime: 'audio/mpeg', bytes: file.byteLength, chunk_size: CHUNK })).json();
+    const id = s.session.id as string;
+    for (let i = 0; i * CHUNK < file.byteLength; i++) expect((await putChunk(id, i, file.slice(i * CHUNK, (i + 1) * CHUNK))).status).toBe(201);
+    return id;
+  }
+  const sessionRow = async (id: string) => (await db.select().from(schema.uploadSessions).where(eq(schema.uploadSessions.id, id)))[0]!;
+
+  it('G25 저장된 verified 세션의 asset 원본이 삭제됨 → 전사 410 asset_deleted → "reupload"(키 지우고 새로 올림) → 새 세션 업로드 뒤 전사 202', async () => {
+    const f = media('mp3', 9000, 93);
+    const { res, sessionId } = await uploadAll(f);
+    const assetId = (await res.json()).asset.id as string;
+    expect(await deleteOriginal(db, storage(), { id: randomUUID(), ownerId: ownerA, assetId }, new Date())).toBe(true);
+    // 화면이 남겨 둔 키로 세션을 보면 여전히 verified + asset → 전사만 요청하는 경로
+    const sv = (await (await sessionGET(get(`/api/uploads/sessions/${sessionId}`), ctx(sessionId))).json()).session;
+    expect(storedSessionAction(sv, false)).toEqual({ kind: 'transcribe_only', assetId });
+    const gone = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(gone.status).toBe(410);
+    const body = await gone.json();
+    expect(body.error).toBe('asset_deleted');
+    expect(transcribeFailureAction(gone.status, body.error)).toBe('reupload');
+    expect(assetGoneMessage(body.message)).toContain('같은 파일을 다시 고르면 새로 올립니다');
+    // 새 세션으로 처음부터 올리면 같은 asset 을 새 key 로 되살리고 전사가 된다
+    const again = await uploadAll(f);
+    expect(again.sessionId).not.toBe(sessionId);
+    expect((await again.res.json()).asset.id).toBe(assetId);
+    expect((await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true })).status).toBe(202);
+  });
+
+  it('G25 없는 asset 404 · VERIFIED 아님 409 asset_not_verified → "reupload", 진행 중 409 → "already", 그 밖 → "retry"(같은 asset 재요청)', async () => {
+    const missing = randomUUID();
+    const nf = await post(transcribePOST, `/api/assets/${missing}/transcribe`, missing, { keep_original: true });
+    expect(nf.status).toBe(404);
+    expect(transcribeFailureAction(nf.status, (await nf.json()).error)).toBe('reupload');
+
+    const f = media('mp3', 9000, 94);
+    const { res } = await uploadAll(f);
+    const assetId = (await res.json()).asset.id as string;
+    await db.update(schema.assets).set({ verificationState: 'pending' }).where(eq(schema.assets.id, assetId));
+    const nv = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(nv.status).toBe(409);
+    const nvBody = await nv.json();
+    expect(nvBody.error).toBe('asset_not_verified');
+    expect(transcribeFailureAction(nv.status, nvBody.error)).toBe('reupload');
+    await db.update(schema.assets).set({ verificationState: 'VERIFIED' }).where(eq(schema.assets.id, assetId));
+
+    expect((await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true })).status).toBe(202);
+    const busy = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { keep_original: true });
+    expect(busy.status).toBe(409);
+    // FIX3-FULLREV2(G25 재검토): 실제 서버의 진행 중 409 → 'already'(다시 요청하지 않고 키를 거둠)
+    expect(transcribeFailureAction(busy.status, (await busy.json()).error)).toBe('already');
+    expect(transcribeFailureAction(429, 'budget_exceeded')).toBe('retry');
+    expect(transcribeFailureAction(409, 'asset_in_use')).toBe('retry');
+    expect(transcribeFailureAction(0, null)).toBe('retry');
+  });
+
+  it('G24 세션 폴더가 통째로 사라짐(ENOENT) · 폴더 자리에 파일(ENOTDIR) → 조립 파일 열기 실패는 io(503)가 아니라 assembly_failed(rejected)', async () => {
+    const store = uploadStoreFor(loadConfig());
+    const f = media('mp3', 6000, 95);
+    const id = await openSession(f);
+    rmSync(store.dirFor(ownerA, id), { recursive: true, force: true });
+    const r = await complete(id);
+    expect(r.status).toBe(400);
+    expect(await r.json()).toMatchObject({ error: 'upload_rejected', reason: 'assembly_failed' });
+    expect(await sessionRow(id)).toMatchObject({ state: 'rejected', rejectReason: 'assembly_failed' });
+
+    const g = media('mp3', 6000, 96);
+    const id2 = await openSession(g);
+    const dir = store.dirFor(ownerA, id2);
+    rmSync(dir, { recursive: true, force: true });
+    writeFileSync(dir, 'not a directory');
+    await expect(completeUploadSession(db, store, storage(), ownerA, id2)).rejects.toMatchObject({ code: 'upload_rejected', extra: { reason: 'assembly_failed' } });
+    expect((await sessionRow(id2)).state).toBe('rejected');
+    rmSync(dir, { force: true });
+  });
+
+  it('FIX3-FULLREV2(G24 재검토): 업로드 루트 자체가 없으면(볼륨 미부착 등) 조각 문제로 거부하지 않고 503 — 세션 open·조각 행 유지, 루트가 돌아오면 완료', async () => {
+    const base = uploadStoreFor(loadConfig());
+    const f = media('mp3', 6000, 98);
+    const id = await openSession(f);
+    const chunksBefore = (await db.select().from(schema.uploadChunks).where(eq(schema.uploadChunks.sessionId, id))).length;
+    expect(chunksBefore).toBeGreaterThan(0);
+    // 루트를 잠깐 다른 이름으로 옮겨 '루트 없음'을 만든다(마운트가 빠진 상황)
+    const moved = `${base.root}.away`;
+    renameSync(base.root, moved);
+    try {
+      await expect(completeUploadSession(db, base, storage(), ownerA, id)).rejects.toMatchObject({ code: 'upload_assembly_io_error' });
+      expect(await sessionRow(id)).toMatchObject({ state: 'open', rejectReason: null });
+      expect((await db.select().from(schema.uploadChunks).where(eq(schema.uploadChunks.sessionId, id))).length).toBe(chunksBefore);
+    } finally {
+      renameSync(moved, base.root);
+    }
+    const r = await complete(id);
+    expect(r.status).toBe(200);
+    expect((await sessionRow(id)).state).toBe('verified');
+  });
+
+  it('G24 최종 커밋 실패(putFile) → 조립 파일은 open 으로 되돌리기 전에 지우고, 되돌린 뒤 생긴 다른 완료의 assembled.part 는 지우지 않는다', async () => {
+    const store = uploadStoreFor(loadConfig());
+    const f = media('mp3', 7000, 97);
+    const id = await openSession(f);
+    const part = path.join(store.dirFor(ownerA, id), 'assembled.part');
+    let failed = false;
+    let partAtRevert: boolean | null = null;
+    const files = new Proxy(storage(), {
+      get(t, p) {
+        if (p === 'putFile') {
+          return async () => {
+            failed = true;
+            throw new Error('putFile 합성 실패');
+          };
+        }
+        const v = Reflect.get(t, p) as unknown;
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+      },
+    });
+    const dbp = new Proxy(db, {
+      get(t, p) {
+        if (p === 'transaction') {
+          return async (...args: Parameters<Db['transaction']>) => {
+            const after = failed && partAtRevert === null;
+            if (after) partAtRevert = existsSync(part); // revertToOpen 직전
+            const r = await t.transaction(...args);
+            // revertToOpen 직후: 그 사이 시작한 다른 완료 요청이 새 조립 파일을 쓰는 중이라고 본다
+            if (after) writeFileSync(part, 'concurrent assembly');
+            return r;
+          };
+        }
+        const v = Reflect.get(t, p) as unknown;
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+      },
+    }) as Db;
+    await expect(completeUploadSession(dbp, store, files, ownerA, id)).rejects.toThrow('putFile 합성 실패');
+    expect(partAtRevert).toBe(false);
+    expect(existsSync(part)).toBe(true);
+    expect(readFileSync(part, 'utf8')).toBe('concurrent assembly');
+    expect((await sessionRow(id)).state).toBe('open');
+    rmSync(part, { force: true });
+    const ok = await completeUploadSession(db, store, storage(), ownerA, id);
+    expect(ok.asset.checksum).toBe(sha(f));
   });
 });

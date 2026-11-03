@@ -638,7 +638,9 @@ function ItemCard({ x, approvable }: { x: PlanItemDetail; approvable: boolean })
           <ul className="list">
             {x.jobs.map((j) => {
               const pub = x.publications.find((p) => p.jobId === j.id) ?? null;
-              const reason = block.code;
+              // FIX3-FULLREV2(G12): block.code 는 가장 최근 작업(사건·lastErrorCode) 기준 — 그 줄에만 쓴다. 옛 작업 줄은 null 을 넘겨 자기 lastErrorCode 로 보인다
+              // (예: 승인 철회로 BLOCKED 된 옛 작업이 새 작업의 '계정 인증 필요'·'실제 게시 일시 중지됨'으로 보이지 않게).
+              const reason = j === latest ? block.code : null;
               return (
                 <li key={j.id} className="hash">
                   <strong>{jobStatusTextFor(j, pub, reason, channel, recordLive)}</strong> · 시도 {j.attempt}/{j.maxAttempts}

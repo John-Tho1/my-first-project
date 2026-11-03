@@ -16,6 +16,8 @@ const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
   channelAccounts: [] as unknown[],
   detail: null as unknown,
+  // FIX3-FULLREV2(G30): 운영 화면 보존 정리 미리보기(없으면 아래 기본 — 지울 것 없음)
+  retentionPlan: null as unknown,
 }));
 
 vi.mock('./auth', () => ({ getSession: async () => ({ ownerId: '00000000-0000-4000-8000-000000000001', identity: 'owner@example.local', expiresAt: new Date() }) }));
@@ -72,7 +74,8 @@ vi.mock('@cs/db', async (orig) => {
       partialRetention: { total: 0, items: [] },
       accounts: {},
     }),
-    planRetention: async () => ({
+    planRetention: async () =>
+      state.retentionPlan ?? {
       policy: { jobEventsDays: 90, packagesDays: 30, exportsKeep: 5 },
       cutoffs: { jobEvents: new Date('2026-07-16T09:00:00Z'), packages: new Date('2026-09-14T09:00:00Z') },
       jobEvents: { jobs: 0, events: 0, jobIds: [] },
@@ -81,7 +84,7 @@ vi.mock('@cs/db', async (orig) => {
       exportsExisting: 0,
       exportsKept: [],
       exportsMissingFile: [],
-    }),
+    },
   };
 });
 
@@ -145,6 +148,7 @@ beforeEach(() => {
   state.accounts = [];
   state.channelAccounts = [];
   state.detail = { plan: { id: PLAN, targetSummary: '시험 계획', status: 'completed', createdAt: T }, items: [liveItem()] };
+  state.retentionPlan = null;
 });
 
 describe('H(b) — 홈·설정·배포 계획: 상한·준비·중지를 실제 설정에서 그린다', () => {
@@ -230,3 +234,78 @@ describe('E(계획 3(b)) — "실제로 게시됩니다" 준비 표시는 중지
   });
 });
 
+
+describe('FIX3-FULLREV2(G11): 실제 게시 일시 중지·재개 완료 배너는 저장된 스위치와 맞을 때만', () => {
+  const PAUSED = '실제 게시를 일시 중지했습니다';
+  const RESUMED = '실제 게시를 재개했습니다';
+  const STALE = "실제 게시 스위치가 그 뒤 다시 바뀌었습니다 — 지금 상태는 아래 &#x27;상태&#x27;를 보세요.";
+  const settingsWith = async (q: Record<string, string>) => liveSection(renderToStaticMarkup(await SettingsPage({ searchParams: Promise.resolve(q) })));
+  const setPaused = (paused: boolean) => {
+    state.overview = { ...state.overview, paused, changedAt: T };
+  };
+
+  it('?live_publish=paused + 지금 중지 중 → 완료 배너(saved), 중립 문구 없음', async () => {
+    setPaused(true);
+    const s = await settingsWith({ live_publish: 'paused' });
+    expect(s).toContain(`<p class="saved" role="status">${PAUSED}`);
+    expect(s).not.toContain(STALE);
+    expect(s).toContain('실제 게시 재개');
+  });
+
+  it('?live_publish=paused 인데 다른 탭에서 재개함(지금 켜짐) → "중지했습니다" 배너 없음, 중립 문구(notice)와 실제 상태', async () => {
+    setPaused(false);
+    const s = await settingsWith({ live_publish: 'paused' });
+    expect(s).not.toContain(PAUSED);
+    expect(s).not.toContain('지금부터 실제 게시 전송은 보내지 않고 보류합니다');
+    expect(s).toContain(`<p class="notice" role="status">${STALE}</p>`);
+    expect(s).toContain('<span class="tag live">켜짐</span>');
+  });
+
+  it('?live_publish=resumed + 지금 켜짐 → 재개 배너, ?live_publish=resumed 인데 지금 중지 중 → 재개 배너 없음·중립 문구', async () => {
+    setPaused(false);
+    const ok = await settingsWith({ live_publish: 'resumed' });
+    expect(ok).toContain(`<p class="saved" role="status">${RESUMED}`);
+    expect(ok).not.toContain(STALE);
+    setPaused(true);
+    const stale = await settingsWith({ live_publish: 'resumed' });
+    expect(stale).not.toContain(RESUMED);
+    expect(stale).toContain(`<p class="notice" role="status">${STALE}</p>`);
+    expect(stale).toContain('일시 중지됨');
+  });
+
+  it('쿼리 없음·모르는 값 → 배너·중립 문구 모두 없음(쿼리 값을 그대로 출력하지 않음)', async () => {
+    for (const paused of [true, false]) {
+      setPaused(paused);
+      for (const q of [{}, { live_publish: 'x<script>' }] as Array<Record<string, string>>) {
+        const s = await settingsWith(q);
+        expect(s).not.toContain(PAUSED);
+        expect(s).not.toContain(RESUMED);
+        expect(s).not.toContain(STALE);
+        expect(s).not.toContain('x<script>');
+      }
+    }
+  });
+});
+
+describe('FIX3-FULLREV2(G30): 운영 화면 보존 정리 폼은 그 미리보기의 계획 지문을 hidden 값으로 보낸다', () => {
+  it('지울 것이 있는 미리보기 → 폼 안에 plan_fingerprint hidden(미리보기 지문 그대로)', async () => {
+    const FP = 'f'.repeat(64);
+    state.retentionPlan = {
+      policy: { jobEventsDays: 90, packagesDays: 30, exportsKeep: 5 },
+      cutoffs: { jobEvents: new Date('2026-07-16T09:00:00Z'), packages: new Date('2026-09-14T09:00:00Z') },
+      jobEvents: { jobs: 0, events: 0, jobIds: [] },
+      packages: [{ id: '33333333-3333-4333-8333-333333333333', contentId: null, bytes: 3, mtime: new Date('2026-08-01T00:00:00Z') }],
+      exports: [],
+      exportsExisting: 0,
+      exportsKept: [],
+      exportsMissingFile: [],
+      fingerprint: FP,
+    };
+    const html = await renderOps();
+    const i = html.indexOf('action="/api/ops/retention"');
+    expect(i).toBeGreaterThan(-1);
+    const form = html.slice(i, html.indexOf('</form>', i));
+    expect(form).toContain(`<input type="hidden" name="plan_fingerprint" value="${FP}"/>`);
+    expect(form).toContain('name="confirm" value="yes"');
+  });
+});

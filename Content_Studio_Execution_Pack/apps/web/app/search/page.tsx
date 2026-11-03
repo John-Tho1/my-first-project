@@ -8,6 +8,7 @@ import {
   formatMsk,
   MAX_SEARCH_Q,
   parseSearchParams,
+  SEARCH_TERMS_LIMIT_MESSAGE,
   searchTerms,
 } from '@cs/domain';
 import { getSession } from '../../lib/auth';
@@ -132,7 +133,7 @@ export default async function SearchPage({
       <section className="card archive" aria-labelledby="search-form">
         <h3 id="search-form">검색 조건</h3>
         <form className="form" method="get" action="/search" role="search">
-          <label htmlFor="q">검색어(공백으로 나누면 모두 포함하는 항목)</label>
+          <label htmlFor="q">검색어(공백으로 나누면 모두 포함하는 항목, 조각 8개까지)</label>
           <input id="q" name="q" type="search" maxLength={MAX_SEARCH_Q} defaultValue={v('q')} placeholder="예: 주재원, 재고 리스, AI" />
           <div className="filters">
             <label>
@@ -196,7 +197,10 @@ export default async function SearchPage({
 
       {!parsed.success ? (
         <p className="notice" role="alert">
-          검색 조건이 올바르지 않습니다. 날짜 형식(YYYY-MM-DD)과 검색어 길이(200자 이하)를 확인하세요.
+          {/* FIX3-FULLREV2(G32): 조각 수 초과는 그 문구를 그대로(조용히 자르지 않음) */}
+          {parsed.error.issues.some((i) => i.message === SEARCH_TERMS_LIMIT_MESSAGE)
+            ? SEARCH_TERMS_LIMIT_MESSAGE
+            : '검색 조건이 올바르지 않습니다. 날짜 형식(YYYY-MM-DD)과 검색어 길이(200자 이하)를 확인하세요.'}
         </p>
       ) : null}
 

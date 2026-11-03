@@ -377,6 +377,8 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
           <p className="empty-text">지울 것이 없습니다.</p>
         ) : (
           <form className="form" method="post" action="/api/ops/retention">
+            {/* FIX3-FULLREV2(G30): 이 미리보기의 계획 지문 — 적용 때 지울 목록이 이것과 다르면 아무것도 지우지 않는다(409 plan_changed) */}
+            <input type="hidden" name="plan_fingerprint" value={plan.fingerprint} />
             <label className="choice">
               <input type="checkbox" name="confirm" value="yes" />위 목록을 지워도 됩니다(이력은 먼저 JSONL 로 보관)
             </label>

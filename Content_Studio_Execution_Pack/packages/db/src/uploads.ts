@@ -389,16 +389,26 @@ export async function writeFully(fh: WriteHandle, buf: Uint8Array, onWritten: (w
 }
 
 /**
- * 조각을 번호 순서로 스트림으로 이어 붙인다. 조각 파일이 없거나 조각 sha256 이 기록과 다르거나, 쓰기가 끝나지 않았거나,
- * 닫은 뒤 파일 크기가 실제로 쓴 바이트 수와 다르면 null(→ assembly_failed).
+ * FIX3-FULLREV2(G24): 조립 결과. 조각 문제(조각 파일 없음·조각 sha256 불일치)만 'chunk'(→ assembly_failed 거부)다.
+ * 조립 파일 열기·쓰기(진행 0 포함)·닫기·stat 오류, 닫은 뒤 크기가 쓴 바이트 수와 다름, 조각 읽기 중 ENOENT 밖의 오류는
+ * 서버 쪽 I/O 문제('io')라 세션을 open 으로 되돌리고 받은 조각을 지키며 일시 오류로 응답한다.
  */
+type AssembleOutcome = { kind: 'ok'; built: Assembled } | { kind: 'chunk' } | { kind: 'io' };
+
+/** 조각 파일이 없음(경로가 사라짐)을 뜻하는 오류 코드 — 이것만 조각 문제로 본다. */
+const isMissingFileError = (e: unknown): boolean => {
+  const code = (e as { code?: unknown } | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' || code === 'EISDIR';
+};
+
+/** 조각을 번호 순서로 스트림으로 이어 붙인다(크기·sha256·앞부분 서명은 실제로 쓴 바이트 기준). */
 async function assemble(
   store: UploadStore,
   ownerId: string,
   sessionId: string,
   chunks: ReadonlyArray<{ index: number; sha256: string }>,
   openWrite: (file: string) => Promise<WriteHandle>,
-): Promise<Assembled | null> {
+): Promise<AssembleOutcome> {
   const dir = store.dirFor(ownerId, sessionId);
   const file = path.join(/*turbopackIgnore: true*/ dir, 'assembled.part');
   const whole = createHash('sha256');
@@ -414,7 +424,20 @@ async function assemble(
     }
     total += w.byteLength;
   };
-  const fh = await openWrite(file);
+  let fh: WriteHandle;
+  try {
+    fh = await openWrite(file);
+  } catch (e) {
+    // FIX3-FULLREV2(G24 보강): 세션 디렉터리 자체가 사라져(만료·정리 등) 조립 파일을 열 수 없으면(ENOENT·ENOTDIR) 받은 조각도 없다 —
+    // 서버 I/O 일시 오류가 아니라 조각 문제(assembly_failed)다. EISDIR(조립 파일 자리에 디렉터리)·ENOSPC·EMFILE·EACCES 는 그대로 io.
+    const code = (e as { code?: unknown } | null)?.code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') return { kind: 'io' };
+    // FIX3-FULLREV2(G24 재검토): 업로드 루트 자체가 없으면(볼륨이 아직 안 붙음·임시 정리) 조각은 루트가 돌아오면 다시 보일 수 있다 —
+    // 세션을 거부(조각 행 삭제)하지 않고 일시 오류(io)로 둔다. 루트는 있는데 세션 디렉터리만 없을 때만 조각 문제(chunk).
+    const rootOk = await stat(store.root).then((s) => s.isDirectory(), () => false);
+    return rootOk ? { kind: 'chunk' } : { kind: 'io' };
+  }
+  let outcome: AssembleOutcome | null = null;
   try {
     for (const c of chunks) {
       const part = createHash('sha256');
@@ -422,22 +445,48 @@ async function assemble(
         for await (const buf of createReadStream(/*turbopackIgnore: true*/ store.chunkPath(ownerId, sessionId, c.index))) {
           const b = buf as Buffer;
           part.update(b);
-          await writeFully(fh, b, onWritten);
+          try {
+            await writeFully(fh, b, onWritten);
+          } catch {
+            outcome = { kind: 'io' };
+            break;
+          }
         }
-      } catch {
-        return null;
+      } catch (e) {
+        outcome = isMissingFileError(e) ? { kind: 'chunk' } : { kind: 'io' };
       }
-      if (part.digest('hex') !== c.sha256) return null;
+      if (outcome) break;
+      if (part.digest('hex') !== c.sha256) {
+        outcome = { kind: 'chunk' };
+        break;
+      }
     }
   } finally {
-    await fh.close();
+    try {
+      await fh.close();
+    } catch {
+      if (!outcome) outcome = { kind: 'io' };
+    }
   }
+  if (outcome) return outcome;
   try {
-    if ((await stat(/*turbopackIgnore: true*/ file)).size !== total) return null;
+    if ((await stat(/*turbopackIgnore: true*/ file)).size !== total) return { kind: 'io' };
   } catch {
-    return null;
+    return { kind: 'io' };
   }
-  return { file, bytes: total, sha256: whole.digest('hex'), head: head.subarray(0, headLen) };
+  return { kind: 'ok', built: { file, bytes: total, sha256: whole.digest('hex'), head: head.subarray(0, headLen) } };
+}
+
+/** FIX3-FULLREV2(G24): 조립 중 서버 쪽 I/O 오류 — 세션은 open 그대로(받은 조각 유지), 같은 세션으로 완료를 다시 요청하면 된다. */
+export class UploadAssemblyIoError extends AppError {
+  constructor() {
+    super(
+      'service_unavailable',
+      'upload_assembly_io_error',
+      '서버에서 조각을 이어 붙이는 중 저장 오류가 났습니다(디스크 공간 등). 받은 조각은 그대로 두었으니 잠시 뒤 완료를 다시 요청하세요.',
+      { retryable: true },
+    );
+  }
 }
 
 export interface CompleteResult {
@@ -492,6 +541,18 @@ async function finishVerified(tx: DbOrTx, s: UploadSessionRow, asset: AssetRow, 
   return rows[0];
 }
 
+/** 세션 행 잠금 아래, 아직 completed 일 때만 open 으로 되돌린다(같은 조각으로 다시 완료할 수 있게). */
+async function revertToOpen(db: Db, ownerId: string, sessionId: string, now: Date): Promise<string | undefined> {
+  return db.transaction(async (tx) => {
+    const cur = await lockSession(tx, ownerId, sessionId);
+    if (cur?.state === 'completed') {
+      await tx.update(uploadSessions).set({ state: 'open', updatedAt: now }).where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.ownerId, ownerId)));
+      return 'open';
+    }
+    return cur?.state;
+  });
+}
+
 class SessionChanged extends Error {
   constructor(readonly state: string | undefined) {
     super('session changed');
@@ -544,13 +605,21 @@ export async function completeUploadSession(
 
   // 2) 트랜잭션 밖에서 스트림 조립·검사(크기·sha256·서명은 실제로 쓴 바이트 기준)
   const openWrite = hooks.openWrite ?? ((file: string) => open(/*turbopackIgnore: true*/ file, 'w'));
-  let built: Assembled | null;
+  let outcome: AssembleOutcome;
   try {
-    built = await assemble(store, ownerId, s.id, claimed.chunks!, openWrite);
+    outcome = await assemble(store, ownerId, s.id, claimed.chunks!, openWrite);
   } catch {
-    built = null;
+    outcome = { kind: 'io' };
   }
-  if (!built) return rejectSession(db, store, s, 'assembly_failed', null, now);
+  if (outcome.kind === 'chunk') return rejectSession(db, store, s, 'assembly_failed', null, now);
+  if (outcome.kind === 'io') {
+    // FIX3-FULLREV2(G24): 서버 I/O 오류는 거부가 아니다 — assembled.part 만 지우고 세션을 open 으로 되돌린다(조각 행·파일 유지).
+    await rm(/*turbopackIgnore: true*/ path.join(/*turbopackIgnore: true*/ store.dirFor(ownerId, s.id), 'assembled.part'), { force: true }).catch(() => undefined);
+    const state = await revertToOpen(db, ownerId, s.id, now);
+    if (state !== 'open') throw sessionChangedError(state); // 그 사이 만료 등 — 만료 처리가 조각을 지웠다
+    throw new UploadAssemblyIoError();
+  }
+  const built = outcome.built;
   if (built.bytes !== s.declaredBytes) return rejectSession(db, store, s, 'size_mismatch', built.sha256, now);
   const family = sniffMedia(built.head);
   if (family === null) return rejectSession(db, store, s, 'unsupported_signature', built.sha256, now);
@@ -564,6 +633,7 @@ export async function completeUploadSession(
   const sha = built.sha256;
   let movedKey: string | null = null;
   let cleanupAsset: string | null = null;
+  let builtRemoved = false;
   try {
     const result = await db.transaction(async (tx) => {
       const cur = await lockSession(tx, ownerId, s.id);
@@ -637,15 +707,14 @@ export async function completeUploadSession(
       throw sessionChangedError(e.state);
     }
     // 그 밖의 실패는 세션을 open 으로 되돌려 같은 조각으로 다시 완료할 수 있게 한다(세션 행 잠금 아래, 아직 completed 일 때만).
-    await db.transaction(async (tx) => {
-      const cur = await lockSession(tx, ownerId, s.id);
-      if (cur?.state === 'completed') {
-        await tx.update(uploadSessions).set({ state: 'open', updatedAt: now }).where(and(eq(uploadSessions.id, s.id), eq(uploadSessions.ownerId, ownerId)));
-      }
-    });
+    // FIX3-FULLREV2(G24 보강): 조립 파일은 open 으로 되돌리기 **전에** 지운다(io 경로와 같은 순서). 되돌린 뒤에 지우면 그 사이 시작한
+    // 다른 완료 요청의 새 assembled.part 를 지울 수 있다. 그래서 finally 에서도 다시 지우지 않는다.
+    await rm(/*turbopackIgnore: true*/ built.file, { force: true }).catch(() => undefined);
+    builtRemoved = true;
+    await revertToOpen(db, ownerId, s.id, now);
     throw e;
   } finally {
-    await rm(/*turbopackIgnore: true*/ built.file, { force: true }).catch(() => undefined);
+    if (!builtRemoved) await rm(/*turbopackIgnore: true*/ built.file, { force: true }).catch(() => undefined);
     const after = await getUploadSession(db, ownerId, s.id);
     if (after && after.state === 'verified') await store.removeSession(ownerId, s.id).catch(() => undefined);
   }

@@ -5,8 +5,26 @@
  * - 조각 업로드: 세션 생성 → 빠진 조각을 차례로 PUT(진행률) → 완료 → 전사 요청. 세션 ID 는 파일(이름·크기·수정 시각)별로
  *   localStorage 에 두어, 새로고침 뒤 같은 파일을 다시 고르면 GET 으로 받은 위치부터 이어 올린다(A14).
  * - 전사 목록: 진행 중 작업이 있으면 1.5초마다 GET(inline worker 가 그때 한 단계씩 진행).
+ * - FIX3-FULLREV2(G23): 전사 수정 초안은 편집을 시작한 버전(base)을 기억하고 그 base 로 저장한다(stale_transcript 잠금 유지).
+ * - FIX3-FULLREV2(G25): 이어 올리기 키는 전사 요청이 성공한 뒤에만 지운다. 업로드 성공 + 전사 요청 실패는 '전사만 다시 요청'.
  */
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  assetGoneMessage,
+  canRebaseDraft,
+  draftSaveBody,
+  draftStatus,
+  editDraft,
+  rebaseDraft,
+  storedSessionAction,
+  TRANSCRIBE_RETRY_LABEL,
+  transcribeFailureAction,
+  uploadFailureMessage,
+  withConflict,
+  type StoredSessionAction,
+  type TranscriptDraft,
+  type UploadStage,
+} from '../../lib/record-client';
 import { resumeDecision, Sha256, startPolling, uploadTargetFor, type ServerSessionLike } from '../../lib/upload-client';
 
 const STATE_LABEL: Record<string, string> = {
@@ -26,6 +44,7 @@ interface SessionView {
   progress: number;
   received_bytes: number;
   bytes: number;
+  asset_id: string | null;
 }
 
 interface TranscriptView {
@@ -48,10 +67,27 @@ interface JobView {
   created_at: string;
 }
 
+/** API 오류(오류 코드·추가 필드 포함 — 409 stale_transcript 의 current_version 등). */
+class ApiCallError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null,
+    readonly body: Record<string, unknown>,
+  ) {
+    super(message);
+  }
+}
+
+/** FIX3-FULLREV2(G25 보강): 전사 요청 대상 파일이 서버에서 사라졌거나 확인되지 않음 — 이어 올리기 키는 이미 지웠다(새로 올려야 함). */
+class AssetGoneError extends Error {}
+
 async function call<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { ...init, headers: { accept: 'application/json', ...(init?.headers ?? {}) } });
   const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!res.ok) throw new Error(typeof body.message === 'string' ? body.message : `요청 실패(${res.status})`);
+  if (!res.ok) {
+    throw new ApiCallError(typeof body.message === 'string' ? body.message : `요청 실패(${res.status})`, res.status, typeof body.error === 'string' ? body.error : null, body);
+  }
   return body as T;
 }
 
@@ -103,15 +139,18 @@ function writeStored(key: string, value: string | null): void {
   }
 }
 
-/** 저장해 둔 세션이 open 이고 **같은 내용의 파일**(전체 sha256·받은 조각별 sha256 일치)이면 그 상태, 아니면 null */
-async function resumeSession(id: string | null, file: File, sha256: string): Promise<SessionView | null> {
-  if (!id) return null;
+/**
+ * 저장해 둔 세션으로 할 일: open 이고 **같은 내용의 파일**(전체 sha256·받은 조각별 sha256 일치)이면 이어 올리기,
+ * FIX3-FULLREV2(G25) verified(asset 있음)면 전사만 다시 요청, 그 밖은 새 세션.
+ */
+async function storedSession(id: string | null, file: File, sha256: string): Promise<{ action: StoredSessionAction; session: SessionView | null }> {
+  if (!id) return { action: { kind: 'new' }, session: null };
   try {
     const r = await call<{ session: SessionView & ServerSessionLike }>(`/api/uploads/sessions/${id}`);
-    const d = await resumeDecision(r.session, { size: file.size, sha256 }, (i, size) => chunkSha256(file, i, size));
-    return d.resume ? r.session : null;
+    const d = r.session.state === 'open' ? await resumeDecision(r.session, { size: file.size, sha256 }, (i, size) => chunkSha256(file, i, size)) : { resume: false };
+    return { action: storedSessionAction(r.session, d.resume), session: r.session };
   } catch {
-    return null;
+    return { action: { kind: 'new' }, session: null };
   }
 }
 
@@ -132,7 +171,9 @@ export default function RecordClient() {
   const [busy, setBusy] = useState(false);
   const [jobs, setJobs] = useState<JobView[] | null>(null);
   const [pollError, setPollError] = useState<string>('');
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [drafts, setDrafts] = useState<Record<string, TranscriptDraft>>({});
+  // FIX3-FULLREV2(G25): 업로드는 끝났고 전사 요청만 실패 — 같은 asset 에 다시 요청한다(이어 올리기 키는 성공 뒤에만 지움).
+  const [pendingTranscribe, setPendingTranscribe] = useState<{ assetId: string; key: string } | null>(null);
   const poller = useRef<{ stop: () => void; poke: () => void } | null>(null);
 
   // FIX-T08(P1): 폴링 루프 — 실패해도 항상 다음 조회를 예약(2초→10초 backoff), 진행 중이면 1.5초, 없으면 10초. 화면을 떠나면 멈춘다.
@@ -170,15 +211,31 @@ export default function RecordClient() {
       return;
     }
     setBusy(true);
+    setPendingTranscribe(null);
+    let stage: UploadStage = 'upload';
     try {
       setStatus('파일 내용을 확인하는 중입니다(sha256)…');
       const sha256 = await fileSha256(file, (pct) => setProgress(pct));
       const key = resumeKey(sha256);
-      const resumed = await resumeSession(readStored(key), file, sha256);
+      const stored = await storedSession(readStored(key), file, sha256);
+      if (stored.action.kind === 'transcribe_only') {
+        // FIX3-FULLREV2(G25): 이 파일은 이미 서버에 올라가 확인됨 — 다시 올리지 않고 전사만 요청한다.
+        setStatus('이 파일은 이미 올라가 있습니다 — 다시 올리지 않고 전사만 요청합니다.');
+        stage = 'transcribe';
+        try {
+          await requestTranscription(stored.action.assetId, key);
+          return;
+        } catch (e) {
+          if (!(e instanceof AssetGoneError)) throw e;
+          // FIX3-FULLREV2(G25 보강): 저장해 둔 asset 이 없어짐(404·410·asset_not_verified) — 키는 지웠다. 새 세션으로 처음부터 올린다.
+          stage = 'upload';
+          setStatus('서버에 올린 파일을 더는 쓸 수 없어 새로 올립니다.');
+        }
+      }
       let session: SessionView;
-      if (resumed) {
-        session = resumed;
-        setStatus(`이전 업로드를 이어 올립니다(${resumed.progress}% 받음).`);
+      if (stored.action.kind === 'resume' && stored.session) {
+        session = stored.session;
+        setStatus(`이전 업로드를 이어 올립니다(${session.progress}% 받음).`);
       } else {
         const created = await call<{ session: SessionView }>(
           '/api/uploads/sessions',
@@ -201,32 +258,90 @@ export default function RecordClient() {
       }
       setStatus('서버에서 파일을 확인하는 중입니다(형식 서명·크기·checksum).');
       const done = await call<{ asset: { id: string } }>(`/api/uploads/sessions/${session.id}/complete`, { method: 'POST' });
-      writeStored(key, null);
-      await call(`/api/assets/${done.asset.id}/transcribe`, jsonInit('POST', { keep_original: keepOriginal }));
-      setStatus('전사를 요청했습니다(모의). 아래 목록에서 진행률을 확인하세요.');
-      setProgress(null);
-      await loadJobs();
+      stage = 'transcribe';
+      await requestTranscription(done.asset.id, key);
     } catch (e) {
-      setError(`${(e as Error).message} — 같은 파일을 다시 고르면 받은 곳부터 이어 올립니다.`);
+      setError(e instanceof AssetGoneError ? assetGoneMessage(e.message) : uploadFailureMessage(stage, (e as Error).message));
     } finally {
       setBusy(false);
     }
   }
 
+  /** 전사 요청. 실패하면 asset 을 남겨 '전사만 다시 요청'으로 재시도하게 하고, 성공한 뒤에만 이어 올리기 키를 지운다(G25). */
+  async function requestTranscription(assetId: string, key: string) {
+    setPendingTranscribe({ assetId, key });
+    // FIX3-FULLREV2(G25 보강): 파일이 서버에 없거나(404·410) 확인되지 않음(asset_not_verified)이면 같은 asset 재요청은 소용없다 —
+    // 성공과 똑같이 키를 지우고 '전사만 다시 요청'도 거둔 뒤 AssetGoneError 로 알린다(호출부가 새 업로드로 넘어가거나 다시 올리라고 안내).
+    let gone: ApiCallError | null = null;
+    let already = false;
+    try {
+      await call(`/api/assets/${assetId}/transcribe`, jsonInit('POST', { keep_original: keepOriginal }));
+    } catch (e) {
+      const action = e instanceof ApiCallError ? transcribeFailureAction(e.status, e.code) : 'retry';
+      if (action === 'retry') throw e;
+      if (action === 'reupload') gone = e as ApiCallError;
+      else already = true; // FIX3-FULLREV2(G25 재검토): 이미 진행 중 — 요청이 들어간 것으로 본다(다시 요청하지 않음)
+    }
+    writeStored(key, null);
+    setPendingTranscribe(null);
+    if (gone) throw new AssetGoneError(gone.message);
+    setStatus(
+      already
+        ? '이 파일의 전사 작업이 이미 진행 중입니다 — 다시 요청하지 않았습니다. 아래 목록에서 진행률을 확인하세요.'
+        : '전사를 요청했습니다(모의). 아래 목록에서 진행률을 확인하세요.',
+    );
+    setProgress(null);
+    await loadJobs();
+  }
+
+  async function retryTranscription() {
+    if (!pendingTranscribe) return;
+    setError('');
+    setBusy(true);
+    try {
+      await requestTranscription(pendingTranscribe.assetId, pendingTranscribe.key);
+    } catch (e) {
+      setError(e instanceof AssetGoneError ? assetGoneMessage(e.message) : uploadFailureMessage('transcribe', (e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const dropDraft = (jobId: string) =>
+    setDrafts((d) => {
+      const next = { ...d };
+      delete next[jobId];
+      return next;
+    });
+
   async function saveVersion(job: JobView) {
     const t = job.latest_transcript;
     if (!t) return;
     setError('');
+    const draft = drafts[job.id];
     try {
-      await call(`/api/transcripts/${t.id}/versions`, jsonInit('POST', { base_version: t.version, text: drafts[job.id] ?? t.text }));
-      setDrafts((d) => {
-        const next = { ...d };
-        delete next[job.id];
-        return next;
-      });
+      // FIX3-FULLREV2(G23): 초안을 시작한 버전(base)을 보낸다 — 폴링으로 바뀐 최신 번호가 아니다.
+      const saved = await call<{ transcript: TranscriptView }>(`/api/transcripts/${t.id}/versions`, jsonInit('POST', draftSaveBody(draft, t)));
+      dropDraft(job.id);
+      // 다음 폴링 전에 이전 본문 위에서 다시 고치지 않도록 방금 만든 버전을 바로 반영한다.
+      setJobs((js) => js?.map((j) => (j.id === job.id ? { ...j, latest_transcript: saved.transcript } : j)) ?? js);
       setStatus('수정본을 새 버전으로 저장했습니다.');
       await loadJobs();
     } catch (e) {
+      if (e instanceof ApiCallError && e.code === 'stale_transcript' && draft) {
+        // 초안은 그대로 두고 최신 본문을 함께 보여 준다.
+        const currentVersion = typeof e.body.current_version === 'number' ? e.body.current_version : t.version;
+        let latest: { version: number; text: string | null } = { version: currentVersion, text: null };
+        try {
+          const r = await call<{ job: JobView }>(`/api/transcription-jobs/${job.id}`);
+          if (r.job.latest_transcript) latest = { version: r.job.latest_transcript.version, text: r.job.latest_transcript.text };
+        } catch {
+          // 최신 본문은 다음 폴링에서 보인다
+        }
+        setDrafts((d) => (d[job.id] ? { ...d, [job.id]: withConflict(d[job.id]!, latest) } : d));
+        setError(`${e.message} 내 초안은 그대로 두었습니다 — 아래에서 최신 본문과 비교하세요.`);
+        return;
+      }
       setError((e as Error).message);
     }
   }
@@ -298,6 +413,11 @@ export default function RecordClient() {
             {error}
           </p>
         ) : null}
+        {pendingTranscribe && !busy ? (
+          <button type="button" onClick={() => void retryTranscription()}>
+            {TRANSCRIBE_RETRY_LABEL}
+          </button>
+        ) : null}
       </section>
 
       <section className="card" aria-labelledby="jobs-title">
@@ -324,14 +444,50 @@ export default function RecordClient() {
               ) : null}
               {j.latest_transcript ? (
                 <div className="form">
-                  <label>
-                    전사 본문 v{j.latest_transcript.version}({j.latest_transcript.created_by === 'mock' ? '모의 전사' : '내가 수정'})
-                    <textarea
-                      rows={5}
-                      value={drafts[j.id] ?? j.latest_transcript.text}
-                      onChange={(e) => setDrafts((d) => ({ ...d, [j.id]: e.target.value }))}
-                    />
-                  </label>
+                  {(() => {
+                    const latest = j.latest_transcript;
+                    const draft = drafts[j.id];
+                    const st = draftStatus(draft, latest);
+                    return (
+                      <>
+                        <label>
+                          전사 본문 v{latest.version}({latest.created_by === 'mock' ? '모의 전사' : '내가 수정'})
+                          {draft ? ` · v${draft.base} 에서 고치는 중` : ''}
+                          <textarea
+                            rows={5}
+                            value={draft?.text ?? latest.text}
+                            onChange={(e) => {
+                              const text = e.target.value;
+                              setDrafts((d) => ({ ...d, [j.id]: editDraft(d[j.id], latest, text) }));
+                            }}
+                          />
+                        </label>
+                        {st.stale && draft ? (
+                          <div className="notice" role="alert">
+                            <p>{st.notice}</p>
+                            <p className="meta">최신 본문 v{st.latestVersion}</p>
+                            {st.latestText !== null ? (
+                              <textarea rows={5} readOnly value={st.latestText} aria-label={`최신 본문 v${st.latestVersion}`} />
+                            ) : (
+                              <p className="note">최신 본문을 불러오는 중입니다 — 잠시 뒤 다시 보입니다.</p>
+                            )}
+                            <button type="button" onClick={() => dropDraft(j.id)}>
+                              최신 본문으로 다시 시작(내 초안 버림)
+                            </button>
+                            {/* FIX3-FULLREV2(G23 보강): 최신 본문을 아직 못 불러왔으면 비교할 수 없으므로 이 버튼을 숨긴다(canRebaseDraft). */}
+                            {canRebaseDraft(st) ? (
+                              <>
+                                {' '}
+                                <button type="button" onClick={() => setDrafts((d) => (d[j.id] ? { ...d, [j.id]: rebaseDraft(d[j.id]!, st.latestVersion) } : d))}>
+                                  비교했음 — 내 초안을 최신 기준으로
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </>
+                    );
+                  })()}
                   <button type="button" onClick={() => void saveVersion(j)}>
                     수정본 저장(새 버전)
                   </button>{' '}

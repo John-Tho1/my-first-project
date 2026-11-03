@@ -58,7 +58,7 @@ import { lockContentForWrite, type ContentRow, type ContentVersionRow } from './
 import { invalidateApprovalsForVariant } from './approval-invalidation';
 import { recordAudit, type DbOrTx } from './queries';
 import { assets, claimConfirmations, contents, distributionItems, generationRuns, variantAssets, variants, variantVersions } from './schema';
-import { getCurrentBrandProfile, liveFailureUsage, promptBrand, successUsage, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
+import { aiFailureCode, getCurrentBrandProfile, liveFailureUsage, promptBrand, successUsage, type AssistLlm, type AssistLlmInput, type GenerationRunRow } from './writing';
 
 export type VariantRow = typeof variants.$inferSelect;
 export type VariantVersionRow = typeof variantVersions.$inferSelect;
@@ -397,7 +397,8 @@ export async function runVariantAssist(
     sanitized = sanitizeLlmOutput(output, []);
   } catch (e) {
     const finished = new Date(Math.max(Date.now(), now.getTime()));
-    const code = e instanceof Error && e.name === 'MockLlmFailure' ? 'mock_injected_failure' : e instanceof AppError ? e.code : 'provider_error';
+    // FIX3-FULLREV2(G21): 원고 작성 보조와 같은 실패 분류(스키마 실패 → invalid_output, provider_error 아님).
+    const code = aiFailureCode(e);
     await db.transaction(async (tx) => {
       await tx
         .update(generationRuns)
@@ -415,7 +416,8 @@ export async function runVariantAssist(
         at: finished,
       });
     });
-    throw new LlmFailedError();
+    // FIX3-FULLREV2(G21): JSON 502 에 run_id·안정 실패 코드(허용 목록만) — 원고 작성 보조와 같은 규칙.
+    throw new LlmFailedError({ runId: prep.run.id, failureCode: code });
   }
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));

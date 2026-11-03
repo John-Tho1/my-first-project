@@ -603,10 +603,86 @@ export class BrandVersionConflictError extends AppError {
   }
 }
 
-/** AI(모의 포함) 호출 실패. 사용자 본문은 바뀌지 않는다. */
+/**
+ * FIX3-FULLREV2(G21): 실제 AI(LiveLlmError) 실패 코드 → 사용자에게 보여도 되는 고정 문구. providers 의 LiveLlmError 도 이 표를 그대로 쓴다
+ * (같은 코드, 같은 문구 — 한 곳에서만 고친다). 공급자 원문·입력·모델 출력은 담지 않는다.
+ */
+export const LIVE_LLM_FAILURE_TEXT = {
+  llm_request_invalid: '실제 AI 요청 조건(출력 상한·프롬프트)이 맞지 않아 호출하지 않았습니다.',
+  llm_refusal: 'AI 가 이 요청에 대한 응답을 거절했습니다. 본문은 바뀌지 않았습니다.',
+  llm_max_tokens: 'AI 응답이 출력 상한(LLM_LIVE_MAX_OUTPUT_TOKENS)에서 끊겨 제안을 만들지 못했습니다.',
+  llm_unexpected_stop: 'AI 응답이 예상하지 못한 이유로 끝나 제안을 만들지 못했습니다.',
+  llm_invalid_output: 'AI 응답 형식이 올바르지 않아 제안을 만들지 못했습니다.',
+  llm_auth_failed: '실제 AI 인증에 실패했습니다(ANTHROPIC_API_KEY 를 확인하세요).',
+  llm_permission_denied: '실제 AI 계정에 이 요청 권한이 없습니다.',
+  llm_not_found: '실제 AI 모델 또는 경로를 찾지 못했습니다(LLM_MODEL 을 확인하세요).',
+  llm_rate_limited: '실제 AI 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도하세요.',
+  llm_bad_request: '실제 AI 가 요청 형식을 거부했습니다.',
+  llm_server_error: '실제 AI 서버 오류입니다. 잠시 뒤 다시 시도하세요.',
+  llm_timeout: '실제 AI 응답 시간이 초과되었습니다.',
+  llm_connection_failed: '실제 AI 서버에 연결하지 못했습니다.',
+  llm_blocked_destination: '허용되지 않은 주소로의 AI 요청을 막았습니다.',
+  llm_provider_error: '실제 AI 호출에 실패했습니다.',
+} as const;
+
+/**
+ * FIX3-FULLREV2(G21): 실패한 AI 실행(run.error)의 안정 코드 → 고정 한국어 문구(허용 목록). 목록에 없는 코드는 일반 문구로만 보인다 —
+ * run.error 값을 화면에 그대로 그리지 않는다(원문 없음).
+ */
+export const AI_RUN_FAILURE_TEXT: Readonly<Record<string, string>> = {
+  ...LIVE_LLM_FAILURE_TEXT,
+  unverifiable_citation: 'AI 출력에 확인할 수 없는 출처 인용(URL·도메인·범위 밖 번호 등)이 있어 저장하지 않았습니다. 본문에 URL 이 있으면 같은 결과가 납니다.',
+  input_version_mismatch: 'AI 응답의 입력 버전이 요청과 달라 제안을 버렸습니다.',
+  proposal_too_large: 'AI 제안이 허용 길이를 넘어 저장하지 않았습니다.',
+  invalid_output: 'AI 응답 형식이 올바르지 않아 제안을 만들지 못했습니다.',
+  mock_injected_failure: '모의 AI 실패(시험용 주입)입니다.',
+  provider_error: 'AI 호출에 실패했습니다.',
+};
+
+/**
+ * FIX3-FULLREV2(G21): 같은 입력으로 다시 요청해도 같은 결과가 날 실패(설정·입력 문제). 재시도마다 예약액이 확정되므로 화면·JSON 에 따로 알린다.
+ * llm_request_invalid 는 호출 전 조건 실패라 입력을 바꾸지 않으면 그대로 반복된다.
+ */
+export const PERMANENT_AI_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'llm_auth_failed',
+  'llm_permission_denied',
+  'llm_not_found',
+  'llm_bad_request',
+  'llm_max_tokens',
+  'llm_request_invalid',
+  'unverifiable_citation',
+]);
+
+export const AI_FAILURE_GENERIC_TEXT = '제안을 만들지 못했습니다.';
+export const AI_PERMANENT_FAILURE_GUIDANCE =
+  '같은 입력·설정으로는 다시 시도해도 같은 결과입니다 — 다시 요청할 때마다 예약액이 확정됩니다. 원인을 먼저 고치세요.';
+
+/** FIX3-FULLREV2(G21): run.error → { code(허용 목록에 있을 때만), text, permanent }. 목록 밖·없음은 code null + 일반 문구. */
+export function aiRunFailureView(error: string | null | undefined): { code: string | null; text: string; permanent: boolean } {
+  if (typeof error === 'string' && Object.prototype.hasOwnProperty.call(AI_RUN_FAILURE_TEXT, error)) {
+    return { code: error, text: AI_RUN_FAILURE_TEXT[error]!, permanent: PERMANENT_AI_FAILURE_CODES.has(error) };
+  }
+  return { code: null, text: AI_FAILURE_GENERIC_TEXT, permanent: false };
+}
+
+/**
+ * AI(모의 포함) 호출 실패. 사용자 본문은 바뀌지 않는다.
+ * FIX3-FULLREV2(G21): run_id 와 실패 코드(허용 목록에 있는 안정 코드만 — 원문 없음)를 extra 로 싣고(JSON 502 본문에 run_id·failure_code),
+ * 영구 실패면 '잠시 뒤 다시 시도' 대신 재시도해도 같은 결과·예약액 확정 안내를 문구에 넣는다. error 필드는 그대로 'llm_failed'(D13).
+ */
 export class LlmFailedError extends AppError {
-  constructor() {
-    super('llm_failed', 'llm_failed', 'AI 제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다. 잠시 뒤 다시 시도하세요.');
+  constructor(detail: { runId?: string; failureCode?: string } = {}) {
+    const view = aiRunFailureView(detail.failureCode);
+    const base = 'AI 제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다.';
+    const message =
+      view.code === null ? `${base} 잠시 뒤 다시 시도하세요.` : view.permanent ? `${base} ${view.text} ${AI_PERMANENT_FAILURE_GUIDANCE}` : `${base} ${view.text}`;
+    const extra: Record<string, unknown> = {};
+    if (detail.runId !== undefined) extra.run_id = detail.runId;
+    if (view.code !== null) {
+      extra.failure_code = view.code;
+      extra.permanent = view.permanent;
+    }
+    super('llm_failed', 'llm_failed', message, Object.keys(extra).length > 0 ? extra : undefined);
   }
 }
 

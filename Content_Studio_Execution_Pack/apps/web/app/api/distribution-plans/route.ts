@@ -1,4 +1,4 @@
-import { createPlan, listPlans, planView } from '@cs/db';
+import { createPlan, listPlans, overallMode, planView } from '@cs/db';
 import { assertSameOrigin, decodeCaptureCursor, encodeCaptureCursor, planCreateSchema } from '@cs/domain';
 import { apiHandler, errorResponse, json, seeOther, wantsHtml } from '../../../lib/api';
 import { readRequestFields, validationError } from '../../../lib/body';
@@ -23,7 +23,7 @@ export const GET = apiHandler(async (request) => {
 
 /**
  * POST /api/distribution-plans — { items: [{ variant_id, channel_account_id, requested_result?, visibility?, schedule?: { date, time }(MSK) }], target_summary? }
- * → 201 { plan, items(payload·payload_hash) }. 승인은 만들지 않는다 — approved·approval 같은 입력 키는 버린다.
+ * → 201 { plan, mode(MOCK·LIVE·MIXED), items(payload·payload_hash·mode) }. 승인은 만들지 않는다 — approved·approval 같은 입력 키는 버린다.
  * 검토 중이 아닌 초안 409 variant_not_review, stale 409 stale_variant, 미디어 부족 409 media_incomplete, 채널 불일치 400 channel_mismatch,
  * 다른 owner 의 파생본·계정 404, 과거 예약 400 schedule_in_past.
  */
@@ -40,10 +40,12 @@ export async function POST(request: Request): Promise<Response> {
     if (!parsed.success) throw validationError(parsed.error);
     const r = await createPlan(owner.db, owner.ownerId, parsed.data);
     if (html) return seeOther(`/distribute/${r.plan.id}?created=1`);
+    // FIX3-FULLREV2(G10): 고정값 MOCK 대신 항목마다 계정 kind 기준 mode, 전체 mode 는 MOCK·LIVE·MIXED(GET /api/distribution-plans/{id} 와 같은 규칙).
+    const modeOf = (id: string) => r.itemModes.get(id) ?? 'MOCK';
     return json(
       {
         plan: planView(r.plan),
-        mode: 'MOCK',
+        mode: overallMode(r.items.map((i) => modeOf(i.id))),
         items: r.items.map((i) => ({
           id: i.id,
           variant_id: i.variantId,
@@ -54,6 +56,7 @@ export async function POST(request: Request): Promise<Response> {
           scheduled_at_utc: i.scheduledAtUtc ? i.scheduledAtUtc.toISOString() : null,
           payload_hash: i.payloadHash,
           payload: i.payloadJson,
+          mode: modeOf(i.id),
         })),
       },
       { status: 201 },

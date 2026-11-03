@@ -725,6 +725,75 @@ export function htmlToText(html: string, stats?: HtmlScanStats): { text: string;
 
 const CREATED_RE = /^(?:Created(?: time)?|Date Created|생성 일시|생성일|만든 날짜|작성일)\s*:\s*(.{1,100})$/im;
 
+/** Markdown 첫 제목을 찾는 앞부분 글자 수. */
+export const MARKDOWN_HEADING_SCAN_CHARS = 4000;
+
+const isWsChar = (c: string): boolean => /\s/.test(c);
+const isLineTerminator = (c: string): boolean => c === '\n' || c === '\r' || c === ' ' || c === ' ';
+
+/**
+ * FIX3-FULLREV2(G26): Markdown 첫 제목 추출(선형). 이전 식 `/^\s{0,3}#\s+(.+?)\s*#*\s*$/m` + '앞이 공백뿐' 조건 + trim 과 같은 결과를
+ * 글자 단위 한 번 훑기로 낸다(겹치는 반복이 없어 백트래킹이 없다). 제목이 없으면 null.
+ * - 앞의 공백·빈 줄을 건너뛴 첫 글자가 `#` 이고, 그 `#` 앞 3글자 안에 줄 시작이 있어야 한다.
+ * - `#` 바로 뒤에 공백이 하나 이상 있어야 하고(줄바꿈 포함 — 이전 식의 `\s+` 와 같다), 그 뒤 첫 비공백 글자부터 줄 끝까지가 제목 줄이다.
+ * - 제목 줄 끝의 공백 → `#` 들 → 공백을 차례로 떼어 낸다(최소 1글자는 남김). 끝까지 공백뿐이면 이전 식처럼 빈 제목 또는 null.
+ * stats.steps 는 살펴본 글자 수(선형성 시험용).
+ */
+export function markdownFirstHeading(text: string, stats?: { steps: number }): string | null {
+  const n = text.length;
+  let steps = 0;
+  let q = 0;
+  while (q < n && isWsChar(text[q]!)) {
+    q++;
+    steps++;
+  }
+  const done = <T>(v: T): T => {
+    if (stats) stats.steps += steps;
+    return v;
+  };
+  if (q >= n || text[q] !== '#') return done(null);
+  let lineStart = false;
+  for (let p = Math.max(0, q - 3); p <= q && !lineStart; p++) {
+    steps++;
+    if (p === 0 || isLineTerminator(text[p - 1]!)) lineStart = true;
+  }
+  if (!lineStart) return done(null);
+  let i = q + 1;
+  if (i >= n || !isWsChar(text[i]!)) return done(null);
+  while (i < n && isWsChar(text[i]!)) {
+    i++;
+    steps++;
+  }
+  if (i >= n) {
+    // `#` 뒤가 끝까지 공백: 이전 식은 `\s+` 를 줄여 줄바꿈 아닌 공백 하나를 제목으로 잡았다(trim 하면 빈 제목).
+    for (let k = q + 2; k < n; k++) {
+      steps++;
+      if (!isLineTerminator(text[k]!)) return done('');
+    }
+    return done(null);
+  }
+  let end = i;
+  while (end < n && !isLineTerminator(text[end]!)) {
+    end++;
+    steps++;
+  }
+  let e = end;
+  while (e > i && isWsChar(text[e - 1]!)) {
+    e--;
+    steps++;
+  }
+  while (e > i && text[e - 1] === '#') {
+    e--;
+    steps++;
+  }
+  while (e > i && isWsChar(text[e - 1]!)) {
+    e--;
+    steps++;
+  }
+  if (e === i) e = i + 1;
+  return done(text.slice(i, e).trim());
+}
+
 /** 텍스트 파일 하나를 항목으로 해석한다(경로·바이트 → 제목·본문·checksum). */
 export function parseImportFile(kind: ImportFileKind, innerPath: string, displayPath: string, bytes: Uint8Array): ParsedImportItem {
   const { folder, stem } = splitPath(displayPath);
@@ -759,8 +828,9 @@ export function parseImportFile(kind: ImportFileKind, innerPath: string, display
     body = h.text;
     if (h.title) title = truncate(h.title, MAX_TITLE);
   } else if (format === 'md') {
-    const m = /^\s{0,3}#\s+(.+?)\s*#*\s*$/m.exec(text.slice(0, 4000));
-    if (m && text.slice(0, m.index).trim() === '') title = truncate(m[1]!.trim(), MAX_TITLE);
+    // FIX3-FULLREV2(G26): 3제곱 백트래킹 정규식 대신 선형 처리(결과는 이전 정규식과 같다 — imports-fix3-fullrev2.test.ts 대조 시험).
+    const h = markdownFirstHeading(text.slice(0, MARKDOWN_HEADING_SCAN_CHARS));
+    if (h !== null) title = truncate(h, MAX_TITLE);
   }
   const created = CREATED_RE.exec(text.slice(0, 4000));
   const out: ParsedImportItem = { ...base, title, body, original, externalCreatedText: created ? created[1]!.trim() : null };

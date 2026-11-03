@@ -365,7 +365,11 @@ export async function computeDuplicates(
   return { exact, similar };
 }
 
-/** 주어진 capture 중 정확 중복(같은 content_hash 또는 같은 source)이 하나라도 있는 ID. 목록의 "중복" 표시용. */
+/**
+ * 목록의 '정확 중복 있음' 표시. FIX3-FULLREV2(G27): 상세 화면 findExactDuplicates 와 같은 규칙 — 원문 해시가 같거나
+ * 출처의 정규화 URL 이 같은 소재만 정확 중복이다(D4). 같은 출처(source_id)라도 정규화 URL 이 없는 가져오기 '새 버전'·
+ * 수집 '고쳐진 글'은 내용이 다른 소재라 정확 중복이 아니다.
+ */
 export async function exactDuplicateIds(db: DbOrTx, ownerId: string, ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
   const rows = await db
@@ -380,7 +384,11 @@ export async function exactDuplicateIds(db: DbOrTx, ownerId: string, ids: string
            where d.owner_id = ${ownerId}
              and d.id <> "captures"."id"
              and ((d.content_hash is not null and d.content_hash = "captures"."content_hash")
-               or (d.source_id is not null and d.source_id = "captures"."source_id")))`,
+               or exists (
+                 select 1 from sources ds, sources s
+                  where ds.id = d.source_id and ds.owner_id = ${ownerId}
+                    and s.id = "captures"."source_id" and s.owner_id = ${ownerId}
+                    and ds.normalized_url is not null and ds.normalized_url = s.normalized_url)))`,
       ),
     );
   return new Set(rows.map((r) => r.id));

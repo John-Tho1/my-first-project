@@ -13,6 +13,7 @@ type Ctx = { params: Promise<{ id: string }> };
  * POST /api/uploads/sessions/{id}/complete — 조각을 이어 붙여 크기·형식 서명·sha256 을 확인한다(디코딩 없음, D15).
  * 통과 200 { session(verified), asset(VERIFIED), duplicate }. 조각이 빠짐 409 upload_incomplete(세션 그대로).
  * 검사 실패 → 세션 rejected·조각 삭제 후 415(형식) 또는 400(크기·checksum) upload_rejected { reason }.
+ * FIX3-FULLREV2(G24): 조립 중 서버 I/O 오류 → 503 upload_assembly_io_error(세션 open·조각 유지, 같은 세션으로 다시 완료).
  */
 export const POST = apiHandler<Ctx>(async (request, ctx) => {
   const config = getConfig();

@@ -1872,6 +1872,8 @@ export interface RetryOutcome {
   state: 'QUEUED';
   attempt_next: number;
   message: string;
+  /** FIX3-FULLREV2(G10): 계정 kind 기준 mode(message·감사 기록과 같은 값) — 실제 계정이면 LIVE. */
+  mode: 'MOCK' | 'LIVE';
 }
 
 /**
@@ -2040,6 +2042,7 @@ async function retryItemTx(db: Db, ownerId: string, itemId: string, now: Date): 
       attempt_next: job.attempt + 1,
       // LIVE-P1: 실제 계정 재시도도 이미 게시 시도한 컨테이너는 다시 게시하지 않는다(어댑터 규칙) — 결과 불명이면 조회만.
       message: live ? '다시 대기열에 넣었습니다(실제 게시 — 새 시도. 이미 게시를 시도한 글은 다시 게시하지 않고 확인만 합니다)' : '다시 대기열에 넣었습니다(MOCK — 새 시도·새 전송 의도)',
+      mode: live ? ('LIVE' as const) : ('MOCK' as const),
     };
   });
 }

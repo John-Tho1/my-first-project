@@ -10,6 +10,9 @@ export const MAX_OPS_REQUEST = 4 * 1024;
 
 export const OPS_ERROR_TEXT: Record<string, string> = {
   confirm_required: '미리보기를 확인한 뒤 "위 목록을 지워도 됩니다"를 체크해야 보존 정리를 적용합니다. 아무것도 지우지 않았습니다.',
+  // FIX3-FULLREV2(G30): 확인한 미리보기와 지울 목록이 달라짐(화면은 지금 계획으로 새 미리보기를 다시 그린다) · 지문 없는 적용
+  plan_changed: '미리보기를 연 뒤 지울 목록이 바뀌어 아무것도 지우지 않았습니다. 아래 새 미리보기를 확인한 뒤 다시 적용하세요.',
+  plan_fingerprint_required: '미리보기 확인 값이 없어 보존 정리를 적용하지 않았습니다. 아래 미리보기를 확인한 뒤 다시 적용하세요.',
   csrf: '요청 출처를 확인할 수 없어 거부했습니다. 이 화면에서 다시 시도하세요.',
   drill_failed: '복원 훈련을 끝까지 실행하지 못했습니다(기록이 남지 않았을 수 있음). 서버 로그 없이 다시 시도하세요.',
   server: '서버 오류로 처리하지 못했습니다.',
@@ -26,6 +29,7 @@ export function opsFormFailure(e: unknown, request: Request, code?: string): Res
   let c = code ?? 'server';
   if (e instanceof AppError) {
     if (e.code === 'confirm_required') c = 'confirm_required';
+    else if (e.code === 'plan_changed' || e.code === 'plan_fingerprint_required') c = e.code;
     else if (e.kind === 'csrf') c = 'csrf';
   }
   return seeOther(`/ops?error=${c}`);
@@ -61,6 +65,8 @@ export function retentionPlanView(p: RetentionPlan) {
     exports: p.exports.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString(), zip_bytes: x.zipBytes })),
     exports_existing: p.exportsExisting,
     exports_missing_file: p.exportsMissingFile.map((x) => ({ export_id: x.id, created_at: x.createdAt.toISOString(), zip_state: x.zipState, dir_present: x.dirPresent })),
+    // FIX3-FULLREV2(G30): 적용(confirm: "yes")에 그대로 돌려줄 계획 지문 — 지울 목록이 바뀌면 적용은 409 plan_changed
+    plan_fingerprint: p.fingerprint,
   };
 }
 

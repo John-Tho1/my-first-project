@@ -451,6 +451,8 @@ export function invalidationReasonOf(problems: readonly string[]): InvalidationR
 export interface CreatedPlan {
   plan: DistributionPlanRow;
   items: DistributionItemRow[];
+  /** FIX3-FULLREV2(G10): 항목 id → 응답 mode(계정 kind 기준 modeForAccountKind — GET 계획·작업 API 와 같은 규칙). */
+  itemModes: ReadonlyMap<string, 'MOCK' | 'LIVE'>;
 }
 
 /**
@@ -476,6 +478,8 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
     const seen = new Set<string>();
     const prepared: Array<Omit<typeof distributionItems.$inferInsert, 'planId'>> = [];
     const channels: string[] = [];
+    // FIX3-FULLREV2(G10): 계정 id → kind(잠근 계정 행에서 읽은 값) — 응답 mode 를 고정값 MOCK 대신 계정 kind 로 정한다.
+    const kindByAccount = new Map<string, string>();
     for (const it of input.items) {
       const key = `${it.variant_id}|${it.channel_account_id}`;
       if (seen.has(key)) throw new AppError('bad_request', 'duplicate_item', '같은 채널 초안·계정 조합을 두 번 넣을 수 없습니다');
@@ -496,6 +500,7 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       if (!acc) throw new NotFoundError('배포 계정을 찾을 수 없습니다');
       if (acc.platform !== variant.channel) throw new ChannelMismatchError();
       if (!accountReady(acc)) throw new AccountNotReadyError();
+      kindByAccount.set(acc.id, acc.kind);
       let requested: RequestedResult;
       // T15(D27): 모의 연결(Google 형 OAuth)한 YouTube 계정은 실제 계정과 같은 목적(upload_private·public_publish)을 쓴다 — 결과는 여전히 MOCK.
       // 연결한 적 없는 모의 계정(seed)·Threads 모의 연결 계정은 T10 규칙 그대로 mock_publish 만.
@@ -619,7 +624,11 @@ export async function createPlan(db: Db, ownerId: string, input: PlanCreateInput
       details: { items: items.length, channels: [...new Set(channels)].sort().join(','), scheduled: items.filter((i) => i.scheduledAtUtc !== null).length },
       at: now,
     });
-    return { plan, items: [...items].sort((a, b) => (a.id < b.id ? -1 : 1)) };
+    return {
+      plan,
+      items: [...items].sort((a, b) => (a.id < b.id ? -1 : 1)),
+      itemModes: new Map(items.map((i) => [i.id, modeForAccountKind(kindByAccount.get(i.channelAccountId))])),
+    };
   });
 }
 
@@ -850,6 +859,8 @@ export interface ApproveResult {
   approvals: ApprovalRow[];
   /** FIX1-FULLREV2(G2): 승인한 항목 중 다른 계획에 같은 글이 있던 것(모의 = 경고만, 실제 = 확인값을 받고 승인함). 없으면 []. */
   duplicateWarnings: DuplicateWarning[];
+  /** FIX3-FULLREV2(G10): 승인한 항목 id → 응답 mode(계정 kind 기준 modeForAccountKind). */
+  itemModes: ReadonlyMap<string, 'MOCK' | 'LIVE'>;
 }
 
 /** FIX1-FULLREV2(G2, D40-1): 항목 하나의 중복 경고(live = 실제 계정 항목 — 확인값 필요). */
@@ -1010,7 +1021,12 @@ export async function approveItems(db: Db, ownerId: string, planId: string, inpu
       }
     }
     await recomputePlanStatus(tx, ownerId, plan.id, now);
-    return { plan: (await getPlanRow(tx, ownerId, plan.id))!, approvals: created, duplicateWarnings };
+    return {
+      plan: (await getPlanRow(tx, ownerId, plan.id))!,
+      approvals: created,
+      duplicateWarnings,
+      itemModes: new Map(items.map((i) => [i.id, modeForAccountKind(accountKinds.get(i.channelAccountId))])),
+    };
   });
   if ('refused' in out && out.refused) throw new SnapshotStaleError(out.refused);
   return out as ApproveResult;
@@ -1389,6 +1405,11 @@ export function modeForAccountKind(kind: string | null | undefined): 'MOCK' | 'L
   return kind === 'live' ? 'LIVE' : 'MOCK';
 }
 
+/** FIX3-FULLREV2(G10): 여러 항목 mode 의 전체 mode — 모두 모의면 MOCK(항목 없음 포함), 모두 실제면 LIVE, 섞이면 MIXED(planDetailView 와 같은 규칙). */
+export function overallMode(modes: readonly ('MOCK' | 'LIVE')[]): 'MOCK' | 'LIVE' | 'MIXED' {
+  return modes.every((m) => m === 'MOCK') ? 'MOCK' : modes.every((m) => m === 'LIVE') ? 'LIVE' : 'MIXED';
+}
+
 export function jobView(j: JobRow, accountKind?: string | null) {
   return {
     id: j.id,
@@ -1447,7 +1468,7 @@ export function itemView(i: DistributionItemRow) {
 export function planDetailView(d: PlanDetail) {
   // LIVEP1-DIAG: 계획 mode — 모든 항목이 모의면 MOCK(이전과 같음), 모두 실제면 LIVE, 섞이면 MIXED. 항목마다 mode 도 함께.
   const modes = d.items.map((x) => modeForAccountKind(x.account?.kind));
-  const planMode: 'MOCK' | 'LIVE' | 'MIXED' = modes.every((m) => m === 'MOCK') ? 'MOCK' : modes.every((m) => m === 'LIVE') ? 'LIVE' : 'MIXED';
+  const planMode = overallMode(modes);
   return {
     plan: planView(d.plan),
     mode: planMode,

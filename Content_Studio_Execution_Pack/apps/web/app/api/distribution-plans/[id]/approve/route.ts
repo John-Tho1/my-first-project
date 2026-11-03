@@ -1,4 +1,4 @@
-import { approvalView, approveItems, duplicateWarningView, planView } from '@cs/db';
+import { approvalView, approveItems, duplicateWarningView, overallMode, planView } from '@cs/db';
 import { AppError, approveSchema, assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { readRequestFields, validationError } from '../../../../../lib/body';
@@ -12,7 +12,7 @@ export const runtime = 'nodejs';
 type Ctx = { params: Promise<{ id: string }> };
 
 /**
- * POST /api/distribution-plans/{id}/approve — { item_ids, expected_hashes: { [item_id]: sha256 }, confirm: true, purpose } → 200 { plan, approvals }.
+ * POST /api/distribution-plans/{id}/approve — { item_ids, expected_hashes: { [item_id]: sha256 }, confirm: true, purpose } → 200 { plan, approvals(각 mode), mode(MOCK·LIVE·MIXED — FIX3-FULLREV2 G10 계정 kind 기준), duplicate_warnings }.
  * confirm 없음 400 confirm_required, hash 불일치 409 hash_mismatch, 스냅샷이 지금과 다름 409 snapshot_stale, 다른 owner 404.
  * FIX1-FULLREV2(G2, D40-1): 다른 계획의 같은 글이 이미 게시됨·결과 불명·진행 중인 **실제 계정** 항목은 acknowledge_duplicate: true(JSON boolean, 폼은 체크박스
  * acknowledge_duplicate=yes)가 있어야 승인된다 — 없으면 409 duplicate_publish_unacknowledged(아무것도 바꾸지 않음). 모의 계정 항목은 경고만(200 duplicate_warnings).
@@ -36,7 +36,14 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     // T16(D29 제안): Instagram 모의 연결 항목은 승인 전에 잠정 규격을 파일 앞부분으로 검사한다(저장소 범위 읽기 창구).
     const r = await approveItems(owner.db, owner.ownerId, id.toLowerCase(), parsed.data, undefined, { media: getStorage() });
     if (html) return seeOther(`/distribute/${r.plan.id}?approved=${r.approvals.length}`);
-    return json({ plan: planView(r.plan), approvals: r.approvals.map(approvalView), mode: 'MOCK', duplicate_warnings: r.duplicateWarnings.map(duplicateWarningView) });
+    // FIX3-FULLREV2(G10): 고정값 MOCK 대신 승인한 항목마다 계정 kind 기준 mode, 전체 mode 는 MOCK·LIVE·MIXED.
+    const modeOf = (itemId: string) => r.itemModes.get(itemId) ?? 'MOCK';
+    return json({
+      plan: planView(r.plan),
+      approvals: r.approvals.map((a) => ({ ...approvalView(a), mode: modeOf(a.distributionItemId) })),
+      mode: overallMode(r.approvals.map((a) => modeOf(a.distributionItemId))),
+      duplicate_warnings: r.duplicateWarnings.map(duplicateWarningView),
+    });
   } catch (e) {
     if (html) return distributeFormFailure(e, request, back);
     return errorResponse(e, request);

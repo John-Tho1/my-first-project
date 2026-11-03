@@ -24,8 +24,8 @@ import {
 import { getSession } from '../../../lib/auth';
 import { Breadcrumbs } from '../../../lib/breadcrumbs';
 import { FORM_ERROR_TEXT, LIFECYCLE_LABEL } from '../../../lib/contents';
-import { normalizeRunParam, selectRun, VARIANT_EDIT_ERROR_CODES, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
-import { WritingPanel, type ProposalView } from './writing-panel';
+import { formFailureCode, normalizeRunParam, selectRun, VARIANT_EDIT_ERROR_CODES, versionAuthorLabel, WRITING_ERROR_TEXT } from '../../../lib/writing';
+import { RunFailureNotice, WritingPanel, type ProposalView } from './writing-panel';
 import { preview } from '../../../lib/labels';
 import { exportsDir } from '../../../lib/backup';
 import { getAppDb, getConfig } from '../../../lib/server';
@@ -62,6 +62,8 @@ export default async function ContentPage({
   const lc = contentLifecycleSchema.safeParse(c.lifecycle);
   const options = lc.success ? allowedLifecycleOptions(lc.data) : [];
   const err = str(q.error) ? (FORM_ERROR_TEXT[str(q.error)!] ?? WRITING_ERROR_TEXT[str(q.error)!] ?? FORM_ERROR_TEXT.server) : undefined;
+  // FIX3-FULLREV2(G21): AI 실패 원인 코드(허용 목록만) — 채널 초안 AI 실패도 원인·영구 실패 안내를 보인다.
+  const failure = formFailureCode(str(q.error), str(q.failure));
   // 조회와 선택에 같은 정규화 값(소문자 UUID 또는 'none')을 쓴다(FIX-T06 round 2).
   const runParam = normalizeRunParam(str(q.run));
   const w = await getWritingState(db, session.ownerId, c.id, runParam !== 'none' ? runParam : undefined);
@@ -106,6 +108,12 @@ export default async function ContentPage({
           {`서버에 저장됨 ✓ (버전 ${savedRow.version}, ${formatMskInline(savedRow.createdAt)})`}
         </p>
       ) : null}
+      {/* FIX3-FULLREV2(G29, D40-5): 본문이 그대로인 저장 — 새 버전·승인 철회·파생본 stale 없음, 메모도 저장하지 않음 */}
+      {str(q.unchanged) === '1' ? (
+        <p className="saved" role="status">
+          {`변경 없음 — 본문이 현재 버전 ${current.version} 과 같아 새 버전을 만들지 않았습니다(줄바꿈 표기 차이는 무시). 저장 메모도 저장되지 않았습니다. 승인과 채널 초안은 그대로입니다.`}
+        </p>
+      ) : null}
       {str(q.meta_updated) === String(c.revision) ? (
         <p className="saved" role="status">
           {`정보 저장됨 ✓ (수정 ${c.revision}, ${formatMskInline(c.updatedAt)})`}
@@ -116,6 +124,7 @@ export default async function ContentPage({
           {err}
         </p>
       ) : null}
+      {failure ? <RunFailureNotice error={failure} /> : null}
       {w.unconfirmed.length > 0 ? (
         <p className="notice" role="alert">
           {`채택한 AI 제안에 확인하지 않은 1인칭 경험 주장이 ${w.unconfirmed.length}개 있습니다. 확인하기 전에는 "준비됨"으로 바꿀 수 없습니다.`}{' '}
@@ -157,7 +166,10 @@ export default async function ContentPage({
           </form>
           <details className="more">
             <summary>자세히</summary>
-            <p>저장하면 이전 버전은 그대로 두고 새 버전을 추가합니다. 그 사이 다른 곳에서 저장했다면 두 본문을 나란히 비교하는 화면으로 갑니다.</p>
+            <p>
+              저장하면 이전 버전은 그대로 두고 새 버전을 추가합니다. 그 사이 다른 곳에서 저장했다면 두 본문을 나란히 비교하는 화면으로 갑니다. 본문을 바꾸지 않고
+              저장하면(메모만 바꾼 경우 포함) 새 버전을 만들지 않고 &quot;변경 없음&quot;으로 끝납니다 — 메모만 따로 저장할 수는 없습니다.
+            </p>
           </details>
         </section>
 

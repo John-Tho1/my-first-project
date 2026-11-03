@@ -17,6 +17,7 @@ import {
   draftTitleFromCapture,
   draftTitleFromIdea,
   isUuid,
+  normalizeNewlines,
   NotFoundError,
   UnconfirmedExperienceClaimsError,
   type ContentLifecycle,
@@ -370,6 +371,9 @@ export interface AppendVersionInput {
  * { current: { version, body, created_at }, yours: { base_version, body, note } } — 두 본문 모두 돌려줘 잃지 않는다(A02).
  * 같으면 version = (최대 버전)+1 행을 추가하고 contents.current_version_id·updated_at 을 옮긴다. 기존 버전 행은 건드리지 않는다.
  * T06: AI 제안 버전(현재가 아닌 버전)이 있을 수 있어 새 번호는 "현재+1" 이 아니라 "최대+1" 이다.
+ * FIX3-FULLREV2(G29, D40-5): 잠금 안에서 본문이 현재 본문과 줄바꿈 표기(CRLF/CR → LF)만 정리해 같으면 새 버전을 만들지 않는다 —
+ * 메모가 있어도(메모는 저장하지 않음). current_version_id·승인·파생본(stale 판정)·감사 기록을 건드리지 않고 { unchanged: true, version: 현재 }.
+ * base_version 검사가 먼저다(오래된 기준이면 본문이 같아도 409 비교 화면 — 기존 동작).
  */
 export async function appendContentVersion(
   db: Db,
@@ -377,7 +381,7 @@ export async function appendContentVersion(
   contentId: string,
   input: AppendVersionInput,
   now: Date = new Date(),
-): Promise<{ content: ContentRow; version: ContentVersionRow }> {
+): Promise<{ content: ContentRow; version: ContentVersionRow; unchanged: boolean }> {
   if (!isUuid(contentId)) throw new NotFoundError(NOT_FOUND);
   return db.transaction(async (tx) => {
     const { content, current } = await lockContentForWrite(tx, ownerId, contentId);
@@ -387,6 +391,7 @@ export async function appendContentVersion(
         yours: { base_version: input.baseVersion, body: input.body, note: input.note ?? null },
       });
     }
+    if (normalizeNewlines(input.body) === normalizeNewlines(current.body)) return { content, version: current, unchanged: true };
     const r = await insertCurrentVersion(tx, ownerId, content, current, { body: input.body, note: input.note ?? null, aiRunId: null }, now);
     await recordAudit(tx, {
       ownerId,
@@ -397,7 +402,7 @@ export async function appendContentVersion(
       details: { version: r.version.version, base_version: input.baseVersion, body_bytes: Buffer.byteLength(input.body, 'utf8') },
       at: now,
     });
-    return r;
+    return { ...r, unchanged: false };
   });
 }
 

@@ -283,6 +283,15 @@ describe('FIX5-FULLREV(T2): 복원 이력 재시도 거절 — 계정 kind 별 �
     await expectUntouched(x.itemId, before);
   });
 
+  it('FIX3-FULLREV2(G10): 모의 계정 보류 → JSON 재시도 200 은 mode MOCK(모의 message 와 같음)', async () => {
+    const x = await blocked('G10 모의 재시도 mode 글.');
+    const res = await retryPOST(post(`/api/distribution-items/${x.itemId}/retry`), ctx(x.itemId));
+    expect(res.status, await res.clone().text()).toBe(200);
+    const body = (await res.json()) as { mode: string; message: string; state: string };
+    expect(body).toMatchObject({ state: 'QUEUED', mode: 'MOCK' });
+    expect(body.message).toContain('MOCK');
+  });
+
   it('그대로: 복원 표시 없는 거절은 일반 not_retryable(화면 문구도 그대로)', async () => {
     const x = await blocked('복원 표시 없는 보류 글.');
     expect(location(await form('retry', x.itemId, { plan_id: x.planId }))).toBe(`/distribute/${x.planId}?retried=1`);

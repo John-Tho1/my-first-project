@@ -473,6 +473,106 @@ describe('모의 계정은 그대로(실제 게시 조건이 모두 있어도 MO
   });
 });
 
+describe('FIX3-FULLREV2(G10): 계획 만들기·승인·재시도 JSON 응답의 mode 는 계정 kind 기준(고정값 MOCK 아님)', () => {
+  type ModeBody = { mode: string; items: Array<{ id: string; variant_id: string; payload_hash: string; channel_account_id: string; mode: string }> };
+  const createPlan = async (items: Array<{ variant_id: string; channel_account_id: string; requested_result?: string }>) => {
+    const res = await rec(await plansPOST(post('/api/distribution-plans', { items })));
+    expect(res.status, await res.clone().text()).toBe(201);
+    return (await res.json()) as ModeBody & { plan: { id: string } };
+  };
+  const approve = async (planId: string, items: ModeBody['items']) => {
+    const res = await rec(
+      await approvePOST(
+        post(`/api/distribution-plans/${planId}/approve`, {
+          item_ids: items.map((i) => i.id),
+          expected_hashes: Object.fromEntries(items.map((i) => [i.id, i.payload_hash])),
+          confirm: true,
+          purpose: 'public_publish',
+        }),
+        ctx(planId),
+      ),
+    );
+    expect(res.status, await res.clone().text()).toBe(200);
+    return (await res.json()) as { mode: string; approvals: Array<{ distribution_item_id: string; mode: string }> };
+  };
+
+  it('실제 계정만 → 만들기·승인 모두 LIVE(항목·승인마다 LIVE), 모의 계정만 → MOCK, 섞이면 MIXED(항목별 값은 각자) — 외부 호출 0', async () => {
+    const fetchSpy = vi.fn(async () => {
+      throw new Error('외부 호출 금지');
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    const live = await createPlan([{ variant_id: await reviewVariant('G10 실제 계정 글.'), channel_account_id: liveAccount }]);
+    expect(live.mode).toBe('LIVE');
+    expect(live.items.map((i) => i.mode)).toEqual(['LIVE']);
+    const liveAp = await approve(live.plan.id, live.items);
+    expect(liveAp.mode).toBe('LIVE');
+    expect(liveAp.approvals.map((a) => a.mode)).toEqual(['LIVE']);
+
+    const mock = await createPlan([{ variant_id: await reviewVariant('G10 모의 계정 글.'), channel_account_id: mockAcc.threads, requested_result: 'mock_publish' }]);
+    expect(mock.mode).toBe('MOCK');
+    expect(mock.items.map((i) => i.mode)).toEqual(['MOCK']);
+
+    const lv = await reviewVariant('G10 섞인 계획 — 실제.');
+    const mv = await reviewVariant('G10 섞인 계획 — 모의.');
+    const mixed = await createPlan([
+      { variant_id: lv, channel_account_id: liveAccount },
+      { variant_id: mv, channel_account_id: mockAcc.threads, requested_result: 'mock_publish' },
+    ]);
+    expect(mixed.mode).toBe('MIXED');
+    const byVariant = (v: string) => mixed.items.find((i) => i.variant_id === v)!;
+    expect(byVariant(lv).mode).toBe('LIVE');
+    expect(byVariant(mv).mode).toBe('MOCK');
+    const mixedAp = await rec(
+      await approvePOST(
+        post(`/api/distribution-plans/${mixed.plan.id}/approve`, {
+          item_ids: mixed.items.map((i) => i.id),
+          expected_hashes: Object.fromEntries(mixed.items.map((i) => [i.id, i.payload_hash])),
+          confirm: true,
+          purposes: { [byVariant(lv).id]: 'public_publish', [byVariant(mv).id]: 'mock_publish' },
+        }),
+        ctx(mixed.plan.id),
+      ),
+    );
+    expect(mixedAp.status, await mixedAp.clone().text()).toBe(200);
+    const mb = (await mixedAp.json()) as { mode: string; approvals: Array<{ distribution_item_id: string; mode: string }> };
+    expect(mb.mode).toBe('MIXED');
+    expect(mb.approvals.find((a) => a.distribution_item_id === byVariant(lv).id)!.mode).toBe('LIVE');
+    expect(mb.approvals.find((a) => a.distribution_item_id === byVariant(mv).id)!.mode).toBe('MOCK');
+    // GET 계획 API(planDetailView)와 같은 값
+    const g = (await (await planGET(new Request(`${BASE}/api/distribution-plans/${mixed.plan.id}`, { headers: { accept: 'application/json', ...cookieHeader(token) } }), ctx(mixed.plan.id))).json()) as {
+      mode: string;
+    };
+    expect(g.mode).toBe(mb.mode);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('실제 항목 보류(전송 직전 승인 기록 없음) → 재시도 JSON: mode LIVE(message 의 "실제 게시"·감사 기록 mode 와 같음), 원격 호출 0', async () => {
+    const p = await planApproved(['G10 재시도 mode 시험 글.']);
+    fullCfg('G10-retry', '3');
+    expect((await execute(p.planId)).status).toBe(200);
+    setGates({ PUBLISH_MODE: 'enabled', PUBLISH_LIVE_MAX_POSTS: '3' });
+    const missing = loadConfig();
+    const fx = publishFixture(happy('x'));
+    expect((await tick(registryWith(fx.fetch, missing), missing)).results).toEqual({ BLOCKED: 1 });
+    fullCfg('G10-retry', '3');
+    const id = p.items[0]!.id;
+    try {
+      const rt = await rec(await retryPOST(post(`/api/distribution-items/${id}/retry`), ctx(id)));
+      expect(rt.status, await rt.clone().text()).toBe(200);
+      const body = (await rt.json()) as { mode: string; message: string; state: string };
+      expect(body).toMatchObject({ state: 'QUEUED', mode: 'LIVE' });
+      expect(body.message).toContain('실제 게시');
+      const audit = (await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.action, 'item.retry'))).filter((a) => a.entityId === id);
+      expect(audit.at(-1)!.sanitizedDetails).toMatchObject({ mode: 'LIVE' });
+      expect(fx.calls).toHaveLength(0);
+    } finally {
+      // 뒤 시험의 tick 이 이 작업을 집지 않도록 취소한다(보내지 않은 작업 → CANCELED)
+      const cn = await rec(await cancelPOST(post(`/api/distribution-items/${id}/cancel`), ctx(id)));
+      expect(await cn.json()).toMatchObject({ state: 'CANCELED' });
+    }
+  });
+});
+
 describe('LIVEP1-DIAG: 실제 실패 진단 · mode 표시 · 실패 뒤 다시 게시하는 길', () => {
   it('컨테이너 생성 403(code 10) → FAILED + 허용 목록 진단(이력·전송 의도·작업 API·화면 줄), 문구·토큰 없음 · 계획/작업 API mode LIVE · 재시도 409 → 같은 파생본 새 계획: 같은 승인 기록·상한 1 이면 429, 새 승인 기록이면 게시', async () => {
     const TEXT = '진단 시험 글.';

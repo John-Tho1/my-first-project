@@ -17,6 +17,8 @@ import {
   appendContentVersion,
   incompleteRetentionSweeps,
   lastRetentionSweep,
+  maybeAutoRetention,
+  retentionPlanFingerprint,
   ensureOwner,
   createTestDb,
   createRestorePreview,
@@ -49,6 +51,7 @@ import { GET as healthDetailsGET } from '../../apps/web/app/api/health/details/r
 import { POST as drillPOST } from '../../apps/web/app/api/ops/restore-drill/route';
 import { GET as summaryGET } from '../../apps/web/app/api/ops/summary/route';
 import { POST as retentionPOST } from '../../apps/web/app/api/ops/retention/route';
+import { OPS_ERROR_TEXT } from '../../apps/web/lib/ops';
 import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const BODY = '# 해외 영업 첫 분기\n\n대리점과 재고 기준을 먼저 합의했다.\n\n가격표는 마지막에 확정했다.';
@@ -359,10 +362,12 @@ describe('보존 정리', () => {
     await expectDbReject(db.execute(sql`update job_events set state_after = 'X' where job_id = ${confirmedB.jobId}::uuid`), /append_only_immutable/u);
   });
 
-  it('POST /api/ops/retention: dry_run → 200 미리보기, confirm 없음 → 400 confirm_required, 폼 confirm 없음 → /ops?error=confirm_required, confirm=yes → 200', async () => {
+  // FIX3-FULLREV2(G30): confirm=yes 적용은 미리보기의 plan_fingerprint 와 함께(없으면 400 — 새 시험 참고). 이 시험의 마지막 200 단언은 그대로, 요청에 지문만 더했다.
+  it('POST /api/ops/retention: dry_run → 200 미리보기, confirm 없음 → 400 confirm_required, 폼 confirm 없음 → /ops?error=confirm_required, confirm=yes(+미리보기 지문) → 200', async () => {
     const dry = await retentionPOST(jsonPost('/api/ops/retention', { dry_run: true }, cookieHeader(A.token)));
     expect(dry.status).toBe(200);
-    expect(await dry.json()).toMatchObject({ dry_run: true, policy: { job_events_days: 180, packages_days: 30, exports_keep: 10 }, job_events: { jobs: 0 } });
+    const preview = await dry.json();
+    expect(preview).toMatchObject({ dry_run: true, policy: { job_events_days: 180, packages_days: 30, exports_keep: 10 }, job_events: { jobs: 0 } });
     const bad = await retentionPOST(jsonPost('/api/ops/retention', { confirm: true }, cookieHeader(A.token)));
     expect(bad.status).toBe(400);
     expect((await bad.json()).error).toBe('confirm_required');
@@ -370,7 +375,7 @@ describe('보존 정리', () => {
       new Request(`${BASE}/api/ops/retention`, { method: 'POST', headers: { accept: 'text/html', 'content-type': 'application/x-www-form-urlencoded', ...ORIGIN_HEADERS, ...cookieHeader(A.token) }, body: '' }),
     );
     expect(form.headers.get('location')).toBe('/ops?error=confirm_required');
-    const ok = await retentionPOST(jsonPost('/api/ops/retention', { confirm: 'yes' }, cookieHeader(A.token)));
+    const ok = await retentionPOST(jsonPost('/api/ops/retention', { confirm: 'yes', plan_fingerprint: preview.plan_fingerprint }, cookieHeader(A.token)));
     expect(ok.status).toBe(200);
     expect(await ok.json()).toMatchObject({ dry_run: false, job_events: { deleted: 0 } });
   });
@@ -1517,5 +1522,126 @@ describe('FIX round 6 (Codex review-FIX5-T20)', () => {
     expect(r.scope.partial_reasons).toContain('empty:approvals');
     expect(r.scope.partial_reasons).not.toContain('empty:jobs');
     expect(r.scope.partial_reasons).not.toContain('no_distribution');
+  }, 60_000);
+});
+
+describe('FIX3-FULLREV2(G30): 수동 보존 정리는 확인한 미리보기(계획 지문)와 같은 목록만 지운다', () => {
+  const later = () => new Date(Date.now() + 200 * DAY);
+  const pol1 = () => ({ ...cfg(), RETENTION_EXPORT_RUNS_KEEP: 1 });
+  const oldPackage = (owner: string) => {
+    const dir = path.join(exportsDir, 'packages', owner, randomUUID());
+    mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, `${randomUUID()}.zip`);
+    writeFileSync(f, 'pkg');
+    const t = new Date(Date.now() - 40 * DAY);
+    utimesSync(f, t, t);
+    return f;
+  };
+  const sweeps = async (owner: string) =>
+    (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.ownerId, owner), eq(schema.auditEvents.action, 'retention.sweep')))).map((a) => a.sanitizedDetails as Record<string, unknown>);
+  const formPost = (token: string, body: Record<string, string>) =>
+    retentionPOST(
+      new Request(`${BASE}/api/ops/retention`, {
+        method: 'POST',
+        headers: { accept: 'text/html', 'content-type': 'application/x-www-form-urlencoded', ...ORIGIN_HEADERS, ...cookieHeader(token) },
+        body: new URLSearchParams(body).toString(),
+      }),
+    );
+
+  it('지문: 삭제 대상 목록만 반영(순서 무관·kind 구분), 형식은 sha256 hex', () => {
+    const a = { jobEvents: { jobs: 2, events: 9, jobIds: ['j1', 'j2'] }, packages: [{ id: 'p1', contentId: 'c1', bytes: 1, mtime: new Date(0) }], exports: [{ id: 'e1', createdAt: new Date(0), zipBytes: 1, runZipBytes: 1, manifestSha256: 'm', filePresent: true, kind: 'zip' as const }] };
+    const fp = retentionPlanFingerprint(a);
+    expect(fp).toMatch(/^[0-9a-f]{64}$/u);
+    expect(retentionPlanFingerprint({ ...a, jobEvents: { jobs: 2, events: 1, jobIds: ['j2', 'j1'] } })).toBe(fp);
+    expect(retentionPlanFingerprint({ ...a, jobEvents: { jobs: 1, events: 1, jobIds: ['j1'] } })).not.toBe(fp);
+    expect(retentionPlanFingerprint({ ...a, exports: [{ ...a.exports[0]!, kind: 'dir_only' }] })).not.toBe(fp);
+    expect(retentionPlanFingerprint({ ...a, packages: [] })).not.toBe(fp);
+  });
+
+  it('미리보기 → 새 끝난 작업이 기준을 넘음 → 옛 지문으로 적용: 409 plan_changed, 이력·보관 파일·감사 모두 그대로 → 새 지문이면 그 목록만 지운다', async () => {
+    const o = await newOwner('ops-g30-job');
+    const first = await distribute(o, 'success');
+    const old = await planRetention(db, o.id, pol1(), exportsDir, later());
+    expect(old.jobEvents.jobIds).toEqual([first.jobId]);
+    const second = await distribute(o, 'success');
+    const ev = [await eventCount(first.jobId), await eventCount(second.jobId)];
+    await expect(applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, now: later(), expectedFingerprint: old.fingerprint })).rejects.toMatchObject({
+      kind: 'conflict',
+      code: 'plan_changed',
+    });
+    expect([await eventCount(first.jobId), await eventCount(second.jobId)]).toEqual(ev);
+    expect(existsSync(path.join(exportsDir, 'retention', o.id))).toBe(false);
+    expect(await sweeps(o.id)).toEqual([]);
+    const fresh = await planRetention(db, o.id, pol1(), exportsDir, later());
+    expect([...fresh.jobEvents.jobIds].sort()).toEqual([first.jobId, second.jobId].sort());
+    const r = await applyRetention(db, o.id, pol1(), exportsDir, { confirm: true, now: later(), expectedFingerprint: fresh.fingerprint });
+    expect(r.jobEvents).toMatchObject({ jobs: 2, deleted: ev[0]! + ev[1]! });
+    expect(await sweeps(o.id)).toEqual([expect.objectContaining({ plan_fingerprint: fresh.fingerprint, job_event_jobs: 2 })]);
+  }, 60_000);
+
+  it('POST /api/ops/retention: 미리보기(백업 ZIP 1개·배포 파일 1개) → 다른 탭에서 새 내보내기(옛 ZIP 이 keep 밖) → 옛 지문 409 plan_changed(아무것도 안 지움) · 폼은 /ops?error=plan_changed → 새 지문이면 미리보기와 같은 목록만 삭제', async () => {
+    vi.stubEnv('RETENTION_EXPORT_RUNS_KEEP', '1');
+    const o = await newOwner('ops-g30-route');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    const pkg = oldPackage(o.id);
+    const dry = await retentionPOST(jsonPost('/api/ops/retention', { dry_run: true }, cookieHeader(o.token)));
+    expect(dry.status).toBe(200);
+    const preview = (await dry.json()) as { plan_fingerprint: string; exports: unknown[]; packages: Array<{ id: string }> };
+    expect(preview.plan_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+    expect(preview.exports).toEqual([]);
+    expect(preview.packages).toHaveLength(1);
+    // 미리보기 뒤(사용자가 보지 않은) 새 내보내기 — 옛 백업 ZIP 이 keep(1) 밖으로 밀린다
+    await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    const stale = await retentionPOST(jsonPost('/api/ops/retention', { confirm: 'yes', plan_fingerprint: preview.plan_fingerprint }, cookieHeader(o.token)));
+    expect(stale.status).toBe(409);
+    const body = (await stale.json()) as { error: string; message: string };
+    expect(body.error).toBe('plan_changed');
+    expect(body.message).toContain('아무것도 지우지 않았습니다');
+    const form = await formPost(o.token, { confirm: 'yes', plan_fingerprint: preview.plan_fingerprint });
+    expect(form.status).toBe(303);
+    expect(form.headers.get('location')).toBe('/ops?error=plan_changed');
+    expect(OPS_ERROR_TEXT.plan_changed).toContain('새 미리보기');
+    expect(existsSync(older.zipPath)).toBe(true);
+    expect(existsSync(pkg)).toBe(true);
+    expect(await sweeps(o.id)).toEqual([]);
+    // 새 미리보기 → 그 지문으로 적용: 미리보기에 보인 옛 ZIP 과 배포 파일만 지운다
+    const dry2 = (await (await retentionPOST(jsonPost('/api/ops/retention', { dry_run: true }, cookieHeader(o.token)))).json()) as {
+      plan_fingerprint: string;
+      exports: Array<{ export_id: string }>;
+    };
+    expect(dry2.plan_fingerprint).not.toBe(preview.plan_fingerprint);
+    expect(dry2.exports.map((e) => e.export_id)).toEqual([older.exportId]);
+    const ok = await retentionPOST(jsonPost('/api/ops/retention', { confirm: 'yes', plan_fingerprint: dry2.plan_fingerprint }, cookieHeader(o.token)));
+    expect(ok.status, await ok.clone().text()).toBe(200);
+    expect(await ok.json()).toMatchObject({ dry_run: false, packages: { deleted: 1 }, exports: { deleted: 1 } });
+    expect(existsSync(older.zipPath)).toBe(false);
+    expect(existsSync(pkg)).toBe(false);
+    expect(await sweeps(o.id)).toEqual([expect.objectContaining({ plan_fingerprint: dry2.plan_fingerprint, planned_packages: 1, planned_export_zips: 1 })]);
+  }, 60_000);
+
+  it('지문 없음·형식 틀림 → 400 plan_fingerprint_required(아무것도 안 지움), 폼은 /ops?error=plan_fingerprint_required(화면 폼 hidden 값은 live-publish-render 시험)', async () => {
+    const o = await newOwner('ops-g30-missing');
+    const pkg = oldPackage(o.id);
+    for (const extra of [{}, { plan_fingerprint: 'abc' }, { plan_fingerprint: 'A'.repeat(64) }, { plan_fingerprint: 1 }]) {
+      const res = await retentionPOST(jsonPost('/api/ops/retention', { confirm: 'yes', ...extra }, cookieHeader(o.token)));
+      expect(res.status, JSON.stringify(extra)).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe('plan_fingerprint_required');
+    }
+    const form = await formPost(o.token, { confirm: 'yes' });
+    expect(form.headers.get('location')).toBe('/ops?error=plan_fingerprint_required');
+    expect(OPS_ERROR_TEXT.plan_fingerprint_required).toContain('적용하지 않았습니다');
+    expect(existsSync(pkg)).toBe(true);
+    expect(await sweeps(o.id)).toEqual([]);
+  });
+
+  it('auto(worker, RETENTION_SWEEP_MODE=auto)는 지문 없이 그대로 적용한다', async () => {
+    const o = await newOwner('ops-g30-auto');
+    const older = await exportOwner(db, storage, o.id, { outDir: exportsDir, now: new Date(Date.now() - 3600_000) });
+    await exportOwner(db, storage, o.id, { outDir: exportsDir });
+    (globalThis as { __csRetentionSweepAt?: number }).__csRetentionSweepAt = undefined;
+    const results = await maybeAutoRetention(db, { ...cfg(), RETENTION_SWEEP_MODE: 'auto', RETENTION_EXPORT_RUNS_KEEP: 1 }, exportsDir);
+    expect(results).not.toBeNull();
+    expect(existsSync(older.zipPath)).toBe(false);
+    expect(await sweeps(o.id)).toEqual([expect.objectContaining({ trigger: 'worker', planned_export_zips: 1, plan_fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u) })]);
   }, 60_000);
 });

@@ -6,6 +6,8 @@ import Link from 'next/link';
 import type { ClaimView, GenerationRunRow, getWritingState, UsageLedgerRow } from '@cs/db';
 import { claimsOf } from '@cs/db';
 import {
+  AI_PERMANENT_FAILURE_GUIDANCE,
+  aiRunFailureView,
   ASSIST_MODE_LABEL,
   ASSIST_MODES,
   assistInputVersion,
@@ -42,6 +44,23 @@ const EVIDENCE_LABEL: Record<string, string> = { none: '없음', source: '허용
 function outputList(run: GenerationRunRow, key: 'followup_questions' | 'warnings'): string[] {
   const v = run.outputJson?.[key];
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+/**
+ * FIX3-FULLREV2(G21): 실패 run 의 원인 — 안정 코드를 허용 목록(aiRunFailureView)으로만 고정 문구로 바꿔 보인다. run.error 원문은 그리지 않는다.
+ * 영구 실패(인증·권한·모델 없음·요청 형식·출력 상한·인용 검증)는 다시 시도해도 같은 결과이고 예약액이 확정된다고 알린다.
+ */
+export function RunFailureNotice({ error }: { error: string | null }) {
+  const view = aiRunFailureView(error);
+  return (
+    <div className="notice" role="note" data-failure-code={view.code ?? undefined}>
+      <p>
+        원인: {view.text}
+        {view.code !== null ? <> (코드 <code>{view.code}</code>)</> : null}
+      </p>
+      {view.permanent ? <p><strong>{AI_PERMANENT_FAILURE_GUIDANCE}</strong></p> : null}
+    </div>
+  );
 }
 
 export function WritingPanel({
@@ -225,6 +244,7 @@ export function WritingPanel({
               </p>
             ) : null}
             {run.status === 'failed' ? <p className="note">제안을 만들지 못했습니다. 본문은 바뀌지 않았습니다.</p> : null}
+            {run.status === 'failed' ? <RunFailureNotice error={run.error} /> : null}
             {run.status === 'running' ? <p className="note">끝나지 않은 실행입니다. 결과를 기다리지 말고 다시 요청하세요.</p> : null}
             {run.provider === 'mock' && run.status === 'succeeded' ? (
               <p className="notice" role="note">

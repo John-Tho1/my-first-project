@@ -307,6 +307,58 @@ ${inputs}
   return new Response(html, { status: 409, headers: CONFLICT_HTML_HEADERS });
 }
 
+/** FIX3-FULLREV2(G31): Brand Profile 폼 충돌 화면의 한 칸(현재 서버 값·내 입력은 폼 textarea 와 같은 글 형태). */
+export interface BrandConflictField {
+  name: string;
+  label: string;
+  current: string;
+  yours: string;
+  /** 비교표에 보일 내 입력(선택 칸은 값 대신 이름). 없으면 yours. */
+  yoursText?: string;
+  input: 'text' | 'textarea' | { options: ReadonlyArray<[string, string]> };
+  maxLength?: number;
+  rows?: number;
+}
+
+/**
+ * FIX3-FULLREV2(G31): Brand Profile 새 버전 저장 충돌(409, A02 — 내 입력을 잃지 않음). 필드별 현재 서버 값/내 입력 비교표 +
+ * 내 입력이 채워진 재저장 폼(base_version = 현재 버전, POST /api/brand). 모든 값 escape, 스크립트 없음, CONFLICT_HTML_HEADERS.
+ */
+export function renderBrandConflictHtml(opts: { baseVersion: number; currentVersion: number; fields: readonly BrandConflictField[] }): Response {
+  const rows = opts.fields
+    .map((f) => `<tr><th scope="row">${esc(f.label)}</th><td>${esc(f.current)}</td><td>${esc(f.yoursText ?? f.yours)}</td></tr>`)
+    .join('\n');
+  const inputs = opts.fields
+    .map((f) => {
+      const idAttr = `f_${esc(f.name)}`;
+      const label = `<label for="${idAttr}">${esc(f.label)}</label>`;
+      const max = f.maxLength ? ` maxlength="${f.maxLength}"` : '';
+      if (f.input === 'text') return `${label}<input id="${idAttr}" name="${esc(f.name)}"${max} value="${esc(f.yours)}">`;
+      if (f.input === 'textarea') return `${label}<textarea id="${idAttr}" name="${esc(f.name)}" rows="${f.rows ?? 4}"${max}>${esc(f.yours)}</textarea>`;
+      const options = f.input.options
+        .map(([v, text]) => `<option value="${esc(v)}"${v === f.yours ? ' selected' : ''}>${esc(text)}</option>`)
+        .join('');
+      return `${label}<select id="${idAttr}" name="${esc(f.name)}">${options}</select>`;
+    })
+    .join('\n');
+  const cur = opts.currentVersion === 0 ? '없음' : `버전 ${opts.currentVersion}`;
+  const html = page(
+    'Brand Profile 저장 충돌',
+    `<h1>Brand Profile 저장 충돌</h1>
+<p class="notice" role="alert">내가 편집을 시작한 뒤(버전 ${opts.baseVersion} 기준) 다른 곳에서 Brand Profile 이 먼저 저장되었습니다(현재 ${cur}).
+내가 입력한 내용은 아래 폼에 그대로 남아 있습니다. 현재 내용과 비교한 뒤 다시 저장하세요. 아직 아무것도 저장하지 않았습니다.</p>
+<table><thead><tr><th></th><th>현재 서버 내용 (${cur})</th><th>내가 입력한 내용</th></tr></thead><tbody>
+${rows}
+</tbody></table>
+<form method="post" action="/api/brand">
+<input type="hidden" name="base_version" value="${opts.currentVersion}">
+${inputs}
+<p><button type="submit">내 입력으로 새 버전 저장(현재 ${cur} 기준)</button> <a href="/brand">저장하지 않고 돌아가기</a></p>
+</form>`,
+  );
+  return new Response(html, { status: 409, headers: CONFLICT_HTML_HEADERS });
+}
+
 export const tagsText = (tags: unknown) => (Array.isArray(tags) ? tags.join(', ') : '');
 export const nz = (v: unknown) => (v === null || v === undefined ? '' : String(v));
 

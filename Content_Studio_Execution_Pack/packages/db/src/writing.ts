@@ -473,8 +473,11 @@ async function prepareAssist(db: Db, ownerId: string, contentId: string, input: 
   });
 }
 
-/** 실패 사유(짧은 코드만 — 모델 출력·입력·예외 메시지 원문을 저장하지 않는다). */
-function failureCode(e: unknown): string {
+/**
+ * 실패 사유(짧은 코드만 — 모델 출력·입력·예외 메시지 원문을 저장하지 않는다).
+ * FIX3-FULLREV2(G21): 채널 초안 AI(variants.ts)도 이 분류를 그대로 쓴다 — 스키마 실패(ZodError)는 어디서나 invalid_output.
+ */
+export function aiFailureCode(e: unknown): string {
   if (e instanceof Error && e.name === 'MockLlmFailure') return 'mock_injected_failure';
   if (e instanceof Error && e.name === 'ZodError') return 'invalid_output';
   if (e instanceof AppError) return e.code;
@@ -551,7 +554,7 @@ export async function runAssist(
     await db.transaction(async (tx) => {
       await tx
         .update(generationRuns)
-        .set({ status: 'failed', error: failureCode(e), finishedAt: finished })
+        .set({ status: 'failed', error: aiFailureCode(e), finishedAt: finished })
         .where(and(eq(generationRuns.id, runId), eq(generationRuns.ownerId, ownerId), eq(generationRuns.status, 'running')));
       // T07: 실패한 호출도 비용이 났을 수 있으므로 예약액 전체를 실제액으로 확정한다(docs/02: 실패 재시도도 예약량에 반영).
       // FIX1-LIVEL1: live 는 응답 usage(숫자)를 알면 max(예약액, usage 비용)으로 — 초과액을 숨기지 않는다.
@@ -562,11 +565,12 @@ export async function runAssist(
         entity: 'content',
         entityId: contentId,
         versionOrHash: runId,
-        details: { mode: input.mode, status: 'failed', provider: llm.name, error: failureCode(e) },
+        details: { mode: input.mode, status: 'failed', provider: llm.name, error: aiFailureCode(e) },
         at: finished,
       });
     });
-    throw new LlmFailedError();
+    // FIX3-FULLREV2(G21): run_id·안정 실패 코드(허용 목록만)를 실어 화면·JSON 이 원인을 보이게 한다(원문 없음).
+    throw new LlmFailedError({ runId, failureCode: aiFailureCode(e) });
   }
 
   const finished = new Date(Math.max(Date.now(), now.getTime()));

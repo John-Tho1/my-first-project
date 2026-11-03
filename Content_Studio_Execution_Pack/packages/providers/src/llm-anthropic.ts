@@ -31,6 +31,7 @@ import {
   liveLlmReadiness,
   LiveProviderNotConfiguredError,
   liveModelOutputSchema,
+  LIVE_LLM_FAILURE_TEXT,
   llmStructuredOutputSchema,
   type AppConfig,
   type LlmStructuredOutput,
@@ -62,24 +63,11 @@ export type LiveLlmErrorCode =
   | 'llm_blocked_destination'
   | 'llm_provider_error';
 
-/** 사용자에게 보여도 되는 고정 문구(입력·모델 출력·공급자 메시지 없음). */
-const MESSAGES: Record<LiveLlmErrorCode, string> = {
-  llm_request_invalid: '실제 AI 요청 조건(출력 상한·프롬프트)이 맞지 않아 호출하지 않았습니다.',
-  llm_refusal: 'AI 가 이 요청에 대한 응답을 거절했습니다. 본문은 바뀌지 않았습니다.',
-  llm_max_tokens: 'AI 응답이 출력 상한(LLM_LIVE_MAX_OUTPUT_TOKENS)에서 끊겨 제안을 만들지 못했습니다.',
-  llm_unexpected_stop: 'AI 응답이 예상하지 못한 이유로 끝나 제안을 만들지 못했습니다.',
-  llm_invalid_output: 'AI 응답 형식이 올바르지 않아 제안을 만들지 못했습니다.',
-  llm_auth_failed: '실제 AI 인증에 실패했습니다(ANTHROPIC_API_KEY 를 확인하세요).',
-  llm_permission_denied: '실제 AI 계정에 이 요청 권한이 없습니다.',
-  llm_not_found: '실제 AI 모델 또는 경로를 찾지 못했습니다(LLM_MODEL 을 확인하세요).',
-  llm_rate_limited: '실제 AI 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도하세요.',
-  llm_bad_request: '실제 AI 가 요청 형식을 거부했습니다.',
-  llm_server_error: '실제 AI 서버 오류입니다. 잠시 뒤 다시 시도하세요.',
-  llm_timeout: '실제 AI 응답 시간이 초과되었습니다.',
-  llm_connection_failed: '실제 AI 서버에 연결하지 못했습니다.',
-  llm_blocked_destination: '허용되지 않은 주소로의 AI 요청을 막았습니다.',
-  llm_provider_error: '실제 AI 호출에 실패했습니다.',
-};
+/**
+ * 사용자에게 보여도 되는 고정 문구(입력·모델 출력·공급자 메시지 없음).
+ * FIX3-FULLREV2(G21): 문구 원본은 domain 의 LIVE_LLM_FAILURE_TEXT(작성 패널의 실패 표시와 같은 표). 코드가 빠지면 타입 검사가 실패한다.
+ */
+const MESSAGES: Record<LiveLlmErrorCode, string> = LIVE_LLM_FAILURE_TEXT;
 
 /**
  * 실제 AI 호출 실패(AppError kind llm_failed → 502). code 는 안정된 짧은 값이라 run.error·감사에 그대로 남는다.

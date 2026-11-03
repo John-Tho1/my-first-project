@@ -174,3 +174,18 @@ describe('초안 템플릿', () => {
     expect(draftTitleFromCapture(null, '짧은\n원문')).toBe('짧은 원문');
   });
 });
+
+// FIX3-FULLREV2(G32): 조각 상한 초과는 스키마에서 거부(조용히 자르지 않음).
+describe('FIX3-FULLREV2(G32) — 검색어 고유 조각 상한', () => {
+  it('고유 조각 9개 → 실패(그 문구), 8개·중복 포함 9개·NFD 중복 → 통과', async () => {
+    const { MAX_SEARCH_TERMS, SEARCH_TERMS_LIMIT_MESSAGE } = await import('./content');
+    expect(MAX_SEARCH_TERMS).toBe(8);
+    const nine = Array.from({ length: 9 }, (_, i) => `t${i}`).join(' ');
+    const bad = parseSearchParams(new URLSearchParams({ q: nine }));
+    expect(bad.success).toBe(false);
+    expect(bad.error!.issues.map((i) => [i.path.join('.'), i.message])).toEqual([['q', SEARCH_TERMS_LIMIT_MESSAGE]]);
+    expect(parseSearchParams(new URLSearchParams({ q: Array.from({ length: 8 }, (_, i) => `t${i}`).join(' ') })).success).toBe(true);
+    expect(parseSearchParams(new URLSearchParams({ q: `${Array.from({ length: 8 }, (_, i) => `t${i}`).join(' ')} t0` })).success).toBe(true);
+    expect(parseSearchParams(new URLSearchParams({ q: `${Array.from({ length: 7 }, (_, i) => `t${i}`).join(' ')} 재고 ${'재고'.normalize('NFD')}` })).success).toBe(true);
+  });
+});

@@ -3,8 +3,15 @@
  * JSON 필드명은 docs/04 의 snake_case 를 따른다.
  */
 import type { CaptureRevisionRow, CaptureRow, SourceRow, SourceVersionRow } from '@cs/db';
+import { MAX_RAW_TEXT, MAX_TITLE, MAX_URL_LENGTH, MAX_USER_NOTE } from '@cs/domain';
 
-export const MAX_CAPTURE_BODY = 128 * 1024;
+/**
+ * FIX3-FULLREV2(G28): 수집 본문 상한은 허용 필드 전부가 최악으로 인코딩된 크기를 덮어야 한다.
+ * urlencoded 폼에서 한국어 1글자(UTF-16 1단위)는 `%XX%XX%XX` 9바이트, 서로게이트 쌍은 2단위에 12바이트 — 단위당 최대 9바이트다.
+ * 여유 있게 단위당 12바이트 × (원문 + 메모 + 제목 + URL) + 필드 이름·command_key 등 16KiB. 글자 수 검사는 파싱 뒤 zod 가 그대로 한다.
+ * (128KiB 였을 때는 한국어 원문 약 14,500자부터 413 too_large 로 거부되었다.)
+ */
+export const MAX_CAPTURE_BODY = (MAX_RAW_TEXT + MAX_USER_NOTE + MAX_TITLE + MAX_URL_LENGTH) * 12 + 16 * 1024;
 
 export function sourceView(s: SourceRow | null) {
   if (!s) return null;

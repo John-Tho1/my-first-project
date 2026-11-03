@@ -418,3 +418,29 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 업그레이드 주의: 0048 적용 뒤에는 모두 한 번 다시 로그인해야 한다(D40-3).
 - not_run: Codex, 실제 Postgres 다중 연결, 실제 systemd, 브라우저, 실제 Threads·OIDC IdP.
 - 다음: FIX3-FULLREV2(G10–G12·G20–G32). 사용자 결정 대기.
+
+## 2026-11-03 — FIX3-FULLREV2(클라우드 세션)
+- 사용자 지시 "진행해줘", 결정은 D40-4·D40-5. **FULLREV2 확정 33건 처리 완료.**
+- **FIX3-FULLREV2 4f6b71b**:
+  - G10 응답 mode
+  - G11 배너
+  - G12 작업 줄 사유
+  - G20 1인칭 확대
+  - G21 AI 실패 원인
+  - G22 통화 문구
+  - G23·G25 녹음 화면 전사 초안·이어 올리기
+  - G24 조립 I/O 오류
+  - G26 Markdown ReDoS
+  - G27 정확 중복
+  - G28 빠른 수집 상한
+  - G29 변경 없는 저장
+  - G30 보존 정리 지문(API 변경)
+  - G31 브랜드 충돌 화면
+  - G32 검색 조각
+- 반박 검토에서 확정 8(P2) → 보완, 보완 재검토에서 확정 3(P2) 중 2 는 직접 보완하고 1 은 위험으로 기록했다. P0·P1 은 0. 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 3.
+- 마지막 검사(4f6b71b 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 87 / 2194 · integration 75 / 1278**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 20번 `4f6b71b FIX3-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15–20번.**
+- not_run: Codex, 브라우저(녹음 화면 등), 실제 Postgres 다중 연결, 실제 LLM·실계정.

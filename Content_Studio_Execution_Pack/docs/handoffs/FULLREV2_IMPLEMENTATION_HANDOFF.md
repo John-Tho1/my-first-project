@@ -213,3 +213,109 @@
 
 ### 이후
 - FIX3-FULLREV2: G10–G12·G20–G32(G20·G29 는 D40-4·5). 사용자 결정 대기.
+
+## FIX round 3 — FIX3-FULLREV2 (G10–G12·G20–G32)
+
+- BASE_SHA: ec0ec6c (FIX2 docs) · **HEAD_SHA: 4f6b71b** (`4f6b71bab0063ed83fd9023a11e21625d0e5ee3d`)
+- 출처: `FULLREV2_CLAUDE_REVIEW.md` 의 G10–G12·G20–G32. 결정은 D40-4(G20)·D40-5(G29)이고, 사용자 지시는 "진행해줘"(2026-11-03). 이로써 FULLREV2 확정 33건을 모두 처리했다.
+- 진행:
+  - 구현 에이전트 3명이 차례로 고쳤다(publish-ui: G10·G11·G12·G30 / writing-content: G20·G21·G22·G29·G31·G32 / capture-upload: G23–G28).
+  - 반박 검토(Claude 3명 — Codex 아님)에서 P0·P1 0, 확정 P2 8이었다(A 0, B 3, C 5). 보완 에이전트가 8건 모두 고쳤다.
+    - B: 채널 초안 실패 원인이 화면에 없음, 1인칭 조사·공백·영어 누락, 스키마 실패 분류 불일치.
+    - C: 지워진 asset 에 410 이 반복됨, 세션 폴더 없음에 503 이 반복됨, 최신 본문 없이 덮어쓰기 버튼이 보임, 정리 순서, 주석 위치.
+  - 보완 재검토에서 확정 P2 3이 나왔다.
+    - 2건은 오케스트레이터가 직접 고쳤다(새 시험 3, 변이 확인 2): ① 전사 진행 중(409 transcription_in_progress)에 다시 요청하지 않고 키를 거둔다(같은 asset 에 작업·비용이 하나 더 생기는 것 방지). ② 업로드 루트 자체가 없으면 세션을 거부하지 않고 503 이다.
+    - 1건(1인칭 오탐: '나와 있다', 'coal mine', 'MY')은 D40-4 가 받아들인 방향(확인 대상만 늘어남)이라 남은 위험으로 둔다.
+
+### 처리
+- **G10**: 계획 만들기·승인·재시도 JSON 의 `mode` 를 계정 종류로 정한다(`modeForAccountKind`). 항목별 mode 와 전체 mode(MOCK·LIVE·MIXED)를 둔다. 재시도는 `RetryOutcome.mode` 를 쓴다.
+- **G11**: 실제 게시 중지·재개 배너는 쿼리와 저장 상태가 맞을 때만 보인다. 다르면 중립 안내(`livePublishDoneBanner`)를 보인다.
+- **G12**: 작업 목록에서 최근 작업 줄만 보류 사유(block.code)를 쓰고, 다른 줄은 자기 `lastErrorCode` 를 쓴다.
+- **G30**:
+  - `retentionPlanFingerprint`(삭제 대상 정렬 목록의 sha256)를 미리보기 JSON 과 폼 hidden 에 넣는다.
+  - 수동 적용은 지문이 필수다(없으면 400 `plan_fingerprint_required`). ① 트랜잭션에서 새 계획과 다르면 아무것도 지우지 않고 409 `plan_changed` 다(폼은 새 미리보기로 간다).
+  - 자동 정리는 지금처럼 지문 없이 돈다. **API 변경**: `{confirm:"yes"}` 만 보내면 400 이다(docs/04·README).
+- **G20**(D40-4) `FIRST_PERSON`:
+  - 앞 경계는 `(?<![\p{L}\p{N}])` 다(괄호·꺾쇠·따옴표·강조 뒤도 잡는다).
+  - 어휘: 저희·우리+공백/조사·저도·제게·저를·저와·저한테·저만·저로서는·필자·본인, `\s` 공백, 영어 I/me/my/we/us/our/myself/ourselves/mine(단어 경계, 대소문자 규칙).
+  - 제외: 우리나라·저만큼·나와서/나와야/나와요·US·ME·i.e.·(i). 선형이다.
+- **G21**:
+  - 허용 목록 `AI_RUN_FAILURE_TEXT`·`LIVE_LLM_FAILURE_TEXT`·`PERMANENT_AI_FAILURE_CODES`·`aiRunFailureView` 를 두었다.
+  - 작성 패널의 실패 run 과 폼 redirect 의 `failure=`(채널 초안 포함)에 원인과 영구 실패 안내를 보인다. 원문은 표시하지 않는다.
+  - 502 에는 `run_id`·`failure_code`·`permanent` 를 담는다. 채널 초안도 `aiFailureCode` 를 같이 쓴다(스키마 실패 = `invalid_output`).
+- **G22**: `budget_currency_mismatch` 에 고정 폼 문구를 둔다.
+- **G29**(D40-5):
+  - 잠금 안에서 base_version 확인 뒤, CRLF/CR→LF 로 맞춘 본문이 같으면 새 버전·감사·승인 변경이 없다(메모와 관계없음).
+  - JSON 은 200 `unchanged:true`, 폼은 '변경 없음(메모 저장 안 됨)' 이다.
+- **G31**: 브랜드 폼 충돌은 409 HTML 비교 화면이다(`CONFLICT_HTML_HEADERS`, 모두 escape). 필드별 현재 값과 내 입력을 보이고, base_version = 현재인 재저장 폼을 준다.
+- **G32**: 고유 검색 조각이 8개를 넘으면 400 이고 검색 화면이 문구를 보인다.
+- **G23**:
+  - 전사 초안은 `{base, text, conflict}` 이고 base_version 은 편집 시작 버전이다.
+  - 409 `stale_transcript` 면 최신 본문과 경고를 보인다. 최신 본문을 못 불러왔으면 '최신 기준으로' 버튼을 숨긴다.
+- **G25**:
+  - 이어 올리기 키는 전사 요청이 성공한 뒤에만 지운다. 실패하면 '전사만 다시 요청'을 보인다.
+  - verified 세션은 전사만 요청한다.
+  - 404·410·`asset_not_verified` 면 키를 지우고 새로 올린다. 409 `transcription_in_progress` 면 다시 요청하지 않고 키를 거둔다.
+- **G24**:
+  - 조립 결과를 ok·chunk·io 로 나눈다.
+  - 조각 sha256 불일치·조각 없음·세션 폴더 없음(루트는 있음)만 `assembly_failed` 다.
+  - 서버 I/O 오류(열기·쓰기·닫기·stat·크기 불일치·루트 없음)는 `assembled.part` 만 지우고 세션을 open 으로 되돌린 뒤 503 `upload_assembly_io_error` 다.
+  - 일반 실패 경로는 파일을 지운 다음 open 으로 되돌린다.
+- **G26**: Markdown 첫 제목은 선형 문자 처리(`markdownFirstHeading`)로 뽑는다. 옛 식과 같은 결과임을 짧은 입력 전수와 무작위 2만 건으로 대조했다.
+- **G27**: 목록의 정확 중복은 상세와 같은 정규화 URL 규칙이다.
+- **G28**: 빠른 수집 본문 상한은 상수에서 계산한다(약 300KiB).
+
+### 시험
+- 신규 파일:
+  - `fix3-fullrev2-writing` 24
+  - `fix3-fullrev2-capture-upload` 6
+  - `fix3-fullrev2-fixup-ai` 6
+  - unit `imports-fix3-fullrev2` 7
+  - `record-client` 14
+- 신규 describe 를 더한 파일: `live-threads-publish`(G10), `fix5-fullrev`, `ops-retention`(G30), `uploads-transcription`(G23–G25·보완·재검토), `llm.test.ts`(G20 39+49), domain `writing`·`content`, web `live-publish-render`·`plan-detail-render`.
+- 바뀐 기존 단언(결정·새 동작에 따른 교체이고, 반박 검토에서 같은 엄격도임을 확인했다):
+  - `ops-retention` 의 수동 적용 200 시험이 자기 미리보기 지문을 보낸다.
+  - `uploads-transcription` 의 '쓰기 진행 0·크기 불일치 → assembly_failed' 가 '503·세션 open·조각 유지·재시도 성공' 이 됐다.
+  - 보완 시험의 `transcription_in_progress → retry` 가 `already` 가 됐다.
+- 변이 확인(제품 변경마다 되돌려 새 시험 실패 → cmp 원복):
+  - A 6, B 9, C 8, 보완 16, 재검토 보완 2.
+  - G26 은 옛 식을 되돌리면 적대 입력에서 60 초를 넘어 멈춘다.
+
+### 명령
+클라우드 Node 22.22.0, 순차 실행. 4f6b71b 와 같은 트리이고, 검사 중 바뀐 파일은 없다.
+- install --frozen-lockfile(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: 모두 exit 0
+- **unit 87 files / 2194 · integration 75 files / 1278**: 실패 0
+- drill:mock: 불변식 위반 0
+- test-dev-cert.sh: 472/472
+- 보이지 않는 문자: 0
+- `./data`: 없음
+- not_run:
+  - Codex
+  - 브라우저(녹음 화면 G23·G25, 브랜드·검색·작성 화면 렌더 일부는 helper·원본 확인만)
+  - 실제 PostgreSQL 다중 연결
+  - 실제 LLM·실계정
+  - 실제 디스크 부족
+
+### 남은 위험
+- G20: 정규식 휴리스틱이다.
+  - 주어가 없는 경험은 놓친다.
+  - 오탐이 늘었다('나와 있다', 'coal mine', 'MY', '본인', '우리 ').
+  - 대문자 'ME TOO' 는 놓친다.
+- G21:
+  - 폼 실패 원인은 redirect 쿼리로만 보인다(새로 고침 뒤에도 기억하지 않는다). 손으로 만든 `failure=` 는 허용 목록 문구만 보인다.
+  - 같은 실패가 작성 패널에 두 번 보일 수 있다.
+- G30: 미리보기와 적용 사이에 항목이 기준 시각을 넘으면 409 가 난다(안전한 쪽).
+- G24: 디스크가 계속 고장 나면 503 이 반복된다(재시도 횟수 상한이 없다). 남은 디스크를 미리 확인하지는 않는다.
+- G25: 404(잘못 라우팅된 프록시 등)도 파일 없음으로 보고 다시 올린다. 이어 올리기 키는 owner 별로 나뉘지 않는다(범위 밖).
+- G32: 대소문자만 다른 9조각도 400 이다.
+- (범위 밖, 검토 메모) 원고·브랜드 화면이 `?error=` 를 그대로 키로 써서 문구를 찾는다. `__proto__` 같은 값이면 렌더가 깨질 수 있다. 별도 작업 후보다.
+
+### 검토자에게 물을 것
+1. G30 의 수동 적용 지문 필수(API 변경)와 지문 범위(작업 id·배포 파일·내보내기 kind+id)가 충분한가?
+2. G20 의 확대 범위와 제외 목록이 D40-4 의 '오탐은 막는 쪽'에 맞는가?
+3. G24 의 io·chunk 경계(크기 불일치 = io, 세션 폴더 없음 = chunk, 루트 없음 = io)가 맞는가?
+4. G29 에서 base_version 이 낡으면 본문이 같아도 409 인 순서가 맞는가?
+5. G25 의 `transcription_in_progress → already`(키를 거둠)가 이어 올리기 규칙에 맞는가?
+
+### 이후
+- FULLREV2 확정 33건 처리를 마쳤다. Codex 재확인은 대기열 15–20번이다(사용자 PC).

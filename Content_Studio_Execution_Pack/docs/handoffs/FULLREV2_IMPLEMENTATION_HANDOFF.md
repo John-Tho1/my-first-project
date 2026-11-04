@@ -353,3 +353,39 @@
 ### 검토자에게 물을 것
 1. 쿼리·사용자 입력으로 고정 문구 표를 찾는 곳 중 남은 것이 있는가(lib 함수 안 포함)?
 2. 원본 가드의 정규식 범위가 충분한가?
+
+## FIX round 4 — FIX4-FULLREV2 (Codex 15–21 검증 F1)
+
+- BASE_SHA: 01927eb (docs) · **HEAD_SHA: 9479869** (`9479869aa3e19392359737f0f6d18a2ba0b7f94a`)
+- 출처: `docs/handoffs/CODEX_15_21_REVIEW_2026-11-03.md`. Codex 판정은 15·16·17·18·20·21 PASS, 19 CHANGES_REQUESTED(F1, P1)다. 이 커밋은 F1 만 고친다(다른 항목은 다시 고치지 않음).
+- 재현: 시험을 새 기대값으로 먼저 바꿔 두 곳이 실패하는 것을 확인했다.
+  - 통합 'issuer 끝의 / 만 바뀌어도 401'.
+  - 단위 '/tenant ↔ /tenant/ 다른 지문'.
+
+### 처리
+- **F1**:
+  - `packages/domain/src/oidc.ts` 의 `normalizeIssuer`(URL 정규화 + 끝 '/' 제거)를 `sessionIssuer`(설정값 그대로)로 바꿨다.
+  - 세션 정책 지문의 issuer 를 OIDC 클라이언트(`oidcClientSettings`·discovery·`oidcSettingsFingerprint`)와 같은 문자열로 맞췄다. OIDC 는 issuer 를 정확한 문자열로 식별하기 때문이다(Discovery §4.3).
+  - 끝의 '/'·경로 끝 '/'·호스트 대소문자만 달라도 지문이 달라 기존 세션을 거부한다(다시 로그인 — 안전한 쪽).
+  - README_KO·deploy/README_KO 에 안내를 넣었다.
+
+### 시험
+- 바뀐 기존 단언(결정 D40-3 에 따른 교체이며 강화다 — 예전에는 끝의 '/' 변경을 '통과'로 고정했다):
+  - `tests/integration/fullrev2-session-policy.test.ts` 의 '정책 무관 설정 변경도 통과': issuer 줄을 뺐다. 새 시험 'issuer 끝의 / 만 바뀌어도 401' 을 더했다.
+  - `packages/domain/src/oidc.test.ts` 의 'issuer 끝의 /·호스트 대소문자는 같은 지문': '같은 지문' 시험과 '다른 지문' 시험으로 나눴다(/tenant ↔ /tenant/ 포함).
+- 변이 확인: 수정 전 코드에서 위 2건이 실패했다.
+
+### 명령
+클라우드 Node 22.22.0, 9479869 와 같은 트리.
+- install(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: PASS
+- **unit 88 files / 2199 · integration 75 files / 1279**
+- drill:mock: 위반 0
+- dev-cert: 472/472
+- not_run: Codex 재확인, 실제 OIDC IdP, 브라우저.
+
+### 남은 위험
+- 운영자가 `OIDC_ISSUER_URL` 의 표기만 정리해도(끝 '/' 추가·삭제, 대소문자) 모든 세션이 끊긴다. 의도한 동작이다.
+- issuer 를 바꿨다가 원래대로 되돌리면 옛 세션이 다시 유효해진다(FIX round 2 의 남은 위험과 같다).
+
+### 검토자에게 물을 것
+1. 세션 지문의 issuer 를 정규화 없이 비교하는 것이 OIDC 클라이언트의 issuer 비교 방식과 완전히 같은가(trim 여부 포함)?

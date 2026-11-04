@@ -456,3 +456,15 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - **unit 88 / 2198 · integration 75 / 1278**
   - drill:mock 위반 0 · dev-cert 472/472
 - not_run: 브라우저, Codex. 사용자 요청으로 Codex 대기열·ChatGPT 프롬프트 21번 `abdc5d9 OWNTEXT` 를 추가했다(인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` '후속 — 쿼리 문구 조회 방어'). **Codex 재확인 대상: 15–21번.**
+
+## 2026-11-04 — Codex 15–21 검증 결과 처리(클라우드 세션)
+- 사용자가 Codex 15–21번 결과 zip 을 첨부했다(사용자 PC 실행, 최신 코드 01927eb 한 곳에서 실행). 원문은 `docs/handoffs/CODEX_15_21_REVIEW_2026-11-03.md` 에 남겼다.
+  - 판정: 15·16·17·18·20·21 PASS. 19(FIX2-FULLREV2) CHANGES_REQUESTED — F1(P1): 세션 정책 지문이 OIDC issuer 끝의 '/' 를 떼어 issuer 변경 뒤에도 옛 세션이 통과했다(D40-3 위반).
+  - Codex 실행 결과: unit 2198·integration 1278 PASS, Chromium 확인(G17·G4·G29·OWNTEXT 9화면).
+- **FIX4-FULLREV2 9479869**: 세션 지문 issuer 를 설정값 그대로(정확 일치) 쓴다. 두 시험 단언은 결정대로 교체했다(강화). 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 4.
+- 마지막 검사(9479869 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 88 / 2199 · integration 75 / 1279**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 22번 `9479869 FIX4-FULLREV2` 를 추가했다. **Codex 재확인 대상: 22번**(F1 수정 확인). 15–21 은 PASS 로 끝났다.
+- not_run: Codex 재확인, 실제 OIDC IdP, 실제 PostgreSQL 다중 연결, Safari·Firefox·Windows.

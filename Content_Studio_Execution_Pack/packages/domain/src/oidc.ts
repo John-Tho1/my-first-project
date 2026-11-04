@@ -133,21 +133,21 @@ export function oidcSettingsFingerprint(s: Pick<OidcClientSettings, 'issuer' | '
 
 export type SessionPolicyConfig = Pick<AppConfig, 'AUTH_MODE' | 'AUTH_ALLOWED_IDENTITY' | 'AUTH_ALLOWED_SUBJECT' | 'OIDC_ISSUER_URL'>;
 
-/** issuer 표기 정리: URL 정규화(호스트 소문자 등) 뒤 끝의 '/' 하나만 뗀다. 형식이 틀리면(설정 검증이 먼저 막지만) 원문 그대로. */
-function normalizeIssuer(raw: string | undefined): string | null {
-  if (!raw) return null;
-  try {
-    return new URL(raw.trim()).href.replace(/\/$/, '');
-  } catch {
-    return raw;
-  }
+/**
+ * 세션 지문에 넣는 issuer: OIDC 클라이언트(oidcClientSettings·discovery)가 쓰는 설정값 그대로(정규화하지 않음).
+ * Codex 검증(2026-11-03) F1 / FIX4-FULLREV2: 예전에는 URL 정규화 뒤 끝의 '/' 를 떼어 `https://idp/tenant` 와 `https://idp/tenant/` 가 같은 지문이 됐다 —
+ * OIDC 는 issuer 를 정확한 문자열로 식별하므로(Discovery §4.3, ID token iss 정확 일치) 서로 다른 issuer 의 세션이 계속 통과했다(D40-3 위반).
+ * 표기만 바꿔도 지문이 달라져 다시 로그인해야 한다(안전한 쪽).
+ */
+function sessionIssuer(raw: string | undefined): string | null {
+  return raw ? raw : null;
 }
 
 /**
  * FIX2-FULLREV2(G16): 세션을 만들 때의 인증 정책 지문(sha256 hex). 세션 행(policy_fingerprint)에 저장하고, 요청마다 현재 정책의 지문과
  * 같을 때만 세션을 받아들인다 — 허용 sub·issuer·허용 email·AUTH_MODE 를 바꾸면 기존 세션이 모두 끊긴다(D40-3).
  * - dev: AUTH_MODE + AUTH_ALLOWED_IDENTITY(그대로 — dev 로그인과 owner 키가 정확 일치로 비교한다). OIDC 설정은 dev 세션에 영향이 없다.
- * - oidc: AUTH_MODE + 정규화한 issuer + 허용 sub(없으면 null) + 허용 email(환경에 명시했을 때만, trim·소문자 — checkOidcIdentity 와 같은 규칙,
+ * - oidc: AUTH_MODE + issuer(설정값 그대로 — 정확 일치) + 허용 sub(없으면 null) + 허용 email(환경에 명시했을 때만, trim·소문자 — checkOidcIdentity 와 같은 규칙,
  *   아니면 null) + owner 키(AUTH_ALLOWED_IDENTITY 그대로).
  * 비밀(클라이언트 시크릿·키)은 넣지 않는다. 지문 값은 응답·감사·로그에 내보내지 않는다.
  */
@@ -159,7 +159,7 @@ export function sessionPolicyFingerprint(config: SessionPolicyConfig, env: Recor
           return [
             'session-policy/v1',
             'oidc',
-            normalizeIssuer(config.OIDC_ISSUER_URL),
+            sessionIssuer(config.OIDC_ISSUER_URL),
             policy.subject,
             policy.email === null ? null : policy.email.trim().toLowerCase(),
             config.AUTH_ALLOWED_IDENTITY,

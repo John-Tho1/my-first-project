@@ -137,15 +137,23 @@ describe('OIDC 세션 — 정책이 바뀌면 기존 세션 401', () => {
     await expectRejected(token);
   });
 
-  it('정책이 그대로면 계속 통과 — 정책과 무관한 설정(scope·client·issuer 끝의 /·email 대소문자) 변경도 통과', async () => {
+  it('정책이 그대로면 계속 통과 — 정책과 무관한 설정(scope·client) 변경도 통과', async () => {
     useOidc({ AUTH_ALLOWED_SUBJECT: 'owner-sub-A' });
     const token = await oidcLogin();
     expect((await probe(token)).status).toBe(404);
     expect((await probe(token)).status).toBe(404);
     vi.stubEnv('OIDC_SCOPES', 'openid email profile');
     vi.stubEnv('OIDC_CLIENT_ID', 'another-client');
-    vi.stubEnv('OIDC_ISSUER_URL', `${FAKE_ISSUER}/`);
     expect((await probe(token)).status).toBe(404);
+  });
+
+  // Codex 검증(2026-11-03) F1 / FIX4-FULLREV2: issuer 는 정확한 문자열로 비교한다 — 끝의 '/' 만 달라도 다른 issuer(OIDC Discovery §4.3).
+  it('issuer 끝의 / 만 바뀌어도 401(이전 issuer 의 세션 거부)', async () => {
+    useOidc({ AUTH_ALLOWED_SUBJECT: 'owner-sub-A' });
+    const token = await oidcLogin();
+    expect((await probe(token)).status).toBe(404);
+    vi.stubEnv('OIDC_ISSUER_URL', `${FAKE_ISSUER}/`);
+    await expectRejected(token);
   });
 });
 

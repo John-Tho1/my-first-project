@@ -201,10 +201,19 @@ describe('FIX2-FULLREV2(G16): 세션 정책 지문', () => {
     expect(fp(sub)).not.toBe(fp({ ...sub, AUTH_ALLOWED_IDENTITY: undefined }));
     expect(fp({ ...READY_ENV, AUTH_MODE: 'dev', APP_BASE_URL: 'http://localhost:3000' })).not.toBe(base);
   });
-  it('oidc: 정책과 무관한 값(client·scope·redirect·시크릿)과 issuer 끝의 /·호스트 대소문자는 같은 지문', () => {
+  it('oidc: 정책과 무관한 값(client·scope·redirect·시크릿)은 같은 지문', () => {
     const base = fp(READY_ENV);
     expect(fp({ ...READY_ENV, OIDC_CLIENT_ID: 'client-2', OIDC_SCOPES: 'openid email profile', OIDC_CLIENT_SECRET: `${SECRET}x` })).toBe(base);
-    expect(fp({ ...READY_ENV, OIDC_ISSUER_URL: 'https://IDP.test/' })).toBe(base);
+  });
+  // Codex 검증(2026-11-03) F1 / FIX4-FULLREV2: OIDC issuer 는 정확한 문자열로 식별한다(Discovery §4.3 — 메타데이터·ID token iss 와 정확 일치).
+  // 끝의 '/'·경로 끝 '/'·호스트 대소문자만 달라도 다른 issuer 로 보고 다른 지문(기존 세션 거부 — 다시 로그인하는 안전한 쪽).
+  it('oidc: issuer 는 정확한 문자열 — 끝의 /·경로 끝 /·호스트 대소문자가 달라도 다른 지문', () => {
+    const base = fp(READY_ENV);
+    expect(fp({ ...READY_ENV, OIDC_ISSUER_URL: `${READY_ENV.OIDC_ISSUER_URL}/` })).not.toBe(base);
+    expect(fp({ ...READY_ENV, OIDC_ISSUER_URL: 'https://IDP.test/' })).not.toBe(base);
+    const tenant = { ...READY_ENV, OIDC_ISSUER_URL: 'https://idp.test/tenant' };
+    expect(fp({ ...tenant, OIDC_ISSUER_URL: 'https://idp.test/tenant/' })).not.toBe(fp(tenant));
+    expect(fp({ ...tenant })).toBe(fp(tenant));
   });
   it('dev: AUTH_ALLOWED_IDENTITY 만 본다(OIDC 설정은 dev 세션에 영향 없음)', () => {
     const dev = { AUTH_MODE: 'dev', AUTH_ALLOWED_IDENTITY: 'owner@example.local' };

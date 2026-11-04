@@ -468,3 +468,8 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
   - drill:mock 위반 0 · dev-cert 472/472
 - Codex 대기열·ChatGPT 프롬프트에 22번 `9479869 FIX4-FULLREV2` 를 추가했다. **Codex 재확인 대상: 22번**(F1 수정 확인). 15–21 은 PASS 로 끝났다.
 - not_run: Codex 재확인, 실제 OIDC IdP, 실제 PostgreSQL 다중 연결, Safari·Firefox·Windows.
+
+## 2026-11-04 — FIX4-FULLREV2 Claude 반박 검토(클라우드 세션)
+- 사용자 요청 "Claude로 반박 검토 해줘". Codex 는 이 컨테이너에 없어 돌리지 못했다(사용자 PC 전용). 이 결과는 Codex 판정이 아니다.
+- 결과: 9479869 확정 지적 0. 'OIDC 클라이언트와 같은 비교'라는 설명이 부정확했다(실제로는 라이브러리보다 엄격). 그래서 코드 주석(동작 변경 없음)과 인계 문서를 정정했다.
+- Codex 재확인 대상은 그대로 22번이다(사용자 PC).

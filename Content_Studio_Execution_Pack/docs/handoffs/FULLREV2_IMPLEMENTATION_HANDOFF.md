@@ -365,7 +365,7 @@
 ### 처리
 - **F1**:
   - `packages/domain/src/oidc.ts` 의 `normalizeIssuer`(URL 정규화 + 끝 '/' 제거)를 `sessionIssuer`(설정값 그대로)로 바꿨다.
-  - 세션 정책 지문의 issuer 를 OIDC 클라이언트(`oidcClientSettings`·discovery·`oidcSettingsFingerprint`)와 같은 문자열로 맞췄다. OIDC 는 issuer 를 정확한 문자열로 식별하기 때문이다(Discovery §4.3).
+  - 세션 정책 지문의 issuer 를 OIDC 클라이언트(`oidcClientSettings`·`oidcSettingsFingerprint`)에 넘기는 설정 문자열 그대로 쓴다. OIDC 는 issuer 를 정확한 문자열로 식별하기 때문이다(Discovery §4.3). (정정 2026-11-04: 라이브러리 oauth4webapi 는 discovery issuer 를 URL href 로 비교하므로 이 지문은 라이브러리와 '같은' 비교가 아니라 그보다 엄격한 비교다 — 아래 'Claude 반박 검토' 참고.)
   - 끝의 '/'·경로 끝 '/'·호스트 대소문자만 달라도 지문이 달라 기존 세션을 거부한다(다시 로그인 — 안전한 쪽).
   - README_KO·deploy/README_KO 에 안내를 넣었다.
 
@@ -389,3 +389,17 @@
 
 ### 검토자에게 물을 것
 1. 세션 지문의 issuer 를 정규화 없이 비교하는 것이 OIDC 클라이언트의 issuer 비교 방식과 완전히 같은가(trim 여부 포함)?
+
+### Claude 반박 검토(2026-11-04, Codex 아님 — 사용자 요청 "Claude로 반박 검토 해줘")
+- 결과: 확정 지적 0(P0·P1·P2 없음). 설명 정정 1건(위 '정정'과 코드 주석 — 동작 변경 없음).
+- 확인한 것:
+  - **issuer 문자열**: 설정 로딩은 `OIDC_ISSUER_URL` 을 다듬지 않는다(빈 값만 undefined). 세션 생성(로그인·OIDC callback)과 검증이 모두 `getConfig()`(= `loadConfig(process.env)`)를 쓴다. 그래서 설정을 바꾸지 않았는데 한꺼번에 로그아웃되는 경로는 없다.
+  - **라이브러리 비교 방식**: oauth4webapi 는 discovery issuer 를 `new URL(...).href` 로, ID token iss 를 discovery 값과 정확히 비교한다. 문자열 그대로 쓰는 지문은 라이브러리보다 엄격하다.
+    - 예전 `normalizeIssuer` 는 `/tenant` 와 `/tenant/`(href 가 다름)를 합쳐 라이브러리보다 약했다. 이것이 F1 이다.
+  - **업그레이드 때 일괄 로그아웃**: 해당 없다. 세션 지문은 같은 미병합 브랜치의 6d54488 에서 처음 생겼고, migration 0048 이 이미 모두를 다시 로그인시킨다. 옛 정규화 지문을 저장한 배포본은 없다.
+  - **dev 모드·빈 issuer**: 영향 없다.
+  - **시험 단언**: 교체된 단언은 약화가 아니라 강화다.
+  - **문서**: README·deploy 문서는 코드와 맞는다.
+- 실행(단일 파일): oidc 단위 41/41, fullrev2-session-policy 11/11, auth-oidc 36/36, auth-oidc-fix1 6/6, auth-oidc-fix2 3/3.
+- 검토자에게 물을 것 1 의 답: 같은 비교가 아니라 더 엄격한 비교이며, 실패는 다시 로그인하는 안전한 쪽이다.
+- 남은 위험(기존과 같음): issuer 를 바꿨다가 되돌리면 옛 세션이 다시 유효해진다.

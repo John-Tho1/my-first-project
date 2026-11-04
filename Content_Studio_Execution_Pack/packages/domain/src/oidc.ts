@@ -138,6 +138,9 @@ export type SessionPolicyConfig = Pick<AppConfig, 'AUTH_MODE' | 'AUTH_ALLOWED_ID
  * Codex 검증(2026-11-03) F1 / FIX4-FULLREV2: 예전에는 URL 정규화 뒤 끝의 '/' 를 떼어 `https://idp/tenant` 와 `https://idp/tenant/` 가 같은 지문이 됐다 —
  * OIDC 는 issuer 를 정확한 문자열로 식별하므로(Discovery §4.3, ID token iss 정확 일치) 서로 다른 issuer 의 세션이 계속 통과했다(D40-3 위반).
  * 표기만 바꿔도 지문이 달라져 다시 로그인해야 한다(안전한 쪽).
+ * 참고(Claude 반박 검토 2026-11-04): 라이브러리(oauth4webapi)는 discovery 의 issuer 를 URL href 로 비교하고 ID token iss 는 discovery 값과 정확히
+ * 비교한다. 설정 문자열 그대로 쓰는 이 지문은 그보다 더 엄격하다 — 라이브러리가 다른 issuer 로 보는 변경은 모두 지문도 바꾸고, 호스트 대소문자·
+ * 끝의 '/'(origin 만)·:443·앞뒤 공백처럼 라이브러리는 같다고 보는 변경도 세션을 끊는다(문서화된 의도).
  */
 function sessionIssuer(raw: string | undefined): string | null {
   return raw ? raw : null;

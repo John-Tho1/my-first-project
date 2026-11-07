@@ -517,3 +517,10 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 ## 2026-11-07 — f7d4c3e 재검증(클라우드 세션)
 - Claude 독립 검토(검토자 1명): FIX2-FULLREV3 `f7d4c3e` 확정 지적 0. FULLREV3 확정 지적(H1–H8)과 그 재검증 지적(K1–K3)은 모두 반영했다.
 - 남은 것: 인계 '남은 위험'(실제 Caddy 배포 미확인, migrate.ts 의 DATABASE_URL 출력 등). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — DB CLI 출력의 DATABASE_URL 제거(클라우드 세션)
+- 사용자 지시 "1번 진행해줘". 코드 커밋 `9f908f7`(BASE `68e4854`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속'.
+- `migrate`·`seed` 의 성공 출력은 `databaseLabel`(scheme://host 만, 비밀이 섞였을 수 있으면 `(숨김)`), 오류는 종류·코드만 쓴다(`dbCliErrorLine`).
+- Claude 독립 검토 3회: P2 6건 중 5건 반영, 1건은 남은 위험. 마지막 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2258 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: export·restore 스크립트의 `throw e`(Postgres 붙일 때 정리), 표시 host 부정확(비밀 아님). M4/D20 보류 조건은 그대로다.

@@ -169,3 +169,56 @@
   - 단언 약화와 보이지 않는 문자는 없다.
 - 검토자 실행(단일 파일): `restore-view.test.ts`·domain `oauth.test.ts` 34/34.
 - 스타일 메모(지적 아님): `docs/04` 의 K3 문장이 어색하다.
+
+## 후속 — DB CLI 출력의 DATABASE_URL 제거(FULLREV3 남은 위험 7)
+
+- BASE_SHA: `68e4854` (`68e4854b7ff46024fc25583f36c52eb9bf5a48ff`, docs) · **HEAD_SHA: `9f908f7`** (`9f908f7806a8ea1f3b621af154ff15c27a0a5dfb`)
+- 출처: 사용자 지시 "1번 진행해줘"(2026-11-07). 대상은 FIX round 1 남은 위험 7 = FULLREV3 남은 위험(`migrate.ts:14` 가 `DATABASE_URL` 을 그대로 출력함).
+
+### 처리
+- `packages/db/src/db-label.ts`:
+  - `databaseLabel(url)`:
+    - PGlite 폴더 경로와 `memory://` 는 그대로 보인다.
+    - `://` 가 있는 값은 `scheme://host[:port]` 만 남긴다(마지막 `@` 뒤, 첫 `/`·`?`·`#` 앞). URL 해석기에 맡기지 않는다. 해석기는 인코딩하지 않은 `/`·`?`·`#` 가 든 비밀번호를 경로로 읽어 내보내기 때문이다.
+    - query 의 `=`, `://` 없는 값의 `=`·`@`(libpq 키워드 형식 포함), host 모양이 아닌 값은 `(숨김)` 이다.
+  - `dbCliErrorLine(what, e)`: `DbLockedError`·`DbDriverNotImplementedError` 는 고정 문구(값 없음)를 그대로 쓴다. 그 밖은 `describeErrorSafely`(허용 이름 + 코드)만 쓴다.
+- `packages/db/scripts/migrate.ts`·`seed.ts`:
+  - 성공 출력은 `databaseLabel` 을 거친다.
+  - 열기·seed·닫기 오류는 다시 던지지 않는다. Node 가 메시지·스택(파일 오류는 경로 = `DATABASE_URL`)을 찍기 때문이다. `dbCliErrorLine` 한 줄을 찍고 종료코드 1 로 끝난다.
+
+### Claude 독립 검토(D42)
+- 1차: P2 2건.
+  - 인코딩하지 않은 `/`·`?`·`#` 비밀번호와 키워드 형식이 그대로 출력됐다.
+  - 예상하지 못한 오류가 메시지·스택을 그대로 출력했다.
+- 2차: P2 4건. 3건을 반영했다.
+  - DB 닫기 오류가 보호되지 않았다.
+  - 드라이버 미구현 안내가 사라졌다.
+  - `user=` 키워드 형식이 그대로 출력됐다.
+  - 1건은 남은 위험으로 둔다(표시 host 가 틀릴 수 있음).
+- 3차: **확정 0**. 순환 import 없음, 모든 경로의 종료코드가 맞음, `e.message`·스택 출력이 남지 않음을 확인했다.
+- 범위 밖으로 확인만 한 것: `export.ts`·`restore.ts`·`restore-drill.ts` 는 예상하지 못한 `openDb` 오류를 다시 던진다(같은 종류의 누출 가능성). 다른 출력 경로(worker·health·ops·check-env·config 오류)는 값을 찍지 않는다.
+
+### 시험
+- 새 단위 시험 `packages/db/src/db-label.test.ts` 8건:
+  - 경로 그대로, postgres URL, 인코딩하지 않은 비밀번호 4종, query·키워드 형식 숨김, host 없음.
+  - 두 스크립트가 helper 를 거치고 `throw e`·`e.message`·보호 없는 close 가 없음(소스 검사).
+  - 오류 한 줄(EACCES 경로 미포함, 고정 안내 유지).
+- 변이 확인(주 세션): 다음을 하나씩 되돌리면 시험이 각각 실패하고, 원복 뒤 `cmp` 로 같음을 확인했다.
+  - 스크립트 연결 되돌림, 원래 URL 반환, query `=` 숨김 제거.
+  - 키워드 형식 규칙 되돌림, 드라이버 미구현 고정 문구 제거, seed close 보호 제거.
+- 실제 실행(주 세션):
+  - `DATABASE_URL=memory://` 로 migrate·seed 를 돌려 정상 출력을 확인했다.
+  - `DB_DRIVER=postgres DATABASE_URL='postgres://u:1234/abc@h/db'` 로 migrate·seed 를 돌리면 고정 안내 한 줄만 나오고 종료코드는 1 이다(URL 없음).
+
+### 명령
+클라우드 Node 22.22.0, `9f908f7` 와 같은 트리. 단계별 종료코드 기준:
+- install(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: 각 exit 0
+- **unit 89 files / 2258 · integration 78 files / 1328**: exit 0
+- drill:mock 위반 0 · dev-cert 472/472 · deploy 셸 시험(비root) PASS
+- not_run: 실제 PostgreSQL(드라이버 미구현), 실제 계정.
+
+### 남은 위험
+1. 표시 host 가 틀릴 수 있다(비밀은 아님). 마지막 `@` 기준이라 fragment 의 `@` 뒤를 host 로 보이고, pglite 드라이버로 postgres 모양 값을 열면 실제로는 로컬 폴더인데 `postgres://host` 로 보인다. 고치면 인코딩하지 않은 `/` 비밀번호가 다시 새는 쪽과 부딪쳐 두었다.
+2. `=`·`@` 가 든 PGlite 폴더 경로는 `(숨김)` 으로만 보인다(정보만 줄어듦).
+3. `export.ts`·`restore.ts`·`restore-drill.ts` 의 `throw e` 는 그대로다. Postgres 드라이버를 붙일 때 같은 `dbCliErrorLine` 으로 바꿀 것.
+4. 일반 잠금 재시도 오류(`lock.ts` '잠금 파일을 만들지 못했습니다')는 이제 `Error` 로만 보인다.

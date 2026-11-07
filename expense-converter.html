@@ -617,7 +617,7 @@ async function copyText(text) {
 }
 
 // --- 영수증 사진 인식 --------------------------------------------------------
-// AGENTS.md §2의 승인된 예외: Tesseract.js를 버전 고정 + SRI로, 사진을 첨부할 때만 불러온다.
+// CLAUDE.md §2의 승인된 예외: Tesseract.js를 버전 고정 + SRI로, 사진을 첨부할 때만 불러온다.
 const TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 const TESSERACT_SRI = 'sha384-GJqSu7vueQ9qN0E9yLPb3Wtpd7OrgK8KmYzC8T1IysG1bcvxvIO4qtYR/D3A991F';
 let ocrWorkerPromise = null;

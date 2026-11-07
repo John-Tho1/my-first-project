@@ -1,0 +1,13 @@
+{
+  "name": "@cs/domain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./media-mime": "./src/media-mime.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  }
+}

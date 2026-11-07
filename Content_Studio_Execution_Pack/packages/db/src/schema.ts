@@ -1,0 +1,2062 @@
+/**
+ * M1 테이블(docs/04 "M1은 users/brand_profiles/captures/sources/ideas/contents/content_versions/assets부터").
+ * - 모든 시각은 timestamptz(UTC 저장). 표시는 MSK(@cs/domain formatMsk).
+ * - owner 참조는 DB FK 로도 강제한다. 하위 테이블(source_versions, content_versions)은 부모의 owner 를 따른다.
+ */
+import { sql } from 'drizzle-orm';
+import {
+  bigint,
+  boolean,
+  check,
+  foreignKey,
+  index,
+  integer,
+  jsonb,
+  numeric,
+  pgEnum,
+  pgTable,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
+
+const ts = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
+const id = () => uuid('id').primaryKey().defaultRandom();
+
+export const inputTypeEnum = pgEnum('capture_input_type', ['text', 'url', 'file', 'voice']);
+
+export const users = pgTable('users', {
+  id: id(),
+  allowedIdentity: text('allowed_identity').notNull().unique(),
+  createdAt: ts('created_at').notNull().defaultNow(),
+});
+
+export const brandProfiles = pgTable(
+  'brand_profiles',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    version: integer('version').notNull(),
+    penName: text('pen_name').notNull(),
+    audience: text('audience').notNull(),
+    pillars: jsonb('pillars').$type<string[]>().notNull(),
+    styleRules: jsonb('style_rules').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    /** T06: 말투 — 'formal'(존댓말) | 'casual'(평어). 0005 이전 행은 기본값 formal. */
+    tone: text('tone').notNull().default('formal'),
+    /** T06: 피하고 싶은 표현 */
+    avoidPhrases: jsonb('avoid_phrases').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    /** T06: CTA 원칙 */
+    ctaRules: jsonb('cta_rules').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    /** T06: 사용자가 직접 제공한 작성 예문(말투 참고용 — 예문 속 사건을 새 글 사실로 옮기지 않는다) */
+    sampleTexts: jsonb('sample_texts').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  },
+  (t) => [
+    unique('brand_profiles_owner_version_uq').on(t.ownerId, t.version),
+    // T06: generation_runs 가 "같은 owner 의 브랜드 프로필" 만 참조하도록 복합 FK 대상.
+    unique('brand_profiles_id_owner_uq').on(t.id, t.ownerId),
+    check('brand_profiles_tone_chk', sql`${t.tone} in ('formal', 'casual')`),
+  ],
+);
+
+export const sources = pgTable(
+  'sources',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    canonicalUrl: text('canonical_url'),
+    externalProvider: text('external_provider'),
+    externalId: text('external_id'),
+    externalRevision: text('external_revision'),
+    checkedAt: ts('checked_at'),
+    contentHash: text('content_hash'),
+    rightsStatus: text('rights_status').notNull().default('unknown'),
+    /** T03: 중복 판정 키(@cs/domain normalizeUrl().normalized). URL 이 아닌 source 는 null. */
+    normalizedUrl: text('normalized_url'),
+  },
+  (t) => [
+    // (id, owner_id) 복합 unique: captures 가 "같은 owner 의 source" 만 참조하도록 복합 FK 대상.
+    unique('sources_id_owner_uq').on(t.id, t.ownerId),
+    // T03: owner 안에서 같은 정규화 URL 의 source 는 하나(부분 unique — null 은 제외).
+    uniqueIndex('sources_owner_normalized_url_uq')
+      .on(t.ownerId, t.normalizedUrl)
+      .where(sql`${t.normalizedUrl} is not null`),
+    // T18(D32 제안): 가져온 외부 항목은 owner·공급자·외부 ID 마다 출처 하나 — 다시 가져오면 같은 출처에 버전이 쌓인다(새 출처 중복 없음).
+    uniqueIndex('sources_owner_import_external_uq')
+      .on(t.ownerId, t.externalProvider, t.externalId)
+      .where(sql`${t.externalProvider} in ('notion_export', 'drive_export', 'mock_connector') and ${t.externalId} is not null`),
+  ],
+);
+
+/**
+ * 원문 추출 시도·결과. T03: 추출이 차단되면(A05 내부 주소, 수집 비활성) extraction_state='blocked' 행만 남기고
+ * 가져온 내용이 없으므로 raw_hash 는 null 이다(0002 에서 nullable 로 변경).
+ */
+export const sourceVersions = pgTable('source_versions', {
+  id: id(),
+  sourceId: uuid('source_id')
+    .notNull()
+    .references(() => sources.id, { onDelete: 'restrict' }),
+  rawHash: text('raw_hash'),
+  fetchedAt: ts('fetched_at').notNull().defaultNow(),
+  excerpt: text('excerpt'),
+  extractionState: text('extraction_state').notNull().default('pending'),
+});
+
+/**
+ * 수집 원문. raw_text 는 불변(T03): 어떤 UPDATE 도 raw_text 를 바꾸지 않는다(query 계층에서 강제).
+ * 수정 가능한 필드(user_note, title, risk)는 revision 으로 낙관적 잠금을 하고, 매 수정은 capture_revisions 에 남긴다.
+ * content_hash: 정확 중복 판정용(@cs/domain contentHash). 0002 이전 행이 있을 수 있어 nullable 이며,
+ * 모든 insert 경로(createCapture, seed)는 값을 넣고 seed 는 null 인 기존 행을 채운다. 중복 조회는 null 을 무시한다.
+ */
+export const captures = pgTable(
+  'captures',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    rawText: text('raw_text').notNull(),
+    inputType: inputTypeEnum('input_type').notNull(),
+    sourceId: uuid('source_id'),
+    receivedAt: ts('received_at').notNull().defaultNow(),
+    risk: text('risk').notNull().default('none'),
+    userNote: text('user_note'),
+    commandKey: text('command_key').notNull(),
+    title: text('title'),
+    revision: integer('revision').notNull().default(1),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+    contentHash: text('content_hash'),
+    /** T08: 음성 전사에서 만든 소재면 그 전사 버전(transcripts.id). 같은 owner 의 전사만(복합 FK). */
+    captureTranscriptId: uuid('capture_transcript_id'),
+  },
+  (t) => [
+    unique('captures_owner_command_key_uq').on(t.ownerId, t.commandKey),
+    // capture_revisions 가 "같은 owner 의 capture" 만 참조하도록 복합 FK 대상.
+    unique('captures_id_owner_uq').on(t.id, t.ownerId),
+    index('captures_owner_content_hash_idx').on(t.ownerId, t.contentHash),
+    index('captures_owner_received_idx').on(t.ownerId, t.receivedAt.desc(), t.id.desc()),
+    // T04 검색: pg_trgm GIN — ILIKE '%…%'(한국어 부분 문자열 포함)를 색인으로 가속한다.
+    index('captures_raw_text_trgm_idx').using('gin', t.rawText.op('gin_trgm_ops')),
+    foreignKey({
+      name: 'captures_source_same_owner_fk',
+      columns: [t.sourceId, t.ownerId],
+      foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'captures_transcript_same_owner_fk',
+      columns: [t.captureTranscriptId, t.ownerId],
+      foreignColumns: [transcripts.id, transcripts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * capture 수정 이력(T03). revision 마다 한 행, 수정 가능한 필드의 그 시점 값을 담는다. raw_text 는 captures 에만 있다.
+ * 생성 시 revision 1 을 남기고, 수정 성공 시 새 revision 을 남긴다(0002 이전 행은 첫 수정 때 직전 값을 먼저 보존).
+ */
+export const captureRevisions = pgTable(
+  'capture_revisions',
+  {
+    id: id(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    revision: integer('revision').notNull(),
+    userNote: text('user_note'),
+    risk: text('risk').notNull(),
+    title: text('title'),
+    changedAt: ts('changed_at').notNull().defaultNow(),
+    /** 'owner'(사용자 수정) | 'system'(0002 이전 행의 직전 값 보존) */
+    changedBy: text('changed_by').notNull(),
+  },
+  (t) => [
+    unique('capture_revisions_capture_revision_uq').on(t.captureId, t.revision),
+    foreignKey({
+      name: 'capture_revisions_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 콘텐츠 카드(T04): Idea / Audience / Evidence / Risk / Next Decision.
+ * 수정은 revision 낙관적 잠금(stale → 409). 출처 소재 연결은 idea_captures(복합 FK) — 0003 에서 jsonb source_capture_ids 를 없앴다.
+ */
+export const ideas = pgTable(
+  'ideas',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    idea: text('idea').notNull(),
+    audience: text('audience'),
+    evidence: text('evidence'),
+    nextQuestion: text('next_question'),
+    nextDecision: text('next_decision'),
+    risk: text('risk').notNull().default('none'),
+    lifecycle: text('lifecycle').notNull().default('candidate'),
+    tags: jsonb('tags').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    revision: integer('revision').notNull().default(1),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('ideas_id_owner_uq').on(t.id, t.ownerId),
+    index('ideas_owner_updated_idx').on(t.ownerId, t.updatedAt.desc(), t.id.desc()),
+    index('ideas_idea_trgm_idx').using('gin', t.idea.op('gin_trgm_ops')),
+  ],
+);
+
+/**
+ * 원고(T04). 본문은 content_versions(불변)에만 있고, current_version_id 가 현재 버전을 가리킨다.
+ * revision 은 메타데이터(제목·연재·독자·태그·상태) 수정용 낙관적 잠금 — 본문 버전과 별개다.
+ * lifecycle: draft|review|ready|archived(CHECK). "게시됨" 같은 단일 published 플래그는 두지 않는다(docs/04, 배포는 M3 별도 테이블).
+ */
+export const contents = pgTable(
+  'contents',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ideaId: uuid('idea_id'),
+    series: text('series'),
+    title: text('title').notNull(),
+    audience: text('audience'),
+    tags: jsonb('tags').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    revision: integer('revision').notNull().default(1),
+    /** content_versions.id — 순환 FK 를 피하려고 애플리케이션 계층에서 검증한다(M1 T04). */
+    currentVersionId: uuid('current_version_id'),
+    lifecycle: text('lifecycle').notNull().default('draft'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    // content_captures 가 "같은 owner 의 content" 만 참조하도록 복합 FK 대상.
+    unique('contents_id_owner_uq').on(t.id, t.ownerId),
+    // 같은 owner 의 idea 만 연결(복합 FK). idea_id 가 null 이면 검사하지 않는다(MATCH SIMPLE).
+    foreignKey({
+      name: 'contents_idea_same_owner_fk',
+      columns: [t.ideaId, t.ownerId],
+      foreignColumns: [ideas.id, ideas.ownerId],
+    }).onDelete('restrict'),
+    check('contents_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review', 'ready', 'archived')`),
+    index('contents_owner_updated_idx').on(t.ownerId, t.updatedAt.desc(), t.id.desc()),
+    index('contents_title_trgm_idx').using('gin', t.title.op('gin_trgm_ops')),
+  ],
+);
+
+/**
+ * 불변(immutable) 버전. 수정은 새 version 행으로만 한다.
+ * DB 트리거 content_versions_immutable(0003)이 UPDATE·DELETE 를 예외로 막는다.
+ */
+export const contentVersions = pgTable(
+  'content_versions',
+  {
+    id: id(),
+    contentId: uuid('content_id')
+      .notNull()
+      .references(() => contents.id, { onDelete: 'restrict' }),
+    version: integer('version').notNull(),
+    body: text('body').notNull(),
+    createdBy: text('created_by').notNull(),
+    aiRunId: uuid('ai_run_id'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    /** T04: 저장 메모(선택). 버전과 함께 불변. */
+    note: text('note'),
+  },
+  (t) => [
+    unique('content_versions_content_version_uq').on(t.contentId, t.version),
+    index('content_versions_body_trgm_idx').using('gin', t.body.op('gin_trgm_ops')),
+  ],
+);
+
+/**
+ * 채널별 파생본(T09, 결정 D14). 원고 하나에 채널마다 하나(unique(content_id, channel)).
+ * lifecycle 은 draft | review | approved(T10 — 서버 승인만 만든다, 철회 → review, 새 버전 → draft). stale 은 저장하지 않고 "현재 버전의 content_version_id ≠ 원고의 현재 버전"으로 파생한다.
+ * current_version_id 는 variant_versions.id — 순환 FK 를 피하려고 앱에서 검증한다(contents 와 같은 방식).
+ */
+export const variants = pgTable(
+  'variants',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    channel: text('channel').notNull(),
+    currentVersionId: uuid('current_version_id'),
+    lifecycle: text('lifecycle').notNull().default('draft'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('variants_content_channel_uq').on(t.contentId, t.channel),
+    unique('variants_id_owner_uq').on(t.id, t.ownerId),
+    check('variants_channel_chk', sql`${t.channel} in ('threads', 'instagram', 'youtube', 'blog')`),
+    // T10(0016, D17): 'approved' = 이 파생본의 현재 버전을 담은 배포 항목에 활성 승인이 있음(approveItems 만 만든다).
+    check('variants_lifecycle_chk', sql`${t.lifecycle} in ('draft', 'review', 'approved')`),
+    foreignKey({
+      name: 'variants_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 파생본 버전(T09, 불변 — 추가 전용 트리거). content_version_id = 이 버전을 만든 원고 버전(stale 판정 기준).
+ * metadata_json = 채널별 필드(@cs/domain channel.ts). created_by 'owner' | 'ai:mock'(AI 제안은 채택 전까지 현재 버전이 아니다).
+ */
+export const variantVersions = pgTable(
+  'variant_versions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    variantId: uuid('variant_id').notNull(),
+    version: integer('version').notNull(),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    body: text('body').notNull(),
+    metadataJson: jsonb('metadata_json').$type<Record<string, unknown>>().notNull(),
+    createdBy: text('created_by').notNull(),
+    aiRunId: uuid('ai_run_id'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('variant_versions_variant_version_uq').on(t.variantId, t.version),
+    unique('variant_versions_id_owner_uq').on(t.id, t.ownerId),
+    check('variant_versions_created_by_chk', sql`${t.createdBy} = 'owner' or ${t.createdBy} like 'ai:%'`),
+    check('variant_versions_version_chk', sql`${t.version} >= 1`),
+    foreignKey({
+      name: 'variant_versions_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 원고 ↔ 원문(수집) 관계(T04). 같은 owner 끼리만(두 복합 FK). role: 'origin'(원고의 출처 소재). */
+export const contentCaptures = pgTable(
+  'content_captures',
+  {
+    id: id(),
+    contentId: uuid('content_id').notNull(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    role: text('role').notNull().default('origin'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('content_captures_content_capture_uq').on(t.contentId, t.captureId),
+    index('content_captures_capture_idx').on(t.captureId),
+    foreignKey({
+      name: 'content_captures_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'content_captures_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 카드 ↔ 원문(수집) 관계(T04). 같은 owner 끼리만(두 복합 FK). */
+export const ideaCaptures = pgTable(
+  'idea_captures',
+  {
+    id: id(),
+    ideaId: uuid('idea_id').notNull(),
+    captureId: uuid('capture_id').notNull(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    role: text('role').notNull().default('origin'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('idea_captures_idea_capture_uq').on(t.ideaId, t.captureId),
+    index('idea_captures_capture_idx').on(t.captureId),
+    foreignKey({
+      name: 'idea_captures_idea_same_owner_fk',
+      columns: [t.ideaId, t.ownerId],
+      foreignColumns: [ideas.id, ideas.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'idea_captures_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 인터뷰 답변(T06, 결정 D12). 불변: 행은 추가만 한다(트리거 interview_answers_immutable). 다시 답하면 새 행,
+ * 같은 question_key 의 가장 최근 행이 "현재 답변"이다. 답변은 사용자만 입력한다(AI 가 채우지 않음).
+ */
+export const interviewAnswers = pgTable(
+  'interview_answers',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    questionKey: text('question_key').notNull(),
+    /** FIX-T06(P2): 원고 안 저장 순번(원고 잠금 안에서 최대+1). 질문별 최신 판정은 created_at 이 아니라 이 값으로 한다. */
+    seq: integer('seq').notNull(),
+    question: text('question').notNull(),
+    answer: text('answer').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    // generation_runs 입력 확인 시 "같은 owner·같은 원고의 답변" 조회용
+    index('interview_answers_content_idx').on(t.contentId, t.questionKey, t.createdAt.desc()),
+    check('interview_answers_question_key_chk', sql`${t.questionKey} in ('situation', 'judgment', 'takeaway')`),
+    unique('interview_answers_content_seq_uq').on(t.contentId, t.seq),
+    foreignKey({
+      name: 'interview_answers_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * AI 작성 보조 실행 기록(T06). 입력 버전(현재 본문 버전·브랜드 프로필 버전·답변 ID)을 고정해 남긴다.
+ * status: running → succeeded | failed. 성공하면 output_ref = 제안 버전(content_versions, created_by='ai:mock', 현재 버전 아님).
+ * output_json = { claims, followup_questions, warnings, proposed_tags, result_type }(모델 출력 — 승인·출처 증거 아님).
+ */
+export const generationRuns = pgTable(
+  'generation_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentId: uuid('content_id').notNull(),
+    mode: text('mode').notNull(),
+    inputVersionId: uuid('input_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    brandProfileId: uuid('brand_profile_id').notNull(),
+    inputVersionRefs: jsonb('input_version_refs').$type<Record<string, unknown>>().notNull(),
+    promptVersion: text('prompt_version').notNull(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    status: text('status').notNull(),
+    outputRef: uuid('output_ref').references(() => contentVersions.id, { onDelete: 'restrict' }),
+    outputJson: jsonb('output_json').$type<Record<string, unknown>>(),
+    /** T09: 채널 초안 run 의 대상 파생본(mode='variant' 일 때만). */
+    variantId: uuid('variant_id'),
+    /**
+     * FIX-T09(P1, 0011): 제안의 처리 상태 — 'proposed'(채택·무시 전) | 'adopted' | 'dismissed'. 버전 번호 선후가 아니라 이 값으로
+     * 미채택 제안을 찾는다(뒤에 수정·첨부 변경이 있어도 제안이 사라지지 않게).
+     */
+    proposalStatus: text('proposal_status').notNull().default('proposed'),
+    error: text('error'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    finishedAt: ts('finished_at'),
+  },
+  (t) => [
+    unique('generation_runs_id_owner_uq').on(t.id, t.ownerId),
+    index('generation_runs_content_idx').on(t.contentId, t.createdAt.desc()),
+    // T09: 'variant' = 채널 초안 AI 제안(variant_id 필수). 결과는 variant_versions(created_by='ai:mock', ai_run_id)이고 output_ref 는 null.
+    check('generation_runs_mode_chk', sql`${t.mode} in ('outline', 'draft', 'revise', 'variant')`),
+    check('generation_runs_proposal_status_chk', sql`${t.proposalStatus} in ('proposed', 'adopted', 'dismissed')`),
+    check('generation_runs_variant_chk', sql`(${t.mode} = 'variant') = (${t.variantId} is not null)`),
+    foreignKey({
+      name: 'generation_runs_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
+    check('generation_runs_status_chk', sql`${t.status} in ('running', 'succeeded', 'failed')`),
+    foreignKey({
+      name: 'generation_runs_content_same_owner_fk',
+      columns: [t.contentId, t.ownerId],
+      foreignColumns: [contents.id, contents.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'generation_runs_brand_same_owner_fk',
+      columns: [t.brandProfileId, t.ownerId],
+      foreignColumns: [brandProfiles.id, brandProfiles.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 경험 claim 확인(T06, A03). 사용자가 "이 1인칭 경험은 사실"이라고 확인한 기록 — AI 가 만들지 않는다.
+ * 불변(트리거 claim_confirmations_immutable). (run_id, claim_index) unique.
+ */
+export const claimConfirmations = pgTable(
+  'claim_confirmations',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    claimIndex: integer('claim_index').notNull(),
+    /**
+     * FIX-T06(P1): 'confirmed' = 사용자가 실제 경험이라고 확인, 'removed' = 사용자가 그 문장을 본문에서 뺐거나 고쳤다고 표시.
+     * 둘 다 사용자 주장이며 AI 가 만들지 않는다. A03 게이트는 둘 다 "해결됨"으로 본다.
+     */
+    resolution: text('resolution').notNull().default('confirmed'),
+    /**
+     * FIX-T06 round 2: 해결을 기록할 때의 현재 본문 버전(0007). 'removed' 는 이 버전에 claim 문장이 없음을 서버가 확인한 뒤에만 저장되고,
+     * 이후에도 "현재 본문에 없을 때만" 해결로 본다(다시 넣으면 다시 미해결). 0007 이전 행은 null.
+     */
+    bodyVersionId: uuid('body_version_id').references(() => contentVersions.id, { onDelete: 'restrict' }),
+    confirmedAt: ts('confirmed_at').notNull().defaultNow(),
+  },
+  (t) => [
+    // 0007: claim 하나에 해결 방식별 한 행(확인·제외가 각각 한 번씩 가능 — 제외 후 다시 넣은 문장을 나중에 확인할 수 있게).
+    unique('claim_confirmations_run_claim_resolution_uq').on(t.runId, t.claimIndex, t.resolution),
+    check('claim_confirmations_claim_index_chk', sql`${t.claimIndex} >= 0`),
+    check('claim_confirmations_resolution_chk', sql`${t.resolution} in ('confirmed', 'removed')`),
+    foreignKey({
+      name: 'claim_confirmations_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 주장(claim)과 근거(T07, 결정 D13). AI 제안 버전(content_versions)마다 출력 claim 을 한 행씩 남긴다(불변, 추가 전용 트리거).
+ * - evidence_grade: 저장 시점 판정 'none' | 'source'(허용 목록 안 출처가 있음). 'user_confirmed' 는 저장하지 않고
+ *   claim_confirmations(resolution='confirmed')에서 화면·API 가 파생한다(claims 는 불변).
+ * - needs_check: 경험 claim, 근거 없는 사실 claim, 허용 목록 밖 출처를 버린 claim.
+ * - 모델이 만든(허용 목록에 없는) 출처는 claim_sources 에 저장하지 않는다.
+ */
+export const claims = pgTable(
+  'claims',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    /** T09: 채널 초안 run 의 claim 이면 그 제안 variant_version(content_version_id 는 파생 기준 원고 버전). */
+    variantVersionId: uuid('variant_version_id').references(() => variantVersions.id, { onDelete: 'restrict' }),
+    claimIndex: integer('claim_index').notNull(),
+    statement: text('statement').notNull(),
+    kind: text('kind').notNull(),
+    evidenceGrade: text('evidence_grade').notNull(),
+    personalExperienceConfirmed: boolean('personal_experience_confirmed').notNull().default(false),
+    needsCheck: boolean('needs_check').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('claims_id_owner_uq').on(t.id, t.ownerId),
+    // T09: 한 원고 버전에서 여러 run(원고 제안·채널 초안)이 나올 수 있어 run 기준으로 바꿨다.
+    unique('claims_run_index_uq').on(t.runId, t.claimIndex),
+    // FIX-T07(P1): 'user_confirmed' 는 저장하지 않는다 — claim_confirmations(confirmed)에서만 파생(0010 에서 기존 값은 'none' 으로).
+    check('claims_evidence_grade_chk', sql`${t.evidenceGrade} in ('none', 'source')`),
+    check('claims_kind_chk', sql`${t.kind} in ('fact', 'opinion', 'experience')`),
+    foreignKey({
+      name: 'claims_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** claim ↔ 허용된 source_version(T07). locator = 출처 위치(URL 등, 사용자 소재에서 온 값). 불변. */
+export const claimSources = pgTable(
+  'claim_sources',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    claimId: uuid('claim_id').notNull(),
+    sourceVersionId: uuid('source_version_id')
+      .notNull()
+      .references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    locator: text('locator'),
+    supportNote: text('support_note'),
+  },
+  (t) => [
+    unique('claim_sources_claim_source_uq').on(t.claimId, t.sourceVersionId),
+    foreignKey({
+      name: 'claim_sources_claim_same_owner_fk',
+      columns: [t.claimId, t.ownerId],
+      foreignColumns: [claims.id, claims.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * AI 비용 원장(T07, A15). T08: 음성 전사 job 도 같은 원장을 쓴다 — 행마다 run_id 또는 transcription_job_id 중 정확히 하나.
+ * run 마다 한 행: 호출 전 reserved(예약액) → 호출 후 settled(실제액).
+ * 실패한 호출도 settled + actual = reserved + failed=true 로 남긴다(docs/02: 실패 재시도도 예약량에 반영). released 는 예약 취소(현재 경로 없음).
+ * 금액은 numeric(18,6) 문자열. pricing_snapshot 에는 단가 값만(키·비밀 없음).
+ */
+export const usageLedger = pgTable(
+  'usage_ledger',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id'),
+    /** T08: 음성 전사 job(모의 포함). run_id 와 둘 중 하나만. */
+    transcriptionJobId: uuid('transcription_job_id'),
+    /** T08: 예약·확정에 쓴 음성 길이(초). 전사 원장만. */
+    audioSeconds: integer('audio_seconds'),
+    reservedAmount: numeric('reserved_amount', { precision: 18, scale: 6 }).notNull(),
+    actualAmount: numeric('actual_amount', { precision: 18, scale: 6 }),
+    currency: text('currency').notNull(),
+    tokensIn: integer('tokens_in'),
+    tokensOut: integer('tokens_out'),
+    pricingSnapshot: jsonb('pricing_snapshot').$type<Record<string, unknown>>().notNull(),
+    state: text('state').notNull(),
+    failed: boolean('failed').notNull().default(false),
+    /** FIX-T07(P1, 0010): 실제액이 예약액을 넘은 만큼(숨기거나 자르지 않는다). 넘지 않았으면 0. */
+    overageAmount: numeric('overage_amount', { precision: 18, scale: 6 }).notNull().default('0'),
+    /** 실제액 > 예약액 이었으면 true */
+    overBudget: boolean('over_budget').notNull().default(false),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    settledAt: ts('settled_at'),
+  },
+  (t) => [
+    unique('usage_ledger_run_uq').on(t.runId),
+    unique('usage_ledger_transcription_job_uq').on(t.transcriptionJobId),
+    check('usage_ledger_subject_chk', sql`num_nonnulls(${t.runId}, ${t.transcriptionJobId}) = 1`),
+    check('usage_ledger_state_chk', sql`${t.state} in ('reserved', 'settled', 'released')`),
+    index('usage_ledger_owner_created_idx').on(t.ownerId, t.createdAt),
+    foreignKey({
+      name: 'usage_ledger_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [generationRuns.id, generationRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'usage_ledger_transcription_job_same_owner_fk',
+      columns: [t.transcriptionJobId, t.ownerId],
+      foreignColumns: [transcriptionJobs.id, transcriptionJobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 파일 메타데이터. 파일 바이트는 StorageAdapter(개발: local-file)에 두고 DB 에는 key·checksum 만 저장한다.
+ * (owner_id, checksum) unique: 같은 owner 의 동일 파일은 한 행만(T02: 중복 업로드는 기존 asset 반환).
+ */
+export const assets = pgTable(
+  'assets',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    key: text('key').notNull().unique(),
+    mime: text('mime').notNull(),
+    bytes: bigint('bytes', { mode: 'number' }).notNull(),
+    checksum: text('checksum').notNull(),
+    rightsStatus: text('rights_status').notNull().default('unknown'),
+    verificationState: text('verification_state').notNull().default('pending'),
+    /**
+     * T08(D15): VERIFIED 가 실제로 확인한 범위. 'signature_size_checksum' = 앞부분 형식 서명·크기·sha256(디코딩·재생 가능 여부는 확인 안 함).
+     */
+    verificationScope: text('verification_scope').notNull().default('signature_size_checksum'),
+    /** T08: 원음 보존을 끈 전사 뒤 파일을 지운 시각. 행(메타데이터)은 남고 다운로드는 410. */
+    deletedAt: ts('deleted_at'),
+    /**
+     * FIX-T08 round 2(0013): 지울 파일의 저장 key(삭제 의도). 원음 삭제·재업로드 복구가 먼저 이 값을 커밋하고, 커밋 뒤 파일을 지운 다음 비운다.
+     * 파일 삭제가 실패하거나 프로세스가 죽으면 값이 남고 worker(assets.cleanup)가 다시 시도한다. 현재 key 와 같은 파일은 지우지 않는다.
+     * 운영 상태이므로 내보내기 묶음에 넣지 않는다(복원한 행은 항상 null — 묶음이 다른 파일 삭제를 지시하지 못하게).
+     */
+    pendingDeleteKey: text('pending_delete_key'),
+    /**
+     * FIX-T08 round 3(0014): 정리 실패 횟수와 다음 재시도 시각(지수 backoff, 최대 6시간). 성공하면 비운다. 운영 상태 — 묶음에 넣지 않음.
+     * round 4(0015): 의도를 만들 때 next_at = 만든 시각(NULL 아님) — 새 의도와 재시도가 한 시간축으로 줄을 선다.
+     */
+    pendingDeleteAttempts: integer('pending_delete_attempts').notNull().default(0),
+    pendingDeleteNextAt: ts('pending_delete_next_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('assets_owner_checksum_uq').on(t.ownerId, t.checksum),
+    // T09: variant_assets 가 "같은 owner 의 파일" 만 참조하도록 복합 FK 대상.
+    unique('assets_id_owner_uq').on(t.id, t.ownerId),
+  ],
+);
+
+/**
+ * 채널 초안 버전의 첨부 파일(T09). 버전과 함께 불변(추가 전용 트리거). 순서(position)는 버전 안에서 unique.
+ * role: image | video | thumbnail | attachment — 역할과 파일 형식이 맞는지는 앱이 검사한다(image/thumbnail 은 image/*, video 는 video/*).
+ */
+export const variantAssets = pgTable(
+  'variant_assets',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    variantVersionId: uuid('variant_version_id').notNull(),
+    assetId: uuid('asset_id').notNull(),
+    position: integer('position').notNull(),
+    role: text('role').notNull(),
+  },
+  (t) => [
+    unique('variant_assets_version_position_uq').on(t.variantVersionId, t.position),
+    check('variant_assets_role_chk', sql`${t.role} in ('image', 'video', 'thumbnail', 'attachment')`),
+    check('variant_assets_position_chk', sql`${t.position} >= 1`),
+    foreignKey({
+      name: 'variant_assets_version_same_owner_fk',
+      columns: [t.variantVersionId, t.ownerId],
+      foreignColumns: [variantVersions.id, variantVersions.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'variant_assets_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 감사 기록. owner_id 는 인증 전 이벤트(예: auth.login_denied — 아직 owner 가 확인되지 않음)에 한해 null(T02).
+ * owner 범위 조회는 owner_id 로 필터하므로 null 행은 어떤 owner 의 목록에도 나타나지 않는다.
+ */
+export const auditEvents = pgTable(
+  'audit_events',
+  {
+    id: id(),
+    ownerId: uuid('owner_id').references(() => users.id, { onDelete: 'restrict' }),
+    action: text('action').notNull(),
+    entity: text('entity').notNull(),
+    entityId: uuid('entity_id'),
+    versionOrHash: text('version_or_hash'),
+    at: ts('at').notNull().defaultNow(),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  // FIX2-FULLREV2(G15): 로그인 판정(countRecentLoginFailures·취소 기록 상한)이 (action, 시간 창)으로 이 표를 훑는다 — 전체 스캔 대신 색인 범위.
+  (t) => [index('audit_events_action_at_idx').on(t.action, t.at)],
+);
+
+/**
+ * 로그인 세션(T02, 결정 D3). 토큰 원문은 쿠키에만 있고 DB 에는 sha256 hex(token_hash)만 저장한다.
+ * 유효 조건: expires_at > now AND revoked_at IS NULL.
+ * 주의(T05): export/restore 대상에서 제외한다 — 세션은 인증 비밀과 같은 등급이며 이식 대상이 아니다.
+ */
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    tokenHash: text('token_hash').notNull().unique(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    expiresAt: ts('expires_at').notNull(),
+    lastSeenAt: ts('last_seen_at').notNull().defaultNow(),
+    revokedAt: ts('revoked_at'),
+    userAgentHash: text('user_agent_hash'),
+    /**
+     * FIX2-FULLREV2(G16, D40-3): 만들 때의 인증 정책 지문(sessionPolicyFingerprint). 검증 때 현재 정책 지문과 다르면 거부한다.
+     * null = 이 열이 생기기 전 세션 — 언제나 거부(migration 0048 뒤 1회 재로그인).
+     */
+    policyFingerprint: text('policy_fingerprint'),
+  },
+  (t) => [index('sessions_owner_idx').on(t.ownerId)],
+);
+
+/**
+ * T21-P1b: 진행 중인 OIDC 로그인 요청(로그인 전 단계 — owner 없음). state 원문은 저장하지 않고 SHA-256 만(state_hash),
+ * 시작한 브라우저의 결합 쿠키도 해시만(browser_hash). PKCE verifier·nonce 는 봉인(encrypted_payload — AAD 에 이 행 ID, 용도 oidc_login_state).
+ * 한 번만 쓰임(used_at — callback 이 찾으면 결과와 관계없이 사용 처리), TTL 10분, settings_hash = 시작 때의 issuer·client_id·redirect·scope 지문.
+ * 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES — 10분짜리 인증 임시 상태).
+ */
+export const authOidcStates = pgTable(
+  'auth_oidc_states',
+  {
+    id: id(),
+    stateHash: text('state_hash').notNull(),
+    browserHash: text('browser_hash').notNull(),
+    encryptedPayload: text('encrypted_payload').notNull(),
+    keyVersion: integer('key_version').notNull(),
+    settingsHash: text('settings_hash').notNull(),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('auth_oidc_states_hash_uq').on(t.stateHash),
+    check('auth_oidc_states_sealed_chk', sql`${t.encryptedPayload} like 'csk1:%'`),
+    index('auth_oidc_states_created_idx').on(t.createdAt),
+  ],
+);
+
+/**
+ * 내보내기 실행 기록(T05). path 는 워크스페이스 루트 기준 상대 경로(루트 밖이면 파일 이름만) — 비밀·절대 경로를 넣지 않는다.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES) — 환경마다 다른 운영 기록이다.
+ */
+export const exportRuns = pgTable(
+  'export_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    formatVersion: integer('format_version').notNull(),
+    manifestSha256: text('manifest_sha256').notNull(),
+    zipBytes: bigint('zip_bytes', { mode: 'number' }).notNull(),
+    path: text('path').notNull(),
+    status: text('status').notNull(),
+    totals: jsonb('totals').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    check('export_runs_status_chk', sql`${t.status} in ('completed', 'failed')`),
+    index('export_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 복원 실행 기록(T05). preview 는 미리보기 결과(표별 건수·경고), result 는 커밋 결과(표별 건수). 올린 ZIP 은 data/restores/<id>.zip.
+ * status: previewed → committed | rejected(커밋 시 재검증 실패) | failed(커밋 중 오류). 커밋은 한 번만.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES).
+ */
+export const restoreRuns = pgTable(
+  'restore_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    source: text('source').notNull(),
+    manifestSha256: text('manifest_sha256').notNull(),
+    preview: jsonb('preview').$type<Record<string, unknown>>().notNull(),
+    status: text('status').notNull(),
+    committedAt: ts('committed_at'),
+    mode: text('mode'),
+    result: jsonb('result').$type<Record<string, unknown>>(),
+  },
+  (t) => [
+    check('restore_runs_source_chk', sql`${t.source} in ('upload', 'export_run')`),
+    check('restore_runs_status_chk', sql`${t.status} in ('previewed', 'committed', 'rejected', 'failed')`),
+    check('restore_runs_mode_chk', sql`${t.mode} is null or ${t.mode} in ('empty_only', 'add_missing')`),
+    index('restore_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 복원 훈련 기록(T20, 결정 D22). 내보내기 → 버리는 메모리 DB + 빈 저장소에 empty_only 복원 → 표별 행 수·ID·내용 sha256·파일 checksum·검색 확인.
+ * result: pass | fail. mismatch_json 은 불일치 목록(표 이름·종류·건수 — 본문·식별자 원문 없음).
+ * export_run_id 는 훈련용 묶음의 export_id 다 — 훈련 묶음은 export_runs 에 기록하지 않는다(백업으로 세지 않음, 파일은 훈련 뒤 삭제).
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES — 운영 기록, 환경마다 다름).
+ */
+export const restoreDrills = pgTable(
+  'restore_drills',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    startedAt: ts('started_at').notNull(),
+    finishedAt: ts('finished_at').notNull(),
+    exportRunId: uuid('export_run_id'),
+    trigger: text('trigger').notNull(),
+    tablesCompared: integer('tables_compared').notNull(),
+    rowsCompared: integer('rows_compared').notNull(),
+    assetsCompared: integer('assets_compared').notNull(),
+    result: text('result').notNull(),
+    mismatchJson: jsonb('mismatch_json').$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+    bundleSha256: text('bundle_sha256'),
+    /** FIX round 1(Codex review-T20 P1): 준비·비교 중 예외로 끝난 훈련의 정제된 오류 코드(오류 클래스 이름·코드만 — 경로·메시지 없음) */
+    errorCode: text('error_code'),
+    /** FIX round 3(Codex review-FIX-T20 Q2): 검증 범위(빈 표·파일 수·검색 확인·부분 검증 이유) — PASS 가 부분 검증인지 화면에 보인다 */
+    scopeJson: jsonb('scope_json').$type<Record<string, unknown>>(),
+  },
+  (t) => [
+    check('restore_drills_result_chk', sql`${t.result} in ('pass', 'fail')`),
+    check('restore_drills_trigger_chk', sql`${t.trigger} in ('cli', 'api', 'test')`),
+    index('restore_drills_owner_started_idx').on(t.ownerId, t.startedAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 업로드 세션(T08, A14). 큰 음성·영상 파일을 조각으로 받는다. 조각 파일은 STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>.
+ * state: open → completed(조립·검사 중) → verified(asset 생성) | rejected(검사 실패, 조각 삭제) / open → aborted | expired(24시간, worker 가 조각 삭제).
+ * 주의: export/restore 대상에서 제외한다 — 전송 중 임시 상태이며 조각 파일은 묶음에 넣지 않는다.
+ */
+export const uploadSessions = pgTable(
+  'upload_sessions',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    declaredMime: text('declared_mime').notNull(),
+    declaredBytes: bigint('declared_bytes', { mode: 'number' }).notNull(),
+    receivedBytes: bigint('received_bytes', { mode: 'number' }).notNull().default(0),
+    chunkSize: integer('chunk_size').notNull(),
+    checksumExpected: text('checksum_expected'),
+    checksumActual: text('checksum_actual'),
+    state: text('state').notNull().default('open'),
+    /** rejected 이유(코드): size_mismatch | unsupported_signature | mime_mismatch | checksum_mismatch | assembly_failed */
+    rejectReason: text('reject_reason'),
+    assetId: uuid('asset_id'),
+    expiresAt: ts('expires_at').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('upload_sessions_id_owner_uq').on(t.id, t.ownerId),
+    check('upload_sessions_kind_chk', sql`${t.kind} in ('audio', 'video')`),
+    check('upload_sessions_state_chk', sql`${t.state} in ('open', 'completed', 'verified', 'rejected', 'aborted', 'expired')`),
+    check('upload_sessions_bytes_chk', sql`${t.declaredBytes} > 0 and ${t.receivedBytes} >= 0`),
+    check('upload_sessions_chunk_size_chk', sql`${t.chunkSize} between 4194304 and 8388608`),
+    index('upload_sessions_owner_created_idx').on(t.ownerId, t.createdAt.desc()),
+    index('upload_sessions_state_expires_idx').on(t.state, t.expiresAt),
+    foreignKey({
+      name: 'upload_sessions_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 받은 조각(T08). 같은 번호를 같은 sha256 으로 다시 보내면 그대로(멱등), 다른 sha256 이면 409. export 제외. */
+export const uploadChunks = pgTable(
+  'upload_chunks',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    chunkIndex: integer('chunk_index').notNull(),
+    bytes: integer('bytes').notNull(),
+    sha256: text('sha256').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('upload_chunks_session_index_uq').on(t.sessionId, t.chunkIndex),
+    check('upload_chunks_index_chk', sql`${t.chunkIndex} >= 0 and ${t.bytes} > 0`),
+    foreignKey({
+      name: 'upload_chunks_session_same_owner_fk',
+      columns: [t.sessionId, t.ownerId],
+      foreignColumns: [uploadSessions.id, uploadSessions.ownerId],
+    }).onDelete('cascade'),
+  ],
+);
+
+/**
+ * 음성 전사 job(T08, 결정 D9). queued → running(진행률 25·50·75) → succeeded(100, transcripts v1) | failed / queued·running → canceled.
+ * provider 는 T08 에서 항상 'mock'. transcript_version_id 는 이 job 이 만든 첫 전사(v1) — transcripts 와 서로 참조하므로 DB FK 대신
+ * 앱·묶음 검사로 강제한다(같은 job·같은 owner).
+ * 같은 asset 에 진행 중(queued·running) job 은 하나만(부분 unique 색인).
+ */
+export const transcriptionJobs = pgTable(
+  'transcription_jobs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    assetId: uuid('asset_id').notNull(),
+    state: text('state').notNull().default('queued'),
+    provider: text('provider').notNull().default('mock'),
+    model: text('model').notNull(),
+    progress: integer('progress').notNull().default(0),
+    transcriptVersionId: uuid('transcript_version_id'),
+    error: text('error'),
+    attempts: integer('attempts').notNull().default(0),
+    /** false 면 전사 성공 뒤 원본 파일을 지운다(assets.deleted_at). */
+    keepOriginal: boolean('keep_original').notNull().default(true),
+    /** 예약에 쓴 음성 길이(초) */
+    audioSeconds: integer('audio_seconds').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    startedAt: ts('started_at'),
+    finishedAt: ts('finished_at'),
+  },
+  (t) => [
+    unique('transcription_jobs_id_owner_uq').on(t.id, t.ownerId),
+    check('transcription_jobs_state_chk', sql`${t.state} in ('queued', 'running', 'succeeded', 'failed', 'canceled')`),
+    check('transcription_jobs_progress_chk', sql`${t.progress} between 0 and 100`),
+    check('transcription_jobs_audio_seconds_chk', sql`${t.audioSeconds} > 0`),
+    index('transcription_jobs_owner_asset_idx').on(t.ownerId, t.assetId, t.createdAt.desc()),
+    index('transcription_jobs_state_idx').on(t.state, t.createdAt),
+    uniqueIndex('transcription_jobs_active_asset_uq').on(t.assetId).where(sql`${t.state} in ('queued', 'running')`),
+    foreignKey({
+      name: 'transcription_jobs_asset_same_owner_fk',
+      columns: [t.assetId, t.ownerId],
+      foreignColumns: [assets.id, assets.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 전사 본문 버전(T08). 불변(추가 전용 트리거). v1 = 전사기 결과(created_by 'mock'), 이후 = 사용자 수정(created_by 'owner').
+ * segments = [{start_ms, end_ms, text}] (사용자 수정 버전은 []).
+ */
+export const transcripts = pgTable(
+  'transcripts',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    version: integer('version').notNull(),
+    text: text('text').notNull(),
+    segments: jsonb('segments').$type<Array<{ start_ms: number; end_ms: number; text: string }>>().notNull().default(sql`'[]'::jsonb`),
+    createdBy: text('created_by').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('transcripts_job_version_uq').on(t.jobId, t.version),
+    unique('transcripts_id_owner_uq').on(t.id, t.ownerId),
+    check('transcripts_created_by_chk', sql`${t.createdBy} in ('mock', 'owner')`),
+    check('transcripts_version_chk', sql`${t.version} >= 1`),
+    foreignKey({
+      name: 'transcripts_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [transcriptionJobs.id, transcriptionJobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T10 배포 계획·승인·실행(결정 D17, migration 0016) ----
+
+/**
+ * 배포 계정. M3 에는 kind='mock' 행만 있다(external_account_id 는 'mock:' 접두어, state 'mock_ready'). 인증 비밀은 여기 두지 않는다(T13).
+ * 상태 변경(setChannelAccountState)은 이 계정을 쓰는 활성 승인을 무효로 한다(A06 account_changed).
+ */
+export const channelAccounts = pgTable(
+  'channel_accounts',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    platform: text('platform').notNull(),
+    kind: text('kind').notNull(),
+    externalAccountId: text('external_account_id').notNull(),
+    displayName: text('display_name').notNull(),
+    state: text('state').notNull(),
+    capabilitySnapshot: jsonb('capability_snapshot').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    /**
+     * T13(D24): 연결 정보(oauth_credentials) 관계 — none(연결한 적 없음 · 모의 계정은 M3 동작 그대로) · linked(연결함 — 실행에 유효한 연결 정보 필요)
+     * · needs_reconnect(복원 등으로 연결 정보 없이 들어옴 — 다시 연결 전까지 실행 차단). 묶음에는 들어가지만 복원 동일성 비교에서는 뺀다(운영 상태).
+     */
+    credentialState: text('credential_state').notNull().default('none'),
+  },
+  (t) => [
+    check('channel_accounts_credential_state_chk', sql`${t.credentialState} in ('none', 'linked', 'needs_reconnect')`),
+    unique('channel_accounts_owner_platform_external_uq').on(t.ownerId, t.platform, t.externalAccountId),
+    unique('channel_accounts_id_owner_uq').on(t.id, t.ownerId),
+    check('channel_accounts_platform_chk', sql`${t.platform} in ('threads', 'instagram', 'youtube', 'blog')`),
+    check('channel_accounts_kind_chk', sql`${t.kind} in ('mock', 'live')`),
+    check('channel_accounts_state_chk', sql`${t.state} in ('mock_ready', 'connected', 'disconnected', 'revoked')`),
+    check('channel_accounts_mock_prefix_chk', sql`(${t.kind} = 'mock') = (${t.externalAccountId} like 'mock:%')`),
+    check('channel_accounts_mock_ready_chk', sql`${t.state} <> 'mock_ready' or ${t.kind} = 'mock'`),
+  ],
+);
+
+/** 배포 계획. status 는 항목·승인에서 파생해 저장한다(@cs/domain computePlanStatus). revision 은 상태가 바뀔 때마다 +1. */
+export const distributionPlans = pgTable(
+  'distribution_plans',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    targetSummary: text('target_summary').notNull().default(''),
+    status: text('status').notNull().default('draft'),
+    revision: integer('revision').notNull().default(1),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('distribution_plans_id_owner_uq').on(t.id, t.ownerId),
+    check(
+      'distribution_plans_status_chk',
+      sql`${t.status} in ('draft', 'partially_approved', 'approved', 'executing', 'partial', 'attention', 'completed', 'canceled', 'failed')`,
+    ),
+    index('distribution_plans_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * 배포 항목 = 승인 대상 불변 스냅샷(docs/03 승인 스냅샷). payload_json 은 canonical publish payload, payload_hash = sha256(canonical JSON).
+ * 트리거 distribution_items_snapshot_immutable: 스냅샷 열(및 ID·owner·계획·생성 시각)을 바꾸는 UPDATE 와 모든 DELETE 를 거부 — status·updated_at 만 바뀐다.
+ * unique(owner, plan, account, variant_version, payload_hash) = docs/03 "중복·재시도 규칙"의 로컬 key.
+ */
+export const distributionItems = pgTable(
+  'distribution_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    planId: uuid('plan_id').notNull(),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    variantId: uuid('variant_id').notNull(),
+    variantVersionId: uuid('variant_version_id').notNull(),
+    contentVersionId: uuid('content_version_id')
+      .notNull()
+      .references(() => contentVersions.id, { onDelete: 'restrict' }),
+    brandProfileId: uuid('brand_profile_id'),
+    brandProfileVersion: integer('brand_profile_version'),
+    payloadJson: jsonb('payload_json').$type<Record<string, unknown>>().notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    requestedResult: text('requested_result').notNull(),
+    visibility: text('visibility').notNull(),
+    scheduledAtUtc: ts('scheduled_at_utc'),
+    scheduleTimezone: text('schedule_timezone').notNull().default('Europe/Moscow'),
+    status: text('status').notNull().default('PLANNED'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+    /**
+     * FIX-T10(0019): 복원 때 진행 중(작업은 복원하지 않음)이던 항목 — 자동 실행·재시도 금지, 사용자 확인 필요. 상태(UNKNOWN 등)와 별개의 속성이라
+     * 결과 불명 상태를 BLOCKED 로 덮어쓰지 않는다(D17 개정).
+     */
+    restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
+  },
+  (t) => [
+    unique('distribution_items_local_key_uq').on(t.ownerId, t.planId, t.channelAccountId, t.variantVersionId, t.payloadHash),
+    unique('distribution_items_id_owner_uq').on(t.id, t.ownerId),
+    index('distribution_items_plan_idx').on(t.planId),
+    index('distribution_items_variant_idx').on(t.variantId),
+    index('distribution_items_account_idx').on(t.channelAccountId),
+    check('distribution_items_requested_result_chk', sql`${t.requestedResult} in ('mock_publish', 'upload_private', 'public_publish')`),
+    check('distribution_items_visibility_chk', sql`${t.visibility} in ('private', 'unlisted', 'public')`),
+    check('distribution_items_timezone_chk', sql`${t.scheduleTimezone} = 'Europe/Moscow'`),
+    check('distribution_items_hash_chk', sql`${t.payloadHash} ~ '^[0-9a-f]{64}$'`),
+    check('distribution_items_brand_chk', sql`(${t.brandProfileId} is null) = (${t.brandProfileVersion} is null)`),
+    check(
+      'distribution_items_status_chk',
+      sql`${t.status} in ('PLANNED', 'QUEUED', 'SENDING', 'REMOTE_PROCESSING', 'CONFIRMED', 'RETRY_WAIT', 'BLOCKED', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED', 'CANCELED', 'FAILED', 'PARTIAL')`,
+    ),
+    foreignKey({
+      name: 'distribution_items_plan_same_owner_fk',
+      columns: [t.planId, t.ownerId],
+      foreignColumns: [distributionPlans.id, distributionPlans.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_variant_same_owner_fk',
+      columns: [t.variantId, t.ownerId],
+      foreignColumns: [variants.id, variants.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_variant_version_same_owner_fk',
+      columns: [t.variantVersionId, t.ownerId],
+      foreignColumns: [variantVersions.id, variantVersions.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'distribution_items_brand_same_owner_fk',
+      columns: [t.brandProfileId, t.ownerId],
+      foreignColumns: [brandProfiles.id, brandProfiles.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 승인(docs/03). 서버 approveItems 만 만든다(클라이언트·LLM 플래그는 승인이 아님). payload_hash·purpose 는 항목과 같아야 한다(INSERT 트리거).
+ * 트리거 approvals_guard: DELETE 거부, UPDATE 는 revoked_at·revoke_reason 을 NULL → 값으로 한 번만(다른 열 변경 거부).
+ * 항목마다 활성(revoked_at IS NULL) 승인은 최대 1개(부분 unique).
+ */
+export const approvals = pgTable(
+  'approvals',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    distributionItemId: uuid('distribution_item_id').notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    purpose: text('purpose').notNull(),
+    approvalVersion: integer('approval_version').notNull().default(1),
+    approvedAt: ts('approved_at').notNull(),
+    revokedAt: ts('revoked_at'),
+    revokeReason: text('revoke_reason'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('approvals_id_owner_uq').on(t.id, t.ownerId),
+    uniqueIndex('approvals_active_item_uq').on(t.distributionItemId).where(sql`${t.revokedAt} is null`),
+    check('approvals_purpose_chk', sql`${t.purpose} in ('mock_publish', 'upload_private', 'public_publish')`),
+    check('approvals_version_chk', sql`${t.approvalVersion} >= 1`),
+    check('approvals_revoke_pair_chk', sql`(${t.revokedAt} is null) = (${t.revokeReason} is null)`),
+    foreignKey({
+      name: 'approvals_item_same_owner_fk',
+      columns: [t.distributionItemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * DB 작업(docs/04 jobs) = transactional outbox 의 작업 행. T10 은 execute 에서 QUEUED 로 만들고, T11(D18) 작업 처리기가 처리한다.
+ * idempotency_key = 'publish:<item>:<approval>' unique. 같은 항목의 진행 중 작업(ACTIVE_JOB_STATES)은 1개(부분 unique).
+ * 상태 전이는 @cs/domain jobs.ts JOB_TRANSITIONS 로만. lease_owner·lease_until 은 전송·조회 lease(짧은 트랜잭션), heartbeat_at 은 연장 시각.
+ * attempt = 전송 시도 횟수(전송 lease 마다 +1), reconcile_count = 이번 시도의 원격 조회 **연속** 확인 불가 횟수.
+ * FIX1-FULLREV2(G5): 원격 처리 중(processing) 조회는 이 열을 0 으로 되돌리고, 처리 중 조회 수(REMOTE_POLL_MAX 한도)는 job_events 에서 따로 센다(jobs.ts).
+ */
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    itemId: uuid('item_id'),
+    payloadRef: text('payload_ref').notNull(),
+    state: text('state').notNull(),
+    attempt: integer('attempt').notNull().default(0),
+    leaseOwner: text('lease_owner'),
+    leaseUntil: ts('lease_until'),
+    nextRunAt: ts('next_run_at').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+    heartbeatAt: ts('heartbeat_at'),
+    lastErrorCode: text('last_error_code'),
+    lastRetryClass: text('last_retry_class'),
+    maxAttempts: integer('max_attempts').notNull().default(5),
+    reconcileCount: integer('reconcile_count').notNull().default(0),
+    cancelRequestedAt: ts('cancel_requested_at'),
+    doneAt: ts('done_at'),
+    /** FIX-T11(0020): 묶음에서 복원한 작업(읽기 전용 이력 — 자동 lease·재시도 없음, 사용자 재확인만). */
+    restoredNeedsReview: boolean('restored_needs_review').notNull().default(false),
+    /** FIX-T11 round 2(0022): 전송 의도 없이 lease 가 만료된 횟수(시도가 아님 — 한도 PRE_INTENT_EXPIRY_LIMIT 에 이르면 FAILED). */
+    leaseExpiredBeforeIntent: integer('lease_expired_before_intent').notNull().default(0),
+    /**
+     * FIX-T14(0034, Codex review-T14 missed case): 원격 처리 지연(REMOTE_PROCESSING) 뒤의 재개(resume) 횟수 — 장애가 아니므로 시도 한도에서 뺀다
+     * (센 시도 = attempt - resume_count). 상한 FREE_RESUME_MAX. 장애 뒤(RECONCILING)의 재개는 여기 넣지 않는다(시도로 센다).
+     * 같은 열로 세지 않는 시도: T15 upload_yield, FIX2-LIVEP2 게시 시도 표식 전 즉시 중지 보류(BLOCKED — 사용자 재개·재시도로만 다음 시도).
+     */
+    resumeCount: integer('resume_count').notNull().default(0),
+  },
+  (t) => [
+    unique('jobs_idempotency_key_uq').on(t.idempotencyKey),
+    unique('jobs_id_owner_uq').on(t.id, t.ownerId),
+    uniqueIndex('jobs_active_item_uq')
+      .on(t.itemId)
+      .where(sql`${t.state} in ('QUEUED', 'LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED')`),
+    index('jobs_state_next_run_idx').on(t.state, t.nextRunAt),
+    check('jobs_kind_chk', sql`${t.kind} in ('publish')`),
+    check('jobs_publish_item_chk', sql`${t.kind} <> 'publish' or ${t.itemId} is not null`),
+    check(
+      'jobs_state_chk',
+      sql`${t.state} in ('QUEUED', 'LEASED', 'SENDING', 'REMOTE_PROCESSING', 'RETRY_WAIT', 'BLOCKED', 'RECONCILING', 'UNKNOWN', 'CANCEL_REQUESTED', 'CANCELED', 'CONFIRMED', 'FAILED')`,
+    ),
+    check('jobs_attempt_chk', sql`${t.attempt} >= 0`),
+    check('jobs_max_attempts_chk', sql`${t.maxAttempts} between 1 and 20`),
+    check('jobs_reconcile_count_chk', sql`${t.reconcileCount} >= 0`),
+    check('jobs_lease_expired_before_intent_chk', sql`${t.leaseExpiredBeforeIntent} >= 0`),
+    check('jobs_resume_count_chk', sql`${t.resumeCount} >= 0 and ${t.resumeCount} <= ${t.attempt}`),
+    check('jobs_retry_class_chk', sql`${t.lastRetryClass} is null or ${t.lastRetryClass} in ('transient_no_side_effect', 'transient_unknown_side_effect', 'permanent', 'auth')`),
+    check('jobs_lease_pair_chk', sql`(${t.leaseOwner} is null) = (${t.leaseUntil} is null)`),
+    foreignKey({
+      name: 'jobs_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** 작업 상태 전이 이력(추가 전용 트리거). event_seq 는 작업마다 1부터. sanitized_details 에 비밀·본문을 넣지 않는다. */
+export const jobEvents = pgTable(
+  'job_events',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    eventSeq: integer('event_seq').notNull(),
+    stateBefore: text('state_before'),
+    stateAfter: text('state_after').notNull(),
+    at: ts('at').notNull().defaultNow(),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    unique('job_events_job_seq_uq').on(t.jobId, t.eventSeq),
+    check('job_events_seq_chk', sql`${t.eventSeq} >= 1`),
+    foreignKey({
+      name: 'job_events_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** HTTP 실행 명령의 멱등 기록(docs/03 "command idempotency key"). 같은 (owner, command_key) 재호출 → 저장된 결과. 추가 전용. */
+export const executeCommands = pgTable(
+  'execute_commands',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    planId: uuid('plan_id').notNull(),
+    commandKey: text('command_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    resultJson: jsonb('result_json').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    unique('execute_commands_owner_key_uq').on(t.ownerId, t.commandKey),
+    foreignKey({
+      name: 'execute_commands_plan_same_owner_fk',
+      columns: [t.planId, t.ownerId],
+      foreignColumns: [distributionPlans.id, distributionPlans.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 전송 의도(transactional outbox 기록, T11 D18). 승인 재검사·SENDING 전이와 **같은 트랜잭션**에서 외부 호출 전에 넣는다.
+ * intent_key = '<job_id>:<attempt>' = 어댑터 멱등 토큰. 의도가 있는데 결과(outcome)가 pending 이면 "보냈을 수도 있음" → 재전송 금지, 조회(A20).
+ * 트리거 send_intents_guard: DELETE 거부, UPDATE 는 outcome 이 pending 일 때 한 번만(submitted_at·outcome·provider_request_id·remote_external_id·sanitized_details).
+ */
+export const sendIntents = pgTable(
+  'send_intents',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    attempt: integer('attempt').notNull(),
+    intentKey: text('intent_key').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    submittedAt: ts('submitted_at'),
+    outcome: text('outcome').notNull().default('pending'),
+    providerRequestId: text('provider_request_id'),
+    remoteExternalId: text('remote_external_id'),
+    sanitizedDetails: jsonb('sanitized_details').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    unique('send_intents_intent_key_uq').on(t.intentKey),
+    unique('send_intents_job_attempt_uq').on(t.jobId, t.attempt),
+    // FIX1-FULLREV(F9, migration 0047): 실제 게시 사용 수 세기(live-publish.ts liveApprovalUsage·livePublishDailyUsage — beginSend 의 배타 advisory
+    // 잠금 아래와 홈·설정 화면에서 부른다)가 표 전체를 읽지 않게 하는 부분 색인. 실제 게시 전송 의도(live_approval_ref 가 있는 행)만 담는다.
+    // 술어는 livePublishDailyUsage 의 조건과 같은 식이고, liveApprovalUsage 의 `->>'live_approval_ref' = ref`(strict 연산자)는 이 술어를 함의하므로
+    // 두 질의 모두 결과를 바꾸지 않고 이 색인을 쓸 수 있다. 질의의 식 모양(`sanitized_details->>'live_approval_ref'`)을 바꾸면 색인을 못 쓴다.
+    index('send_intents_live_ref_job_idx')
+      .on(sql`(${t.sanitizedDetails}->>'live_approval_ref')`, t.jobId)
+      .where(sql`${t.sanitizedDetails}->>'live_approval_ref' is not null`),
+    index('send_intents_live_owner_created_idx')
+      .on(t.ownerId, t.createdAt)
+      .where(sql`${t.sanitizedDetails}->>'live_approval_ref' is not null`),
+    check('send_intents_outcome_chk', sql`${t.outcome} in ('pending', 'accepted', 'rejected', 'ambiguous')`),
+    check('send_intents_attempt_chk', sql`${t.attempt} >= 1`),
+    check('send_intents_key_chk', sql`${t.intentKey} = ${t.jobId}::text || ':' || ${t.attempt}::text`),
+    foreignKey({
+      name: 'send_intents_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 원격 결과(docs/04 publications, T11 D18). CONFIRMED 라고 public 은 아니다 — result_kind·remote_visibility·verification 을 함께 본다.
+ * 모의 결과: is_mock = (verification = 'MOCK'), external_id 는 'mock:' 접두어, permalink 는 null 이거나 'mock://' — 실제 발행 실적이 아님(DB CHECK).
+ * 트리거 publications_guard: DELETE 거부, UPDATE 는 verification·verified_at·remote_visibility 만(재확인 결과).
+ * LIVE-P1(D38, migration 0044): 실제 결과(is_mock=false)는 external_id 'threads:<숫자>'·permalink 는 null 이거나 https://(www.)threads.com|net/…,
+ * VERIFIED 는 verified_at 필수. 트리거 publications_kind_guard: INSERT 때 is_mock 이 항목 계정의 kind(mock ⇔ is_mock)와 맞아야 한다 —
+ * 모의 계정 작업은 실제 결과를, 실제 계정 작업은 모의 결과를 남길 수 없다.
+ * LIVEP1-USERCONFIRM(migration 0045): verification USER_CONFIRMED = 사용자가 확인 후보를 Threads 에서 직접 확인하고 기록함(앱 검증 아님) —
+ * confirmed_by 'owner'·confirmed_at 필수, verified_at 없음, 실제 결과·공식 링크·PUBLISHED 만. publications_guard 는 confirmed_by·confirmed_at 변경과
+ * USER_CONFIRMED 로/에서의 verification 변경을 거부한다(사용자 확인을 나중에 VERIFIED 로 바꾸거나 되돌리지 않음).
+ */
+export const publications = pgTable(
+  'publications',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    itemId: uuid('item_id').notNull(),
+    jobId: uuid('job_id').notNull(),
+    externalId: text('external_id').notNull(),
+    permalink: text('permalink'),
+    resultKind: text('result_kind').notNull(),
+    remoteVisibility: text('remote_visibility').notNull(),
+    verification: text('verification').notNull(),
+    isMock: boolean('is_mock').notNull(),
+    verifiedAt: ts('verified_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    /** LIVEP1-USERCONFIRM(0045): 사용자 확인(USER_CONFIRMED)한 사람 — 'owner' 만(다른 값 없음). 그 밖의 확인 상태는 null. */
+    confirmedBy: text('confirmed_by'),
+    /** LIVEP1-USERCONFIRM(0045): 사용자 확인 시각(USER_CONFIRMED 일 때만). */
+    confirmedAt: ts('confirmed_at'),
+  },
+  (t) => [
+    unique('publications_item_external_uq').on(t.itemId, t.externalId),
+    index('publications_item_idx').on(t.itemId),
+    check('publications_result_kind_chk', sql`${t.resultKind} in ('UPLOADED_PRIVATE', 'SCHEDULED_REMOTE', 'PUBLISHED', 'MANUAL_REPORTED')`),
+    check('publications_visibility_chk', sql`${t.remoteVisibility} in ('private', 'unlisted', 'public', 'unknown')`),
+    check('publications_verification_chk', sql`${t.verification} in ('MOCK', 'VERIFIED', 'UNVERIFIED', 'MANUAL_REPORTED', 'USER_CONFIRMED')`),
+    // LIVEP1-USERCONFIRM(0045): USER_CONFIRMED ⇔ 확인자('owner')·확인 시각이 있음. 사용자 확인은 실제 결과·공식 링크·PUBLISHED 만이고 verified_at 은 없다(VERIFIED 로 보이지 않게).
+    check(
+      'publications_user_confirmed_chk',
+      sql`(${t.verification} = 'USER_CONFIRMED') = (${t.confirmedBy} is not null) and (${t.confirmedBy} is null) = (${t.confirmedAt} is null) and (${t.confirmedBy} is null or ${t.confirmedBy} = 'owner')`,
+    ),
+    check(
+      'publications_user_confirmed_shape_chk',
+      sql`${t.verification} <> 'USER_CONFIRMED' or (not ${t.isMock} and ${t.verifiedAt} is null and ${t.permalink} is not null and ${t.resultKind} = 'PUBLISHED')`,
+    ),
+    check('publications_mock_verification_chk', sql`${t.isMock} = (${t.verification} = 'MOCK')`),
+    check('publications_mock_external_chk', sql`not ${t.isMock} or ${t.externalId} like 'mock:%'`),
+    check('publications_mock_permalink_chk', sql`not ${t.isMock} or ${t.permalink} is null or ${t.permalink} like 'mock://%'`),
+    check('publications_real_not_mock_chk', sql`${t.isMock} or ${t.externalId} not like 'mock:%'`),
+    check('publications_real_external_chk', sql`${t.isMock} or ${t.externalId} ~ '^threads:[0-9]{1,30}$'`),
+    check('publications_real_permalink_chk', sql`${t.isMock} or ${t.permalink} is null or ${t.permalink} ~ '^https://(www[.])?threads[.](com|net)/'`),
+    check('publications_verified_at_chk', sql`${t.verification} <> 'VERIFIED' or ${t.verifiedAt} is not null`),
+    foreignKey({
+      name: 'publications_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'publications_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T12 모의 시나리오(결정 D19, migration 0018) ----
+
+/**
+ * 항목별 모의 결과 시나리오(개발·시험 전용 — 실제 채널 개념이 아니다). 승인 스냅샷(payload)·계정 capability_snapshot 에 넣지 않는다 —
+ * 넣으면 payload hash 가 바뀌고 승인이 무효가 된다. 항목당 1행(distribution_item_id unique), 트리거 mock_scenarios_mock_only 가
+ * 항목의 계정이 kind='mock' 일 때만 INSERT·UPDATE 를 허용한다. 내보내기만(복원 안 함).
+ */
+export const mockScenarios = pgTable(
+  'mock_scenarios',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    distributionItemId: uuid('distribution_item_id').notNull(),
+    scenario: text('scenario').notNull(),
+    delayMs: integer('delay_ms').notNull().default(0),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('mock_scenarios_item_uq').on(t.distributionItemId),
+    check(
+      'mock_scenarios_scenario_chk',
+      sql`${t.scenario} in ('success', 'success_public', 'processing_then_confirm', 'transient', 'transient_then_success', 'rate_limited', 'server_error_no_side_effect', 'server_error_side_effect_unknown', 'permanent', 'auth', 'ambiguous_sent', 'ambiguous_not_sent', 'hang', 'cancel_supported', 'reconcile_unsupported', 'threads_success', 'threads_container_slow', 'threads_publish_timeout_sent', 'threads_publish_timeout_not_sent', 'threads_thread_partial', 'threads_rate_limited', 'threads_token_invalid', 'threads_text_too_long', 'youtube_success_private', 'youtube_processing_slow', 'youtube_network_drop', 'youtube_response_lost_after_complete', 'youtube_session_expired_before_complete', 'youtube_quota_exceeded', 'youtube_token_invalid', 'youtube_rejected', 'youtube_public_unverified_forced_private', 'youtube_scheduled_private', 'youtube_project_verified', 'instagram_success', 'instagram_container_slow', 'instagram_publish_timeout_sent', 'instagram_publish_timeout_not_sent', 'instagram_rate_limited', 'instagram_token_invalid', 'instagram_permission_denied', 'instagram_invalid_spec_remote', 'instagram_container_error')`,
+    ),
+    check('mock_scenarios_delay_chk', sql`${t.delayMs} between 0 and 5000`),
+    foreignKey({
+      name: 'mock_scenarios_item_same_owner_fk',
+      columns: [t.distributionItemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T14 Threads 원격 단계 참조(결정 D26, migration 0031) ----
+
+/**
+ * 원격 단계 기록(remote_steps) — 두 단계 게시(Threads: 컨테이너 생성 → 게시)의 원격 참조를 **다음 원격 호출 전에** 남긴다.
+ * 재개·재확인은 이 기록을 먼저 읽고 이미 만든 컨테이너를 다시 만들지 않으며, 이미 게시된 게시물을 다시 게시하지 않는다(A08).
+ * - (job, post_index, kind) unique: 게시물마다 컨테이너 1개·게시 1개. remote_id 전체 unique(같은 원격 ID 는 한 번만).
+ * - remote_id CHECK `LIKE 'mock%'`: live 어댑터가 없는 동안 모의 ID 만(D26 — live 어댑터를 붙일 때 다시 정한다).
+ * - kind='publish' 는 status='published' 만, kind='container' 는 created·finished·error.
+ * - 트리거 remote_steps_guard: DELETE 거부, remote_id·식별 열 변경 거부, published 는 바뀌지 않음, INSERT 때 전송 의도가 같은 작업·owner 인지 확인.
+ * 내보내기만(복원 안 함 — send_intents·publications 와 같이 원격 결과는 복원 환경이 다시 확인할 사실).
+ * T15(D27, migration 0032): YouTube 재개 업로드 단계 — upload_session(세션 URI, post_index = 세션 순번, created|finished|expired|error)·
+ * video(영상 ID, uploaded|processed|error). received_bytes(원격이 확인한 받은 바이트)는 트리거로 **앞으로만**, total_bytes 는 처음 값 그대로,
+ * resume_count(같은 세션을 다음 시도가 이어 받은 횟수)도 앞으로만. 세션 URI 는 내보내기 묶음에서 가린다(bundle-tables selectExpr).
+ * T16(D29 제안, migration 0036): Instagram 미디어 게시 단계 — ig_container(post_index 0 = 게시할 컨테이너, 1..n = 캐러셀 자식, created|finished|error)·
+ * ig_publish(post_index 0, published). 트리거 규칙은 0032 그대로(종류에 매이지 않음). 공개 미디어 URL 은 이 표에 넣지 않는다.
+ * FIX-T16(P1, migration 0037): ig_parent_request(post_index 0, created) — 캐러셀 부모 생성 요청 표식(remote_id mockig_req_…, 원격 호출 전 기록).
+ */
+export const remoteSteps = pgTable(
+  'remote_steps',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    jobId: uuid('job_id').notNull(),
+    intentId: uuid('intent_id')
+      .notNull()
+      .references(() => sendIntents.id, { onDelete: 'restrict' }),
+    itemId: uuid('item_id').notNull(),
+    stepIndex: integer('step_index').notNull(),
+    kind: text('kind').notNull(),
+    postIndex: integer('post_index').notNull(),
+    remoteId: text('remote_id').notNull(),
+    status: text('status').notNull(),
+    /** T15: 업로드 세션의 받은 바이트(원격 확인값, 앞으로만) */
+    receivedBytes: bigint('received_bytes', { mode: 'number' }),
+    /** T15: 업로드 전체 바이트(불변) */
+    totalBytes: bigint('total_bytes', { mode: 'number' }),
+    /** T15: 같은 세션 재개 횟수(앞으로만) */
+    resumeCount: integer('resume_count').notNull().default(0),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('remote_steps_job_post_kind_uq').on(t.jobId, t.postIndex, t.kind),
+    unique('remote_steps_remote_id_uq').on(t.remoteId),
+    index('remote_steps_item_idx').on(t.itemId),
+    check('remote_steps_kind_chk', sql`${t.kind} in ('container', 'publish', 'upload_session', 'video', 'ig_container', 'ig_publish', 'ig_parent_request', 'publish_attempt')`),
+    check('remote_steps_status_chk', sql`${t.status} in ('created', 'finished', 'published', 'error', 'expired', 'uploaded', 'processed')`),
+    check(
+      'remote_steps_kind_status_chk',
+      sql`(${t.kind} = 'container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'publish' and ${t.status} = 'published') or (${t.kind} = 'upload_session' and ${t.status} in ('created', 'finished', 'expired', 'error')) or (${t.kind} = 'video' and ${t.status} in ('uploaded', 'processed', 'error')) or (${t.kind} = 'ig_container' and ${t.status} in ('created', 'finished', 'error')) or (${t.kind} = 'ig_publish' and ${t.status} = 'published') or (${t.kind} = 'ig_parent_request' and ${t.status} = 'created') or (${t.kind} = 'publish_attempt' and ${t.status} = 'created')`,
+    ),
+    check('remote_steps_bytes_chk', sql`(${t.receivedBytes} is null or ${t.receivedBytes} >= 0) and (${t.totalBytes} is null or ${t.totalBytes} > 0) and (${t.receivedBytes} is null or ${t.totalBytes} is null or ${t.receivedBytes} <= ${t.totalBytes})`),
+    check('remote_steps_resume_count_chk', sql`${t.resumeCount} >= 0`),
+    check('remote_steps_post_index_chk', sql`${t.postIndex} >= 0`),
+    check('remote_steps_step_index_chk', sql`${t.stepIndex} >= 0`),
+    // LIVE-P1(D38, 0044): 모의 ID(mock…) 또는 실제 Threads 단계 ID(종류별 접두 + 숫자). publish_attempt 는 실제 형식만.
+    // 실제 ID 는 실제(live) Threads 계정의 작업에만, 모의 ID 는 모의 계정의 작업에만 — remote_steps_guard 트리거가 INSERT 때 계정으로 확인한다.
+    check(
+      'remote_steps_remote_id_chk',
+      sql`(${t.remoteId} like 'mock%' and ${t.kind} <> 'publish_attempt') or (${t.kind} = 'container' and ${t.remoteId} ~ '^threads:ct:[0-9]{1,30}$') or (${t.kind} = 'publish_attempt' and ${t.remoteId} ~ '^threads:pa:[0-9]{1,30}$') or (${t.kind} = 'publish' and ${t.remoteId} ~ '^threads:post:[0-9]{1,30}$')`,
+    ),
+    foreignKey({
+      name: 'remote_steps_job_same_owner_fk',
+      columns: [t.jobId, t.ownerId],
+      foreignColumns: [jobs.id, jobs.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'remote_steps_item_same_owner_fk',
+      columns: [t.itemId, t.ownerId],
+      foreignColumns: [distributionItems.id, distributionItems.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+// ---- T13 계정 연결(OAuth)·비밀 보호(결정 D24) ----
+
+/**
+ * 계정 연결 정보(oauth_credentials). 계정마다 한 행. 토큰 평문은 저장하지 않는다 — encrypted_token 은 AES-256-GCM 봉인
+ * (`csk1:` 형식, @cs/domain secrets.ts, AAD = owner + 계정 + 용도), key_version 은 봉인한 키 버전.
+ * 연결 해제(revoke)는 암호문·키 버전을 지우고 revoked_at·status='revoked' 를 남긴다(행은 남김 — 감사·상태 표시).
+ * is_mock = (provider ∈ 모의 공급자 mock_threads·mock_google — T15·mock_instagram — T16), 그리고 트리거가 계정 kind 와 맞는지 확인한다 — 모의 토큰은 실제 계정에 붙을 수 없다.
+ * 주의: export/restore 대상에서 제외한다(@cs/domain EXCLUDED_TABLES). 복원한 계정은 "다시 연결 필요".
+ */
+export const oauthCredentials = pgTable(
+  'oauth_credentials',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    provider: text('provider').notNull(),
+    isMock: boolean('is_mock').notNull(),
+    encryptedToken: text('encrypted_token'),
+    keyVersion: integer('key_version'),
+    /**
+     * FIX-T13: 토큰 세대 — 교환·갱신·다시 연결로 새 토큰을 저장할 때마다 +1. 키 교체(재암호화)는 바꾸지 않는다.
+     * 공급자 호출 뒤 되쓰기는 읽었던 세대와 같을 때만 한다(계정 → 연결 정보 순서로 잠근 뒤).
+     */
+    tokenGeneration: integer('token_generation').notNull().default(1),
+    /**
+     * FIX2-T13(Codex review-FIX-T13 P1): 해제 세대 — 연결 해제를 **시작**할 때마다 +1, 다시 연결로 초기화되지 않는다(단조 증가).
+     * 연결 요청(oauth_states)은 발급 시 이 값을 기록하고, callback 저장은 계정 잠금 아래에서 값이 같을 때만 한다(시각 비교 없음).
+     */
+    revocationEpoch: integer('revocation_epoch').notNull().default(0),
+    /** FIX2-T13: 진행 중이거나 마지막으로 끝난 연결 해제 작업 ID. 다시 연결하면 null — 해제 요청이 자기 작업이 아직 현재인지 판정한다. */
+    revokeOpId: uuid('revoke_op_id'),
+    /**
+     * FIX7-T13(Codex review-FIX6-T13 P2 :1779, 0035): 끝나지 않은 해제(revoking)를 worker 가 다시 이어 볼 시각·횟수 — 정리 대기의
+     * next_attempt_at·attempts 와 같은 다음 시도 시각/지수 backoff. 해제 1단계가 지금 + REVOKE_RESUME_AFTER_MS 이후로 미루고(진행 중 표시 —
+     * 프로세스가 그 뒤 멈추면 worker 가 이어 받는다), worker 가 열 수 없어 넘긴 행도 미룬다(감사·비밀 쓰기 없음). 해제가 끝나거나 다시 연결하면 비운다.
+     * null 이면 updated_at + REVOKE_RESUME_AFTER_MS 로 본다(이 열 전의 행).
+     */
+    revokeResumeAt: ts('revoke_resume_at'),
+    revokeResumeAttempts: integer('revoke_resume_attempts').notNull().default(0),
+    /**
+     * FIX3-T13 의 정리 대기 열(pending_*)은 FIX4-T13(0033)에서 별도 표 oauth_pending_tokens 로 옮겼다 — 계정마다 여러 건,
+     * 연결 정보 행이 없어도(첫 연결) 기록할 수 있다.
+     */
+    /** access token 만료 시각 */
+    expiresAt: ts('expires_at'),
+    scopes: jsonb('scopes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    status: text('status').notNull(),
+    connectedAt: ts('connected_at').notNull(),
+    lastCheckedAt: ts('last_checked_at'),
+    lastRefreshedAt: ts('last_refreshed_at'),
+    lastErrorCode: text('last_error_code'),
+    revokedAt: ts('revoked_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('oauth_credentials_account_uq').on(t.channelAccountId),
+    check('oauth_credentials_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google', 'mock_instagram')`),
+    check('oauth_credentials_mock_chk', sql`${t.isMock} = (${t.provider} in ('mock_threads', 'mock_google', 'mock_instagram'))`),
+    // FIX-T13: revoking = 연결 해제 진행 중(공급자 철회 대기) — 갱신·다시 연결이 토큰을 바꾸지 못하고 실행도 차단된다.
+    check('oauth_credentials_status_chk', sql`${t.status} in ('active', 'error', 'revoking', 'revoked')`),
+    check('oauth_credentials_generation_chk', sql`${t.tokenGeneration} >= 1`),
+    check('oauth_credentials_revoke_resume_attempts_chk', sql`${t.revokeResumeAttempts} >= 0`),
+    check('oauth_credentials_revoked_chk', sql`(${t.status} = 'revoked') = (${t.revokedAt} is not null)`),
+    check('oauth_credentials_secret_chk', sql`(${t.revokedAt} is null) = (${t.encryptedToken} is not null)`),
+    check('oauth_credentials_key_version_chk', sql`(${t.encryptedToken} is null) = (${t.keyVersion} is null)`),
+    check('oauth_credentials_sealed_chk', sql`${t.encryptedToken} is null or ${t.encryptedToken} like 'csk1:%'`),
+    foreignKey({
+      name: 'oauth_credentials_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * FIX4-T13(Codex review-FIX3-T13 P1 :908·:1037·P2 :1293): 정리 대기(oauth_pending_tokens). 발급받았지만 처리가 끝나지 않은 토큰과
+ * 아직 확인하지 못한 현재 토큰의 의무를 **건마다 한 행**으로 남긴다(계정마다 여러 행 — 두 번째 정리 실패도 버리지 않는다).
+ * - kind: refresh_unknown(받은 토큰 P 가 저장됐는지 모름) · cleanup_revoke(P 는 현재 토큰이 아님 — 공급자에서 다시 철회해야 함) ·
+ *   verify_current(P 는 정리됐지만 현재 토큰 C 의 유효성을 아직 확인하지 못함 — 봉인 없음, base_generation = 확인할 C 의 세대).
+ * - sealed_token: P 봉인(AAD purpose 'oauth_pending_token', 평문 없음). verify_current 만 비어 있다.
+ * - revision: 행을 바꿀 때마다 +1 — 공급자 호출 뒤 되쓰기는 읽은 revision 일 때만(낡은 판정 폐기).
+ * - attempts·next_attempt_at·last_result: 정리 시도마다(판정 불가 포함) 갱신 — worker 는 next_attempt_at 이 지난 행부터 고른다.
+ * 행이 하나라도 있으면 그 계정은 실행 차단(credentialHealth pendingKind). 연결 정보 행이 없어도 된다(첫 연결 — 자리 표시 행을 만들지 않는다).
+ * 모든 변경은 계정 → 연결 정보 잠금 아래. 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES). 키 교체가 다시 봉인한다.
+ */
+export const oauthPendingTokens = pgTable(
+  'oauth_pending_tokens',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    kind: text('kind').notNull(),
+    sealedToken: text('sealed_token'),
+    keyVersion: integer('key_version'),
+    /** refresh_unknown: 갱신 전에 읽은 세대(callback 은 null) · verify_current: 확인할 현재 토큰의 세대 */
+    baseGeneration: integer('base_generation'),
+    /** verify_current: C 가 무효로 확인되면 기록할 오류 코드(null 이면 공급자 코드) */
+    onInvalidCode: text('on_invalid_code'),
+    /** 어디서 생겼는가(refresh·callback·reconcile·migrated_0030 …) — 감사용 코드 */
+    source: text('source').notNull(),
+    revision: integer('revision').notNull().default(1),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: ts('next_attempt_at').notNull().defaultNow(),
+    lastResult: text('last_result'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    check('oauth_pending_tokens_kind_chk', sql`${t.kind} in ('refresh_unknown', 'cleanup_revoke', 'verify_current')`),
+    check('oauth_pending_tokens_token_chk', sql`(${t.kind} = 'verify_current') = (${t.sealedToken} is null)`),
+    check('oauth_pending_tokens_sealed_chk', sql`(${t.sealedToken} is null) = (${t.keyVersion} is null) and (${t.sealedToken} is null or ${t.sealedToken} like 'csk1:%')`),
+    check('oauth_pending_tokens_verify_chk', sql`${t.kind} <> 'verify_current' or ${t.baseGeneration} is not null`),
+    check('oauth_pending_tokens_counters_chk', sql`${t.revision} >= 1 and ${t.attempts} >= 0`),
+    index('oauth_pending_tokens_account_idx').on(t.ownerId, t.channelAccountId),
+    index('oauth_pending_tokens_next_attempt_idx').on(t.nextAttemptAt),
+    foreignKey({
+      name: 'oauth_pending_tokens_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * 진행 중인 연결 요청(oauth_states). state 원문은 저장하지 않고 SHA-256 만(state_hash). 한 번만 쓰임(used_at), owner + 로그인 세션 + 계정에 묶임,
+ * TTL 10분. PKCE verifier 는 봉인해 둔다(encrypted_verifier, AAD 에 이 행 ID). 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES).
+ */
+export const oauthStates = pgTable(
+  'oauth_states',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    channelAccountId: uuid('channel_account_id').notNull(),
+    provider: text('provider').notNull(),
+    stateHash: text('state_hash').notNull(),
+    encryptedVerifier: text('encrypted_verifier').notNull(),
+    keyVersion: integer('key_version').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    scopes: jsonb('scopes').$type<string[]>().notNull(),
+    /** FIX2-T13: 발급 시점의 계정 해제 세대(oauth_credentials.revocation_epoch, 연결 정보가 없으면 0) */
+    revocationEpoch: integer('revocation_epoch').notNull().default(0),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('oauth_states_hash_uq').on(t.stateHash),
+    check('oauth_states_provider_chk', sql`${t.provider} in ('mock_threads', 'threads', 'mock_google', 'mock_instagram')`),
+    check('oauth_states_sealed_chk', sql`${t.encryptedVerifier} like 'csk1:%'`),
+    index('oauth_states_owner_expires_idx').on(t.ownerId, t.expiresAt),
+    foreignKey({
+      name: 'oauth_states_account_same_owner_fk',
+      columns: [t.channelAccountId, t.ownerId],
+      foreignColumns: [channelAccounts.id, channelAccounts.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * T18(제안 결정 D32) 가져오기 실행 기록(import ledger). 사용자가 올린 Notion·Drive 내보내기 ZIP(또는 모의 커넥터)을
+ * 미리보기(preview) → 선택 확정(committed) | 취소(canceled) | 실패(failed) 로 기록한다. 외부 원본은 읽기만 하고 바꾸지 않는다.
+ * file_checksum 은 올린 ZIP 의 sha256(모의 커넥터는 null). 자격 증명·토큰은 이 표에 없다(어떤 열에도 넣지 않는다).
+ * counts: 미리보기 판정 건수(new·identical·conflict·skipped·attachments·total). result: 확정 결과 건수.
+ * export/restore 에 포함한다(D32 제안 — 가져온 소재의 출처 이력이므로 사용자 자료와 함께 옮긴다).
+ */
+export const importRuns = pgTable(
+  'import_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sourceKind: text('source_kind').notNull(),
+    fileName: text('file_name'),
+    fileChecksum: text('file_checksum'),
+    fileBytes: bigint('file_bytes', { mode: 'number' }),
+    status: text('status').notNull().default('preview'),
+    counts: jsonb('counts').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result').$type<Record<string, number>>(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    committedAt: ts('committed_at'),
+    canceledAt: ts('canceled_at'),
+  },
+  (t) => [
+    unique('import_runs_id_owner_uq').on(t.id, t.ownerId),
+    check('import_runs_source_kind_chk', sql`${t.sourceKind} in ('notion_export', 'drive_export', 'mock_connector')`),
+    check('import_runs_status_chk', sql`${t.status} in ('preview', 'committed', 'failed', 'canceled')`),
+    check(
+      'import_runs_checksum_chk',
+      sql`(${t.sourceKind} = 'mock_connector' and ${t.fileChecksum} is null) or (${t.sourceKind} <> 'mock_connector' and ${t.fileChecksum} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check('import_runs_committed_chk', sql`(${t.status} = 'committed') = (${t.committedAt} is not null)`),
+    index('import_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * T18 가져오기 항목(import ledger 의 줄). 실행마다 외부 항목 하나(external_id: Notion 페이지 ID 또는 내보내기 안 경로).
+ * decision(미리보기 판정): new | identical(같은 외부 ID·같은 checksum 이 이미 있음) | conflict(같은 외부 ID, 내용 다름 — 덮어쓰지 않음) | skipped(지원 안 함).
+ * outcome(확정 결과, 미리보기 중 null): imported | versioned(사용자가 고른 충돌 → 기존 출처에 새 버전) | skipped_* | failed_changed
+ *   | original_backfilled(FIX-T18 round 2, 0040: 사용자가 고른 동일 항목 — 빠진 원본 바이트만 기존 출처 버전에 채움, 소재·출처·버전은 그대로).
+ * target_*: 확정으로 만든 소재·출처·출처 버전(같은 owner — 복합 FK). 본문은 이 표에 없다(소재 원문에만).
+ */
+export const importItems = pgTable(
+  'import_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    externalId: text('external_id').notNull(),
+    externalPath: text('external_path').notNull(),
+    folder: text('folder').notNull().default(''),
+    title: text('title'),
+    format: text('format').notNull(),
+    contentChecksum: text('content_checksum'),
+    /** FIX-T18 round 1(Codex review-T18 P2, 0039): ZIP 크기 필드는 unsigned 32bit 라 integer 를 넘을 수 있다 → bigint. */
+    byteSize: bigint('byte_size', { mode: 'number' }).notNull(),
+    externalCreatedText: text('external_created_text'),
+    decision: text('decision').notNull(),
+    skipReason: text('skip_reason'),
+    matchedSourceId: uuid('matched_source_id'),
+    outcome: text('outcome'),
+    targetCaptureId: uuid('target_capture_id'),
+    targetSourceId: uuid('target_source_id'),
+    targetSourceVersionId: uuid('target_source_version_id').references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('import_items_run_external_uq').on(t.runId, t.externalId),
+    check('import_items_format_chk', sql`${t.format} in ('md', 'txt', 'html', 'csv', 'other')`),
+    check('import_items_decision_chk', sql`${t.decision} in ('new', 'identical', 'conflict', 'skipped')`),
+    check(
+      'import_items_outcome_chk',
+      sql`${t.outcome} is null or ${t.outcome} in ('imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed', 'original_backfilled')`,
+    ),
+    // FIX-T18 round 2(Codex review-FIX-T18 P1, 0040): 원본 보충(0039 이전 가져오기의 빠진 원본을 같은 바이트로 채움)은 기존 출처 버전만 가리키고 소재는 만들지 않는다.
+    check(
+      'import_items_backfill_chk',
+      sql`${t.outcome} is distinct from 'original_backfilled' or (${t.targetSourceId} is not null and ${t.targetSourceVersionId} is not null and ${t.targetCaptureId} is null)`,
+    ),
+    check('import_items_checksum_chk', sql`${t.contentChecksum} is null or ${t.contentChecksum} ~ '^[0-9a-f]{64}$'`),
+    check('import_items_skip_chk', sql`(${t.decision} = 'skipped') = (${t.skipReason} is not null)`),
+    check(
+      'import_items_target_chk',
+      sql`(${t.outcome} in ('imported', 'versioned')) = (${t.targetCaptureId} is not null and ${t.targetSourceId} is not null and ${t.targetSourceVersionId} is not null)`,
+    ),
+    index('import_items_owner_capture_idx').on(t.ownerId, t.targetCaptureId),
+    foreignKey({
+      name: 'import_items_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [importRuns.id, importRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_capture_same_owner_fk',
+      columns: [t.targetCaptureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_source_same_owner_fk',
+      columns: [t.targetSourceId, t.ownerId],
+      foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'import_items_matched_source_same_owner_fk',
+      columns: [t.matchedSourceId, t.ownerId],
+      foreignColumns: [sources.id, sources.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * FIX-T18 round 1(Codex review-T18 P0 :293, AGENTS "원본·버전 이력 보존", 0039): 가져온 텍스트 파일의 **원본 그대로**(출처 버전마다 하나).
+ * content_base64 는 원본 파일 바이트의 base64(변환 없음 — BOM·CRLF·NUL 도 그대로). 문자열 디코딩을 거치지 않으므로 드라이버·JSON 묶음이
+ * 앞의 BOM 등을 바꿀 수 없다. DB CHECK: 길이(decode) = byte_size, sha256(decode) = sha256.
+ * 트리거: sha256 = 그 출처 버전의 raw_hash(INSERT), 수정·삭제 금지(append_only_immutable). 소재 원문(captures.raw_text)은 이 값에서 만든 파생 값이다
+ * (.html 은 추출 텍스트). 내보내기·복원에 포함(변환 없이).
+ */
+export const sourceVersionOriginals = pgTable(
+  'source_version_originals',
+  {
+    id: id(),
+    sourceVersionId: uuid('source_version_id')
+      .notNull()
+      .unique('source_version_originals_version_uq')
+      .references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    format: text('format').notNull(),
+    byteSize: integer('byte_size').notNull(),
+    sha256: text('sha256').notNull(),
+    contentBase64: text('content_base64').notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    check('source_version_originals_format_chk', sql`${t.format} in ('md', 'txt', 'html', 'csv')`),
+    check('source_version_originals_size_chk', sql`${t.byteSize} >= 0 and ${t.byteSize} <= 2097152 and octet_length(decode(${t.contentBase64}, 'base64')) = ${t.byteSize}`),
+    check('source_version_originals_sha_chk', sql`${t.sha256} ~ '^[0-9a-f]{64}$' and encode(sha256(decode(${t.contentBase64}, 'base64')), 'hex') = ${t.sha256}`),
+    index('source_version_originals_owner_idx').on(t.ownerId),
+  ],
+);
+
+/**
+ * T19(제안 결정 D33) 허용 수집 소스(allowlist). owner 가 등록한 RSS·Atom 피드 또는 선택 URL(페이지)만 수집한다.
+ * 기본 꺼짐(enabled=false)·주기 꺼짐(schedule='off'). https 만(CHECK) — 주소 정책(@cs/domain checkCollectorUrl)은 등록·실행·redirect 마다 다시 적용한다.
+ * 자격 증명 열 없음(공개 피드만). host = 정규화 호스트(허용 목록 비교용). 내보내기·복원 포함(복원 때 enabled=false 로 — 새 환경에서 자동 수집하지 않게).
+ */
+export const collectorSources = pgTable(
+  'collector_sources',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    url: text('url').notNull(),
+    normalizedUrl: text('normalized_url').notNull(),
+    host: text('host').notNull(),
+    label: text('label'),
+    enabled: boolean('enabled').notNull().default(false),
+    schedule: text('schedule').notNull().default('off'),
+    lastRunAt: ts('last_run_at'),
+    lastStatus: text('last_status'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    updatedAt: ts('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('collector_sources_id_owner_uq').on(t.id, t.ownerId),
+    unique('collector_sources_owner_url_uq').on(t.ownerId, t.normalizedUrl),
+    check('collector_sources_kind_chk', sql`${t.kind} in ('rss', 'atom', 'url')`),
+    check('collector_sources_schedule_chk', sql`${t.schedule} in ('off', 'daily', 'weekly')`),
+    check('collector_sources_https_chk', sql`${t.url} like 'https://%' and ${t.normalizedUrl} like 'https://%'`),
+    check('collector_sources_status_chk', sql`${t.lastStatus} is null or ${t.lastStatus} in ('preview', 'failed', 'blocked')`),
+    index('collector_sources_owner_created_idx').on(t.ownerId, t.createdAt, t.id),
+  ],
+);
+
+/**
+ * T19 수집 실행(수동 | 주기). 실행은 **미리보기만** 만든다(status preview) — 사용자가 항목을 골라 받아들일 때만 소재가 생긴다(accepted).
+ * failed(응답·형식 오류)·blocked(주소 정책) 실행은 항목 없이 error_code 만 남는다. counts: 판정 건수, result: 받아들인 결과 건수.
+ */
+export const collectorRuns = pgTable(
+  'collector_runs',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    sourceId: uuid('source_id').notNull(),
+    trigger: text('trigger').notNull(),
+    mode: text('mode').notNull().default('mock'),
+    status: text('status').notNull(),
+    errorCode: text('error_code'),
+    counts: jsonb('counts').$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result').$type<Record<string, number>>(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    acceptedAt: ts('accepted_at'),
+    closedAt: ts('closed_at'),
+  },
+  (t) => [
+    unique('collector_runs_id_owner_uq').on(t.id, t.ownerId),
+    check('collector_runs_trigger_chk', sql`${t.trigger} in ('manual', 'scheduled')`),
+    check('collector_runs_mode_chk', sql`${t.mode} = 'mock'`),
+    check('collector_runs_status_chk', sql`${t.status} in ('preview', 'accepted', 'discarded', 'failed', 'blocked')`),
+    check('collector_runs_error_chk', sql`(${t.status} in ('failed', 'blocked')) = (${t.errorCode} is not null)`),
+    check('collector_runs_accepted_chk', sql`(${t.status} = 'accepted') = (${t.acceptedAt} is not null)`),
+    index('collector_runs_owner_created_idx').on(t.ownerId, t.createdAt.desc(), t.id.desc()),
+    index('collector_runs_source_idx').on(t.sourceId, t.createdAt.desc()),
+    foreignKey({
+      name: 'collector_runs_source_same_owner_fk',
+      columns: [t.sourceId, t.ownerId],
+      foreignColumns: [collectorSources.id, collectorSources.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * T19 수집 항목(실행의 줄). 본문 전체는 넣지 않는다 — 발췌(200자)만. 받아들일 때 수집기로 다시 읽어 checksum 이 같을 때만 소재를 만든다.
+ * decision: new | duplicate | skipped, reason: 세부 이유(@cs/domain COLLECTED_REASONS). outcome(받아들인 뒤, new 만): accepted | not_selected | skipped_duplicate | failed_changed.
+ * capture_id·source_version_id·accepted_at: 받아들여 만든 소재·출처 버전(같은 owner — 소재는 복합 FK) — outcome=accepted 일 때만. 외부 키 = guid 또는 정규화 링크.
+ */
+export const collectedItems = pgTable(
+  'collected_items',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    runId: uuid('run_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    position: integer('position').notNull(),
+    externalKey: text('external_key'),
+    guid: text('guid'),
+    link: text('link'),
+    linkNormalized: text('link_normalized'),
+    title: text('title'),
+    excerpt: text('excerpt').notNull().default(''),
+    publishedText: text('published_text'),
+    publishedAt: ts('published_at'),
+    contentChecksum: text('content_checksum').notNull(),
+    rawSha256: text('raw_sha256').notNull(),
+    byteSize: integer('byte_size').notNull(),
+    decision: text('decision').notNull(),
+    reason: text('reason').notNull(),
+    outcome: text('outcome'),
+    captureId: uuid('capture_id'),
+    sourceVersionId: uuid('source_version_id').references(() => sourceVersions.id, { onDelete: 'restrict' }),
+    acceptedAt: ts('accepted_at'),
+    createdAt: ts('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('collected_items_run_position_uq').on(t.runId, t.position),
+    check('collected_items_decision_chk', sql`${t.decision} in ('new', 'duplicate', 'skipped')`),
+    check(
+      'collected_items_reason_chk',
+      sql`(${t.decision} = 'new' and ${t.reason} in ('new', 'updated')) or (${t.decision} = 'duplicate' and ${t.reason} in ('same_item', 'existing_capture', 'in_feed')) or (${t.decision} = 'skipped' and ${t.reason} in ('no_id', 'blocked_link', 'empty', 'too_long', 'limit'))`,
+    ),
+    check('collected_items_outcome_chk', sql`${t.outcome} is null or (${t.decision} = 'new' and ${t.outcome} in ('accepted', 'not_selected', 'skipped_duplicate', 'failed_changed'))`),
+    check(
+      'collected_items_accepted_chk',
+      // FIX-T19 round 1(0042): NULL 에 안전한 식 — outcome 이 null 이어도 식 전체가 null(통과)이 되지 않는다.
+      sql`((${t.outcome} is not distinct from 'accepted') = (${t.captureId} is not null)) and ((${t.outcome} is not distinct from 'accepted') = (${t.sourceVersionId} is not null)) and ((${t.outcome} is not distinct from 'accepted') = (${t.acceptedAt} is not null))`,
+    ),
+    check('collected_items_checksum_chk', sql`${t.contentChecksum} ~ '^[0-9a-f]{64}$' and ${t.rawSha256} ~ '^[0-9a-f]{64}$'`),
+    check('collected_items_key_chk', sql`${t.externalKey} is not null or ${t.reason} in ('no_id', 'limit')`),
+    index('collected_items_owner_key_idx').on(t.ownerId, t.sourceId, t.externalKey),
+    index('collected_items_owner_capture_idx').on(t.ownerId, t.captureId),
+    foreignKey({
+      name: 'collected_items_run_same_owner_fk',
+      columns: [t.runId, t.ownerId],
+      foreignColumns: [collectorRuns.id, collectorRuns.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'collected_items_source_same_owner_fk',
+      columns: [t.sourceId, t.ownerId],
+      foreignColumns: [collectorSources.id, collectorSources.ownerId],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'collected_items_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/** T19 재추천 닫기("다시 볼 만한 소재" 목록에서 뺌). owner·소재마다 하나. 소재 자체는 바뀌지 않는다. 내보내기·복원 포함. */
+export const recommendationDismissals = pgTable(
+  'recommendation_dismissals',
+  {
+    id: id(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    captureId: uuid('capture_id').notNull(),
+    dismissedAt: ts('dismissed_at').notNull().defaultNow(),
+  },
+  (t) => [
+    unique('recommendation_dismissals_owner_capture_uq').on(t.ownerId, t.captureId),
+    foreignKey({
+      name: 'recommendation_dismissals_capture_same_owner_fk',
+      columns: [t.captureId, t.ownerId],
+      foreignColumns: [captures.id, captures.ownerId],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * LIVE-P2(결정 D39, migration 0046): 실제 게시 즉시 중지 스위치(owner 당 한 행). **행이 없으면 중지 아님**(이전 동작 그대로).
+ * paused=true 면 전송 직전(beginSend 실제 분기 — 같은 트랜잭션, owner 별 일일 잠금 아래)에 보내지 않고 BLOCKED(live_publish_paused). 모의 전송은 영향 없음.
+ * changed_by 는 누가 바꿨는지의 종류만('owner' — 로그인한 소유자). 식별자·IP·사유 문구는 넣지 않는다. 변경은 감사(live_publish_paused/resumed)에도 남는다.
+ * 주의: export/restore 대상에서 제외한다(EXCLUDED_TABLES — 이 환경의 운영 안전 스위치. 복원 환경으로 옮기면 다른 환경의 게시를 켜거나 멈추게 된다).
+ */
+export const livePublishControls = pgTable(
+  'live_publish_controls',
+  {
+    ownerId: uuid('owner_id')
+      .primaryKey()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    paused: boolean('paused').notNull(),
+    changedAt: ts('changed_at').notNull().defaultNow(),
+    changedBy: text('changed_by').notNull(),
+  },
+  (t) => [check('live_publish_controls_changed_by_chk', sql`${t.changedBy} in ('owner')`)],
+);

@@ -1,0 +1,1621 @@
+/**
+ * FIX-T12(P2, Codex review-T12 lib/distribution.ts:269) · FIX-T11(P2): 보류 이유는 구조화된 코드로 판단하고 상세 사유는 따로 보인다,
+ * 스냅샷이 바뀌어 다시 승인할 수 없으면 새 계획 안내, 승인 철회 안내는 저장된 작업 결과 수만 말한다.
+ */
+import { describe, expect, it } from 'vitest';
+import {
+  accountHealthLine,
+  APPROVAL_BLOCK_REASONS,
+  bannersFromState,
+  blockDetailLabel,
+  // FIX3-FULLREV(R2)
+  CANCEL_UNKNOWN_BANNER,
+  cancelRedirectQuery,
+  cancelUnknownBannerOf,
+  blockInfoOf,
+  DISTRIBUTE_ERROR_TEXT,
+  distributeFormFailure,
+  // FIX1-FULLREV2(G2)
+  DUPLICATE_ACK_LABEL,
+  duplicateStateLabel,
+  duplicateWarningLine,
+  duplicateWarningTail,
+  formToApprove,
+  formToExecute,
+  formToPlanCreate,
+  instagramProgressLine,
+  instagramStepLine,
+  itemHeadline,
+  jobStatusText,
+  latestThreadsDiag,
+  liveCandidateForCard,
+  liveCandidateFromEvents,
+  liveDailyLimitOf,
+  liveItemHeadline,
+  liveVerificationLabel,
+  liveVerificationTag,
+  userConfirmCandidateForCard,
+  userConfirmClaimedNotice,
+  threadsDiagLine,
+  mockScenarioOptionsFor,
+  planAccountLabel,
+  planFormDefaults,
+  planFormEcho,
+  planResultSelect,
+  problemLabel,
+  reconciledNotice,
+  REQUESTED_RESULT_LABEL,
+  RESULT_CHOICE_LABEL,
+  resultChoicesFor,
+  reconciledParam,
+  remoteStepLine,
+  revocationCountParam,
+  revocationNotice,
+  stepsPanelView,
+  publishAtView,
+  YOUTUBE_MOCK_DISCLAIMER,
+  youtubeSessionNote,
+  // FIX2-FULLREV(Q2)
+  LIVE_UNKNOWN_GUIDANCE,
+  LIVE_UNKNOWN_GUIDANCE_BY_KIND,
+  RESTORED_CANCEL_UNVERIFIED_CODE,
+  SNAPSHOT_PROBLEMS_PREFIX_BY_KIND,
+  UNKNOWN_JOB_LINE_BY_KIND,
+  UNKNOWN_JOB_LINE_PARTIAL_MOCK,
+  UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK,
+  UNKNOWN_STATUS_LABEL_BY_KIND,
+  unknownKindOf,
+  // FIX4-FULLREV(S3·S4)
+  itemPlanBack,
+  itemRecordLive,
+  recordModeKey,
+  UNPROVEN_CONFIRMED_LINE,
+  // FIX5-FULLREV(T1·T4)
+  LIVE_UNKNOWN_HEADLINE,
+  itemFormBack,
+} from './distribution';
+import { DuplicatePublishUnacknowledgedError, NotRetryableError, SCHEDULE_STALE_RETRY_MESSAGE, USER_CONFIRM_CLAIMED_MESSAGE, USER_CONFIRM_CODES } from '@cs/domain';
+
+const job = (state: string, lastErrorCode: string | null) => ({ state, attempt: 1, maxAttempts: 5, nextRunAt: new Date('2030-01-01T00:00:00Z'), lastErrorCode });
+const ev = (details: Record<string, unknown>) => [
+  { stateAfter: 'BLOCKED', sanitizedDetails: details },
+  { stateAfter: 'QUEUED', sanitizedDetails: { event: 'execute' } },
+];
+
+describe('blockInfoOf — 표준 코드와 상세 사유 분리', () => {
+  it('RETRY_WAIT 첨부 변경 무효화: 이벤트 event=approval_invalidated·reason=invalidated:assets_changed → code 는 승인 코드, detail 은 상세', () => {
+    const b = blockInfoOf(ev({ event: 'approval_invalidated', reason: 'invalidated:assets_changed', transition: 'blocked' }), job('BLOCKED', 'approval_invalidated'));
+    expect(b).toEqual({ code: 'approval_invalidated', detail: 'invalidated:assets_changed' });
+    // 수정 전(blockReasonOf)은 reason 을 먼저 돌려줘 'invalidated:assets_changed' 가 승인 코드를 가렸다
+    const headline = itemHeadline({ status: 'PLANNED', channel: 'threads', job: job('BLOCKED', 'approval_invalidated'), pub: null, blockReason: b.code, blockDetail: b.detail });
+    expect(headline).toBe('승인 없음 (첨부 파일이 바뀜) — 다시 승인 후 실행');
+  });
+  it('사용자 철회: reason=user → detail 사용자 철회', () => {
+    const b = blockInfoOf(ev({ event: 'approval_revoked', reason: 'user: 날짜 변경' }), job('BLOCKED', 'approval_revoked'));
+    expect(b.code).toBe('approval_revoked');
+    expect(blockDetailLabel(b.detail)).toBe('사용자 철회: 날짜 변경');
+  });
+  it('전송 전 재검사(event=blocked, reason=approval_missing)·401 보류(reason=auth)는 예전과 같은 코드', () => {
+    expect(blockInfoOf(ev({ event: 'blocked', reason: 'approval_missing' }), job('BLOCKED', 'approval_missing'))).toEqual({ code: 'approval_missing', detail: null });
+    expect(blockInfoOf(ev({ event: 'blocked', reason: 'auth' }), job('BLOCKED', 'mock_401_unauthorized')).code).toBe('auth');
+    expect(blockInfoOf([], null)).toEqual({ code: null, detail: null });
+  });
+});
+
+describe('itemHeadline — 승인 문제·새 계획 안내', () => {
+  it('401 보류 뒤 편집으로 승인 무효(항목 PLANNED, 작업 BLOCKED, 활성 승인 없음, 스냅샷 변경) → 새 계획 만들기', () => {
+    const b = blockInfoOf(ev({ event: 'blocked', reason: 'auth' }), job('BLOCKED', 'mock_401_unauthorized'));
+    const h = itemHeadline({
+      status: 'PLANNED',
+      channel: 'blog',
+      job: job('BLOCKED', 'mock_401_unauthorized'),
+      pub: null,
+      blockReason: b.code,
+      blockDetail: null,
+      activeApproval: false,
+      needsNewPlan: true,
+    });
+    expect(h).toContain('승인 무효');
+    expect(h).toContain('새 계획 만들기');
+  });
+  it('작업 없는 PLANNED·활성 승인 있는 PLANNED 는 계획됨', () => {
+    expect(itemHeadline({ status: 'PLANNED', channel: 'threads', job: null, pub: null, blockReason: null, activeApproval: false })).toBe('계획됨(실행 전)');
+    expect(itemHeadline({ status: 'PLANNED', channel: 'threads', job: job('BLOCKED', 'auth'), pub: null, blockReason: 'auth', activeApproval: true })).toBe('계획됨(실행 전)');
+  });
+});
+
+describe('revocationNotice — 저장된 작업 결과만 말한다', () => {
+  it('보류·취소 확인 중·작업 없음·수 없음', () => {
+    expect(revocationNotice(1, 0)).toContain('보류(BLOCKED) — 다음 전송이 차단');
+    const c = revocationNotice(0, 1);
+    expect(c).toContain('취소 확인 중');
+    expect(c).not.toContain('보류');
+    expect(revocationNotice(0, 0)).toContain('대기 중이던 작업은 없었습니다');
+    expect(revocationNotice(null, null)).toBe('승인을 철회했습니다(MOCK).');
+  });
+
+  it('FIX1-FULLREV(F2): 부분 게시로 UNKNOWN 에 둔 작업(revoked_partial) — "실행 전"·"대기 작업 없음"이라고 하지 않는다, 이전 링크(partial 없음)는 그대로', () => {
+    const p = revocationNotice(0, 0, 1);
+    expect(p).toContain('작업 1개는 남은 게시물을 보내지 않고 결과 불명(UNKNOWN)');
+    expect(p).toContain('실행 전으로 되돌리지 않으므로');
+    expect(p).not.toContain('대기 중이던 작업은 없었습니다');
+    expect(p).not.toContain('보류(BLOCKED)');
+    const both = revocationNotice(1, 0, 1);
+    expect(both).toContain('보류(BLOCKED) — 다음 전송이 차단');
+    expect(both).toContain('결과 불명(UNKNOWN)');
+    expect(revocationNotice(0, 0, 0)).toContain('대기 중이던 작업은 없었습니다');
+    expect(revocationNotice(null, null, null)).toBe('승인을 철회했습니다(MOCK).');
+    // 이전 링크(revoked_partial 없음): 지금까지와 같은 문구
+    expect(revocationNotice(0, 0)).toBe(revocationNotice(0, 0, null));
+    expect(revocationNotice(null, null)).toBe('승인을 철회했습니다(MOCK).');
+  });
+
+  it('FIX1-FULLREV(F2): thread_partial_revoked 항목 문구 — 보류(401) 뒤 철회라 blockReason 이 앞선 BLOCKED 사유여도 작업 코드로 고른다(모의·실제)', () => {
+    const unknown = job('UNKNOWN', 'thread_partial_revoked');
+    for (const blockReason of [null, 'auth_invalid_token', 'publish_auth_invalid_token']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+      expect(mock, String(blockReason)).toContain('승인 철회·무효 뒤 남은 게시물은 보내지 않음');
+      expect(mock).not.toContain('실행 전');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+      expect(live, String(blockReason)).toContain('승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음');
+    }
+    // 취소 경로 문구는 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'thread_partial_canceled'), pub: null, blockReason: null })).toContain('취소 뒤 남은 게시물은 보내지 않음');
+  });
+
+  it('FIX1-FULLREV(F2 후속2): 부분 게시 UNKNOWN 사유 코드 전부 — 앞선 BLOCKED 사유(401·연결 정보·보내기 직전 멈춤)가 blockReason 이어도 작업 코드로 고른다(모의·실제)', () => {
+    const OLDER_BLOCKED = [null, 'auth', 'auth_invalid_token', 'publish_auth_invalid_token', 'credential_blocked', 'approval_missing', 'snapshot_stale', 'attempts_exhausted', 'lease_expired_before_intent'];
+    // FIX1-FULLREV(F2 후속2): thread_partial_stopped 는 멈출 때의 BLOCKED 사유(blockReason)로 원인을 말한다 — 그 사유가 아니면 셋 중 하나라고만(단정 안 함)
+    const STOP_ANY = '시도 한도·작업 처리기 중단 반복·검증 실패 중 하나';
+    const cases: Array<{ code: string; mock: string; live: string; byReason?: Record<string, { mock: string; live: string }> }> = [
+      { code: 'thread_partial_canceled', mock: '취소 뒤 남은 게시물은 보내지 않음', live: '취소 요청 — 이미 게시됐거나 게시됐을 수 있음' },
+      { code: 'thread_partial_cancel_requested', mock: '취소 뒤 남은 게시물은 보내지 않음', live: '취소 요청 — 이미 게시됐거나 게시됐을 수 있음' },
+      { code: 'thread_partial_revoked', mock: '승인 철회·무효 뒤 남은 게시물은 보내지 않음', live: '승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음' },
+      {
+        code: 'thread_partial_stopped',
+        mock: `보내기 전 멈춤(${STOP_ANY}), 남은 게시물은 보내지 않음`,
+        live: `보내기 전 멈춤(${STOP_ANY}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음`,
+        byReason: {
+          attempts_exhausted: { mock: '보내기 전 멈춤(시도 한도), 남은 게시물은 보내지 않음', live: '보내기 전 멈춤(시도 한도) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음' },
+          lease_expired_before_intent: {
+            mock: '보내기 전 멈춤(작업 처리기 중단 반복), 남은 게시물은 보내지 않음',
+            live: '보내기 전 멈춤(작업 처리기 중단 반복) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음',
+          },
+        },
+      },
+    ];
+    for (const c of cases) {
+      const unknown = job('UNKNOWN', c.code);
+      for (const blockReason of OLDER_BLOCKED) {
+        const label = `${c.code}/${String(blockReason)}`;
+        const want = (blockReason !== null ? c.byReason?.[blockReason] : undefined) ?? c;
+        const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+        expect(mock, label).toContain(want.mock);
+        expect(mock, label).not.toContain('새 계획 필요');
+        const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: unknown, pub: null, blockReason });
+        expect(live, label).toContain(want.live);
+        expect(live, label).not.toContain('새 배포 계획으로 다시 승인하세요');
+        expect(live, label).not.toContain('MOCK');
+        // FIX4-FULLREV(S1, 사용자 결정 2026-10-23): (FIX3 R3 의 "조건부 복구 길로 끝난다"를 바꿈) 실제 머리줄은 다시 게시하지 않음·Threads 직접 확인으로 끝나고
+        // 새 배포 계획을 말하지 않는다 — 조건부 복구 줄은 카드의 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE_BY_KIND)에 한 번만. 모의 머리줄에도 없다(그대로)
+        expect(live.endsWith('Threads 에서 직접 확인하세요'), label).toBe(true);
+        expect(live, label).toContain('다시 게시하지 않');
+        expect(live, label).not.toContain('없을 때만');
+        expect(live, label).not.toContain('새 배포 계획');
+        expect(live, label).not.toContain('새 계획 필요');
+        expect(mock, label).not.toContain('없을 때만');
+        expect(mock, label).not.toContain('새 배포 계획');
+      }
+      // 작업 행이 없어도(사유만) 같은 문구
+      expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: c.code })).toContain(c.mock);
+    }
+    // 부분 게시 코드가 아니면 지금까지의 결과 불명 문구 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'reconcile_timeout'), pub: null, blockReason: 'auth' })).toBe('확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: 'credential_blocked' })).toContain('결과 불명(UNKNOWN)');
+  });
+
+  it('FIX1-FULLREV(F2 후속2): thread_partial_stopped 문구는 멈춘 실제 원인만 말한다 — 검증 실패(validate_failed)를 "시도 한도·중단 반복"이라고 하지 않음(모의·실제)', () => {
+    const stopped = job('UNKNOWN', 'thread_partial_stopped');
+    const CAUSES = [
+      { reason: 'validate_failed', says: '보내기 전 멈춤(검증 실패 — 내용이 지금 채널 규칙에 맞지 않음)', not: ['시도 한도', '중단 반복'] },
+      { reason: 'attempts_exhausted', says: '보내기 전 멈춤(시도 한도)', not: ['중단 반복', '검증 실패'] },
+      { reason: 'lease_expired_before_intent', says: '보내기 전 멈춤(작업 처리기 중단 반복)', not: ['시도 한도', '검증 실패'] },
+    ];
+    for (const c of CAUSES) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason: c.reason });
+      expect(mock, c.reason).toBe(`일부만 게시됨(MOCK) — ${c.says}, 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`);
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason: c.reason });
+      // FIX4-FULLREV(S1): (FIX3 R3 의 꼬리를 뺌) 실제 머리줄은 다시 게시하지 않음·Threads 직접 확인만 — 정확한 문구
+      expect(live, c.reason).toBe(`${c.says} — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`);
+      for (const wrong of c.not) {
+        expect(mock, `${c.reason}/${wrong}`).not.toContain(wrong);
+        expect(live, `${c.reason}/${wrong}`).not.toContain(wrong);
+      }
+    }
+    // 원인을 모름(이력 창 밖 — blockReason 이 작업 코드 그대로, 상속 속성 이름 같은 이상한 값) → 셋 중 하나라고만
+    for (const blockReason of ['thread_partial_stopped', 'toString', '__proto__', '']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason });
+      expect(mock, blockReason).toContain('보내기 전 멈춤(시도 한도·작업 처리기 중단 반복·검증 실패 중 하나), 남은 게시물은 보내지 않음');
+      expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: stopped, pub: null, blockReason }), blockReason).toContain(
+        '보내기 전 멈춤(시도 한도·작업 처리기 중단 반복·검증 실패 중 하나) — 이미 게시됐거나',
+      );
+    }
+  });
+});
+
+describe('FIX round 2 (Codex review-FIX-T11T12) P2', () => {
+  it('철회 리다이렉트 파라미터를 페이지와 같은 파싱(revocationCountParam)으로: revoked_blocked=0&revoked_cancel=1 → 취소 확인 중', () => {
+    const q = new URL('http://localhost:3000/distribute/p?revoked=1&revoked_blocked=0&revoked_cancel=1').searchParams;
+    const blocked = revocationCountParam(q.get('revoked_blocked') ?? undefined);
+    const cancel = revocationCountParam(q.get('revoked_cancel') ?? undefined);
+    expect([blocked, cancel]).toEqual([0, 1]);
+    expect(revocationNotice(blocked, cancel)).toContain('취소 확인 중');
+    for (const bad of [undefined, '', 'x', '-1', '1.5', '1234', ['1']]) expect(revocationCountParam(bad as string | string[] | undefined), String(bad)).toBeNull();
+    expect(revocationCountParam(' 12 ')).toBe(12);
+  });
+
+  it('활성 승인이 있으면(다시 승인함) 과거 보류 사유와 관계없이 "승인 없음"이라고 하지 않는다 — activeApproval × 승인 관련 코드 행렬', () => {
+    for (const code of [...APPROVAL_BLOCK_REASONS]) {
+      for (const active of [true, false]) {
+        const h = itemHeadline({ status: 'PLANNED', channel: 'threads', job: job('BLOCKED', code), pub: null, blockReason: code, blockDetail: null, activeApproval: active });
+        if (active) expect(h, code).toBe('계획됨(실행 전)');
+        else expect(h, code).toBe('승인 없음 — 다시 승인 후 실행');
+      }
+    }
+  });
+});
+
+describe('M3 화면 FIX D8 — 재확인 결과 4종(조회 미지원·불명을 "찾지 못함"으로 뭉개지 않음)', () => {
+  it('reconciledParam: 원격 조회 상태 → 리다이렉트 값', () => {
+    expect(reconciledParam('found')).toBe('found');
+    expect(reconciledParam('not_found')).toBe('not_found');
+    expect(reconciledParam('unsupported')).toBe('unsupported');
+    expect(reconciledParam('unknown')).toBe('unknown');
+    expect(reconciledParam('processing')).toBe('unknown');
+    expect(reconciledParam('뭔가 다른 값')).toBe('unknown');
+  });
+  it('reconciledNotice: 네 문구, 옛 값(found·not_found) 유지, 쓰레기 값·배열·없음 → null', () => {
+    expect(reconciledNotice('found')).toBe('원격에서 결과를 찾았습니다(MOCK — 실제 발행 실적 아님).');
+    expect(reconciledNotice('not_found')).toBe('원격에서 결과를 찾지 못했습니다. 상태는 그대로이며 다시 보내지 않았습니다.');
+    expect(reconciledNotice('unsupported')).toBe('이 채널은 원격 조회를 지원하지 않아 확인하지 못했습니다. 원격에 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.');
+    expect(reconciledNotice('unknown')).toBe('원격 상태를 확인하지 못했습니다(진행 중이거나 기록이 없음). 없다는 뜻이 아닙니다. 다시 보내지 않았습니다.');
+    for (const bad of ['', 'FOUND', 'toString', '__proto__', 'constructor', '<script>', ' found']) expect(reconciledNotice(bad), bad).toBeNull();
+    expect(reconciledNotice(['found', 'not_found'])).toBeNull();
+    expect(reconciledNotice(undefined)).toBeNull();
+    expect(reconciledNotice('stale')).toMatch(/적용하지 않았습니다/);
+  });
+});
+
+describe('M3 화면 FIX D5 — 성공 배너는 저장된 상태로(bannersFromState)', () => {
+  const it_ = (status: string, approved: boolean, jobs: string[]) => ({ item: { status }, activeApproval: approved ? { id: 'a' } : null, jobs: jobs.map((state) => ({ state })) });
+  const fake = { approved: '1', executed: '1', canceled: '1', cancel_requested: '1', retried: '1', replay: '1' };
+
+  it('미승인·작업 0건 계획에 가짜 쿼리 → 주장 배너 없음', () => {
+    expect(bannersFromState(fake, { items: [it_('PLANNED', false, []), it_('PLANNED', false, [])] })).toEqual({
+      approved: null,
+      executed: null,
+      canceled: false,
+      cancelRequested: false,
+      retried: false,
+    });
+    expect(bannersFromState(fake, { items: [] }).approved).toBeNull();
+  });
+
+  it('실제 상태 → 수는 상태에서(쿼리 숫자 무시)', () => {
+    const d = { items: [it_('PLANNED', true, []), it_('QUEUED', true, ['QUEUED']), it_('PLANNED', false, [])] };
+    expect(bannersFromState({ approved: '99' }, d).approved).toBe(2);
+    expect(bannersFromState({ executed: '99', replay: '1' }, d).executed).toEqual({ items: 1, jobs: 1, replay: true });
+    expect(bannersFromState({ executed: '0' }, d).executed).toEqual({ items: 1, jobs: 1, replay: false });
+    // Codex review-FIX-M3screen P2: 첫 실행의 QUEUED 는 재시도가 아니다
+    expect(bannersFromState({ retried: '1' }, d).retried).toBe(false);
+    // 쿼리가 없으면 상태가 있어도 배너 없음
+    expect(bannersFromState({}, d)).toEqual({ approved: null, executed: null, canceled: false, cancelRequested: false, retried: false });
+  });
+
+  it('취소·취소 확인 중은 실제 CANCELED·CANCEL_REQUESTED 가 있을 때만, 재시도는 QUEUED 작업이 있을 때만', () => {
+    const canceled = { items: [it_('CANCELED', true, ['CANCELED'])] };
+    expect(bannersFromState({ canceled: '1' }, canceled).canceled).toBe(true);
+    expect(bannersFromState({ cancel_requested: '1' }, { items: [it_('CANCEL_REQUESTED', true, ['CANCEL_REQUESTED'])] }).cancelRequested).toBe(true);
+    const confirmed = { items: [it_('CONFIRMED', true, ['CONFIRMED'])] };
+    expect(bannersFromState({ canceled: '1', cancel_requested: '1', retried: '1' }, confirmed)).toMatchObject({ canceled: false, cancelRequested: false, retried: false });
+    // 처리기가 이미 가져간 재시도(QUEUED 아님) → 재시도 배너 없음
+    expect(bannersFromState({ retried: '1' }, { items: [it_('SENDING', true, ['BLOCKED', 'SENDING'])] }).retried).toBe(false);
+    // 쿼리 값은 정확히 '1' 이어야 한다
+    expect(bannersFromState({ canceled: 'yes' }, canceled).canceled).toBe(false);
+  });
+});
+
+describe('화면 확인 D10 — planFormEcho·planFormDefaults', () => {
+  const V = '11111111-2222-4333-8444-555555555555';
+  const A = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  it('형식이 맞는 값만 왕복하고 체크 안 한 파생본은 use 에 없다', () => {
+    const W = '99999999-2222-4333-8444-555555555555';
+    const qs = planFormEcho({
+      content_id: 'x',
+      [`use_${V}`]: 'on',
+      [`account_${V}`]: A,
+      [`visibility_${V}`]: 'public',
+      [`date_${V}`]: '2030-01-02',
+      [`time_${V}`]: '09:30',
+      [`account_${W}`]: A,
+      [`visibility_${W}`]: 'everyone',
+      [`date_${W}`]: '2030/01/02',
+      [`time_${W}`]: '9:30',
+      'use_not-a-uuid': 'on',
+      target_summary: '  이름  ',
+    });
+    expect(qs.startsWith('&')).toBe(true);
+    const d = planFormDefaults(Object.fromEntries(new URLSearchParams(qs.slice(1)).entries()));
+    expect([...d.use]).toEqual([V]);
+    expect(d.account).toEqual({ [V]: A, [W]: A });
+    expect(d.visibility).toEqual({ [V]: 'public' });
+    expect(d.date).toEqual({ [V]: '2030-01-02' });
+    expect(d.time).toEqual({ [V]: '09:30' });
+    expect(d.name).toBe('이름');
+    expect(planFormEcho({ content_id: 'x' })).toBe('');
+  });
+  it('쿼리를 직접 고쳐도 형식이 틀린 값·배열은 버린다, 이름은 200자', () => {
+    const d = planFormDefaults({ e_use: `${V},bad`, [`e_vis_${V}`]: 'x', [`e_acc_${V}`]: ['a', 'b'], 'e_date_bad': '2030-01-01', e_name: '가'.repeat(300) });
+    expect([...d.use]).toEqual([V]);
+    expect(d.visibility).toEqual({});
+    expect(d.account).toEqual({});
+    expect(d.date).toEqual({});
+    expect(Array.from(d.name)).toHaveLength(200);
+  });
+});
+
+describe('M4UI(G1·G2) — 승인 폼 항목별 목적, 계획 폼 요청 결과·예약 공개', () => {
+  const V = '11111111-2222-4333-8444-555555555555';
+  const I1 = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const I2 = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  it('formToApprove: purpose_<id> → purposes(체크 안 한 항목도 담기지만 item_ids 만 승인 대상), 단일 purpose 는 있을 때만', () => {
+    const r = formToApprove({ [`item_${I1}`]: 'on', [`hash_${I1}`]: 'h1', [`hash_${I2}`]: 'h2', [`purpose_${I1}`]: 'upload_private', [`purpose_${I2}`]: 'mock_publish', confirm: 'yes' });
+    expect(r).toEqual({ item_ids: [I1], expected_hashes: { [I1]: 'h1', [I2]: 'h2' }, confirm: true, purposes: { [I1]: 'upload_private', [I2]: 'mock_publish' } });
+    expect(formToApprove({ [`item_${I1}`]: 'on', purpose: 'mock_publish' })).toEqual({ item_ids: [I1], expected_hashes: {}, confirm: false, purpose: 'mock_publish' });
+  });
+  it('formToPlanCreate: 예약 공개 = public_publish + publish_at, 빈 값 = 계정 기본값, 예약 공개 날짜가 비어도 넘겨 서버가 거부', () => {
+    const base = { [`use_${V}`]: 'on', [`account_${V}`]: I1, [`visibility_${V}`]: 'private' };
+    const item = (f: Record<string, string>) => formToPlanCreate({ ...base, ...f }).items[0]!;
+    expect(item({ [`result_${V}`]: 'scheduled_publish', [`publish_date_${V}`]: '2030-01-02', [`publish_time_${V}`]: '09:30' })).toMatchObject({
+      requested_result: 'public_publish',
+      publish_at: { date: '2030-01-02', time: '09:30' },
+      schedule: undefined,
+    });
+    expect(item({ [`result_${V}`]: 'scheduled_publish' }).publish_at).toEqual({ date: '', time: '' });
+    expect(item({ [`result_${V}`]: '' })).toMatchObject({ requested_result: undefined, publish_at: undefined });
+    expect(item({})).toMatchObject({ requested_result: undefined, publish_at: undefined });
+    // M4UI FIX1(Codex review-M4UI P1 :161): 예약 공개가 아닌 선택에 남아 있는 예약 공개 날짜·시각은 버린다(publish_at 없음)
+    expect(item({ [`result_${V}`]: 'upload_private', [`publish_date_${V}`]: '2030-01-02' })).toMatchObject({ requested_result: 'upload_private', publish_at: undefined });
+    // 모르는 값은 그대로 넘겨 스키마가 거부
+    expect(item({ [`result_${V}`]: 'go_live' }).requested_result).toBe('go_live');
+  });
+  it('M4UI FIX1: 공개 게시 + 남은 예약 공개 날짜·시각 → publish_at 없음(즉시 공개 계획), 예약 공개 → publish_at, 두 선택이 요청에서 구별됨', () => {
+    const leftover = { [`use_${V}`]: 'on', [`account_${V}`]: I1, [`publish_date_${V}`]: '2030-01-02', [`publish_time_${V}`]: '09:30' };
+    const pub = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'public', [`result_${V}`]: 'public_publish' }).items[0]!;
+    expect(pub).toMatchObject({ requested_result: 'public_publish', visibility: 'public' });
+    expect(pub.publish_at).toBeUndefined();
+    // 같은 입력(private + 날짜·시각)에서 공개 게시와 예약 공개가 서로 다른 요청이 된다
+    const pubPrivate = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'private', [`result_${V}`]: 'public_publish' }).items[0]!;
+    const sched = formToPlanCreate({ ...leftover, [`visibility_${V}`]: 'private', [`result_${V}`]: 'scheduled_publish' }).items[0]!;
+    expect(pubPrivate.publish_at).toBeUndefined();
+    expect(sched).toMatchObject({ requested_result: 'public_publish', visibility: 'private', publish_at: { date: '2030-01-02', time: '09:30' } });
+    expect(JSON.stringify(pubPrivate)).not.toBe(JSON.stringify(sched));
+    // 계정 기본값(빈 값)·MOCK 실행에 남은 값도 버린다. 실행 예약(date_·time_)은 그대로
+    expect(formToPlanCreate({ ...leftover, [`result_${V}`]: '' }).items[0]!.publish_at).toBeUndefined();
+    expect(formToPlanCreate({ ...leftover, [`result_${V}`]: 'mock_publish', [`date_${V}`]: '2030-01-01', [`time_${V}`]: '08:00' }).items[0]).toMatchObject({
+      requested_result: 'mock_publish',
+      publish_at: undefined,
+      schedule: { date: '2030-01-01', time: '08:00' },
+    });
+    // 예약 공개 날짜·시각 앞뒤 공백은 잘라 넘긴다
+    expect(formToPlanCreate({ ...leftover, [`publish_time_${V}`]: ' 09:30 ', [`result_${V}`]: 'scheduled_publish' }).items[0]!.publish_at).toEqual({ date: '2030-01-02', time: '09:30' });
+  });
+  it('resultChoicesFor·planResultSelect·planAccountLabel: D27 — 모의 연결 YouTube 만 비공개 업로드·공개 게시·예약 공개, seed·Threads 는 MOCK 실행만', () => {
+    const ytLinked = { kind: 'mock', platform: 'youtube', credentialState: 'linked', displayName: 'YT' };
+    const ytSeed = { kind: 'mock', platform: 'youtube', credentialState: 'none', displayName: 'YT seed' };
+    const thrLinked = { kind: 'mock', platform: 'threads', credentialState: 'linked', displayName: 'TH' };
+    expect(resultChoicesFor(ytLinked)).toEqual(['upload_private', 'public_publish', 'scheduled_publish']);
+    expect(resultChoicesFor(ytSeed)).toEqual(['mock_publish']);
+    expect(resultChoicesFor(thrLinked)).toEqual(['mock_publish']);
+    expect(resultChoicesFor({ ...ytLinked, credentialState: 'needs_reconnect' })).toEqual(['upload_private', 'public_publish', 'scheduled_publish']);
+    expect(planResultSelect([thrLinked])).toEqual({ fixed: true, accountDefault: false, choices: ['mock_publish'], scheduledAllowed: false, live: false });
+    expect(planResultSelect([ytLinked])).toEqual({ fixed: false, accountDefault: false, choices: ['upload_private', 'public_publish', 'scheduled_publish'], scheduledAllowed: true, live: false });
+    expect(planResultSelect([ytSeed, ytLinked])).toEqual({
+      fixed: false,
+      accountDefault: true,
+      choices: ['upload_private', 'public_publish', 'scheduled_publish', 'mock_publish'],
+      scheduledAllowed: true,
+      live: false,
+    });
+    expect(planAccountLabel(ytLinked)).toBe('YT (MOCK) · 모의 연결 — 비공개 업로드·공개 게시·예약 공개');
+    expect(planAccountLabel(thrLinked)).toBe('TH (MOCK) · MOCK 실행만');
+    for (const l of Object.values(RESULT_CHOICE_LABEL)) expect(l).toContain('MOCK');
+    // LIVE-P1(D38): 실제 Threads 계정(실제 게시 계정으로 사용 중) — MOCK 이라고 하지 않고 실제 게시라고 말한다, 요청 결과는 서버 기본값
+    const liveThr = { kind: 'live', platform: 'threads', credentialState: 'linked', displayName: '@tester' };
+    expect(resultChoicesFor(liveThr)).toEqual([]);
+    expect(planAccountLabel(liveThr)).toBe('@tester (실제 계정) · 실제 게시 — Threads 텍스트 1개, 되돌리기 없음');
+    expect(planAccountLabel(liveThr)).not.toContain('MOCK');
+    expect(planResultSelect([liveThr])).toEqual({ fixed: true, accountDefault: false, choices: [], scheduledAllowed: false, live: true });
+    expect(planResultSelect([thrLinked, liveThr])).toMatchObject({ fixed: true, live: true, choices: ['mock_publish'] });
+  });
+  it('planFormEcho·planFormDefaults: 요청 결과·예약 공개 날짜·시각 왕복(목록 밖 값·형식 틀린 값은 버림)', () => {
+    const W = '99999999-2222-4333-8444-555555555555';
+    const qs = planFormEcho({
+      [`use_${V}`]: 'on',
+      [`result_${V}`]: 'scheduled_publish',
+      [`publish_date_${V}`]: '2030-01-02',
+      [`publish_time_${V}`]: '18:00',
+      [`result_${W}`]: 'go_live',
+      [`publish_date_${W}`]: '2030/01/02',
+      [`publish_time_${W}`]: '6pm',
+    });
+    const d = planFormDefaults(Object.fromEntries(new URLSearchParams(qs.slice(1)).entries()));
+    expect(d.result).toEqual({ [V]: 'scheduled_publish' });
+    expect(d.publishDate).toEqual({ [V]: '2030-01-02' });
+    expect(d.publishTime).toEqual({ [V]: '18:00' });
+    // 기존 예약(date_·time_)과 섞이지 않는다
+    expect(d.date).toEqual({});
+    expect(d.time).toEqual({});
+  });
+  it('오류 문구: 요청 결과·예약 공개 규칙 코드는 모두 한국어 문구가 있다', () => {
+    for (const c of [
+      'requested_result_not_supported',
+      'requested_result_required',
+      'visibility_mismatch',
+      'publish_at_not_supported',
+      'publish_at_requires_public_publish',
+      'publish_at_requires_private',
+      'publish_at_before_send',
+      'purpose_mismatch',
+      'mock_only',
+      'invalid_schedule',
+      'schedule_in_past',
+    ]) {
+      expect(DISTRIBUTE_ERROR_TEXT[c], c).toMatch(/[가-힣]/u);
+    }
+    expect(REQUESTED_RESULT_LABEL).toEqual({ mock_publish: 'MOCK 실행', upload_private: '비공개 업로드(MOCK)', public_publish: '공개 게시 계획(MOCK)' });
+  });
+});
+
+describe('Codex review-FIX-M3screen — 취소 두 배너 분리·재시도 배너는 기록된 재시도로', () => {
+  const ev = (details: Record<string, unknown>) => ({ sanitizedDetails: details });
+  const row = (status: string, jobs: string[], events: Array<{ sanitizedDetails: unknown }> = []) => ({ item: { status }, activeApproval: { id: 'a' }, jobs: jobs.map((state) => ({ state })), events });
+  it('P1: CANCEL_REQUESTED 만 있는 계획에 ?canceled=1 → 취소됨 배너 없음, 취소 확인 중 배너는 그 상태일 때만', () => {
+    const requested = { items: [row('CANCEL_REQUESTED', ['CANCEL_REQUESTED'])] };
+    expect(bannersFromState({ canceled: '1' }, requested)).toMatchObject({ canceled: false, cancelRequested: false });
+    expect(bannersFromState({ cancel_requested: '1' }, requested)).toMatchObject({ canceled: false, cancelRequested: true });
+  });
+  it('P1: CANCELED 만 있는 계획에 ?cancel_requested=1 → 취소 확인 중 배너 없음', () => {
+    const canceled = { items: [row('CANCELED', ['CANCELED'])] };
+    expect(bannersFromState({ cancel_requested: '1' }, canceled)).toMatchObject({ canceled: false, cancelRequested: false });
+    expect(bannersFromState({ canceled: '1' }, canceled)).toMatchObject({ canceled: true, cancelRequested: false });
+  });
+  it('P2: 첫 실행으로 QUEUED 인 계획에 ?retried=1 → 재시도 배너 없음, 사용자 재시도(unblock·user_retry) 뒤 QUEUED 면 표시', () => {
+    const firstRun = { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'execute', transition: 'execute' })])] };
+    expect(bannersFromState({ retried: '1' }, firstRun).retried).toBe(false);
+    expect(bannersFromState({ retried: '1' }, { items: [row('QUEUED', ['QUEUED'])] }).retried).toBe(false);
+    const retried = { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'unblock', transition: 'unblock', cause: 'user_retry' }), ev({ event: 'blocked', transition: 'blocked' })])] };
+    expect(bannersFromState({ retried: '1' }, retried).retried).toBe(true);
+    // unblock 이지만 사용자 재시도가 아닌 경우(다른 원인)·이미 처리기가 가져간 경우는 아님
+    expect(bannersFromState({ retried: '1' }, { items: [row('QUEUED', ['QUEUED'], [ev({ event: 'unblock', transition: 'unblock', cause: 'other' })])] }).retried).toBe(false);
+    expect(bannersFromState({ retried: '1' }, { items: [row('SENDING', ['SENDING'], [ev({ event: 'unblock', transition: 'unblock', cause: 'user_retry' })])] }).retried).toBe(false);
+    // 쿼리 없으면 상태가 맞아도 없음
+    expect(bannersFromState({}, retried).retried).toBe(false);
+  });
+});
+
+describe('T14(D26) Threads 모의 화면 문구', () => {
+  it('요청 제한 대기(로컬·원격 429)는 "요청 제한 — HH:mm MSK 이후 재시도", 다른 재시도 대기는 기존 문구', () => {
+    const at = new Date('2030-01-01T09:05:00Z'); // 12:05 MSK
+    const w = (code: string | null) => ({ state: 'RETRY_WAIT', attempt: 1, maxAttempts: 5, nextRunAt: at, lastErrorCode: code });
+    expect(jobStatusText(w('local_rate_limited'))).toBe('RETRY_WAIT · 요청 제한 — 12:05 MSK 이후 재시도');
+    expect(jobStatusText(w('rate_limited'))).toBe('RETRY_WAIT · 요청 제한 — 12:05 MSK 이후 재시도');
+    expect(itemHeadline({ status: 'RETRY_WAIT', channel: 'threads', job: w('local_rate_limited'), pub: null, blockReason: null })).toBe('요청 제한 — 12:05 MSK 이후 재시도');
+    expect(jobStatusText(w('mock_503_not_sent'))).toBe('RETRY_WAIT · 재시도 대기 (1/5, 다음 12:05 MSK)');
+    // FIX-T15: web tick 조각 예산으로 양보한 업로드는 장애·재시도 횟수가 아니라 진행 중
+    expect(jobStatusText(w('upload_slice_yield'), null, null, 'youtube')).toBe('RETRY_WAIT · 업로드 진행 중 — 다음 처리에서 같은 세션으로 이어 올림');
+    expect(itemHeadline({ status: 'RETRY_WAIT', channel: 'youtube', job: w('upload_slice_yield'), pub: null, blockReason: null })).toBe('비공개 업로드 진행 중 — 다음 처리에서 이어 올림');
+  });
+  it('401(auth_invalid_token) 보류는 "계정 다시 연결 필요", 재확인 resumable 은 고정 문구(게시하지 않음)', () => {
+    const j = { ...job('BLOCKED', 'auth_invalid_token'), lastRetryClass: 'auth' };
+    expect(itemHeadline({ status: 'BLOCKED', channel: 'threads', job: j, pub: null, blockReason: null })).toBe('계정 다시 연결 필요');
+    expect(reconciledParam('resumable')).toBe('resumable');
+    expect(reconciledNotice('resumable')).toMatch(/게시하지 않았습니다/);
+  });
+  it('단계 한 줄: 게시물 n/m · 상태 · 모의 ID, "게시 완료"라고 하지 않는다', () => {
+    expect(remoteStepLine({ kind: 'container', status: 'created', postIndex: 1, remoteId: 'mockthr_ct_x' }, 3)).toBe('게시물 2/3 · 컨테이너 생성됨 · mockthr_ct_x');
+    const pub = remoteStepLine({ kind: 'publish', status: 'published', postIndex: 0, remoteId: 'mockthr_post_y' }, 1);
+    expect(pub).toBe('게시물 1/1 · 게시됨(MOCK) · mockthr_post_y');
+    expect(pub).not.toMatch(/게시 완료/);
+  });
+  it('시나리오 선택지는 항목 어댑터에 맞는 것만(success 는 둘 다)', () => {
+    const thr = mockScenarioOptionsFor('mock_threads').map((o) => o.value);
+    const gen = mockScenarioOptionsFor('mock_generic').map((o) => o.value);
+    expect(thr).toContain('threads_thread_partial');
+    expect(thr).not.toContain('ambiguous_sent');
+    expect(gen).not.toContain('threads_success');
+    expect(thr).toContain('success');
+    expect(gen).toContain('success');
+  });
+});
+
+describe('stepsPanelView — M4 화면 FIX(S1): 단계 패널은 기록된 어댑터 기준', () => {
+  const base = { currentAdapter: 'mock_threads' as const, platform: 'threads', remoteStepKinds: [] as string[] };
+
+  it('T14 이전 전송 의도(adapter_id 없음)는 mock_generic — 지금 연결됨(mock_threads)이어도 "일반 모의 어댑터로 처리됨"', () => {
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { mode: 'MOCK' } } });
+    expect(v).toMatchObject({ panel: 'threads', adapter: 'mock_generic', source: 'intent' });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — Threads 단계 기록 없음(MOCK)');
+    expect(v.note).not.toContain('진행');
+  });
+
+  it('adapter_id: null 도 mock_generic', () => {
+    expect(stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: null } } }).adapter).toBe('mock_generic');
+  });
+
+  it('YouTube 계정·일반 모의로 처리된 의도 → YouTube 쪽 같은 안내', () => {
+    const v = stepsPanelView({ currentAdapter: 'mock_youtube', platform: 'youtube', remoteStepKinds: [], latestIntent: { sanitizedDetails: {} } });
+    expect(v).toMatchObject({ panel: 'youtube', adapter: 'mock_generic' });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — YouTube 업로드 단계 기록 없음(MOCK)');
+  });
+
+  it('기록된 mock_threads 의도 → Threads 단계 패널(안내 없음), 현재 선택이 mock_generic 이어도', () => {
+    const v = stepsPanelView({ ...base, currentAdapter: 'mock_generic', latestIntent: { sanitizedDetails: { adapter_id: 'mock_threads' } } });
+    expect(v).toEqual({ panel: 'threads', adapter: 'mock_threads', source: 'intent', note: null });
+  });
+
+  it('기록된 mock_youtube 의도 → YouTube 패널', () => {
+    const v = stepsPanelView({ currentAdapter: 'mock_generic', platform: 'youtube', remoteStepKinds: [], latestIntent: { sanitizedDetails: { adapter_id: 'mock_youtube' } } });
+    expect(v).toEqual({ panel: 'youtube', adapter: 'mock_youtube', source: 'intent', note: null });
+  });
+
+  it('전송 의도가 아직 없으면 현재 선택(adapterIdFor) — mock_threads 면 진행 안내가 있는 Threads 패널', () => {
+    expect(stepsPanelView({ ...base, latestIntent: null })).toEqual({ panel: 'threads', adapter: 'mock_threads', source: 'current', note: null });
+  });
+
+  it('전송 의도 없음 + 현재 선택 mock_generic → 패널 없음', () => {
+    expect(stepsPanelView({ ...base, currentAdapter: 'mock_generic', latestIntent: null }).panel).toBeNull();
+  });
+
+  it('계정 없음 → 패널 없음(source none)', () => {
+    expect(stepsPanelView({ currentAdapter: null, platform: null, remoteStepKinds: [], latestIntent: null })).toEqual({ panel: null, adapter: null, source: 'none', note: null });
+  });
+
+  it('원격 단계 기록이 있으면 그 패널(기록이 우선 보인다)', () => {
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: {} }, remoteStepKinds: ['container'] });
+    expect(v).toMatchObject({ panel: 'threads', note: null });
+  });
+
+  it('모르는 adapter_id → 확인 불가 안내(진행 안내 아님)', () => {
+    // LIVE-P1(D38): live_threads 는 이제 아는 어댑터 — 모르는 값의 예는 live_youtube(단언 의미 그대로)
+    const v = stepsPanelView({ ...base, latestIntent: { sanitizedDetails: { adapter_id: 'live_youtube' } } });
+    expect(v).toMatchObject({ panel: 'threads', adapter: null, source: 'intent' });
+    expect(v.note).toBe('전송 의도에 기록된 어댑터를 확인할 수 없음 — Threads 단계 표시 안 함(MOCK)');
+  });
+
+  it('일반 채널(blog 등) + 일반 모의 의도 → 패널 없음', () => {
+    expect(stepsPanelView({ currentAdapter: 'mock_generic', platform: 'blog', remoteStepKinds: [], latestIntent: { sanitizedDetails: {} } }).panel).toBeNull();
+  });
+});
+
+describe('accountHealthLine — M4 화면 FIX(S3): 배포 계정 연결 상태(설정 화면과 같은 라벨)', () => {
+  const h = (status: Parameters<typeof accountHealthLine>[0]['status'], extra: Partial<Parameters<typeof accountHealthLine>[0]> = {}) =>
+    accountHealthLine({ status, usable_for_execution: false, credential_required: true, pending_reconcile: null, mock: true, ...extra });
+
+  it('상태별 한국어 라벨', () => {
+    expect(h('not_connected', { usable_for_execution: true, credential_required: false }).label).toBe('연결 정보 없음');
+    expect(h('connected', { usable_for_execution: true }).label).toBe('연결됨');
+    expect(h('expiring_soon', { usable_for_execution: true }).label).toBe('곧 만료');
+    expect(h('expired').label).toBe('만료됨');
+    expect(h('revoked').label).toBe('연결 해제됨');
+    expect(h('needs_reconnect').label).toBe('다시 연결 필요');
+    expect(h('error').label).toBe('오류');
+  });
+
+  it('정리 대기가 있으면 "정리 대기 차단" + 배포 실행 차단', () => {
+    const r = h('error', { pending_reconcile: 'cleanup_revoke' });
+    expect(r.label).toBe('정리 대기 차단');
+    expect(r.text).toBe('정리 대기 차단 — 배포 실행 차단');
+    expect(r.warn).toBe(true);
+  });
+
+  it('연결한 적 없는 모의 계정: 실행 가능 안내, 경고 아님', () => {
+    const r = h('not_connected', { usable_for_execution: true, credential_required: false });
+    expect(r).toEqual({ label: '연결 정보 없음', warn: false, text: '연결 정보 없음 — 모의 배포는 연결 없이 가능(결과는 MOCK)' });
+  });
+
+  it('연결됨: 경고·차단 없음', () => {
+    expect(h('connected', { usable_for_execution: true })).toEqual({ label: '연결됨', warn: false, text: '연결됨' });
+  });
+
+  it('다시 연결 필요·만료됨: 배포 실행 차단', () => {
+    expect(h('needs_reconnect').text).toBe('다시 연결 필요 — 배포 실행 차단');
+    expect(h('expired').text).toBe('만료됨 — 배포 실행 차단');
+  });
+});
+
+describe('M4 화면 FIX(S4) — YouTube 업로드 패널: "(세션 있음)" 은 세션이 있을 때만', () => {
+  it('세션 없음: 공통 MOCK 안내만, "세션 있음" 문구 없음', () => {
+    const t = youtubeSessionNote({ hasSession: false });
+    expect(t).toBe(YOUTUBE_MOCK_DISCLAIMER);
+    expect(t).not.toContain('세션 있음');
+    expect(t).not.toContain('세션 URI');
+  });
+
+  it('세션 있음: 세션 URI 미표시 안내(세션 있음) + 공통 MOCK 안내', () => {
+    const t = youtubeSessionNote({ hasSession: true });
+    expect(t).toContain('세션 URI 는 화면·로그에 표시하지 않습니다(세션 있음)');
+    expect(t.endsWith(YOUTUBE_MOCK_DISCLAIMER)).toBe(true);
+  });
+});
+
+describe('M4 화면 FIX(S5, D27) — 요청한 예약 공개 시각과 원격 결과 구분(publishAtView)', () => {
+  const publishAt = '2026-10-04T07:00:00.000Z'; // 10:00 MSK
+
+  it('publish_at 없음: 표시 없음', () => {
+    expect(publishAtView({ publishAt: null, resultKind: 'UPLOADED_PRIVATE', isMock: true })).toBeNull();
+    expect(publishAtView({ publishAt: undefined, resultKind: null, isMock: true })).toBeNull();
+  });
+
+  it('결과 전: 요청만(원격 결과 전), 경고 아님, "적용" 이라고 하지 않음', () => {
+    const v = publishAtView({ publishAt, resultKind: null, isMock: true })!;
+    expect(v.state).toBe('requested');
+    expect(v.warn).toBe(false);
+    expect(v.text).toContain('요청한 예약 공개 시각');
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).toContain('원격 결과 전');
+    expect(v.text).not.toContain('적용');
+  });
+
+  it('SCHEDULED_REMOTE: 원격 적용으로 표시(MOCK 이면 MOCK)', () => {
+    const v = publishAtView({ publishAt, resultKind: 'SCHEDULED_REMOTE', isMock: true })!;
+    expect(v.state).toBe('applied');
+    expect(v.warn).toBe(false);
+    expect(v.text).toMatch(/^예약 공개\(원격 publishAt 적용\): .+ \(MOCK\)$/);
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).not.toContain('적용하지 않음');
+  });
+
+  it('UPLOADED_PRIVATE(미검증 프로젝트가 비공개 강제·publishAt 버림): 원격이 적용하지 않음 + 경고', () => {
+    const v = publishAtView({ publishAt, resultKind: 'UPLOADED_PRIVATE', isMock: true })!;
+    expect(v.state).toBe('not_applied');
+    expect(v.warn).toBe(true);
+    expect(v.text).toContain('요청한 예약 공개 시각');
+    expect(v.text).toContain('2026-10-04 10:00');
+    expect(v.text).toContain('원격이 적용하지 않음(미검증 프로젝트 등으로 비공개로 강제, 원격 publishAt 없음, MOCK)');
+    expect(v.text).not.toContain('원격 publishAt 적용');
+  });
+
+  // M4UI FIX1(Codex review-FIX-M4screen2 P1 :860): PUBLISHED 만으로 "적용하지 않음"이라고 단정하지 않는다
+  it('PUBLISHED, 예약 시각 이후 기록(정상 예약 뒤 공개일 수 있음): 중립 문구, 경고 아님, "적용하지 않음" 없음', () => {
+    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: false, recordedAt: new Date('2026-10-04T07:05:00.000Z') })!;
+    expect(v.state).toBe('unconfirmed');
+    expect(v.warn).toBe(false);
+    expect(v.text).toBe('요청한 예약 공개 시각: 2026-10-04 10:00 (MSK) — 원격 결과: 공개됨(예약 적용 여부는 원격 기록으로 확인 필요)');
+    expect(v.text).not.toContain('적용하지 않음');
+    expect(v.text).not.toContain('MOCK');
+    // 예약 시각과 같은 순간에 기록 → 이전이 아니므로 중립
+    expect(publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt: publishAt })!.state).toBe('unconfirmed');
+  });
+
+  it('PUBLISHED, 기록 시각 없음·잘못됨: 중립 문구(MOCK 이면 MOCK)', () => {
+    for (const recordedAt of [undefined, null, 'nope']) {
+      const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt })!;
+      expect(v.state).toBe('unconfirmed');
+      expect(v.warn).toBe(false);
+      expect(v.text).toContain('원격 결과: 공개됨(예약 적용 여부는 원격 기록으로 확인 필요, MOCK)');
+    }
+  });
+
+  it('PUBLISHED, 예약 시각 전에 기록(원격이 예약 전에 공개로 보고): 적용하지 않음 + 경고 + 기록 시각', () => {
+    const v = publishAtView({ publishAt, resultKind: 'PUBLISHED', isMock: true, recordedAt: '2026-10-03T12:00:00.000Z' })!;
+    expect(v.state).toBe('not_applied');
+    expect(v.warn).toBe(true);
+    expect(v.text).toContain('예약 시각 전(2026-10-03 15:00 MSK 기록)에 원격이 공개로 보고함');
+    expect(v.text).toContain('예약이 적용되지 않음(원격 결과: 게시, MOCK)');
+  });
+
+  it('PUBLISHED, 요청 시각이 잘못됨: 비교할 수 없으므로 중립', () => {
+    expect(publishAtView({ publishAt: 'nope', resultKind: 'PUBLISHED', isMock: false, recordedAt: '2020-01-01T00:00:00Z' })!.state).toBe('unconfirmed');
+  });
+
+  it('MANUAL_REPORTED·모르는 결과: 중립 문구(적용·미적용 단정 없음)', () => {
+    const m = publishAtView({ publishAt, resultKind: 'MANUAL_REPORTED', isMock: false, recordedAt: '2026-10-03T12:00:00.000Z' })!;
+    expect(m.state).toBe('unconfirmed');
+    expect(m.text).toContain('원격 결과: 수동 기록(예약 적용 여부는 원격 기록으로 확인 필요)');
+    const u = publishAtView({ publishAt, resultKind: 'SOMETHING', isMock: false })!;
+    expect(u.state).toBe('unconfirmed');
+    expect(u.text).toContain('원격 결과: SOMETHING(');
+  });
+
+  it('UPLOADED_PRIVATE·SCHEDULED_REMOTE 는 기록 시각과 무관(예약 시각 이후 기록이어도 같은 판정)', () => {
+    const late = '2026-10-05T00:00:00.000Z';
+    expect(publishAtView({ publishAt, resultKind: 'UPLOADED_PRIVATE', isMock: true, recordedAt: late })!.state).toBe('not_applied');
+    expect(publishAtView({ publishAt, resultKind: 'SCHEDULED_REMOTE', isMock: true, recordedAt: late })!.state).toBe('applied');
+  });
+
+  it('잘못된 시각: 시각 미확인', () => {
+    expect(publishAtView({ publishAt: 'nope', resultKind: null, isMock: true })!.text).toContain('시각 미확인');
+  });
+});
+
+describe('T16(D29 제안) Instagram 모의 화면 문구', () => {
+  it('단계 패널: 기록된 어댑터·단계 종류로 instagram 패널, 일반 모의로 처리된 Instagram 항목은 안내 한 줄', () => {
+    expect(stepsPanelView({ currentAdapter: 'mock_instagram', platform: 'instagram', remoteStepKinds: [], latestIntent: null }).panel).toBe('instagram');
+    expect(stepsPanelView({ currentAdapter: 'mock_generic', platform: 'instagram', remoteStepKinds: ['ig_container'], latestIntent: { sanitizedDetails: {} } }).panel).toBe('instagram');
+    const v = stepsPanelView({ currentAdapter: 'mock_instagram', platform: 'instagram', remoteStepKinds: [], latestIntent: { sanitizedDetails: { adapter_id: 'mock_generic' } } });
+    expect(v.note).toBe('일반 모의 어댑터로 처리됨 — Instagram 단계 기록 없음(MOCK)');
+  });
+  it('단계 한 줄·진행: 캐러셀 자식/부모/게시를 구분, 모의 ID 만, "게시 완료" 없음', () => {
+    expect(instagramStepLine({ kind: 'ig_container', status: 'finished', postIndex: 2, remoteId: 'mockig_ct_x' }, 3)).toBe('캐러셀 이미지 2/3 · 컨테이너 준비됨 · mockig_ct_x');
+    expect(instagramStepLine({ kind: 'ig_container', status: 'created', postIndex: 0, remoteId: 'mockig_ct_p' }, 3)).toBe('캐러셀(부모) 컨테이너 · 컨테이너 생성됨(처리 중) · mockig_ct_p');
+    expect(instagramStepLine({ kind: 'ig_container', status: 'finished', postIndex: 0, remoteId: 'mockig_ct_s' }, 1)).toBe('이미지 컨테이너 · 컨테이너 준비됨 · mockig_ct_s');
+    expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'mockig_m_1' }, 1)).toBe('게시 · 게시됨(MOCK) · mockig_m_1');
+    // FIX-T16(P1): 부모 생성 요청 표식은 원격 ID 가 아님을 밝힌다
+    expect(instagramStepLine({ kind: 'ig_parent_request', status: 'created', postIndex: 0, remoteId: 'mockig_req_1' }, 3)).toBe('캐러셀(부모) 생성 요청 · 요청 표식(원격 ID 아님 — 응답을 잃으면 자식으로 부모를 찾음) · mockig_req_1');
+    expect(instagramProgressLine({ images: 3, finished: 2, created: 3, published: false })).toBe('컨테이너 2/4 준비 · 처리 중 1 · 게시 대기');
+    expect(instagramProgressLine({ images: 1, finished: 1, created: 1, published: true })).toBe('게시됨(MOCK) · 컨테이너 1/1');
+    expect(instagramStepLine({ kind: 'ig_publish', status: 'published', postIndex: 0, remoteId: 'm' }, 1)).not.toContain('게시 완료');
+  });
+  it('항목 문구: 처리 중·게시 확인(MOCK, 실제 발행 아님), 규격 문제·공개 범위 오류·계정 줄', () => {
+    expect(itemHeadline({ status: 'REMOTE_PROCESSING', channel: 'instagram', job: null, pub: null, blockReason: null })).toBe('Instagram 컨테이너 처리 중 — 확인 대기(MOCK)');
+    const h = itemHeadline({ status: 'CONFIRMED', channel: 'instagram', job: null, pub: { permalink: 'mock://instagram/p/x', resultKind: 'PUBLISHED', isMock: true }, blockReason: null });
+    expect(h).toBe('MOCK 게시 확인(Instagram 모의 — 실제 발행 아님)');
+    expect(h).not.toContain('게시 완료');
+    expect(problemLabel('media_spec:aspect_out_of_range:1').startsWith('Instagram 규격(잠정): 가로세로 비율')).toBe(true);
+    expect(DISTRIBUTE_ERROR_TEXT.instagram_visibility_public_only).toMatch(/public/);
+    expect(planAccountLabel({ displayName: 'IG', kind: 'mock', platform: 'instagram', credentialState: 'linked' })).toBe('IG (MOCK) · 모의 연결 — MOCK 실행만(공개 범위 public 만)');
+    expect(planAccountLabel({ displayName: 'IG', kind: 'mock', platform: 'instagram', credentialState: 'none' })).toBe('IG (MOCK) · MOCK 실행만');
+    expect(resultChoicesFor({ kind: 'mock', platform: 'instagram', credentialState: 'linked' })).toEqual(['mock_publish']);
+    expect(mockScenarioOptionsFor('mock_instagram').every((o) => o.value === 'success' || o.value.startsWith('instagram_'))).toBe(true);
+    expect(mockScenarioOptionsFor('mock_generic').some((o) => o.value.startsWith('instagram_'))).toBe(false);
+  });
+});
+
+// FIX2-LIVEP1(Codex 놓친 케이스): 확인 후보는 **가장 최근 재확인 이력**의 것만 — 나중 재확인이 0개·2개·불완전 목록이면 옛 후보를 보이지 않는다.
+describe('liveCandidateFromEvents — 최신 재확인 기준(오래된 후보 숨김)', () => {
+  const C1 = 'threads:18000000000000201';
+  const L1 = 'https://www.threads.com/@t/post/A1';
+  const ev = (eventSeq: number, details: Record<string, unknown>) => ({ eventSeq, sanitizedDetails: details });
+  const cand = (seq: number) => ev(seq, { event: 'reconcile_retry', reconcile: 'unknown', error_code: 'publish_unconfirmed_candidate', candidate_external_id: C1, candidate_permalink: L1 });
+  it('최신 재확인이 후보를 남겼으면 그 후보', () => {
+    expect(liveCandidateFromEvents([ev(1, { event: 'send_start' }), ev(2, { event: 'ambiguous' }), cand(3)])).toEqual({ externalId: C1, permalink: L1 });
+  });
+  it.each(['publish_unconfirmed_no_candidate', 'publish_unconfirmed_candidates_ambiguous', 'publish_unconfirmed_list_incomplete', 'list_unreadable'])(
+    '앞 재확인은 후보, 다음 재확인은 %s → 후보 없음',
+    (code) => {
+      expect(liveCandidateFromEvents([cand(3), ev(4, { event: 'reconcile_retry', reconcile: 'unknown', error_code: code })])).toBeNull();
+      // 순서가 섞여 와도(새 것부터) 같은 판단
+      expect(liveCandidateFromEvents([ev(4, { event: 'reconcile_unsupported', reconcile: 'unknown', error_code: code }), cand(3)])).toBeNull();
+    },
+  );
+  it('재확인이 아닌 나중 이력(예: 다른 사건)은 판단을 바꾸지 않는다, 형식 틀린 후보는 버린다', () => {
+    expect(liveCandidateFromEvents([cand(3), ev(4, { event: 'blocked' })])).toEqual({ externalId: C1, permalink: L1 });
+    expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: 'mock:threads:x' })])).toBeNull();
+    expect(liveCandidateFromEvents([ev(5, { reconcile: 'unknown', candidate_external_id: C1, candidate_permalink: 'https://evil.example/x' })])).toEqual({ externalId: C1, permalink: null });
+  });
+});
+
+// LIVEP1-DIAG: 실제 Threads 오류 진단 한 줄(허용 목록 필드만 — 이력에 다른 값이 섞여 있어도 화면에 나가지 않는다)
+describe('threadsDiagLine·latestThreadsDiag', () => {
+  const TOKEN = 'FAKE_diag_ui_token_tttttttttttttttt';
+  it('한국어 한 줄: 단계·HTTP·code·subcode·type·is_transient·fbtrace', () => {
+    expect(threadsDiagLine({ op: 'create', http_status: 403, code: 10, error_subcode: 2207051, error_type: 'OAuthException', is_transient: false, fbtrace_id: 'AbC_1' })).toBe(
+      'Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10 · subcode 2207051 · OAuthException · is_transient=false · fbtrace AbC_1',
+    );
+    expect(threadsDiagLine({ op: 'publish', transport: 'timeout' })).toBe('Threads 오류 코드: 게시 · 응답 시간 초과(응답 없음)');
+    expect(threadsDiagLine({ op: 'list' })).toBeNull();
+  });
+  it('이력에 문구·토큰·URL 이 섞여 있어도 줄에는 허용 목록만', () => {
+    const line = threadsDiagLine({ op: 'create', http_status: 403, code: 10, message: `perm ${TOKEN}`, error_user_msg: TOKEN, url: `https://graph.threads.net/x?access_token=${TOKEN}`, error_type: `x ${TOKEN}` })!;
+    expect(line).toBe('Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10');
+    expect(line).not.toContain(TOKEN);
+  });
+  it('가장 최근 진단(새 것부터)', () => {
+    const ev = (eventSeq: number, d: Record<string, unknown>) => ({ eventSeq, sanitizedDetails: d });
+    expect(latestThreadsDiag([ev(1, { provider_diag: { op: 'create', http_status: 500 } }), ev(2, { event: 'x' }), ev(3, { provider_diag: { op: 'create', http_status: 403, code: 10 } })])).toBe(
+      'Threads 오류 코드: 컨테이너 생성 · HTTP 403 · code 10',
+    );
+    expect(latestThreadsDiag([ev(1, { event: 'x' })])).toBeNull();
+  });
+});
+
+// ---- LIVEP1-USERCONFIRM: "Threads에서 확인함" 버튼·결과 표시 ----
+describe('LIVEP1-USERCONFIRM: 사용자 확인 버튼 판정·결과 문구', () => {
+  const ID = 'threads:18000000000123456';
+  const LINK = 'https://www.threads.com/@t/post/DeeRJ-LjgdA';
+  const card = (over: Record<string, unknown> = {}) => ({
+    account: { kind: 'live', platform: 'threads' },
+    jobs: [{ id: 'j1', state: 'UNKNOWN', restoredNeedsReview: false }],
+    remoteSteps: [
+      { jobId: 'j1', kind: 'container' },
+      { jobId: 'j1', kind: 'publish_attempt' },
+    ],
+    publications: [] as unknown[],
+    // FIX-LIVEP1-USERCONFIRM: 서버와 같은 조회의 가장 최근 재확인 이력(화면 이력 10개와 무관)
+    latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } as Record<string, unknown> } as { eventSeq: number; sanitizedDetails: Record<string, unknown> } | null,
+    // FIX1-FULLREV2(G6): 후보 글이 다른 항목의 결과인지(getPlanDetail 이 서버 판정으로 채움)
+    candidateClaimed: false,
+    ...over,
+  });
+  it('조건이 모두 맞으면 후보(버튼), RECONCILING 도', () => {
+    expect(userConfirmCandidateForCard(card())).toEqual({ external_id: ID, permalink: LINK });
+    expect(userConfirmCandidateForCard(card({ jobs: [{ id: 'j1', state: 'RECONCILING' }] }))).toEqual({ external_id: ID, permalink: LINK });
+  });
+  it.each<[string, Record<string, unknown>]>([
+    ['모의 계정(MOCK 은 절대 아님)', { account: { kind: 'mock', platform: 'threads' } }],
+    ['결과 있음', { publications: [{}] }],
+    ['CONFIRMED', { jobs: [{ id: 'j1', state: 'CONFIRMED' }] }],
+    ['복원 이력', { jobs: [{ id: 'j1', state: 'UNKNOWN', restoredNeedsReview: true }] }],
+    ['게시 시도 표식 없음', { remoteSteps: [{ jobId: 'j1', kind: 'container' }] }],
+    ['다른 작업의 표식만', { remoteSteps: [{ jobId: 'j0', kind: 'publish_attempt' }] }],
+    ['게시 기록 있음', { remoteSteps: [{ jobId: 'j1', kind: 'publish_attempt' }, { jobId: 'j1', kind: 'publish' }] }],
+    ['링크 없는 후보', { latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } } }],
+    ['최근 재확인에 후보 없음(낡은 후보는 조회가 고르지 않음)', { latestReconcileEvent: { eventSeq: 5, sanitizedDetails: { reconcile: 'unknown' } } }],
+    ['재확인 이력 없음', { latestReconcileEvent: null }],
+    // FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과(서버도 409 user_confirm_candidate_claimed)
+    ['후보가 이미 다른 항목의 결과', { candidateClaimed: true }],
+  ])('%s → 버튼 없음', (_, over) => {
+    expect(userConfirmCandidateForCard(card(over))).toBeNull();
+  });
+  it('FIX-LIVEP1-USERCONFIRM: 후보 표시·버튼은 화면 이력(events)이 아니라 latestReconcileEvent 로 — 화면 이력에 재확인이 없어도 보이고, 화면 이력의 낡은 후보는 무시', () => {
+    const ordinary = Array.from({ length: 10 }, (_, i) => ({ eventSeq: 20 - i, sanitizedDetails: { event: 'note' } as Record<string, unknown> }));
+    const x = { ...card(), events: ordinary };
+    expect(userConfirmCandidateForCard(x)).toEqual({ external_id: ID, permalink: LINK });
+    expect(liveCandidateForCard(x)).toEqual({ externalId: ID, permalink: LINK });
+    const stale = { ...card({ latestReconcileEvent: { eventSeq: 30, sanitizedDetails: { reconcile: 'unknown' } } }), events: [{ eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID, candidate_permalink: LINK } }] };
+    expect(userConfirmCandidateForCard(stale)).toBeNull();
+    expect(liveCandidateForCard(stale)).toBeNull();
+    // 링크 없는 후보: 표시는 ID 만(버튼은 없음 — 위 표)
+    expect(liveCandidateForCard({ latestReconcileEvent: { eventSeq: 4, sanitizedDetails: { reconcile: 'unknown', candidate_external_id: ID } } })).toEqual({ externalId: ID, permalink: null });
+    expect(liveCandidateForCard({ latestReconcileEvent: null })).toBeNull();
+  });
+  it('결과 문구·배지: 사용자 확인은 VERIFIED 와 다른 문구·다른 색, 그 밖은 배지 없음', () => {
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).toContain('사용자 확인');
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).toContain('앱이 검증한 것은 아님');
+    expect(liveVerificationLabel('USER_CONFIRMED', LINK)).not.toBe(liveVerificationLabel('VERIFIED', LINK));
+    const v = liveVerificationTag('VERIFIED')!;
+    const u = liveVerificationTag('USER_CONFIRMED')!;
+    expect(u.text).toBe('사용자 확인');
+    expect(v.text).toBe('확인됨(VERIFIED)');
+    expect(u.className).not.toBe(v.className);
+    expect(u.className).not.toContain('warn');
+    expect(liveVerificationTag('UNVERIFIED')).toBeNull();
+    expect(liveVerificationTag('MOCK')).toBeNull();
+    const headline = liveItemHeadline({ status: 'CONFIRMED', channel: 'threads', job: null, pub: { permalink: LINK, resultKind: 'PUBLISHED', isMock: false }, blockReason: null, verification: 'USER_CONFIRMED' });
+    expect(headline).toContain('사용자 확인');
+    expect(headline).not.toContain('MOCK');
+  });
+  it('작업 줄: 사용자 확인 결과는 "사용자 확인", 모의 결과는 그대로 MOCK', () => {
+    const job = { state: 'CONFIRMED', attempt: 1, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: 'submit_timeout' };
+    const uc = jobStatusText(job, { permalink: LINK, resultKind: 'PUBLISHED', isMock: false, verification: 'USER_CONFIRMED' });
+    expect(uc).toContain('사용자 확인');
+    expect(uc).not.toContain('MOCK');
+    expect(jobStatusText(job, { permalink: null, resultKind: 'PUBLISHED', isMock: true, verification: 'MOCK' })).toContain('MOCK');
+  });
+  it('거절 코드마다 화면 문구가 있다(폼 오류가 "서버 오류"로 뭉개지지 않음)', () => {
+    for (const code of ['user_confirm_not_live', 'user_confirm_already_published', 'user_confirm_not_pending', 'user_confirm_restored', 'user_confirm_no_attempt', 'user_confirm_publish_recorded', 'user_confirm_no_candidate', 'user_confirm_candidate_claimed', 'user_confirm_candidate_mismatch']) {
+      expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
+    }
+    // FIX1-FULLREV2(G6): 도메인의 모든 거절 코드에 화면 문구가 있다 · claimed 는 도메인 문구 그대로
+    for (const code of USER_CONFIRM_CODES) expect(DISTRIBUTE_ERROR_TEXT[code], code).toBeTruthy();
+    expect(DISTRIBUTE_ERROR_TEXT.user_confirm_candidate_claimed).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+  });
+  it('FIX1-FULLREV2(G6): 후보 글이 이미 다른 항목의 결과면 버튼 대신 이유(서버 거절과 같은 문구) — 실제 항목·후보가 있을 때만', () => {
+    expect(userConfirmCandidateForCard(card({ candidateClaimed: true }))).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, true, true)).toBe(USER_CONFIRM_CLAIMED_MESSAGE);
+    expect(userConfirmClaimedNotice({ candidateClaimed: false }, true, true)).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, false, true)).toBeNull();
+    expect(userConfirmClaimedNotice({ candidateClaimed: true }, true, false)).toBeNull();
+  });
+});
+
+describe('LIVE-P2(D39): 즉시 중지·최근 24시간 상한 보류 문구', () => {
+  const job = (code: string) => ({ state: 'BLOCKED', attempt: 0, maxAttempts: 5, nextRunAt: new Date(), lastErrorCode: code });
+  const ev = (details: Record<string, unknown>) => [{ stateAfter: 'BLOCKED', sanitizedDetails: { event: 'blocked', not_sent: true, ...details } }];
+
+  // FIX2-LIVEP2(검토 #7): 재시도 거절 코드는 폼 경로에서 그대로 넘어가 화면 문구가 된다 — schedule_stale 이 일반 conflict("다른 곳에서 먼저 바뀌었습니다")로
+  // 뭉개지면 사용자는 다음 재시도가 D36 확인이라는 안내를 못 본다.
+  it('재시도 거절 코드(schedule_stale 등) → 폼 303 back?error=<코드>, 그 화면 문구(schedule_stale = SCHEDULE_STALE_RETRY_MESSAGE)', () => {
+    const req = new Request('http://localhost:3000/api/distribution-items/x/retry', { method: 'POST', headers: { accept: 'text/html', origin: 'http://localhost:3000' } });
+    for (const code of ['schedule_stale', 'attempts_exhausted', 'outcome_unknown', 'not_retryable', 'approval_required'] as const) {
+      const r = distributeFormFailure(new NotRetryableError(code, '시험'), req, '/distribute/P');
+      expect(r.status, code).toBe(303);
+      expect(r.headers.get('location'), code).toBe(`/distribute/P?error=${code}`);
+      expect(DISTRIBUTE_ERROR_TEXT[code], code).toMatch(/[가-힣]/u);
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.schedule_stale).toBe(SCHEDULE_STALE_RETRY_MESSAGE);
+    expect(SCHEDULE_STALE_RETRY_MESSAGE).toContain('재시도');
+    // back 에 이미 질의가 있으면 & 로 잇는다
+    expect(distributeFormFailure(new NotRetryableError('schedule_stale', '시험'), req, '/distribute/P?x=1').headers.get('location')).toBe('/distribute/P?x=1&error=schedule_stale');
+  });
+
+  it('liveDailyLimitOf: 가장 최근 BLOCKED 사건이 일일 상한일 때만, 형식이 맞는 값만', () => {
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', used: 3, limit: 3, available_at: '2026-10-20T09:00:00.000Z' }))).toEqual({ limit: 3, availableAt: '2026-10-20T09:00:00.000Z' });
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: 3, available_at: 'x' }))).toEqual({ limit: 3, availableAt: null });
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: 0 }))).toBeNull();
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_daily_limit', limit: '3' }))).toBeNull();
+    expect(liveDailyLimitOf(ev({ reason: 'live_publish_paused' }))).toBeNull();
+    expect(liveDailyLimitOf([])).toBeNull();
+  });
+
+  it('실제 항목 BLOCKED: 일일 상한 → 상한·모스크바 시각, 중지 → 재개 뒤 재시도, 작업 줄도 보내지 않았음을 말한다', () => {
+    const base = { status: 'BLOCKED', channel: 'threads', pub: null } as const;
+    const daily = liveItemHeadline({
+      ...base,
+      job: job('live_publish_daily_limit'),
+      blockReason: 'live_publish_daily_limit',
+      liveDaily: { limit: 3, availableAt: '2026-10-20T09:00:00.000Z' },
+    });
+    expect(daily).toBe("보류 — 최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. 2026-10-20 12:00 (MSK) 이후 '재시도'로 다시 보낼 수 있습니다.");
+    expect(liveItemHeadline({ ...base, job: job('live_publish_daily_limit'), blockReason: 'live_publish_daily_limit' })).toContain('최근 24시간 실제 게시 상한');
+    const paused = liveItemHeadline({ ...base, job: job('live_publish_paused'), blockReason: 'live_publish_paused' });
+    expect(paused).toBe("보류 — 실제 게시가 일시 중지되어 게시하지 않았습니다. 설정에서 재개한 뒤 '재시도'로 다시 보낼 수 있습니다.");
+    expect(jobStatusText(job('live_publish_paused'), null, 'live_publish_paused')).toBe('BLOCKED · 실제 게시 일시 중지됨 — 보내지 않음(재개 뒤 재시도)');
+    expect(jobStatusText(job('live_publish_daily_limit'), null, 'live_publish_daily_limit')).toBe('BLOCKED · 최근 24시간 실제 게시 상한 — 보내지 않음(창이 풀린 뒤 재시도)');
+    // 기존 승인 기록 상한 문구는 그대로
+    expect(liveItemHeadline({ ...base, job: job('live_publish_limit'), blockReason: 'live_publish_limit' })).toBe('보류 — 승인된 실제 게시 수(PUBLISH_LIVE_MAX_POSTS)를 다 씀(보내지 않음)');
+  });
+});
+
+describe('FIX2-FULLREV(Q1·Q2·Q3): 부분 게시·복원 취소 미확정 UNKNOWN — 상태 태그·작업 줄·머리줄이 "새 계획 필요"라고 하지 않는다', () => {
+  // FIX2-FULLREV(FX2): thread_partial_unresolved(조회 한도 — 게시된 게시물이 있음)
+  const PARTIAL_CODES = ['thread_partial_canceled', 'thread_partial_cancel_requested', 'thread_partial_revoked', 'thread_partial_stopped', 'thread_partial_failed', 'thread_partial_unresolved'];
+  const GENERIC_UNKNOWN_LINE = 'UNKNOWN · 확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요';
+
+  it('unknownKindOf: 항목 UNKNOWN + 최근 작업 lastErrorCode 가 부분 게시 사유면 partial, 복원 취소 미확정이면 restored_unverified, 그 밖·다른 상태는 null', () => {
+    for (const code of PARTIAL_CODES) {
+      expect(unknownKindOf('UNKNOWN', { lastErrorCode: code }), code).toBe('partial');
+      for (const s of ['CONFIRMED', 'FAILED', 'BLOCKED', 'RECONCILING', 'PLANNED']) expect(unknownKindOf(s, { lastErrorCode: code }), `${s}/${code}`).toBeNull();
+    }
+    expect(RESTORED_CANCEL_UNVERIFIED_CODE).toBe('restored_cancel_unverified');
+    expect(unknownKindOf('UNKNOWN', { lastErrorCode: 'restored_cancel_unverified' })).toBe('restored_unverified');
+    for (const code of [null, 'reconcile_timeout', 'publish_attempt_unresolved', 'restored_steps_missing', 'thread_partial', 'toString', '__proto__', '']) {
+      expect(unknownKindOf('UNKNOWN', { lastErrorCode: code }), String(code)).toBeNull();
+    }
+    expect(unknownKindOf('UNKNOWN', null)).toBeNull();
+    expect(unknownKindOf('UNKNOWN', undefined)).toBeNull();
+  });
+
+  it('jobStatusText(UNKNOWN): 부분 게시 사유 코드 전부·복원 취소 미확정 → 종류별 줄("새 계획" 없음), 그 밖은 지금까지의 줄 그대로', () => {
+    for (const code of PARTIAL_CODES) {
+      const line = jobStatusText(job('UNKNOWN', code));
+      expect(line, code).toBe(UNKNOWN_JOB_LINE_BY_KIND.partial);
+      expect(line, code).not.toContain('새 계획');
+      expect(line, code).toContain('남은 부분은 보내지 않음');
+      // 보류 사유(blockReason)가 무엇이든 작업 코드로 고른다
+      expect(jobStatusText(job('UNKNOWN', code), null, 'auth', 'threads'), code).toBe(UNKNOWN_JOB_LINE_BY_KIND.partial);
+    }
+    const restored = jobStatusText(job('UNKNOWN', 'restored_cancel_unverified'));
+    expect(restored).toBe(UNKNOWN_JOB_LINE_BY_KIND.restored_unverified);
+    expect(restored).toContain('채널에서 직접 확인');
+    expect(restored).not.toContain('새 계획');
+    for (const code of [null, 'reconcile_timeout', 'publish_attempt_unresolved']) expect(jobStatusText(job('UNKNOWN', code)), String(code)).toBe(GENERIC_UNKNOWN_LINE);
+    // UNKNOWN 이 아닌 작업은 사유 코드가 남아 있어도(뒤에 CONFIRMED 등) 그 상태의 줄
+    expect(jobStatusText(job('FAILED', 'thread_partial_failed'))).toBe('FAILED · 실패 (thread_partial_failed)');
+  });
+
+  it('thread_partial_failed 머리줄 — 원인은 멈출 때의 BLOCKED 사유(영구 거부·재시도 한도·Retry-After·원격 처리 실패), 모르면 단정하지 않음(모의·실제), "새 계획" 없음', () => {
+    const failed = job('UNKNOWN', 'thread_partial_failed');
+    const CAUSES = [
+      { reason: 'permanent_failure', says: '원격 거절' },
+      { reason: 'max_attempts', says: '일시 오류 재시도 한도' },
+      { reason: 'retry_after_too_long', says: '원격 대기 요구가 너무 김' },
+      { reason: 'remote_failed', says: '원격 처리 실패' },
+    ];
+    for (const c of CAUSES) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason: c.reason });
+      expect(mock, c.reason).toBe(`일부만 게시됨(MOCK) — 남은 게시물 전송 실패(${c.says}), 남은 게시물은 보내지 않음, 게시된 부분은 원격에 남음(자동 재전송 안 함)`);
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason: c.reason });
+      // FIX4-FULLREV(S1): (FIX3 R3 의 꼬리를 뺌) 실제 머리줄은 다시 게시하지 않음·Threads 직접 확인만 — 정확한 문구
+      expect(live, c.reason).toBe(`게시 뒤 실패(${c.says}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`);
+      for (const t of [mock, live]) {
+        expect(t).not.toContain('새 계획');
+        expect(t).not.toContain('보내기 전 멈춤');
+      }
+      expect(live).not.toContain('MOCK');
+    }
+    for (const blockReason of [null, 'thread_partial_failed', 'auth', 'toString', '__proto__', '']) {
+      expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: failed, pub: null, blockReason }), String(blockReason)).toContain(
+        '남은 게시물 전송 실패(원격 거절·재시도 한도·원격 처리 실패 중 하나)',
+      );
+    }
+    // 작업 행이 없어도(사유만) 같은 문구
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: 'thread_partial_failed' })).toContain('남은 게시물 전송 실패');
+    // 다른 부분 게시 코드 문구는 그대로(보내기 전 멈춤)
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'thread_partial_stopped'), pub: null, blockReason: 'attempts_exhausted' })).toContain('보내기 전 멈춤(시도 한도)');
+  });
+
+  it('FIX2-FULLREV(FX2) thread_partial_unresolved 머리줄 — 조회 한도까지 결과 확인 못함·게시된 게시물이 있음(모의·실제), 보류 사유가 가리지 않음, "새 계획" 없음', () => {
+    const u = job('UNKNOWN', 'thread_partial_unresolved');
+    for (const blockReason of [null, 'auth', 'thread_partial_unresolved', 'toString', '']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: u, pub: null, blockReason });
+      expect(mock, String(blockReason)).toBe('게시된 게시물이 있음(MOCK) — 조회 한도까지 나머지 결과를 확인하지 못함, 자동 재전송 안 함, 게시된 부분은 원격에 남음(재확인만 가능)');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: u, pub: null, blockReason });
+      // FIX4-FULLREV(S1): (FIX3 R3 의 꼬리를 뺌) 정확한 문구
+      expect(live, String(blockReason)).toBe('게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요');
+      for (const t of [mock, live]) expect(t).not.toContain('새 계획');
+      expect(live).not.toContain('MOCK');
+    }
+    // 작업 행이 없어도(사유만) 같은 문구
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason: 'thread_partial_unresolved' })).toContain('조회 한도까지 나머지 결과를 확인하지 못함');
+  });
+
+  it('restored_cancel_unverified 머리줄 — 보냈는지 모름·취소 확정 안 함(실제 = Threads 에서 직접 확인, 모의 = MOCK·실제 채널로 보낸 것 없음), 부분 게시·일반 UNKNOWN 문구와 섞이지 않음', () => {
+    const r = job('UNKNOWN', 'restored_cancel_unverified');
+    for (const blockReason of [null, 'auth', 'restored_cancel_unverified']) {
+      const mock = itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: r, pub: null, blockReason });
+      // FIX2-FULLREV(FX4): 모의 항목은 확인할 곳이 없다(시뮬레이터는 복원되지 않음) — "채널에서 직접 확인"을 시키지 않는다
+      expect(mock, String(blockReason)).toBe('복원한 모의 작업 — 모의 전송 여부를 기록으로 확인할 수 없어 취소를 확정하지 않음, 자동 재전송 안 함(MOCK — 실제 채널로 보낸 것 없음)');
+      expect(mock, String(blockReason)).not.toContain('채널에서 직접 확인');
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: r, pub: null, blockReason });
+      // FIX4-FULLREV(S1): (FIX3 R3 의 꼬리를 뺌) 정확한 문구 — 새 배포 계획 권유 없음(모의 머리줄에도 없음)
+      expect(live, String(blockReason)).toBe('복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요');
+      expect(live, String(blockReason)).not.toContain('없을 때만');
+      expect(mock, String(blockReason)).not.toContain('없을 때만');
+      for (const t of [mock, live]) {
+        expect(t).not.toContain('새 계획');
+        expect(t).not.toContain('일부만 게시됨');
+      }
+    }
+    // 일반 UNKNOWN 은 그대로
+    expect(itemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', 'reconcile_timeout'), pub: null, blockReason: null })).toBe('확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요');
+    // FIX5-FULLREV(T1, 사용자 결정 2026-10-23): (FIX2 의 "일반 실제 머리줄 = 결과 불명 — 안내 전체"를 바꿈) 작업이 있는 일반 결과 불명 실제 머리줄은 짧은 정확한 문구 —
+    // 조건부 복구 줄은 같은 카드의 일반 결과 불명 안내에 한 번만. 작업이 없는 카드(안내를 그리지 않음)는 지금처럼 안내 전체(아래 FIX5-FULLREV(T1) 시험)
+    expect(liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', null), pub: null, blockReason: null })).toBe(
+      '결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요',
+    );
+  });
+
+  // FIX3-FULLREV(R3, 사용자 결정 2026-10-23): 실제 게시 안내(LIVE_UNKNOWN_GUIDANCE_BY_KIND)는 다시 조건부 복구 길("직접 확인해 글이 없을 때만 새 배포 계획으로
+  // 다시 승인하세요")을 말한다 — FIX2 의 "다시 승인하세요 없음" 단언은 그 안내에 한해 아래의 정확한 문구·조건부 단언으로 바꿨다(그 밖의 문구는 그대로).
+  it('종류별 상태 태그·스냅샷 안내·작업 줄은 "새 계획 필요"·"다시 승인하세요"를 말하지 않고, 실제 게시 안내는 조건부 복구 길만(무조건 새 계획 아님), 실제 문구에는 MOCK 이 없다', () => {
+    for (const kind of ['partial', 'restored_unverified'] as const) {
+      // FIX2-FULLREV(FX3): 스냅샷 안내는 모의·실제 둘 다
+      const texts = [
+        UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock,
+        UNKNOWN_STATUS_LABEL_BY_KIND[kind].live,
+        UNKNOWN_JOB_LINE_BY_KIND[kind],
+        SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].mock,
+        SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live,
+      ];
+      for (const t of texts) {
+        expect(t, kind).not.toContain('새 계획 필요');
+        expect(t, kind).not.toContain('다시 승인하세요');
+        expect(t, kind).toMatch(/재전송 안 함|다시 게시하지 않|권하지 않음|직접 확인/);
+      }
+      // FIX3-FULLREV(R3): 실제 게시 안내 — "새 계획 필요" 없음, 새 배포 계획은 정확히 한 번·"직접 확인해 글이 없을 때만" 조건 아래에서만, 직접 확인·재게시 없음은 그대로
+      const g = LIVE_UNKNOWN_GUIDANCE_BY_KIND[kind];
+      expect(g, kind).not.toContain('새 계획 필요');
+      expect(g.split('새 배포 계획').length - 1, kind).toBe(1);
+      expect(g, kind).toContain('직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요');
+      expect(g, kind).toContain('자동으로 다시 게시하지 않습니다');
+      expect(g, kind).toContain('Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고');
+      expect(g, kind).toContain('같은 글이 두 번 올라갈 수 있습니다');
+      // FIX4-FULLREV(S1): (FIX3 R3 의 "실제 스냅샷 안내도 조건부 복구 길"을 바꿈) 실제 스냅샷 안내는 다시 게시하지 않음·Threads 직접 확인만, 새 배포 계획 권유 없음 —
+      // 조건부 복구 줄은 같은 카드의 결과 불명 안내에 한 번만. 모의 스냅샷 안내에는 그대로 없다
+      expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live, kind).toContain('다시 게시하지 않음');
+      expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live, kind).toContain('먼저 Threads 에서 직접 확인)');
+      for (const v of ['mock', 'live', 'unknown'] as const) {
+        expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind][v], `${kind}/${v}`).not.toContain('없을 때만');
+        expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind][v], `${kind}/${v}`).not.toContain('새 배포 계획');
+      }
+      expect(UNKNOWN_STATUS_LABEL_BY_KIND[kind].mock.startsWith('UNKNOWN · '), kind).toBe(true);
+      expect(UNKNOWN_STATUS_LABEL_BY_KIND[kind].live.startsWith('UNKNOWN · '), kind).toBe(true);
+      for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND[kind].live, LIVE_UNKNOWN_GUIDANCE_BY_KIND[kind], SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live]) expect(t, kind).not.toContain('MOCK');
+      for (const v of ['mock', 'live'] as const) expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind][v].startsWith('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다('), `${kind}/${v}`).toBe(true);
+    }
+    expect(UNKNOWN_STATUS_LABEL_BY_KIND.partial.mock).toContain('MOCK');
+    // FIX2-FULLREV(FX3): 실제 부분 게시 안내는 상태 태그처럼 "게시됐거나 게시됐을 수 있음" — 단일 게시물·표식뿐일 수 있어 "일부 게시된 작업"·"게시된 부분"이라고 단정하지 않는다
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live).toContain('게시됐거나 게시됐을 수 있는 작업');
+    for (const w of ['일부 게시된', '게시된 부분']) expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live).not.toContain(w);
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.mock).toContain('일부 게시된 작업');
+    // FIX2-FULLREV(FX4): 모의 복원 취소 미확정 문구는 MOCK·실제 채널로 보낸 것 없음 — 할 수 없는 "채널에서 직접 확인"을 시키지 않는다(실제 문구는 Threads 직접 확인 그대로)
+    // FIX2-FULLREV(FX6): 모의 부분 게시 작업 줄도 같은 규칙(머리줄의 "재확인만 가능"과 같은 뜻)
+    for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.mock, UNKNOWN_JOB_LINE_RESTORED_UNVERIFIED_MOCK, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.mock, UNKNOWN_JOB_LINE_PARTIAL_MOCK]) {
+      expect(t).toContain('MOCK');
+      expect(t).toContain('실제 채널로 보낸 것 없음');
+      expect(t).not.toContain('직접 확인');
+      expect(t).toContain('재전송 안 함');
+    }
+    for (const t of [UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.live, LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.live]) {
+      expect(t).toContain('Threads');
+      expect(t).toContain('직접 확인');
+    }
+    // 일반 결과 불명 안내는 그대로(없을 때만 새 배포 계획)
+    expect(LIVE_UNKNOWN_GUIDANCE).toContain('없을 때만 새 배포 계획으로 다시 승인하세요');
+    // FIX3-FULLREV(R3): 실제 게시 안내의 정확한 문구 — 부분 게시는 카드에 사용자 확인 버튼이 보일 때만 그 버튼, 복원한 작업은 사용자 확인이 거절되므로
+    // (user_confirm_restored) 버튼을 가리키지 않는다
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.partial).toBe(
+      '이미 게시됐거나 게시됐을 수 있습니다(게시 시도 기록 있음). 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(이 카드에 「Threads에서 확인함」 버튼이 보이면 눌러 기록할 수 있음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
+    );
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified).toBe(
+      '복원한 작업이라 게시됐는지 이 환경에서 확인할 수 없습니다. 자동으로 다시 게시하지 않습니다. Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고(복원한 작업은 이 환경에서 사용자 확인으로 기록하지 않음), 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
+    );
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.restored_unverified).not.toContain('Threads에서 확인함');
+    expect(LIVE_UNKNOWN_GUIDANCE_BY_KIND.partial).toContain('「Threads에서 확인함」 버튼이 보이면');
+    // FIX4-FULLREV(S1): 실제 스냅샷 안내의 정확한 문구(조건부 복구 줄 없음 — 다시 게시하지 않음·Threads 직접 확인)
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.partial.live).toBe(
+      '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(게시됐거나 게시됐을 수 있는 작업 — 다시 게시하지 않음, 먼저 Threads 에서 직접 확인)',
+    );
+    expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND.restored_unverified.live).toBe(
+      '스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(복원한 작업 — 게시됐는지 모름, 다시 게시하지 않음, 먼저 Threads 에서 직접 확인)',
+    );
+  });
+});
+
+/**
+ * FIX3-FULLREV(R2, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘"): 취소 HTML 경로가 결과 불명(UNKNOWN — 부분 게시·복원 미확정)으로 끝나면
+ * "취소 확인 중"(cancel_requested=1)이 아니라 전용 쿼리(cancel_unknown=1 + 항목 + 허용 목록 사유 코드)와 전용 배너. 배너는 저장된 상태가 뒷받침할 때만이고,
+ * 사유 값이 허용 목록 밖·이상한 값이면 사유를 단정하지 않는 일반 배너(쿼리 글자는 화면에 옮기지 않음).
+ */
+describe('FIX3-FULLREV(R2) — 취소 결과 불명 리다이렉트·배너', () => {
+  const ITEM = '0f0e0d0c-0b0a-4908-8706-050403020100';
+  const OTHER = '11111111-2222-4333-8444-555555555555';
+  const AT = new Date('2026-10-23T09:00:00Z');
+  const view = (o: { live?: boolean; status?: string; jobState?: string; code?: string | null; cancelAt?: Date | null; id?: string; account?: null }) => ({
+    items: [
+      {
+        item: { id: o.id ?? ITEM, status: o.status ?? 'UNKNOWN' },
+        account: o.account === null ? null : { kind: o.live ? 'live' : 'mock' },
+        jobs: [
+          { state: 'FAILED', lastErrorCode: 'thread_partial_canceled', cancelRequestedAt: AT },
+          { state: o.jobState ?? 'UNKNOWN', lastErrorCode: o.code === undefined ? 'thread_partial_canceled' : o.code, cancelRequestedAt: o.cancelAt === undefined ? AT : o.cancelAt },
+        ],
+      },
+    ],
+  });
+  const q = (reason?: string, item: string = ITEM) => ({ cancel_unknown: '1', cancel_item: item, ...(reason === undefined ? {} : { cancel_reason: reason }) });
+
+  it('리다이렉트: 취소됨·취소 확인 중은 지금 그대로, UNKNOWN 은 cancel_unknown=1 + 항목 + 허용 목록 사유 코드(목록 밖이면 사유 없음)', () => {
+    expect(cancelRedirectQuery({ item_id: ITEM, canceled: true, state: 'CANCELED' })).toBe('canceled=1');
+    expect(cancelRedirectQuery({ item_id: ITEM, canceled: false, state: 'CANCEL_REQUESTED' })).toBe('cancel_requested=1');
+    expect(cancelRedirectQuery({ item_id: ITEM, canceled: false, state: 'UNKNOWN', reason: 'thread_partial_canceled' })).toBe(
+      `cancel_unknown=1&cancel_item=${ITEM}&cancel_reason=thread_partial_canceled`,
+    );
+    expect(cancelRedirectQuery({ item_id: ITEM, canceled: false, state: 'UNKNOWN', reason: 'restored_cancel_unverified' })).toBe(
+      `cancel_unknown=1&cancel_item=${ITEM}&cancel_reason=restored_cancel_unverified`,
+    );
+    for (const reason of [undefined, '', 'thread_partial_failed', 'constructor', '__proto__', 'toString', 'a&canceled=1', '<b>x</b>']) {
+      expect(cancelRedirectQuery({ item_id: ITEM, canceled: false, state: 'UNKNOWN', reason }), String(reason)).toBe(`cancel_unknown=1&cancel_item=${ITEM}`);
+    }
+    // UNKNOWN 은 어느 것도 취소됨·취소 확인 중 쿼리를 싣지 않는다
+    const unknown = cancelRedirectQuery({ item_id: ITEM, canceled: false, state: 'UNKNOWN', reason: 'thread_partial_canceled' });
+    expect(new URLSearchParams(unknown).has('canceled')).toBe(false);
+    expect(new URLSearchParams(unknown).has('cancel_requested')).toBe(false);
+  });
+
+  it('배너: 부분 게시·복원 미확정 × 모의·실제 — 허용 목록 사유 코드가 저장된 작업 코드와 같을 때만 그 문구', () => {
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({}))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ live: true }))).toBe(CANCEL_UNKNOWN_BANNER.partial.live);
+    expect(cancelUnknownBannerOf(q('restored_cancel_unverified'), view({ code: 'restored_cancel_unverified' }))).toBe(CANCEL_UNKNOWN_BANNER.restored_unverified.mock);
+    expect(cancelUnknownBannerOf(q('restored_cancel_unverified'), view({ live: true, code: 'restored_cancel_unverified' }))).toBe(
+      CANCEL_UNKNOWN_BANNER.restored_unverified.live,
+    );
+    // 항목 ID 는 대소문자 무관(경로 id 와 같은 규칙)
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled', ITEM.toUpperCase()), view({}))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    // FIX4-FULLREV(S3, 사용자 결정 2026-10-23): (FIX3 의 "계정 없는 항목 → 모의 문구"를 바꿈) 계정이 없고 결과·기록된 어댑터도 없으면 모의임이 증명되지 않는다 —
+    // MOCK·"실제 채널로 보낸 것 없음" 대신 조심스러운 unknown 문구(카드와 같은 한 규칙 itemRecordLive)
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ account: null }))).toBe(CANCEL_UNKNOWN_BANNER.partial.unknown);
+    expect(cancelUnknownBannerOf(q('restored_cancel_unverified'), view({ account: null, code: 'restored_cancel_unverified' }))).toBe(CANCEL_UNKNOWN_BANNER.restored_unverified.unknown);
+    expect(cancelUnknownBannerOf(q('weird'), view({ account: null }))).toBe(CANCEL_UNKNOWN_BANNER.generic.unknown);
+  });
+
+  it('배너: 사유 값이 없거나 허용 목록 밖(이상한 값 포함)이거나 저장된 작업 코드와 다르면 — 상태가 결과 불명이면 일반 배너(사유 단정·쿼리 글자 노출 없음)', () => {
+    for (const reason of [undefined, '', 'weird', 'thread_partial_failed', 'constructor', '__proto__', 'toString', '<script>alert(1)</script>']) {
+      for (const live of [false, true]) {
+        const b = cancelUnknownBannerOf(q(reason), view({ live }));
+        expect(b, `${String(reason)}/${live}`).toBe(CANCEL_UNKNOWN_BANNER.generic[live ? 'live' : 'mock']);
+        if (reason) expect(b!, String(reason)).not.toContain(reason);
+      }
+    }
+    // 허용 목록 코드지만 저장된 작업 코드와 다름(복원 미확정이라고 했는데 작업은 부분 게시 코드 등) → 일반
+    expect(cancelUnknownBannerOf(q('restored_cancel_unverified'), view({}))).toBe(CANCEL_UNKNOWN_BANNER.generic.mock);
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ live: true, code: 'restored_cancel_unverified' }))).toBe(CANCEL_UNKNOWN_BANNER.generic.live);
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ code: null }))).toBe(CANCEL_UNKNOWN_BANNER.generic.mock);
+    // 배열 값(같은 이름 반복)은 사유로 쓰지 않는다
+    expect(cancelUnknownBannerOf({ ...q(), cancel_reason: ['thread_partial_canceled', 'x'] }, view({}))).toBe(CANCEL_UNKNOWN_BANNER.generic.mock);
+  });
+
+  it('배너 없음: 쿼리 없음·값 다름·항목 ID 없음·형식 틀림·이 계획에 없는 항목·상태가 결과 불명이 아님·취소 요청 시각 없음', () => {
+    const v = view({});
+    expect(cancelUnknownBannerOf({}, v)).toBeNull();
+    for (const flag of ['0', 'true', '', ' 1']) expect(cancelUnknownBannerOf({ ...q('thread_partial_canceled'), cancel_unknown: flag }, v), flag).toBeNull();
+    expect(cancelUnknownBannerOf({ cancel_unknown: ['1', '1'], cancel_item: ITEM }, v)).toBeNull();
+    expect(cancelUnknownBannerOf({ cancel_unknown: '1', cancel_reason: 'thread_partial_canceled' }, v)).toBeNull();
+    for (const item of ['', 'not-a-uuid', `${ITEM}x`, '../x']) expect(cancelUnknownBannerOf(q('thread_partial_canceled', item), v), item).toBeNull();
+    expect(cancelUnknownBannerOf({ ...q('thread_partial_canceled'), cancel_item: [ITEM] }, v)).toBeNull();
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled', OTHER), v)).toBeNull();
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ status: 'CANCELED', jobState: 'CANCELED' }))).toBeNull();
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ status: 'CANCEL_REQUESTED', jobState: 'CANCEL_REQUESTED' }))).toBeNull();
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ jobState: 'RECONCILING' }))).toBeNull();
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), view({ status: 'CONFIRMED' }))).toBeNull();
+    // 취소를 요청한 적 없는 결과 불명(예: 조회 한도) — 취소 배너를 띄우지 않는다
+    expect(cancelUnknownBannerOf(q(), view({ code: 'reconcile_timeout', cancelAt: null }))).toBeNull();
+    expect(cancelUnknownBannerOf({ cancel_unknown: '1', cancel_item: ITEM }, { items: [] })).toBeNull();
+    // 작업이 없는 항목
+    expect(cancelUnknownBannerOf(q('thread_partial_canceled'), { items: [{ item: { id: ITEM, status: 'UNKNOWN' }, account: { kind: 'mock' }, jobs: [] }] })).toBeNull();
+  });
+
+  it('배너 문구: 취소 성공·취소 확인 중·새 계획을 말하지 않고, 더 보내지 않음·다시 보내지 않음 — 모의 = 실제 채널로 보낸 것 없음(채널 확인 지시 없음), 실제 = Threads 직접 확인(MOCK 없음)', () => {
+    for (const kind of ['partial', 'restored_unverified', 'generic'] as const) {
+      for (const v of ['mock', 'live'] as const) {
+        const t = CANCEL_UNKNOWN_BANNER[kind][v];
+        const label = `${kind}/${v}`;
+        expect(t.startsWith('취소: '), label).toBe(true);
+        expect(t, label).toContain('결과 불명');
+        expect(t, label).toMatch(/더 보내지 않습니다|남은 부분은 보내지 않습니다/);
+        expect(t, label).toMatch(/아무것도 다시 보내지 않습니다|다시 게시하지 않습니다/);
+        for (const w of ['취소했습니다', '취소 확인 중', '취소됨', '새 계획', '새 배포 계획']) expect(t, `${label}/${w}`).not.toContain(w);
+        if (v === 'mock') {
+          expect(t, label).toContain('MOCK');
+          expect(t, label).toContain('실제 채널로 보낸 것');
+          expect(t, label).not.toContain('직접 확인');
+          expect(t, label).not.toContain('Threads');
+        } else {
+          expect(t, label).not.toContain('MOCK');
+          expect(t, label).not.toContain('모의');
+          expect(t, label).toContain('Threads 앱·웹에서 직접 확인하세요');
+        }
+      }
+    }
+    expect(CANCEL_UNKNOWN_BANNER.partial.mock).toContain('일부 게시됨');
+    expect(CANCEL_UNKNOWN_BANNER.partial.live).toContain('이미 게시됐거나 게시됐을 수 있어');
+    expect(CANCEL_UNKNOWN_BANNER.restored_unverified.mock).toContain('복원한 모의 작업');
+    expect(CANCEL_UNKNOWN_BANNER.restored_unverified.live).toContain('복원한 작업이라 게시됐는지 이 환경에서 확인할 수 없어');
+    // 일반 문구는 사유(부분 게시·복원)를 단정하지 않는다
+    for (const v of ['mock', 'live'] as const) for (const w of ['일부', '복원', '게시됐거나']) expect(CANCEL_UNKNOWN_BANNER.generic[v], `${v}/${w}`).not.toContain(w);
+  });
+
+  it('기존 취소 배너는 그대로: cancel_unknown 쿼리는 취소됨·취소 확인 중 배너를 켜지 않는다', () => {
+    const row = (status: string) => ({ item: { status }, activeApproval: null, jobs: [{ state: status }] });
+    const d = { items: [row('UNKNOWN'), row('CANCELED'), row('CANCEL_REQUESTED')] };
+    expect(bannersFromState(q('thread_partial_canceled'), d)).toMatchObject({ canceled: false, cancelRequested: false });
+    expect(bannersFromState({ canceled: '1' }, d)).toMatchObject({ canceled: true, cancelRequested: false });
+    expect(bannersFromState({ cancel_requested: '1' }, d)).toMatchObject({ canceled: false, cancelRequested: true });
+  });
+});
+
+/**
+ * FIX4-FULLREV(S1·S2·S3·S4, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘" · FULLREV1 인계 FIX round 3 "남은 것" 1~4).
+ */
+describe('FIX4-FULLREV(S1) — 실제 카드의 조건부 복구 줄은 결과 불명 안내에 한 번만', () => {
+  const ANY_STOP = '시도 한도·작업 처리기 중단 반복·검증 실패 중 하나';
+  const ANY_FAIL = '원격 거절·재시도 한도·원격 처리 실패 중 하나';
+  const LIVE_HEADLINES: Array<[string, string]> = [
+    ['thread_partial_canceled', '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음, 다시 게시하지 않음). Threads 에서 직접 확인하세요'],
+    ['thread_partial_cancel_requested', '취소 요청 — 이미 게시됐거나 게시됐을 수 있음(되돌리지 않음, 다시 게시하지 않음). Threads 에서 직접 확인하세요'],
+    ['thread_partial_revoked', '승인 철회·무효 — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요'],
+    ['thread_partial_stopped', `보내기 전 멈춤(${ANY_STOP}) — 이미 게시됐거나 게시됐을 수 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`],
+    ['thread_partial_failed', `게시 뒤 실패(${ANY_FAIL}) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요`],
+    ['thread_partial_unresolved', '게시 뒤 결과 확인 불가(조회 한도) — 이미 게시된 부분이 있어 다시 게시하지 않음(되돌리지 않음). Threads 에서 직접 확인하세요'],
+    ['restored_cancel_unverified', '복원한 작업 — 게시됐는지 이 환경에서 확인할 수 없어 취소를 확정하지 않음(다시 게시하지 않음). Threads 에서 직접 확인하세요'],
+  ];
+
+  it('부분 게시 6코드·복원 미확정의 실제 머리줄: 정확한 문구 — 다시 게시하지 않음·Threads 직접 확인, 새 배포 계획·조건부 복구 줄 없음', () => {
+    for (const [code, want] of LIVE_HEADLINES) {
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', code), pub: null, blockReason: null });
+      expect(live, code).toBe(want);
+      expect(live, code).toContain('다시 게시하지 않음');
+      expect(live.endsWith('Threads 에서 직접 확인하세요'), code).toBe(true);
+      for (const w of ['새 배포 계획', '없을 때만', '새 계획', '다시 승인']) expect(live, `${code}/${w}`).not.toContain(w);
+    }
+  });
+
+  it('실제 카드 문구 셋(머리줄·스냅샷 안내·결과 불명 안내) 중 조건부 복구 줄("직접 확인해 글이 없을 때만 새 배포 계획")은 안내에만 정확히 한 번', () => {
+    const count = (t: string) => t.split('새 배포 계획').length - 1;
+    for (const kind of ['partial', 'restored_unverified'] as const) {
+      const code = kind === 'partial' ? 'thread_partial_revoked' : 'restored_cancel_unverified';
+      const headline = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', code), pub: null, blockReason: null });
+      const texts = { headline, prefix: SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[kind].live, guidance: LIVE_UNKNOWN_GUIDANCE_BY_KIND[kind] };
+      expect({ headline: count(texts.headline), prefix: count(texts.prefix), guidance: count(texts.guidance) }, kind).toEqual({ headline: 0, prefix: 0, guidance: 1 });
+      expect(texts.guidance, kind).toContain('직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요');
+      // 머리줄·스냅샷 안내도 여전히 다시 게시하지 않음·Threads 직접 확인을 말한다
+      for (const t of [texts.headline, texts.prefix]) {
+        expect(t, kind).toContain('다시 게시하지 않음');
+        expect(t, kind).toMatch(/Threads 에서 직접 확인/);
+      }
+    }
+  });
+});
+
+describe('FIX4-FULLREV(S2) — 복원 작업 사용자 확인 거절 문구(화면)', () => {
+  it('DISTRIBUTE_ERROR_TEXT.user_confirm_restored: 무조건 "새 배포 계획을 만드세요"가 아니라 Threads 직접 확인 뒤 글이 없을 때만(도메인 거절 문구와 같은 글)', () => {
+    expect(DISTRIBUTE_ERROR_TEXT.user_confirm_restored).toBe(
+      '복원한 작업(읽기 전용 이력)은 이 환경에서 사용자 확인으로 기록하지 않습니다(다시 게시하지도 않음). Threads 앱·웹에서 이 계정의 최근 글을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 글이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 글이 두 번 올라갈 수 있습니다).',
+    );
+    expect(DISTRIBUTE_ERROR_TEXT.user_confirm_restored).not.toContain('새 배포 계획을 만드세요');
+    expect(DISTRIBUTE_ERROR_TEXT.user_confirm_restored!.split('새 배포 계획').length - 1).toBe(1);
+  });
+});
+
+describe('FIX4-FULLREV(S3) — 모의·실제·증명 못 함을 한 규칙(itemRecordLive)으로', () => {
+  const intent = (adapter_id?: unknown) => ({ sanitizedDetails: adapter_id === undefined ? { attempt: 1 } : { adapter_id } });
+
+  it('itemRecordLive: 결과 기록 → 계정 kind → 기록된 어댑터 순으로 증명, 아무 증명도 없으면 null', () => {
+    // 증명된 실제
+    expect(itemRecordLive({ accountKind: 'live', pub: null })).toBe(true);
+    expect(itemRecordLive({ accountKind: null, pub: { isMock: false } })).toBe(true);
+    expect(itemRecordLive({ accountKind: undefined, pub: null, intent: intent('live_threads') })).toBe(true);
+    // 증명된 모의
+    expect(itemRecordLive({ accountKind: 'mock', pub: null })).toBe(false);
+    expect(itemRecordLive({ accountKind: null, pub: { isMock: true } })).toBe(false);
+    for (const a of ['mock_generic', 'mock_threads', 'mock_youtube', 'mock_instagram']) expect(itemRecordLive({ accountKind: null, pub: null, intent: intent(a) }), a).toBe(false);
+    // 결과 기록이 계정 kind 보다 먼저(둘은 DB 트리거로 같은 값 — 기록이 있으면 기록대로)
+    expect(itemRecordLive({ accountKind: 'mock', pub: { isMock: false } })).toBe(true);
+    expect(itemRecordLive({ accountKind: 'live', pub: { isMock: true } })).toBe(false);
+    // 계정 kind 가 있으면 의도 기록보다 먼저
+    expect(itemRecordLive({ accountKind: 'mock', pub: null, intent: intent('live_threads') })).toBe(false);
+    expect(itemRecordLive({ accountKind: 'live', pub: null, intent: intent('mock_threads') })).toBe(true);
+    // 증명 못 함: 계정 없음·모르는 kind + 결과 없음 + 의도 없음·기록 없는 옛 의도(legacy)·모르는 어댑터 값
+    for (const kind of [null, undefined, '', 'other', 'LIVE', 'Mock']) expect(itemRecordLive({ accountKind: kind, pub: null }), String(kind)).toBeNull();
+    for (const i of [null, undefined, intent(), intent(null), intent('live_youtube'), intent('mock'), intent(7), { sanitizedDetails: null }]) {
+      expect(itemRecordLive({ accountKind: null, pub: null, intent: i }), JSON.stringify(i)).toBeNull();
+    }
+    expect([true, false, null].map((v) => recordModeKey(v))).toEqual(['live', 'mock', 'unknown']);
+  });
+
+  it('취소 결과 불명 배너: 계정이 없어도 결과 기록·기록된 어댑터가 증명하면 그 문구, 증명이 없으면 unknown(카드와 같은 결과 고르기)', () => {
+    const ITEM = '0f0e0d0c-0b0a-4908-8706-050403020100';
+    const AT = new Date('2026-10-23T09:00:00Z');
+    const q = { cancel_unknown: '1', cancel_item: ITEM, cancel_reason: 'thread_partial_canceled' };
+    const d = (o: { account?: { kind: string } | null; pubs?: Array<{ jobId: string | null; isMock: boolean }>; intent?: Record<string, unknown> | null }) => ({
+      items: [
+        {
+          item: { id: ITEM, status: 'UNKNOWN' },
+          account: o.account === undefined ? null : o.account,
+          jobs: [{ id: 'j-old', state: 'FAILED', lastErrorCode: null, cancelRequestedAt: null }, { id: 'j-new', state: 'UNKNOWN', lastErrorCode: 'thread_partial_canceled', cancelRequestedAt: AT }],
+          publications: o.pubs ?? [],
+          latestIntent: o.intent === undefined ? null : o.intent === null ? null : { sanitizedDetails: o.intent },
+        },
+      ],
+    });
+    expect(cancelUnknownBannerOf(q, d({}))).toBe(CANCEL_UNKNOWN_BANNER.partial.unknown);
+    expect(cancelUnknownBannerOf(q, d({ pubs: [{ jobId: 'j-new', isMock: true }] }))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(cancelUnknownBannerOf(q, d({ pubs: [{ jobId: 'j-new', isMock: false }] }))).toBe(CANCEL_UNKNOWN_BANNER.partial.live);
+    // 최근 작업의 결과가 없으면 항목의 마지막 결과(카드와 같음)
+    expect(cancelUnknownBannerOf(q, d({ pubs: [{ jobId: 'j-old', isMock: true }] }))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(cancelUnknownBannerOf(q, d({ intent: { adapter_id: 'mock_threads' } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(cancelUnknownBannerOf(q, d({ intent: { adapter_id: 'live_threads' } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.live);
+    expect(cancelUnknownBannerOf(q, d({ intent: { attempt: 1 } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.unknown);
+    expect(cancelUnknownBannerOf(q, d({ account: { kind: 'other' } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.unknown);
+    // 계정이 있으면 지금 그대로
+    expect(cancelUnknownBannerOf(q, d({ account: { kind: 'mock' } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.mock);
+    expect(cancelUnknownBannerOf(q, d({ account: { kind: 'live' } }))).toBe(CANCEL_UNKNOWN_BANNER.partial.live);
+  });
+
+  it('unknown 문구(배너·상태 태그·스냅샷 안내·CONFIRMED 줄): MOCK·"실제 채널로 보낸 것"·"실제 Threads"·새 계획을 말하지 않고 다시 보내지 않음·채널에서 직접 확인', () => {
+    const banners = (['partial', 'restored_unverified', 'generic'] as const).map((k) => CANCEL_UNKNOWN_BANNER[k].unknown);
+    const labels = (['partial', 'restored_unverified'] as const).flatMap((k) => [UNKNOWN_STATUS_LABEL_BY_KIND[k].unknown, SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[k].unknown]);
+    for (const t of [...banners, ...labels, UNPROVEN_CONFIRMED_LINE]) {
+      for (const w of ['MOCK', '모의 작업', '실제 채널로 보낸 것', '실제 Threads', 'Threads', '새 계획', '새 배포 계획', '취소했습니다', '취소됨', '실제 게시']) expect(t, w).not.toContain(w);
+      expect(t).toContain('모의·실제 여부를 기록으로 확인할 수 없음');
+      expect(t).toContain('채널에서 직접 확인');
+    }
+    for (const t of [...banners, ...labels]) expect(t).toMatch(/다시 보내지 않/);
+    for (const t of banners) {
+      expect(t.startsWith('취소: 더 보내지 않습니다.')).toBe(true);
+      expect(t).toContain('결과 불명');
+    }
+    expect(UNKNOWN_STATUS_LABEL_BY_KIND.partial.unknown.startsWith('UNKNOWN · ')).toBe(true);
+    expect(UNKNOWN_STATUS_LABEL_BY_KIND.restored_unverified.unknown.startsWith('UNKNOWN · ')).toBe(true);
+    for (const k of ['partial', 'restored_unverified'] as const) expect(SNAPSHOT_PROBLEMS_PREFIX_BY_KIND[k].unknown.startsWith('스냅샷이 지금과 다릅니다 — 승인·실행할 수 없습니다(')).toBe(true);
+    expect(UNPROVEN_CONFIRMED_LINE.startsWith('CONFIRMED · ')).toBe(true);
+  });
+});
+
+describe('FIX4-FULLREV(S4) — plan_id 없는 취소 폼의 되돌아갈 곳(itemPlanBack)', () => {
+  const PLAN = '11111111-2222-4333-8444-555555555555';
+  it('항목의 계획을 찾으면 그 계획 화면, 없거나·UUID 가 아니거나·조회가 실패하면 /distribute 그대로', async () => {
+    expect(await itemPlanBack(async () => PLAN)).toBe(`/distribute/${PLAN}`);
+    expect(await itemPlanBack(async () => null)).toBe('/distribute');
+    for (const bad of ['', 'not-a-uuid', `${PLAN}?canceled=1`, '../x', `${PLAN}/../x`]) expect(await itemPlanBack(async () => bad), bad).toBe('/distribute');
+    expect(
+      await itemPlanBack(async () => {
+        throw new Error('db down');
+      }),
+    ).toBe('/distribute');
+  });
+});
+
+/**
+ * FIX5-FULLREV(T1, 사용자 결정 2026-10-23 "다 권고 사항으로 진행해줘" · FULLREV1 인계 FIX round 4 "남은 것" 1): 일반 결과 불명(부분 게시·복원 미확정 코드 아님)
+ * 실제 카드는 조건부 복구 줄("없을 때만 새 배포 계획으로 다시 승인하세요")을 일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE)에만 한 번 — 머리줄은 결과 불명·다시 게시하지 않음·
+ * Threads 직접 확인만(정확한 문구). 작업이 없는 카드는 작업 칸·안내가 없으므로(page.tsx) 머리줄이 지금처럼 안내 전체를 싣는다(그 카드에서도 한 번).
+ */
+describe('FIX5-FULLREV(T1) — 일반 결과 불명 실제 머리줄', () => {
+  const WANT = '결과 불명(UNKNOWN) — 게시됐는지 확인하지 못함(다시 게시하지 않음). Threads 앱·웹에서 직접 확인하세요';
+  const count = (t: string) => t.split('없을 때만 새 배포 계획으로 다시 승인하세요').length - 1;
+
+  it('작업이 있으면 짧은 정확한 문구(조건부 복구 줄·새 계획 권유 없음) — 앞선 BLOCKED 사유·부분 게시가 아닌 사유 코드여도 같다, 안내와 합쳐 조건부 줄은 정확히 한 번', () => {
+    expect(LIVE_UNKNOWN_HEADLINE).toBe(WANT);
+    for (const code of [null, 'reconcile_timeout', 'submit_timeout', 'remote_unknown']) {
+      for (const blockReason of [null, 'auth', 'credential_blocked', 'approval_missing']) {
+        const label = `${String(code)}/${String(blockReason)}`;
+        const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: job('UNKNOWN', code), pub: null, blockReason });
+        expect(live, label).toBe(WANT);
+        // 이 머리줄이 나오는 작업은 종류가 없다(unknownKindOf null) — 카드의 안내는 일반 결과 불명 안내(LIVE_UNKNOWN_GUIDANCE)
+        expect(unknownKindOf('UNKNOWN', job('UNKNOWN', code)), label).toBeNull();
+        expect({ headline: count(live), guidance: count(LIVE_UNKNOWN_GUIDANCE) }, label).toEqual({ headline: 0, guidance: 1 });
+        for (const w of ['새 배포 계획', '없을 때만', '새 계획', '다시 승인', 'MOCK']) expect(live, `${label}/${w}`).not.toContain(w);
+        for (const w of ['결과 불명(UNKNOWN)', '다시 게시하지 않음', 'Threads 앱·웹에서 직접 확인하세요']) expect(live, `${label}/${w}`).toContain(w);
+      }
+    }
+  });
+
+  it('작업이 없으면(카드에 결과 불명 안내가 없음) 지금처럼 안내 전체 — 그 카드의 조건부 복구 줄은 머리줄에 정확히 한 번', () => {
+    for (const blockReason of [null, 'credential_blocked']) {
+      const live = liveItemHeadline({ status: 'UNKNOWN', channel: 'threads', job: null, pub: null, blockReason });
+      expect(live, String(blockReason)).toBe(`결과 불명(UNKNOWN) — ${LIVE_UNKNOWN_GUIDANCE}`);
+      expect(count(live), String(blockReason)).toBe(1);
+    }
+  });
+});
+
+/**
+ * FIX5-FULLREV(T2): 복원 이력 재시도 거절(not_retryable + restored: true — @cs/db retryItem)의 폼 경로 화면 문구도 같은 조건부 복구 길.
+ * 그 밖의 not_retryable(보류 아님)은 지금 문구 그대로, JSON 오류 코드는 바꾸지 않는다(폼 리다이렉트의 화면 문구 코드만).
+ */
+describe('FIX5-FULLREV(T2) — 복원 이력 재시도 거절의 화면 문구', () => {
+  const req = new Request('http://localhost:3000/api/distribution-items/x/retry', { method: 'POST', headers: { accept: 'text/html', origin: 'http://localhost:3000' } });
+  it('not_retryable + restored → error=not_retryable_restored(정확한 문구 — 직접 확인해 없을 때만 새 배포 계획), restored 아님 → error=not_retryable 그대로', () => {
+    for (const status of ['BLOCKED', 'QUEUED', 'UNKNOWN']) {
+      const r = distributeFormFailure(new NotRetryableError('not_retryable', '시험', { status, restored: true }), req, '/distribute/P');
+      expect(r.status, status).toBe(303);
+      expect(r.headers.get('location'), status).toBe('/distribute/P?error=not_retryable_restored');
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored).toBe(
+      '복원한 작업·복원 때 진행 중이던 항목은 다시 보내지 않습니다. 채널에서 이 계정의 최근 게시물을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 내용이 두 번 올라갈 수 있습니다).',
+    );
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored!.split('새 배포 계획').length - 1).toBe(1);
+    for (const w of ['새 배포 계획을 만드세요', 'MOCK', 'Threads']) expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored, w).not.toContain(w);
+    // restored 표시가 없거나 true 가 아니면 지금처럼
+    for (const extra of [undefined, { status: 'PLANNED' }, { restored: false }, { restored: 'true' }]) {
+      expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', extra), req, '/distribute/P').headers.get('location'), JSON.stringify(extra)).toBe(
+        '/distribute/P?error=not_retryable',
+      );
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable).toBe('보류(BLOCKED)된 작업이 있는 항목만 재시도할 수 있습니다.');
+    // 복원 전 결과 불명(outcome_unknown + restored)은 지금 코드·문구 그대로(새 계획을 말하지 않음)
+    expect(distributeFormFailure(new NotRetryableError('outcome_unknown', '시험', { status: 'UNKNOWN', restored: true }), req, '/distribute/P').headers.get('location')).toBe(
+      '/distribute/P?error=outcome_unknown',
+    );
+    expect(DISTRIBUTE_ERROR_TEXT.outcome_unknown).not.toContain('새 배포 계획');
+  });
+
+  // FIX5-FULLREV(T2 후속 — 리뷰 확정 @cs/db jobs.ts:1857): 모의 계정 항목(details mock: true)은 모의 화면 문구 — 채널 확인·두 번 게시 경고 없음
+  it('not_retryable + restored + mock: true → error=not_retryable_restored_mock(정확한 문구), mock 이 true 가 아니면 조건부 문구 코드 그대로', () => {
+    for (const status of ['BLOCKED', 'QUEUED']) {
+      const r = distributeFormFailure(new NotRetryableError('not_retryable', '시험', { status, restored: true, mock: true }), req, '/distribute/P');
+      expect(r.status, status).toBe(303);
+      expect(r.headers.get('location'), status).toBe('/distribute/P?error=not_retryable_restored_mock');
+    }
+    expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored_mock).toBe(
+      'MOCK — 복원한 모의 작업·복원 때 진행 중이던 모의 항목은 다시 보내지 않습니다(자동 재전송 안 함). 실제 채널로 보낸 것은 없습니다(확인할 게시물 없음). 모의 실행을 다시 하려면 새 배포 계획을 만드세요.',
+    );
+    for (const w of ['채널에서', '두 번 올라갈', '직접 확인', 'Threads']) expect(DISTRIBUTE_ERROR_TEXT.not_retryable_restored_mock, w).not.toContain(w);
+    // mock 표시가 없거나 true 가 아니면 조건부(실제·kind 모름) 문구 코드
+    for (const extra of [{ restored: true }, { restored: true, mock: false }, { restored: true, mock: 'true' }]) {
+      expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', extra), req, '/distribute/P').headers.get('location'), JSON.stringify(extra)).toBe(
+        '/distribute/P?error=not_retryable_restored',
+      );
+    }
+    // restored 가 아니면 mock 표시가 있어도 일반 not_retryable
+    expect(distributeFormFailure(new NotRetryableError('not_retryable', '시험', { mock: true }), req, '/distribute/P').headers.get('location')).toBe(
+      '/distribute/P?error=not_retryable',
+    );
+  });
+});
+
+/**
+ * FIX5-FULLREV(T4, 사용자 결정 2026-10-23 · FULLREV1 인계 FIX round 4 "남은 것" 4): 항목 폼의 되돌아갈 곳(itemFormBack) — 취소 경로(FIX4 S4)의 규칙 한곳.
+ * plan_id 숨은 필드 → 그 계획(조회 없음) · 없음 + owner 확인 → 항목의 계획(itemPlanBack) · owner 확인 전·HTML 아님 → /distribute(조회 없음).
+ */
+describe('FIX5-FULLREV(T4) — 항목 폼의 되돌아갈 곳(itemFormBack)', () => {
+  const PLAN = '11111111-2222-4333-8444-555555555555';
+  const finder = (v: string | null | Error) => {
+    const calls = { n: 0 };
+    const find = async () => {
+      calls.n++;
+      if (v instanceof Error) throw v;
+      return v;
+    };
+    return { calls, find };
+  };
+
+  it('plan_id 없음 + owner 확인 → 항목의 계획 화면 · 조회가 없음·실패·UUID 아님이면 /distribute', async () => {
+    for (const [v, want] of [
+      [PLAN, `/distribute/${PLAN}`],
+      [null, '/distribute'],
+      ['not-a-uuid', '/distribute'],
+      [`${PLAN}?x=1`, '/distribute'],
+      [new Error('db down'), '/distribute'],
+    ] as const) {
+      const f = finder(v);
+      const b = itemFormBack(true);
+      b.ownerChecked(f.find);
+      b.formPlanId(undefined);
+      b.formPlanId('');
+      expect(await b.target(), String(v)).toBe(want);
+      expect(f.calls.n, String(v)).toBe(1);
+    }
+  });
+
+  it('plan_id 숨은 필드가 있으면 그 값(인코딩) — 조회하지 않는다, 순서와 무관', async () => {
+    const f = finder(PLAN);
+    const a = itemFormBack(true);
+    a.ownerChecked(f.find);
+    a.formPlanId('p/1?x');
+    expect(await a.target()).toBe('/distribute/p%2F1%3Fx');
+    const b = itemFormBack(true);
+    b.formPlanId('P2');
+    b.ownerChecked(f.find);
+    expect(await b.target()).toBe('/distribute/P2');
+    expect(f.calls.n).toBe(0);
+  });
+
+  it('owner 확인 전(CSRF·로그인 실패)·HTML 이 아닌 요청은 조회 없이 /distribute', async () => {
+    expect(await itemFormBack(true).target()).toBe('/distribute');
+    const f = finder(PLAN);
+    const json = itemFormBack(false);
+    json.ownerChecked(f.find);
+    expect(await json.target()).toBe('/distribute');
+    expect(f.calls.n).toBe(0);
+  });
+});
+
+describe('FIX1-FULLREV2(G2, D40-1) — 같은 글 중복 게시 경고 문구·확인 체크박스 폼', () => {
+  const P = '33333333-3333-4333-8333-333333333333';
+  const dup = (o: Partial<Parameters<typeof duplicateWarningLine>[0]> = {}) => ({
+    itemId: 'i',
+    planId: P,
+    planSummary: 'Threads 1',
+    status: 'CONFIRMED',
+    kind: 'published' as const,
+    mock: false,
+    verification: null,
+    accountDisplayName: '@tester',
+    ...o,
+  });
+  it('실제: "이 글은 계획 … 에서 이미 게시됨/결과 불명/진행 중 — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다"', () => {
+    expect(duplicateWarningLine(dup(), 'approve')).toBe('이 글은 계획 「Threads 1」 에서 이미 게시됨 — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다');
+    expect(duplicateWarningLine(dup({ verification: 'USER_CONFIRMED' }), 'approve')).toBe('이 글은 계획 「Threads 1」 에서 이미 게시됨(사용자 확인) — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다');
+    expect(duplicateWarningLine(dup({ kind: 'unknown', status: 'UNKNOWN' }), 'approve')).toBe(
+      '이 글은 계획 「Threads 1」 에서 결과 불명(UNKNOWN — 게시됐을 수 있음) — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다',
+    );
+    expect(duplicateWarningLine(dup({ kind: 'in_progress', status: 'QUEUED' }), 'execute')).toBe('이 글은 계획 「Threads 1」 에서 진행 중(QUEUED) — 실행하면 같은 글이 한 번 더 게시될 수 있습니다');
+    // 배포 계획 만들기: 계정 이름(그 계정을 고르면 같은 글)
+    expect(duplicateWarningLine(dup({ kind: 'in_progress', status: 'BLOCKED' }), 'plan')).toBe(
+      '이 글은 계획 「Threads 1」(계정 @tester) 에서 진행 중(BLOCKED) — 같은 계정으로 다시 계획·승인하면 같은 글이 한 번 더 게시될 수 있습니다',
+    );
+    expect(duplicateWarningLine(dup({ planSummary: '  ' }), 'approve')).toContain('계획 「이름 없음」');
+  });
+  it('모의 기록은 "게시"라고 하지 않는다(MOCK — 실제 게시 아님)', () => {
+    for (const stage of ['approve', 'execute', 'plan'] as const) {
+      const line = duplicateWarningLine(dup({ mock: true, verification: 'MOCK' }), stage);
+      expect(line).toContain('모의 처리됨(MOCK — 실제 게시 아님)');
+      expect(line).toContain('한 번 더 모의 처리됩니다(MOCK — 실제 게시 아님)');
+      expect(line).not.toContain('게시됨');
+      expect(line).not.toContain('게시될 수 있습니다');
+    }
+    expect(duplicateStateLabel(dup({ mock: true, kind: 'unknown', status: 'UNKNOWN' }))).toBe('결과 불명(MOCK)');
+    expect(duplicateStateLabel(dup({ mock: true, kind: 'in_progress', status: 'QUEUED' }))).toBe('진행 중(MOCK · QUEUED)');
+    expect(duplicateWarningTail('approve', true)).toBe('다시 승인하면 같은 글이 한 번 더 모의 처리됩니다(MOCK — 실제 게시 아님)');
+  });
+  it('폼: 확인 체크박스(acknowledge_duplicate=yes)만 true, 다른 값은 false, 없으면 넣지 않음(승인·실행)', () => {
+    const I = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes', acknowledge_duplicate: 'yes' })).toMatchObject({ acknowledge_duplicate: true });
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes', acknowledge_duplicate: 'on' })).toMatchObject({ acknowledge_duplicate: false });
+    expect(formToApprove({ [`item_${I}`]: 'on', confirm: 'yes' })).not.toHaveProperty('acknowledge_duplicate');
+    expect(formToExecute({ command_key: 'k-12345678', acknowledge_duplicate: 'yes' })).toEqual({ command_key: 'k-12345678', acknowledge_duplicate: true });
+    expect(formToExecute({ command_key: 'k-12345678', acknowledge_duplicate: 'true' })).toEqual({ command_key: 'k-12345678', acknowledge_duplicate: false });
+    expect(formToExecute({ command_key: 'k-12345678' })).toEqual({ command_key: 'k-12345678' });
+  });
+  it('폼 오류 코드 duplicate_publish_unacknowledged 는 허용 목록 문구로 되돌아간다(서버 오류·충돌로 뭉개지지 않음)', () => {
+    expect(DISTRIBUTE_ERROR_TEXT.duplicate_publish_unacknowledged).toContain(DUPLICATE_ACK_LABEL);
+    expect(DISTRIBUTE_ERROR_TEXT.duplicate_publish_unacknowledged).toContain('아무것도 바꾸지 않음');
+    const res = distributeFormFailure(new DuplicatePublishUnacknowledgedError([]), new Request('http://localhost:3000/x'), '/distribute/p');
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/distribute/p?error=duplicate_publish_unacknowledged');
+  });
+});

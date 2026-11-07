@@ -1,0 +1,349 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1790258630313,
+      "tag": "0000_t01_m1_core",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790259531341,
+      "tag": "0001_t02_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790260683068,
+      "tag": "0002_t03_captures",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790261715334,
+      "tag": "0003_t04_contents",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790263135522,
+      "tag": "0004_t05_exports",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790279661586,
+      "tag": "0005_t06_writing",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790282141567,
+      "tag": "0006_t06_claim_resolution",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790283617014,
+      "tag": "0007_t06_removed_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790285010436,
+      "tag": "0008_t07_budget_claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790286702502,
+      "tag": "0009_t09_variants",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790288930899,
+      "tag": "0010_t07_fix_budget",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790290998991,
+      "tag": "0011_t09_fix_proposals",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790297049162,
+      "tag": "0012_t08_uploads_transcription",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790303186982,
+      "tag": "0013_t08_fix_pending_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790305238291,
+      "tag": "0014_t08_fix_cleanup_backoff",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790307538137,
+      "tag": "0015_t08_fix_cleanup_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790313369796,
+      "tag": "0016_t10_distribution",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790315472209,
+      "tag": "0017_t11_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790317528508,
+      "tag": "0018_t12_mock_scenarios",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790322340276,
+      "tag": "0019_t10_fix_restore_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790325063018,
+      "tag": "0020_t11_t12_fix_restore_history_plan_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790327820831,
+      "tag": "0021_t10_fix2_variant_assets_lock",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790329497368,
+      "tag": "0022_t11_fix2_pre_intent_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790331113467,
+      "tag": "0023_t11_fix3_normalize_attempt",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790883992960,
+      "tag": "0024_t20_restore_drills",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790887564046,
+      "tag": "0025_t20_fix_drill_error_code",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790891336027,
+      "tag": "0026_t20_fix3_drill_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790923670668,
+      "tag": "0027_t13_oauth_credentials",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790935997334,
+      "tag": "0028_t13_fix_token_generation",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790943068202,
+      "tag": "0029_t13_fix2_revocation_epoch",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790949739094,
+      "tag": "0030_t13_fix3_pending_reconcile",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790953142990,
+      "tag": "0031_t14_threads_steps",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790955548070,
+      "tag": "0032_t15_youtube_upload",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790959310454,
+      "tag": "0033_t13_fix4_pending_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790963584398,
+      "tag": "0034_t14_fix_resume_count",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1790986417394,
+      "tag": "0035_t13_fix7_revoke_resume",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1790992236867,
+      "tag": "0036_t16_instagram_media",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1790996842970,
+      "tag": "0037_t16_fix1_ig_parent_request",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1791021445677,
+      "tag": "0038_t18_imports",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1791029547142,
+      "tag": "0039_t18_fix1_originals",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1791037437848,
+      "tag": "0040_t18_fix2_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1791047805303,
+      "tag": "0041_t19_collector",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1791053111375,
+      "tag": "0042_t19_fix1_collected_accepted",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1791866345362,
+      "tag": "0043_t21p1b_oidc_states",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1791899614989,
+      "tag": "0044_livep1_threads_live",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1791981657498,
+      "tag": "0045_livep1_user_confirm",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1792412870809,
+      "tag": "0046_livep2_daily_cap_pause",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1792616216122,
+      "tag": "0047_fullrev_fix1_live_intent_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1793641128843,
+      "tag": "0048_fullrev2_fix2_session_policy_audit_idx",
+      "breakpoints": true
+    }
+  ]
+}

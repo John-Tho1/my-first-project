@@ -1,0 +1,553 @@
+# M4 현황 (갱신 2026-10-02, 클라우드 세션 → 로컬 인계)
+
+## 브랜치·커밋
+- `content-studio/m3` HEAD `dfc9842` = Codex 검증을 거친 마지막 지점(T13 FIX round 2 까지).
+- **`content-studio/m4`** = m3 에서 분기. 클라우드 세션에서 T13 FIX round 3·T14·T15 를 구현·커밋·푸시했다. **셋 다 Codex 미검증** — 로컬 복귀 후 아래 순서로 검증한다.
+
+| 작업 | 코드 커밋 | 인계 | 검사(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행) | Codex |
+|---|---|---|---|---|
+| T13 FIX3 (review-FIX2-T13) | **`79201d6`** (base 666deff WIP) | `T13_IMPLEMENTATION_HANDOFF.md` "FIX round 3" 절 (8e658e5) | lint·typecheck·build PASS, unit 618, integ 475/475, drill:mock 0, migrate 0030 | 대기 |
+| T14 Threads 텍스트(모의) | **`67ade9e`** | `T14_IMPLEMENTATION_HANDOFF.md` (00cc27e) | unit 657, integ 495/495, drill:mock 0(M3+Threads 12행), migrate 0031 | 대기 |
+| T15 YouTube 재개 업로드(모의) | **`427dc71`** | `T15_IMPLEMENTATION_HANDOFF.md` | unit 697, integ 517/517, drill:mock 0(M3+Threads+YouTube), migrate 0032 | 대기 |
+
+이전 라운드(구현 bf57eae → FIX1 5479a7f → FIX2 dfc9842)의 Codex 판정은 `M4_CODEX_VERDICTS.md`.
+
+공통: 외부 호출 0, 새 의존성 0(lockfile 불변), 비밀 0, 실제 게시 0. 클라우드에서 실행하지 못한 것 — Codex, 실제 PostgreSQL 병렬 트랜잭션, 실제 브라우저 렌더링, Windows/Node 24 위 migration 0030~0032, 실계정.
+알려진 불안정: `packages/db/src/lock.test.ts`(다중 프로세스 경합)가 병렬 부하에서 가끔 1건 실패 — FIX3 검사 첫 실행에서 1회, 단독 3/3·전체 재실행 통과. 이번 라운드에서 바뀌지 않은 파일.
+
+## 결정 (docs/DECISIONS.md)
+- D20~D25: 이전과 같음(D24 M4 착수·로컬/모의 범위, D25 T13 잠정 판단 확정).
+- **D26 (T14, 잠정 — 사용자 확인 요청)**: (a) 연결한 적 있는 모의 Threads 계정만 Threads 모의 어댑터, (b) 401 뒤 refresh 대신 T13 연결 확인 1회, (c) 잠정 요청 제한 24h 250·창 비면 허용, (d) 스레드가 중간에 401·403·400 으로 멈추면 앞 게시물은 원격에 남고 항목은 BLOCKED/FAILED + 단계 목록, (e) 취소 요청 중 일부 게시된 스레드는 UNKNOWN, (f) 모의 공개 범위 = 승인 공개 범위 가정.
+- **D27 (T15, 잠정 — 사용자 확인 요청)**: (a) 자리표시 scope `youtube.upload(mock)`(실제 이름은 live 전 재확인), (b) 모의 갱신이 refresh token 회전, (c) 모의 연결 YouTube 계정은 `upload_private`·`public_publish` 허용·`mock_publish` 불가(기본 upload_private), (d) 예약 공개 = `public_publish + private + publish_at`, (e) 잠정 할당량 24h 6회 롤링 창·원격 초과는 초기화 시각까지 대기, (f) 업로드 뒤 취소 = CONFIRMED + "삭제는 범위 밖", (g) 썸네일 첨부 시 실패, (h) export 에서 세션 URI 가림.
+
+## 로컬에서 먼저 할 일
+1. "로컬 복귀 시" 명령(`M4_CLOUD_KICKOFF.md` 하단)으로 체크아웃·설치·migration(0030~0032)·전체 검사·`drill:restore`.
+2. Codex 3건을 순서대로: FIX3-T13 → T14 → T15. 판정 요약은 이 폴더 `M4_CODEX_VERDICTS.md` 에 옮긴다.
+3. D26·D27 확인(위 항목별로 유지/변경). 변경이 있으면 FIX 라운드에서 함께 반영.
+4. 화면 확인(브라우저): 설정의 Threads·YouTube 모의 연결, `/distribute/{id}` Threads 단계 목록(게시물 n/m), YouTube 패널(업로드 n%·세션 재개·처리 중·"비공개 업로드 완료, 공개 전환 확인 필요"), 복원 화면의 "배포 계정 다시 연결 필요".
+
+## 클라우드 세션이 남긴 화면·흐름 공백 (FIX 또는 다음 작업 후보)
+- 배포함 승인 폼은 목적 1개만 보낸다 → YouTube(upload_private)와 Threads 항목이 섞인 계획은 폼 한 번으로 승인 불가(API 로 목적별 승인 가능).
+- `/distribute/new` 에 요청 결과·publish_at 입력 없음(YouTube 기본 upload_private, 공개·예약 계획은 API 전용).
+- live 어댑터 전 필요: `remote_steps.remote_id LIKE 'mock%'` CHECK 를 바꾸는 migration, 조각 진행에 따라 늘어나는 submit timeout(현재 30 s / UI 10 s), 공식 rate limit·quota·scope 이름 재확인.
+
+## 남은 작업
+- **T16 Instagram**(모의 — 계정 유형·권한·미디어 규격은 공식 재확인 전 잠정), **T17**(추가 채널 — 사용자 선택 필요), **M5**: T18 Notion·Drive 선택 가져오기(파일·모의), T19 허용 소스 수집(모의 수집기, 기본 OFF), T21 운영 배포(승인 필요). T20 은 이미 구현(`T20_IMPLEMENTATION_HANDOFF.md`).
+- 실계정 연결 전 사용자에게 받을 것(D24): Meta 앱 등록·앱 ID 보관 방식, 테스트 Threads 계정, Google Cloud 프로젝트·OAuth 동의 화면·YouTube API 감사 여부, redirect URI(로컬/운영), 마스터 키 위치, 첫 실계정 시험 원고·공개 범위.
+
+## 남은 위험 / not_run
+- 실제 PostgreSQL 다중 연결 동시성(경합 테스트는 PGlite 단일 연결 위 순서 주입).
+- 프록시 뒤 콜백 URL·서버 접근 로그의 비밀 노출, 브라우저 렌더링.
+- 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(사용자 결정 대기, D23).
+- T13 FIX3: 계정당 정리 대기 슬롯 1개(두 번째 정리 실패는 감사만), 열 수 없는 pending 기록은 키를 고칠 때까지 계정 차단.
+- T14/T15: 각 인계 문서 "Known risks" 참조(부분 스레드 공개 잔존, 고아 컨테이너, 세션 만료 not_found 판정 근거, 업로드 뒤 취소 처리).
+
+---
+
+# 로컬 복귀 후 진행 (2026-10-02~03, 로컬 세션, Opus 5.5 구현 · Codex 검증)
+
+## 로컬 복귀 검사 (7634bb1, Windows 10 · Node 24.21.0)
+설치·migration 0030~0032·lint·typecheck·build·unit 697·integration 517·drill:mock(M3·T14·T15) 0건·실제 DB drill:restore PASS.
+
+## Codex 판정과 수정 라운드
+| 대상 | 코드 커밋 | Codex |
+|---|---|---|
+| T13 FIX3 (클라우드) | 79201d6 | P1 3·P2 1 |
+| T14 (클라우드) | 67ade9e | P0 1·P1 1·P2 1 |
+| T15 (클라우드) | 427dc71 | P1 3 |
+| T13 FIX4 (oauth_pending_tokens, 0033) | ea85ac6 | P1 1·P2 2(1건은 D28 로 처리) |
+| T14 FIX1 (기록 어댑터·remote_steps 복원·resume_count 0034) | 6f766d2 | **대기열** |
+| T13 FIX5 (해제 시 현재 토큰 철회 의무 보존·행별 백오프) | 492b1b9 | **대기열** |
+| T15 FIX1 (조각 읽기 뒤 중단·할당량 단위·웹 경로 조각 예산) | cc26535 | **대기열** |
+| 화면 S1–S3 | f2bb3b9 | **대기열** |
+| 화면 기능 G1(항목별 목적 승인)·G2(요청 결과·예약 공개 입력) | fa37b1a | **대기열** |
+| 화면 S4·S5 | 8d2cc64 | **대기열** |
+| 업로드 세션 URI 이중 가림(실제 DB drill:restore 실패 수정) | 0c86db2 | **대기열** |
+판정 요약 `M4_CODEX_VERDICTS.md`. 각 코드 커밋의 인계는 `T13/T14/T15_IMPLEMENTATION_HANDOFF.md`, `M4UI_IMPLEMENTATION_HANDOFF.md`, `screen-notes-m4.md`, `FIX_DRILL_MASK_HANDOFF.md`.
+마지막 검사(0c86db2): lint·typecheck·build·unit 745·integration 570·drill:mock 0건·db:migrate(0034)·실제 DB drill:restore PASS.
+
+## Codex 사용 한도
+2026-10-02 21:31 FIX-T14 검토 중 Codex 사용 한도 도달("try again at Oct 3rd, 2026 10:06 PM"). 모델은 바꾸지 않는다(gpt-6-astra / xhigh 고정). 로컬 `.handoffs/codex-queue.txt` + `run-codex-queue.sh` 가 10-03 22:15 까지 기다렸다가 위 **대기열** 7건을 순서대로 검토한다(PC·앱이 켜져 있어야 함). 결과는 `.handoffs/review-<label>.md`.
+
+## 결정
+- D28: 인계·판정 사본은 docs/handoffs/ 에 추적하되 docs 전용 커밋으로만(코드 커밋과 분리).
+- D26·D27 후속: 클라우드 잠정 판단 위에 FIX 라운드 변경을 기록. D26(a~f)·D27(a~h) 사용자 확인은 아직 받지 않음 — 잠정대로 진행 중.
+
+## 화면 확인 (오케스트레이터 직접, 모의만) — `screen-notes-m4.md`
+Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 공개)·항목별 승인·실행·YouTube 업로드 → UPLOADED_PRIVATE("비공개 업로드 완료, 공개 전환 확인 필요") 확인. 결함 S1–S5 수정. 로컬 `.env.local` 에 이 PC 에서 만든 시험용 마스터 키 추가(값 비공개, git 무시).
+
+## 남은 것
+- Codex 대기열 7건 결과 → 수정 라운드.
+- 사용자 확인: D26(a~f)·D27(a~h), 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(D23).
+- 다음 작업 후보(검증이 따라온 뒤): T16 Instagram(모의), 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
+- 실계정 연결 전 사용자 준비물(D24): Meta 앱·Threads 테스트 계정, Google Cloud 프로젝트·OAuth 동의 화면·YouTube API 감사, redirect URI, 마스터 키 위치, 첫 실계정 시험 원고·공개 범위.
+
+## 2026-10-03 04:35 — M4 모의 범위 Codex 종결
+- T13(FIX8 c82c721)·T14(FIX2 746aa3a)·T15(FIX1 cc26535)·화면(cd0a2aa)·가림(75dd988) 모두 Codex(gpt-6-astra/xhigh) PASS. 라운드별 판정은 `M4_CODEX_VERDICTS.md` 하단 요약.
+- 마지막 검사(c82c721): lint·typecheck·build·unit 759·integration 600·drill:mock(M3·T14·T15) 0건·db:migrate(0035)·실제 로컬 DB drill:restore PASS.
+- migration 0030~0035 로컬 적용. 외부 호출·새 의존성·비밀·실제 게시 0.
+- 실계정 연결은 여전히 사용자 준비물·승인 대기(D24). D26(a~f)·D27(a~h) 사용자 확인 대기(잠정대로 진행 중).
+
+## 2026-10-03 아침 — 밤사이 진행 (Codex 한도 복귀 후 00:55 ~)
+- Codex 대기열 → 상주 실행기(`.handoffs/run-codex-daemon.sh`, 대기열 파일에 줄을 추가하면 자동 검토).
+- **종결(Codex PASS)**: T13(FIX8 c82c721) · T14(FIX2 746aa3a) · T15(FIX1 cc26535) · 화면(S1–S5, G1·G2, 해제 안내 cd0a2aa) · 업로드 세션 가림(75dd988).
+- **T16 Instagram(모의)**: 구현 620ed86(D29 잠정) → FIX1 165f0df(체크섬 대조·쓰기 5xx ambiguous·캐러셀 부모 요청 표식 0037) → FIX2 914ac36(sideEffect unknown 전 상태 코드 조회·표식 없는 옛 작업 부모 조회) — **Codex PASS(07:33) → 종결**.
+- 마지막 검사(914ac36): lint·typecheck·build·unit 825·integration 628·drill:mock(M3·Threads·YouTube·Instagram) 0건·db:migrate(0037)·실제 로컬 DB drill:restore PASS. migration 0030~0037 로컬 적용.
+- 외부 호출·새 의존성·비밀·실제 게시 0. 모의 연결용 로컬 시험 마스터 키는 `.env.local`(git 무시)에만.
+
+## 사용자 결정 대기 (모아 보기)
+1. **D26 (Threads, T14)** a~f — 잠정대로 진행 중(모의 Threads 어댑터 선택 규칙, 401 뒤 연결 확인, 잠정 요청 제한 250/24h, 부분 스레드 처리, 취소 중 부분 → UNKNOWN, 모의 공개 범위 가정).
+2. **D27 (YouTube, T15)** a~h — 잠정(자리표시 scope, 갱신 시 refresh token 회전, 요청 결과 규칙, 예약 공개 표현, 잠정 할당량 6/24h, 업로드 뒤 취소, 썸네일 실패, 세션 URI 가림).
+3. **D29 (Instagram, T16)** — 특히 **공개 미디어 URL 방식**(실제 Instagram 은 공개 URL 로 미디어를 가져감 — 이 앱이 짧은 서명 URL 을 열지/외부 호스트/수동 게시), scope 이름, 미디어 규격 수치, 요청 제한 25/24h, 캐러셀·영상 범위, Business/Creator 계정 유형, 공개 게시만.
+4. **D23 남은 항목** — 공개 /api/health 의 jobs·uploads·db.captures 를 세션 뒤로 옮길지(Codex 권고: 옮김).
+5. **D28** — 인계 사본을 docs/handoffs/ 에 추적하는 방식 유지 여부(AGENTS.md 규칙의 예외).
+6. **실계정 연결 준비물(D24)** — Meta 앱(Threads·Instagram)·Google Cloud/YouTube API 감사, 테스트 계정, redirect URI, 마스터 키 보관 위치, 첫 실계정 시험 원고·공개 범위.
+
+## 다음 후보
+- T16 Codex 결과 반영(필요 시 FIX3).
+- 모의 OAuth 발급 기록 DB 재수화(dev 서버 재시작마다 다시 연결해야 하는 불편).
+- T17(추가 채널) — 사용자 선택 필요. M5: T18 Notion·Drive 가져오기(모의), T19 허용 소스 수집(모의, 기본 OFF).
+
+## 2026-10-03 10:00 — 아침 마감
+- M4-DEV1(모의 OAuth 재수화, dev 서버 재시작 뒤 모의 연결 유지): 0d9911b → FIX1 b3041c0 → **FIX2 63ad062 Codex PASS**.
+- 열린 Codex 지적 없음. M4 모의 범위(T13~T16)·화면·가림·재수화 모두 종결.
+- 마지막 검사(63ad062): lint·typecheck·build·unit 831·integration 647·drill:mock(M3·Threads·YouTube·Instagram) 0건·실제 로컬 DB drill:restore PASS.
+- Codex 상주 실행기는 정지(`.handoffs/codex-daemon.stop`). 다시 쓰려면 stop 파일을 지우고 `nohup bash .handoffs/run-codex-daemon.sh &`.
+
+## 2026-10-03 23:00 — T19 종결
+- T19(허용 소스 수집, 모의·기본 OFF): 4a2e02f → FIX1 66e1257 → **FIX2 f07153c Codex PASS**. 마지막 검사(f07153c): lint·typecheck·build·unit 1269·integration 738·drill:mock 0건·db:migrate·drill:restore PASS.
+- M5 모의 범위(T18·T19) 종결. 남은 것: T17(보류), T21 운영 배포(승인 필요 — D30-1 서명 URL 의 전제), Threads 2단계(사용자와 함께, D31), D32·D33 사용자 확인.
+- 다음(로컬·결정 불필요): T19 남은 위험 중 소스 등록 상한 경쟁(동시 등록으로 51개) 보강.
+- T19-H1(소스 상한 동시 등록 경쟁): 1e47574 **Codex PASS**.
+
+## 2026-10-10 — LIVE-L1(D34 1단계, 실제 Claude 어댑터) 종결
+- D34(사용자 결정): 첫 실제 AI = Claude(Anthropic), 기본 모델 `claude-opus-5-5`, 월 상한 10 USD. 1단계 = 코드·기록된 응답 시험만(실제 호출 0, 과금 0).
+- 2cbcb49 → FIX1 d7da959 → FIX2 ea5954b → FIX3 a4da041 → **FIX4 2b05044 Codex PASS**. 인계: `LIVEL1_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(2b05044): lint·typecheck·build·unit 1401·integration 786·drill:mock 0건·db:migrate·drill:restore PASS.
+- 핵심: 공식 SDK 0.128.0 고정·재시도 0·목적지/헤더 고정·오류 원문 차단, 예약 = 보수적 추정(상한 증명 아님) + 실제 usage 정산(출처 provider/estimate/none/provider_unstorable), `LLM_LIVE_MAX_RUNS`(승인 기록별 실제 호출 수 제한), 본문 1인칭 문단 → 확인 필요 claim.
+- 남은 위험: 동시 초과 누적(LLM_LIVE_MAX_RUNS=1 이면 1회분), provider_unstorable 해제는 수동, Postgres 다중 연결 동시성 미검증, 사용자가 직접 쓴 1인칭은 게이트 대상 아님(기존 설계).
+- 다음: D34 2단계(실제 호출 1회) — 사용자 승인 필요.
+- LIVEL1-H1(Codex FIX4 놓친 케이스 보강): 259f4f9 **Codex PASS**. 검사: unit 1405·integration 789·drill·restore PASS. NFD 1인칭 탐지 수정 1줄, 나머지는 시험 추가.
+- 남은 보강 후보(Codex LIVEL1H1 놓친 케이스, 우선순위 낮음): resolution 형식 검증, 모의 provider 도 공통 1인칭 판별 함수 사용, NFC/NFD 교차 중복, 복원 후 월 예산 반영, 복원 실패 시 필드 값 보존, Postgres 다중 연결(미검증).
+
+## 2026-10-12 — D34 2단계(실제 Claude 호출 1회) 완료
+- 사용자 승인("2단계 승인") → 가상 소재(`LIVEL1_STAGE2_MATERIAL.md`)로 작성 보조 '개요' 1회: **성공**. 예약 0.105476 USD / 실제 0.035192 USD, 토큰 입력 1988 · 출력 1362(공급자 보고). 허용 목록 밖 출처 4건 서버가 버림. 직후 승인 기록 제거로 잠금.
+- 준비 중 발견·수정: LIVE-UI(a9898a6) → FIX 5bd62f3 **Codex PASS** — 실제 모드에서 화면이 "모의"로 표시되던 문제, 결과 출처 mock/live/출처 미확인 구분.
+- 다음 후보: 예약 추정 교정(실제 입력이 추정의 약 1/3), 실사용(D34 범위 확장)은 사용자 승인 필요.
+
+## 2026-10-12 저녁 — T21 선행 작업(로컬, 사용자 부재 중 자율 진행)
+- D35 일시 중지(Anthropic 지원 지역 확인 전 — 사용자 확인 필요). Threads 2단계는 설정 완료·형식 확인, 실제 OAuth 는 사용자 로그인 필요로 대기.
+- T21-P3(공개 health 생존 확인만·상세는 세션): 449da0f **Codex PASS**. 검사 unit 1411·integration 793·drill·restore PASS.
+- 진행 순서: P1a(운영 빌드 dev 로그인 차단·로그인 횟수 제한) → P2(tick 타이머·배포 설정 파일) → P1b(일반 OIDC, 가짜 IdP 시험).
+- T21-P1a(운영 빌드 dev 로그인 거부·로그인 실패 15분 10회 제한·판정 원자화): e70f7d4 → FIX1 e57cfa5 → FIX2 a448b78 → **FIX3 6f7a2a7 Codex PASS**. 검사 unit 1437·integration 816·drill·restore PASS. 남은 위험: Postgres 다중 연결 미검증(G2), 공격자의 전역 잠금으로 새 로그인 15분 차단 가능(기존 세션 유지), 순번 소진 시 관리자 정리 필요.
+- T21-P2(inline 주기 타이머·오래된 예약 60분 차단(D36 잠정)·deploy/ 예시와 스크립트): b73fc65 → FIX1 f351b7a → FIX2 69bf4b0 → FIX3 4e3490a → FIX4 47917f3 → **FIX5 e1025ba Codex PASS**. 앱 검사 unit 1466·integration 833 PASS, 배포 bash 시험 286(가짜 명령). 남은 위험: 배포 스크립트는 실제 Linux·root·flock·bind mount·PGlite 백업→복원→기동 미실행(서버 생긴 뒤 1회 확인 필요).
+- TEST-TIMEOUT(import 2MB 선형성 시험 벽시계 30초): f71f7ad Codex PASS.
+- T21-P1b(일반 OIDC 로그인 — openid-client 6.8.8, PKCE·state·nonce, 서명 검증 강제, 허용 이메일·sub, 가짜 IdP 시험): af9860c → FIX1 e75fa0c → **FIX2 1beee05 Codex PASS**. 검사 unit 1550·integration 878 PASS. migration 0043(auth_oidc_states). 남은 위험: 실제 IdP·프록시 뒤 callback URL 미확인(첫 배포 때 확인 — 불일치면 로그인 실패가 전역 제한에 누적), 미고지 JWKS 키 교체 후 최대 1분 실패, Postgres 다중 연결 미검증.
+
+## 2026-10-13 낮 — T21 로컬 선행 작업 종결
+- P3(health)·P1a(dev 로그인 차단·제한)·P2(타이머·배포 파일)·P1b(OIDC) 모두 Codex PASS. 운영 배포에 남은 것은 **사용자 결정·승인**: IdP 선택·등록, 호스팅·도메인 선택(T21_DEPLOY_REVIEW §3), 서버 밖 백업 위치(P4/G5), D36(60분) 확인, D35 재개 여부(Anthropic 지원 지역), Threads 2단계(사용자 로그인 필요). 선택 과제: Postgres 드라이버(P5/G2).
+
+## 2026-10-13 오후 — D31 2단계 완료 · D35 재개 · D36 확정 · D37 배포 대기
+- Threads 실제 연결 성공(@yongho.tho, 만료 2026-12-12, 게시 없음). 로컬 HTTPS(`content-studio-dev-https`, 127.0.0.1 바인드)로 전환 — Meta 가 http redirect 거부.
+- D35 재개(사용자가 지원 지역 확인). D36(오래된 예약 60분) 확정. D37 운영 배포 대기.
+- DEV-LOG(콜백 query 로그 제외) 4f0bc1d **Codex PASS**.
+- LIVE-P1(D38 1단계 — 실제 Threads 글 게시 어댑터, fixture 시험만): 320dadb → FIX1 1a22434 → **FIX2 b8a7200 Codex PASS**. 검사 unit 1630·integration 895 PASS. migration 0044 로컬 적용(백업 data/pglite.bak-20261013-pre0044). 남은 위험: 결과 불명 게시는 항상 UNKNOWN(사용자 확인), GET 질의 토큰의 앱 밖 기록 미검증, Postgres 독립 연결 동시성 미검증, 화면은 브라우저 미확인(2단계 때 확인).
+- LIVEP1-TIMEOUT(98f11cd → FIX e708106 PASS)·LIVEP1-USERCONFIRM(a67f462 → FIX 2af529b PASS) 종결. migration 0045 로컬 적용(백업 data/pglite.bak-20261014-pre0045), drill:restore PASS.
+- UI-CLEAN(fdb6aea → FIX 254ee5e PASS): 메뉴 5묶음+소메뉴·현재 위치 강조, 모든 화면 위치 경로, 긴 설명 '자세히'로 접기(안전 표시 유지·ui-safety 시험), 실제/MOCK 안내를 계정·기록 상태로. 검사 unit 1788·integration 917 PASS. 브라우저 확인: 데스크톱·375px 가로 넘침 없음.
+- DESIGN-A(9bbf96a PASS): 사용자 선택 샘플 A(Apple 시스템 다크) — 순흑 배경·세그먼트 메뉴·묶음 목록 행·시스템 색, 실제(주황 tag live)/MOCK(회색 점선 tag mock) 분리, AA 대비 시험, 밝은 모드 대응. 브라우저 확인(데스크톱·375px).
+
+## 2026-10-19 — D39 승인 · 클라우드 인계
+- 사용자 승인: Threads 평상시 실제 게시(최근 24시간 3건 상한·즉시 중지 스위치) + 만료 관리 → D39. 계획 `LIVEP2_EXPIRY_PLAN.md`.
+- 로컬 PC 메모리 부족(dev 서버 컴파일 중 V8 OOM 2회)으로 구현·검사는 클라우드로 인계: `M4_CLOUD_KICKOFF_D39.md`. Codex 검증·실제 설정 적용은 로컬.
+- 게시는 계속 잠김(PUBLISH_MODE=disabled). 로컬 dev 서버·Codex 실행기 꺼짐.
+
+## 2026-10-19~20 — D39 구현(클라우드 세션)
+- 사용자 지시(2026-10-19): 로컬로 돌아가지 않고 **클라우드에서 계속** 진행. 클라우드에는 Codex CLI·OpenAI 인증이 없어 Codex 검증은 미실행으로 남고, 대신 Claude 독립 검토(여러 관점 + 지적마다 반박 검증, **Codex 판정 아님**)를 돌린다.
+- **LIVE-P2**(Task A, 최근 24시간 실제 게시 상한 + 즉시 중지 스위치, migration 0046): 코드 **ca7228e**, 인계 c5597e1(`LIVEP2_IMPLEMENTATION_HANDOFF.md`). 검사(클라우드 Node 22.22.2, 오케스트레이터 순차 재실행): lint·typecheck·build PASS, unit 76 files / 1838, integration 51 files / 928, drill:mock 위반 0, test-check-env.sh 58/58, lockfile 불변.
+- **EXPIRY-1**(Task B, Threads 실제 연결·로컬 인증서 만료 14일 전 경고, `scripts/dev-cert.sh check|renew`): 코드 **5739e5a**, 인계 0b7220f(`EXPIRY1_IMPLEMENTATION_HANDOFF.md`). 검사: lint·typecheck·build PASS, unit 79 files / 1885, integration 51 files / 928, drill:mock 위반 0, test-dev-cert.sh 82/82, lockfile 불변. `renew` 는 임시 디렉터리에서만 시험(실제 경로 실행 안 함).
+- not_run: Codex(클라우드 불가), 실제 Postgres 다중 연결(LIVE-P2 경쟁 시험은 PGlite 단일 연결이라 advisory 잠금 자체를 증명하지 못함), 브라우저 렌더링, 사용자 PC 의 실제 인증서·Windows Git Bash, `./data` migrate(0046)·`drill:restore`, 실제 Threads.
+- 알려진 불안정: `packages/db/src/lock.test.ts`(다중 프로세스 시간 시험) 첫 단위 실행 1건 실패 → 단독·재실행 PASS(이번 작업과 무관한 파일).
+- Codex 큐 줄(나중에 로컬에서 쓸 경우): `ca7228e LIVEP2 docs/handoffs/LIVEP2_IMPLEMENTATION_HANDOFF.md`, `5739e5a EXPIRY1 docs/handoffs/EXPIRY1_IMPLEMENTATION_HANDOFF.md`.
+- D39 실제 적용(`.env.local` 의 PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF=D39·PUBLISH_LIVE_MAX_POSTS=1000·PUBLISH_LIVE_DAILY_MAX=3, `./data` 백업 → `db:migrate`(0046))은 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만 가능 — 그 전까지 게시는 잠김(PUBLISH_MODE=disabled).
+- (이 줄은 아래 "2026-10-20 — 독립 검토·FIX·보강" 절로 완료됨.)
+- 푸시 메모: 2026-10-19 한때 GitHub 앱 권한 403 → 사용자가 앱 권한 정리 후 해결. 1회 `commit_refs` 일시 오류는 재시도로 해결.
+
+## 2026-10-20 — 독립 검토·FIX·보강(클라우드 세션, Codex 대신 Claude 독립 검토)
+- 방식: 읽기 전용 검토자 5명(관점별) + 지적마다 반박 검증(P0·P1 3표 중 2표, P2 1표). **Codex 판정 아님.** 기록 `D39_CLAUDE_REVIEW.md`(1차 bc24fbe, 2차 41bd767).
+- 1차(LIVE-P2 ca7228e · EXPIRY-1 5739e5a): 확정 21(중복 포함, P1 2 = 같은 시험 누락)·기각 3.
+  - **LIVE-P2 FIX1 7538492**(인계 4865c23): 다음 가능 시각(상한 초과·분 올림), 중지 시험(P1), 결과 불명 → resume → 중지/상한 보류 재시도 가능, 게시 시도 표식 전 중지 재확인, 화면 중지 표시, 오래된 예약 재시도, 잠금 순서 시험, 모의 미집계·화면 연결 시험. unit 1896 · integration 938.
+  - **EXPIRY-1 FIX1 92cd026**(인계 1cb9d3c): 해제 중 연결 경고 제외, 운영 기본 경로 시험, 인증서 교체 되돌리기·원자성, 대소문자 무시 같은 이름, bash 시험 보강. unit 1906 · integration 938 · test-dev-cert 165.
+- 보강 후보 조사(읽기 전용 워크플로): 7개 중 2개는 이미 처리됨(목적 섞인 계획 승인·계획 만들기 입력 = M4UI cd0a2aa, Codex PASS — 위 "클라우드 세션이 남긴 화면·흐름 공백" 문구는 오래된 기록).
+  - **LIVEL1-H2 990fd5d**(인계 41addc3): 복원 시 수동 해결(resolution) 형식 검증, 모의 provider 공통 1인칭(NFC), 경험 claim NFC 중복 제거, 복원 예산·실패 시 값 보존 시험. unit 1931 · integration 952.
+- 2차(7538492 · 92cd026 · 990fd5d): 확정 12(중복 2쌍, 실질 10, **전부 P2**)·기각 2.
+  - **FIX2 561bc5f**: 재개 증명 + 표식만 있는 경우 거부 시험, 잠금끼리 순서 시험, 마지막 시도 표식 전 중지 → 재시도 가능(그 시도 미집계), 설정 다음 가능 시각·오래된 예약 경로 시험, 해제 중 + 정리 대기 연결 경고 제외, dev-cert 정리 중 errexit·신호, 점 이름 거부·백업 누락 가드, 키 누출 단언, 운영자 수동 해결 절차 갱신 + 읽기 전용 `pnpm bundle:check <zip>`.
+  - 마지막 검사(561bc5f, 클라우드 Node 22.22.2): lint·typecheck·build PASS, **unit 81 files / 1934 · integration 51 files / 956** · drill:mock 위반 0 · test-dev-cert.sh 251/251 · lockfile 불변(새 의존성 0) · 외부 호출 0.
+- not_run: Codex(클라우드 불가), FIX2 에 대한 3차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS 의 dev-cert.sh, 사용자 PC 의 실제 인증서, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(잠정 적용):
+  1. LIVE-P2: 게시 시도 표식 전 중지로 끝난 시도를 max_attempts 에 세지 않음(사용자 중지·재개·재시도가 있어야 하므로 유한). 시도 표시가 6/5 처럼 보일 수 있음.
+  2. LIVE-P2: 다음 가능 시각 표시는 다음 분으로 올림. 상한 미설정 = 상한 없음(D39 적용 값 3 으로 해소).
+  3. EXPIRY-1: error·needs_reconnect·expired 실제 연결은 계속 경고, 해제 중·해제됨만 제외. 만료된 인증서도 `check` 는 exit 0.
+  4. LIVEL1-H2: settled_amount 는 actual 과 같음, 단 actual > reserved(상향 재정산·상한)일 때만 더 클 수 있음. 실제 Claude 출력에서 NFC 만 다른 경험 claim 을 합침(확인 수·경고 수가 줄 수 있음). **실제 `./data` 에 옛 형식의 수동 해결 행이 있으면 그 백업 복원이 거부될 수 있으니 적용 전 `pnpm bundle:check` 로 확인.**
+- Codex 큐 줄(나중에 로컬에서 쓸 경우, 순서대로): `ca7228e LIVEP2`, `5739e5a EXPIRY1`, `7538492 FIX1-LIVEP2`, `92cd026 FIX1-EXPIRY1`, `990fd5d LIVEL1H2`, `561bc5f FIX2-D39` — 인계 문서는 각각 `docs/handoffs/{LIVEP2,EXPIRY1,LIVEL1H2}_IMPLEMENTATION_HANDOFF.md`.
+- D39 실제 적용(`.env.local`·`./data` migrate 0046·실제 게시)은 여전히 사용자 PC 또는 운영 배포(D37, 승인 필요)에서만. 게시는 잠긴 상태(PUBLISH_MODE=disabled).
+
+## 2026-10-21 — 3차 독립 검토·FIX3(클라우드 세션)
+- 3차 Claude 독립 검토(Codex 아님, FIX2 561bc5f 대상, 에이전트 10개): 확정 3(**전부 P2**)·기각 3. 라운드별 확정 21 → 12(실질 10) → 3 — 수렴.
+- **FIX3 e7c73c9**: dev-cert 인증서 쪽 백업 가드 시험(271/271), 운영자 수동 해결 SQL 안전화(잘못 채우면 0행·returning 1행·확인 질의) + 이미 resolution 이 있는 행용 수정문(original_reported 보존), `bundle:check` 미해결 건수 표시, 7-④ 의 RESTORE_LOCAL_DIR 쓰기 경로 안내. 인계: EXPIRY1·LIVEL1H2 "FIX round 3" 절.
+- 마지막 검사(e7c73c9, 클라우드 Node 22.22.2): lint·typecheck·build PASS, **unit 81 files / 1934 · integration 51 files / 959** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · lockfile 불변 · 외부 호출 0.
+- not_run: Codex, FIX3 에 대한 4차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 수정문이 usage_source 도 가드 아래 다시 씀, SQL 은 none ⇒ actual = reserved 를 강제(검증기보다 엄격), 추가 키·original_reported 없는 옛 수동 해결 행은 "멈춤"만 안내.
+- Codex 큐 줄(추가): `e7c73c9 FIX3-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX2 줄 다음).
+
+## 2026-10-21 — 4차 독립 검토·FIX4(클라우드 세션)
+- 4차 Claude 독립 검토(Codex 아님, FIX3 e7c73c9 대상, 기록 8bff163): 확정 11(**실질 전부 P2**)·기각 4. 대부분 손으로 채워 실행하는 운영자 수동 해결 SQL 에서 나옴 → 가드를 더하지 않고 SQL 자체를 없앰.
+- **FIX4 fb1fa58**: 수동 해결 SQL → 검증기(`isValidResolution`)를 그대로 쓰는 CLI `corepack pnpm ledger:resolve` (`--list` 읽기 전용 · 기본 미리보기 · `--confirm` 정확히 1행 + 재검증 + 감사 · 이미 해결된 행은 `--correct` 필수). 운영 절차(LIVEL1 인계 2·4~7단계)·README 갱신, `bundle:check` 미해결 건수 시험, 7-④ `.env.local` 우선순위 시험. 인계: LIVEL1H2 "FIX round 4" 절(a490261).
+- 마지막 검사(fb1fa58, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 980** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX4 에 대한 5차 독립 검토(이어서 진행), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(CLI 인자 인용·UTF-8 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 절차가 SQL → CLI 로 바뀜(손으로 쓰는 SQL 미지원), `--list` 는 보고 값을 출력, 수정 모드는 original_* 증거가 있으면 현재 usage_source 를 가리지 않음, 버리는 DB 경로는 `./data/pglite-check-<날짜>`(기본 data 폴더와 겹치지 않는 하위 폴더).
+- Codex 큐 줄(추가): `fb1fa58 FIX4-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX3 줄 다음).
+
+## 2026-10-21 오후 — 5차 독립 검토·FIX5(클라우드 세션)
+- 5차 Claude 독립 검토(Codex 아님, FIX4 fb1fa58 대상, 에이전트 30개 — 첫 실행이 세션 한도로 일부 실패해 한도 해제 뒤 이어 실행, 기록 cacfd05·4edf71e): 확정 9(**전부 P2**, P0·P1 없음)·기각 16.
+- **FIX5 4769c4e**: `ledger:resolve` 적용은 미리보기 확인 지문 `--expect` 필수(`expect_mismatch`), by/reason 을 받은 그대로 이스케이프 표시 + `"`·`%`·`\` 거부(`text_shell_unsafe`)·문서 `MSYS_NO_PATHCONV=1`, 이미 유효한 행 정정은 `--overwrite-valid`(`already_valid`), DB 폴더 없으면 만들지 않음, 해결 owner 를 1단계 export 범위로(`owner_not_exported`), 원자성(트리거)·누출·큰 수·형제 단언 시험. 인계: LIVEL1H2 "FIX round 5" 절.
+- 마지막 검사(4769c4e, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 999** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX5 에 대한 6차 독립 검토, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS(cmd.exe 스크립트 셸·MSYS 변환 포함), `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 명령이 두 번(미리보기 → `--expect <지문> --confirm`)으로 바뀜, by/reason 에 `"`·`%`·`\` 를 쓸 수 없음, 다른 owner 는 모든 명령 앞 `AUTH_ALLOWED_IDENTITY=` 로만, 적용 실행이 실패해도 by/reason 이 터미널에 남음.
+- Codex 큐 줄(추가): `4769c4e FIX5-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX4 줄 다음).
+
+## 2026-10-21 저녁 — 6차 독립 검토·FIX6(클라우드 세션)
+- 6차 Claude 독립 검토(Codex 아님, FIX5 4769c4e 대상, 에이전트 22개·실패 0, 기록 7340e8b): 확정 6(**실질 전부 P2** — #5 는 검증자 1명 P1·2명 P2)·기각 9. 라운드별 확정 21 → 12 → 3 → 11 → 9 → 6.
+- **FIX6 1b6e4f4**: FIX5 의 `MSYS_NO_PATHCONV=1` 앞붙임 제거(Git Bash 의 corepack shim 이 시작하지 못할 수 있음 [추정]) + `/` 로 시작하는 값 거부, 셸 문자 거부에 `& | < > ^` 추가·문구 정정(도착한 문자만 봄), 보이지 않는 기본 무시 문자(한글 채움 문자 등) 이스케이프 표시, 불필요한 `--overwrite-valid` 거부(`overwrite_not_needed`), 정정 전 settled_amount·resolved_at 표시·감사, 시험 보강(정정·반쯤 끝난 행 거부, `updated 1` 뒤 exit 1), 1단계 기준값 보완. 인계: LIVEL1H2 "FIX round 6" 절.
+- 마지막 검사(1b6e4f4, 클라우드 Node 22.22.2, 순차): install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS, **unit 81 files / 1934 · integration 52 files / 1002** · drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근.
+- not_run: Codex, FIX6 에 대한 7차 독립 검토, 실제 Postgres 다중 연결, 브라우저, **Windows Git Bash 에서 `corepack pnpm ledger:resolve` 실제 실행**(인용·경로 변환·corepack shim), macOS, `./data` migrate(0046)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용): 운영 명령 앞붙임 없음, by/reason 에 `" % \ & | < > ^` 와 앞 `/` 를 쓸 수 없음(`R&D` 등도 거부), 정정 감사에 정정 전 settled_amount·resolved_at 을 남김. **사용자 PC 에서 처음 쓸 때 `corepack pnpm ledger:resolve --list` 가 Git Bash 에서 실행되는지 먼저 확인.**
+- Codex 큐 줄(추가): `1b6e4f4 FIX6-D39 docs/handoffs/LIVEL1H2_IMPLEMENTATION_HANDOFF.md`(FIX5 줄 다음).
+
+## 2026-10-22 — 전체 코드 Claude 독립 검토 1차·FIX1-FULLREV(클라우드 세션)
+- 사용자 지시(2026-10-21 "현재까지의 전체 코드 리뷰를 클로드 코드 리뷰로 진행해줘", "권고사항대로 진행해줘"). Claude 독립 검토이며 Codex 아님. 대상 `origin/main...a0521fe` 의 앱 전체(631 files), 기록 b533650(`FULLREV1_CLAUDE_REVIEW.md`).
+  - 지적 10 → 확정 7(F1·F2·F3 P1, F5·F6·F7·F9 P2) · 기각 3(F4 D12·D13 수용 위험, F8 작업 키로 감사 연결 유지, #10 D28·D30).
+- **FIX1-FULLREV af1d0b5**:
+  - 승인 철회 뒤 남은 보류 작업을 상한에서 세지 않음.
+  - 일부 게시 뒤 승인 철회·무효·취소·작업 처리기 멈춤은 모두 UNKNOWN 이다(다시 게시 안 함). 판정은 하나를 공유한다.
+  - 업로드 MIME 별칭 정규화, 복원 ZIP 구간 겹침 거부, mock 시험 인자 판정을 빌드 때 고정, 검색 날짜 왕복 확인.
+  - **migration 0047**(send_intents 부분 인덱스 2개).
+  - 고친 결과 반박 검토 3회 + 보완 3회(확정 1 → 10 → 2 → 0). 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(af1d0b5 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 1974 · integration 56 files / 1047**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저(.m4a 실제 업로드 포함), Windows Git Bash·macOS, `./data` **migrate(0046·0047)**·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용):
+  - 부분 게시 뒤 멈춘 항목은 "실행 전"으로 돌아가지 않고 결과 불명으로 남는다(다시 승인·실행 불가 — Threads 에서 직접 확인).
+  - 실제 계정은 게시 시도 표식 뒤 동시 취소면 UNKNOWN 이다.
+  - 사용자 PC 에서 다음에 DB 를 열면 0046 과 0047 이 함께 적용된다(서버 끈 상태, 백업 먼저).
+- Codex 큐 줄(추가): `af1d0b5 FIX1-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX6 줄 다음).
+
+## 2026-10-22 오후 — FIX2-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-22 "다 권고 사항으로 진행해줘"): FULLREV1 검토자 질문 1~4 모두 권고안이다.
+- **FIX2-FULLREV 13f29b3**:
+  - 부분 게시 뒤 최종 실패·조회 한도는 FAILED 대신 UNKNOWN(`thread_partial_failed`·`thread_partial_unresolved`)이다.
+  - 부분 게시·복원 미확정 UNKNOWN 은 상태 태그·작업 줄·안내 어디에서도 새 계획을 권하지 않는다(모의 카드는 모의 문구).
+  - 복원한 작업 취소는 기록이 증명할 때만 "보내지 않음"이다(`restored_cancel_unverified`).
+  - 취소 요청 시각은 처음 값을 유지한다.
+  - 반박 검토 2회(확정 5 → 3, 모두 P2) 뒤 보완했다. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 2".
+- 마지막 검사(13f29b3 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 1990 · integration 58 files / 1063**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- 확인 필요(추가, 잠정 적용):
+  - 일부 게시된 스레드가 뒤에서 실패하면 "실패" 대신 "결과 불명"이다.
+  - 옛 묶음(0031 이전)에서 복원한 작업을 취소하면 "결과 불명"이 될 수 있다.
+- Codex 큐 줄(추가): `13f29b3 FIX2-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX1-FULLREV 줄 다음).
+
+## 2026-10-23 — FIX3-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 2 검토자 질문 1~3.
+  - R1: 복원 묶음 migration 수준을 작업마다 기록하지 않는다(보수적 UNKNOWN 유지, 받아들인 제약).
+  - R2: 취소 결과 불명 전용 안내.
+  - R3: 실제 계정 카드에만 조건부 복구 줄.
+- **FIX3-FULLREV a9873af**: HTML 취소가 UNKNOWN 이면 `cancel_unknown` 으로 돌아가고 저장된 상태로 확인한 안내를 보인다. 실제 계정의 부분 게시·복원 미확정 안내에는 "Threads 에 없음을 직접 확인한 경우에만 새 배포 계획"이 붙는다(모의 그대로). 반박 검토 2관점 지적 0. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 3".
+- 마지막 검사(a9873af 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2002 · integration 59 files / 1069**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- Codex 큐 줄(추가): `a9873af FIX3-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX2-FULLREV 줄 다음).
+
+## 2026-10-23 오후 — FIX4-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 3 남은 것 1~4.
+  - S1: 실제 카드 복구 줄은 안내에 한 번만 둔다.
+  - S2: 복원 확인 거부 문구에 조건을 붙인다.
+  - S3: 계정 근거 규칙을 하나로 모은다(항목은 계정을 잃을 수 없음 — 시험 고정).
+  - S4: plan_id 없는 취소는 항목의 계획 화면으로 보낸다.
+- **FIX4-FULLREV fc74b3a**. 반박 검토 2관점: 확정 0·기각 5(모두 기존 문구·닿을 수 없는 상태). 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 4".
+- 마지막 검사(fc74b3a 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2018 · integration 60 files / 1079**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- not_run: Codex, 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, `./data` migrate(0046·0047)·`drill:restore`, 실제 Threads·Claude.
+- Codex 큐 줄(추가): `fc74b3a FIX4-FULLREV docs/handoffs/FULLREV1_IMPLEMENTATION_HANDOFF.md`(FIX3-FULLREV 줄 다음).
+
+## 2026-10-23 저녁 — 사용자 PC 확인(Windows 10 · Git Bash · Node 24.21.0, 브랜치 8166e52)
+- 사용자가 직접 실행했고, 결과는 화면 캡처로 받았다. 클라우드 세션은 실행하지 않았다.
+  1. `corepack pnpm ledger:resolve`: 사용법 출력·exit=2. Git Bash 에서 corepack shim 이 정상 시작한다(FIX6 의 [추정] 위험 해소).
+  2. 없는 DB 폴더로 `--list`: "DB 폴더가 없습니다 … 아무것도 만들지 않았습니다"·exit=1. 새 폴더 없음.
+  3. 실제 DB 복사본(`data/pglite-check-20261023`):
+     - `--list` 결과는 후보 0행·아직 provider_unstorable 0행·exit=0 이다. 손으로 해결할 원장 행이 없다.
+     - `drill:restore` 결과는 PASS·exit=0 이다(37표 133행 same, 파일 2, 검색 found). 확인 뒤 복사본을 지웠다.
+  4. Git Bash 인자 변환 확인: `node -e … '/ops 시험 한글'` → `"C:/Program Files/Git/ops 시험 한글"`. 앞 `/` 값은 MSYS 가 먼저 바꾼다(확인됨). Git Bash 에서는 `text_shell_unsafe` 의 앞 `/` 거부가 아니라 미리보기 `reason:` 표시가 실제 보호다(FIX6 남은 위험과 같음).
+  5. 실제 DB 적용: 백업 `data/pglite-backup-20261023-before-0046`(폴더 복사) 뒤 `corepack pnpm db:migrate` 는 `{"ok":true,…,"database":"./data/pglite"}`·exit=0 이다(0046·0047 적용). `drill:restore` 는 PASS·exit=0 이다(복사본과 같은 표).
+- 5-4 개발 서버 확인(사용자 보고, 캡처 없음): `pnpm dev` → 로그인(AUTH_ALLOWED_IDENTITY) 성공. `/api/health`·`/`·`/api/health/details`·`/settings`·`/distribute`(계획 상세 포함)·`/ops` 화면이 모두 열렸다. 버튼 조작은 없었다. 이것으로 0046·0047 의 실제 `./data` 적용을 마쳤다.
+- 백업 폴더(`pglite-backup-20261023-before-0046`, 그 앞 `pglite.bak-2026101x-pre004x`)는 사용 확인 뒤 사용자가 정리한다.
+- not_run(남음): Codex, 실제 Postgres 다중 연결, 브라우저 자동 시험, macOS, 실제 Threads·Claude 호출, 원장 해결 행이 있는 상태의 `ledger:resolve` 미리보기·적용.
+
+## 2026-10-23 저녁 — Codex 검증 대기열 준비(사용자 PC 실행용)
+- 사용자 지시("codex 검증 진행해줘"). 클라우드 세션에는 codex CLI 가 없다(`which codex` 결과 없음). 사용자 규칙도 Codex 검증은 사용자 PC 전용·gpt-6-astra / xhigh 고정이다. 그래서 실행기와 대기열만 준비했다.
+- 대기열 `docs/handoffs/CODEX_QUEUE.txt`(14건): D39 의 LIVEP2·EXPIRY1·FIX1-LIVEP2·FIX1-EXPIRY1·LIVEL1H2·FIX2~6-D39, 그리고 FIX1~4-FULLREV 다. 실행은 `bash scripts/codex-review-queue.sh`(결과 `.handoffs/review-<작업명>.md`)다.
+- 실행기 시험 `scripts/tests/test-codex-review-queue.sh`(가짜 codex) 15/15 를 통과했다. 변이 2개(판정 없이 건너뜀·실패해도 계속)를 잡았다.
+- (추가) 사용자 지시("codex 검증 ChatGPT에서 받아서 진행할 수 있도록 해줘"): ChatGPT 의 Codex(웹)용 프롬프트 14개를 `docs/handoffs/CODEX_CHATGPT_PROMPTS.md` 로 만들었다. 대기열과 같은 순서이고, 리뷰 지시는 `codex-review-commit.sh` 와 같다. 웹에서는 Codex 가 저장소를 직접 읽는다. 결과는 대화에 붙이거나 `.handoffs/review-<작업명>.md` 로 저장하면 로컬 실행기와 섞어 쓸 수 있다.
+
+## 2026-10-23 밤 — Codex 14건 결과(ChatGPT Codex 웹, 사용자 실행)
+- 원문: `docs/handoffs/CODEX_14_REVIEWS_2026-10-23.md`(사용자 전달본 그대로). 기준은 docs HEAD 52f3a09·제품 코드 fc74b3a 이고 FIX5-FULLREV 는 포함하지 않았다.
+- **실제 모델 ID·추론 설정은 노출되지 않았다** — 요청값은 gpt-6-astra / xhigh 이고 준수 확인은 불가하다. Codex 도 그렇게 실행했다고 주장하지 않는다.
+- 판정: 현재 HEAD 기준 **CHANGES_REQUESTED, P2 2건**. 작업별로는 PASS 2(FIX6-D39·FIX4-FULLREV), 나머지 12 CHANGES_REQUESTED 다. 12건의 P0·P1·P2 는 모두 이후 커밋에서 해결로 표시됐다(해결 SHA 는 원문). 다시 고치지 않는다.
+- 남은 유효 지적과 처리:
+  1. [P2] `scripts/dev-cert.sh:294,296` 같은 폴더 동시 renew 가 섞여 키·인증서 짝이 어긋날 수 있다. Claude 확인 결과 잠금이 없다 [확실]. → FIX1-CODEX 가 진행 중이다(폴더 잠금 + 교체 뒤 짝 확인, 별도 작업 공간).
+  2. [P2] `packages/db/src/jobs.ts:1853,1862` 복원 작업 retryItem 거부 문구에 조건 없는 "새 배포 계획을 만드세요"가 있다. → FIX5-FULLREV T2 로 고쳤고 커밋 전이다(검토·보완 중).
+- 결함이 아닌 제안(결정 전, 고치지 않음):
+  - 부분 복원으로 비용 원장이 빠질 때 예산 이력 완전성 경고 보강(LIVEL1H2 Q5). 지금 미리보기에는 통화 불일치 경고는 있지만 원장 누락 영향 경고는 없다.
+  - D39 "재시도는 새로 세지 않음"을 창 안 중복 제거로 문서에 명시(LIVEP2 Q2).
+  - 미래 시각 의도 운영 진단(LIVEP2 Q6).
+  - 실제 계정이 여럿일 때 만료 경고에 계정 이름(EXPIRY1 Q4).
+  - 유효 시도·전체 시도 구분 표시(FIX2-D39 Q2).
+  - 기본 무시 문자만으로 된 by/reason 을 CLI 에서 거부(FIX6-D39 Q4).
+  - 반쯤 끝난 행의 버리는 값 표시·감사(FIX6-D39 Q1).
+- Codex 독립 실행 범위(원문 그대로): 메모리 내 단언 67(함수 58 + ZIP 9)·TS 149 문법 변환·셸 9 `bash -n`.
+- Codex 미실행: 설치·lint·typecheck·build·Vitest 전체·통합·drill·mutation·실제 인증서·production 빌드·PostgreSQL 동시성·실제 DB·브라우저·Windows/Git Bash·외부 호출. 구현자 PASS 수치는 Codex 가 독립 실행 결과로 인용하지 않았다.
+
+## 2026-10-23 밤 — FIX5-FULLREV(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): FIX round 4 남은 것 중 T1·T2·T4 를 고치고 T3 는 그대로 둔다. T2 = Codex 14건 남은 지적 2번.
+- **FIX5-FULLREV 39aa665**:
+  - 일반 실제 결과 불명 머리줄을 줄이고 조건부 줄은 카드당 1회로 했다.
+  - 복원 재시도 거부 문구에 조건을 붙였고 모의 계정은 모의 문구다(**Codex 지적 2 해결**).
+  - 항목 폼 다섯 경로가 plan_id 없이 오면 항목의 계획 화면으로 간다.
+  - 반박 검토 확정 1(P2)을 보완했고, 보완 재검토는 확정 0 이다. 인계: `FULLREV1_IMPLEMENTATION_HANDOFF.md` "FIX round 5".
+- 마지막 검사(39aa665 와 같은 코드, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2034 · integration 61 files / 1101**
+  - drill:mock 위반 0 · test-dev-cert.sh 271/271 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근
+- Codex 대기열·ChatGPT 프롬프트에 15번 `39aa665 FIX5-FULLREV` 를 추가했다.
+- Codex 14건 제안 7건 처리(사용자 "다 권고 사항으로", Claude 권고): 원장 누락 경고·D39 문구·기본 무시 문자만인 by/reason 거부는 FIX2-CODEX 로 한다. 미래 의도 진단·만료 경고 계정 이름·유효/전체 시도 표시·반쯤 끝난 행 값 감사는 보류한다(효과가 작거나 지금 쓰일 일 없음). FIX2-CODEX 에는 복원 결과 불명 재시도 거부의 모의 문구도 함께 넣는다.
+- not_run: Codex(FIX5), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, 실제 Threads·Claude.
+
+## 2026-10-23 밤 — FIX1-CODEX(클라우드 세션)
+- **FIX1-CODEX d88c31a**: Codex 14건 남은 지적 1(P2 `dev-cert.sh:294,296` 동시 renew 짝 어긋남)을 **해결**했다.
+  - renew 단일 실행 잠금(`.dev-cert-renew.lock`, 원자적 mkdir, 그룹 신호에도 잠금 남기지 않음)과 교체 뒤 키·인증서 짝 확인을 넣었다. 어긋나면 백업에서 되돌린다.
+  - 반박 검토 확정 3 → 보완, 보완 재검토 확정 1 → 오케스트레이터 수정. 인계: `EXPIRY1_IMPLEMENTATION_HANDOFF.md` "FIX round 4".
+- 검사:
+  - 그룹 신호 수정 직전 상태에서 전체 PASS: unit 2034·integration 1101·drill:mock 0·dev-cert 442.
+  - 수정 뒤: test-dev-cert.sh **472/472**, `bash -n`, 보이지 않는 문자 0.
+  - shellcheck 미설치, 실제 renew·Windows Git Bash·macOS 미실행.
+- 이로써 Codex 14건의 현재 남은 지적 2건(P2)을 모두 고쳤다(39aa665·d88c31a). Codex 재확인 대상은 대기열·ChatGPT 프롬프트 15·16번이다.
+- 다음: FIX2-CODEX(부분 복원 원장 누락 경고, D39 재시도 집계 문구, 기본 무시 문자만인 by/reason 거부, 복원 결과 불명 재시도 거부의 모의 문구).
+
+## 2026-10-23 밤 — FIX2-CODEX(클라우드 세션)
+- 사용자 결정(2026-10-23 "다 권고 사항으로 진행해줘"): Codex 14건 제안 7건 중 3건 + FIX5 후속 1건. 역사적 해결 항목은 다시 고치지 않았다.
+- **FIX2-CODEX c189319**:
+  - U1 복원 미리보기 경고 `ledger_history_incomplete`(건수만, 복원은 막지 않음): 들어가지 않고 이 계정에도 남지 않는 비용 원장 행 + 원장 없는 AI 실행·전사 작업. `different`·`unique` 충돌은 이 계정 행이 남아 세지 않는다.
+  - U2 D39 명확화(코드 변경 없음): 같은 작업의 재시도는 24시간 창 안에서는 한 번만 세고, 창이 지나면 다시 센다(DECISIONS·README·.env.example).
+  - U3 `ledger:resolve` 의 `--by`·`--reason` 이 공백·기본 무시 문자만이면 `text_blank` 거부(복원 검사는 그대로).
+  - U4 복원 때 결과 불명이던 모의 항목 재시도 거절은 모의 문구 + `mock: true`(코드 그대로).
+  - 반박 검토 확정 1(P2, U1 이 different 도 셈) → 보완, 보완 재검토 지적 1(P2) 기각. 인계: `docs/handoffs/FIX2CODEX_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(c189319 와 같은 파일, 클라우드 Node 22.22.2, 순차):
+  - install --frozen-lockfile(lockfile 불변) · lint·typecheck·build PASS
+  - **unit 83 files / 2034 · integration 62 files / 1120**
+  - drill:mock 위반 0 · test-dev-cert.sh 472/472 · 보이지 않는 문자 0 · 외부 호출 0 · 실제 `./data` 미접근(스냅숏 전후 같음)
+- Codex 대기열·ChatGPT 프롬프트에 17번 `c189319 FIX2-CODEX` 를 추가했다. **Codex 재확인 대상: 15·16·17번**(39aa665·d88c31a·c189319).
+- 보류(사용자 결정): 미래 의도 진단, 만료 경고 계정 이름, 유효·전체 시도 표시, 반쯤 끝난 행 값 감사.
+- not_run: Codex(15~17), 실제 Postgres 다중 연결, 브라우저, Windows Git Bash·macOS, 실제 Threads·Claude, 0008 이전 실제 묶음 복원.
+
+## 2026-10-25 ~ 11-02 — 전체 코드 Claude 독립 검토 2차(FULLREV2, 클라우드 세션)
+- 사용자 지시("현재까지 모든 코드 리뷰 한번 더 진행해줘", 한도 중단 뒤 "계속 진행해줘"·"다시해줘"). 대상 HEAD 09ddca0(코드 c189319). Codex 판정이 아니다.
+- 방식: 제품 파일 14개 영역을 하나씩 모두 읽고, 영역을 가로지르는 점검 8개를 돌렸다. 지적마다 반박 검증(P0·P1 은 3명 중 2명 유지, P2 는 1명 유지)을 붙였다. 에이전트 79개, 결과 누락 0. 사용량 한도로 두 번 끊겨 같은 입력으로 재개했다.
+- 결과: `docs/handoffs/FULLREV2_CLAUDE_REVIEW.md` — 확정 33건(**P1 4**·P2 29), 기각 6건, P0 없음 [추정].
+  - P1: G1 `pnpm dev` 0.0.0.0 바인드로 비밀번호 없는 dev 로그인이 같은 망에 노출, G2 다른 계획에서 이미 게시·결과 불명인 글의 중복 게시 경고 없음(docs/03), G3 복원 PARENTS 두 FK 누락으로 add_missing 미리보기·복원 500, G4 409 충돌 화면 no-referrer 로 다시 저장 CSRF 403.
+- 시험·빌드·dev 서버·`./data` 는 쓰지 않았다(정적 검토). 이 컨테이너의 `corepack pnpm` 은 깨져 있어 pnpm 12.6.0 을 직접 경로로 썼다(install --frozen-lockfile, lockfile 불변).
+- 다음: 권고 FIX 묶음 3개와 결정 5건(G2·G9·G16·G20·G29)을 사용자에게 묻는다. 코드는 아직 고치지 않았다.
+
+## 2026-11-02 — FIX1-FULLREV2(클라우드 세션)
+- 사용자 결정 D40("권고대로") + G17 앞당김(사용자 요청 2026-11-02). 커밋·푸시는 사용자 승인("커밋하고 푸시해줘") 뒤에 했다.
+- **FIX1-FULLREV2 d641ac4**:
+  - G1 dev 루프백 바인드
+  - G2 중복 게시 경고·실제 계정 확인 필수(D40-1)
+  - G3 복원 PARENTS FK 2개
+  - G4 충돌 화면 same-origin
+  - G5 폴링·불명 횟수 분리
+  - G6 이미 쓴 게시물 ID 후보 제외
+  - G7 finished 컨테이너 다시 읽기
+  - G8 진행 중 승인 철회 + 보류 시 PLANNED
+  - G17 로그인 multipart boundary 보존
+- 반박 검토 확정 1(P2, G8 막다른 BLOCKED) → 보완. 보완 재검토는 확정 0. 인계: `docs/handoffs/FULLREV2_IMPLEMENTATION_HANDOFF.md`.
+- 마지막 검사(d641ac4 와 같은 트리, 순차):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 84 / 2069 · integration 67 / 1169**
+  - drill:mock 위반 0 · dev-cert 472/472
+- 실제 Chromium E2E(로컬 dev·합성 PGlite·모의 설정): G17 multipart 로그인과 G4 충돌 화면 다시 저장 통과. 수정을 되돌린 대조에서는 두 결함이 재현됐다.
+- 독립 검증 스냅샷: zip SHA256 `ceec7e4b0ba5…3fa46`, 트리 `3f8001e2…`. 커밋 트리와 같다.
+- Codex 대기열·ChatGPT 프롬프트에 18번 `d641ac4 FIX1-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15·16·17·18번.**
+- not_run: Codex, 실제 Postgres 다중 연결, Safari·Firefox·Windows·macOS, 실제 Threads·실계정.
+- 다음: FIX2-FULLREV2(G9·G13–G16·G18·G19·G33), FIX3-FULLREV2. 사용자 결정 대기.
+
+## 2026-11-02 저녁 — FIX2-FULLREV2(클라우드 세션)
+- 사용자 지시 "FIX2-FULLREV2 진행해줘", 결정은 D40-2·D40-3.
+- **FIX2-FULLREV2 6d54488**:
+  - G9 '확인 필요' 게시 게이트·승인 무효화
+  - G13 실제 Threads 해제 로컬 완료
+  - G14 해제 중 연결 거부
+  - G15 로그인 감사 상한
+  - G16 세션 정책 지문(migration 0048)
+  - G18 복원 기존 항목 이력 미부착
+  - G19 복원 브랜드 변경 승인 무효화
+  - G33 데이터 볼륨 마운트 확인
+- 반박 검토에서 확정 4(P2) → 보완, 보완 재검토에서 확정 1(P2) → 직접 보완. P0·P1 은 0. 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 2.
+- 마지막 검사(6d54488 과 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 85 / 2073 · integration 72 / 1224**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 19번 `6d54488 FIX2-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15–19번.**
+- 업그레이드 주의: 0048 적용 뒤에는 모두 한 번 다시 로그인해야 한다(D40-3).
+- not_run: Codex, 실제 Postgres 다중 연결, 실제 systemd, 브라우저, 실제 Threads·OIDC IdP.
+- 다음: FIX3-FULLREV2(G10–G12·G20–G32). 사용자 결정 대기.
+
+## 2026-11-03 — FIX3-FULLREV2(클라우드 세션)
+- 사용자 지시 "진행해줘", 결정은 D40-4·D40-5. **FULLREV2 확정 33건 처리 완료.**
+- **FIX3-FULLREV2 4f6b71b**:
+  - G10 응답 mode
+  - G11 배너
+  - G12 작업 줄 사유
+  - G20 1인칭 확대
+  - G21 AI 실패 원인
+  - G22 통화 문구
+  - G23·G25 녹음 화면 전사 초안·이어 올리기
+  - G24 조립 I/O 오류
+  - G26 Markdown ReDoS
+  - G27 정확 중복
+  - G28 빠른 수집 상한
+  - G29 변경 없는 저장
+  - G30 보존 정리 지문(API 변경)
+  - G31 브랜드 충돌 화면
+  - G32 검색 조각
+- 반박 검토에서 확정 8(P2) → 보완, 보완 재검토에서 확정 3(P2) 중 2 는 직접 보완하고 1 은 위험으로 기록했다. P0·P1 은 0. 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 3.
+- 마지막 검사(4f6b71b 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 87 / 2194 · integration 75 / 1278**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 20번 `4f6b71b FIX3-FULLREV2` 를 추가했다. **Codex 재확인 대상: 15–20번.**
+- not_run: Codex, 브라우저(녹음 화면 등), 실제 Postgres 다중 연결, 실제 LLM·실계정.
+
+## 2026-11-03 — 쿼리 문구 조회 결함(FIX3 검토의 범위 밖 지적, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘". FIX3-FULLREV2 검토에서 범위 밖으로 남긴 결함을 고쳤다.
+- **abdc5d9**:
+  - `?error=__proto__` 같은 쿼리 값이 문구 표의 프로토타입 속성을 꺼내 렌더가 깨지던 것을 막았다.
+  - `apps/web/lib/lookup.ts` 의 `ownText`(자기 키·문자열만)로 화면 17개 파일 24곳을 바꿨다.
+  - 시험 `lookup.test.ts` 4건: 프로토타입 키, 원본 가드, 화면 연결. 원고 화면을 되돌리면 실패한다(변이 확인).
+- 마지막 검사(abdc5d9 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 88 / 2198 · integration 75 / 1278**
+  - drill:mock 위반 0 · dev-cert 472/472
+- not_run: 브라우저, Codex. 사용자 요청으로 Codex 대기열·ChatGPT 프롬프트 21번 `abdc5d9 OWNTEXT` 를 추가했다(인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` '후속 — 쿼리 문구 조회 방어'). **Codex 재확인 대상: 15–21번.**
+
+## 2026-11-04 — Codex 15–21 검증 결과 처리(클라우드 세션)
+- 사용자가 Codex 15–21번 결과 zip 을 첨부했다(사용자 PC 실행, 최신 코드 01927eb 한 곳에서 실행). 원문은 `docs/handoffs/CODEX_15_21_REVIEW_2026-11-03.md` 에 남겼다.
+  - 판정: 15·16·17·18·20·21 PASS. 19(FIX2-FULLREV2) CHANGES_REQUESTED — F1(P1): 세션 정책 지문이 OIDC issuer 끝의 '/' 를 떼어 issuer 변경 뒤에도 옛 세션이 통과했다(D40-3 위반).
+  - Codex 실행 결과: unit 2198·integration 1278 PASS, Chromium 확인(G17·G4·G29·OWNTEXT 9화면).
+- **FIX4-FULLREV2 9479869**: 세션 지문 issuer 를 설정값 그대로(정확 일치) 쓴다. 두 시험 단언은 결정대로 교체했다(강화). 인계: `FULLREV2_IMPLEMENTATION_HANDOFF.md` FIX round 4.
+- 마지막 검사(9479869 와 같은 트리):
+  - install(lockfile 불변) · lint · typecheck · build PASS
+  - **unit 88 / 2199 · integration 75 / 1279**
+  - drill:mock 위반 0 · dev-cert 472/472
+- Codex 대기열·ChatGPT 프롬프트에 22번 `9479869 FIX4-FULLREV2` 를 추가했다. **Codex 재확인 대상: 22번**(F1 수정 확인). 15–21 은 PASS 로 끝났다.
+- not_run: Codex 재확인, 실제 OIDC IdP, 실제 PostgreSQL 다중 연결, Safari·Firefox·Windows.
+
+## 2026-11-04 — FIX4-FULLREV2 Claude 반박 검토(클라우드 세션)
+- 사용자 요청 "Claude로 반박 검토 해줘". Codex 는 이 컨테이너에 없어 돌리지 못했다(사용자 PC 전용). 이 결과는 Codex 판정이 아니다.
+- 결과: 9479869 확정 지적 0. 'OIDC 클라이언트와 같은 비교'라는 설명이 부정확했다(실제로는 라이브러리보다 엄격). 그래서 코드 주석(동작 변경 없음)과 인계 문서를 정정했다.
+- Codex 재확인 대상은 그대로 22번이다(사용자 PC).
+
+## 2026-11-07 — Codex 미사용 전환(D42, 클라우드 세션)
+- 사용자 결정 "이제부터 Codex 활용하지 않고 모두 클로드코드에서 진행할 수 있도록 수정해줘". 구현·독립 검토·수정·재검토를 모두 Claude Code 에서 한다.
+  - 독립 검토자: 새 컨텍스트·읽기 전용 서브에이전트. P0/P1 3관점 2명 유지, P2 1명 유지.
+- 바꾼 것:
+  - 규칙: AGENTS/CLAUDE(상위·앱)
+  - 지시문: CLAUDE_START·CLAUDE_FIX, CLAUDE_REVIEW(CODEX_REVIEW 대체)
+  - 템플릿과 문서: docs/06·README_KO·ENVIRONMENT·02
+  - 상위 명령: `/claude-review`·`/claude-task`(codex 명령 대체)
+- 삭제한 것: 상위 `scripts/codex-*.sh`·`link-check.sh`·`.codex/config.toml.example`, 앱 `codex-review-commit.sh`·`codex-review-queue.sh`·그 시험.
+- Codex 대기열·ChatGPT 프롬프트는 종료 표시(이력 보존)를 붙였다. 22번은 Claude 반박 검토(확정 0)로 대신했다.
+- 다음 작업부터 검증 기록은 "Claude 독립 검토"로 적는다.
+
+## 2026-11-07 — 전체 코드 Claude 독립 검토 3차(FULLREV3, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘" → 선택 "전체 코드 검토 3차". 대상 bc0e864. Claude 독립 검토(D42)이며, 검토자 7 + 검증자 11 이 참여했다.
+- 결과: `docs/handoffs/FULLREV3_CLAUDE_REVIEW.md` — 확정 8(**P1 1**·P2 7), P0 없음, 기각 1.
+  - P1 H1: 문서대로 운영 배포하면 OIDC 로그인과 계정 연결 콜백이 항상 redirect 불일치다(Next `request.url` 호스트가 서버 설정 — 실제 실험으로 재현). 운영 배포(D37) 전에 꼭 고쳐야 한다.
+- 코드는 아직 고치지 않았다. 다음: 권고 수정 묶음 FIX1-FULLREV3(사용자 확인 뒤).
+
+## 2026-11-07 — FIX1-FULLREV3(FULLREV3 H1–H8 수정, 클라우드 세션)
+- 사용자 지시 "권고대로 진행해줘". 코드 커밋 `e1fdc02`(BASE `26b44c1`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` FIX round 1.
+- 처리:
+  - H1(P1): 운영 callback redirect 비교를 `APP_BASE_URL` origin + 요청 경로로 바꿨다. `OAUTH_REDIRECT_URI` origin 불일치는 연결 시작에서 미리 503 으로 막는다.
+  - H2–H6: 위험 표시 전송 중 철회, 복원 부분 게시 안내, 1인칭 축약형, 충돌 textarea 앞 줄바꿈, 전사 중복 요청.
+  - H7·H8: 절차 문서와 명령.
+- Claude 독립 검토(D42): 구현 뒤 반박 검토 3명 → 확정 P2 6건 보완. 보완분 재검토 1명 → P2 1건(문서) 수정. P0·P1 확정 0.
+- gate 에서 처음 돌린 deploy 셸 시험이 시험 자체의 정렬 의존(같은 초 사본)으로 간헐 실패했다. 시험을 고쳤다(단언 그대로, 비root 10회 연속 통과).
+- 최종 트리 전체 검사(단계별 exit 0): unit 88/2248 · integration 78/1322 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- not_run: 실제 Caddy + `next start` 배포(H1 은 첫 배포 때 OIDC 로그인 한 번으로 확인), 실제 IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저.
+- 남은 위험: 인계 문서 '남은 위험' 1–7(migrate.ts 의 DATABASE_URL 출력 포함). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — FIX2-FULLREV3(e1fdc02 재검증, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘" → 절차 9단계(새 커밋 재검증). e1fdc02 를 영역 3개(인증·OAuth / 승인·복원 / 작성·전사·도구)로 나눠 Claude 독립 검토. P0·P1 0, 확정 P2 3건(K1–K3).
+- 코드 커밋 `f7d4c3e`(BASE `26601dc`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` FIX round 2.
+  - K1: 계정 연결 redirect 정확 일치 사전 거부(`oauth_redirect_uri_mismatch`).
+  - K2: 복원 확인 표시 보류 항목 안내(게시물이 없을 때만 새 계획 — FIX5-FULLREV T2 문구). 지금은 도달 불가 상태라 방어용.
+  - K3: 원음 삭제 감사 trigger.
+- 보완분 재검토 P2 2건(K2 문구가 사용자 결정과 어긋남, 인계 옛 오류 코드)을 반영했다.
+- 최종 트리 전체 검사(단계별 exit 0): unit 88/2250 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- not_run: 실제 Caddy 배포·IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저. M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — f7d4c3e 재검증(클라우드 세션)
+- Claude 독립 검토(검토자 1명): FIX2-FULLREV3 `f7d4c3e` 확정 지적 0. FULLREV3 확정 지적(H1–H8)과 그 재검증 지적(K1–K3)은 모두 반영했다.
+- 남은 것: 인계 '남은 위험'(실제 Caddy 배포 미확인, migrate.ts 의 DATABASE_URL 출력 등). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — DB CLI 출력의 DATABASE_URL 제거(클라우드 세션)
+- 사용자 지시 "1번 진행해줘". 코드 커밋 `9f908f7`(BASE `68e4854`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속'.
+- `migrate`·`seed` 의 성공 출력은 `databaseLabel`(scheme://host 만, 비밀이 섞였을 수 있으면 `(숨김)`), 오류는 종류·코드만 쓴다(`dbCliErrorLine`).
+- Claude 독립 검토 3회: P2 6건 중 5건 반영, 1건은 남은 위험. 마지막 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2258 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: export·restore 스크립트의 `throw e`(Postgres 붙일 때 정리), 표시 host 부정확(비밀 아님). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — DB CLI 오류 출력 후속(클라우드 세션)
+- 사용자 지시 "진행해줘". 코드 커밋 `3bc5729`(BASE `c253559`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속 2'.
+- export·restore·restore-drill·worker CLI 의 DB 열기·예상 밖·닫기 오류를 종류·코드만 출력한다(restore AppError 그대로).
+- Claude 독립 검토 1회: P2 1건(worker 닫기) 반영.
+- 전체 검사(단계별 exit 0): unit 89/2259 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: worker tick 안 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — worker CLI 오류 출력(클라우드 세션)
+- 사용자 지시 "계속 진행해줘". 코드 커밋 `e0d0817`(BASE `4ad5123`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속 3'.
+- `pnpm worker` 의 tick·시작·준비 오류를 메시지·스택 없이 한 줄로 낸다(DrizzleQueryError 메시지의 쿼리 파라미터 값 노출 방지). DB 닫기는 그대로다.
+- Claude 독립 검토 2회: P2 2건 반영, 마지막 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2260 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: 진단 정보 감소, web(Next) route 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — 전체 코드 Claude 독립 검토 4차(FULLREV4, 클라우드 세션)
+- 사용자 선택 "전체 코드 검토 4차". 대상: `bc0e864` 이후 바뀐 코드(HEAD `59f6c26`). 검토자 4 + 검증자 1.
+- 결과: `docs/handoffs/FULLREV4_CLAUDE_REVIEW.md`. P0·P1 없음. 범위 diff 안에서는 확정 0.
+  - 기존 코드에서 확정 P2 1건(J1): 승인 무효화 때 lease 된 작업이 남고, lease 복구와 재승인 뒤 사용자 실행은 409 인데 옛 작업이 새 승인으로 게시된다. 두 번 게시는 없다.
+- 코드는 고치지 않았다. 다음: 권고 FIX1-FULLREV4(J1), 사용자 확인 뒤.
+
+## 2026-11-07 — FIX1-FULLREV4(J1, 클라우드 세션)
+- 사용자 지시 "권고대로 진행해줘". 코드 커밋 `0020226`(BASE `af3894e`). 인계: `docs/handoffs/FULLREV4_IMPLEMENTATION_HANDOFF.md`.
+- `beginSend` 가 작업이 만들어진 승인(작업 키)과 지금 활성 승인이 같은지 확인한다. 다르면 approval_missing(부분 게시면 UNKNOWN). 무효화 뒤 lease 복구된 옛 작업이 재승인된 새 승인으로 사용자 실행 없이 게시되지 않는다.
+- Claude 독립 검토 2명(코드 추적·방어 장치): 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2260 · integration 79/1332 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: 409 한 주기, lease 만료 5회 되풀이 시 FAILED(게시 없음). M4/D20 보류 조건은 그대로다.

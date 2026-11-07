@@ -1,0 +1,259 @@
+/** T13(D24): OAuth 공통 — PKCE S256, state, scope, 연결 상태 판정, live 준비 상태(항상 준비 안 됨). */
+import { describe, expect, it } from 'vitest';
+import { ConfigError, loadConfig } from './config';
+import {
+  callbackRedirectTarget,
+  codeChallengeS256,
+  credentialHealth,
+  hashOAuthState,
+  INSTAGRAM_NOT_REQUESTED_BY_DEFAULT,
+  INSTAGRAM_REQUIRED_SCOPES,
+  isPlainRedirectUri,
+  isUnboundLiveExternalId,
+  isWellFormedOAuthState,
+  LIVE_THREADS_PUBLISH_MARKER,
+  isValidThreadsAppId,
+  isValidThreadsAppSecret,
+  assertOAuthRedirectUri,
+  expectedOAuthRedirectUri,
+  OAUTH_REDIRECT_URI_MISMATCH,
+  liveOAuthReadiness,
+  oauthRedirectUriMismatch,
+  threadsAppSecretState,
+  livePublishReadiness,
+  UNBOUND_LIVE_EXTERNAL_PREFIX,
+  newCodeVerifier,
+  newOAuthState,
+  OAUTH_EXPIRING_SOON_MS,
+  oauthRedirectUri,
+  requestRedirectTarget,
+  requiredScopesForPlatform,
+  THREADS_NOT_REQUESTED_BY_DEFAULT,
+  THREADS_REQUIRED_SCOPES,
+} from './oauth';
+
+const NOW = new Date('2026-10-02T12:00:00Z');
+const DAY = 24 * 3600_000;
+
+describe('PKCE·state', () => {
+  it('S256 = RFC 7636 부록 B 시험 벡터', () => {
+    expect(codeChallengeS256('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk')).toBe('E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
+  });
+  it('state·verifier: 32바이트 난수(base64url 43자), 매번 다름, 저장은 SHA-256 hex', () => {
+    const a = newOAuthState();
+    const b = newOAuthState();
+    expect(a).not.toBe(b);
+    expect(isWellFormedOAuthState(a)).toBe(true);
+    expect(isWellFormedOAuthState('short')).toBe(false);
+    expect(isWellFormedOAuthState(undefined)).toBe(false);
+    expect(hashOAuthState(a)).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashOAuthState(a)).not.toContain(a);
+    expect(newCodeVerifier()).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+  it('redirect URI: 기본 APP_BASE_URL + /api/oauth/callback, 설정값 우선, 요청 대상은 query 제외', () => {
+    expect(oauthRedirectUri(loadConfig({}))).toBe('http://localhost:3000/api/oauth/callback');
+    expect(oauthRedirectUri(loadConfig({ OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback' }))).toBe('https://studio.example.test/api/oauth/callback');
+    expect(requestRedirectTarget('http://localhost:3000/api/oauth/callback?code=x&state=y')).toBe('http://localhost:3000/api/oauth/callback');
+  });
+  it('FIX1-FULLREV3(H1): callback 비교 대상 = APP_BASE_URL origin + 요청 path(요청 origin·query 무시)', () => {
+    const prod = { APP_BASE_URL: 'https://studio.example.com' };
+    // 운영 형태: next start --hostname 127.0.0.1 뒤의 request.url 은 서버 자신의 origin
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/auth/oidc/callback?code=x&state=y')).toBe('https://studio.example.com/api/auth/oidc/callback');
+    expect(callbackRedirectTarget(prod, 'http://127.0.0.1:3000/api/oauth/callback?code=x')).toBe('https://studio.example.com/api/oauth/callback');
+    // APP_BASE_URL 의 경로·query·끝 / 는 쓰지 않는다(origin 만)
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'https://studio.example.com/app/?x=1' }, 'https://localhost:3000/api/oauth/callback')).toBe('https://studio.example.com/api/oauth/callback');
+    // 경로는 요청 그대로 — 다른 경로·끝 / 는 등록값과 달라진다
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/oauth/callback/')).toBe('https://studio.example.com/api/oauth/callback/');
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/oauth/other')).toBe('https://studio.example.com/api/oauth/other');
+    // dev 형태: 요청 origin = APP_BASE_URL 이면 이전(requestRedirectTarget)과 같다
+    const dev = 'http://localhost:3000/api/oauth/callback?code=x&state=y';
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'http://localhost:3000' }, dev)).toBe(requestRedirectTarget(dev));
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'http://127.0.0.1:3000' }, 'http://127.0.0.1:3000/api/auth/oidc/callback')).toBe('http://127.0.0.1:3000/api/auth/oidc/callback');
+  });
+});
+
+describe('scope', () => {
+  it('Threads 는 기본 + 게시만 요청, 답글·통계는 기본 요청 목록에 없다', () => {
+    expect([...requiredScopesForPlatform('threads')]).toEqual(['threads_basic', 'threads_content_publish']);
+    for (const s of THREADS_NOT_REQUESTED_BY_DEFAULT) expect(THREADS_REQUIRED_SCOPES as readonly string[]).not.toContain(s);
+    // T16: Instagram 은 모의 자리 표시 scope(기본 + 게시)가 생겼다 — 연결 공급자가 없는 채널은 블로그(같은 단언)
+    expect(requiredScopesForPlatform('blog')).toEqual([]);
+  });
+  it('T16 Instagram: 자리 표시 scope(기본 + 콘텐츠 게시)만, 댓글·메시지·통계는 기본 요청 목록에 없다 — 이름은 모두 (mock) 표시', () => {
+    expect([...requiredScopesForPlatform('instagram')]).toEqual(['instagram_basic(mock)', 'instagram_content_publish(mock)']);
+    for (const s of INSTAGRAM_NOT_REQUESTED_BY_DEFAULT) expect(INSTAGRAM_REQUIRED_SCOPES as readonly string[]).not.toContain(s);
+    for (const s of [...INSTAGRAM_REQUIRED_SCOPES, ...INSTAGRAM_NOT_REQUESTED_BY_DEFAULT]) expect(s.endsWith('(mock)')).toBe(true);
+  });
+});
+
+describe('credentialHealth', () => {
+  const base = { status: 'active', expiresAt: new Date(NOW.getTime() + 30 * DAY), scopes: [...THREADS_REQUIRED_SCOPES], revokedAt: null, lastErrorCode: null };
+  const h = (account: { kind: string; credentialState: string }, credential: typeof base | null, pendingKind: string | null = null) =>
+    credentialHealth({ account, credential, requiredScopes: THREADS_REQUIRED_SCOPES, now: NOW, pendingKind });
+  const mockNone = { kind: 'mock', credentialState: 'none' };
+  const mockLinked = { kind: 'mock', credentialState: 'linked' };
+
+  it('연결한 적 없는 모의 계정 = not_connected, 실행 가능(M3 동작), 연결 정보 불필요', () => {
+    expect(h(mockNone, null)).toMatchObject({ status: 'not_connected', usable: true, required: false });
+  });
+  it('live 계정·복원 계정·연결했던 계정에 연결 정보가 없으면 needs_reconnect(실행 불가)', () => {
+    expect(h({ kind: 'live', credentialState: 'none' }, null)).toMatchObject({ status: 'needs_reconnect', usable: false, required: true });
+    expect(h({ kind: 'mock', credentialState: 'needs_reconnect' }, null)).toMatchObject({ status: 'needs_reconnect', usable: false, reason: 'restored_without_credential' });
+    expect(h(mockLinked, null)).toMatchObject({ status: 'needs_reconnect', usable: false });
+  });
+  it('연결됨 / 곧 만료(7일 안) / 만료 / 철회 / 오류 / scope 부족', () => {
+    expect(h(mockLinked, base)).toMatchObject({ status: 'connected', usable: true, required: true });
+    expect(h(mockLinked, { ...base, expiresAt: new Date(NOW.getTime() + OAUTH_EXPIRING_SOON_MS) })).toMatchObject({ status: 'expiring_soon', usable: true });
+    expect(h(mockLinked, { ...base, expiresAt: NOW })).toMatchObject({ status: 'expired', usable: false });
+    expect(h(mockLinked, { ...base, expiresAt: new Date(NOW.getTime() - 1) })).toMatchObject({ status: 'expired', usable: false });
+    expect(h(mockLinked, { ...base, status: 'revoked', revokedAt: NOW } as unknown as typeof base)).toMatchObject({ status: 'revoked', usable: false });
+    expect(h(mockLinked, { ...base, status: 'error', lastErrorCode: 'token_revoked' } as unknown as typeof base)).toMatchObject({ status: 'error', reason: 'token_revoked', usable: false });
+    expect(h(mockLinked, { ...base, scopes: ['threads_basic'] })).toMatchObject({ status: 'needs_reconnect', reason: 'scope_missing', missingScopes: ['threads_content_publish'], usable: false });
+  });
+  it('FIX3·FIX4: 정리 대기가 있으면 active·유효 기간이어도 error(pending_<kind>)·실행 불가, 해제된 행·연결 정보 없는 모의 계정도 마찬가지', () => {
+    expect(h(mockLinked, base, 'refresh_unknown')).toMatchObject({ status: 'error', reason: 'pending_refresh_unknown', usable: false });
+    expect(h(mockLinked, base, 'cleanup_revoke')).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
+    expect(h(mockLinked, base, 'verify_current')).toMatchObject({ status: 'error', reason: 'pending_verify_current', usable: false });
+    expect(h(mockNone, { ...base, status: 'revoked', revokedAt: NOW } as unknown as typeof base, 'cleanup_revoke')).toMatchObject({ status: 'error', usable: false });
+    // FIX4: 첫 연결 정리 대기 — 연결 정보 행이 없고 연결한 적 없는 모의 계정(평소엔 실행 가능)도 차단
+    expect(h(mockNone, null, 'cleanup_revoke')).toMatchObject({ status: 'error', reason: 'pending_cleanup_revoke', usable: false });
+    expect(h(mockNone, null, null)).toMatchObject({ status: 'not_connected', usable: true });
+    expect(h(mockLinked, base, null)).toMatchObject({ status: 'connected', usable: true });
+  });
+});
+
+// LIVE-T1(D31): T13 의 "항상 준비 안 됨(LIVE_OAUTH_ADAPTER(T14 미구현))" → 실제 Threads 연결은 조건이 모두 갖춰지면 준비됨.
+// PUBLISH_MODE 는 연결 준비에서 빠지고(D31 은 disabled 로 연결만 승인), 게시 준비(livePublishReadiness)는 항상 준비 안 됨.
+describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 나눠 본다', () => {
+  const FULL = {
+    OAUTH_MODE: 'live',
+    // FIX1-LIVET1(Codex review-LIVET1 P2): 숫자 아닌 앱 ID 는 이제 준비 안 됨(THREADS_APP_ID(형식)) — 공급자 생성자와 같은 검증
+    THREADS_APP_ID: '000000000000001',
+    // FIX1-FULLREV3(H1 후속): redirect 는 APP_BASE_URL 과 같은 origin 이어야 준비된다 — 공개 주소를 함께 둔다
+    APP_BASE_URL: 'https://studio.example.test',
+    OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
+    OAUTH_LIVE_APPROVAL_REF: 'D31',
+  } as const;
+  it('기본 설정: 빠진 조건 이름만(값 없음), 게시 관련 이름은 연결 준비에 없다', () => {
+    const r = liveOAuthReadiness(loadConfig({}), { threadsAppSecret: 'missing', masterKeyConfigured: false });
+    expect(r.ready).toBe(false);
+    expect(r.missing).toEqual(['OAUTH_MODE=live', 'THREADS_APP_ID', 'THREADS_APP_SECRET', 'OAUTH_REDIRECT_URI', 'SECRETS_MASTER_KEY', 'OAUTH_LIVE_APPROVAL_REF']);
+    expect(r.missing.join(',')).not.toContain('LIVE_OAUTH_ADAPTER');
+  });
+  it('모든 조건(PUBLISH_MODE=disabled 그대로) → ready=true, 빠진 이름 없음, 값은 결과에 없다', () => {
+    const config = loadConfig({ ...FULL });
+    expect(config.PUBLISH_MODE).toBe('disabled');
+    const r = liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true });
+    expect(r).toEqual({ ready: true, missing: [] });
+    expect(JSON.stringify(r)).not.toContain('000000000000001');
+  });
+  it.each([
+    ['OAUTH_MODE', { OAUTH_MODE: 'mock' }, {}, 'OAUTH_MODE=live'],
+    ['THREADS_APP_ID', { THREADS_APP_ID: undefined }, {}, 'THREADS_APP_ID'],
+    ['THREADS_APP_SECRET', {}, { threadsAppSecret: 'missing' }, 'THREADS_APP_SECRET'],
+    ['THREADS_APP_ID(형식)', { THREADS_APP_ID: 'placeholder-app-id' }, {}, 'THREADS_APP_ID(형식)'],
+    ['THREADS_APP_SECRET(형식)', {}, { threadsAppSecret: 'invalid' }, 'THREADS_APP_SECRET(형식)'],
+    ['OAUTH_REDIRECT_URI', { OAUTH_REDIRECT_URI: undefined }, {}, 'OAUTH_REDIRECT_URI'],
+    ['SECRETS_MASTER_KEY', {}, { masterKeyConfigured: false }, 'SECRETS_MASTER_KEY'],
+    ['OAUTH_LIVE_APPROVAL_REF', { OAUTH_LIVE_APPROVAL_REF: undefined }, {}, 'OAUTH_LIVE_APPROVAL_REF'],
+  ] as const)('%s 하나만 빠짐 → ready=false, 그 이름 하나만', (_n, cfg, sec, name) => {
+    const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecret: 'ok', masterKeyConfigured: true, ...sec });
+    expect(r).toEqual({ ready: false, missing: [name] });
+  });
+  // FIX2-FULLREV3(K1): 예전 이름 'OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)'·코드 oauth_redirect_origin_mismatch → 전체 URI 정확 일치의
+  // 'OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)'·oauth_redirect_uri_mismatch. 다른 origin 사례는 그대로 같은 엄격도로 남긴다.
+  it('FIX1-FULLREV3(H1 후속)·FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin → OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름) 하나만 · 연결 시작 거부', () => {
+    expect(OAUTH_REDIRECT_URI_MISMATCH).toBe('OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)');
+    for (const base of ['http://localhost:3000', 'https://www.studio.example.test', 'https://studio.example.test:8443', 'http://studio.example.test']) {
+      const config = loadConfig({ ...FULL, APP_BASE_URL: base });
+      expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI)).toEqual({
+        ready: false,
+        missing: ['OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)'],
+      });
+      expect(oauthRedirectUriMismatch(config)).toBe(true);
+      expect(() => assertOAuthRedirectUri(config)).toThrow(expect.objectContaining({ code: 'oauth_redirect_uri_mismatch', kind: 'service_unavailable' }));
+    }
+    // 같은 URI(APP_BASE_URL 의 경로는 무시 — origin + /api/oauth/callback)·설정 없음(기본값 = 기대값)은 통과
+    const same = loadConfig({ ...FULL, APP_BASE_URL: 'https://studio.example.test/app' });
+    expect(expectedOAuthRedirectUri(same)).toBe('https://studio.example.test/api/oauth/callback');
+    expect(oauthRedirectUriMismatch(same)).toBe(false);
+    expect(() => assertOAuthRedirectUri(same)).not.toThrow();
+    expect(liveOAuthReadiness(same, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI)).toEqual({ ready: true, missing: [] });
+    expect(oauthRedirectUriMismatch(loadConfig({}))).toBe(false);
+    expect(() => assertOAuthRedirectUri(loadConfig({ APP_BASE_URL: 'https://studio.example.test' }))).not.toThrow();
+  });
+  it('FIX2-FULLREV3(K1): origin 은 같아도 경로가 다르거나 끝 `/` 가 붙으면 불일치 — 준비 안 됨 하나만 · 연결 시작 거부(503 oauth_redirect_uri_mismatch)', () => {
+    for (const redirect of [
+      'https://studio.example.test/oauth/callback',
+      'https://studio.example.test/api/oauth/callback/',
+      'https://studio.example.test/api/oauth/callback2',
+      'https://studio.example.test/API/oauth/callback',
+      'https://studio.example.test/app/api/oauth/callback',
+    ]) {
+      const config = loadConfig({ ...FULL, OAUTH_REDIRECT_URI: redirect });
+      expect(oauthRedirectUriMismatch(config), redirect).toBe(true);
+      // 실제 배선과 같이 등록 redirect = 설정값(oauthRedirectUri)으로 준다 — 그래도 기대값과 달라 준비 안 됨
+      expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, redirect), redirect).toEqual({
+        ready: false,
+        missing: [OAUTH_REDIRECT_URI_MISMATCH],
+      });
+      let err: unknown;
+      try {
+        assertOAuthRedirectUri(config);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, redirect).toEqual(expect.objectContaining({ code: 'oauth_redirect_uri_mismatch', kind: 'service_unavailable' }));
+      expect((err as { extra?: unknown }).extra, redirect).toEqual({ missing: [OAUTH_REDIRECT_URI_MISMATCH] });
+      // 오류 문구에 설정값(URI)을 싣지 않는다 — 이름만
+      expect((err as Error).message, redirect).not.toContain(redirect);
+    }
+  });
+  it('FIX1-LIVET1: 등록 redirect URI 를 주면 설정값과 정확히 같아야 한다(불일치 → OAUTH_REDIRECT_URI(불일치)), 형식 검증 함수', () => {
+    const config = loadConfig({ ...FULL });
+    expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI).ready).toBe(true);
+    expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, 'https://studio.example.test/api/oauth/callback/')).toEqual({ ready: false, missing: ['OAUTH_REDIRECT_URI(불일치)'] });
+    expect([isValidThreadsAppId('123'), isValidThreadsAppId('12a'), isValidThreadsAppId(''), isValidThreadsAppId('1'.repeat(31))]).toEqual([true, false, false, false]);
+    expect([isValidThreadsAppSecret(' abc '), isValidThreadsAppSecret('a b'), isValidThreadsAppSecret('  '), isValidThreadsAppSecret(undefined)]).toEqual([true, false, false, false]);
+    expect([threadsAppSecretState({}), threadsAppSecretState({ THREADS_APP_SECRET: ' ' }), threadsAppSecretState({ THREADS_APP_SECRET: 'a b' }), threadsAppSecretState({ THREADS_APP_SECRET: 'ab' })]).toEqual(['missing', 'missing', 'invalid', 'ok']);
+  });
+  // LIVE-P1(D38 1단계 — 의도한 동작 변경): "항상 준비 안 됨(D31 범위 밖)" 대신 실제 게시 환경 조건 세 가지(이름만)를 본다. 기본값은 준비 안 됨(fail closed).
+  it('게시 준비: PUBLISH_MODE=enabled·PUBLISH_LIVE_APPROVAL_REF·PUBLISH_LIVE_MAX_POSTS 가 모두 있어야 준비됨(하나씩 빠지면 그 이름)', () => {
+    expect(livePublishReadiness(loadConfig({}))).toEqual({ ready: false, missing: ['PUBLISH_MODE=enabled', 'PUBLISH_LIVE_APPROVAL_REF', 'PUBLISH_LIVE_MAX_POSTS'] });
+    expect(livePublishReadiness(loadConfig({ PUBLISH_MODE: 'enabled' }))).toEqual({ ready: false, missing: ['PUBLISH_LIVE_APPROVAL_REF', 'PUBLISH_LIVE_MAX_POSTS'] });
+    const full = { PUBLISH_MODE: 'enabled', PUBLISH_LIVE_APPROVAL_REF: 'D38-2', PUBLISH_LIVE_MAX_POSTS: '1' };
+    expect(livePublishReadiness(loadConfig(full))).toEqual({ ready: true, missing: [] });
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_MODE: 'disabled' })).missing).toEqual(['PUBLISH_MODE=enabled']);
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_LIVE_APPROVAL_REF: '' })).missing).toEqual(['PUBLISH_LIVE_APPROVAL_REF']);
+    expect(livePublishReadiness(loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: '' })).missing).toEqual(['PUBLISH_LIVE_MAX_POSTS']);
+    // 형식: 1 ~ 1000 정수만(0·음수·소수·1001 은 설정 오류)
+    for (const bad of ['0', '-1', '1.5', '1001', 'abc']) expect(() => loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: bad })).toThrow(/PUBLISH_LIVE_MAX_POSTS/);
+    expect(loadConfig({ ...full, PUBLISH_LIVE_MAX_POSTS: '1000' }).PUBLISH_LIVE_MAX_POSTS).toBe(1000);
+    // 표식 상수는 실제 게시 계정이 아닐 때의 연결 상태 안내에만 남는다
+    expect(LIVE_THREADS_PUBLISH_MARKER).toBe('LIVE_THREADS_PUBLISH(D31 범위 밖)');
+  });
+  it('연결 전 실제 계정 ID 접두(pending:)는 mock: 과 겹치지 않는다', () => {
+    expect(isUnboundLiveExternalId(`${UNBOUND_LIVE_EXTERNAL_PREFIX}x`)).toBe(true);
+    expect(isUnboundLiveExternalId('1234567')).toBe(false);
+    expect(UNBOUND_LIVE_EXTERNAL_PREFIX.startsWith('mock:')).toBe(false);
+  });
+});
+
+describe('FIX-T13 P2 — redirect URI 는 query·fragment 없이', () => {
+  it('query·fragment·사용자 정보·http(s) 아님 → 설정 오류(ConfigError), 경로만 있는 주소는 통과', () => {
+    for (const bad of [
+      'http://localhost:3000/api/oauth/callback?tenant=x',
+      'http://localhost:3000/api/oauth/callback#frag',
+      'http://localhost:3000/api/oauth/callback?',
+      'http://user:pw@localhost:3000/api/oauth/callback',
+      'ftp://localhost/api/oauth/callback',
+    ]) {
+      expect(() => loadConfig({ OAUTH_REDIRECT_URI: bad }), bad).toThrow(ConfigError);
+      expect(isPlainRedirectUri(bad), bad).toBe(false);
+    }
+    expect(loadConfig({ OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback' }).OAUTH_REDIRECT_URI).toBe('https://studio.example.test/api/oauth/callback');
+    expect(isPlainRedirectUri('https://studio.example.test/api/oauth/callback')).toBe(true);
+    // 기본값은 APP_BASE_URL 의 origin 만 쓴다(경로·query 가 있어도)
+    expect(oauthRedirectUri(loadConfig({ APP_BASE_URL: 'http://localhost:3000/app?x=1' }))).toBe('http://localhost:3000/api/oauth/callback');
+  });
+});

@@ -1,0 +1,141 @@
+# Implementation handoff — T19 허용 소스 수집·재추천 (M5, 모의 수집기만)
+
+- Task: T19 (tasks.json, M5) — "허용 RSS/URL 수집·dedupe·주기 설정 OFF 기본·수동 실행·archive 재추천" (docs/05), docs/01 §2-A(장기 미사용 소재 재추천)·§2-C(승인한 RSS/공식 블로그/선택 URL 만, 주기·ON/OFF 설정), docs/02(collector·SSRF: HTTP(S) 한정, private/loopback/link-local/metadata IP·redirect 재검사, DNS rebinding·큰 파일), 위험 시나리오 A04(원문 속 "즉시 발행하라" → 자료로만, 게시 0)·A05(localhost/metadata IP/redirect → 차단, 기존 메모 저장).
+- BASE_SHA: 1808c65 · HEAD_SHA: 4a2e02f (code only, D28; orchestrator reran lint·typecheck·build·unit 1246·integration 731·drill:mock 0·db:migrate 0041·real-DB drill:restore PASS) (커밋 안 한 작업 트리 — 오케스트레이터가 커밋)
+- Implementer: Claude Code. Verifier: Codex (아직 실행 안 함).
+- 범위: **모의 수집기만.** 네트워크 호출 0(RSS/URL 실제 요청 없음, DNS 조회 없음 — 모의 DNS 표), live fetcher 없음, 자격 증명 0, 새 의존성 0(XML 파서 직접 구현), migration 0041. `./data` 열지 않음, dev 서버 꺼짐.
+- 결정: 아래 "Proposed D33" — DECISIONS.md 에는 넣지 않았다(사용자 확인 전).
+
+## 변경 파일
+- 새 파일: `packages/domain/src/collector.ts`(+ `collector.test.ts`), `packages/domain/src/recommend.ts`(+ `recommend.test.ts`), `packages/providers/src/collector-mock.ts`(+ `collector-mock.test.ts`), `packages/db/src/collector.ts`, `packages/db/drizzle/0041_t19_collector.sql`(+ `meta/0041_snapshot.json`), `apps/web/lib/collector.ts`, `apps/web/app/api/collector/sources/route.ts`, `apps/web/app/api/collector/sources/[id]/settings/route.ts`, `apps/web/app/api/collector/sources/[id]/run/route.ts`, `apps/web/app/api/collector/runs/[id]/route.ts`, `apps/web/app/api/collector/runs/[id]/accept/route.ts`, `apps/web/app/api/collector/runs/[id]/discard/route.ts`, `apps/web/app/api/recommendations/route.ts`, `apps/web/app/api/recommendations/[captureId]/dismiss/route.ts`, `apps/web/app/collect/page.tsx`, `apps/web/app/collect/runs/[id]/page.tsx`, `tests/integration/collector.test.ts`.
+- 수정: `packages/db/src/schema.ts`(표 4개), `packages/db/drizzle/meta/_journal.json`, `packages/db/src/{index,queries,bundle-tables,restore,restore-expect}.ts`, `packages/domain/src/{index,config,bundle,ops,url}.ts`(url.ts 는 `isBlockedHostname` export 만), `packages/domain/src/{bundle,writing}.test.ts`(BundleTables 리터럴에 빈 표 4개), `packages/providers/src/index.ts`, `apps/worker/src/{index,cli}.ts`(주기 수집 훅), `apps/web/lib/stt.ts`(inline tick 에 모의 어댑터 전달), `apps/web/app/layout.tsx`(메뉴 `수집`), `apps/web/app/captures/page.tsx`(다시 볼 만한 소재), `apps/web/app/captures/[id]/page.tsx`(수집(모의) 출처 표시), `apps/web/app/globals.css`(`.actions`), `.env.example`, `README_KO.md`(새 절 "허용 소스 수집·재추천").
+- 건드리지 않음: `docs/DECISIONS.md`, `docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md`, `M4_CODEX_VERDICTS.md`(작업 시작 때 이미 다른 쪽에서 수정된 상태 — 이 작업의 변경 아님), `M4_STATUS.md`, 다른 handoff, `./data`.
+
+## 설계 표 (영역 → 변경 → 시험)
+| 영역 | 변경 | 시험 |
+|---|---|---|
+| 모드(fail closed) | `COLLECTOR_MODE=disabled`(기본)\|`mock`(새)\|`enabled`. `collectorReadiness`: disabled → 실행 503 `collector_disabled`, enabled(실제) → 503 `collector_live_not_ready` + 빠진 조건(실제 수집기 미구현·D33 승인 범위) — **요청 0**, mock 만 실행. `live` 같은 다른 값은 zod 에서 설정 오류. T03 추출(`/api/captures/{id}/extract`)은 그대로(enabled 501, 그 밖 403). `COLLECTOR_SCHEDULER=off`(기본)\|`on` | 단위: 기본값·mock 허용·live/auto 거부·준비 상태. 통합: disabled 503·enabled 503(missing)·실행 기록 0 |
+| URL 정책(A05) | 순수 함수 `checkCollectorUrl(url, allowlist?)`: https 만, 사용자 정보·443 외 포트 거부, **IP 리터럴 전부 거부**(10진·8진·16진·축약 IPv4, IPv6, ::ffff: 매핑 — 공개 IP 포함), localhost·*.localhost·*.local·*.internal·점 없는 이름·.lan 등(T03 `isBlockedHostname` 재사용) + 와일드카드 DNS(nip.io·sslip.io·xip.io·localtest.me·lvh.me·traefik.me) 거부, 허용 목록 = owner 가 등록한 소스의 호스트와 **정확히 일치**(하위 도메인 자동 허용 없음). `checkResolvedAddresses(ips)`: 하나라도 사설·loopback·link-local·메타데이터·예약(T03 `isBlockedIPv4/6`)이거나 해석 불가·빈 목록이면 거부(DNS rebinding 훅 — 실제 수집기는 검사한 IP 로만 연결해야 함). `checkRedirect(from, location, allowlist, hop)`: 상대 Location 해석 후 같은 정책·허용 목록, 3번 초과 거부. `COLLECTOR_FETCH_LIMITS`(1MiB·10s·redirect 3·content-type 목록)는 앞으로의 실제 수집기 계약으로만 문서화 | 단위 8: scheme 6종·자격·포트·IP 17종·호스트 10종·허용 목록 정확 일치·해석 IP 9종·redirect 8종. 통합: 등록 거부 7종(400 `collector_url_blocked`+reason, 저장 0), 중복 409 |
+| 모의 어댑터 | `CollectorAdapter`(domain 인터페이스: fetchFeed·fetchPage, mode 'mock') + `MockCollectorAdapter`(providers): `*.mock.example`(RFC 2606 예약) 고정 자료 — RSS(같은 guid 반복·A04 지시문·메타데이터 링크·키 없는 항목), Atom(상대 링크·text/html), HTML 페이지(script 포함), 깨진 XML, billion laughs DTD, 1.2MB 피드(지연 생성), redirect → `http://169.254.169.254/…`·`https://localhost/…`·허용 목록 밖·같은 호스트, 사설 IP 로 풀리는 이름(모의 DNS). hop 마다 정책 → 모의 DNS 검사 → 조회 → redirect 재검사 → 크기 상한. 막힌 hop 의 대상은 "요청" 목록에도 들어가지 않음. 시험용 `setFixtureForTest`·`resetForTest`. `createCollectorAdapter(config)`: mock 일 때만(그 밖 null) | 단위 7(fetch spy 0): 정상·메타데이터/localhost redirect 차단(대상 미요청)·같은 호스트 따라감·목록 밖 차단·redirect 루프 3·rebind 차단(요청 0)·too_large·not_found·모드별 생성 |
+| XML 파서 | `parseXml`: 한 번 앞으로만 훑는 토크나이저(indexOf 는 현재 위치부터, 찾은 곳까지 소비), `<!`(DOCTYPE·ENTITY·ELEMENT…) → `feed_dtd_not_allowed`, 엔티티는 기본 5개 + 숫자 참조만(이름 11자 안에서만 `;` 탐색 — `&&&…` 제곱 방지), 그 밖 이름은 글자 그대로(확장 없음). 처리 명령·주석 건너뜀, CDATA 글자, 루트 하나, 깊이 32·요소 50,000·입력 1MiB, 속성 따옴표 필수·중복 속성·값 안 `<`·텍스트 `]]>` 거부, UTF-8(fatal) 아님 거부. `parseFeed`: RSS 2.0·RSS 1.0(rdf)·Atom(localName) → 항목(guid/id, link(상대 → 최종 URL 기준), title, pubDate/published/updated/dc:date 문자열, 본문 HTML 은 T18 `htmlToText`(선형) 로 텍스트, 원본 `<item>`/`<entry>` 조각). `parsePage`: HTML 페이지 하나(h1 > title 제목, 원본 HTML) | 단위 10: DTD·XXE·ELEMENT 거부, 엔티티 표, 잘못된 문서 12종, 깊이·크기, UTF-8, **steps ≤ 4n+16**(엔티티 20만·엔티티 흉내·요소 1만·CDATA·주석) + 2배 입력 단계 비 < 2.2, 적대 입력 2종 < 300ms, RSS·Atom·페이지 해석 |
+| 판정(dedupe) | 외부 키 = `guid:<guid>` 또는 `link:<정규화 링크>`(T03 normalizeUrl — 추적 파라미터 제거, 500자 넘으면 `h:<sha256>`). 내용 checksum = contentHash(제목+본문), 원본 sha256 = 조각 바이트. `decideCollected`(결정적, 순서대로): 100개 초과 skipped/limit → 키 없음 skipped/no_id → 같은 피드 안 반복 duplicate/in_feed → 링크가 내부 주소(isFetchableUrl 실패) skipped/blocked_link → 빈 본문 skipped/empty → 20,000자 초과 skipped/too_long → 이 소스에서 **받아들인** 같은 키·같은 checksum duplicate/same_item → (받아들인 적 없는 키) 링크가 owner 의 기존 소재 URL(sources.normalized_url) 또는 받아들인 수집 링크와 같음 duplicate/existing_capture → 받아들인 키·다른 checksum new/updated → new/new. 미리보기만 하고 버린 항목은 중복이 아니다(다시 새 항목) | 단위 3 + 통합: 첫 실행 new 3·dup 1·skip 2, 재실행 same_item, updated, existing_capture(Atom 상대 링크 + utm 붙은 URL 소재) |
+| 저장(0041) | `collector_sources`(owner, kind rss\|atom\|url, url·normalized_url(https CHECK), host, label, **enabled 기본 false**, **schedule off\|daily\|weekly 기본 off**, last_run_at, last_status preview\|failed\|blocked; unique(owner, normalized_url)). `collector_runs`(source 복합 FK, trigger manual\|scheduled, mode='mock' CHECK, status preview\|accepted\|discarded\|failed\|blocked, error_code ⇔ failed/blocked, accepted_at ⇔ accepted, counts, result). `collected_items`(run·source·capture 복합 FK, source_version FK, position unique per run, external_key·guid·link·link_normalized·title·**excerpt(200자)**·published_text/at·content_checksum·raw_sha256·byte_size, decision+reason CHECK 짝, outcome(new 만) accepted\|not_selected\|skipped_duplicate\|failed_changed, capture/source_version/accepted_at ⇔ accepted CHECK). `recommendation_dismissals`(owner, capture 복합 FK, unique(owner, capture)). **본문 전체·자격 증명 열 없음** | 통합: 원장 발췌 ≤ 200자, CHECK 는 정상 경로로 확인(위반 INSERT 시험은 없음 — 아래 위험) |
+| 수동 실행 | `POST /api/collector/sources/{id}/run` "지금 수집(모의)": 준비 확인 → 꺼진 소스 409 `collector_source_disabled` → 허용 목록(owner 소스 호스트) → 어댑터 → 해석 → 판정 → 한 트랜잭션에 실행·항목·소스 last_* + audit `collector.run`(건수만). 정책 차단·응답/형식 오류도 **200 + 실행(status blocked\|failed, error_code `blocked:<이유>`\|`feed_*`\|`too_large`\|`not_found`)**, 항목 0, 소스 그대로. **소재·출처·출처 버전·원본·이력 쓰기 0** | 통합: 미리보기 무쓰기(6개 표 건수 동일), A05 8종(메타데이터·localhost·목록 밖 redirect, rebind, 깨진 XML, DTD, 1MB 초과, 없는 주소) 상태·코드·항목 0·쓰기 0·차단 대상 미요청, 같은 호스트 redirect 미리보기 |
+| 받아들이기 | `POST /api/collector/runs/{id}/accept`(JSON `item_ids` \| 폼 `item`): 빈 선택 400 `collector_nothing_selected`, 새 항목 아님 400 `collector_invalid_selection`, 다른 실행·없는 ID 400 — 모두 상태 변경 전. **미리보기를 믿지 않음**: 모의 수집기로 다시 읽기(실패 409 `collector_refetch_failed`, 쓰기 0) → 트랜잭션: preview→accepted 선점(두 번째 409 `collector_run_not_open`) → `pg_advisory_xact_lock('cs.collector:<owner>')` → 중복 다시 판정 → 고른 항목: 다시 읽은 같은 키의 checksum·raw sha256 이 원장과 다르면 failed_changed, 그사이 중복이면 skipped_duplicate, 아니면 출처(`kind='collector'`, `external_provider='collector_mock'`, `external_id='<소스 ID>:<외부 키>'` — 있으면 재사용) + 출처 버전(raw_hash = 조각 sha256, `extraction_state='collected'`, excerpt) + **원본 조각 그대로**(`source_version_originals` — 피드 'txt' = `<item>` XML, 페이지 'html'; 0039 트리거가 sha256·owner 재확인) + 소재(input 'text', 원문 = 제목\n\n본문, command_key `collect-<항목 ID>`, risk none) + 이력 r1 + audit capture.create(origin collector_mock). 안 고른 새 항목 not_selected. **자동 수락 경로 없음** | 통합: 2개 선택(A04 포함) → 소재 2·출처 2·원본 2·이력 2, 조각 바이트 sha256 = raw_hash 이고 원래 피드의 부분 문자열, 다시 수락 409, updated 수락 → 같은 출처에 버전 2·새 소재·기존 소재 행 동일, 미리보기 뒤 원본 변경 → failed_changed·쓰기 0, 페이지 소스 원본 html·원문에 script 없음 |
+| A04 | 수집 경로는 배포·게시·승인 코드를 부르지 않는다. 지시문은 소재 원문에 그대로(자료) | 통합: `DisabledPublisher.publish` 호출 0, distribution_items·jobs 증가 0. 단위: 판정·원문 불변 |
+| 주기 | 소스의 schedule 은 저장만. `runDueCollectorSources`: `COLLECTOR_SCHEDULER!=='on'` → skipped scheduler_off, `COLLECTOR_MODE!=='mock'` 또는 어댑터 없음 → collector_not_mock. 켜진 소스 중 schedule≠off·기한 지남(daily 24h·weekly 7d·처음은 즉시)을 tick 당 최대 3개(라우트 무관 전 owner) → trigger scheduled **미리보기만**. worker tick 결과에 `collector` 필드, web inline tick·CLI 가 `createCollectorAdapter(config)`(mock 일 때만) 전달 | 통합: 기본 off 에서 daily 소스 → tick.collector = scheduler_off·실행 0, on+disabled/enabled → collector_not_mock, on+mock → 예약 실행 1(preview)·소재 0, 기한 전 재호출 0. 단위: 기한 계산 |
+| 재추천 | `recommendArchive`(순수·결정적, AI 없음): 받은 지 30일 넘은 소재(닫은 것 제외, 최근 300개까지) × 최근 14일 신호(수집 항목 new/duplicate 의 제목+발췌 100개, lifecycle≠archived 원고의 제목+현재 버전 본문 50개). 핵심어 = `[\p{L}\p{N}]+` 토큰, 소문자, 한글 조사 접미 제거(남는 길이 ≥2), 영문 3자↑, 불용어 제외, 앞 4,000자·200개까지. **서로 다른 핵심어 2개 이상** 공유 시 추천, 가장 많이 겹친 신호(동점: 최신 → ID) 로 이유 줄 `최근 수집한 글 "…" 와 겹치는 단어: a, b, …`(최대 4개). 정렬: 겹친 수 ↓ → 오래된 소재 → ID, 최대 5. `/captures` 첫 페이지 위 "다시 볼 만한 소재" + `추천에서 닫기`(`recommendation_dismissals`, 멱등, 소재 불변) | 단위 4: 핵심어·규칙·결정성(입력 순서 무관)·닫기·신호 없음. 통합: 60일 전 소재 추천(이유·공유 단어), 같은 결과 반복, 최근 소재 제외, B 에게 안 보임, 닫기 멱등·목록에서 빠짐·소재 행 동일·B 404 |
+| owner(A01) | 모든 조회·변경에 owner 조건 + 복합 FK. 허용 목록도 owner 별 | 통합: B 의 실행 조회·실행·설정·수락·버리기 404, B 목록 빈 배열, 같은 주소 B 별도 등록, A 가 받아들인 글이 B 에게는 new, B 소재 0 |
+| UI(한국어) | `/collect`: "기본 꺼짐 · 모의 수집기 · 실제 웹 요청 없음" 안내, 상태 카드(MOCK 배지·주기 실행 켜짐/꺼짐·빠진 조건), 소스 추가 폼(꺼진 상태로 저장), 소스 목록(켜기/끄기·주기 선택·`지금 수집(모의)` — 모의·켜짐일 때만 활성), 실행 기록 표(수동/주기·MOCK·상태·오류 문구·판정·결과). `/collect/runs/[id]`: MOCK 안내, 판정·이유 칩, 새 항목만 체크 상자(기본 해제), `고른 항목을 소재로 저장`·`이 미리보기 버리기`, 결과·소재 링크. 소재 상세 `수집(모의)` 배지·소스·수집 기록·원본 조각 받기(`/api/imports/originals/<버전>` 재사용). 메뉴 `수집` | typecheck·build(화면은 브라우저로 보지 않음 — 위험) |
+| 내보내기·복원 | 4표를 EXPORTED·RESTORED(감사 대상 `audit_events` 앞), `TABLE_INTRODUCED_IN` 0041(이전 묶음은 빈 표), 행 스키마, 묶음 관계 검사(실행→소스, 항목→실행·소스·소재·버전, 항목 소스 = 실행 소스, 소재·버전이 같은 출처, 닫기→소재), 복원 PARENTS(항목은 이번에 들어간 실행에만), **복원 override: collector_sources.enabled=false**(restore-expect 도 같은 규칙 — 훈련이 독립 계산), add_missing 비교에서 소스의 운영 열(enabled·last_run_at·last_status·updated_at) 제외, 보존 정리 보호 표(ops) | 단위: bundle-tables 열=스키마·표 분류(기존 시험). 통합: 복원 훈련 PASS — 4표 ids same·행 수 일치(켜진 소스 ≥1 이 있는 상태에서) |
+
+## Proposed D33 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+## D33 — T19 허용 소스 수집(모의)·재추천: 허용 소스 목록, 주기 기본값, 재추천 규칙, 실제 수집기 승인 범위
+- (a) **허용 소스 = 사용자가 /collect 에 직접 등록한 https 주소만**(RSS·Atom·선택 URL 페이지, owner 당 50개). 등록이 곧 허용 목록이며 실행 때 호스트 정확 일치만 통과(redirect 포함, 하위 도메인 자동 허용 없음). IP 주소 직접 입력·443 외 포트·내부 이름은 받지 않는다. 회사 메일·채팅·전체 Drive·검색 결과 자동 수집은 범위 밖(docs/01). **사용자 결정 1: 실제로 등록할 소스 목록(블로그·공식 피드 이름·URL)과 각 소스의 원문 사용권 확인 방식(rights_status 를 지금처럼 'unknown' 으로 둘지).**
+- (b) **주기 기본값**: 소스 enabled=false·schedule=off, 서버 `COLLECTOR_SCHEDULER=off`. 주기를 켜도 실행은 **미리보기만**(소재 자동 생성 없음 — 사용자가 고를 때만 저장). 기한: 매일 24h·매주 7d, tick 당 최대 3 소스. 복원한 소스는 꺼진 채. **사용자 결정 2: 실제 운영에서 주기 실행을 켤지, 켠다면 기본 주기(매일/매주)와 쌓인 미리보기 보존 기한(현재 무기한 — 아래 위험).**
+- (c) **중복·갱신 규칙**: 외부 키(guid → 정규화 링크) + 내용 checksum. 받아들인 같은 글은 중복, 같은 키의 바뀐 내용은 "고쳐진 글(updated)" 새 항목 — 받아들이면 같은 출처에 새 버전과 **새 소재**(기존 소재는 그대로). 미리보기만 하고 버린 글은 다음 실행에 다시 새 항목. 기존 소재의 URL 과 같은 링크는 중복. **사용자 결정 3: 고쳐진 글을 새 소재로 만드는 방식(현재)과 버린 글을 다시 보여 주는 방식이 맞는지(대안: "무시" 표시를 저장해 숨김).**
+- (d) **재추천 규칙**: 받은 지 30일 넘은 소재 × 최근 14일 수집 글·작성 중 원고, 서로 다른 핵심어 2개 이상 공유, 최대 5개, 이유 줄 표시, 닫기는 영구(소재당 하나). AI 호출 없음. **사용자 결정 4: 기간(30일/14일)·최소 공유 수(2)·표시 위치(/captures 위, 오늘 화면에도 넣을지)·닫기를 영구로 둘지(대안: 90일 뒤 다시).**
+- (e) **원장·원본 보존**: 실행·항목 원장에는 발췌 200자만(본문 전체 없음), 받아들인 항목의 원본 조각(피드 `<item>` XML·페이지 HTML)은 `source_version_originals` 에 바이트 그대로, 소재 원문은 파생 값(제목 + 본문 텍스트). 4표 모두 내보내기·복원 포함. **사용자 결정 5: 원장(수집 실행·항목·닫기)을 내보내기에 포함하는 데 동의하는지.**
+- (f) **실제 수집기(live fetcher) 승인 범위 — 이번에는 만들지 않음.** 만들 때의 조건(제안): 등록한 소스 호스트만, GET 만, 응답 1MB·10초·redirect 3번, content-type 목록, 요청 전·redirect 마다 `checkCollectorUrl`·`checkRedirect`, DNS 해석 뒤 `checkResolvedAddresses` 를 통과한 **그 IP 로만 연결**(rebinding 방지), 쿠키·인증 헤더 없음, User-Agent 고정, 소스당 최소 간격, 실패 백오프. `COLLECTOR_MODE=enabled` 는 이 승인(예: `COLLECTOR_LIVE_APPROVAL_REF`)과 구현이 모두 있어야 실행되게 한다. **사용자 결정 6: 실제 수집을 시작할지, 시작한다면 첫 시험 소스 1–2개와 요청 빈도 상한.**
+
+## 명령과 결과 (로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `drizzle-kit generate --name t19_collector`(packages/db): 0041 생성(머리말 주석 2줄만 덧붙임).
+- `corepack pnpm lint`: pass.
+- `corepack pnpm typecheck`: pass(tsc + next typegen + web tsc). 첫 실행에서 새 통합 시험의 GET 호출 인자 누락(TS2554 4건)을 고친 뒤 pass.
+- `corepack pnpm test`(unit): pass — 52 files, 1246 tests(새: `packages/domain/src/collector.test.ts` 23, `packages/domain/src/recommend.test.ts` 4, `packages/providers/src/collector-mock.test.ts` 7).
+- `corepack pnpm build`: pass(`/collect`, `/collect/runs/[id]`, `/api/collector/*` 6개, `/api/recommendations*` 2개 경로 포함).
+- `corepack pnpm test:integration`(혼자 실행): pass — "Test Files 36 passed (36)", "Tests 731 passed (731)", 646s, exit 0(새: `tests/integration/collector.test.ts` 21). 로그는 세션 scratchpad(저장소 밖).
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건"(M3·T14·T15·T16 모의 불변식). 수집은 drill:mock 에 넣지 않았다(통합 시험·복원 훈련 시험으로 확인).
+- 개발 중 단독 실행: `vitest run --project integration tests/integration/collector.test.ts` → 21 passed(첫 실행 1 실패: 페이지 제목 기대값을 title 태그로 잘못 적음 — htmlToText 는 h1 우선이라 시험 기대값을 h1 로 고침, 코드 변경 없음).
+
+## 남은 위험
+- **실제 네트워크 경로는 없다** — 정책 함수와 모의 어댑터의 hop 순서로만 확인했다. 실제 수집기를 만들 때 DNS 해석 IP 고정 연결(undici `connect`/`lookup` 훅 등), TLS SNI, 압축 응답 크기(압축 해제 후 1MB), 느린 응답(slowloris)·청크 상한은 새로 구현·시험해야 한다.
+- 화면(`/collect`, `/collect/runs/[id]`, `/captures` 추천 블록, 소재 상세 표시)은 build·typecheck 만 통과 — 브라우저로 보지 않았다(dev 서버 꺼짐 지시).
+- 미리보기 실행(특히 주기 실행)은 버리지 않으면 계속 쌓인다 — 보존 정리(RETENTION) 대상이 아니다. 원장 행은 DB 트리거로 불변을 강제하지 않는다(앱 경로만).
+- DB CHECK(decision·reason 짝, accepted ⇔ capture/버전/시각, https) 를 직접 위반하는 INSERT 시험은 없다(정상 경로만). `collected_items.source_version_id` 는 owner 복합 FK 가 아니다(source_versions 에 owner_id 없음) — 앱 경로·묶음 관계 검사·0039 원본 트리거로만 묶는다.
+- 재추천은 토큰 겹침뿐이라 흔한 업무 단어(딜러·영업 등)가 많은 사용자는 추천이 과할 수 있다. 한글 조사 제거는 짧은 접미 목록 기반(형태소 분석 아님).
+- 주기 실행은 owner 를 가리지 않고 tick 당 3 소스만 — 소스가 많으면 순서(last_run_at 오래된 순)대로 밀린다. 같은 소스에 수동·주기 실행이 겹치면 미리보기가 둘 생길 수 있다(받아들이기는 advisory lock + 재판정으로 중복 소재를 막음).
+- 외부 키가 guid 이므로 피드가 guid 를 바꾸면 같은 글이 새 항목이 된다(링크 기반 existing_capture 는 받아들인 링크·소재 URL 만 봄).
+- `M4_CODEX_VERDICTS.md` 는 이 작업 시작 전부터 작업 트리에서 수정된 상태였다 — 이 작업의 변경이 아니다(커밋 때 분리 필요).
+
+## Codex 에게 질문
+1. URL 정책이 A05 를 충분히 막는가? 특히 IP 리터럴 전면 거부 + 이름 기반 거부 + 허용 목록 정확 일치 조합에서 빠진 우회(IDN·punycode 호스트, 끝 점, `%2e` 인코딩, 백슬래시, `https:\\`·`https:/x` 같은 WHATWG 관용 파싱, 마지막 레이블이 숫자인 이름)가 있는가? `checkResolvedAddresses` 를 실제 수집기가 "검사한 IP 로만 연결" 하도록 강제하는 경계가 인터페이스(`CollectorAdapter`)에 충분히 드러나는가?
+2. XML 파서의 선형성·안전성: `decodeXmlEntities` 의 11자 창, 속성 값 `indexOf(quote)`, 닫는 태그·주석·CDATA 의 indexOf 가 모두 "찾은 곳까지 소비 또는 즉시 실패" 인지, steps 계측이 실제 비용을 과소 계상하는 구간이 있는지(예: `xmlText` 의 자손 순회, 항목마다 `child()` 선형 탐색, `htmlToText` 호출 합계).
+3. 받아들이기 경계: 다시 읽기(트랜잭션 밖) → 선점 → advisory lock → 재판정 순서에서, 같은 owner 의 두 실행을 동시에 받아들일 때 같은 외부 키로 출처가 둘 생기거나 같은 글이 두 소재가 되는 경로가 있는가? `sources` 에 collector 용 부분 unique 를 두지 않은 결정이 맞는가?
+4. 판정 규칙: "받아들인 적 있는 키" 만 중복으로 보고 버린 미리보기는 다시 new 로 보이는 것, existing_capture 를 받아들인 적 없는 키에만 적용하는 것, updated 를 새 소재로 만드는 것이 docs/01 "출처·날짜가 다른 관찰은 자동 삭제하지 않음"·원문 불변과 맞는가?
+5. 내보내기·복원: 복원 때 `collector_sources.enabled=false` override + add_missing 비교에서 운영 열 제외(enabled·last_run_at·last_status·updated_at)가 다른 표의 규칙(D17~D19, channel_accounts)과 일관적인가? 원본 조각을 `source_version_originals`(format 'txt' 에 XML 조각) 로 재사용한 것이 T18 의 의미(가져온 파일 원본)와 섞여 문제를 만드는가?
+6. 주기 실행: COLLECTOR_SCHEDULER=on 이어도 미리보기만 만들고 web inline tick(요청 처리 중)에서도 돈다 — inline 모드에서 web 요청 지연·모의 외 경로가 생길 여지는 없는가? "자동 수락 없음" 이 서버 쪽에서 충분히 강제되는가(받아들이기는 사용자 요청 경로 하나뿐)?
+
+---
+
+## FIX round 1 (Codex review-T19)
+- Orchestrator: HEAD_SHA 66e1257 (code only, D28) — reran lint·typecheck·build·unit 1266·integration 737·drill:mock 0·db:migrate 0042·real-DB drill:restore PASS.
+- 대상 판정: `.handoffs/review-T19.md`(CHANGES_REQUESTED, BASE 1808c65 → HEAD 4a2e02f).
+- BASE_SHA: 9aaeda2 · HEAD_SHA: TBD(커밋 안 한 작업 트리 — 오케스트레이터가 커밋)
+- Implementer: Claude Code. 네트워크 0·live fetcher 없음·수집 기본 꺼짐 그대로. 새 의존성 0. migration 0042. `./data` 열지 않음, dev 서버 꺼짐.
+- 건드리지 않음: `docs/DECISIONS.md`, `docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md`, `M4_CODEX_VERDICTS.md`(작업 전부터 작업 트리에서 수정된 상태 — 이 작업 변경 아님), `M4_STATUS.md`, 다른 handoff.
+
+### 지적 → 변경 → 시험
+| 지적 | 변경 | 시험 |
+|---|---|---|
+| [P0] `domain/collector.ts:605` BOM 있는 HTML 원본 바이트가 디코딩·재인코딩돼 보존되지 않음 | `FeedItem.raw: string` 을 없애고 `rawBytes: Uint8Array`(응답 바이트)로 바꿈. 페이지 = 응답 바이트 전체 복사본(BOM·CRLF·charset 선언 무관). 피드 = 응답을 `TextDecoder(fatal, ignoreBOM:true)` 로 디코딩해 문자열 위치와 바이트 위치를 1:1 로 맞춘 뒤 `<item>`/`<entry>` 구간을 **원본 바이트에서** 자름(`byteSlicer` — 앞에서 뒤로 이어 세는 선형). 텍스트 추출은 따로(BOM 제거 후 htmlToText). `toCandidate` 의 `raw_sha256`·`byte_size` 는 그 바이트로 계산, `createCollectedCapture` 는 그 바이트를 그대로 base64 로 `source_version_originals` 에 저장(0039 CHECK·트리거가 sha256 = raw_hash 재확인). 실제 UTF-8 아닌 바이트(windows-1251 등)는 텍스트를 만들 수 없어 예전처럼 `feed_not_utf8`(실행 failed·쓰기 0) | 단위: 피드 BOM+CRLF+한글·이모지 — 항목 바이트 = 응답 구간 `Buffer.compare` 0, sha256·크기 일치, CRLF 유지; 페이지 BOM+CRLF+`<meta charset="windows-1251">` — 원본 = 응답 전체, sha256·크기, 텍스트·제목에 BOM 없음, 원본은 복사본; cp1251 바이트 → feed_not_utf8. 통합: BOM 페이지 수집→수락 → DB 원본 base64 디코딩 = 응답 바이트(BOM 3바이트 포함), `format html`·`byte_size`·`sha256`·`source_versions.raw_hash`·원장 `byte_size` 일치, **내려받기 `/api/imports/originals/<버전>` 응답 바이트 = 응답 바이트**·`x-content-sha256`; BOM+CRLF 피드 수락 → 원본 = 응답의 `<item>` 구간; cp1251 페이지 실행 failed/feed_not_utf8·쓰기 0 |
+| [P1] `0041:31` accepted CHECK 가 NULL outcome + 채워진 연결 필드를 허용 | 새 migration **0042**(`0042_t19_fix1_collected_accepted.sql`, drizzle-kit 생성 + 머리말·앞 검사): CHECK 를 NULL 에 안전한 식으로 — `((outcome is not distinct from 'accepted') = (capture_id is not null)) and (… = (source_version_id is not null)) and (… = (accepted_at is not null))`(어느 항도 NULL 이 되지 않음). 앞 검사 `DO $$ … RAISE EXCEPTION` — 새 규칙을 어기는 기존 행이 있으면 **데이터를 바꾸지 않고** 멈춤(앱 경로는 이런 행을 만들지 않음 — 있으면 사람이 확인). `schema.ts` 같은 식. 묶음 검사(`bundle.ts checkIntegrity`)에도 같은 규칙 + "새 항목만 outcome" 추가(복원 전에 거부) | 통합(직접 SQL): 받아들인 행을 복사한 INSERT 5종(outcome null+연결, null+시각만, not_selected+연결, accepted+시각 없음, accepted+소재 없음) → 모두 `collected_items_accepted_chk` 위반, `UPDATE … set outcome = null` 위반, 정상 형태(null·연결 없음) INSERT 는 통과(지움), 원래 행 그대로. 단위: 묶음 integrity 7종 |
+| [P1] `db/collector.ts:552` 기한 판정 전 50개 제한 → 기한 지난 daily 소스 굶음 | 기한을 SQL 에서 먼저 판정: `enabled and schedule in ('daily','weekly') and (last_run_at is null or last_run_at + case schedule when 'daily' then 24h when 'weekly' then 7d end <= now)`, 정렬 = 기한(`last_run_at + 주기`) 오래된 순(처음은 맨 앞) → id, `LIMIT max`(50 고정 제거). `isScheduleDue` 로 한 번 더 확인 | 통합: 다른 owner 에 기한 전 weekly 55개(이틀 전 실행) + 25시간 전 daily 1 + 24h−1초 경계 1 → tick(max 3)에 daily 만 실행(preview), weekly 55·경계 0; 1초 뒤 tick 에 경계 소스 실행(>= 24h 경계 = domain 규칙과 같음). 끝나면 B 소스 끔 |
+| [P1] `db/collector.ts:396` 다시 읽을 때 바뀐 상대 링크 해석 결과를 검사 안 함 | (1) `parseFeed` 가 링크가 원문에서 상대였는지(`linkRelative` — `/x`·`x`·`//host/x`) 표시. (2) 새 순수 함수 `applyLinkPolicy(cands, allowlist)`: 상대 링크를 최종 URL(redirect 뒤) 기준으로 푼 결과에 `checkCollectorUrl(link, owner 허용 목록)` — 통과 못 하면 `blockedLink`(미리보기 skipped/blocked_link). 실행·다시 읽기 모두 `fetchCandidates` 에서 적용. 절대 링크는 예전대로 내부 주소만 막음(다른 사이트 글 링크는 조회하지 않는 출처 표시용). (3) 받아들이기: 다시 읽은 항목의 `link`·`link_normalized` 가 원장과 다르거나 `blockedLink` 면 `failed_changed`(원본 조각·checksum 이 같아도) | 단위: `/posts/1` 통과, `//evil…/x` 차단, 절대 다른 사이트 링크 통과, 판정 reason, 허용 목록 밖 호스트 차단. 통합: 같은 호스트 redirect `/old/feed.xml` → `/new/feed.xml` 로만 바뀐 같은 `<item>`(`<link>post/1</link>`) 수락 → failed_changed(raw_sha256·checksum 은 원장과 같음)·쓰기 0; `//evil.mock.example/x` → blocked_link, 고르면 400, 그 주소 미요청 |
+| [P2] `domain/collector.ts:318` 엔티티·속성 사전이 Object.prototype 을 상속 | 기본 엔티티 표를 `Map` 으로(`PREDEFINED.get`). 속성 사전은 `Object.create(null)` + 중복 검사 `Object.hasOwn` | 단위: `&toString; &valueOf; &__proto__; &constructor; &hasOwnProperty; &isPrototypeOf; &propertyIsEnumerable;` 가 decode·parseXml 모두 글자 그대로(함수 문자열·`[object` 없음), 속성 `toString`·`constructor`·`__proto__`·`hasOwnProperty`·`valueOf` 를 일반 키로 저장(프로토타입 null), 진짜 중복만 거부, `attrs.type` 상속값 없음 |
+
+### 놓친 케이스 중 함께 처리(값싼 것)
+- **파싱 실패 경로 계측**: `parseXml` 이 `finally` 에서 steps 를 더함(예전에는 정상 반환 때만) — 시험 주석과 구현이 이제 일치. 단위: 거부된 입력도 steps ≥ 1000.
+- **Atom 기본 text·XHTML**: type 없음 = text(RFC 4287, 예전에는 HTML 로 해석), `html`/`text/html` = HTML, `xhtml` = 안쪽 XHTML 조각(원문 구간)에서 htmlToText(script 제외). 제목도 같은 규칙. 단위 1.
+- **수락 후 화면 문구**: `/collect/runs/[id]` 상단 안내가 상태별(preview: 고르라는 안내, accepted: "결과" 열 안내, 그 밖: 소재 없음). build·typecheck 만(브라우저 확인 안 함).
+- 모의 어댑터 fixture 가 `Uint8Array` 본문을 받음(BOM·비 UTF-8 바이트 시험용, 그대로 복사해 돌려줌).
+
+### 변경 파일
+`packages/domain/src/collector.ts`, `packages/domain/src/collector.test.ts`, `packages/domain/src/bundle.ts`(CRLF 유지), `packages/domain/src/bundle.test.ts`, `packages/db/src/collector.ts`, `packages/db/src/schema.ts`(CRLF 유지), 새 `packages/db/drizzle/0042_t19_fix1_collected_accepted.sql` + `meta/0042_snapshot.json` + `meta/_journal.json`, `packages/providers/src/collector-mock.ts`, `apps/web/app/collect/runs/[id]/page.tsx`, `tests/integration/collector.test.ts`.
+
+### 명령과 결과 (로컬 Windows 10, Git Bash, `source tools/env.sh`, Node 24.21.0, `corepack pnpm`, 순차 — 단위와 통합 동시 실행 안 함, dev 서버 꺼짐)
+- `drizzle-kit generate --name t19_fix1_collected_accepted`(packages/db): 0042 생성(DROP/ADD CONSTRAINT 2문), 머리말 2줄 + 앞 검사 DO 블록만 덧붙임.
+- `corepack pnpm lint`: pass(첫 실행 1 오류 — 새 단위 시험 정규식에 BOM 글자가 그대로 들어감(no-irregular-whitespace) → `charCodeAt(0) !== 0xfeff` 비교로 고침).
+- `corepack pnpm typecheck`: pass.
+- `corepack pnpm test`(unit): pass — 53 files, 1266 tests(새: collector.test.ts FIX 8, bundle.test.ts FIX 1). 개발 중 1 실패: Atom xhtml 제목이 null — 바깥 `<title>` 태그까지 htmlToText 에 넘겨 HTML title 로 해석됨 → 안쪽 XHTML 조각만 넘기도록 코드 수정.
+- `corepack pnpm build`: pass.
+- 개발 중 단독: `vitest run --project integration tests/integration/collector.test.ts` → 27 passed(새 6). 0042 적용 확인 = NULL outcome INSERT 가 CHECK 로 거부됨(0041 식이면 통과했을 행).
+- `corepack pnpm test:integration`(혼자 실행): pass — "Test Files 36 passed (36)", "Tests 737 passed (737)", 525s, exit 0(T19 때 731 + 새 6). 로그는 세션 scratchpad(저장소 밖).
+- `corepack pnpm drill:mock`: pass — "불변식 위반 0건"(M3·T14·T15·T16 모의 불변식, Instagram fetch 0).
+
+### 남은 위험
+- 페이지 원본은 바이트 그대로지만 **텍스트는 UTF-8 만** — 실제 windows-1251·EUC-KR 등으로 인코딩된 페이지는 `feed_not_utf8` 로 실패한다(charset 선언을 따라 디코딩하지 않음 — 새 의존성 없이 하려면 TextDecoder 의 레이블 지원으로 가능하나 이번 범위 밖). 피드 항목 원본도 UTF-8 응답에서만 만들어진다.
+- 0042 앞 검사는 위반 행이 있으면 마이그레이션을 멈춘다(자동 정리 없음). 현재 앱 경로·복원 경로로는 그런 행이 생기지 않는다(복원은 묶음 검사가 먼저 거부).
+- 상대 링크만 허용 목록을 다시 본다 — 절대 링크(다른 사이트 글)는 내부 주소만 막는다(링크는 조회하지 않고 출처 표시용). 실제 수집기가 링크를 따라가 본문을 가져오게 되면 같은 정책을 그 요청에도 적용해야 한다.
+- 주기 실행 SQL 의 간격(24h·7d)은 domain `scheduleIntervalMs` 와 별도로 적혀 있다 — 통합 시험의 24h 경계와 `isScheduleDue` 재확인으로 묶었다. 기한 식은 인덱스를 쓰지 않는다(owner 당 50·전체 소스 수가 작다는 가정).
+- `XmlScanStats.steps` 는 여전히 엔티티 이름 탐색(최대 11자)·`xmlText`·`htmlToText` 비용을 세지 않는다(Codex 답 2) — 각각 상수·선형이지만 계측값은 실제 비용보다 작다.
+- 놓친 케이스 중 **처리 안 함**: 실제 PostgreSQL 에서 두 실행 동시 수락·수락/버리기 경쟁, 소스 49개에서 두 등록 동시 요청(상한 경쟁 — count 뒤 insert 라 51개가 될 수 있음), collector 출처 식별자 DB unique, `existing_capture` 를 "선택 가능한 후보"로 보여 줄지(D33 사용자 결정 3), inline tick 지연. 화면은 브라우저로 보지 않았다.
+
+### Codex 에게 질문
+1. 피드 항목 원본을 "응답 바이트에서 자른 구간"으로 정의했다(BOM 은 항목 밖이라 항목 원본에 없음, 페이지 원본에는 있음). `byteSlicer`(fatal·ignoreBOM 디코딩 → 문자열 위치 ↔ 바이트 위치)가 서로게이트 쌍·4바이트 문자·CRLF 에서 항상 정확한가? 이 정의가 docs 의 "원본 바이트 그대로 보존" 과 맞는가?
+2. 0042 의 앞 검사(위반 행 있으면 RAISE, 데이터 변경 없음)와 새 CHECK 식이 0041 의 모든 정상 상태(preview 의 outcome null, not_selected·skipped_duplicate·failed_changed, accepted)를 그대로 허용하고 위반만 막는가? 묶음 검사에 넣은 "새 항목만 outcome" 이 기존 `collected_items_outcome_chk` 와 정확히 같은 규칙인가?
+3. 상대 링크에만 허용 목록을 다시 적용하고 절대 링크는 내부 주소만 막는 경계가 A05 에 충분한가? 받아들이기에서 링크 불일치를 failed_changed 로 보는 것(새 미리보기 요구)이 Codex 제안과 맞는가, 아니면 링크 정책 실패를 별도 outcome(policy_blocked)으로 구분해야 하는가?
+
+---
+
+## FIX round 2 (Codex review-FIX-T19, P2 2)
+
+### 고친 것
+- **[P2] collector.ts:560 Buffer 공유**: 새 `copyBytes`(= `Uint8Array.prototype.slice.call`) — Node `Buffer.prototype.slice` 는 같은 메모리를 보는 view 를 돌려주므로 `bytes.slice` 대신 이것을 씀. `byteSlicer`(피드 항목 원본)와 `parsePage` 의 `rawBytes` 둘 다. 새 단위 `packages/domain/src/collector-fix2.test.ts` 3개(copyBytes 메모리 비공유, parsePage(Buffer)·parseFeed(Buffer) 뒤 입력 `fill(0)` 해도 원본 그대로). 옛 `bytes.slice` 로 되돌리면 2개 실패함을 확인.
+- **[P2] db collector.ts:563 주간 간격**: SQL 기한 식을 `interval '24 hours'`·`interval '168 hours'`(고정 시간)로. 세션 시간대가 America/New_York 일 때 PGlite 에서 `'2026-03-07T12:00Z' + interval '7 days'` = 03-14 08:00Z(167시간), `+ '168 hours'` = 09:00Z 확인.
+- 통합 시험(collector.test.ts 'Codex review-FIX-T19 P2 :563'): 세션 시간대 New_York, 서머타임 시작을 끼는 주간 소스(lastRunAt+167.5h, 아직 기한 전)와 10분 전에 기한이 된 daily 소스, 한도 max=1. '7 days' 였다면 SQL 이 주간 소스를 먼저 골라 한도를 차지하고 JS `isScheduleDue` 재확인에서 빠져 daily 가 굶는다 — 이 시험은 daily 1회 실행·주간 0회, 168h 에 주간 1회를 단언. '7 days' 로 되돌리면 실패(expected +0 to be 1)함을 확인. (처음 쓴 시험은 JS 재확인 때문에 '7 days' 에서도 통과해 회귀를 못 잡았으므로 다시 설계함.)
+
+### 변경 파일
+`packages/domain/src/collector.ts`, 새 `packages/domain/src/collector-fix2.test.ts`, `packages/db/src/collector.ts`, `tests/integration/collector.test.ts`.
+
+### 명령과 결과
+- 개발 중 단독: `vitest run --project integration tests/integration/collector.test.ts` → 28 passed. `'7 days'` 로 임시 되돌림 → 1 failed(위 단언), 원복 후 cmp 확인.
+- 전체 검사: `.handoffs/run-checks.sh FIX2-T19` — 결과는 아래 줄에 기록.
+- 전체 검사(로컬 Windows 10, Node 24.21.0, 순차, dev 서버 꺼짐): lint 0, typecheck 0, build 0, unit pass(54 files, 1269 tests), integration pass(36 files, 738 tests), drill:mock pass("불변식 위반 0건"), db:migrate 0, drill:restore PASS.
+
+### 리뷰 대상
+- BASE: 66e1257 (FIX round 1) / HEAD: f07153c (FIX round 2 코드 커밋)
+
+### 남은 위험
+- round 1 의 남은 위험 그대로(UTF-8 만, 0042 앞 검사 멈춤, 절대 링크 정책, 동시성 경쟁 미처리, 화면 브라우저 미확인).
+- SQL 간격과 domain `scheduleIntervalMs` 는 여전히 따로 적혀 있다 — 이번 시험이 168h 경계·DST 를 묶는다.

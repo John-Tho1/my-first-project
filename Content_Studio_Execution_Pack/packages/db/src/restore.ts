@@ -1,0 +1,1216 @@
+/**
+ * 복원(T05, 결정 D6). 미리보기 → (사용자 확인) → 커밋.
+ *
+ * 미리보기(createRestorePreview)
+ * - ZIP 을 읽어 @cs/domain parseBundle 로 모든 파일 sha256·형식 버전·migration 호환·행 스키마·묶음 안 참조를 검사한다.
+ *   하나라도 어긋나면 BundleError(400) — DB 는 바뀌지 않고 restore_runs 행도 남기지 않는다.
+ * - 현재 owner 범위에서 표별 {in_bundle, new, existing_same, existing_different} 를 계산한다.
+ *   계산은 커밋과 같은 코드(applyBundle)를 트랜잭션 안에서 실행한 뒤 되돌리는(rollback) 방식이라 커밋 결과와 어긋나지 않는다.
+ * - 통과하면 ZIP 을 <restoresDir>/<restore_id>.zip 에 두고 restore_runs(previewed) 를 남긴다.
+ *
+ * 커밋(commitRestore)
+ * - 미리보기를 믿지 않고 저장된 ZIP 을 다시 읽어 검증한다(manifest sha256 이 미리보기 때와 같아야 함, 다르면 rejected).
+ * - 한 트랜잭션: empty_only 는 owner 범위가 비어 있고 충돌 0 이어야 한다(아니면 409). add_missing 은 없는 ID 만 넣고
+ *   같은 행은 건너뛰며, 다른 행은 **절대 덮어쓰지 않고** 충돌로 보고한다.
+ * - owner 재지정: 모든 행의 owner_id = 현재 owner. 엔터티 ID 는 그대로 보존한다.
+ * - 파일 바이트는 같은 key(assets/<원래 owner>/<uuid>)로 저장소에 쓰고 sha256 을 다시 확인한다. 접근 권한은 assets.owner_id 가 정한다.
+ * - content_versions 는 INSERT 만 한다(불변 트리거). contents.current_version_id 는 버전을 넣은 뒤 채운다.
+ */
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { and, count, desc, eq, sql } from 'drizzle-orm';
+import {
+  AppError,
+  isUuid,
+  NotFoundError,
+  parseBundle,
+  readZip,
+  restoredItemStatus,
+  restoredJobState,
+  RESTORED_TABLES,
+  rowHash,
+  sha256Hex,
+  type BundleManifest,
+  type ParsedBundle,
+  type RestoredTable,
+} from '@cs/domain';
+import type { Db } from './client';
+import { recordAudit, type DbOrTx } from './queries';
+import { idIn, insertBundleRow, selectBundleRows } from './bundle-tables';
+
+/**
+ * 기존 행과 묶음 행의 동일성 비교 hash. T13: channel_accounts.credential_state 는 운영 상태(연결 여부)라 비교에서 뺀다 —
+ * 같은 계정을 다시 연결·해제했다고 같은 환경 복원(add_missing)이 계정과 그 밑의 계획·항목을 "충돌"로 막지 않게.
+ */
+function compareHash(name: RestoredTable, row: Record<string, unknown>): string {
+  // T19(D33 제안): 수집 소스의 운영 상태(켜짐·마지막 실행·갱신 시각)는 비교에서 뺀다 — 복원은 꺼진 채로 넣고, 그 뒤 실행해도 같은 소스로 본다.
+  if (name === 'collector_sources') {
+    const { enabled: _e, last_run_at: _l, last_status: _s, updated_at: _u, ...rest } = row;
+    return rowHash(rest);
+  }
+  if (name !== 'channel_accounts') return rowHash(row);
+  const { credential_state: _ignored, ...rest } = row;
+  return rowHash(rest);
+}
+import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
+import { variantReviewBlockers } from './variants';
+import { invalidateApprovalsForBrandProfile, invalidateApprovalsForRisk, recomputePlanStatus, settleApprovedVariants, type RevokedApproval } from './approval-invalidation';
+import { snapshotProblems } from './distribution';
+import { getCurrentBrandProfile } from './writing';
+import { assets, captures, contents, distributionItems, ideas, jobs, publications, restoreRuns, sources } from './schema';
+
+export type RestoreMode = 'empty_only' | 'add_missing';
+export const RESTORE_MODES: readonly RestoreMode[] = ['empty_only', 'add_missing'];
+
+/** 복원 대상 owner 범위가 비어 있지 않음(empty_only) — 409. */
+export class RestoreTargetNotEmptyError extends AppError {
+  constructor(extra?: Record<string, unknown>) {
+    super(
+      'conflict',
+      'restore_target_not_empty',
+      '이 계정에 이미 소재·카드·원고·파일이 있어 "빈 환경에만 복원"을 할 수 없습니다. "없는 항목만 추가"를 고르세요.',
+      extra,
+    );
+  }
+}
+
+export class RestoreConflictError extends AppError {
+  constructor(extra?: Record<string, unknown>) {
+    super('conflict', 'restore_conflict', '같은 ID 의 다른 데이터가 있어 "빈 환경에만 복원"을 할 수 없습니다', extra);
+  }
+}
+
+export class AlreadyCommittedError extends AppError {
+  constructor() {
+    super('conflict', 'already_committed', '이미 복원(커밋)한 미리보기입니다. 다시 복원하려면 파일을 새로 올려 미리보기를 만드세요.');
+  }
+}
+
+export class RestoreNotCommittableError extends AppError {
+  constructor(status: string) {
+    super('conflict', 'restore_not_committable', `이 미리보기는 복원할 수 없는 상태입니다(${status}). 파일을 새로 올려 미리보기를 만드세요.`);
+  }
+}
+
+export class RestoreFileMissingError extends AppError {
+  constructor() {
+    super('not_found', 'restore_file_missing', '미리보기에 쓴 파일이 서버에 없습니다. 파일을 다시 올려 미리보기를 만드세요.');
+  }
+}
+
+export interface TableCounts {
+  in_bundle: number;
+  new: number;
+  existing_same: number;
+  existing_different: number;
+}
+
+export interface RestoreConflict {
+  table: RestoredTable;
+  id: string;
+  /** different: 같은 owner 의 같은 ID 가 내용이 다름 / id_in_use: 다른 owner 가 쓰는 ID / dependency: 부모 행이 복원되지 않음 / unique: 다른 unique 값 충돌 / version_exists: 같은 버전의 브랜드 프로필이 다름 */
+  /**
+   * existing_parent(FIX2-FULLREV2 G18): 승인·작업·전송 의도·원격 결과·원격 단계 행의 부모(배포 항목·작업·의도)가 이 환경에 이미 있던(동일) 행이라
+   * 넣지 않음 — 기존 항목에 승인·실행 이력을 덧붙이지 않는다(D6 기존 행 UPDATE 없음 — 계획 상태·파생본 lifecycle 을 다시 맞추지 않으므로).
+   */
+  reason: 'different' | 'id_in_use' | 'dependency' | 'unique' | 'version_exists' | 'immutable_version' | 'snapshot_referenced' | 'existing_parent';
+}
+
+export interface DowngradedVariant {
+  variant_id: string;
+  channel: string;
+  reasons: string[];
+}
+
+export interface ApplyReport {
+  tables: Record<RestoredTable, TableCounts>;
+  conflicts: RestoreConflict[];
+  /** 이번 실행에서 새로 넣은 assets 행 id */
+  insertedAssetIds: string[];
+  /** FIX-T09(P1): review 조건(현재 버전·stale 아님·채널 미디어)을 못 채워 draft 로 낮춘 파생본 */
+  downgradedVariants: DowngradedVariant[];
+  /** T08: 묶음에서 진행 중(queued·running)이던 전사 job — 복원 환경에서 다시 돌리지 않고 canceled 로 넣는다 */
+  interruptedTranscriptions: string[];
+  /** T10(D17): 묶음에서 보내기 전 대기(QUEUED·RETRY_WAIT)이던 배포 항목 — 작업(jobs)은 복원하지 않으므로 BLOCKED 로 넣는다(맹목 재전송 없음) */
+  blockedItems: string[];
+  /** FIX-T10(P0): 묶음에서 전송 중·결과 불명이던 항목 — UNKNOWN 그대로(또는 UNKNOWN 으로) 넣는다. BLOCKED·FAILED 로 덮어쓰지 않는다. */
+  unknownItems: string[];
+  /** FIX-T11(P1): 묶음에서 CONFIRMED 였지만 복원된 원격 결과(publications)가 없는 항목 — 근거 없이 CONFIRMED 로 두지 않고 UNKNOWN(+표시). */
+  unverifiedConfirmedItems: string[];
+  /** T10(D17): 복원한 행 기준으로 스냅샷이 맞지 않는 활성 승인 — revoke_reason 'restore_stale' 로 철회해 넣는다 */
+  revokedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[] }>;
+  /**
+   * FIX2-FULLREV2(G19, D19-a): 복원으로 더 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌어, 이 환경에 **이미 있던** 활성 승인을
+   * `invalidated:brand_changed` 로 무효로 한 것(새 브랜드 버전 훅 invalidateApprovalsForBrandProfile 과 같은 규칙 — 대기 작업 BLOCKED, 항목 PLANNED).
+   * revokedApprovals(묶음에서 들어온 승인의 restore_stale)와 따로 둔다 — 복원 훈련은 revokedApprovals 를 묶음 기대값과 정확히 대조한다.
+   * FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효로 한 기존 승인도 여기에(reasons ['risk_needs_check']).
+   * FIX1-FULLREV3(H3): partial_job_ids — 이미 일부가 게시됐거나 게시 시도 표식이 있어 실행 전(PLANNED)이 아니라 UNKNOWN(thread_partial_revoked)으로 둔 작업
+   * (revokeActiveApprovalsLocked 의 partialJobIds, 승인 철회 경로의 partial_job_ids·revoked_partial 과 같은 뜻). in_flight — 진행 중(SENDING·REMOTE_PROCESSING·
+   * RECONCILING·CANCEL_REQUESTED) 항목이라 작업·항목 상태는 그대로 두고 승인만 무효로 한 것(FIX1-FULLREV3(H2) — 다음 전송은 approval_missing 으로 멈춘다).
+   * FIX1-FULLREV3(H3 후속): leased_partial_job_ids — lease 만 잡고 보내기 전(LEASED)인데 이미 일부가 게시됐거나 게시 시도 표식이 있는 작업. 작업은 그대로,
+   * 항목도 실행 전(PLANNED)으로 두지 않는다 — 그 작업의 다음 전송은 보내지 않고 결과 불명(UNKNOWN)으로 정해진다(revokeActiveApprovalsLocked 의 leasedPartialJobIds).
+   * 세 칸 모두 옛 미리보기·결과 기록에는 없다(화면은 []·false 로 읽는다).
+   */
+  // FIX2-FULLREV3(K2): restored_review — 이전 복원의 확인 표시로 BLOCKED 그대로 둔 항목(옛 기록에는 없음 → false 로 읽는다)
+  invalidatedApprovals: Array<{
+    approval_id: string;
+    item_id: string;
+    reasons: string[];
+    blocked_job_ids: string[];
+    partial_job_ids?: string[];
+    leased_partial_job_ids?: string[];
+    in_flight?: boolean;
+    restored_review?: boolean;
+  }>;
+  /**
+   * FIX-T13(Codex review-T13 P1 #4): 복원 뒤 "다시 연결 필요"가 된 계정 — 새로 넣은 연결 이력 계정(linked → needs_reconnect)과,
+   * 이미 있던(동일) 계정 중 로컬이 none 인데 묶음이 linked·needs_reconnect 인 계정(연결 이력을 잃지 않게 needs_reconnect 로 올림).
+   * 로컬이 linked·needs_reconnect 이면 그대로 둔다(로컬의 유효한 연결을 묶음이 덮지 않음).
+   */
+  reconnectRequiredAccounts: string[];
+  /** FIX2-T13(Codex Q11): 화면 표시용 — 플랫폼·표시 이름·기존 계정 여부만(ID·비밀 없음) */
+  reconnectRequiredLabels: ReconnectLabel[];
+}
+
+export interface ReconnectLabel {
+  platform: string;
+  display_name: string;
+  /** true = 이미 있던 계정이 이번 복원으로 실행 차단됨, false = 새로 들어오는 계정 */
+  existing: boolean;
+}
+
+const MAX_CONFLICTS_LISTED = 200;
+
+/**
+ * FIX1-FULLREV3(H3): 복원 보고 한 줄 — 부분 게시로 UNKNOWN 에 둔 작업(partial_job_ids)·진행 중 항목(in_flight)을 버리지 않는다.
+ * FIX1-FULLREV3(H3 후속): 부분 게시가 있는 lease 된 작업(leased_partial_job_ids)도 보고하고, in_flight 는 RevokedApproval.inFlight 를 그대로 쓴다
+ * (진행 중 상태 목록을 여기서 따로 베끼지 않는다).
+ * FIX2-FULLREV3(K2): 이전 복원의 확인 표시로 BLOCKED 그대로 둔 항목(restored_review)도 보고한다.
+ */
+function invalidatedEntry(r: RevokedApproval, reason: 'brand_changed' | 'risk_needs_check'): ApplyReport['invalidatedApprovals'][number] {
+  return {
+    approval_id: r.approvalId,
+    item_id: r.itemId,
+    reasons: [reason],
+    blocked_job_ids: r.blockedJobIds,
+    partial_job_ids: r.partialJobIds,
+    leased_partial_job_ids: r.leasedPartialJobIds,
+    in_flight: r.inFlight,
+    // FIX2-FULLREV3(K2): BLOCKED + 이전 복원 확인 표시 — 실행 전으로 돌리지 않았다(다시 승인하면 item_not_planned)
+    restored_review: r.restoredReview,
+  };
+}
+
+/**
+ * 묶음의 부모 참조(같은 owner 에 있어야 삽입 가능). owned=true 는 부모가 "이번에 넣었거나 동일"일 때만(기존 다른 행에 덧붙이지 않음).
+ * fresh=true(FIX2-FULLREV2 G18)는 부모가 **이번 복원에서 넣은** 행일 때만 — 이미 있던(동일) 부모면 existing_parent 충돌로 남긴다(owned 와 별개 플래그,
+ * 다른 표의 owned 의미는 그대로). 승인·작업·전송 의도·원격 결과·원격 단계: 이미 있던 배포 항목에 새 활성 승인을 붙이면 그 계획 상태·파생본 lifecycle 은
+ * 다시 계산되지 않아(D6 — 기존 행 UPDATE 없음) 계획은 '초안'인데 실행 폼은 대기열에 넣고 재승인은 already_approved 가 된다.
+ */
+const PARENTS: Partial<Record<RestoredTable, Array<{ col: string; table: RestoredTable; owned?: boolean; fresh?: boolean }>>> = {
+  source_versions: [{ col: 'source_id', table: 'sources', owned: true }],
+  // T08: 전사에서 만든 소재는 그 전사 버전이 이번에 들어갔거나 같은 행일 때만.
+  captures: [
+    { col: 'source_id', table: 'sources' },
+    { col: 'capture_transcript_id', table: 'transcripts' },
+  ],
+  transcription_jobs: [{ col: 'asset_id', table: 'assets' }],
+  transcripts: [{ col: 'job_id', table: 'transcription_jobs', owned: true }],
+  capture_revisions: [{ col: 'capture_id', table: 'captures', owned: true }],
+  idea_captures: [
+    { col: 'idea_id', table: 'ideas' },
+    { col: 'capture_id', table: 'captures' },
+  ],
+  contents: [{ col: 'idea_id', table: 'ideas' }],
+  content_versions: [{ col: 'content_id', table: 'contents', owned: true }],
+  content_captures: [
+    { col: 'content_id', table: 'contents' },
+    { col: 'capture_id', table: 'captures' },
+  ],
+  // T06: 답변·AI 실행 기록·경험 확인은 부모(원고·버전·브랜드 프로필·run)가 이번에 들어갔거나 같은 행일 때만.
+  interview_answers: [{ col: 'content_id', table: 'contents', owned: true }],
+  generation_runs: [
+    { col: 'content_id', table: 'contents', owned: true },
+    { col: 'brand_profile_id', table: 'brand_profiles' },
+    { col: 'input_version_id', table: 'content_versions' },
+    { col: 'output_ref', table: 'content_versions' },
+    // FIX1-FULLREV2(G3): 채널 초안 AI 실행(mode=variant)은 그 파생본 밑의 기록 — FK generation_runs_variant_same_owner_fk(0009, 같은 owner 복합).
+    // 빠져 있으면 파생본이 unique·다름으로 들어가지 못했는데 run 만 넣다가 원시 FK 오류로 미리보기·복원 전체가 500 으로 끝났다.
+    { col: 'variant_id', table: 'variants', owned: true },
+  ],
+  claim_confirmations: [
+    { col: 'run_id', table: 'generation_runs', owned: true },
+    { col: 'body_version_id', table: 'content_versions' },
+  ],
+  // T07
+  claims: [
+    { col: 'content_version_id', table: 'content_versions' },
+    { col: 'run_id', table: 'generation_runs', owned: true },
+    // FIX1-FULLREV2(G3): 파생본 제안 버전의 claim — FK claims_variant_version_id_variant_versions_id_fk(0009, 단일 열). 그 버전이 들어가지
+    // 못하면(unique·의존성 — run 은 들어가도) claim 도 의존성 충돌로 남긴다(원시 FK 오류로 중단하지 않음).
+    { col: 'variant_version_id', table: 'variant_versions' },
+  ],
+  claim_sources: [
+    { col: 'claim_id', table: 'claims', owned: true },
+    { col: 'source_version_id', table: 'source_versions' },
+  ],
+  usage_ledger: [
+    { col: 'run_id', table: 'generation_runs', owned: true },
+    { col: 'transcription_job_id', table: 'transcription_jobs', owned: true },
+  ],
+  // T09
+  variants: [{ col: 'content_id', table: 'contents', owned: true }],
+  variant_versions: [
+    { col: 'variant_id', table: 'variants', owned: true },
+    { col: 'content_version_id', table: 'content_versions' },
+  ],
+  variant_assets: [
+    { col: 'variant_version_id', table: 'variant_versions', owned: true },
+    { col: 'asset_id', table: 'assets' },
+  ],
+  // T10: 항목은 계획이 이번에 들어갔거나 같을 때만, 스냅샷이 가리키는 행(계정·파생본·버전·원고 버전·브랜드)이 있을 때만. 승인은 그 항목에만.
+  distribution_items: [
+    { col: 'plan_id', table: 'distribution_plans', owned: true },
+    { col: 'channel_account_id', table: 'channel_accounts' },
+    { col: 'variant_id', table: 'variants' },
+    { col: 'variant_version_id', table: 'variant_versions' },
+    { col: 'content_version_id', table: 'content_versions' },
+    { col: 'brand_profile_id', table: 'brand_profiles' },
+  ],
+  // FIX2-FULLREV2(G18): 승인은 그 항목이 이번에 들어갔을 때만(fresh) — 이미 있던(동일) 항목이면 existing_parent 충돌(다시 승인은 이 환경에서).
+  approvals: [{ col: 'distribution_item_id', table: 'distribution_items', owned: true, fresh: true }],
+  // FIX-T11: 작업·전송 의도·원격 결과는 읽기 전용 이력 — 그 항목·작업이 이번에 들어갔을 때만(기존 항목에 이력을 덧붙이지 않는다).
+  // FIX2-FULLREV2(G18): 주석의 "이번에 들어갔을 때만"을 코드로(fresh) — 전에는 동일 부모에도 붙었다.
+  jobs: [{ col: 'item_id', table: 'distribution_items', owned: true, fresh: true }],
+  send_intents: [{ col: 'job_id', table: 'jobs', owned: true, fresh: true }],
+  publications: [
+    { col: 'item_id', table: 'distribution_items', owned: true, fresh: true },
+    { col: 'job_id', table: 'jobs', owned: true, fresh: true },
+  ],
+  // FIX-T14(Codex review-T14 P1): 원격 단계 기록도 읽기 전용 이력 — 그 작업·의도·항목이 이번에 들어갔을 때만(기존 작업에 단계를 덧붙이지 않는다).
+  remote_steps: [
+    { col: 'job_id', table: 'jobs', owned: true, fresh: true },
+    { col: 'intent_id', table: 'send_intents', owned: true, fresh: true },
+    { col: 'item_id', table: 'distribution_items', owned: true, fresh: true },
+  ],
+  // T18(D32 제안): 가져오기 원장 항목은 그 실행이 이번에 들어갔거나 같을 때만(기존 실행에 항목을 덧붙이지 않는다), 대상(소재·출처·버전)이 있을 때만.
+  import_items: [
+    { col: 'run_id', table: 'import_runs', owned: true },
+    { col: 'target_capture_id', table: 'captures' },
+    { col: 'target_source_id', table: 'sources' },
+    { col: 'target_source_version_id', table: 'source_versions' },
+    { col: 'matched_source_id', table: 'sources' },
+  ],
+  // FIX-T18 round 1(0039): 원본은 그 출처 버전이 있을 때만(버전 행·sha256 일치는 DB 트리거가 다시 확인).
+  source_version_originals: [{ col: 'source_version_id', table: 'source_versions' }],
+  // T19(D33 제안): 실행은 그 소스가, 항목은 그 실행(이번에 들어간 실행에만 — 기존 실행에 덧붙이지 않음)·소스·소재·출처 버전이 있을 때만. 닫기는 소재가 있을 때만.
+  collector_runs: [{ col: 'source_id', table: 'collector_sources' }],
+  collected_items: [
+    { col: 'run_id', table: 'collector_runs', owned: true },
+    { col: 'source_id', table: 'collector_sources' },
+    { col: 'capture_id', table: 'captures' },
+    { col: 'source_version_id', table: 'source_versions' },
+  ],
+  recommendation_dismissals: [{ col: 'capture_id', table: 'captures' }],
+};
+
+/**
+ * FIX1-FULLREV2(G3): 시험용 읽기 전용 보기 — DB 의 모든 FK 가 여기(또는 사후 검사 목록)에 있는지 대조한다
+ * (tests/integration/fullrev2-restore-parents.test.ts). applyBundle 이 쓰는 것과 같은 객체다.
+ */
+export const RESTORE_PARENTS: Readonly<typeof PARENTS> = PARENTS;
+
+type Avail = 'inserted' | 'same' | 'different';
+
+/**
+ * 묶음 행을 현재 owner 로 넣는다(add_missing 규칙). 미리보기는 이것을 트랜잭션 안에서 실행하고 되돌린다.
+ * 기존 행은 UPDATE 하지 않는다 — 유일한 UPDATE 는 이번에 넣은 원고의 current_version_id(null → 버전 id).
+ */
+/**
+ * now: 복원 판정 시각(승인 재검사의 예약 시각 비교·철회 시각·계획 상태 갱신 시각). 기본 지금 — 복원 훈련은 같은 시각을 기대값 계산에도 쓴다(FIX round 4).
+ */
+export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBundle, now?: Date): Promise<ApplyReport> {
+  const avail: Record<string, Map<string, Avail>> = {};
+  const tables = {} as Record<RestoredTable, TableCounts>;
+  const conflicts: RestoreConflict[] = [];
+  const insertedAssetIds: string[] = [];
+  const insertedContents: Array<{ id: string; currentVersionId: string | null }> = [];
+  const insertedVariants: Array<{ id: string; currentVersionId: string | null }> = [];
+  const blockedItems: string[] = [];
+  const unknownItems: string[] = [];
+  // FIX2-FULLREV2(G19): 복원 전 현재 브랜드(최대 version) — 복원 뒤 바뀌었으면 기존 활성 승인을 브랜드 훅과 같이 무효로 한다.
+  const brandBefore = (await getCurrentBrandProfile(tx, ownerId))?.id ?? null;
+
+  for (const name of RESTORED_TABLES) {
+    const rows = bundle.tables[name] as unknown as Array<Record<string, unknown> & { id: string }>;
+    const counts: TableCounts = { in_bundle: rows.length, new: 0, existing_same: 0, existing_different: 0 };
+    const map = new Map<string, Avail>();
+    avail[name] = map;
+    const existing = new Map<string, { owner: string | null; hash: string }>();
+    for (let i = 0; i < rows.length; i += 500) {
+      const ids = rows.slice(i, i + 500).map((r) => r.id);
+      for (const e of await selectBundleRows(tx, name, idIn(name, ids))) {
+        existing.set(String(e.row.id), { owner: e.owner, hash: compareHash(name, e.row) });
+      }
+    }
+    const conflict = (id: string, reason: RestoreConflict['reason']) => {
+      counts.existing_different++;
+      conflicts.push({ table: name, id, reason });
+    };
+
+    for (const row of rows) {
+      const ex = existing.get(row.id);
+      if (ex) {
+        if (ex.owner !== ownerId) {
+          conflict(row.id, 'id_in_use');
+        } else if (ex.hash === compareHash(name, row)) {
+          counts.existing_same++;
+          map.set(row.id, 'same');
+        } else {
+          conflict(row.id, 'different');
+          map.set(row.id, 'different');
+        }
+        continue;
+      }
+      const parentsOk = (PARENTS[name] ?? []).every((p) => {
+        const v = row[p.col];
+        if (v === null || v === undefined) return true;
+        const a = avail[p.table]?.get(String(v));
+        // 부모가 묶음과 내용이 다른 기존 행('different')이면 그 밑에 자식·관계를 붙이지 않는다(묶음의 의미적 관계 보존).
+        return a !== undefined && a !== 'different';
+      });
+      if (!parentsOk) {
+        conflict(row.id, 'dependency');
+        continue;
+      }
+      // FIX2-FULLREV2(G18): fresh 부모(배포 항목·작업·의도)가 이번 복원에서 넣은 행이 아니라 이미 있던(동일) 행이면 넣지 않는다.
+      const staleParent = (PARENTS[name] ?? []).some((p) => {
+        const v = row[p.col];
+        return p.fresh === true && v !== null && v !== undefined && avail[p.table]?.get(String(v)) === 'same';
+      });
+      if (staleParent) {
+        conflict(row.id, 'existing_parent');
+        continue;
+      }
+      // FIX-T09 round 2(P1): 이미 있던(동일) 파생본 버전에 첨부를 새로 붙이지 않는다 — 버전은 불변이고, 붙이면 검토 조건(미디어)이 바뀐다.
+      if (name === 'variant_assets' && avail.variant_versions!.get(String(row.variant_version_id)) === 'same') {
+        conflict(row.id, 'immutable_version');
+        continue;
+      }
+      // FIX-T10 round 2(P1, Codex review-FIX-T10 0019:31): add_missing 이 기존 파생본에 옛 버전과 그 첨부를 보충하는 경우 — 트리거(0019·0021)에
+      // 닿기 전에 같은 규칙으로 명시적 충돌로 남긴다(복원 전체를 DB 오류로 중단하지 않음): 그 버전을 배포 항목이 참조하면 snapshot_referenced,
+      // 파생본의 현재 버전(대상 DB)이 이 버전보다 새것이면 immutable_version.
+      if (name === 'variant_assets') {
+        const reason = await variantAssetRestoreBlocker(tx, String(row.variant_version_id));
+        if (reason) {
+          conflict(row.id, reason);
+          continue;
+        }
+      }
+      if (name === 'brand_profiles') {
+        // (owner, version) unique: 같은 버전이 이미 있으면(예: seed) 내용이 같을 때만 "동일", 다르면 충돌. 덮어쓰지 않는다.
+        // 같은 (owner, version) 이 다른 ID 로 이미 있으면(예: seed) 내용이 같아도 충돌이다 — 묶음의 ID 가 보존되지 않기 때문(결정 D6: ID 보존).
+        // 같은 ID 인 경우는 위의 existing 분기에서 same/different 로 판정된다. 기존 행은 덮어쓰지 않는다.
+        const r = row as unknown as { version: number };
+        const found = await tx.execute(
+          sql`select id from brand_profiles where owner_id = ${ownerId}::uuid and version = ${r.version}`,
+        );
+        if ((found as unknown as { rows: unknown[] }).rows.length > 0) {
+          conflict(row.id, 'version_exists');
+          continue;
+        }
+      }
+      const overrides: Record<string, unknown> = name === 'contents' || name === 'variants' ? { current_version_id: null } : {};
+      // T10(D17)·FIX-T10(P0): 작업은 복원하지 않는다 — 진행 중이던 항목은 새 환경에서 다시 보내지 않도록 restored_needs_review 를 켠다(자동 실행·재시도 금지).
+      // 상태는 결과를 정할 수 있을 때만 바꾼다: 보내기 전 대기(QUEUED·RETRY_WAIT) → BLOCKED, 전송 중·결과 불명 → UNKNOWN(그대로 보존).
+      const restoredStatus = name === 'distribution_items' ? restoredItemStatus(String(row.status)) : null;
+      if (restoredStatus) {
+        overrides.status = restoredStatus;
+        overrides.restored_needs_review = true;
+      }
+      // T13(D24): 연결 정보(oauth_credentials)는 묶음 밖이다 — 연결했던 계정은 새 환경에서 "다시 연결 필요"로 넣는다(그 전까지 실행 차단).
+      if (name === 'channel_accounts' && row.credential_state === 'linked') overrides.credential_state = 'needs_reconnect';
+      // T19(D33 제안): 수집 소스는 꺼진 채로 들어온다 — 복원한 환경이 사용자 확인 없이 (주기) 수집을 시작하지 않게. 주기 설정 값은 그대로 보존.
+      if (name === 'collector_sources') overrides.enabled = false;
+      // FIX-T11(P1): 작업은 읽기 전용 이력 — 끝난 상태·BLOCKED·UNKNOWN 으로만, lease 없이, 복원 표시(자동 lease·재시도 없음).
+      if (name === 'jobs') {
+        overrides.state = restoredJobState(String(row.state));
+        overrides.lease_owner = null;
+        overrides.lease_until = null;
+        overrides.heartbeat_at = null;
+        overrides.restored_needs_review = true;
+      }
+      // variant_assets 는 트리거가 남은 경합(사전 검사 뒤 변경)에서 거부할 수 있으므로 savepoint 안에서 넣고, 그 거부는 같은 충돌로 바꾼다.
+      let inserted: boolean;
+      if (name === 'variant_assets') {
+        try {
+          inserted = await tx.transaction(async (sp) => insertBundleRow(sp, name, row, ownerId, overrides));
+        } catch (e) {
+          if (!pgErrorText(e).includes('variant_assets_version_open')) throw e;
+          conflict(row.id, pgErrorText(e).includes('배포 스냅샷') ? 'snapshot_referenced' : 'immutable_version');
+          continue;
+        }
+      } else {
+        inserted = await insertBundleRow(tx, name, row, ownerId, overrides);
+      }
+      if (inserted) {
+        if (restoredStatus === 'BLOCKED') blockedItems.push(row.id);
+        if (restoredStatus === 'UNKNOWN') unknownItems.push(row.id);
+        counts.new++;
+        map.set(row.id, 'inserted');
+        if (name === 'assets') insertedAssetIds.push(row.id);
+        if (name === 'contents') insertedContents.push({ id: row.id, currentVersionId: (row.current_version_id as string | null) ?? null });
+        if (name === 'variants') insertedVariants.push({ id: row.id, currentVersionId: (row.current_version_id as string | null) ?? null });
+      } else {
+        conflict(row.id, 'unique');
+      }
+    }
+    tables[name] = counts;
+
+    if (name === 'content_versions') {
+      // 이번에 넣은 원고의 현재 버전을 연결한다. 버전이 들어가지 못했으면 원고가 본문 없이 남으므로 전체를 중단한다.
+      for (const c of insertedContents) {
+        if (c.currentVersionId === null) continue;
+        if (avail.content_versions!.get(c.currentVersionId) !== 'inserted') {
+          throw new AppError('conflict', 'restore_conflict', '원고의 현재 버전을 복원할 수 없어 복원을 중단했습니다', {
+            conflicts: [{ table: 'contents', id: c.id, reason: 'dependency' }],
+          });
+        }
+        await tx.execute(
+          sql`update contents set current_version_id = ${c.currentVersionId}::uuid where id = ${c.id}::uuid and owner_id = ${ownerId}::uuid and current_version_id is null`,
+        );
+      }
+    }
+  }
+
+  // T09: 이번에 넣은 파생본의 현재 버전을 연결한다(원고와 같은 규칙 — 버전이 들어가지 못했으면 전체 중단).
+  for (const v of insertedVariants) {
+    if (v.currentVersionId === null) continue;
+    if (avail.variant_versions!.get(v.currentVersionId) !== 'inserted') {
+      throw new AppError('conflict', 'restore_conflict', '채널 초안의 현재 버전을 복원할 수 없어 복원을 중단했습니다', {
+        conflicts: [{ table: 'variants', id: v.id, reason: 'dependency' }],
+      });
+    }
+    await tx.execute(
+      sql`update variants set current_version_id = ${v.currentVersionId}::uuid where id = ${v.id}::uuid and owner_id = ${ownerId}::uuid and current_version_id is null`,
+    );
+  }
+
+  // FIX-T06(P0): content_versions.ai_run_id ↔ generation_runs(input_version_id/output_ref) 는 서로 참조하는 순환이라 PARENTS 로
+  // 표현하지 않고, 모든 표를 적용한 뒤 확인한다. 이번에 넣은 버전의 run 이 "이번에 넣음" 또는 "동일"이 아니면(충돌·의존성 실패로
+  // 빠졌거나 내용이 다른 기존 행) 채택 이력이 A03 게이트에서 사라지므로 복원 전체를 중단한다.
+  // T09: variant_versions.ai_run_id 도 같은 규칙.
+  const orphanOf = (table: 'content_versions' | 'variant_versions') =>
+    (bundle.tables[table] as Array<{ id: string; ai_run_id: string | null }>)
+      .filter((v) => {
+        if (v.ai_run_id === null || avail[table]!.get(v.id) !== 'inserted') return false;
+        const a = avail.generation_runs!.get(v.ai_run_id);
+        return a !== 'inserted' && a !== 'same';
+      })
+      .map((v) => ({ table, id: v.id, reason: 'dependency' as const }));
+  const orphaned: RestoreConflict[] = [...orphanOf('content_versions'), ...orphanOf('variant_versions')];
+  // T08: job 의 첫 전사(transcript_version_id)도 서로 참조하는 순환이라 여기서 확인한다 — 들어간 job 의 전사가 빠졌으면 중단.
+  for (const j of bundle.tables.transcription_jobs) {
+    if (j.transcript_version_id === null || avail.transcription_jobs!.get(j.id) !== 'inserted') continue;
+    const a = avail.transcripts!.get(j.transcript_version_id);
+    if (a !== 'inserted' && a !== 'same') orphaned.push({ table: 'transcription_jobs', id: j.id, reason: 'dependency' });
+  }
+  if (orphaned.length > 0) {
+    throw new AppError('conflict', 'restore_conflict', 'AI 제안·채택 버전 또는 전사 작업의 실행 기록을 복원할 수 없어 복원을 중단했습니다', {
+      conflicts: orphaned.slice(0, MAX_CONFLICTS_LISTED),
+    });
+  }
+  // FIX-T09(P1): 이번에 넣은 review 파생본을 복원된 행(현재 버전·원고 현재 버전·실제 첨부 관계)으로 다시 검사하고,
+  // 조건을 못 채우면 draft 로 낮춘다(검토 상태를 조건 없이 들여오지 않는다). 결과·미리보기에 이유와 함께 남긴다.
+  const downgradedVariants: DowngradedVariant[] = [];
+  for (const v of bundle.tables.variants) {
+    if (avail.variants!.get(v.id) !== 'inserted' || (v.lifecycle !== 'review' && v.lifecycle !== 'approved')) continue;
+    // FIX-T09 round 2(P1): 검토 요청과 같은 조건(현재 버전·stale·미디어·원고와 파생본의 미해결 경험 claim — 파생본은 나가는 글 전체 기준)을
+    // 복원된 행(claim_confirmations 포함)으로 검사한다.
+    const reasons = await variantReviewBlockers(tx, ownerId, v.id);
+    if (reasons.length) {
+      await tx.execute(sql`update variants set lifecycle = 'draft' where id = ${v.id}::uuid and owner_id = ${ownerId}::uuid`);
+      downgradedVariants.push({ variant_id: v.id, channel: v.channel, reasons });
+    }
+  }
+  // T08: 진행 중이던 전사 job 은 복원 환경의 worker 가 다시 처리하지 않도록 canceled 로 바꾸고, 예약 원장은 예약액으로 확정(failed=true)한다.
+  const interruptedTranscriptions: string[] = [];
+  for (const j of bundle.tables.transcription_jobs) {
+    if (avail.transcription_jobs!.get(j.id) !== 'inserted' || (j.state !== 'queued' && j.state !== 'running')) continue;
+    await tx.execute(
+      sql`update transcription_jobs set state = 'canceled', error = '복원 시 진행 중이던 작업(중단됨)', finished_at = coalesce(finished_at, now()) where id = ${j.id}::uuid and owner_id = ${ownerId}::uuid`,
+    );
+    await tx.execute(
+      sql`update usage_ledger set state = 'settled', actual_amount = reserved_amount, failed = true, settled_at = now() where transcription_job_id = ${j.id}::uuid and owner_id = ${ownerId}::uuid and state = 'reserved'`,
+    );
+    interruptedTranscriptions.push(j.id);
+  }
+  // FIX-T11(P1): 묶음에서 CONFIRMED 인데 원격 결과(publications)가 함께 들어오지 않은 항목은 근거가 없으므로 UNKNOWN(+restored_needs_review)으로,
+  // 그 항목의 CONFIRMED 작업(가장 최근 것)도 UNKNOWN 으로 — 사용자 재확인(조회만)으로 다시 확인한다. 원격 결과가 있는 항목은 CONFIRMED 그대로.
+  const unverifiedConfirmedItems: string[] = [];
+  for (const i of bundle.tables.distribution_items) {
+    if (avail.distribution_items!.get(i.id) !== 'inserted' || i.status !== 'CONFIRMED') continue;
+    const pubs = await tx.select({ id: publications.id }).from(publications).where(and(eq(publications.itemId, i.id), eq(publications.ownerId, ownerId))).limit(1);
+    if (pubs.length) continue;
+    await tx.execute(
+      sql`update distribution_items set status = 'UNKNOWN', restored_needs_review = true where id = ${i.id}::uuid and owner_id = ${ownerId}::uuid`,
+    );
+    const lastJob = await tx
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(eq(jobs.itemId, i.id), eq(jobs.ownerId, ownerId), eq(jobs.state, 'CONFIRMED')))
+      .orderBy(desc(jobs.createdAt), desc(jobs.id))
+      .limit(1);
+    if (lastJob[0]) await tx.execute(sql`update jobs set state = 'UNKNOWN', done_at = null where id = ${lastJob[0].id}::uuid and owner_id = ${ownerId}::uuid`);
+    unverifiedConfirmedItems.push(i.id);
+  }
+  // T10(D17): 이번에 넣은 활성 승인을 복원된 행으로 다시 검사한다(파생본 현재 버전·원고 현재 버전·첨부·계정·재계산 hash·예약 시각).
+  // 맞지 않으면 'restore_stale' 로 철회해 둔다(승인 행·hash 는 그대로 보존). 그 뒤 활성 승인이 없는 approved 파생본은 review 로,
+  // 이번에 넣은 계획의 상태는 항목·승인으로 다시 계산한다.
+  const restoreNow = now ?? new Date();
+  const revokedApprovals: ApplyReport['revokedApprovals'] = [];
+  const itemById = new Map(bundle.tables.distribution_items.map((i) => [i.id, i]));
+  for (const a of bundle.tables.approvals) {
+    if (avail.approvals!.get(a.id) !== 'inserted' || a.revoked_at !== null) continue;
+    const rows = await tx
+      .select()
+      .from(distributionItems)
+      .where(and(eq(distributionItems.id, a.distribution_item_id), eq(distributionItems.ownerId, ownerId)))
+      .limit(1);
+    const item = rows[0];
+    if (!item || !itemById.has(a.distribution_item_id)) continue;
+    const reasons = await snapshotProblems(tx, ownerId, item, restoreNow);
+    if (reasons.length === 0) continue;
+    await tx.execute(
+      sql`update approvals set revoked_at = ${restoreNow.toISOString()}::timestamptz, revoke_reason = 'restore_stale' where id = ${a.id}::uuid and owner_id = ${ownerId}::uuid and revoked_at is null`,
+    );
+    revokedApprovals.push({ approval_id: a.id, item_id: a.distribution_item_id, reasons });
+  }
+  // FIX2-FULLREV2(G19, D19-a): add_missing 으로 더 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌었으면, 옛 브랜드를 가리키는 활성 승인
+  // (이 환경에 이미 있던 승인 — 묶음 승인은 위 재검사가 brand_changed 로 이미 철회)을 새 브랜드 버전 훅과 같은 규칙으로 무효로 한다
+  // (대기 작업 BLOCKED, 항목 PLANNED, 계획 재계산, 파생본 approved → review). 기존 행 UPDATE 의 예외(D6) — 실행을 막는 쪽으로만 바꾸고
+  // 미리보기·결과에 보고한다(FIX-T13 연결 이력 규칙과 같은 선례). 전에는 예약 시각에야 beginSend 가 brand_changed 로 조용히 막았다.
+  const invalidatedApprovals: ApplyReport['invalidatedApprovals'] = [];
+  const brandAfter = await getCurrentBrandProfile(tx, ownerId);
+  if (brandAfter && brandAfter.id !== brandBefore) {
+    for (const r of await invalidateApprovalsForBrandProfile(tx, ownerId, brandAfter.id, restoreNow)) {
+      invalidatedApprovals.push(invalidatedEntry(r, 'brand_changed'));
+    }
+  }
+  // FIX2-FULLREV2(G9 fixup, D40-2): add_missing 이 이미 있던(동일) 원고에 위험 표시 '확인 필요' 소재를 잇는 content_captures 행을 넣으면, 그 원고의
+  // 기존 활성 승인을 소재 위험 표시 훅(invalidateApprovalsForRisk)과 같은 규칙으로 무효로 한다(invalidated:risk_needs_check — 대기 작업 BLOCKED,
+  // 항목 PLANNED, 계획 재계산, 파생본 approved → review). 미리보기는 같은 트랜잭션을 되돌리므로 보고만 한다.
+  // FIX1-FULLREV3(H2·H3): 진행 중 항목의 승인도 무효로 한다(작업·항목 상태 그대로 — in_flight), 부분 게시 작업은 UNKNOWN(partial_job_ids) — 보고에 둘 다 남긴다.
+  // 아이디어는 해당 없음: contents.idea_id 는 원고 행의 열이라 기존 원고에는 복원이 바꾸지 않고(UPDATE 없음), 새로 넣은 원고의 승인은 위 재검사가 맡는다.
+  const riskLinkedContents = new Set<string>();
+  for (const cc of bundle.tables.content_captures as unknown as Array<{ id: string; content_id: string; capture_id: string }>) {
+    if (avail.content_captures!.get(cc.id) !== 'inserted' || avail.contents!.get(cc.content_id) !== 'same') continue;
+    const cap = await tx
+      .select({ risk: captures.risk })
+      .from(captures)
+      .where(and(eq(captures.id, cc.capture_id), eq(captures.ownerId, ownerId)))
+      .limit(1);
+    if (cap[0]?.risk === 'needs_check') riskLinkedContents.add(cc.content_id);
+  }
+  for (const r of await invalidateApprovalsForRisk(tx, ownerId, { contentIds: [...riskLinkedContents].sort() }, restoreNow)) {
+    invalidatedApprovals.push(invalidatedEntry(r, 'risk_needs_check'));
+  }
+  await settleApprovedVariants(
+    tx,
+    ownerId,
+    bundle.tables.variants.filter((v) => avail.variants!.get(v.id) === 'inserted' && v.lifecycle === 'approved').map((v) => v.id),
+    'review',
+    restoreNow,
+  );
+  for (const p of bundle.tables.distribution_plans) {
+    if (avail.distribution_plans!.get(p.id) === 'inserted') await recomputePlanStatus(tx, ownerId, p.id, restoreNow);
+  }
+  // FIX-T13(P1 #4): 연결 이력 규칙 — 동일성 비교는 credential_state 를 빼지만(compareHash), 묶음에 연결 이력이 있으면 로컬 none 을 needs_reconnect 로
+  // 올린다(기존 행 UPDATE 의 예외 — 실행을 막는 쪽으로만 바꾼다). 로컬 linked(유효한 연결)·needs_reconnect 는 그대로.
+  const reconnectRequiredAccounts: string[] = [];
+  const reconnectRequiredLabels: ReconnectLabel[] = [];
+  for (const a of bundle.tables.channel_accounts) {
+    const st = avail.channel_accounts!.get(a.id);
+    if (a.credential_state === 'none') continue;
+    if (st === 'inserted') {
+      reconnectRequiredAccounts.push(a.id);
+      reconnectRequiredLabels.push({ platform: a.platform, display_name: a.display_name, existing: false });
+    } else if (st === 'same') {
+      const res = await tx.execute(
+        sql`update channel_accounts set credential_state = 'needs_reconnect' where id = ${a.id}::uuid and owner_id = ${ownerId}::uuid and credential_state = 'none' returning id`,
+      );
+      if ((res as unknown as { rows: unknown[] }).rows.length) {
+        reconnectRequiredAccounts.push(a.id);
+        reconnectRequiredLabels.push({ platform: a.platform, display_name: a.display_name, existing: true });
+      }
+    }
+  }
+  return {
+    tables,
+    conflicts,
+    insertedAssetIds,
+    downgradedVariants,
+    interruptedTranscriptions,
+    blockedItems,
+    unknownItems,
+    unverifiedConfirmedItems,
+    revokedApprovals,
+    invalidatedApprovals,
+    reconnectRequiredAccounts,
+    reconnectRequiredLabels,
+  };
+}
+
+/** 드라이버가 감싼 오류의 메시지 사슬(cause 포함). */
+function pgErrorText(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; i < 5 && cur; i++) {
+    parts.push(String((cur as { message?: unknown }).message ?? ''));
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return parts.join(' | ');
+}
+
+/**
+ * FIX-T10 round 2: 복원이 넣으려는 첨부의 파생본 버전이 대상 DB 에서 "닫힌" 버전인지(트리거 variant_assets_version_open 과 같은 규칙).
+ * 이번 복원에서 새로 넣은 파생본은 current_version_id 가 아직 NULL 이라 통과한다(복원이 모든 표를 넣은 뒤 연결).
+ */
+async function variantAssetRestoreBlocker(tx: DbOrTx, variantVersionId: string): Promise<'snapshot_referenced' | 'immutable_version' | null> {
+  const r = await tx.execute(sql`
+    select
+      exists (select 1 from distribution_items di where di.variant_version_id = vv.id) as referenced,
+      (select cv.version from variants v join variant_versions cv on cv.id = v.current_version_id where v.id = vv.variant_id) as current_version,
+      vv.version as version
+    from variant_versions vv where vv.id = ${variantVersionId}::uuid`);
+  const row = (r as unknown as { rows: Array<{ referenced: boolean; current_version: number | null; version: number }> }).rows[0];
+  if (!row) return null;
+  if (row.referenced) return 'snapshot_referenced';
+  if (row.current_version !== null && Number(row.current_version) > Number(row.version)) return 'immutable_version';
+  return null;
+}
+
+/** owner 범위가 비었는지(소재·카드·원고·파일·출처 0건). 브랜드 프로필(seed)은 세지 않는다. */
+export async function ownerScopeCounts(db: DbOrTx, ownerId: string) {
+  const n = async (t: typeof captures | typeof ideas | typeof contents | typeof assets | typeof sources) =>
+    (await db.select({ n: count() }).from(t).where(eq(t.ownerId, ownerId)))[0]?.n ?? 0;
+  const counts = {
+    captures: await n(captures),
+    ideas: await n(ideas),
+    contents: await n(contents),
+    assets: await n(assets),
+    sources: await n(sources),
+  };
+  return { counts, empty: Object.values(counts).every((v) => v === 0) };
+}
+
+class DryRunRollback extends Error {}
+
+export interface RestorePreview {
+  format: string;
+  format_version: number;
+  export_id: string;
+  exported_at: string;
+  app_version: string;
+  schema_migrations: string[];
+  manifest_sha256: string;
+  owner_remap: { from: string; to: string };
+  bundle_owner_identity_masked: string;
+  files_verified: number;
+  tables: Record<string, TableCounts & { restored: boolean }>;
+  conflicts: RestoreConflict[];
+  conflicts_total: number;
+  assets: { total: number; included: number; missing: number; verified: number };
+  target: { empty: boolean; counts: Record<string, number> };
+  can_commit_empty_only: boolean;
+  can_commit_add_missing: boolean;
+  warnings: BundleManifest['warnings'];
+  /** FIX-T09: 복원하면 draft 로 낮아질 review 파생본 */
+  downgraded_variants: DowngradedVariant[];
+  /** T08: 복원하면 canceled 로 들어갈 진행 중 전사 job */
+  interrupted_transcriptions: string[];
+  /** T10: 복원하면 BLOCKED 로 들어갈 보내기 전 대기 배포 항목(작업은 복원하지 않음) */
+  blocked_items: string[];
+  /** FIX-T10: 복원하면 UNKNOWN 으로 들어갈(결과 불명 보존) 배포 항목 */
+  unknown_items: string[];
+  /** FIX-T11: CONFIRMED 였지만 원격 결과 근거가 없어 UNKNOWN 으로 들어갈 항목 */
+  unverified_confirmed_items: string[];
+  /** T10: 복원하면 'restore_stale' 로 철회될 승인 */
+  revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX2-FULLREV2(G19): 복원하면 현재 브랜드가 바뀌어 invalidated:brand_changed 로 무효가 될 이 환경의 기존 승인 */
+  invalidated_approvals: ApplyReport['invalidatedApprovals'];
+  /** FIX-T13: 복원하면 "다시 연결 필요"가 될 계정 */
+  reconnect_required_accounts: string[];
+  /** FIX2-T13: 같은 계정의 화면 표시용 이름(ID 없음) */
+  reconnect_required_labels: ReconnectLabel[];
+}
+
+/** 검증된 묶음을 현재 owner 에 대해 미리 계산한다(DB 변경 없음 — 계산 후 rollback). */
+/**
+ * FIX-T07(P1): 묶음의 비용 원장 통화가 현재 설정 통화와 다르면 미리보기 경고(복원은 허용 — 데이터이므로).
+ * 복원 뒤 그 달에 다른 통화 원장이 있으면 AI 예약이 budget_currency_mismatch 로 거부된다.
+ */
+export function ledgerCurrencyWarnings(bundle: ParsedBundle, budgetCurrency: string | undefined): BundleManifest['warnings'] {
+  if (!budgetCurrency) return [];
+  const others = [...new Set(bundle.tables.usage_ledger.map((l) => l.currency))].filter((c) => c !== budgetCurrency).sort();
+  return others.length
+    ? [
+        {
+          code: 'ledger_currency_mismatch',
+          message: `묶음의 AI 비용 원장 통화(${others.join(', ')})가 설정 통화(${budgetCurrency})와 다릅니다. 복원은 되지만, 같은 달에는 AI 호출이 통화 불일치로 거부됩니다.`,
+        },
+      ]
+    : [];
+}
+
+/**
+ * FIX2-CODEX(U1, Codex review-LIVEL1H2 Q5 · 사용자 결정 2026-10-23): 복원 뒤 이 owner 의 AI 비용 원장이 묶음의 비용 이력보다 빠지는 건수(건수만 — 금액·ID 없음).
+ * 미리보기가 applyBundle 을 실행한 같은 트랜잭션에서, 되돌리기 전에 센다(커밋과 같은 계산 — 복원 뒤 상태 그대로).
+ */
+export interface LedgerHistoryGap {
+  /**
+   * 묶음의 usage_ledger 행 중 이번 복원으로 들어가지 않고, 그 비용의 원장 행이 이 owner 에 남지도 않는 행 — 다른 계정이 쓰는 ID(id_in_use)·의존성(dependency) 충돌.
+   * "없는 항목만 추가"는 기존 행을 덮어쓰지 않고 건너뛰므로 그대로 빠진다("빈 환경에만 복원"은 충돌이 하나라도 있으면 커밋을 거부한다).
+   * FIX2-CODEX(U1 fixup): 표 미리보기의 usage_ledger "충돌" 수 전체가 아니다 — 같은 ID 원장이 이미 이 owner 에 있는 'different'(내보낸 뒤 정산·취소·
+   * ledger:resolve 로 바뀐 행, 복원 커밋이 전사 예약을 확정한 행 등)와 같은 실행·전사 작업의 원장이 이미 이 owner 에 있는 'unique'(usage_ledger_run_uq·
+   * usage_ledger_transcription_job_uq — 같은 owner FK 라 그 행은 이 owner 의 것)는 그 행이 남아 월 합계(monthlyUsedMicro)에 들어가므로 세지 않는다
+   * (충돌 목록에는 그대로 나온다).
+   */
+  ledgerNotRestored: number;
+  /**
+   * 복원 뒤 이 owner 에 있는 묶음의 AI 실행(generation_runs) 중 비용 원장 행이 하나도 없는 것 — 원장 도입(0008) 전에 만든 실행, 0008 이전 묶음(원장 표 파일 없음 →
+   * 빈 표로 읽음), 실행은 들어갔지만 그 원장만 충돌로 빠진 경우.
+   */
+  runsWithoutLedger: number;
+  /** 같은 기준의 전사 작업(transcription_jobs) */
+  transcriptionsWithoutLedger: number;
+}
+
+async function ledgerHistoryGap(tx: DbOrTx, ownerId: string, bundle: ParsedBundle, report: ApplyReport): Promise<LedgerHistoryGap> {
+  const missing = async (table: 'generation_runs' | 'transcription_jobs', ledgerCol: 'run_id' | 'transcription_job_id', ids: string[]): Promise<number> => {
+    if (ids.length === 0) return 0;
+    const res = await tx.execute(
+      sql`select count(*)::int as n from ${sql.identifier(table)} where ${sql.identifier(table)}."owner_id" = ${ownerId}::uuid and ${idIn(table, ids)}
+        and not exists (select 1 from usage_ledger l where l.${sql.identifier(ledgerCol)} = ${sql.identifier(table)}."id" and l.owner_id = ${ownerId}::uuid)`,
+    );
+    return Number((res as unknown as { rows: Array<{ n: number }> }).rows[0]?.n ?? 0);
+  };
+  return {
+    // FIX2-CODEX(U1 fixup): 잘리지 않은 전체 충돌 목록에서, 이 owner 에 그 비용의 원장 행이 남는 이유(different·unique)는 뺀다
+    ledgerNotRestored: report.conflicts.filter((c) => c.table === 'usage_ledger' && c.reason !== 'different' && c.reason !== 'unique').length,
+    runsWithoutLedger: await missing('generation_runs', 'run_id', bundle.tables.generation_runs.map((r) => r.id)),
+    transcriptionsWithoutLedger: await missing('transcription_jobs', 'transcription_job_id', bundle.tables.transcription_jobs.map((j) => j.id)),
+  };
+}
+
+/**
+ * FIX2-CODEX(U1): 복원 뒤 비용 이력이 빠지는 경우의 미리보기 경고(복원은 허용 — 지금 허용되는 복원을 막지 않는다). 빠지는 것이 없으면 경고 없음.
+ * 월 합계(monthlyUsedMicro)는 이 owner 의 원장 행만 더하므로 빠진 행·원장 없는 실행의 비용은 그 달 사용액·예산 판정에 들어가지 않는다.
+ */
+export function ledgerHistoryWarnings(g: LedgerHistoryGap): BundleManifest['warnings'] {
+  const parts: string[] = [];
+  if (g.ledgerNotRestored > 0) {
+    parts.push(`"없는 항목만 추가"로 복원해도 묶음의 비용 원장 ${g.ledgerNotRestored}건은 들어가지 않습니다(충돌·의존성 — 기존 행은 덮어쓰지 않음)`);
+  }
+  const subjects = [
+    g.runsWithoutLedger > 0 ? `AI 실행 ${g.runsWithoutLedger}건` : null,
+    g.transcriptionsWithoutLedger > 0 ? `전사 작업 ${g.transcriptionsWithoutLedger}건` : null,
+  ].filter((s): s is string => s !== null);
+  if (subjects.length > 0) parts.push(`복원 뒤에도 비용 원장이 없는 ${subjects.join('·')}이 남습니다`);
+  if (parts.length === 0) return [];
+  return [
+    {
+      code: 'ledger_history_incomplete',
+      message: `AI 비용 이력이 완전하지 않습니다: ${parts.join('. ')}. 복원은 되지만, 이 계정의 월 비용 이력과 예산 합계가 실제 사용보다 적게 잡힐 수 있습니다.`,
+    },
+  ];
+}
+
+export async function previewRestore(db: Db, ownerId: string, bundle: ParsedBundle, budgetCurrency?: string): Promise<RestorePreview> {
+  const target = await ownerScopeCounts(db, ownerId);
+  let report: ApplyReport | null = null;
+  let gap: LedgerHistoryGap | null = null;
+  try {
+    await db.transaction(async (tx) => {
+      report = await applyBundle(tx, ownerId, bundle);
+      // FIX2-CODEX(U1): 되돌리기 전, 복원 뒤 상태로 비용 원장 누락을 센다
+      gap = await ledgerHistoryGap(tx, ownerId, bundle, report);
+      throw new DryRunRollback();
+    });
+  } catch (e) {
+    if (!(e instanceof DryRunRollback)) throw e;
+  }
+  const r = report as unknown as ApplyReport;
+  const g = gap as unknown as LedgerHistoryGap;
+  const m = bundle.manifest;
+  const tables: RestorePreview['tables'] = {};
+  for (const [name, meta] of Object.entries(m.tables)) {
+    const counts = r.tables[name as RestoredTable];
+    tables[name] = counts
+      ? { ...counts, restored: true }
+      : { in_bundle: meta.rows, new: 0, existing_same: 0, existing_different: 0, restored: false };
+  }
+  const included = m.assets.filter((a) => !a.missing).length;
+  return {
+    format: m.format,
+    format_version: m.format_version,
+    export_id: m.export_id,
+    exported_at: m.exported_at,
+    app_version: m.app_version,
+    schema_migrations: m.schema_migrations,
+    manifest_sha256: bundle.manifestSha256,
+    owner_remap: { from: m.owner.id, to: ownerId },
+    bundle_owner_identity_masked: m.owner.identity_masked,
+    files_verified: bundle.files.length,
+    tables,
+    conflicts: r.conflicts.slice(0, MAX_CONFLICTS_LISTED),
+    conflicts_total: r.conflicts.length,
+    downgraded_variants: r.downgradedVariants,
+    interrupted_transcriptions: r.interruptedTranscriptions,
+    blocked_items: r.blockedItems,
+    unknown_items: r.unknownItems,
+    unverified_confirmed_items: r.unverifiedConfirmedItems,
+    revoked_approvals: r.revokedApprovals,
+    invalidated_approvals: r.invalidatedApprovals,
+    reconnect_required_accounts: r.reconnectRequiredAccounts,
+    reconnect_required_labels: r.reconnectRequiredLabels,
+    assets: { total: m.assets.length, included, missing: m.assets.length - included, verified: bundle.assetBytes.size },
+    target,
+    can_commit_empty_only: target.empty && r.conflicts.length === 0,
+    can_commit_add_missing: true,
+    warnings: [...m.warnings, ...ledgerCurrencyWarnings(bundle, budgetCurrency), ...ledgerHistoryWarnings(g)],
+  };
+}
+
+/** ZIP 바이트 → 검증된 묶음(migration 호환 포함). 실패는 ZipFormatError/BundleError(400). */
+export async function parseBundleZip(zip: Uint8Array): Promise<ParsedBundle> {
+  return parseBundle(readZip(zip), { migrations: await readMigrationTags() });
+}
+
+export type BundleCheckResult =
+  | {
+      ok: true;
+      manifest_sha256: string;
+      rows: Record<string, number>;
+      assets: number;
+      /**
+       * FIX3-LIVEL1H2: 아직 해결되지 않은 live 사용량 — usage_ledger 중 pricing_snapshot.usage_source 가 'provider_unstorable' 인 행 수(정보 — 통과·실패와 무관).
+       * 복원하면 그 owner 의 live 예약이 다시 막힌다(hasUnresolvedLiveUsage). 수동 해결(인계 LIVEL1 4~6) 뒤 묶음에서는 해결한 행만큼 줄어야 한다. 값은 내보내지 않는다.
+       */
+      unresolved_live_usage: number;
+    }
+  | { ok: false; error: string; message: string; problems?: unknown; fields?: unknown; tables?: unknown };
+
+/**
+ * FIX2-LIVEL1H2(검토 #12): 운영자용 **읽기 전용** 묶음 확인(`pnpm bundle:check <zip>`). 복원 미리보기와 같은 묶음 검증(parseBundleZip — manifest·migration
+ * 호환·파일 sha256·행 스키마·owner·참조 무결성(수동 해결 `resolution` 형식 포함)·asset checksum)만 하고 DB 를 열지 않으며 아무것도 쓰지 않는다
+ * (restore:preview 는 대상 DB 에 restore_runs·감사 행을 남기고 ZIP 사본을 저장하며 앱을 멈춰야 한다). 실패는 오류 코드·고정 문구·문제 목록만(값 없음 —
+ * 묶음 오류 extra 의 problems·fields·tables 만 옮긴다). 묶음 오류가 아닌 예외는 그대로 던진다.
+ */
+export async function checkBundleZip(zip: Uint8Array): Promise<BundleCheckResult> {
+  try {
+    const b = await parseBundleZip(zip);
+    return {
+      ok: true,
+      manifest_sha256: b.manifestSha256,
+      rows: Object.fromEntries(Object.entries(b.manifest.tables).map(([name, t]) => [name, t.rows])),
+      assets: b.manifest.assets.length,
+      unresolved_live_usage: b.tables.usage_ledger.filter((r) => (r.pricing_snapshot as Record<string, unknown>).usage_source === 'provider_unstorable').length,
+    };
+  } catch (e) {
+    if (!(e instanceof AppError) || e.kind !== 'bad_request') throw e;
+    const extra = (e.extra ?? {}) as Record<string, unknown>;
+    return {
+      ok: false,
+      error: e.code,
+      message: e.message,
+      ...(extra.problems !== undefined ? { problems: extra.problems } : {}),
+      ...(extra.fields !== undefined ? { fields: extra.fields } : {}),
+      ...(extra.tables !== undefined ? { tables: extra.tables } : {}),
+    };
+  }
+}
+
+export type RestoreRunRow = typeof restoreRuns.$inferSelect;
+
+export interface CreatePreviewOptions {
+  restoresDir: string;
+  source: 'upload' | 'export_run';
+  now?: Date;
+  /** FIX-T07: 현재 설정 통화(LLM_BUDGET_CURRENCY) — 다른 통화 원장이 있으면 미리보기 경고 */
+  budgetCurrency?: string;
+}
+
+/**
+ * 미리보기를 만들고 restore_runs(previewed) 를 남긴다. zip 은 검증을 통과한 뒤에만 <restoresDir>/<id>.zip 에 둔다.
+ * 이미 파일로 받아 둔 경우 zipFile 을 넘기면 그 파일을 옮긴다(업로드 임시 파일).
+ */
+export async function createRestorePreview(
+  db: Db,
+  ownerId: string,
+  zip: Uint8Array,
+  opts: CreatePreviewOptions,
+): Promise<{ restoreId: string; preview: RestorePreview }> {
+  const bundle = await parseBundleZip(zip);
+  const preview = await previewRestore(db, ownerId, bundle, opts.budgetCurrency);
+  const restoreId = randomUUID();
+  await mkdir(opts.restoresDir, { recursive: true });
+  const file = restoreZipPath(opts.restoresDir, restoreId);
+  await writeFile(file, zip, { flag: 'wx' });
+  try {
+    await db.transaction(async (tx) => {
+      await tx.insert(restoreRuns).values({
+        id: restoreId,
+        ownerId,
+        createdAt: opts.now ?? new Date(),
+        source: opts.source,
+        manifestSha256: bundle.manifestSha256,
+        preview: preview as unknown as Record<string, unknown>,
+        status: 'previewed',
+      });
+      await recordAudit(tx, {
+        ownerId,
+        action: 'restore.preview',
+        entity: 'restore',
+        entityId: restoreId,
+        versionOrHash: bundle.manifestSha256,
+        details: {
+          source: opts.source,
+          conflicts: preview.conflicts_total,
+          can_commit_empty_only: preview.can_commit_empty_only,
+        },
+        at: opts.now,
+      });
+    });
+  } catch (e) {
+    await rm(file, { force: true }).catch(() => undefined);
+    throw e;
+  }
+  return { restoreId, preview };
+}
+
+/** owner 자신의 내보내기(export_runs)로 미리보기. 다른 owner·없는 ID → 404. */
+export async function createRestorePreviewFromExport(
+  db: Db,
+  ownerId: string,
+  exportId: string,
+  opts: { exportsDir: string; restoresDir: string; now?: Date; budgetCurrency?: string },
+): Promise<{ restoreId: string; preview: RestorePreview }> {
+  const run = await getExportRun(db, ownerId, exportId.toLowerCase());
+  if (!run || run.status !== 'completed') throw new NotFoundError('내보내기를 찾을 수 없습니다');
+  let zip: Uint8Array;
+  try {
+    zip = new Uint8Array(await readFile(exportZipPath(opts.exportsDir, run.id)));
+  } catch {
+    throw new NotFoundError('내보내기 파일이 서버에 없습니다');
+  }
+  return createRestorePreview(db, ownerId, zip, {
+    restoresDir: opts.restoresDir,
+    source: 'export_run',
+    now: opts.now,
+    budgetCurrency: opts.budgetCurrency,
+  });
+}
+
+export function restoreZipPath(restoresDir: string, restoreId: string): string {
+  if (!isUuid(restoreId)) throw new Error('잘못된 복원 ID');
+  return path.join(restoresDir, `${restoreId}.zip`);
+}
+
+export async function getRestoreRun(db: DbOrTx, ownerId: string, id: string): Promise<RestoreRunRow | null> {
+  if (!isUuid(id)) return null;
+  const rows = await db
+    .select()
+    .from(restoreRuns)
+    .where(and(eq(restoreRuns.id, id), eq(restoreRuns.ownerId, ownerId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface CommitOptions {
+  mode: RestoreMode;
+  confirm: true;
+  restoresDir: string;
+  now?: Date;
+}
+
+export interface CommitResult {
+  restore_id: string;
+  mode: RestoreMode;
+  restored: Record<string, number>;
+  skipped_identical: Record<string, number>;
+  conflicts: RestoreConflict[];
+  conflicts_total: number;
+  assets_written: number;
+  assets_verified: number;
+  assets_missing: number;
+  committed_at: string;
+  downgraded_variants: DowngradedVariant[];
+  /** T08 */
+  interrupted_transcriptions: string[];
+  /** T10 */
+  blocked_items: string[];
+  /** FIX-T10 */
+  unknown_items: string[];
+  /** FIX-T11 */
+  unverified_confirmed_items: string[];
+  revoked_approvals: ApplyReport['revokedApprovals'];
+  /** FIX2-FULLREV2(G19): 현재 브랜드가 바뀌어 invalidated:brand_changed 로 무효가 된 이 환경의 기존 승인 */
+  invalidated_approvals: ApplyReport['invalidatedApprovals'];
+  /** FIX-T13: 복원 뒤 다시 연결이 필요한 계정 */
+  reconnect_required_accounts: string[];
+  /** FIX2-T13: 화면 표시용 이름(ID 없음) */
+  reconnect_required_labels: ReconnectLabel[];
+}
+
+async function markRun(db: Db, ownerId: string, id: string, status: 'rejected' | 'failed') {
+  await db
+    .update(restoreRuns)
+    .set({ status })
+    .where(and(eq(restoreRuns.id, id), eq(restoreRuns.ownerId, ownerId), eq(restoreRuns.status, 'previewed')));
+}
+
+/**
+ * 커밋. confirm 이 true 가 아니면 400. 다른 owner·없는 ID → 404. 이미 커밋 → 409 already_committed.
+ * empty_only 인데 비어 있지 않음 → 409 restore_target_not_empty(상태는 previewed 로 남아 add_missing 으로 다시 시도 가능).
+ */
+export async function commitRestore(
+  db: Db,
+  storage: BlobStore,
+  ownerId: string,
+  restoreId: string,
+  opts: CommitOptions,
+): Promise<CommitResult> {
+  if (opts.confirm !== true) throw new AppError('bad_request', 'confirm_required', '내용을 확인했다는 표시(confirm)가 필요합니다');
+  if (!RESTORE_MODES.includes(opts.mode)) throw new AppError('bad_request', 'bad_request', 'mode 는 empty_only 또는 add_missing 입니다');
+  const run = await getRestoreRun(db, ownerId, restoreId.toLowerCase());
+  if (!run) throw new NotFoundError('복원 미리보기를 찾을 수 없습니다');
+  if (run.status === 'committed') throw new AlreadyCommittedError();
+  if (run.status !== 'previewed') throw new RestoreNotCommittableError(run.status);
+
+  // 미리보기를 믿지 않는다: 저장된 ZIP 을 다시 읽고 검증한다.
+  let zip: Uint8Array;
+  try {
+    zip = new Uint8Array(await readFile(restoreZipPath(opts.restoresDir, run.id)));
+  } catch {
+    throw new RestoreFileMissingError();
+  }
+  let bundle: ParsedBundle;
+  try {
+    bundle = await parseBundleZip(zip);
+    if (bundle.manifestSha256 !== run.manifestSha256) {
+      throw new AppError('bad_request', 'manifest_mismatch', '미리보기 이후 복원 파일이 바뀌었습니다. 파일을 다시 올려 미리보기를 만드세요.');
+    }
+  } catch (e) {
+    await markRun(db, ownerId, run.id, 'rejected');
+    throw e;
+  }
+
+  const now = opts.now ?? new Date();
+  try {
+    return await db.transaction(async (tx) => {
+      const locked = await tx
+        .select({ status: restoreRuns.status })
+        .from(restoreRuns)
+        .where(and(eq(restoreRuns.id, run.id), eq(restoreRuns.ownerId, ownerId)))
+        .for('update');
+      if (locked[0]?.status === 'committed') throw new AlreadyCommittedError();
+      if (locked[0]?.status !== 'previewed') throw new RestoreNotCommittableError(locked[0]?.status ?? 'unknown');
+
+      if (opts.mode === 'empty_only') {
+        const scope = await ownerScopeCounts(tx, ownerId);
+        if (!scope.empty) throw new RestoreTargetNotEmptyError({ target: scope.counts });
+      }
+      const report = await applyBundle(tx, ownerId, bundle, now);
+      if (opts.mode === 'empty_only' && report.conflicts.length > 0) {
+        throw new RestoreConflictError({ conflicts: report.conflicts.slice(0, MAX_CONFLICTS_LISTED), conflicts_total: report.conflicts.length });
+      }
+
+      // 파일 바이트: 같은 key 로 쓰고 다시 읽어 sha256 확인. 실패하면 트랜잭션 전체를 되돌린다(이미 쓴 파일은 고아로 남을 수 있음).
+      let written = 0;
+      let verified = 0;
+      let missing = 0;
+      const assetById = new Map(bundle.tables.assets.map((a) => [a.id, a]));
+      for (const id of report.insertedAssetIds) {
+        const a = assetById.get(id)!;
+        const bytes = bundle.assetBytes.get(id);
+        if (!bytes) {
+          missing++;
+          continue;
+        }
+        await storage.put(a.key, bytes);
+        written++;
+        const back = await storage.get(a.key);
+        if (!back || sha256Hex(back) !== a.checksum) {
+          throw new Error('복원한 파일의 checksum 이 일치하지 않습니다');
+        }
+        verified++;
+      }
+
+      const restored: Record<string, number> = {};
+      const skipped: Record<string, number> = {};
+      for (const [name, c] of Object.entries(report.tables)) {
+        restored[name] = c.new;
+        skipped[name] = c.existing_same;
+      }
+      const result: CommitResult = {
+        restore_id: run.id,
+        mode: opts.mode,
+        restored,
+        skipped_identical: skipped,
+        conflicts: report.conflicts.slice(0, MAX_CONFLICTS_LISTED),
+        conflicts_total: report.conflicts.length,
+        downgraded_variants: report.downgradedVariants,
+        interrupted_transcriptions: report.interruptedTranscriptions,
+        blocked_items: report.blockedItems,
+        unknown_items: report.unknownItems,
+        unverified_confirmed_items: report.unverifiedConfirmedItems,
+        revoked_approvals: report.revokedApprovals,
+        invalidated_approvals: report.invalidatedApprovals,
+        reconnect_required_accounts: report.reconnectRequiredAccounts,
+        reconnect_required_labels: report.reconnectRequiredLabels,
+        assets_written: written,
+        assets_verified: verified,
+        assets_missing: missing,
+        committed_at: now.toISOString(),
+      };
+      const updated = await tx
+        .update(restoreRuns)
+        .set({ status: 'committed', committedAt: now, mode: opts.mode, result: result as unknown as Record<string, unknown> })
+        .where(and(eq(restoreRuns.id, run.id), eq(restoreRuns.ownerId, ownerId), eq(restoreRuns.status, 'previewed')))
+        .returning({ id: restoreRuns.id });
+      if (!updated[0]) throw new AlreadyCommittedError();
+      await recordAudit(tx, {
+        ownerId,
+        action: 'restore.commit',
+        entity: 'restore',
+        entityId: run.id,
+        versionOrHash: run.manifestSha256,
+        details: {
+          mode: opts.mode,
+          rows: Object.values(restored).reduce((n, v) => n + v, 0),
+          skipped: Object.values(skipped).reduce((n, v) => n + v, 0),
+          conflicts: report.conflicts.length,
+          assets_written: written,
+          assets_verified: verified,
+        },
+        at: now,
+      });
+      return result;
+    });
+  } catch (e) {
+    if (!(e instanceof AppError)) await markRun(db, ownerId, run.id, 'failed').catch(() => undefined);
+    throw e;
+  }
+}
+
+/** 화면 표시용 목록. */
+export async function listRestoreRuns(db: Db, ownerId: string, limit = 20): Promise<RestoreRunRow[]> {
+  return db
+    .select()
+    .from(restoreRuns)
+    .where(eq(restoreRuns.ownerId, ownerId))
+    .orderBy(sql`${restoreRuns.createdAt} desc`, sql`${restoreRuns.id} desc`)
+    .limit(limit);
+}

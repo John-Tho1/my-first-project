@@ -1,0 +1,587 @@
+# 개인 콘텐츠 스튜디오 — 실행계획·개발 착수 패키지
+기준일: 2026-09-24 (Europe/Moscow) · 설계 v1.0 · 개발용 가칭: Content Studio
+
+이 패키지는 **실행 가능한 앱이 아니라 구현 명세와 Claude Code 인계 자료**다. 앱 코드·OAuth 연결·실제 게시·배포는 아직 수행하지 않았다.
+
+## Idea — 권고안
+모바일과 PC에서 쓰는 개인용 웹앱으로 시작한다. 메모·링크·음성을 쉽게 모으고, AI의 짧은 질문으로 소재를 글로 발전시키며, 작성한 원본을 검색·재사용한다. 사용자가 채널별 최종본과 계정을 확인하고 배포를 실행하면 게시 작업을 추적한다.
+
+기술 권고 [실험 가정]: Next.js/TypeScript 웹앱 + PostgreSQL + 별도 Node.js 작업 처리기 + 비공개 파일 저장소. 하나의 저장소·하나의 도메인 모델을 쓰는 모듈형 단일 앱. 초기에는 Redis, 벡터 DB, 마이크로서비스를 추가하지 않는다. React/Next.js 등 실제 버전은 M0에서 지원·보안 상태를 확인하고 잠근다.
+
+핵심 효과의 가설은 “더 많은 글을 자동 생산”이 아니라 **포착한 생각을 잃지 않고, 쓰기 시작하는 부담을 줄이며, 완성한 글을 다시 활용하는 것**이다. 매체 수와 자동화율보다 사용자가 실제로 이어서 쓰는지를 먼저 확인한다.
+
+## Audience — 확정된 독자와 운영자
+- 운영자: 1명, 필명/별도 채널명으로 시작. 얼굴 공개는 후속 결정.
+- 콘텐츠 독자: 해외 사업·영업 실무자 및 관리자이면서 해외 근무에도 관심 있는 사람.
+- 전문 영역: 해외 사업·영업 운영.
+- 연재 축: 해외 사업·영업 운영 / 전문성의 AI 적용 / 해외·러시아·주재원·조직 차이 경험.
+- 목표: 독립적인 배포 구조, 원본·아이디어 아카이브, 장래 수익 아이디어 축적.
+- 언어: 한국어 우선. 영어 파생본은 명시적 선택. 앱 시간표시: Europe/Moscow.
+
+## Evidence — 근거와 확인 범위
+[확실] 위 방향과 Claude Code 주 구현·Codex 검증 방식은 이번 대화에서 사용자가 정했다. 검증 방식은 2026-11-07 사용자 결정(D42)으로 Claude 독립 검토로 바뀌었다.
+[확실] 직전 단계에서 관련 Notion·Drive를 실제 조회했다. Content Vault 속성 16건, 그중 본문 4건을 읽었다. 이전 조회값은 마이그레이션 직전에 재확인한다.
+[공식자료] API 및 코딩 도구의 공식 자료를 검색·확인했다. 출처·접근 제한은 docs/08_SOURCES.md에 기록했다.
+[미확인] 사용자 PC의 Claude Code/Codex 설치·인증·기존 연결 설정, Git 저장소, 도메인, 서버, SNS 계정 종류·API 승인, 실행 지역의 서비스 지원, 예산.
+[확실] 이 대화의 실행 환경에서는 claude/codex 실행파일이 PATH에서 발견되지 않았다. 사용자 PC의 설치 상태를 의미하지 않는다. 외부 Claude Code를 실행하거나 그 결과를 대신 주장하지 않았다.
+ChatGPT에서 연결된 Notion·Drive 권한은 새 웹앱으로 이전되지 않는다. 앱용 인증을 따로 구성한다.
+
+## 앱에서 실제로 하는 일
+| 화면 | 사용자 행동 | 앱이 돕는 것 |
+| --- | --- | --- |
+| 오늘 | “지금 10분만 쓰기” 선택 | 작성 중 1건, 다시 볼 소재 2건, 확인이 필요한 사실 제시 |
+| 빠른 수집 | 한 문장·URL·파일·음성 입력 | 원문 즉시 저장, 나중에 분류, 중복 후보 제안 |
+| 소재함 | 관심 소재를 선택 | 독자 문제·핵심 주장·필요 근거를 제안 |
+| 작성실 | 질문에 답하고 편집 | 개요 → 초안 → 수정 비교, 실제 경험 확인, 버전 기록 |
+| 아카이브 | 주제·독자·근거로 검색 | 원본과 파생본·발행 결과를 연결 |
+| 배포함 | 계정·채널별 미리보기 확인 후 실행 | 작업별 업로드/게시/실패/확인 필요 상태 추적 |
+
+기술 오류를 제외한 일상 화면에는 큐, API, 토큰 같은 구현 용어를 노출하지 않는다. 배포 화면은 예를 들어 “YouTube: 비공개 업로드 완료, 공개 전환 확인 필요”처럼 실제 결과를 표현한다.
+
+## 범위와 단계
+| 단계 | Claude Code 구현 | 독립 검토 통과 기준 | 참고 기간 [추정] |
+| --- | --- | --- | --- |
+| M0 환경·결정 | 저장소/버전/명령 점검, UI 뼈대, 가상 데이터, 외부 호출 차단 | 문서 정합성·clean-room·기본 구동 | 1–2 개발일 |
+| M1 수집·아카이브 | 텍스트/URL 저장, 편집·검색·태그, 원문 내보내기/복원 | 저장 손실·중복·접근 제어·복원 | 3–5 개발일 |
+| M2 작성 보조 | 문답·초안·버전·채널별 초안·비용 제한, 음성 파일 전사 | 경험 날조 방지·출처 연결·원본 보존 | 3–5 개발일 |
+| M3 배포 엔진 | 승인 스냅샷·DB 작업함·모의 어댑터·수동 배포 파일 | 중복/동시실행/수정 후 승인/취소/불명확 응답 | 3–5 개발일 |
+| M4 채널 연결 | Threads 텍스트 → YouTube 업로드 → IG 조건부, 각 채널 별도 PR | 각 계정과 실제 API로 승인된 시험 | 채널당 2–5 개발일 + 외부 심사 대기 |
+| M5 지속 운영 | 선택 소스 수집, Notion·Drive 선택 가져오기, 백업·알림·재사용 | 복구 훈련·오류 가시성·재수집 중복 방지 | 3–5 개발일 |
+
+개발일은 집중 작업량의 대략적인 가정이며 사용자에게 요구하는 시간이나 완료 약속이 아니다. 작은 PR과 검증 통과를 기준으로 진행한다. 외부 API 심사는 위 기간과 별개다. M1부터 사용하며 M4를 기다리지 않는다.
+
+### 첫 버전에서 제외
+영상 자동 생성·자동 편집, 네이티브 모바일 앱, 멀티테넌트 SaaS, 유료 결제, DM/댓글 자동응답, 모든 SNS 동시 연결, 웹사이트 무차별 수집, Notion 양방향 동기화, 회사 시스템 연결. 영상은 사용자가 완성한 파일을 등록한다. 원본 영상 보관·업로드와 공개 게시를 구분한다.
+
+## 아키텍처 한눈에
+~~~mermaid
+flowchart TD
+  U["개인 웹앱"] --> A["인증·콘텐츠 API"]
+  A --> D["PostgreSQL"]
+  A --> F["비공개 파일 저장소"]
+  A --> Q["승인·작업함"]
+  Q --> W["별도 작업 처리기"]
+  W --> D
+  W --> G["작성·수집 어댑터"]
+  W --> P["채널별 게시 어댑터"]
+  P --> S["SNS·YouTube"]
+  G --> R["허용한 자료·AI API"]
+~~~
+
+웹 화면을 닫아도 작업이 지속되려면 서버와 작업 처리기가 켜져 있어야 한다. 로컬 PC만 사용하는 단계에서는 종료 중 예약 실행을 보장하지 않는다. 운영 배포는 HTTPS가 있는 한 개의 관리 가능한 서버부터 검토하고, 예약 기능을 켜기 전에 상시 실행 여부를 확인한다.
+
+## 채널별 실행 원칙
+- Threads: 공식 API로 텍스트 게시부터. 실제 계정 권한·테스터/앱 공개 조건은 M0/M4에서 확인.
+- YouTube: 완성된 영상의 재개 가능한 업로드. 최초 통합 검증은 승인된 비공개 영상 1건. 미검증 API 프로젝트의 공개 제한을 숨기지 않는다.
+- Instagram: 프로 계정·권한·미디어 규격 확인 후. 본문만으로 이미지/영상 게시물을 완성했다고 표시하지 않는다. (T16: 이미지·캐러셀 **모의** 어댑터만 — 잠정 규격, 공개 미디어 URL 방식은 사용자 결정 대기)
+- LinkedIn: 선택 기능. 필명 정체성·계정 정책·권한 적합성 확인 전 연결하지 않는다.
+- 미지원/미승인 채널: 원고·미디어·제목·설명·체크리스트를 담은 ZIP 내보내기. “파일 준비 완료”와 “게시 완료”는 별개다.
+채널 상태는 지원됨/구현됨/인증됨/실계정 검증됨을 따로 기록한다. 구체 제약은 docs/03_DISTRIBUTION.md 참고.
+
+## Risk — 핵심 통제
+1. 발행 버튼은 선택한 계정·최종 원문·미디어·공개 수준·시간을 보여준 뒤 승인한다.
+2. 글·미디어·계정·공개 범위·예약 시간이 바뀌면 그 채널 승인은 무효화한다.
+3. 응답을 잃어 게시 여부가 불명확하면 자동 재게시하지 않는다. 상태 조회 또는 사용자 확인으로 해결한다.
+4. 외부 콘텐츠는 명령이 아니라 자료다. AI에 게시 권한·OAuth 비밀을 제공하지 않는다.
+5. 원문·근거·AI 생성·사용자 확인을 구분한다. 경험담을 만들어 넣지 않는다.
+6. 고용주·고객·직원의 비공개 자료는 제외한다. 기존 데이터도 선택 미리보기·확인 후 가져온다.
+7. AI/API 비용은 서비스 요금과 별개다. 가격을 가정하지 않고 설정한 상한·사용량을 기록한다.
+8. DB+파일 백업과 복원 시험이 운영 배포의 조건이다.
+
+## Claude Code 역할 (D42 — Codex 미사용, 2026-11-07)
+사용자: 독자·문체·공개 범위 및 실제 연결/게시/운영 배포 결정.
+Claude Code(주 세션): 하나의 작업을 구현하고 테스트·변경 내역·검증할 커밋을 고정.
+Claude 독립 검토자(새 컨텍스트 서브에이전트, 읽기 전용): 같은 HEAD 를 위험 중심으로 반박 검토. 수정 없이 보고.
+Claude Code: 지적을 재현한 뒤 수정 → 새로운 HEAD → 재검토 → 전체 검사.
+검토의 "문제 없음"은 테스트 통과나 사용자 발행 승인과 같지 않다. 자세한 절차는 docs/06_AGENT_WORKFLOW.md.
+
+## Next Decision — 지금 시작하는 방법
+1. ZIP을 개인 프로젝트 폴더에 푼다. 기존 저장소가 있다면 통째로 덮어쓰지 않고 문서를 검토해 합친다.
+2. Claude Code에서 prompts/CLAUDE_START.md를 읽게 한다. 첫 작업 범위는 M0+M1.
+3. 작업 커밋이 만들어지면 Claude Code 가 prompts/CLAUDE_REVIEW.md 로 독립 검토자를 돌린다.
+4. 확정 지적은 prompts/CLAUDE_FIX.md 로 재현·수정하고 재검토한다.
+5. M3까지는 가상 데이터·모의 게시를 기본으로 계속 구현할 수 있다. 실제 계정 연결·API 과금·게시·운영 배포는 구체 실행안을 확인하고 사용자가 결정한다.
+
+채널 우선순위·환경 정보가 없어도 M0–M3 설계와 구현은 시작 가능하다. 정확한 서비스·예산·주간 루틴은 M0에서 선택한다.
+
+### 파일 안내
+- docs/01_PRODUCT_AND_UX.md: 수집·아이디어·작성·아카이브 경험
+- docs/02_ARCHITECTURE.md: 배포 구조·보안·소유권·운영
+- docs/03_DISTRIBUTION.md: 채널 어댑터·승인·재시도 상태
+- docs/04_DATA_AND_API.md: 데이터·API 계약
+- docs/05_BACKLOG_AND_ACCEPTANCE.md + tasks.json: 구현 순서·완료 조건
+- docs/06_AGENT_WORKFLOW.md: Claude Code 구현·독립 검토·수정 진행법
+- docs/07_MIGRATION_AND_OPERATIONS.md: 선택 가져오기·운영/백업
+- docs/08_SOURCES.md: 공식 근거·미확인 사항
+- AGENTS.md, CLAUDE.md: 저장소 작업 규칙
+- prompts/: 시작·검증·수정 지시문
+- templates/, review/: 인계·결정·검증 양식
+
+
+## 실행 방법 (M0, T01)
+T01은 앱 뼈대(web·worker·DB·모의 provider·가상 데이터)다. 외부 키 없이 동작하며 **기본 모드에서 외부 쓰기는 0**이다(AI 모의, 게시 비활성, 수집 비활성). 게시·수집 가드는 서버/worker 코드(`packages/domain/src/guards.ts`)에서 기본 거부로 강제된다.
+
+### 준비
+- Node.js ≥ 22.12 (사용자 PC: v24.21.0, 클라우드 검증: v22.22.2)
+- pnpm 12.6.0 — 루트 `package.json`의 `packageManager`로 고정. `corepack pnpm …`으로 실행하면 이 버전이 자동 선택된다. 아래 `pnpm`은 모두 `corepack pnpm`으로 바꿔 써도 된다.
+
+### 설치·실행
+~~~bash
+corepack pnpm install --frozen-lockfile   # lockfile 고정 설치
+cp .env.example .env.local                # placeholder 만 있음. 기본값으로도 동작
+pnpm db:seed                              # migration + owner·brand profile·가상 소재 10건 (재실행해도 중복 없음)
+pnpm dev                                  # http://localhost:3000 , 생존: http://localhost:3000/api/health , 자세한 상태(로그인 뒤): /api/health/details
+~~~
+`pnpm dev`는 첫 요청에서 migration을 자동 적용하므로 `db:seed` 없이도 뜬다(이때 화면에 `pnpm db:seed 를 실행하세요`가 보인다).
+
+**dev 서버는 이 PC 에서만 듣는다(FIX1-FULLREV2 G1)**: `next dev` 는 hostname 을 주지 않으면 모든 네트워크 인터페이스(0.0.0.0)에서 듣는데, 개발용 로그인은 비밀번호가 없어 같은 Wi-Fi·LAN 의 다른 기기가 owner 로 로그인할 수 있었다. 그래서 `apps/web/scripts/next.mjs` 가 `dev` 에 hostname 이 없으면 loopback 을 넣는다 — `APP_BASE_URL` 호스트가 `127.0.0.1` 이면 `--hostname 127.0.0.1`, 그 밖(기본 `localhost`·로컬 HTTPS `https://localhost:3000` 포함)은 `--hostname localhost`(OS 가 127.0.0.1 또는 ::1 로 푼다). `APP_BASE_URL` 은 환경 → 루트 `.env.local` → `.env` 순서로 읽는다. 127.0.0.1 로 고정하지 않는 이유: Next 가 이 값으로 route handler 의 요청 URL(`request.url`)을 만들므로 `APP_BASE_URL` 과 호스트가 다르면 OAuth 연결(callback 주소 정확 일치)이 실패한다(Next 16.3.6 `router-utils/resolve-routes.js` 코드 기준 — 실제 dev 서버로 확인하지 않음). (FIX1-FULLREV3 H1 뒤로는 callback 이 `APP_BASE_URL` origin + 요청 경로로 비교하므로 이 호스트 일치가 callback 성공의 조건은 아니다 — 개발용 로그인·쿠키·같은 출처 검사가 `APP_BASE_URL` 과 같은 주소로 열기를 기대하므로 그대로 둔다.) 콘솔의 `Network:` 줄도 같은 loopback 주소로 나온다. 다른 기기에서 열어야 하면 `pnpm dev --hostname <주소>` 처럼 직접 준다(`--` 없이 — `pnpm dev -- --hostname …` 은 Next 가 옵션으로 읽지 않는다). loopback 이 아닌 값(`0.0.0.0`·LAN IP 등)이면 그대로 쓰되 시작할 때 한국어 경고 한 줄을 stderr 에 낸다 — 비밀번호 없는 개발용 로그인이 그 망에 열리므로 믿을 수 있는 망에서만 쓴다. `pnpm build`·`pnpm start` 인자는 바꾸지 않는다(운영은 `deploy/content-studio.service` 가 `start --hostname 127.0.0.1` 을 직접 준다). 시험: `apps/web/scripts/next-args.test.ts`.
+
+dev 서버는 Turbopack 파일 시스템 캐시를 끈 채 뜬다(`apps/web/next.config.ts`의 `experimental.turbopackFileSystemCacheForDev: false`, 결정 D21). 재시작·`pnpm build` 뒤 동적 경로(`/distribute/{id}` 등)가 404 로 나오던 문제(M3 화면 확인 D9) 때문이다. 그래도 404 가 나오면 dev 서버를 끄고 `apps/web/.next/dev`·`apps/web/.next/cache`를 지운 뒤 다시 띄운다. `pnpm build`는 dev 서버를 끈 상태에서 실행한다.
+
+### 로그인 (M1, T02)
+로그인 수단은 둘이다. 로컬 개발은 **개발용 로그인(`AUTH_MODE=dev`)**(결정 D3, `docs/DECISIONS.md`), 운영은 **OpenID Connect 로그인(`AUTH_MODE=oidc`, T21-P1b — 아래 "운영 로그인(OIDC)")**. 개발용 로그인은 비밀번호 없이 허용된 식별자 1개(`AUTH_ALLOWED_IDENTITY`)만 접속할 수 있고, `APP_BASE_URL` 이 `localhost`/`127.0.0.1` 일 때만 동작한다. 이 검사는 설정값만 보므로 실제로 이 PC 에서만 닿게 하는 것은 dev 서버의 loopback 바인드다(위 "dev 서버는 이 PC 에서만 듣는다" — `--hostname` 으로 다른 주소를 주면 그 망에 열린다).
+
+1. `.env.local` 에서 `AUTH_ALLOWED_IDENTITY` 를 본인이 쓸 식별자로 바꾼다(기본 placeholder: `owner@example.local`).
+2. `pnpm dev` 후 http://localhost:3000 을 열면 `/login` 으로 이동한다. 식별자를 입력하면 `/`(오늘)로 돌아간다.
+3. 오늘 화면 상단에 `로그인: ow***@example.local`(가린 식별자)·`세션 만료: … (MSK)`·로그아웃 버튼이 보인다. `파일` 섹션에서 PNG·JPEG·WebP·PDF·텍스트(UTF-8, Markdown 포함)를 최대 10MB 까지 올리고 내려받을 수 있다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `AUTH_MODE` | `dev` | `dev` = 개발용 로그인(localhost 전용, **운영 빌드에서는 거부** — 아래 T21-P1a). `oidc` = OpenID Connect 로그인(T21-P1b, 아래). oidc 에서는 식별자 입력 로그인(`POST /api/auth/login`)을 403 `identity_login_disabled` 로 거부(FIX2-FULLREV2 G15: 이런 설정 거부는 감사 행을 쓰지 않고 서버 로그에 사유 이름만 1분 1회) |
+| `AUTH_ALLOWED_IDENTITY` | `owner@example.local` | 로그인 가능한 유일한 식별자. 바꾸면 기존 세션도 무효 |
+| `AUTH_SESSION_TTL_MINUTES` | `720` | 세션 유효 시간(분, 5~43200). 연장(sliding) 없음 |
+| `AUTH_COOKIE_SECURE` | `auto` | `auto` = `http://localhost`·`127.0.0.1` 이면 Secure 끔, 그 외 켬 |
+| `STORAGE_DRIVER` / `STORAGE_LOCAL_DIR` | `local` / `./data/assets` | 업로드 파일 저장 위치(워크스페이스 루트 기준, gitignore). `object` 는 미구현 |
+
+- 세션: 쿠키 `cs_session`(HttpOnly, SameSite=Lax, Path=/). 토큰 원문은 쿠키에만 있고 DB(`sessions`)에는 sha256 해시만 저장한다. 로그아웃은 POST 로만 가능하다.
+- 상태를 바꾸는 요청(로그인·로그아웃·업로드)은 `Origin`(없으면 `Referer`)이 `APP_BASE_URL` 과 같아야 한다. 그래서 `APP_BASE_URL=http://localhost:3000` 이면 `http://127.0.0.1:3000` 으로 열었을 때 403 이 난다 — 주소창 주소를 `APP_BASE_URL` 과 맞춘다.
+- 다른 사용자의 capture·파일 ID 로는 조회·다운로드할 수 없다(항상 404).
+- **주의**: 이 모드는 인증이 아니라 개발 편의 장치다. 인터넷에 노출된 서버에서 쓰지 않는다. 운영은 `AUTH_MODE=oidc`(아래).
+- **운영 로그인(OIDC, T21-P1b — `docs/handoffs/T21_DEPLOY_REVIEW.md` G1)**: 검증된 라이브러리 `openid-client`(panva, **6.8.8 고정**, 2026-09-05 공개 — 전이 의존성 `jose` 6.2.12·`oauth4webapi` 3.8.8 도 2026-09-05)로 일반 OpenID Connect 를 쓴다. IdP 는 정하지 않았다(Google 등은 사용자가 고른다). 자체 비밀번호·자체 JWT 검증은 없다.
+  - 설정(값은 서버 환경에만 — 저장소·화면·로그에 값 없음): `AUTH_MODE=oidc` · `OIDC_ISSUER_URL`(https 만) · `OIDC_CLIENT_ID` · `OIDC_CLIENT_SECRET`(서버 환경 변수로만 읽음, 설정 스키마 밖) · `OIDC_REDIRECT_URI`(= `APP_BASE_URL` 의 origin + `/api/auth/oidc/callback`, 글자까지 같아야 함 — IdP 에도 이 값을 등록) · `OIDC_SCOPES`(기본 `openid email`, openid 필수) · 허용 신원 · `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(로그인 요청의 PKCE verifier·nonce 를 10분 봉인).
+  - 허용 신원(결정): `AUTH_ALLOWED_IDENTITY` 를 **환경에 명시**하면 ID token 의 `email` 이 그 값과 같고(대소문자 무시) `email_verified` 가 불리언 `true` 여야 한다. `AUTH_ALLOWED_SUBJECT` 를 설정하면 `sub` 가 정확히 같아야 한다(issuer 가 하나라 issuer+sub 고정 — 이메일 재할당에 강함). 둘 다 설정하면 둘 다 맞아야 한다. 둘 다 없으면(기본값 `owner@example.local` 뿐이면) 준비 안 됨. 다른 사용자는 만들지 않는다 — owner 는 언제나 `AUTH_ALLOWED_IDENTITY`(기본값 포함)의 행이라 dev 로 쓰던 자료가 그대로 이어진다.
+  - 세션 정책 지문(FIX2-FULLREV2 G16, D40-3): 세션을 만들 때 인증 정책(`AUTH_MODE`·`OIDC_ISSUER_URL`(설정값 그대로 — 끝의 `/`·대소문자만 달라도 다른 issuer, FIX4-FULLREV2)·`AUTH_ALLOWED_SUBJECT`·명시한 허용 email·owner 키)의 sha256 지문을 저장하고, 요청마다 지금 정책의 지문과 다르면 그 세션을 401(쿠키 삭제)로 거부한다. 그래서 허용 sub·issuer·허용 email·인증 방식을 바꾸고 재시작하면 기존 세션이 모두 끊긴다(탈취·재할당 대응). dev 세션은 `AUTH_MODE`·`AUTH_ALLOWED_IDENTITY` 만 본다. migration 0048 적용 뒤에는 지문이 없는 기존 세션이 모두 거부되므로 **한 번 다시 로그인**해야 한다. scope·client_id·redirect·시크릿 변경은 세션을 끊지 않는다.
+  - 흐름: `/login` 의 **OIDC로 로그인** → `GET /api/auth/oidc/start`(다른 사이트에서 연 요청 거부 · 준비 상태 · 시도 제한 · discovery(1시간 캐시, 요청당 10초 제한) · state·nonce·PKCE S256 난수 → 로그인 요청 행 `auth_oidc_states`(state·브라우저 결합 쿠키는 해시만, verifier·nonce 봉인, 10분, 1회용, 진행 중 최대 100개) · 결합 쿠키 `cs_oidc_flow`(HttpOnly·SameSite=Lax·Path=/api/auth/oidc)) → IdP → `GET /api/auth/oidc/callback`(요청 주소(`APP_BASE_URL` origin + 요청 경로 — 프록시 뒤 운영에서 request.url 은 서버 자신의 주소라 요청 origin 은 쓰지 않음, FIX1-FULLREV3 H1) = `OIDC_REDIRECT_URI` 정확 일치 · state 1회용 소비(같은 브라우저·10분·설정 지문) · 라이브러리가 code 교환(PKCE)과 ID token 검증(서명 JWKS·iss·aud·exp·iat·nonce) · 허용 신원 → **T21-P1a 와 같은 전역 잠금 판정(`withLoginAttemptLock`)** 에서 세션 생성·`auth.login`(mode oidc) 또는 `auth.login_denied`(reason·check)).
+  - 실패: 코드별 고정 한국어 문구(`/login?error=<코드>`, JSON 은 `error`) — `oidc_not_configured`(503) · `oidc_state_invalid`(400) · `oidc_login_invalid`(401) · `oidc_identity_denied`(403) · `oidc_provider_unavailable`(502 — IdP 5xx·시간 초과·discovery 실패) · `oidc_cancelled`(401 — IdP 에서 거부) · `login_rate_limited`(429). **state 오류·검증 실패(`oidc_invalid`)·허용 신원 불일치(`oidc_identity_mismatch`)는 식별자 로그인 실패와 같은 전역 15분·10회 창에서 센다**(IdP 장애·취소는 세지 않음). 취소(`oidc_cancelled`) 감사 행은 24시간 창에 20개까지만 쓴다(인증 없이 반복할 수 있어서 — FIX2-FULLREV2 G15, 넘으면 응답은 같고 서버 로그에 이름만 1분 1회). 막힌 동안은 맞는 callback 도 429(state 를 소비하지 않음). code·state·토큰·IdP 오류 본문·이메일 값은 응답·감사·로그에 남기지 않는다.
+  - 준비 상태(빠진 설정 이름만): 로그인 후 설정 화면 "로그인(인증)"·`GET /api/health/details` 의 `auth`. 로그인 전에는 서버 로그 `[auth] oidc_not_configured: <이름들>`(`/login` 을 열거나 시작을 누를 때, 같은 목록은 프로세스당 1분에 한 번 — FIX-T21P1B). 결합 쿠키는 callback 이 지우지 않는다(600초 만료에 맡김 — 늦게 끝난 callback 이 같은 브라우저의 새 흐름 쿠키를 지우지 않게, FIX2-T21P1B). 끝난 흐름의 재사용은 서버의 1회용 state 가 막는다. IdP 응답은 본문 끝까지(1 MiB 상한) 시간 제한 안에서 받으며 본문 끊김·멈춤은 IdP 장애(실패 횟수 제외)로 본다. ID token 의 `iat` 가 30초 넘게 미래면 거부, 시각 클레임(iat·exp·nbf·auth_time)은 유한한 숫자만. IdP 키 교체 직후 60초 안의 로그인은 라이브러리가 JWKS 를 다시 받지 않아 실패할 수 있다.
+  - 시험: 프로세스 안 가짜 IdP(`tests/helpers/fake-oidc-idp.ts` — discovery·JWKS·token endpoint, 생성한 RSA 키로 서명)만 쓴다. 실제 IdP 연결은 하지 않았다(**not_run**) — IdP 콘솔에서 클라이언트를 만들고 실제로 로그인해 보는 일은 사용자 단계이며 별도 승인 범위다(`deploy/README_KO.md`).
+- **운영 빌드에서 dev 로그인 거부(T21-P1a, G1a)**: `NODE_ENV` 가 없음·빈 값·`development`·`test` 가 아니면(운영 빌드 `pnpm build`/`pnpm start` 는 `production`) `AUTH_MODE=dev`(또는 미설정)를 세 곳에서 거부한다 — ① 서버 시작(`apps/web/instrumentation.ts`: 한국어 안내 후 종료 코드 1 로 프로세스를 끝냄 — 다만 Next 가 "Ready" 를 먼저 출력하므로 종료 직전 짧은 순간의 요청 처리 여부는 확인하지 않았다. **보장은 ②·③ 이다**) ② 설정 읽기(`loadConfig` 가 `AUTH_MODE(인증 방식)` 이름만 담은 설정 오류 — 화면·API 가 열리지 않고 공개 `/api/health` 는 `degraded` 503) ③ 로그인 요청(`POST /api/auth/login` 503 `dev_login_refused_in_production`, 폼은 `/login?error=production_dev`). web 은 Next 빌드가 고정한 `NODE_ENV` 를 쓰므로 `pnpm start` 때 `NODE_ENV` 를 바꿔도 풀리지 않는다. **탈출구 없음**: 운영 빌드를 로컬에서 dev 로그인으로 돌리는 설정은 두지 않았다 — Next route handler 는 소켓의 실제 원격 주소를 주지 않고 Host·Origin·X-Forwarded-* 는 위조할 수 있어 "loopback 요청만"을 믿고 가릴 수 없기 때문이다. 로컬 사용·확인은 `pnpm dev` 로 한다. **worker·DB 스크립트도 같은 설정 검사를 쓴다**: `pnpm worker`·`pnpm db:migrate`·`pnpm db:seed`·`pnpm export`·`pnpm restore:*`·`pnpm drill:restore`·`pnpm secrets:rotate` 등을 `NODE_ENV=production` 으로 실행하려면 `AUTH_MODE=oidc` 도 함께 줘야 한다(아니면 같은 안내로 exit 1). 평소처럼 `NODE_ENV` 없이 실행하면 영향 없음(`pnpm drill:mock`·`drill:restore`·`db:migrate` 그대로 동작. `drill:mock` 은 NODE_ENV 를 넘기지 않는 고정 설정이라 운영 환경변수에서도 영향 없음).
+- **로그인 시도 횟수 제한(T21-P1a)**: 최근 15분 동안 실패한 로그인(식별자 불일치·잘못된 요청 본문)이 **전체 합계 10회**가 되면 그 뒤 시도는 식별자가 맞든 틀리든 같은 429 `login_rate_limited`(폼은 `/login?error=rate_limited`)로 거부한다. IP 는 프록시 헤더로 위조할 수 있어 쓰지 않고(전역 창), 식별자 존재 여부도 드러내지 않는다. 마지막 성공 로그인 이전의 실패는 세지 않는다. 실패 기록은 기존 감사 기록(`auth.login_denied`)을 그대로 세므로 별도 표·migration 이 없고 서버를 다시 켜도 유지된다. 429 자체는 감사 기록을 남기지 않는다. 대가: 막힌 동안(가장 오래된 실패가 15분을 넘을 때까지)은 주인도 새로 로그인할 수 없다(이미 있는 세션은 그대로). 동시 요청: 본문을 읽기 전 값싼 조기 검사 뒤, **재검사(잠금을 얻은 뒤의 시각)·판정·성공·실패 기록을 전역 advisory 잠금(`cs.auth.login`) 한 트랜잭션에서 직렬화**하므로 창 안 실패가 10회를 넘지 않는다(FIX-T21P1A). 본문이 늦게 와도 판정·기록 시각은 잠금 안 시각이다. 판정 기록에는 로그인 순번(감사 행 `version_or_hash`)을 붙여 같은 ms 의 성공·실패도 기록 순서로 가린다(순번 없는 예전·복원 기록끼리는 시각 비교, 같은 ms 면 성공 우선). 마지막 성공 찾기와 실패 세기는 SQL 한 문장(한 스냅숏)이라 잠금 밖 조기 검사도 섞인 상태를 세지 않는다(FIX2). 알려진 느슨함: 복원(add_missing)으로 다른 이력의 성공 행이 창 안에 섞이거나 시계가 뒤로 가면 그 창(최대 15분·되돌린 폭) 동안 실패를 덜 셀 수 있다.
+
+### 수집 (M1, T03)
+필수 입력은 원문 하나다. 오늘 화면(`/`)의 **빠른 수집**에서 저장한다.
+
+1. **텍스트**: `원문` 칸에 한 문장만 붙여 넣고 `서버에 저장`. `메모(왜 저장했는지)`·`제목`은 선택.
+2. **URL**: `URL(선택)` 칸을 채우면 URL 수집으로 저장된다. `원문` 칸에 쓴 말은 URL 과 함께 보존된다(원문 = 입력한 URL 그대로 + 줄바꿈 + 내 말).
+3. 저장이 끝나면 상세 화면(`/captures/{id}`)으로 이동하고 `서버에 저장됨 ✓ (YYYY-MM-DD HH:mm MSK)` 이 보인다. 이 표시는 **서버가 저장을 확인한 뒤에만** 나온다(A19). 기기 임시 저장(오프라인)은 아직 없으므로, 저장 버튼을 누르기 전 내용은 서버에 없다.
+4. 소재함(`/captures`)은 최근 순 목록(원문 앞 120자·수집일(MSK)·유형·출처 URL·위험·중복 표시)이며 `더 보기` 로 다음 페이지를 연다.
+
+- **원문은 수정할 수 없다.** 상세 화면에서 바꿀 수 있는 것은 메모·제목·위험 표시뿐이고, 저장할 때마다 `수정 이력`에 한 줄씩 남는다.
+- **수정 충돌**: 두 탭에서 같은 소재를 고치면 늦게 저장한 쪽은 저장되지 않고 `현재 서버 내용 | 내가 입력한 내용` 비교표가 나온다. 내 입력은 폼에 그대로 남아 있으니 비교 후 다시 저장한다(API 는 `If-Match: "<revision>"` 또는 `expected_revision`, 충돌 시 409 + `current`/`yours`).
+- **같은 제출 두 번**(더블클릭·새로고침 재전송)은 폼마다 붙는 `command_key` 로 한 건만 저장된다.
+- **중복 후보**: `정확 중복`은 정규화 URL 이 같거나(추적 파라미터 `utm_*`·`fbclid`·`gclid`, `#…`, 끝 `/`, 대소문자 차이 무시) 원문이 같은(공백·유니코드 정규화 후) 소재다. `유사 (xx%)`는 한국어 음절 2글자 조각이 45% 이상 겹치는 소재다(결정 D4). 둘 다 **제안일 뿐** 자동으로 합치거나 지우지 않는다. 소재함 목록의 `정확 중복 있음` 표시(`GET /api/captures` 의 `has_exact_duplicate`)도 상세 화면과 같은 규칙이다 — 가져오기 '새 버전'·수집 '고쳐진 글'처럼 같은 출처에 붙었지만 내용이 다른 소재는 정확 중복이 아니다(FIX3-FULLREV2 G27).
+- **빠른 수집 본문 크기**: 원문 20,000자·메모 2,000자·제목 200자·URL 2,048자를 모두 채운 한국어 입력도 폼(urlencoded — 한국어 1자 9바이트)으로 저장된다. 요청 본문 상한은 허용 글자 수의 최악 인코딩(글자당 12바이트) + 16KiB(약 300KiB)이고, 글자 수 초과는 파싱 뒤 검사가 거부한다(`?capture_error=invalid`). 이보다 큰 본문만 413(`too_large`)(FIX3-FULLREV2 G28).
+- **원문 추출은 M5 전까지 막혀 있다.** URL 소재의 `원문 추출 요청`은 외부 사이트에 접속하지 않고 차단 기록만 남긴다(`수집 기능이 비활성 상태입니다(M5에서 활성화)`).
+- **내부 주소는 추출 대상이 될 수 없다**(A05): `localhost`, `*.local`/`*.internal`, `127.0.0.1`·`10.x`·`192.168.x` 같은 사설/루프백 IP, `169.254.169.254` 같은 클라우드 메타데이터 주소 등은 `내부망·로컬 주소는 추출할 수 없습니다` 로 거부된다. 서버가 내 PC·사내망에 대신 접속하는 통로(SSRF)가 되지 않게 하기 위해서다. 이런 URL 도 메모와 함께 **저장은 된다**.
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/captures` | `{input_type:'text'\|'url', raw_text?, url?, user_note?, title?, command_key}` → 201 `{capture, created:true, duplicates:{exact,similar}}`, 같은 `command_key` 재요청은 200 `created:false` |
+| `GET /api/captures?cursor=&limit=` | 최근 순 목록(최대 50), `next_cursor` |
+| `GET /api/captures/{id}` | capture·source·중복 후보·수정 이력(ETag = revision). 다른 사용자 ID 는 404 |
+| `PATCH /api/captures/{id}` | 메모·제목·위험만. `raw_text` 를 보내면 400 `raw_text_immutable`, 오래된 revision 은 409 |
+| `POST /api/captures/{id}/extract` | 내부 주소 400 `url_not_allowed`, 기본 모드 403 `collector_disabled`. 어떤 경우에도 외부 접속 없음 |
+
+### 카드·원고·검색 (M1, T04)
+상단 메뉴: `오늘 · 소재함 · 카드 · 아카이브 · 검색`.
+
+1. **소재 → 카드**: 소재 상세(`/captures/{id}`)의 `발전시키기`에서 카드 문구(원문 앞 100자가 채워져 있음)를 고치고 `카드로 발전`. 카드(`/ideas/{id}`)는 **Idea(핵심 아이디어) / Audience(독자) / Evidence(근거) / Risk(위험) / Next Decision(다음 결정)** 과 태그를 담고, 연결된 소재는 `원문(수집)`에 링크로 남는다. AI 제안은 없다(M2).
+2. **원고 시작**: 소재 상세나 카드에서 `원고 시작`. 소재에서 시작하면 원문이 `> 원문:` 인용 블록으로 들어간 초안(버전 1)이, 카드에서 시작하면 카드 항목을 인용한 초안이 만들어지고 소재가 원고의 `원문(수집)`으로 연결된다. 원문 자체는 바뀌지 않는다.
+3. **작성실**(`/contents/{id}`): 본문을 고쳐 `새 버전으로 저장`하면 이전 버전은 그대로 두고 버전이 하나 늘어난다(버전은 DB 에서도 수정·삭제 불가). 버전 목록에서 각 버전을 읽기 전용으로 열고 `이전과 비교`로 줄 단위 차이(+ 추가 / − 삭제)를 본다. 본문을 바꾸지 않고 저장하면(줄바꿈 표기만 다르거나 메모만 바꾼 경우 포함) 새 버전을 만들지 않고 `변경 없음` 안내만 나온다 — 승인·채널 초안은 그대로이고 메모는 저장되지 않는다(FIX3-FULLREV2 G29, D40-5).
+4. **본문 충돌**: 두 탭에서 같은 원고를 고치면 늦게 저장한 쪽은 저장되지 않고 **현재 서버 본문과 내 본문을 둘 다 전부 보여 주는 비교 화면**(차이 표시 포함)이 나온다. 내 본문은 그 화면의 폼에 그대로 있으니 확인 후 `내 본문으로 새 버전 저장`을 누른다(A02). 충돌 화면(원고 본문·원고 정보·카드·소재 긴 입력)은 `Referrer-Policy: same-origin` 으로 나간다(FIX1-FULLREV2 G4 — 전에는 `no-referrer` 라 브라우저가 이 폼 POST 를 `Origin: null` 로 보내 CSRF 거부(`?error=csrf`)됐다. 서버는 지금도 `Origin: null` 을 거부한다). 충돌 화면의 입력칸(`<textarea>`)은 여는 태그 바로 뒤에 줄바꿈 하나를 넣는다 — HTML 규칙상 브라우저가 그 첫 줄바꿈을 버리므로, 내 입력이 빈 줄로 시작해도 다시 저장한 값이 원문과 같다(FIX1-FULLREV3 H5).
+5. **원고 정보**: 제목·연재·독자·태그·상태. 상태는 `초안 → 검토 중 → 준비됨 → 보관`이며 한 단계씩 되돌릴 수 있다(보관 → 초안 가능). 건너뛰기(예: 초안 → 준비됨)는 거부된다. "게시됨" 상태는 없다 — 실제 배포 여부는 채널·버전별로 M3 배포함에서 따로 기록한다.
+6. **아카이브**(`/contents`): 최근 수정 순, 연재·태그·상태 필터. 오늘 화면의 `이어 쓸 초안`은 가장 최근에 고친 초안/검토 중 원고 1건을 보여 준다.
+7. **검색**(`/search`): 소재(원문·메모·제목)·원고(제목·현재 버전 본문)·카드(아이디어·근거·다음 결정)를 **글자 그대로** 찾는다. 한국어는 형태소 분석 없이 부분 문자열로 찾으므로 `주재원`은 “주재원으로”도, `재고 리스`는 “재고 리스크”도 찾는다. 영문은 대소문자를 구분하지 않는다. 공백으로 나눈 여러 단어는 모두 들어 있는 항목만 나온다(서로 다른 단어 8개까지 — 넘으면 자르지 않고 `검색어는 공백으로 나눈 조각 8개까지` 안내로 거부, FIX3-FULLREV2 G32). 연재·상태 필터는 원고에만, 위험 필터는 소재·카드에만 적용된다(결정 D5). 날짜 필터는 MSK 기준.
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/ideas` · `GET /api/ideas?cursor=&limit=` | 카드 생성 `{idea, audience?, evidence?, risk?, next_question?, next_decision?, tags?, capture_ids?}` → 201 · 목록 |
+| `GET/PATCH /api/ideas/{id}` | 카드 + 연결 소재 + 파생 원고(ETag = revision). PATCH 는 `If-Match` 또는 `expected_revision`, 오래되면 409 `current`/`yours` |
+| `POST /api/captures/{id}/ideas` | 소재가 연결된 카드 생성 → 201 |
+| `POST /api/captures/{id}/contents` · `POST /api/ideas/{id}/contents` | 소재/카드에서 원고 시작 → 201 `{content, version, capture_ids}` |
+| `POST /api/contents` · `GET /api/contents?series=&tag=&lifecycle=&cursor=` | 원고 생성(버전 1) · 아카이브 목록 |
+| `GET /api/contents/{id}` | 원고 + 현재 본문 + 버전 목록(바이트 길이) + 원문(수집) + 카드 (ETag = 정보 revision) |
+| `PATCH /api/contents/{id}` | 제목·연재·독자·태그·상태만(본문은 400). 잘못된 전이 400 `invalid_transition`, 오래된 revision 409 |
+| `POST /api/contents/{id}/versions` | `{base_version, body, note?}` → 201 새 버전. `base_version` 이 현재가 아니면 409 `{current:{version, body}, yours:{base_version, body}}` |
+| `GET /api/contents/{id}/versions/{n}` · `GET /api/contents/{id}/diff?from=&to=` | 버전 본문(불변) · 줄 단위 diff `{stats, lines:[{type, text}]}` |
+| `GET /api/search?q=&type=&series=&tag=&risk=&lifecycle=&from=&to=&cursor=&limit=` | `type=all` 은 종류별 첫 `limit` 건 + `more`/`next_cursors`, `type=captures\|contents\|ideas` 는 `next_cursor` 로 이어 보기 |
+
+- 다른 사용자의 카드·원고·소재 ID 는 모두 404 이며, 다른 사용자의 소재를 카드·원고에 연결하는 것은 DB 복합 FK 로도 막힌다(A01).
+- 같은 폼을 두 번 제출하면 카드·원고가 두 개 생길 수 있다(수집과 달리 `command_key` 없음).
+
+### 내보내기·복원 (M1, T05)
+상단 메뉴 `설정`(`/settings`). 결정 D6(docs/DECISIONS.md).
+
+1. **내보내기**: `지금 내보내기` → `data/exports/<export_id>/`(풀어 둔 파일)와 `data/exports/<export_id>.zip` 이 만들어지고 화면에 `내보내기 파일 생성됨 (sha256 …)` 이 표시된다. 목록에서 MSK 시각·크기·건수를 보고 `다운로드`(파일명 `content-studio-export-<yyyymmdd-hhmm>-msk.zip`).
+   - 들어 있는 것: `manifest.json`(모든 파일 크기·sha256, 표별 행 수·sha256, 파일 목록, 적용된 migration), `data/<표>.json`(소재·수정 이력·출처·카드·원고·**모든 원고 버전 본문**·원문 관계·파일 메타데이터·감사 기록), `markdown/`(사람이 읽는 사본 — 소재 원문 그대로, 원고 버전 이력), `assets/`(파일 바이트), `README.md`.
+   - 들어 있지 않은 것: 로그인 세션·토큰·OAuth/API key(표 `sessions`, 그리고 운영 기록 `export_runs`·`restore_runs` 는 제외 목록에 있고 단위 테스트가 schema 와 대조한다). 허용 식별자는 `ow***@example.local` 처럼 가린 형태만.
+   - 묶음은 **암호화되지 않은 개인 데이터**다. 보관 위치는 직접 정한다. `data/` 는 gitignore 대상.
+2. **복원 미리보기**: ZIP(최대 256MB)을 올리거나 목록의 `이 파일로 복원 미리보기`. **이 단계에서는 DB 가 바뀌지 않는다.** 모든 파일의 sha256 을 manifest 와 대조(하나라도 다르면 `manifest_mismatch` 와 문제 경로를 보여 주고 끝), 형식 버전·DB migration 호환·행 형식·묶음 안 ID 참조를 검사한 뒤, 표별 `새로 추가 / 동일 / 충돌` 건수와 파일 checksum 확인 결과를 보여 준다.
+   - 비용 이력 경고(FIX2-CODEX, `ledger_history_incomplete` — 복원은 막지 않음): 복원 뒤 이 계정의 AI 비용 원장이 묶음보다 빠지면 건수만(금액·ID 없음) 알린다 — `없는 항목만 추가`에서 들어가지 않고 이 계정에 그 비용의 원장 행도 남지 않는 비용 원장 행(연결된 항목이 복원되지 않음·다른 계정이 쓰는 ID), 복원 뒤에도 비용 원장이 없는 AI 실행·전사 작업(원장 도입 전 실행 등). 그 비용은 월 사용액·예산 판정에 들어가지 않으므로 월 합계가 실제보다 적게 잡힐 수 있다. 같은 원장이 이미 이 계정에 있어 내용만 다른 행(`같은 ID, 내용 다름` — 예: 같은 환경에서 내보낸 뒤 정산·취소·`ledger:resolve` 로 바뀐 행, 복원이 진행 중이던 전사 예약을 확정한 행)과 같은 실행·전사 작업의 원장이 다른 ID 로 이미 있는 행(`다른 고유 값 충돌`)은 세지 않는다 — 이 계정의 그 행이 그대로 남아 월 합계에 들어간다(표의 충돌 목록에는 나온다).
+3. **복원**: 방식 선택 + `내용을 확인했습니다` 체크 → `복원`. 결과 화면은 `복원 완료: 표별 건수`.
+   - `빈 환경에만 복원`(기본): 이 계정에 소재·카드·원고·파일·출처가 하나도 없고 충돌이 0일 때만. 아니면 409.
+   - `없는 항목만 추가`: 없는 ID 만 넣고, 같은 행은 건너뛰고, **내용이 다른 기존 행은 덮어쓰지 않고 충돌로 보고**한다.
+   - 모든 항목의 소유자는 복원하는 계정으로 바뀌고 **ID 는 그대로** 유지된다(원고↔버전↔소재 관계 보존). 파일은 원래 저장 key 그대로 저장소에 쓰고 sha256 을 다시 확인한다.
+   - 커밋은 미리보기를 믿지 않고 올려 둔 ZIP(`data/restores/<restore_id>.zip`)을 다시 검증한다. 같은 미리보기는 한 번만 커밋된다(두 번째는 409).
+
+CLI(dev 서버를 끈 상태에서 — PGlite 단일 연결):
+```bash
+pnpm export                                    # AUTH_ALLOWED_IDENTITY 의 데이터 → data/exports/<id>.zip (JSON 출력: export_id, zip, totals, 표 sha256)
+pnpm restore:preview data/exports/<id>.zip     # 미리보기(DB 변경 없음, restore_runs 에 기록)
+pnpm bundle:check data/exports/<id>.zip        # 묶음만 확인(복원 미리보기와 같은 검증 — DB 를 열지 않고 아무것도 쓰지 않음, dev 서버가 켜져 있어도 됨. 통과 exit 0, 검증 실패 exit 1)
+pnpm restore:commit data/exports/<id>.zip --mode empty_only --confirm    # --confirm 없으면 거부(exit 2)
+pnpm restore:commit data/exports/<id>.zip --mode add_missing --confirm
+```
+
+**M1 게이트**(10개 가상 소재 입력→검색→원고 수정→export→빈 DB 복원 후 ID 관계·본문·checksum 일치, A18):
+```bash
+pnpm exec vitest run --project integration tests/integration/export-restore.test.ts
+```
+CLI 로 직접 확인하려면 버리는 DB 두 개로:
+```bash
+DATABASE_URL=./data/pglite-t05 pnpm db:seed
+DATABASE_URL=./data/pglite-t05 pnpm export                               # zip 경로 확인
+DATABASE_URL=./data/pglite-t05-restore pnpm db:migrate
+DATABASE_URL=./data/pglite-t05-restore pnpm restore:preview <zip>
+DATABASE_URL=./data/pglite-t05-restore pnpm restore:commit <zip> --mode empty_only --confirm
+DATABASE_URL=./data/pglite-t05-restore pnpm export                       # 두 manifest 의 tables.*.sha256 비교(users·audit_events 제외 모두 같아야 함)
+```
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/exports` · `GET /api/exports` | 내보내기 생성 → 201 `{export_id, zip_bytes, manifest_sha256, totals, tables, warnings, download_url}` · 최근 20건 |
+| `GET /api/exports/{id}` | ZIP 스트림(`application/zip`, attachment, no-store). 다른 사용자·없는 ID → 404 |
+| `POST /api/restores/preview` | multipart `file` 또는 `application/zip` 본문(≤256MB, 임시 파일로 받은 뒤 검사), 또는 JSON `{export_id}` → 200 `{restore_id, preview}`. 검증 실패 → 400 `manifest_mismatch`·`invalid_zip`·`schema_incompatible` 등 + 문제 경로 |
+| `GET /api/restores/{id}` | 미리보기·결과 |
+| `POST /api/restores/{id}/commit` | `{mode: "empty_only"\|"add_missing", confirm: true}` → 200 `{restored, skipped_identical, conflicts, assets_written, assets_verified}`. confirm 없음 400, 비어 있지 않음 409 `restore_target_not_empty`, 두 번째 409 `already_committed` |
+
+- 이 화면·API 는 "안전"·"백업 완료"라고 표시하지 않는다. 복원이 되는지는 실제 복원(미리보기 → 커밋) 결과로만 판단한다(docs/07).
+- 경로는 `EXPORT_LOCAL_DIR`(기본 `./data/exports`)·`RESTORE_LOCAL_DIR`(기본 `./data/restores`)로 바꿀 수 있다.
+
+### 작성 지원 — Brand Profile·인터뷰·모의 AI (M2, T06)
+결정 D7(모의 AI 만)·D12(docs/DECISIONS.md). **외부 AI 호출 없음** — `LLM_MODE=mock`(기본)에서 결정적 모의 응답만 쓰고, 모든 모의 출력에 `모의 응답: 실제 AI 호출 아님` 이 보인다.
+
+1. **Brand Profile**(상단 메뉴 `브랜드`, 또는 `설정` → `/brand`): 필명·독자·연재 축·말투(존댓말/평어)·문체 원칙·피할 표현·CTA 원칙·직접 쓴 예문. 저장할 때마다 **새 버전**이 추가되고 이전 버전은 바뀌지 않는다(seed 는 v1). 두 탭에서 고쳐 늦게 저장한 쪽은 저장되지 않고 필드별 현재 값/내 입력 비교 화면이 나오며, 내 입력이 채워진 폼에서 다시 저장할 수 있다(FIX3-FULLREV2 G31). 회사 문서·다른 프로젝트 메모리 자동 가져오기는 없다.
+2. **인터뷰 질문 3개**(작성실 `/contents/{id}`): 상황 / 판단 / 독자에게 남길 한 가지. 답변은 직접 쓰고, 다시 답하면 새 행이 추가된다(질문별 최신이 현재). AI 는 답변을 채우지 않는다.
+3. **AI 작성 보조**(작성실): 모드 개요/초안/다듬기 → 입력(현재 본문 버전·Brand Profile 버전·답변 ID)을 고정해 실행 기록(`generation_runs`)을 남기고, 제안을 **현재가 아닌 버전**(`AI 제안(모의)`)으로 저장한다. 본문은 바뀌지 않는다. 화면에서 현재 본문 ↔ 제안 diff, `제안 채택`(새 사용자 버전) 또는 `무시`. 실패해도 본문은 그대로이고 실행 기록은 `실패`. 실패한 실행에는 원인(안정 코드 → 고정 문구, 예: 인증 실패·모델 없음·출력 상한·확인할 수 없는 인용)이 보이고, 다시 시도해도 같은 결과인 실패에는 `재시도해도 같은 결과 — 예약액은 확정됩니다` 안내가 붙는다(공급자 원문은 보이지 않음, FIX3-FULLREV2 G21). 채널 초안 AI 실패도 폼 제출 뒤 화면 위 안내에 같은 원인·안내가 보인다. 이번 달 비용 원장에 설정과 다른 통화가 있으면 전용 문구(통화 확인 안내)가 나온다(G22).
+4. **A03**: 채택한 제안에 1인칭 경험 주장(모의·실제 공통 판별: "저는/제가/저희/우리 팀/저도/제게/필자/본인…", 괄호·꺾쇠·따옴표·`*` 뒤 포함, 영어 I/my/we/our — FIX3-FULLREV2 G20, D40-4. 축약형 `우린`·`저흰`·`난 `(뒤에 공백·쉼표 — 난초·난관은 아님)·`내겐`·`제겐`·`저한텐`·`나한텐`·`우리한텐`·`저 혼자`·`나 혼자`·`우리끼리` 도 잡는다 — FIX1-FULLREV3 H4. `전`(전 세계)·`날`(그 날)은 다른 뜻이 많아 넣지 않았다. 정규식이라 주어를 생략한 경험은 놓치고, `본인`·`우리 ` 같은 일반 서술도 확인 대상이 될 수 있다. `우리나라`는 잡지 않는다)이 있으면, 작성실에서 `내 경험이 맞음(확인)` 또는 (문장을 본문에서 뺀 뒤) `본문에서 뺐음(제외)` 을 누르기 전에는 상태를 `준비됨` 으로 바꿀 수 없다(서버 409).
+5. **프롬프트 복사용 보기**(작성실 `<details>`): 모의·실제 AI 가 받을 프롬프트 원문(읽기 전용). 다른 AI 결과를 붙여 넣어 가져오는 기능은 아직 없다(T06 범위 밖).
+
+| API | 설명 |
+| --- | --- |
+| `GET /api/brand` · `POST /api/brand` | `{current, versions}` · 새 버전 `{base_version, pen_name, audience, pillars[], style_rules[], tone, avoid_phrases[], cta_rules[], sample_texts[]}` → 201, base_version 이 현재가 아니면 409 |
+| `GET`·`POST /api/contents/{id}/answers` | `{questions, current, history}` · `{answers:{situation?, judgment?, takeaway?}}` → 201 `{inserted, current}` |
+| `POST /api/contents/{id}/assist` | `{mode, base_version, brand_profile_version, answer_ids[]}` → 201 `{run, proposal_version, diff, claims, followup_questions, warnings, mock_warning}`. 현재가 아닌 base → 409 `stale_base`, 실패 → 502 `llm_failed`, `LLM_MODE=live` → 503(fail-closed, 실행 기록 없음) |
+| `POST /api/contents/{id}/assist/{run_id}/adopt` | `{base_version}` → 201 새 사용자 버전(현재). 제안의 기준 버전이 현재가 아니면 409 `stale_base` |
+| `POST /api/contents/{id}/claims/confirm` | `{run_id, claim_indexes[], resolution?: "confirmed"|"removed"}` → 200 `{confirmed, unconfirmed}`. `removed` = 그 문장을 본문에서 뺐다는 표시 — 현재 본문에 문장(공백·문장부호 무시)이 남아 있으면 409 `claim_still_in_body`, 나중에 다시 넣으면 다시 미해결 |
+
+- 다른 사용자의 원고·실행 기록·답변은 404. 새 표(`interview_answers`·`generation_runs`·`claim_confirmations`)와 Brand Profile 새 열은 내보내기·복원에 포함된다(M1 묶음은 새 표를 빈 표로 읽는다).
+- migration `0005_t06_writing`·`0006_t06_claim_resolution`·`0007_t06_removed_binding` 은 다음 `pnpm dev`/`pnpm db:migrate` 때 기존 DB 에 적용된다(기존 Brand Profile 행은 말투=존댓말, 나머지 빈 목록).
+
+### 근거·비용·live 경계 (M2, T07 — 모의 경계까지)
+결정 D13(docs/DECISIONS.md). **외부 호출·과금·비밀 0.** 실제 AI 호출은 사용자의 별도 승인 뒤에만 연결한다(D7·D8).
+
+- **허용 출처**: 작성실의 AI 작성 보조는 이 원고에 연결된 소재의 출처(source_version)만 근거로 넘긴다(`source_version_ids`, 그 밖이면 404). 입력 버전(`generation_runs.input_version_refs`)에 함께 고정된다.
+- **claim–근거**: 제안의 주장마다 `claims` 행(불변)과 허용 출처 연결 `claim_sources`(locator)가 남는다. AI 가 목록 밖 출처(만든 URL 등)를 내면 저장하지 않고 "출처 미확인"·확인 필요로만 표시한다. 경험 주장을 사용자가 확인하면 근거 등급이 "사용자 확인"으로 보인다(파생).
+- **비용 예약(A15)**: 호출 전 `usage_ledger` 에 예약(프롬프트 글자/3 토큰 추정 × 단가 + 출력 여유분), 호출 후 실제 사용량으로 확정. 이번 달(MSK) 합계 + 예약이 `LLM_BUDGET_MONTHLY_LIMIT` 또는 1회 예약이 `LLM_BUDGET_PER_RUN_MAX` 를 넘으면 429 `budget_exceeded`(아무것도 기록하지 않음). 실패한 호출은 예약액 전체를 비용으로 확정. 가격(`LLM_PRICE_*`)이 비어 있으면 모의는 0 으로 기록만, live 는 차단.
+- **live 경계**: `LLM_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`LLM_LIVE_APPROVAL_REF`)이 모두 있어도 T07 에는 어댑터가 없어 503 으로 거부된다(아무것도 기록하지 않음). 로그인 뒤 `GET /api/health/details` 의 `llm.live_ready`(항상 false)와 `llm.missing`(빠진 조건 이름만), 설정 화면의 "AI 모드·비용"(이번 달 사용액/상한, live 준비 안 됨 목록)으로 확인한다.
+- migration `0008_t07_budget_claims`(claims·claim_sources·usage_ledger). 새 표는 내보내기·복원에 포함된다.
+
+### 채널 초안·배포 파일 (M2, T09)
+결정 D14(docs/DECISIONS.md). **게시하지 않는다**(PUBLISH_MODE=disabled, 채널 어댑터·OAuth 없음). 작성실 `/contents/{id}` 의 "채널 초안" 영역.
+
+- **초안 만들기**: Threads·Instagram·YouTube·블로그마다 원고 현재 버전을 채널 모양으로 바꾼 초안(결정적). "AI 초안(모의)"은 채택하기 전까지 현재 초안이 아니다(예산 원장·claim 저장은 T07 규칙). 편집은 본문 + 채널 형식(JSON), 첨부는 올린 파일 중에서 역할(이미지·영상·썸네일·첨부)을 골라 붙인다.
+- **stale**: 원고가 바뀌면 "원문이 바뀜 — 재검토 필요". 저장 값이 아니라 파생 판정이며, 수정만으로는 풀리지 않는다 — "현재 원문으로 다시 초안". AI 가 자동으로 다시 만들지 않는다.
+- **검토로**: stale 이 아니고, 채널 필수 미디어(Instagram 이미지 1개 이상, YouTube 완성 영상 1개)가 있고, 미해결 1인칭 경험 주장이 없을 때만. 완성 영상은 T08 업로드 세션으로 올려 첨부할 수 있다(D15).
+- **배포 파일 만들기**: 채널별 현재 초안의 본문·메타데이터·첨부 파일(sha256 확인)·manifest 를 ZIP 으로 — "배포 파일(수동 게시용). 자동 게시 아님". 승인·게시 기록이 아니다. 위치 `EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip`.
+
+| API | 설명 |
+| --- | --- |
+| `GET`·`POST /api/contents/{id}/variants` | 파생본 목록 · `{channel, mode: draft\|ai_draft, base_version(원고 현재 버전)}` → 201, 원고 버전 불일치 409 `stale_base` |
+| `POST /api/variants/{id}/versions` | `{base_version, body, metadata}` → 201 새 현재 버전(draft), 오래된 base 409, 채널 형식 위반 400 `invalid_metadata` |
+| `POST /api/variants/{id}/adopt/{versionId}` | AI 초안 채택 `{base_version}` → 201 |
+| `POST /api/variants/{id}/assets` | `{base_version, assets:[{asset_id, position, role}]}` → 201, 다른 사용자 파일 404, 역할·형식 불일치 400 |
+| `POST /api/variants/{id}/lifecycle` | `{lifecycle: draft\|review, base_version}` → 200, `stale_variant`·`media_incomplete`·`unconfirmed_experience_claims` 409 |
+| `POST /api/contents/{id}/package` · `GET /api/packages/{id}` | 배포 파일 ZIP 생성 → 201 · 내려받기(다른 사용자·없는 ID 404) |
+
+- migration `0009_t09_variants`(variants·variant_versions·variant_assets, generation_runs.variant_id, claims.variant_version_id). 새 표는 내보내기·복원에 포함된다.
+
+### 음성 전사·큰 파일 업로드 (M2, T08 — 모의 전사)
+결정 D9·D15(docs/DECISIONS.md). **외부 호출·과금·비밀 0.** 전사는 모의(`STT_MODE=mock`, 파일 checksum 으로 정해지는 자리표시 문장 — 실제 음성 인식 아님). 화면 `/record`(상단 "음성").
+
+- **업로드 세션(A14)**: 음성(MP3·M4A·WAV·WebM, 최대 200MB)·영상(MP4·WebM·MOV, 최대 2GB)을 4–8MiB 조각(기본 8MiB)으로 올린다. 끊기면 같은 세션을 `GET` 해 받은 위치(`next_index`)부터 이어 올린다. 화면은 먼저 파일 전체 sha256 을 계산해 세션에 신고하고(`sha256`), 이어 올릴 때는 신고 sha256·크기·이미 받은 조각별 sha256(`GET` 의 `chunks`)이 이 파일과 모두 같을 때만 재사용한다(다르면 새 세션). 같은 조각 재전송은 그대로(200), 다른 내용이면 409. 세션은 24시간 뒤 만료되고 worker 가 조각을 지운다.
+- **완료 검사**: 서버가 조각을 이어 붙이며(메모리에 전체를 올리지 않음) 크기·앞부분 형식 서명·sha256 을 확인한다. 통과하면 asset `VERIFIED`(`verification_scope=signature_size_checksum` — 재생 가능 여부·디코딩은 확인하지 않음). 실패하면 세션 rejected + 조각 삭제(415 형식, 400 크기·checksum, 400 `assembly_failed` = 조각 파일이 없거나 조각 sha256 이 바뀜). **서버 쪽 저장 오류**(조립 파일 열기·쓰기·닫기·크기 확인 실패 — 디스크 부족 ENOSPC·파일 수 한도 EMFILE 등)는 거부가 아니다: 조립 중이던 파일만 지우고 세션을 open 으로 되돌려 받은 조각을 그대로 두며 503 `upload_assembly_io_error` 로 답한다. 원인을 고친 뒤 같은 세션으로 완료를 다시 요청하면 된다(FIX3-FULLREV2 G24).
+- **전사 job**: `queued → running(25·50·75) → succeeded(100)`. inline worker 가 tick 마다 한 단계(로그인한 전사 목록 조회 `GET /api/transcription-jobs` 때 — 공개 `/api/health` 는 T21-P3 부터 tick 을 돌리지 않는다). 비용은 T07 원장·통화·상한을 같이 쓴다(1분 가격 `STT_PRICE_PER_MINUTE`, 길이 = `duration_seconds` 또는 bytes/16000초, 가격이 비면 0 으로 기록). 실패는 예약액 확정, 시작 전 취소는 예약 해제(0), 처리 중 취소는 예약액 확정.
+- **전사 본문**: 버전 불변. 수정은 새 버전(`base_version` 이 최신이 아니면 409). 화면은 고치기 시작한 버전을 기억해 그 버전을 `base_version` 으로 보낸다 — 그 사이 다른 탭·기기에서 새 버전이 저장되면 초안 옆에 '다른 곳에서 새 버전이 저장됨' 경고와 최신 본문이 보이고, 저장하면 409 로 막힌다(초안은 그대로). '최신 본문으로 다시 시작' 또는 비교 뒤 '내 초안을 최신 기준으로'를 고른다(FIX3-FULLREV2 G23). "이 버전을 소재로 보내기" → 소재(원문 = 전사 본문, 메모 "음성 전사(모의)").
+- **업로드는 됐는데 전사 요청만 실패**(진행 중 409·예산 429·`asset_in_use` 409·네트워크 등): 화면은 '파일 업로드는 끝났습니다 … 전사 요청만 실패했습니다'로 구분해 알리고 **`전사만 다시 요청`** 버튼으로 같은 asset 에 다시 요청한다(다시 올리지 않음). 이어 올리기 기록은 전사 요청이 성공한 뒤에만 지우므로, 새로고침 뒤 같은 파일을 다시 골라도 이미 확인된 세션(verified)의 asset 으로 전사만 요청한다(FIX3-FULLREV2 G25). 다만 그 파일이 서버에서 사라졌거나(404·원본 삭제 410) 확인되지 않은 상태(409 `asset_not_verified`)면 전사만 다시 요청해도 소용없으므로, 저장해 둔 업로드 기록을 지우고 새로 올린다(같은 파일을 고른 경우엔 자동으로 새 세션으로 올림, `전사만 다시 요청`에서는 다시 올리라고 안내). 전사 수정 중 최신 본문을 아직 못 불러왔으면 `비교했음 — 내 초안을 최신 기준으로` 버튼은 숨긴다(G23).
+- **원음 보존**(기본 켬): 끄면 전사 성공 뒤 원본 파일을 지우고 `assets.deleted_at` 을 남긴다(다운로드 410, 채널 초안에 첨부된 파일은 지우지 않음). 내보내기에는 메타데이터만(`asset_deleted` 경고).
+- **live 경계**: `STT_MODE=live` 는 공급자·모델·가격·월 상한·승인 기록(`STT_LIVE_APPROVAL_REF`)이 모두 있어도 T08 에는 어댑터가 없어 503(아무것도 기록하지 않음). 로그인 뒤 `GET /api/health/details` 의 `stt`(모드·`live_ready:false`·빠진 조건 이름), 설정 화면 "AI 모드·비용"에서 확인. 업로드 임시 영역 사용량(세션 폴더·파일 수·바이트)은 로그인 뒤 `GET /api/ops/summary` 의 `uploads`(내 폴더만, D30-3).
+- **브라우저 녹음**: `/record` 는 `MediaRecorder` 지원 여부만 알려 준다(미지원 → "이 기기에서는 브라우저 녹음을 지원하지 않습니다 → 파일 업로드"). 녹음 기능은 기기 확인 뒤 추가(docs/01).
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/uploads/sessions` | `{kind: audio\|video, mime, bytes, sha256?, chunk_size?}` → 201(`chunk_size`·`chunk_count`·`expires_at`), 형식 415, 한도 413 |
+| `GET`·`DELETE /api/uploads/sessions/{id}` | 진행 상태(`received_bytes`·`next_index`·`missing_indexes`·`progress`) · 중단(open 만) |
+| `PUT /api/uploads/sessions/{id}/chunks/{index}` | 조각 바이트(선택 `x-chunk-sha256`) → 새 조각 201 · 같은 내용 200 · 다른 내용 409 `chunk_mismatch` |
+| `POST /api/uploads/sessions/{id}/complete` | 검사 → 200 `{asset(VERIFIED), session}` · 조각 부족 409 `upload_incomplete` · 거부 415/400 `upload_rejected` · 서버 저장 오류 503 `upload_assembly_io_error`(세션 open·조각 유지 — 같은 세션으로 다시 완료) |
+| `POST /api/assets/{id}/transcribe` | `{duration_seconds?, keep_original?, force?}` → 202 {job, existing:false} · 이 파일에 이미 성공한 전사가 있으면(force 아님) 새 작업·비용 예약 없이 200 {job(기존 성공 작업), existing:true} — 응답을 잃은 재시도가 이중 예약을 만들지 않게(원음 보존을 끈 성공 뒤 원본이 지워진 파일도 마찬가지, FIX1-FULLREV3 H6). `force:true` 는 일부러 다시 전사(새 작업·예약 — /record 화면은 보내지 않음) · `keep_original:false` 가 기존 성공 작업을 만나면 원본을 지우고 `original_deleted:true`(첨부·정리 대기면 `original_deleted:false`+`original_kept_reason`, FIX1-FULLREV3 H6 후속) · 음성·영상 아님 415 · 진행 중 409 · 원본 삭제됨 410 · 예산 429 · live 503 |
+| `GET /api/transcription-jobs?asset_id=` · `GET /api/transcription-jobs/{id}` | 목록(inline tick 1회 후) · 한 작업(버전 목록·최신 본문·`mock_warning`) |
+| `POST /api/transcription-jobs/{id}/cancel` | queued·running → canceled, 끝난 작업 409 |
+| `GET /api/transcripts/{id}` · `POST /api/transcripts/{id}/versions` | 전사 버전 · `{base_version, text}` → 201 새 버전, 오래된 base 409 `stale_transcript` |
+| `POST /api/transcripts/{id}/to-capture` | 소재 저장 → 201(같은 버전 재요청 200) |
+
+- 다른 사용자의 세션·조각·파일·작업·전사는 모든 경로에서 404. 조각 파일 위치 `STORAGE_LOCAL_DIR/uploads/<owner>/<session>/<index>`(UUID·정수만으로 경로를 만듦).
+- migration `0012_t08_uploads_transcription`(upload_sessions·upload_chunks·transcription_jobs·transcripts, assets.verification_scope·deleted_at, captures.capture_transcript_id, usage_ledger.transcription_job_id·audio_seconds — run_id 와 둘 중 하나). 업로드 세션·조각은 내보내기에서 **제외**(전송 중 임시 상태), 전사 job·버전은 **포함**. 복원 시 진행 중이던 job 은 canceled 로 넣고 예약 원장은 예약액으로 확정한다.
+
+### 배포 계획·승인·실행 (M3, T10)
+결정 D17(docs/DECISIONS.md). **MOCK 만 — 실제 게시는 하지 않는다.** 배포 계정은 seed 가 만드는 플랫폼별 모의 계정(`MOCK Threads 계정` 등, `external_account_id` 는 `mock:` 접두어)뿐이고, OAuth·인증 비밀·채널 어댑터는 없다(M4). "MOCK" 은 "이 앱 안에서만 기록하고 외부로 아무것도 보내지 않는다"는 뜻이며 모의 결과는 발행 실적이 아니다. 화면: 상단 "배포함"(`/distribute`).
+
+- **계획 만들기**: 작성실 채널 초안이 "검토 중"이면 "배포 계획 만들기" → 채널 초안 × 그 플랫폼의 모의 계정, 공개 범위, 선택 예약(모스크바 날짜·시각 → 서버가 UTC 로 저장, 지금 + 1분 이하·과거는 400 `schedule_in_past`). 기본 선택 없음. 검토 중이 아닌 초안·stale·미디어 부족·미해결 경험 주장·채널과 계정 플랫폼 불일치는 거부된다.
+- **불변 스냅샷**: 항목마다 "정확히 나갈 내용"(원고·파생본·브랜드 버전, 계정·외부 계정 ID, 채널별 글, 첨부 ID·checksum·순서, 공개 범위, 예약 UTC·시간대)을 canonical JSON 으로 만들고 SHA-256 hash 를 저장한다. 항목의 스냅샷은 DB 트리거로 바꾸거나 지울 수 없다.
+- **승인**: 계획 화면에서 항목 카드(계정 `MOCK` 배지·채널별 글·미디어 checksum 앞 12자·공개 범위·`MSK (UTC)` 또는 `즉시`·hash)를 확인하고, 항목을 직접 체크 + "내용을 확인했습니다" → "선택 승인". 서버는 화면의 hash 와 저장된 hash, 그리고 지금의 실제 행(파생본 현재 버전·원고 현재 버전·첨부·계정 상태·예약 시각)을 다시 대조한다. 클라이언트·AI 가 보낸 `approved` 같은 값은 무시된다(승인이 아님). 승인되면 채널 초안은 "승인됨".
+- **승인 무효(A06)**: 승인 뒤 채널 초안 수정·AI 채택·다시 초안·첨부 변경·원고 수정·계정 상태 변경은 같은 트랜잭션에서 그 항목의 승인을 철회한다(`invalidated:body_changed|assets_changed|content_changed|account_changed`). 실행할 때도 다시 검사해 어긋나면 전체를 거부하고 승인을 철회한다. 바뀐 내용을 배포하려면 새 계획을 만든다. 계정 상태 변경(연결 해제·"실제 게시 계정으로 사용" 중지 등)은 이미 보내는 중·원격 처리 중·확인 중인 항목의 승인도 철회한다 — 작업은 그대로 결과를 확인하지만, 다음 전송(재개·재시도)은 보내기 직전 재검사가 막아 다시 승인해야 한다(계정을 다시 켜도 옛 승인은 되살아나지 않음, FIX1-FULLREV2 G8). 보내는 중이던 그 시도가 보류(즉시 중지·인증 거절)로 끝나도 항목은 실행 전(PLANNED)으로 돌아가 다시 승인할 수 있다 — 스레드 일부가 이미 게시됐으면 남은 부분은 보내지 않고 결과 불명(UNKNOWN). 원고의 아이디어 또는 연결 소재에 위험 표시 '확인 필요'가 있으면 승인·실행·보내기 직전 재검사가 모두 막고(`risk_needs_check` — 계획 화면 항목 카드에 위험 표시와 아이디어·소재 링크), 아이디어·소재를 '확인 필요'로 바꾸면 그 원고 항목의 승인을 `invalidated:risk_needs_check` 로 철회한다. '확인 필요'를 해제하면 같은 계획에서 다시 승인할 수 있지만 철회한 승인이 되살아나지는 않는다(FIX2-FULLREV2 G9, D40-2). 계정 상태 변경처럼, 위험 표시도 이미 보내는 중·원격 처리 중·확인 중인 항목의 승인을 철회한다 — '확인 필요'를 붙였다 해제한 뒤 재개해도 다시 승인 없이는 보내지 않는다(FIX1-FULLREV3 H2).
+- **실행(MOCK)**: "지금 실행"은 승인된 항목을 작업 대기열(`jobs`, `QUEUED`)에 넣기까지만 한다 — 결과는 항상 `MOCK`, 처리(lease·재시도·확인)는 **작업 처리기(T11, 아래)**가 맡는다. 버튼을 두 번 눌러도 작업은 하나(같은 `command_key` 재호출은 저장된 결과, 다른 key 는 409 `already_executed`). 승인 없음 403 `approval_required`(아무것도 넣지 않음).
+- **철회**: 승인 기록의 "철회" → 대기 중(QUEUED) 작업은 `BLOCKED`(작업 이력 기록), 항목은 실행 전 상태로, 채널 초안은 "검토 중"으로. 같은 계획에서 다시 승인할 수 있다(새 승인 → 새 작업 key).
+- **같은 글 중복 게시 경고(FIX1-FULLREV2 G2, D40-1)**: 같은 채널 초안 버전 + 같은 계정(또는 같은 payload hash)의 항목이 **다른 계획**에서 이미 게시됨(결과 기록 — 사용자 확인 포함)·결과 불명(`UNKNOWN`)·진행 중(`QUEUED`·`SENDING`·`REMOTE_PROCESSING`·`RETRY_WAIT`·`RECONCILING`·`CANCEL_REQUESTED`·`BLOCKED`)이면 배포 계획 만들기(채널 초안 줄)·선택 승인·실행 구역에 "이 글은 계획 「…」 에서 이미 게시됨/결과 불명/진행 중 — 다시 승인하면 같은 글이 한 번 더 게시될 수 있습니다"를 보인다. **실제 계정** 항목은 승인·실행 때 서버가 다시 조회해 확인값이 있어야 진행한다(화면: "같은 글이 한 번 더 게시될 수 있음을 확인했습니다" 체크 — 필요할 때만 보임, API: `acknowledge_duplicate: true`) — 없으면 409 `duplicate_publish_unacknowledged`(아무것도 바꾸지 않음). 모의 계정은 경고만("모의 처리됨(MOCK — 실제 게시 아님)"). 실행 전(`PLANNED`)·취소(`CANCELED`)·실패(`FAILED` — 보내지 않음)는 세지 않는다. 실행 뒤 전송 전에 생긴 중복은 다시 막지 않는다(화면 경고만).
+
+| API | 설명 |
+| --- | --- |
+| `GET /api/channel-accounts` | 배포 계정(모의만, 비밀 없음) |
+| `GET`·`POST /api/distribution-plans` | 계획 목록(cursor) · `{items:[{variant_id, channel_account_id, requested_result?, visibility?, schedule?:{date,time}}], target_summary?}` → 201(항목 payload·hash) |
+| `GET /api/distribution-plans/{id}` | 계획·항목(payload·hash·계정·활성 승인·작업·지금 검사한 문제·`duplicate_publishes`·`duplicate_ack_required`) |
+| `POST /api/distribution-plans/{id}/approve` | `{item_ids, expected_hashes:{id: sha256}, confirm: true, purpose, acknowledge_duplicate?}` → 200(`duplicate_warnings`), confirm 없음 400, hash 불일치 409 `hash_mismatch`, 스냅샷 변경 409 `snapshot_stale`, 실제 계정 항목의 같은 글 중복 미확인 409 `duplicate_publish_unacknowledged` |
+| `POST /api/distribution-plans/{id}/execute` | `{command_key(8~64), item_ids?, acknowledge_duplicate?}` → 200 `{queued:[{item_id, job_id, mode:'MOCK'}], mode:'MOCK', notice, idempotent_replay, duplicate_warnings}`, 실제 게시 항목의 같은 글 중복 미확인 409 `duplicate_publish_unacknowledged`(대기열·실행 키 그대로) |
+| `POST /api/approvals/{id}/revoke` | `{reason?}` → 200, 이미 철회 409 |
+
+- migration `0016_t10_distribution`(channel_accounts·distribution_plans·distribution_items·approvals·jobs·job_events·execute_commands, variants.lifecycle 에 `approved`). 내보내기에는 모두 들어가고, 복원은 계정·계획·항목·승인만(hash 그대로). 작업·작업 이력·실행 명령은 복원하지 않는다 — 진행 중이던 항목은 `BLOCKED` 로, 복원된 행과 스냅샷이 맞지 않는 활성 승인은 `restore_stale` 로 철회해 넣는다. `add_missing` 은 이미 있던(동일) 배포 항목에 승인·작업 이력을 붙이지 않는다(충돌 `existing_parent` — 필요하면 이 환경에서 다시 승인, FIX2-FULLREV2 G18). 복원으로 더 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌면 이 환경의 기존 활성 승인을 `invalidated:brand_changed` 로 무효로 하고 복원 미리보기·결과(`invalidated_approvals`)와 복원 화면에 그 수를 보인다(G19). 이미 있던 원고에 위험 표시 '확인 필요' 소재 연결이 들어오면 그 원고의 기존 활성 승인도 `invalidated:risk_needs_check` 로 무효로 하고 같은 칸·복원 화면에 따로 보인다(G9 fixup). 무효로 한 승인 중 이미 일부가 게시된(또는 게시 시도가 있었던) 작업은 실행 전으로 가지 않고 결과 불명(UNKNOWN, `thread_partial_revoked`)이 되며, `invalidated_approvals[].partial_job_ids` 로 보고하고 복원 화면이 "실행 전으로 — 다시 계획·승인"과 따로 "다시 게시하지 않음 — 게시 채널에서 직접 확인"을 안내한다. 진행 중이던 항목(`in_flight`)과, lease 된(보내기 전) 작업에 이미 부분 게시가 있어 항목을 실행 전으로 두지 않은 것(`leased_partial_job_ids` — 다음 전송이 다시 보내지 않고 UNKNOWN 으로 정함, H3 후속)도 따로 안내한다(FIX1-FULLREV3 H3). 이전 복원의 확인 표시가 있는 보류(BLOCKED) 항목은 승인만 무효가 되고 보류 그대로라(다시 승인할 수 없음) `restored_review: true` 로 보고하고 "실행 전으로"에 세지 않으며, 채널에서 직접 확인해 게시물이 없을 때만 새 계획으로 다시 승인하라고(확인하지 않고 새 계획을 만들면 두 번 올라갈 수 있음) 따로 안내한다(FIX2-FULLREV3 K2).
+
+### 작업 처리기·재시도·재확인·취소 (M3, T11)
+결정 D18(docs/DECISIONS.md). **모의 어댑터만 — 외부로 아무것도 보내지 않는다.** 확인된 결과도 `MOCK`(외부 ID `mock:<플랫폼>:<uuid>`, 링크 `mock://<플랫폼>/<uuid>`)이며 **실제 발행 실적이 아니다**(DB 가 `is_mock = (verification = 'MOCK')`·`mock:` 접두어를 CHECK 로 강제).
+
+- **처리 흐름**: tick 한 번 = lease 만료 복구 → lease(짧은 트랜잭션, `FOR UPDATE SKIP LOCKED` — 다른 worker 가 잡은 작업은 건너뜀) → 작업마다 ① 한 트랜잭션에서 **승인·스냅샷·취소·실행 모드를 다시 검사**하고 `SENDING` 전이 + **전송 의도(`send_intents`, key `<작업>:<시도>`)** 기록 ② DB 잠금 없이 어댑터 호출(heartbeat 로 lease 연장, `JOB_SUBMIT_TIMEOUT_MS` 기본 30초 넘으면 결과 불명) ③ 한 트랜잭션에서 결과 기록·다음 상태.
+- **상태(작업·항목)**: `QUEUED · 대기` → `SENDING · 전송 중` → `CONFIRMED · MOCK 게시 확인 (mock://…)`(비공개면 "비공개 업로드" — 확인됨 ≠ 공개). 그 밖에 `REMOTE_PROCESSING`(원격 처리 중), `RETRY_WAIT · 재시도 대기 (n/5, 다음 …)`, `RECONCILING · 등록 여부 확인 필요`, `UNKNOWN · 확인 불가 — 자동 재전송 안 함`, `CANCEL_REQUESTED · 취소 확인 중`, `BLOCKED`(승인 없음/변경됨·인증), `FAILED`, `CANCELED`. 전이는 `@cs/domain` `JOB_TRANSITIONS` 한 곳에서만 정의하고 모든 전이는 `job_events` 에 추가 전용으로 남는다(코드·시도·재시도 분류·외부 ID 만 — 본문·토큰 없음).
+- **재시도**: 부작용 없는 일시 오류만 자동 재시도(30초 × 2^(n-1), 상한 15분, ±20% jitter, `Retry-After` 존중, 최대 5회 → `FAILED`, Retry-After 1시간 초과는 바로 `FAILED`). 부작용 불명(시간 초과·응답 유실·불명확한 5xx)은 재시도가 아니라 **원격 조회**(`RECONCILING`). 인증 오류(401)는 `BLOCKED`(M3 에는 refresh 없음), 형식·권한 오류는 `FAILED` — 자동 반복하지 않는다. 숫자는 잠정값(D18).
+- **결과 불명(A08·A20)**: 전송 의도가 있는데 결과를 모르면 다시 보내지 않고 조회한다 — 찾으면 `CONFIRMED`, "확실히 없음"이면 새 시도(새 의도), 확인 불가 3회면 `UNKNOWN`. `UNKNOWN` 은 자동으로 다시 보내지 않는다(사용자 "재확인"만). worker 가 죽어 lease 가 만료되면 의도 전 작업은 `QUEUED` 로, 의도 뒤 작업은 `RECONCILING` 으로 간다.
+- **취소(A11)**: 아직 보내지 않은 작업(`QUEUED`·`RETRY_WAIT`·`BLOCKED`)만 바로 `CANCELED`. 전송 단계면 `취소 확인 중`(CANCEL_REQUESTED) — 원격이 이미 받았으면 `CONFIRMED`(이력 `cancel_too_late`, 화면 "취소 불가(이미 전송됨)")이고 취소 성공이라고 하지 않는다. `UNKNOWN` 은 409 `cancel_unknown`. 전송 단계 작업의 승인을 철회해도 같은 방식(CANCEL_REQUESTED).
+- **승인 철회(A10)**: 재시도 대기 중 승인을 철회하면 **즉시** `BLOCKED`(항목은 `PLANNED` — 다시 승인 후 실행, T12 D19). 훅을 거치지 않은 변경도 다음 전송 직전 재검사가 `BLOCKED`(`approval_missing`)로 막고 새 전송 의도를 만들지 않는다. 이 재검사는 활성 승인이 **그 작업을 만든 승인**(작업 키 `publish:<항목>:<승인>`)과 같은지도 본다 — lease 만 잡은(보내기 전) 작업은 철회 때 막히지 않으므로, 원인(계정 끔→켬·위험 표시 해제)을 되돌리고 다시 승인한 뒤 lease 만료 복구로 되살아난 옛 작업은 새 승인으로 보내지 않고 `BLOCKED`(`approval_missing`, 이력 `approval_binding: other_approval`)·항목 `PLANNED` 로 둔다. 새 승인은 그대로라 다시 "실행"하면 새 작업으로 게시한다(FIX1-FULLREV4 J1).
+- **계획 상태**(T12 D19 에서 정리): 모두 확인 → `completed`, 확인 1개 이상 + 나머지 끝남·멈춤 → `partial`(부분 성공), 확인 없이 보류·불명·다시 승인할 항목 → `attention`(확인 필요), 모두 취소 → `canceled`, 실패·취소만 → `failed`.
+- **화면**: `/distribute/{id}` 항목 카드에 작업 상태 한 줄, `취소`·`재확인(조회만 — 다시 보내지 않음)` 버튼, 원격 결과(`MOCK` 배지 + **실제 발행 실적 아님**), 작업 이력 최근 10개. 계획 아래 `작업 처리 실행(모의 1회)`(내 작업 최대 5개).
+- **처리기 실행**: web(`WORKER_MODE=inline`)은 기본적으로 로그인한 요청에서만 배포 작업을 처리한다 — 화면의 "작업 처리 실행"(`POST /api/worker/tick`, 내 작업 최대 5개)과 전사 목록 조회(`GET /api/transcription-jobs`, tick 1회·최대 5개). 공개 `/api/health` 는 T21-P3 부터 처리하지 않는다.
+  - **주기 처리(T21-P2, G3)**: `WORKER_INLINE_INTERVAL_SECONDS`(기본 `0` = 끔, 켜면 `5`~`600` 초)를 주면 서버 시작 훅(`apps/web/instrumentation.ts`, 시작 가드 다음)이 web 안 타이머를 하나 띄운다. 직전 처리가 **끝난 뒤** 그 간격만큼 쉬고 다음 처리를 시작한다(겹치지 않음·흔들림 없음·`unref`·프로세스당 한 타이머 — 모듈이 다시 읽혀도 두 번 띄우지 않음). 처리 함수는 전사 목록 조회와 같은 `runInlineWorker`(HTTP 요청·인증 우회 없음)이고, 실패는 오류 이름·코드만 로그에 남긴 뒤 다음 주기에 다시 한다(서버는 계속). 개발(`pnpm dev`)·시험에서는 기본이 끔이라 동작이 바뀌지 않는다. 운영 빌드에서 끈 채로 시작하면 경고 한 줄. 운영 권장값 30 — `deploy/README_KO.md`.
+  - **오래 지난 예약(docs/07, T21-P2)**: 예약 항목의 **첫 전송**을 할 때 예약 시각이 60분(`SCHEDULE_STALE_GRACE_MS`, 잠정)보다 더 지났으면 보내지 않고 `BLOCKED`(`schedule_stale`, 화면 "예약 시각이 오래 지나 자동으로 보내지 않음 — 확인 후 재시도")로 둔다. 승인은 그대로라 항목의 "재시도"로 확인하면 그때 보낸다(FIX1-T21P2: 재시도가 승인 ID·내용 hash·예약 시각을 담은 확인을 기록하고, 보내기 직전 셋이 지금과 모두 같을 때만 통과 — 다른 사유의 재시도는 확인이 아니다). 이미 한 번 보낸 작업(재시도·이어 올리기)과 예약 없는 작업은 해당 없음. 주기 처리·화면 버튼·`pnpm worker` 모두 같은 경로. `pnpm worker` = tick 1회(서버를 끈 뒤), `pnpm worker -- --loop 5000` = 5초마다(Ctrl-C 로 멈춤). 모의 결과 시나리오는 개발·테스트에서만 `MOCK_CHANNEL_SCENARIO`(`success`·`transient`·`permanent`·`auth`·`ambiguous_sent`·`ambiguous_not_sent`·`processing_then_confirm`·`hang`)로 바꿀 수 있다(운영 빌드에서는 무시). 항목별 선택은 T12.
+
+| API | 설명 |
+| --- | --- |
+| `POST /api/distribution-items/{id}/cancel` | `{}` → `{canceled:true, state:'CANCELED'}` 또는 `{cancel_requested:true, state:'CANCEL_REQUESTED', message:'취소 확인 중'}`. UNKNOWN 409 `cancel_unknown`, 끝남·실행 전 409 `not_cancellable` |
+| `POST /api/distribution-items/{id}/reconcile` | `{}` → `{state_before, state, found, remote}` — 조회만(절대 다시 보내지 않음), 대상 없음 409 `nothing_to_reconcile` |
+| `GET /api/jobs/{id}` | 작업 상태·이력(최근 50)·전송 의도·원격 결과(비밀·본문 없음, lease 소유자는 표시 이름뿐) |
+| `POST /api/worker/tick` | `{max_jobs?(1~20), worker_id?}` → `{worker_id, recovered, leased, results, mode:'MOCK'}` — 로그인 owner 의 작업만 |
+| `GET /api/ops/summary`(로그인) | `ops.jobs: {queued, leased, retry_wait, reconciling, unknown, blocked}` 내 작업 상태별 개수(집계만). T11 에서는 공개 `/api/health` 에 있었으나 D30-3 에서 옮김 |
+
+- migration `0017_t11_jobs`: jobs 열(heartbeat_at·last_error_code·last_retry_class·max_attempts·reconcile_count·cancel_requested_at·done_at), 상태 CHECK 확장(`DONE` → `CONFIRMED`), `send_intents`(결과 한 번만 기록·삭제 금지 트리거), `publications`(모의 CHECK·재확인 열만 변경·삭제 금지 트리거). 둘 다 **내보내기만**(복원 안 함) — 복원한 환경은 원격을 다시 확인해야 한다.
+
+### 모의 배포 시나리오·M3 게이트 (T12)
+결정 D19(docs/DECISIONS.md). **MOCK 결과는 어떤 경우에도 실제 발행 실적이 아니다** — 모의 계정·모의 어댑터만 쓰고 외부로 아무것도 보내지 않으며, 성공 화면에는 항상 `MOCK` 배지와 `실제 발행 실적 아님`이 붙는다(`publications.verification = 'MOCK'` 로만 저장).
+
+- **항목별 모의 시나리오(개발용)**: `/distribute/{id}` 의 실행 전·진행 중 항목(모의 계정만)에 `모의 시나리오` 선택 + `모의 시나리오 저장` — 라벨 `개발용 · 모의 결과 선택 (실제 채널 없음)`. 값: `success`(공개 범위 그대로, **YouTube 는 비공개 업로드 → 조회에서 확인**, A12) · `success_public`(payload 가 public 일 때만 공개 결과, 비공개 승인이면 `visibility_not_approved` 로 거절) · `processing_then_confirm` · `transient` · `transient_then_success` · `rate_limited`(429 + Retry-After 5초) · `server_error_no_side_effect`(503) · `server_error_side_effect_unknown`(쓰기 뒤 5xx = 결과 불명 → 조회) · `permanent`(400) · `auth`(401) · `ambiguous_sent` · `ambiguous_not_sent` · `hang`(시간 초과) · `cancel_supported`(원격 취소 가능) · `reconcile_unsupported`(조회 불가 → 3회 뒤 UNKNOWN) + 지연 `delay_ms`(0~5000). 시나리오는 승인 스냅샷 **밖** 별도 표(`mock_scenarios`)에 저장되므로 **payload hash·승인 상태가 바뀌지 않는다**. 우선순위: 항목별 → `MOCK_CHANNEL_SCENARIO`(개발·테스트만) → `success`.
+- **화면 문구**: `비공개 업로드 완료, 공개 전환 확인 필요`(YouTube 비공개 — "공개 게시"가 아님) · `등록 여부 확인 필요`(RECONCILING) · `확인 불가 — 자동 재전송 안 함, 재확인 또는 새 계획 필요`(UNKNOWN) · `취소 확인 중` · `취소됨` · `승인 없음 — 다시 승인 후 실행` · `계정 다시 연결 필요`(401 보류) · `재시도 대기 (n/5, 다음 HH:mm MSK)`. 버튼: `재시도`(보류 + 유효 승인) · `재확인` · `취소` · `모의 시나리오 저장` · `작업 처리 실행(모의 1회)`. 배포함 목록에 `부분 성공`·`확인 필요`.
+- **부분 성공(A09)**: 여러 채널 중 일부만 확인되면 계획은 `partial`(부분 성공). 성공한 항목은 더 돌려도·재확인해도 다시 보내지 않는다. 401 로 보류된 항목은 계정을 다시 연결(모의: 시나리오를 바꿈)한 뒤 **`재시도`** — 같은 작업이 새 시도·새 전송 의도로 대기열에 들어간다(승인·내용이 그대로일 때만, 감사 기록). 승인 문제로 보류된 항목(`PLANNED` 로 돌아감)은 다시 승인한 뒤 새 실행 키로 실행하면 그 항목만 새 작업이 된다.
+- **재시작**: 모의 "원격"은 프로세스 메모리라 서버를 다시 켜면 결과 불명(`RECONCILING`) 작업은 3회 확인 불가 뒤 `UNKNOWN` 으로 끝난다 — **다시 보내지 않는다**(예상된 동작). 원격을 다시 볼 수 있으면 `재확인` 으로 `CONFIRMED`.
+- **`pnpm drill:mock`**(서버를 끈 상태 불필요 — 버리는 메모리 DB): 모든 시나리오 × 항목 1개, PARTIAL 계획(threads·instagram 401 → 재시도·youtube·blog), 더블 실행, worker 2개, lease 만료, 재시작, A10(철회 → 재승인·재실행)을 끝까지 돌리고 표를 찍는다. 열: `시나리오 | 최종 job 상태 | 항목 상태 | intent 수(전송 의도 = 원격으로 보내려 한 횟수) | publication(MOCK)(모의 결과 종류/원격 공개 범위, 없으면 "없음") | 재전송 여부(없음 · 재시도 N회(보내지 않음 확인 뒤) · 새 작업)`. 불변식(확인된 항목의 중복 전송·MOCK 아닌 결과·결과 불명 뒤 맹목 재전송·결과 없는 CONFIRMED·`fetch` 호출)이나 기대 상태와 다르면 **exit 1**. `tests/integration/m3-gate.test.ts` 가 같은 표를 확인한다.
+
+| API | 설명 |
+| --- | --- |
+| `PUT /api/distribution-items/{id}/mock-scenario` | `{scenario, delay_ms?}` → `{item_id, scenario, delay_ms, notice:'개발용 · 모의 결과 선택 (실제 채널 없음)'}`. 모의 계정 아님 400 `not_mock_account`, 끝난 항목 409 `item_finished`(POST = HTML 폼) |
+| `POST /api/distribution-items/{id}/retry` | `{}` → `{state:'QUEUED', attempt_next, mode:'MOCK'}`. 보류 아님 409 `not_retryable`, 승인 없음 409 `approval_required`, 결과 불명 409 `outcome_unknown`(조회가 남은 단계 미게시를 확인한 뒤 중지·일일 상한·연결 정보로 보류된 작업은 예외 — 재시도 가능), 한도 409 `attempts_exhausted`, 내용 변경 409 `snapshot_stale`, 첫 전송 전 보류된 예약이 60분 넘게 지남 409 `schedule_stale`(대기열에 넣지 않음 — 한 번 더 재시도 = 지난 예약 전송 확인, D36) |
+| `GET /api/ops/summary`(로그인) | `ops.attention_plans`(내 확인 필요 계획 수). T12 에서는 공개 `/api/health` 의 `jobs.attention_plans` 였으나 D30-3 에서 옮김 |
+
+- migration `0018_t12_mock_scenarios`: `mock_scenarios`(항목당 1행, 시나리오 CHECK, 지연 0~5000, 모의 계정 항목만 트리거) — **내보내기만**. 계획 상태 CHECK 에 `attention` 추가(기존 `failed`·`partial` 중 확인 없이 보류·불명이 있는 계획은 `attention` 으로 재분류). 브랜드 프로필 새 버전은 옛 브랜드를 가리키는 활성 승인을 `invalidated:brand_changed` 로 철회한다.
+
+### 운영·복원 훈련·보존 정리 (M5, T20 — 로컬·모의 범위)
+결정 D22(docs/DECISIONS.md). **외부 알림·외부 저장소·외부 호출 0.**
+- 화면 `/ops`(상단 "운영", 설정에서도 링크): owner 전용·읽기 전용. 숫자는 모두 DB 행과 파일에서 센다. 원천이 없으면 "측정 없음"이며, "정상"·"안전" 같은 판정 배지는 없다.
+  - 배포 작업: 상태별 개수, 처리할 때가 지난 QUEUED 중 가장 오래 기다린 시간, RETRY_WAIT 다음 시각, RECONCILING·UNKNOWN·BLOCKED 작업(계획 링크), 지난 7일 실패(거부·결과 불명) 3회 이상 항목, 확인 필요(attention) 계획, 결과 대기 전송 의도, 파일 삭제 대기.
+  - 용량: DB 데이터 폴더(메모리 DB 면 측정 없음)·파일 저장소·업로드 조각·내보내기·배포 파일·보존 보관 파일 바이트(경로는 표시하지 않음), 만료된 업로드 세션 수.
+  - 비용: 이번 달(MSK) 통화별 사용·초과액·실행 수(기존 원장), 월 상한.
+  - 백업: 마지막 내보내기 시각·나이·크기. `BACKUP_MAX_AGE_HOURS`(기본 24)보다 오래되면 경고. 마지막 복원 훈련 결과.
+  - 모드: LLM·게시·수집·음성 전사·작업 처리기, live 준비 안 됨 이유.
+- 복원 훈련(A18): `/ops` 의 "복원 훈련 실행"(서버 켠 채로) 또는 `corepack pnpm drill:restore`(서버를 끈 상태 — 켜져 있으면 잠금 안내와 함께 exit 1).
+  - 순서: 임시 폴더로 내보내기 → 묶음에 인증 비밀이 없는지 확인 → **버리는 메모리 PGlite + 빈 임시 저장소**에 `empty_only` 복원 → 복원 표마다 행 수·ID 집합·내용 sha256 비교, 파일 checksum, 검색 1건 확인.
+  - 복원이 일부러 바꾸는 열(진행 중 작업 → 보류·결과 불명, 계획 상태, 승인 철회, 파생본 검토 → 초안 등)은 내용 비교에서 빼고 행 수·ID 로만 본다.
+  - 결과는 `restore_drills` 표에 남는다(불일치는 표·종류·ID·열 이름만). 훈련용 묶음은 내보내기 기록에 남지 않고(백업으로 세지 않음) 끝나면 지운다. 불일치가 있으면 CLI 는 exit 1.
+- 보존 정리: `/ops` 에서 "지금 적용하면 지울 것"(미리보기, 변경 없음)을 보고, 체크(`confirm=yes`)한 뒤에만 적용한다. API: `POST /api/ops/retention` `{dry_run:true}` | `{confirm:"yes", plan_fingerprint}`.
+  - 확인한 미리보기와 같은 목록만 지운다(FIX3-FULLREV2 G30): 미리보기(화면 폼 hidden 값·JSON 응답 `plan_fingerprint`)에 삭제 대상 목록(작업 ID·배포 파일 ID·내보내기 실행 ID·종류)의 sha256 지문을 싣고, 적용은 그 지문을 받아 트랜잭션 안에서 새로 세운 계획과 비교한다. 그 사이 목록이 바뀌었으면(다른 탭의 새 내보내기로 옛 백업 ZIP 이 보존 개수 밖으로 밀림·시간이 지나 기준을 넘은 파일·이력) 아무것도 지우지 않고 409 `plan_changed`(화면은 `/ops?error=plan_changed` — 새 미리보기를 보고 다시 적용). 지문이 없거나 형식이 틀리면 400 `plan_fingerprint_required`. 삭제 직전 재검증(작업 재확인·ZIP 다시 검증)은 그대로. `RETENTION_SWEEP_MODE=auto`(작업 처리기)는 사람이 본 미리보기가 없어 지문 없이 적용한다. 감사 `retention.sweep` 에 지운 계획의 `plan_fingerprint` 를 남긴다.
+  - 끝난 작업(CONFIRMED·FAILED·CANCELED)의 마지막 이력이 `RETENTION_JOB_EVENTS_DAYS`(180일)보다 오래되면 그 이력을 `EXPORT_LOCAL_DIR/retention/<owner>/job-events-*.jsonl` 로 먼저 보관한 뒤 지운다. DB 트리거가 이 경우 외의 삭제를 계속 막는다.
+  - 배포 파일 ZIP 은 `RETENTION_PACKAGES_DAYS`(30일), 내보내기 ZIP 은 최근 `RETENTION_EXPORT_RUNS_KEEP`(10개)만 남긴다. 실행 기록은 남긴다.
+  - 원문 소재·출처·원고 버전·파생본·승인·결과 기록은 지우지 않는다. 업로드 세션은 기존 24시간 자동 만료(D15) 그대로. 앱은 파일 로그를 쓰지 않아 로그 보존 설정은 없다.
+  - `RETENTION_SWEEP_MODE=auto` 면 작업 처리기가 한 시간에 한 번 같은 정리를 적용한다(기본 manual).
+- 운영 숫자 `GET /api/ops/summary`(**로그인 필요**, 로그인한 owner 범위): `ops: {backup_age_hours, attention_plans, jobs{queued,leased,retry_wait,reconciling,unknown,blocked}, captures, uploads{sessions,files,bytes}, repeated_failures, pending_deletes, disk{db,assets,uploads,exports}, disk_partial, account_health}`. 숫자만, 기록이 없으면 null.
+  - `jobs`(작업 상태별 수)·`attention_plans`·`captures`(소재 수)는 내 DB 행만 센다.
+  - `uploads` 는 업로드 임시 영역 중 **내 폴더**(세션 폴더·파일 수·바이트)를 요청마다 측정한다(읽기 실패면 null).
+  - `disk` 는 이 PC 폴더 전체 측정(owner 구분 없음)이며 60초 동안 같은 측정값을 쓴다.
+- 공개 `GET /api/health`(로그인 없음)는 **생존 여부만** 낸다: 정확히 `{status: ok|degraded, app, time_utc, db_ok}`(ok 200, degraded 503). 부작용이 없다 — worker tick 을 돌리지 않는다(T21-P3, T21_DEPLOY_REVIEW G4). 프록시는 이 경로만 외부에 열어도 된다.
+- 자세한 상태는 `GET /api/health/details`(**로그인 필요**, 없으면 401): `app, version, time_utc, time_msk, timezone, status, modes, llm·stt(모드·준비 여부·빠진 조건 이름), db{driver, ok, migrated}, worker{mode, last_tick_utc}`. 읽기 전용(tick 없음). 운영 숫자(위 목록, 작업 수·업로드 사용량·소재 수 포함)는 어느 health 에도 없다(D23(e)·D30-3).
+
+### 계정 연결(모의)·비밀 보호 (M4, T13 — 로컬·모의 범위)
+결정 D24(docs/DECISIONS.md). **실제 Threads·Meta 연결 0, 외부 호출 0.** 실계정 연결(T14)은 사용자 승인 후.
+- 준비: `.env.local` 에 `SECRETS_MASTER_KEY`(base64, 32바이트 — 직접 만든 난수)와 `SECRETS_KEY_VERSION=1` 을 넣고 서버를 다시 시작한다. 없으면 계정 연결만 503(`secrets_not_configured`)이고 나머지는 그대로 동작한다. 기본·개발용 키는 없다.
+- 화면: 설정 → **배포 계정 연결**. Threads 모의 계정의 "연결(모의)" → 앱 안의 모의 동의 화면(`/api/oauth/mock-threads/authorize`) → `/api/oauth/callback` → 설정 화면으로 돌아온다. 상태(연결됨·곧 만료·만료됨·연결 해제됨·다시 연결 필요·오류·연결 정보 없음), 만료 시각, 필요/허락 scope, 마지막 확인 시각, "지금 갱신·연결 확인·연결 해제". `/ops` 에는 상태별 계정 수.
+- 모의 연결은 **MOCK** 표시이며 실제 Threads 계정 연결이 아니고 실제 게시에 쓰이지 않는다(모의 계정의 결과는 지금처럼 항상 MOCK). 요청 scope 는 `threads_basic, threads_content_publish`(잠정 — T14 에서 공식 문서로 재확인), 답글·통계는 요청하지 않는다.
+- 보호: state 는 서버에 SHA-256 만(1회용, 로그인 세션·owner·계정에 묶임, 10분), PKCE S256(verifier 는 서버에 봉인), redirect URI 정확 일치(callback 은 `APP_BASE_URL` origin + 요청 경로로 비교 — 요청 origin·Host·X-Forwarded-Host 는 쓰지 않음, FIX1-FULLREV3 H1). 토큰은 AES-256-GCM(Node 표준 crypto)으로 봉인하고 키 버전을 함께 저장한다(AAD = owner·계정·용도 — 다른 행으로 옮긴 암호문은 열리지 않음). 토큰·code·state·verifier 는 API 응답·감사·로그·내보내기·화면에 나오지 않는다.
+- 실행 차단: 연결했던 계정의 연결이 만료·해제·다시 연결 필요·오류이면 실행(409 `account_credential_blocked`)과 작업 전송(BLOCKED, `credential_<상태>`, 보내지 않음)을 막는다. 다시 연결하면 재시도할 수 있다. 연결한 적 없는 모의 계정은 M3 동작 그대로. 다시 연결·갱신은 승인을 유지하고(계정이 같을 때만 저장 — 다른 계정이면 409 `oauth_account_mismatch`), **연결 해제는 그 계정의 활성 승인을 철회**한다.
+- 내보내기·복원: `oauth_credentials`·`oauth_states` 는 묶음에서 제외. 연결했던 계정은 복원 후 "다시 연결 필요". 같은 환경에 `add_missing` 으로 복원할 때 로컬 계정이 연결 이력 없음(none)인데 묶음에는 연결 이력이 있으면 "다시 연결 필요"로 올리고 미리보기·결과의 `reconnect_required_accounts` 에 보고한다(로컬의 유효한 연결은 그대로).
+- 동시 변경: 연결 저장·갱신·확인·해제·키 교체는 계정별로 잠그고(계정 → 연결 정보 순서), 토큰 세대(`token_generation`)가 그대로일 때만 결과를 기록한다. 갱신 중 다른 변경이 먼저 끝나면 새로 받은 토큰은 저장하지 않고 공급자에서 바로 철회한다. 해제는 진행 중(`revoking`) 표시 뒤 공급자 철회 → 같은 세대만 삭제(바뀌었으면 `incomplete`, 계속 차단). 교환 뒤 저장하지 못한 토큰도 철회한다.
+- 해제 세대·해제 작업(FIX2): 연결 해제를 시작할 때마다 계정의 해제 세대(`revocation_epoch`)가 오르고(다시 연결해도 내려가지 않음), 그 전에 발급된 연결 요청은 저장 단계에서 거부된다. 해제는 작업 ID 로 묶여 중복 요청은 같은 작업에 합류한다. 응답 `outcome`: `revoked`(이 요청이 마무리) · `already_revoked` · `completed_by_other`(합류한 다른 요청이 마무리) · `superseded`(해제가 끝난 뒤 다시 연결됨 — 새 연결은 건드리지 않음) · `incomplete`(자기 작업이 현재인데 세대가 바뀜 — 계속 차단, 다시 해제하면 마무리). 갱신·callback 이 새 토큰을 받은 뒤 저장에 실패하면 다시 읽어 저장 여부를 확인하고, 저장되지 않았으면 그 토큰을 철회한다(판정 불가면 철회하지 않고 실패로 보고).
+- 저장 실패·정리 대기(FIX3): 갱신 토큰 저장이 실패한 것이 확인되면 새 토큰을 철회하고, 읽었던 토큰 세대가 아직 현재일 때만 연결 정보를 `오류`(`refresh_store_failed`)로 바꿔 바로 실행을 막는다(그 사이 다시 연결된 새 세대는 그대로). 저장됐는지 판정할 수 없거나(`refresh_unknown`) 정리 철회가 실패·불명이면(`cleanup_revoke`, 감사 `oauth.cleanup_revoke_failed`/`_unknown`) 받은 토큰을 봉인해 연결 정보에 **정리 대기**로 남긴다 — 첫 연결이면 해제 상태의 자리 표시 행. 정리 대기가 있는 동안 연결 상태는 `오류`(`pending_*`)로 실행·전송·재시도가 막히고, 다음 `확인`·`갱신`·worker tick 이 공급자에 물어 정리한다(저장된 토큰과 같으면 유지, 아니면 철회하고 저장 토큰의 유효성으로 상태를 정함). 키 교체는 정리 대기 봉인도 다시 봉인한다. 정리 대기는 내보내기 묶음에 들어가지 않는다.
+- **dev 서버 재시작 뒤 모의 연결 유지(M4-DEV1, 개발 품질)**: 모의 공급자(Threads·YouTube·Instagram 모의)는 발급한 토큰을 프로세스 메모리에만 둔다. 서버를 다시 켜면 그 프로세스가 처음 연결 경로(연결 확인·갱신·해제·callback·`작업 처리 실행`·inline worker tick, 별도 `pnpm worker` 의 첫 tick)를 쓸 때 **한 번**, DB 의 쓸 수 있는 모의 연결 정보(해제되지 않음·`active`·연결됨/곧 만료·봉인을 서버 키로 열 수 있음)를 열어 모의 공급자 메모리에 다시 등록한다 — 그래서 **모의 연결은 재시작 뒤에도 유지**되고 다시 연결하지 않아도 새 계획 전송·갱신이 된다. 조건: `OAUTH_MODE=mock` 이고 마스터 키가 있을 때만, 모의 공급자 행만(실제 공급자 행은 읽지 않음). 해제·오류·다시 연결 필요·만료·열 수 없는 봉인은 등록하지 않고 행도 바꾸지 않는다(열 수 없는 행은 다음 사용에서 기존처럼 `decrypt_*` 오류). 정리 대기 토큰은 등록하지 않는다(정리 대기 계정은 계속 차단). 토큰은 로그·감사·응답에 나오지 않는다. **시뮬레이터의 원격 기록(게시물·영상·컨테이너·업로드 세션)은 재시작 뒤 복원되지 않는다** — 재시작 전 결과 불명 작업은 지금처럼 확인 불가 3회 뒤 `UNKNOWN`(재전송 없음), `pnpm drill:mock` 의 재시작 행도 그대로.
+- 모의 동의 화면의 시험용 매개변수(`mock_user`·`mock_grant`·`mock_deny`)는 운영(`NODE_ENV=production`)에서 400 `mock_params_not_allowed`(D25-3). callback·동의 화면의 모든 응답에 `Referrer-Policy: no-referrer`·`Cache-Control: no-store`.
+- `OAUTH_REDIRECT_URI` 는 http(s) + 호스트 + 경로만(query·fragment·사용자 정보가 있으면 설정 오류). **`APP_BASE_URL` 의 origin + `/api/oauth/callback` 과 글자 그대로 같아야 한다**(FIX1-FULLREV3 H1 후속 → FIX2-FULLREV3 K1 — callback 은 `APP_BASE_URL` origin + 요청 경로로 비교하므로 다른 origin 이면 동의 화면 뒤 언제나 실패하고, 같은 origin 의 다른 경로(`/oauth/callback`, 끝 `/` 붙은 `/api/oauth/callback/` 등)면 공급자가 route 없는 경로로 돌려보내 연결을 끝낼 수 없다). 다르면 연결 시작이 인증 창으로 보내기 전에 503 `oauth_redirect_uri_mismatch`(모의·실제 모두, state·감사·외부 호출 없음)로 거부하고, 실제 연결 준비 상태에는 `OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)` 이 준비 안 됨으로 보인다. 비워 두면 기본값(= 그 주소).
+- API: `POST /api/channel-accounts/{id}/connect|refresh|check|revoke`(같은 출처·로그인), `GET /api/channel-accounts/{id}/health`, `GET /api/oauth/callback`. 다른 owner 의 계정은 404.
+- 키 교체: 새 키를 `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(새 번호)에, 직전 키를 `SECRETS_MASTER_KEY_PREVIOUS`·`SECRETS_KEY_VERSION_PREVIOUS` 에 두면 옛 봉인도 읽힌다. 다시 봉인은 `corepack pnpm secrets:rotate`(서버를 끈 상태 — 미리보기, 숫자만) → `corepack pnpm secrets:rotate --confirm`(적용). 모든 봉인을 열어 현재 버전 행의 손상·버전 불일치도 센다. 끝나면 이전 키를 비운다(D25-5).
+
+### Threads 텍스트 (M4, T14 — 모의)
+결정 D26(docs/DECISIONS.md). **모의 어댑터만 — 실제 Threads·Meta API 호출·앱 등록·실계정·네트워크 0.** 실계정 시험(docs/05 "사용자가 정한 계정… 실계정 시험")은 **`blocked_external`**: D24 의 Meta 앱 등록·앱 ID 보관 방식·테스트 Threads 계정·redirect URI·마스터 키 위치·첫 시험 원고·공개 범위를 사용자에게 받기 전에는 하지 않는다. 모의 통과는 실계정 통과가 아니다.
+- 어댑터 선택(한 곳, `@cs/domain` `adapterIdFor`): 모의 계정 + Threads + T13 모의 연결을 쓴 적 있음(`credential_state` ≠ none) → **Threads 모의 어댑터**. 연결한 적 없는 seed 모의 계정은 M3 의 일반 모의 어댑터 그대로(그래서 M3 시험·`drill:mock` M3 표는 바뀌지 않는다). live 계정은 지금처럼 `LiveChannelNotConfiguredError`.
+- 흐름: 게시물마다 컨테이너 생성(`mockthr_ct_…`) → 상태 조회(FINISHED 까지, 한 번의 전송에서 최대 3회) → 게시(`mockthr_post_…`). 스레드(최대 20개, 각 500자 — 잠정값)는 앞 게시물에 답글로 순서대로 이어 붙인다. **각 원격 참조는 다음 원격 호출 전에 `remote_steps` 에 기록**하고, 재개·재확인은 기록을 먼저 읽어 같은 컨테이너를 재사용하며 이미 게시된 게시물은 다시 게시하지 않는다. 결과는 스레드 전체가 게시된 뒤에만 publication 1개(첫 게시물, `mock:threads:<게시 ID>`·`mock://threads/<게시 ID>`, MOCK).
+- 토큰: 작업 처리기 안에서 T13 연결 정보를 열어 어댑터 메모리에만 둔다(`SECRETS_MASTER_KEY` 필요). 응답·로그·감사·작업 이력·단계 기록·내보내기에 없다. 연결 정보를 쓸 수 없으면(만료·해제·정리 대기·다시 연결 필요) 실행 409·전송 BLOCKED(원격 호출 0) — T13 게이트 그대로.
+- 결과 불명·재개: 게시 응답 유실 → `RECONCILING` → 조회가 컨테이너로 게시물을 찾으면 CONFIRMED(재게시 없음). 끝났지만 게시되지 않은 컨테이너 → `resume`(새 시도·새 전송 의도가 **같은 컨테이너**로 게시). 컨테이너 처리 중 → `REMOTE_PROCESSING` → 나중에 같은 컨테이너로(처리 중 조회는 20회까지, 그 사이의 확인 불가는 연속 3회째에만 `UNKNOWN` — 두 횟수를 따로 센다, FIX1-FULLREV2 G5). 스레드 일부만 게시된 채 결과 불명 → 남은 게시물부터만. 기록을 잃은 원격(재시작)·만료 컨테이너(429 대기·재개 대기 중 만료 포함 — 게시 오류 `container_expired` 도 조회로) → 확인 불가 3회 뒤 `UNKNOWN`(자동 재게시 없음). 조회는 **보낸 어댑터**(전송 의도의 `adapter_id`)로만 — T14 이전 의도(ID 없음)는 일반 모의 어댑터로 읽고, 모르는 ID 는 확인 불가(현재 선택 규칙으로 대신하지 않음). 처리 지연(`REMOTE_PROCESSING`) 뒤의 재개는 시도 한도에서 빼고(`jobs.resume_count`, 최대 20), 결과 불명 뒤의 재개는 시도로 센다. 스레드 일부가 게시된 작업을 대기(`QUEUED`·`RETRY_WAIT`·`BLOCKED`) 중 취소하면 `CANCELED` 가 아니라 `UNKNOWN`(`thread_partial_canceled` — 남은 게시물은 보내지 않고, 게시된 부분은 원격에 남음). 사용자 재확인은 조회만(`reconciled=resumable` 이어도 게시하지 않음).
+- 오류: 401 → BLOCKED("계정 다시 연결 필요", 자동 재시도 없음) + T13 확인 경로(연결 확인)를 한 번 부른다. 403·400 → FAILED(재시도 없음). 429 → Retry-After 를 지키는 재시도 대기. 5xx 부작용 없음 → 재시도, 5xx 부작용 불명·시간 초과 → 조회.
+- 요청 제한: 계정별 **로컬 제한**(잠정값 24시간 250개 — 확인일 없음, "provisional — 공식 자료 재확인 필요")을 `remote_steps` 의 게시 기록으로 센다. 넘으면 전송 의도 없이 `RETRY_WAIT`(`local_rate_limited`, 창이 풀리는 시각). 원격 429 도 같은 대기. 같은 계정의 검사는 advisory 잠금으로 줄 세우고, 진행 중인 다른 작업(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)의 남은 게시물을 예약으로 함께 센다(예약 때문에만 막히면 60초 뒤 다시 확인). 화면: `요청 제한 — HH:mm MSK 이후 재시도`.
+- 별도 `pnpm worker` 프로세스·서버 재시작: 모의 OAuth 발급 기록은 프로세스 메모리지만 M4-DEV1 부터 그 프로세스의 첫 tick·연결 경로에서 DB 의 쓸 수 있는 모의 연결 정보로 다시 채운다(위 "계정 연결(모의)" 참고) — 다시 연결하지 않아도 새 계획을 보낼 수 있다. Threads 시뮬레이터(컨테이너·게시물)는 계속 **프로세스 메모리**라 다른 프로세스·재시작 뒤에는 이전 원격 기록을 모른다(결과 불명 작업 → 확인 불가 3회 뒤 `UNKNOWN`, 재게시 없음). 모의 Threads 시연은 web inline worker(`작업 처리 실행`·`/api/worker/tick`)로 한다(PGlite 는 어차피 한 프로세스만 연다).
+- 화면 `/distribute/[id]`: Threads 항목에 단계 목록(`게시물 n/m · 컨테이너 생성됨/컨테이너 준비됨/게시됨(MOCK)/컨테이너 오류 · 모의 ID`)과 T13 연결 상태 한 줄, MOCK 배지·"실제 발행 실적 아님". 개발용 시나리오: `threads_success`·`threads_container_slow`·`threads_publish_timeout_sent`·`threads_publish_timeout_not_sent`·`threads_thread_partial`·`threads_rate_limited`·`threads_token_invalid`·`threads_text_too_long`(Threads 모의 항목에만 — 일반 항목에는 400 `scenario_not_applicable`, `success` 는 둘 다). 시나리오는 시뮬레이터만 바꾸고 payload·hash 는 그대로.
+- 내보내기·복원: `remote_steps` 는 작업·전송 의도와 함께 **읽기 전용 이력으로 복원**한다(FIX-T14 — 게시된 부분의 근거·재확인 참조 보존, 업로드 세션 URI 는 가린 값 그대로). 복원한 작업은 자동 재개·재시도가 없고, 수동 재확인에서 단계 기록이 없으면(이전 묶음) `not_found` 가 아니라 확인 불가(`restored_steps_missing`). `pnpm drill:mock` 은 M3 표 다음에 Threads 모의 표(중복 컨테이너·중복 게시·스레드 전체 전 publication 없음 불변식)를 찍는다.
+
+### YouTube 재개 업로드 (M4, T15 — 모의)
+결정 D27(docs/DECISIONS.md). **모의 어댑터·모의 Google OAuth 만 — 실제 Google/YouTube API 호출·OAuth 앱 등록·실계정·네트워크 0.** 실계정 시험은 **`blocked_external`**(Google Cloud 프로젝트·OAuth 동의 화면·실제 scope 이름·테스트 채널·API 프로젝트 감사 여부·첫 시험 영상과 공개 범위를 사용자에게 받고 정확한 범위를 승인받기 전에는 하지 않는다). 모의 통과는 실계정 통과가 아니다.
+- 연결: 설정 → 배포 계정 연결에서 YouTube 모의 계정 `연결(모의)` → 앱 안의 **Google 형 모의 동의 화면**(`/api/oauth/mock-google/authorize`, authorization code + PKCE S256 + state) → T13 callback. scope 는 업로드용 **자리 표시 이름 `youtube.upload(mock)`**(실제 Google scope 이름 아님 — live 전에 공식 문서로 확인). access token(`mockyt_at_…`) 1시간·refresh token(`mockyt_rt_…`) 180일(모의 값), 연결 만료 표시는 refresh 기준. 보내기 직전에 access token 이 지났으면 T13 갱신 경로(세대·정리 규칙 그대로)로 한 번 갱신한다. 토큰은 T13 과 같이 봉인 저장, 응답·로그·내보내기에 없다.
+- 어댑터 선택(`adapterIdFor`): 모의 + YouTube + 연결한 적 있음 → **YouTube 모의 어댑터**. seed 모의 계정(연결 없음)은 M3 일반 어댑터 그대로(M3·Threads 시험·훈련 불변).
+- 계획: 연결한 YouTube 모의 계정은 `upload_private`(기본) 또는 `public_publish` 만(`mock_publish` 400). `upload_private` = private + 예약 공개 없음. `public_publish` = public·unlisted, 또는 private + **예약 공개 `publish_at`**(MSK, 미래만 — 승인 스냅샷 `provider_metadata.publish_at` 에 들어가 hash 대상). 비공개 업로드 계획에 publish_at → 400. 예약 공개 시각이 지나면 승인 무효(`publish_at_passed`).
+- 업로드: VERIFIED 영상 파일(T08)을 저장소에서 **조각(기본 8MiB)씩 범위로 읽어** 올린다(파일 전체를 메모리에 올리지 않음). 세션 URI 는 첫 조각 전에, 받은 바이트는 조각마다 `remote_steps`(`upload_session` — 받은 바이트는 DB 트리거로 앞으로만)에 짧은 트랜잭션으로 기록, 조각마다 heartbeat·취소 확인. 끊김·시간 초과 → `RECONCILING` → 조회가 같은 세션의 받은 바이트를 물어 `resumable` → 다음 시도가 **같은 세션**으로 이어 올린다(A14 — 처음부터 다시 올리지 않음). 마지막 조각 응답 유실 → 조회가 영상 ID 를 찾는다(A08 — 두 번째 업로드 없음). 만료된 세션(영상 없음이 확인됨) → 새 세션. 세션을 모르는 원격(재시작) → 확인 불가 3회 뒤 `UNKNOWN`.
+- 처리·결과: 마지막 조각 뒤 영상 ID(`mockyt_v_…`)를 기록하고 `REMOTE_PROCESSING` → 조회가 처리 끝을 확인하면 CONFIRMED + 결과 종류 `UPLOADED_PRIVATE`(비공개) / `SCHEDULED_REMOTE`(비공개 + publishAt) / `PUBLISHED`(검증된 프로젝트의 public·unlisted 만). 처리 실패·거부 → FAILED. **미검증 API 프로젝트(모의 기본값)는 public 요청도 private 로 강제** — CONFIRMED 지만 화면은 `비공개 업로드 완료, 공개 전환 확인 필요`, 작업 이력에 요청·실제 공개 범위를 함께 남긴다(A12). 결과는 `mock:youtube:…`·`mock://youtube/watch/…`, MOCK.
+- 화면 `/distribute/[id]`: `업로드 n% (x/y MB) · 세션 재개 n회`, 처리 상태, 결과 문구(`비공개 업로드 완료, 공개 전환 확인 필요` / `비공개 업로드 + 예약 공개 YYYY-MM-DD HH:mm MSK (원격 예약, 확인 필요)` / `공개 게시 확인(MOCK)`) — "게시 완료" 없음, MOCK 배지·"실제 발행 실적 아님". 세션 URI 는 화면·API·로그에 내지 않는다(`세션 있음`), 내보내기 묶음에서는 가린다(`mock-redacted:session:…`).
+- 할당량: 잠정 로컬 할당량(24시간 업로드 시작 6회 = 10,000 ÷ 1,600 단위 추정, 확인일 없음)을 `upload_session` 기록으로 센다 — 넘으면 전송 의도·세션 없이 `RETRY_WAIT`(`할당량 소진 — HH:mm MSK 이후 재시도`). 원격 403 quotaExceeded 도 초기화 시각까지 대기(세션 없음).
+- 취소: 영상이 생기기 전이면 멈추고 CANCELED. 업로드 뒤에는 삭제가 범위 밖이라 원격 확인 뒤 CONFIRMED + `업로드됨 — 삭제는 별도 동작(범위 밖)`.
+- 개발용 시나리오(YouTube 모의 항목에만): `youtube_success_private`·`youtube_processing_slow`·`youtube_network_drop`·`youtube_response_lost_after_complete`·`youtube_session_expired_before_complete`·`youtube_quota_exceeded`·`youtube_token_invalid`·`youtube_rejected`·`youtube_public_unverified_forced_private`·`youtube_scheduled_private`·`youtube_project_verified`(시험·개발 전용 — 검증된 프로젝트 흉내). payload·hash 는 바꾸지 않는다.
+- `pnpm drill:mock` 은 Threads 표 다음에 YouTube 모의 표(영상 1개·유효 세션 재사용·보낸 바이트 < 2×·미검증 프로젝트 PUBLISHED 없음·처리 전 publication 없음)를 찍는다.
+
+### Instagram 이미지·캐러셀 (M4, T16 — 모의)
+**모의 어댑터만** — 실제 Instagram/Meta 호출·앱 등록·실계정·실제 공개 URL 없음. 결과는 모두 MOCK 이며 실제 발행 실적이 아니다. 규격·한도·scope 이름은 **잠정값**(공식 자료 재확인 전 — docs/03 "[공식자료·부분 확인]"), 결정은 docs/handoffs/T16_IMPLEMENTATION_HANDOFF.md 의 "Proposed D29"(사용자 확인 전).
+- 연결: 설정 → 배포 계정 연결에서 Instagram 모의 계정 `연결(모의)` → 앱 안의 **Meta 형 모의 동의 화면**(`/api/oauth/mock-instagram/authorize`, authorization code + PKCE S256 + state) → T13 callback. scope 는 **자리 표시 이름 `instagram_basic(mock)`·`instagram_content_publish(mock)`**(댓글·메시지·통계는 요청하지 않음 — 공식 이름은 live 전 재확인). 토큰 `mockig_at_…`(60일, refresh token 없음 — 만료 전 같은 토큰으로 갱신). 모의 사용자는 비즈니스·크리에이터(professional) 계정으로 **가정**한다. 토큰은 T13 과 같이 봉인 저장, 응답·로그·내보내기에 없다.
+- 어댑터 선택(`adapterIdFor`): 모의 + Instagram + 연결한 적 있음 → **Instagram 모의 어댑터**(`mock_instagram`). seed Instagram 계정(연결 없음)은 M3 일반 어댑터 그대로(규격 검사·공개 범위 규칙 없음 — M3 시험·훈련 불변).
+- 계획: 연결한 Instagram 모의 계정은 `mock_publish` 만(결과 PUBLISHED, MOCK — Instagram 에는 비공개·원격 예약 결과가 없다), 공개 범위는 **public 만**(생략 시 public, private·unlisted → 400 `instagram_visibility_public_only`). 앱 쪽 실행 예약(`schedule`)은 그대로 쓸 수 있다(원격 예약이 아님). 범위: 이미지 1장 또는 **캐러셀 2~10장**(영상·Reels·스토리·썸네일 첨부는 범위 밖).
+- 잠정 규격(`INSTAGRAM_PROVISIONAL_MEDIA_SPEC`, 확인일 없음): JPEG 만 · 8MiB 이하 · 가로세로 4:5~1.91:1 · 가로 320px 이상 · 캡션 2,200자 · 해시태그 30개 · 언급 20개. **승인 전**에 파일 앞부분(헤더)만 읽어 검사하고(계획 화면 problems·승인 409 `snapshot_stale` 의 `media_spec:…`), **보내기 직전**에 어댑터가 같은 검사를 다시 한다(원격 호출 0 으로 FAILED, 재시도 없음). 모의 원격도 받은 이미지를 다시 검사해 400 `invalid_image_spec` 으로 거부할 수 있다(FAILED).
+- 공개 미디어 URL: 실제 Instagram 은 공개 URL 에서 이미지를 가져간다. 이 앱에는 **인터페이스(`PublicMediaUrlProvider`)와 모의 구현만** 있다 — `mock://public-media/<불투명 값>`(실제 호스팅 없음, URL 에 파일 내용·asset ID·checksum 없음), 같은 프로세스의 모의 원격만 저장소 창구로 읽고, 컨테이너를 만든 직후 철회한다. URL 은 단계 기록·작업 이력·감사·로그·내보내기에 남기지 않는다. **실제 방식(이 앱의 짧은 서명 URL / 제3자 호스팅 / 수동 게시)은 live 전 사용자 결정**(누가 언제까지 파일을 볼 수 있는가 — 개인정보 영향).
+- 게시: 이미지 컨테이너(`ig_container` post 0) → FINISHED 까지 조회 → 게시(`ig_publish`). 캐러셀은 자식 컨테이너(post 1..n) → 부모 컨테이너(post 0) → 게시 1번. 각 원격 참조는 **다음 원격 호출 전에** `remote_steps` 에 기록(migration 0036 — 종류 `ig_container`·`ig_publish`, 모의 ID CHECK 그대로). 처리 지연 → `REMOTE_PROCESSING` → 같은 컨테이너로 이어 게시. 게시 응답 유실 → `RECONCILING` → 조회가 컨테이너로 미디어를 찾아 CONFIRMED(A08 — 두 번째 게시 없음). 원격이 기록을 잃음(재시작)·만료 컨테이너 → 확인 불가 3회 뒤 `UNKNOWN`(맹목 재게시 없음). 401 → BLOCKED(`계정 다시 연결 필요`), 403·400 → FAILED, 429 → Retry-After 뒤 같은 컨테이너로. 결과 `mock:instagram:mockig_m_…`·`mock://instagram/p/…`, `PUBLISHED/public`, MOCK.
+- 요청 제한(잠정): 계정당 24시간 게시 25개(`ig_publish` 기록으로 셈 — 캐러셀도 1개). 넘으면 전송 의도 없이 `RETRY_WAIT`(`요청 제한 — HH:mm MSK 이후 재시도`).
+- 화면 `/distribute/[id]`: Instagram 단계(MOCK) — `이미지 1개 · 컨테이너 1/1 준비 · 게시 대기` / 캐러셀 `컨테이너 n/m 준비`, 단계 줄(`캐러셀 이미지 2/3 · 컨테이너 준비됨 · mockig_ct_…`), 모의 링크, `MOCK 게시 확인(Instagram 모의 — 실제 발행 아님)`. `/distribute/new` 는 모의 연결 Instagram 계정에 `MOCK 실행만(공개 범위 public 만)`·잠정 규격 안내를 보이고 공개 범위 기본값을 public 으로 둔다.
+- 복원: `ig_container`·`ig_publish` 단계는 읽기 전용 이력으로 함께 복원되고, 복원한 작업의 조회는 not_found 를 믿지 않는다(unknown — T14 규칙 그대로).
+- 개발용 시나리오(Instagram 모의 항목에만): `instagram_success`·`instagram_container_slow`·`instagram_publish_timeout_sent`·`instagram_publish_timeout_not_sent`·`instagram_rate_limited`·`instagram_token_invalid`·`instagram_permission_denied`·`instagram_invalid_spec_remote`·`instagram_container_error`. payload·hash 는 바꾸지 않는다.
+- `pnpm drill:mock` 은 YouTube 표 다음에 Instagram 모의 표(단일·캐러셀·컨테이너 지연·게시 응답 유실·401·원격 규격 거부·컨테이너 오류·429·승인 전 규격 거절·로컬 제한·재시작 UNKNOWN — 게시 1회·받은 이미지 = 승인 파일·살아 있는 공개 URL 0·DB 에 공개 URL 0)를 찍는다.
+
+### Threads 실제 연결(D31 2단계 준비)
+결정 D31(docs/DECISIONS.md). **1단계(LIVE-T1)는 코드와 기록된 응답(fixture) 시험만 — 이 저장소의 어떤 코드·시험도 실제 Threads·Meta 로 요청하지 않았다.** 시험은 `tests/setup/no-meta-network.ts` 가드가 `*.threads.com`·`*.threads.net`·`*.facebook.com`·`*.instagram.com`·`*.fbcdn.net`(대소문자·끝의 점 정규화) 요청을 연결·DNS 조회 전에 막고, 시도가 있으면 그 시험 파일을 실패시킨다. 막는 경로(시험 프로세스 안, `packages/providers/src/no-meta-network.test.ts` 로 하나씩 확인): 전역 fetch, Node 내장 undici 전역 dispatcher(fetch 의 리다이렉트 각 단계 포함), `node:http`·`node:https` 의 request·get, `node:net`·`node:tls` 의 connect·createConnection 과 `net.Socket.prototype.connect`, `node:dns` 의 lookup·resolve* 전부(콜백·promises 모듈 함수와 `new dns.Resolver()`·`new dns.promises.Resolver()` 인스턴스 메서드 — 하위 클래스 포함), `node:http2` connect(tls 연결 단계에서). 막지 못하는 것: 자식 프로세스·worker_threads, 이미 해석한 IP 로의 직접 연결·`dns.reverse`/`lookupService`(IP 를 받아 판별 불가), 네이티브 애드온, undici 패키지의 별도 dispatcher(이 저장소에 패키지 없음 — 쓰더라도 net/tls 단계가 막는다고 보지만 시험은 없음). 실제 갱신(`LIVE_THREADS_REFRESH(D31 범위 밖)`)은 서버 공통 갱신 진입점에서 409 `live_refresh_out_of_scope` 로 거부한다(외부 호출 0). 2단계(실제 연결 1회)는 사용자가 아래 순서로 직접 한다.
+- **범위 안(D31)**: 테스트 Threads 계정 1개를 실제 OAuth 로 연결 — 인증 창(`threads.com/oauth/authorize`) → 코드 교환(`POST graph.threads.com/oauth/access_token`) → 장기 토큰 교환(`GET graph.threads.net/access_token`, `th_exchange_token`) → 프로필 조회(`GET graph.threads.net/v1.0/me?fields=id,username`). 요청 권한은 `threads_basic,threads_content_publish` 만(답글·통계 요청 안 함). 장기 토큰은 T13 규칙대로 서버에서 봉인 저장.
+- **범위 밖(별도 승인)**: 실제 게시(컨테이너·`threads_publish` — 화면·`/ops` 에 `LIVE_THREADS_PUBLISH(D31 범위 밖)` 표시, `PUBLISH_MODE=disabled` 유지), 다른 계정·채널, 운영 배포, 터널 등 앱을 외부에 노출하는 일. **자동 갱신(`th_refresh_token`)도 worker 가 하지 않는다**(실제 연결 정보는 자동 갱신 대상에서 빠짐 — 설정 화면에 "지금 갱신" 버튼도 없다). 실제 계정 행은 `state=disconnected` 로 남아 배포 계획에 고를 수 없다.
+- 환경 변수(값은 사용자가 `.env.local` 에 직접 — 대화·저장소·로그에 값 없음): `OAUTH_MODE=live` · `THREADS_APP_ID`(앱 대시보드의 Threads 앱 ID, 숫자) · `THREADS_APP_SECRET` · `OAUTH_REDIRECT_URI`(예: `http://localhost:3000/api/oauth/callback` — 앱 대시보드의 "유효한 OAuth 리디렉션 URI" 와 글자까지 같아야 하고, `APP_BASE_URL` origin + `/api/oauth/callback` 과 정확히 같아야 함 — 다르면 준비 안 됨 `OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)`, FIX2-FULLREV3 K1) · `OAUTH_LIVE_APPROVAL_REF=D31` · `SECRETS_MASTER_KEY`·`SECRETS_KEY_VERSION`(T13). `PUBLISH_MODE` 는 넣지 않거나 `disabled`.
+- 준비 상태: 위 이름이 하나라도 빠지면 설정 → 배포 계정 연결에 `실제 Threads 연결 준비 안 됨: <이름들>`(값 없음)이 보이고 연결 버튼 대신 같은 이름 목록이 나온다. 모두 갖춰지면 `실제 Threads 연결 준비됨`.
+- 2단계 순서(사용자):
+  1. Meta 앱 대시보드에서 Threads 사용 사례·테스트 사용자(테스트 Threads 계정)·유효한 OAuth 리디렉션 URI 를 확인한다. Meta 가 `http://localhost` 를 거부하면 멈추고 알려 준다(HTTPS 로컬 주소 방법은 다시 정한다 — 외부 노출은 별도 승인).
+  2. `.env.local` 에 위 변수를 넣고 dev 서버를 다시 시작한다.
+  3. 설정 → 배포 계정 연결 → **실제 Threads 계정 추가(연결 전 행 — 외부 호출 없음)**.
+  4. 그 행의 **실제 연결(Threads 인증 창)** → Threads 에 테스트 계정으로 로그인·동의 → 앱으로 돌아오면 `실제 Threads 계정을 연결했습니다`. 행 이름이 `@<username>` 으로 바뀌고 상태 `연결됨`, 만료(약 60일)가 보인다.
+  5. (선택) **연결 확인(프로필 조회)** — `/me` 한 번.
+  6. 끝나면 결과(성공·오류 코드만)를 Claude 에 알린다. 토큰·코드·시크릿은 붙여 넣지 않는다.
+- 연결 해제: Threads 에는 토큰 철회 API 가 공식 문서에 없다 → `연결 해제`는 **이 앱의 연결 정보만** 지우고(T13 규칙 — 암호문 삭제·승인 철회) 응답·감사에 `remote_revoke=unsupported` 를 남긴다. Threads 쪽 권한까지 없애려면 Threads 앱 설정의 앱·웹사이트 권한 메뉴에서 이 앱을 지운다(메뉴 이름은 앱 버전에 따라 다를 수 있음). 그러지 않으면 장기 토큰은 만료(60일)까지 Threads 쪽에서 유효하다. FIX2-FULLREV2(G13): 연결 해제는 실제 연결 준비 설정(`OAUTH_MODE=live`·앱 ID·시크릿·redirect·`OAUTH_LIVE_APPROVAL_REF`·마스터 키)과 무관하게 로컬 삭제로 끝난다 — 승인 기록을 지우거나 `OAUTH_MODE=mock` 으로 돌린 뒤에도 해제할 수 있다(감사 `live_provider_unavailable=true`). 실제 Threads 해제는 저장 토큰을 복호화하지 않으므로 마스터 키를 바꿔(이전 버전 없이) 토큰을 열 수 없어도 끝난다(G13 fixup). 이전 판에서 `해제 중`(revoke_provider_unavailable)으로 멈춘 실제 계정은 연결 해제를 다시 누르거나 작업 처리기가 다음 주기에 마무리한다. FIX2-FULLREV2(G14): 해제가 끝나지 않은(`revoking`) 계정은 연결 시작이 409 `credential_busy` 로 거부된다(인증 창으로 보내지 않음 — 버려질 장기 토큰을 발급받지 않게). 설정 화면에는 다시 연결 버튼 대신 "연결 해제 미완료" 안내가 나온다.
+- 보호: PKCE 는 Threads 문서에 없어 보내지 않는다 — state(서버에 SHA-256 만, 로그인 세션·계정에 묶임, 1회용, 10분) + redirect URI 정확 일치 + 서버만 아는 앱 시크릿으로 막는다. 앱 시크릿·토큰은 공식 문서대로 질의 문자열에 들어가는 요청이 있으므로 URL 을 기록하지 않고, 공급자 오류는 코드와 숫자(HTTP 상태·Meta 오류 코드)만 남긴다(원 오류·메시지 원문 버림). 리다이렉트를 따르지 않고(시크릿이 다른 호스트로 가지 않게) 10초 시간 제한.
+- 오류: 코드 교환 중 끊김·시간 초과·5xx 는 **결과 불명**(코드가 소비됐을 수 있음) — 다시 보내지 않고 400 `oauth_exchange_failed`(`outcome: unknown`), 감사 `outcome_ambiguous=yes`. 손에 받은 토큰이 없으므로 저장·정리 대기·철회할 것이 없다 — 설정에서 다시 연결한다. 이미 쓴 코드 → `invalid_grant`, 앱 ID·시크릿 거부 → `invalid_client`, 190 → `invalid_token`(463 만료 · 458/460 철회), 10·200번대 → `scope_not_allowed`, 429·4/17/32/613 → 요청 제한(`provider_error`).
+- API: `POST /api/channel-accounts`(본문 `platform=threads`, `kind=live` — 연결 전 실제 Threads 행, 같은 출처·로그인, 멱등). 첫 실제 연결이 `pending:<uuid>` 를 프로필 ID 로 묶는다. 같은 owner 의 다른 행이 이미 그 프로필에 묶여 있으면 409 `oauth_account_duplicate`, 묶인 행에 다른 Threads 계정이 돌아오면 409 `oauth_account_mismatch`(저장 안 함).
+
+### 실제 게시 상한·즉시 중지 (D39, LIVE-P2)
+결정 D39(docs/DECISIONS.md). 실제 Threads 게시를 평상시에 켜 둘 때의 안전장치 두 가지. 실제 호출은 시험에서 0(가짜 fetch 만).
+- **최근 24시간 상한** `PUBLISH_LIVE_DAILY_MAX`(1~50, 비우면 일일 상한 없음 — 이전 동작). 전송 직전(`beginSend`)에 이 owner 의 실제 게시 전송 의도를 최근 24시간 안에 만든 **서로 다른 작업 수**를 세고, 이미 상한이면 보내지 않고 보류(`live_publish_daily_limit`). 같은 작업의 재시도·이어 보내기는 최근 24시간 창 안에서는 한 번만 센다(그 작업의 실제 전송 의도가 창 안에 이미 있으면 새로 세지도 일일 상한으로 막지도 않는다). 그 작업의 마지막 실제 전송 의도가 창 밖이 된 뒤 다시 보내면 새 게시로 다시 센다(D39 명확화 2026-10-23). 화면 문구: "최근 24시간 실제 게시 상한(3건)을 다 써서 게시하지 않았습니다. YYYY-MM-DD HH:MM (MSK) 이후 '재시도'로 다시 보낼 수 있습니다." — 그 시각 뒤 항목의 **재시도**로 보낸다(자동 재전송 없음). 시각은 사용 수가 상한 아래로 내려가는 때(상한을 줄여 사용 수가 상한보다 많아도 맞게)이고 분 단위로 **올려** 보인다(보이는 시각에는 이미 보낼 수 있다). 그 사이 창 안 다른 작업의 재시도가 있으면 더 늦어질 수 있다(판정은 언제나 전송 직전). 예약 항목이 이렇게 보류됐다가 예약 시각보다 60분 넘게 지난 뒤 재시도하면 D36 대로 먼저 확인을 묻는다(첫 재시도는 대기열에 넣지 않고 `schedule_stale`, 한 번 더 누르면 전송). 승인 기록당 총량 `PUBLISH_LIVE_MAX_POSTS` 는 그대로 함께 적용된다.
+- **즉시 중지** 설정 → **실제 게시** → `실제 게시 일시 중지`(확인 없이 바로, 서버 재시작 없음 — DB `live_publish_controls` 에 저장). 중지 중에는 실제 게시 전송을 보내지 않고 보류(`live_publish_paused`), 모의 전송은 그대로. 전송 직전 판정 뒤라도 게시 시도 표식(publish_attempt)을 쓰기 전이면 표식 기록 트랜잭션이 중지를 다시 보고 게시하지 않고 보류한다(만든 컨테이너는 남겨 재시도 때 이어 게시 — 재시도는 표식을 쓰기 전에 컨테이너 상태를 다시 읽어, 24시간이 지나 만료(`EXPIRED`)·오류면 게시 요청 없이 실패 `container_expired`·`container_error` 로 끝낸다(결과 불명 아님, FIX1-FULLREV2 G7)). 이미 게시를 시도한(표식 뒤·결과 확인 중) 항목은 바꾸지 않는다. 결과 불명 뒤 조회가 "남은 단계 미게시"를 확인하고 이어 보내다 중지·일일 상한에 막힌 항목도 재개 뒤 **재시도**로 보낼 수 있다. 재개는 확인 칸에 `재개` 를 입력해야 하고, 보류된 항목은 재개 뒤 **재시도**를 눌러야 다시 보낸다. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
+- 표시: 실제 계정이 있으면 홈과 실제 항목이 있는 배포 계획 화면에 "실제 게시: 최근 24시간 n/3" 또는 "실제 게시 일시 중지됨" 한 줄. 설정 화면에 상태(켜짐/일시 중지됨/꺼짐)·최근 24시간 사용. 중지·재개 완료 문구는 저장된 스위치와 맞을 때만 보인다 — 다른 탭에서 상태를 다시 바꾼 뒤 그 주소(`?live_publish=paused|resumed`)를 새로 고치면 완료 문구 대신 "지금 상태는 아래 '상태'를 보세요" 안내만(FIX3-FULLREV2 G11). "실제로 게시됩니다" 안내(배포 계획 만들기·배포함·설정 준비 표시)와 운영의 실제 게시 준비 줄은 중지 중이면 "일시 중지됨"을 함께 보인다.
+- 내보내기·복원: `live_publish_controls` 는 이 환경의 운영 스위치라 묶음에서 제외한다(복원 환경은 "중지 아님"으로 시작 — 복원한 작업은 어차피 다시 보내지 않는다).
+- migration: 0046(즉시 중지 스위치 표)과 0047(FIX1-FULLREV F9 — 위 두 사용 수 세기가 전송 의도 표 전체를 읽지 않게 하는 `send_intents` 부분 색인 2개. 표·열·행·묶음 형식은 그대로)은 dev 서버를 끈 뒤 `pnpm db:migrate` 로 적용한다(밀린 migration 을 순서대로 모두 적용 — 0046 을 이미 적용한 DB 는 0047 만). 0046 에서 만든 묶음은 0047 앱에서 복원되고, 0047 에서 만든 묶음은 0046 앱에서 거부된다(다른 migration 과 같은 규칙).
+- 운영 환경 파일(`deploy/`)에서는 D37(배포 대기) 동안 `PUBLISH_LIVE_DAILY_MAX` 도 비워 둔다(check-env 가 거부).
+
+### 만료 관리 (D39, EXPIRY-1)
+결정 D39(docs/DECISIONS.md). 외부 호출 없음 — 만료 시각은 이미 저장된 연결 정보와 로컬 인증서 파일에서만 읽는다.
+- **경고 시점**: 만료까지 남은 시간이 14일 이하(정확히 14일 포함)면 "곧 만료", 0 이하(만료 시각 그 순간부터)면 "만료됨". 홈 맨 위(헤더 아래)와 설정 맨 위에 보인다. 모의(MOCK) 계정·연결 해제한 계정(해제 진행 중 포함 — 그동안은 다시 연결도 막힘)은 경고하지 않는다.
+- **실제 Threads 연결**(현재 만료 2026-12-12): "Threads 연결이 YYYY-MM-DD HH:MM (MSK)에 만료됩니다 — 설정에서 다시 연결하세요", 만료 뒤 "Threads 연결이 만료되었습니다 — 다시 연결 전에는 실제 게시가 되지 않습니다". 설정 → 배포 계정 연결 표의 "만료" 칸 옆에도 계정별로 표시된다. 다시 연결은 그 행의 **다시 연결(실제 Threads)**(기존 연결 흐름 — 인증 창 → 코드 교환 → 장기 토큰). 토큰 갱신 API(`th_refresh_token`)는 부르지 않는다(D31 범위 밖, 자동 갱신 없음).
+- **로컬 인증서**(개발 모드만, 현재 만료 2026-11-12): dev 서버가 `DEV_TLS_CERT_PATH`(비우면 `data/dev-certs/localhost-cert.pem`)의 인증서 만료 시각만 읽는다 — 파일이 없거나 읽지 못하면 경고 없음, 운영 빌드는 읽지 않는다. 설정 → **만료 관리**에 만료 시각이 보인다.
+- **인증서 확인·갱신**(앱 루트에서, Git Bash):
+  - `bash scripts/dev-cert.sh check` — 만료 시각(notAfter)과 남은 날짜. 키는 출력하지 않는다.
+  - `bash scripts/dev-cert.sh renew [일수]`(기본 90, 1~825) — 기존 `*.pem` 을 `data/dev-certs/backup-YYYYMMDD-HHMMSS/` 에 복사한 뒤 새 EC P-256 키(`localhost-key.pem`, 권한 600 — 지원되는 파일 시스템에서만) + 자체 서명 인증서(`localhost-cert.pem`, CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`)로 바꾼다. 새 파일을 다 만들고 검사한 뒤에만 바꾸므로 중간에 실패하면 기존 파일은 그대로다. 키와 인증서를 바꾸는 사이에 실패하거나 멈추면(Ctrl+C·터미널 닫기 포함 — 화면 출력이 실패해도 끝까지) 백업에서 기존 키를 되돌리고, 되돌리지도 못하면 새 키와 짝인 새 인증서 임시 파일의 경로와 옮길 명령을 알려 준다. 같은 폴더의 renew 는 한 번에 하나만 돈다 — 잠금 폴더 `.dev-cert-renew.lock` 이 이미 있으면 아무것도 바꾸지 않고 exit 1(실행 중인 renew 가 없다고 확실하면 그 폴더를 지운다 — 안에 `.DS_Store` 등 파일이 생겼으면 그 파일부터 지운 뒤 `rmdir`). 바꾼 뒤 키·인증서 짝을 다시 확인해 맞지 않으면 백업에서 갱신 전 인증서·키로 되돌리고 exit 1. 끝나면 **dev 서버를 다시 시작하고 브라우저의 인증서 경고를 다시 수락**한다. 백업 폴더에는 예전 개인 키가 있으니 `data/` 밖으로 옮기지 않는다.
+  - dev 서버 실행 설정이 다른 폴더·파일 이름을 쓰면 `DEV_CERT_DIR`·`DEV_CERT_FILE`·`DEV_KEY_FILE` 로 맞춘다(`DEV_TLS_CERT_PATH` 도 같은 인증서를 가리키게). `DEV_CERT_FILE`·`DEV_KEY_FILE` 은 대소문자만 달라도 같은 파일로 보고 거부하고, 점(.)으로 시작하는 이름도 거부한다(숨김 파일은 백업 `*.pem` 에서 빠짐). 바꿀 키·인증서가 백업에 없으면 바꾸기 전에 멈춘다(NTFS·macOS 는 대소문자를 가리지 않음). openssl 이 PATH 에 없으면 한국어 안내와 함께 exit 1(`OPENSSL=<경로>` 로 지정 가능), 사용법 오류는 exit 2.
+  - 로컬 HTTPS 도 LAN 바인드가 필요 없다(FIX1-FULLREV2 G1): 인증서는 `localhost`·`127.0.0.1` 용이고, `pnpm dev`(`next.mjs dev`)에 HTTPS 인자(`--experimental-https --experimental-https-key … --experimental-https-cert …`)를 붙여도 hostname 을 주지 않으면 `APP_BASE_URL=https://localhost:3000` 에 맞춰 `--hostname localhost` 로 이 PC 에서만 듣는다(callback `https://localhost:3000/api/oauth/callback` 그대로). 실행 설정이 `--hostname 127.0.0.1`·`localhost` 를 직접 주면 그 값을 쓰고 경고는 없다 — 다만 `APP_BASE_URL` 호스트와 다르면 OAuth 연결이 redirect 불일치(`oauth_redirect_mismatch`)로 실패할 수 있으니 같게 둔다(Next 16.3.6 의 요청 URL 조립 코드를 읽어 판단 — 실제 dev 서버로 확인하지 않음).
+- 시험: `bash scripts/tests/test-dev-cert.sh`(임시 폴더에서만 — 실제 `data/dev-certs` 를 건드리지 않음). 바꾸기 중 실패·중단은 가짜 `mv`(TERM·HUP·INT, stderr 를 `/dev/full`·닫힌 fd·읽는 쪽이 닫힌 파이프로 둔 경우 포함), 백업에 키가 빠진 경우는 가짜 `cp`, 백업 이름 충돌은 가짜 `date` 로 만든다. 잠금(겹친 renew·잠금 폴더 안에 파일이 생김)·바꾼 뒤 짝 불일치(다른 renew 의 짝이 끼어듦)는 가짜 `mv`·openssl, 잠금 폴더를 만들지 못함·만드는 도중 신호는 가짜 `mkdir` 로 만든다. 파일 시스템이 `chmod 600` 을 지키지 않으면(Git Bash/NTFS) 키 권한 확인만 SKIP.
+
+### Notion·Drive 선택 가져오기 (M5, T18 — 파일·모의 범위)
+**Notion·Google 에 연결하지 않는다** — 자격 증명·OAuth·네트워크 호출 없음. 사용자가 직접 받은 내보내기 ZIP 을 올리면 **원본 파일은 그대로, 이 앱 안에 사본(소재)을 만든다**. 결정은 docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md 의 "Proposed D32"(사용자 확인 전). 다른 앱(ChatGPT 등)에서 연결한 Notion·Drive 권한은 이 앱의 자격 증명이 아니다.
+- 화면: 상단 메뉴 `가져오기`(`/imports`) → ZIP 올리기(최대 50MB, 원본 종류 자동 판별 | Notion | Drive) → **미리보기**(`/imports/<id>`) → 항목·폴더 선택 → `선택한 항목 가져오기` | `이 미리보기 취소`. 실행 기록은 `/imports` 아래 표.
+- 받는 파일: Notion "Markdown & CSV" 내보내기 ZIP(파일 이름 끝 32자리 페이지 ID 를 외부 ID 로), Drive 폴더 "다운로드" ZIP(경로를 외부 ID 로). 안쪽 ZIP(Part-1.zip 등)은 **한 겹만** 연다. 가져오는 것은 텍스트 `.md`·`.markdown`·`.txt`·`.html`·`.htm`·`.csv` 뿐 — 이미지·첨부·`.docx` 등은 **목록에만**(건너뜀, 풀지 않음). `.md`·`.txt`·`.csv` 는 원문 그대로, `.html` 은 텍스트만 소재 원문이 된다. **원본 파일은 바이트 그대로 보존한다**(출처 버전마다 `source_version_originals`, sha256 = 출처 버전 raw_hash, 내보내기·복원 포함) — 소재 상세의 `원본 파일 그대로 받기`(`GET /api/imports/originals/<출처 버전 ID>`, text/plain 첨부로만 보냄). 0039 이전에 가져온 항목은 원본 행이 없어 `원본 바이트 없음(0039 이전 가져오기)` 으로 표시되며, 같은 파일을 다시 올려 동일 항목의 **원본 보충**을 고르면 올린 바이트의 sha256 이 그 버전 raw_hash 와 같을 때만 원본 행을 추가한다(소재·출처·버전은 그대로, 이후 수정·삭제 불가). 제목은 첫 `# 제목`(HTML 은 h1·title) 또는 파일 이름, 원본의 `Created: …` 같은 생성 표시는 해석하지 않고 그대로 보인다.
+- 안전: 위험한 경로(`..`·절대 경로·역슬래시·드라이브 문자)가 하나라도 있으면 **ZIP 전체를 거부**(파일을 디스크에 풀지 않음), 암호화·ZIP64·분할 ZIP 거부, 압축은 저장·deflate 만. 상한(바깥·안쪽 ZIP 합산): 항목 5,000개(디렉터리 포함) · 안쪽 ZIP 16개 · 실제로 푸는 바이트 합계 128MB · 텍스트 파일 하나 2MB · 풀린 텍스트 합계 64MB · 가져올 항목 1,000개 · 소재 원문 20,000자(넘으면 그 항목만 건너뜀). deflate 는 목록의 크기까지만 풀고 CRC-32 를 확인한다.
+- 미리보기는 소재·출처를 만들지 않는다(원장 `import_runs`·`import_items` 만 — 본문 없음). 판정: **새 항목** / **이미 가져옴(동일)** = 같은 외부 ID·같은 원본 sha256 이 어떤 버전에 있음 → 다시 가져오지 않음 / **충돌** = 같은 외부 ID, 내용 다름 → **덮어쓰지 않는다**(기본 건너뜀, `새 버전으로 추가`를 직접 체크할 때만 기존 출처에 출처 버전 + 새 소재) / **건너뜀** = 지원하지 않음.
+- 확정은 미리보기를 믿지 않는다: 보관한 ZIP 을 다시 읽어 sha256 이 다르면 409 `import_file_changed`, 항목 checksum 이 달라졌으면 그 항목 `failed_changed`. 만든 소재는 입력 종류 `파일`, 원문 불변(T03 규칙 그대로), 출처(`sources.kind`=`notion_export`|`drive_export`, 외부 ID)·출처 버전(`raw_hash` = 원본 파일 sha256, `extraction_state`=`imported`)과 연결되고, 소재 상세에 "가져온 사본 · 원래 경로" 가 보인다. 기존 소재의 원문·제목·메모는 바꾸지 않는다. 확정·취소 뒤 보관 ZIP(`IMPORT_LOCAL_DIR`, 기본 `./data/imports`)은 지운다.
+- API: `POST /api/imports/preview`(multipart `file`+`source_kind` | `application/zip` 본문 + `?kind=` | JSON `{source:'mock_connector'}`), `GET /api/imports`, `GET /api/imports/{id}`, `POST /api/imports/{id}/commit`(JSON `{item_ids, folders, version_ids}` 또는 폼 `item`·`folder`·`version` 여러 개 — 아무것도 고르지 않으면 400), `POST /api/imports/{id}/cancel`. 모두 로그인·같은 출처 확인·owner 범위(다른 owner → 404).
+- 커넥터: `ImportConnector`(listScope·fetchItem) 인터페이스와 **모의 구현만**. `IMPORT_CONNECTOR_MODE=disabled`(기본 — 화면 "준비 중(모의)", API 503 `import_connector_disabled`) | `mock`(합성 예시 3건, 외부 호출 0). live 값은 설정에서 거부된다.
+- 내보내기·복원: `import_runs`·`import_items` 는 묶음에 들어가고 그대로 복원된다(가져온 소재의 출처 이력). 복원한 환경에는 보관 ZIP 이 없으므로 복원된 "미리보기" 실행은 확정할 수 없다(409 `import_file_missing` — 취소만).
+
+### 허용 소스 수집·재추천 (M5, T19 — 모의 수집기만)
+**기본 꺼짐 · 모의 수집기 · 실제 웹 요청 없음.** 결정은 docs/handoffs/T19_IMPLEMENTATION_HANDOFF.md 의 "Proposed D33"(사용자 확인 전). 실제 수집기(live fetcher)는 없다 — 허용 소스·주기·요청 상한을 따로 승인받은 뒤 만든다.
+- 모드: `COLLECTOR_MODE=disabled`(기본 — 실행 503 `collector_disabled`) | `mock`(메모리 고정 합성 자료 `*.mock.example` 만, 네트워크 0) | `enabled`(실제 수집 요청 — 수집기가 없어 503 `collector_live_not_ready`, 빠진 조건 표시; T03 추출은 그대로 501). `COLLECTOR_SCHEDULER=off`(기본) | `on`(모의 모드일 때만 worker tick 이 기한이 된 소스를 수집해 **미리보기만** 만든다 — 소재 자동 생성 없음).
+- 화면: 상단 메뉴 `수집`(`/collect`) → 소스 추가(RSS | Atom | 선택 URL, **꺼진 상태·주기 꺼짐으로 저장**) → `켜기` → `지금 수집(모의)` → 미리보기(`/collect/runs/<id>`: 새 항목·중복·건너뜀과 이유, 새 항목만 체크 가능, 기본 선택 없음) → `고른 항목을 소재로 저장` | `이 미리보기 버리기`. 주기(꺼짐·매일·매주)는 저장만 되고 스케줄러가 꺼져 있으면 돌지 않는다.
+- 주소 정책(A05, `checkCollectorUrl`·`checkResolvedAddresses`·`checkRedirect` — 순수 함수): **https 만**, 사용자 정보·443 외 포트 거부, **IP 주소 직접 입력은 모두 거부**(10진·8진·16진 IPv4·IPv6·메타데이터 169.254.169.254·fd00:ec2::254 포함), localhost·*.local·*.internal·점 없는 이름·nip.io 류 거부, 실행 때는 owner 가 등록한 소스의 호스트(허용 목록)와 **정확히 같은** 호스트만. redirect 는 hop 마다 같은 정책·허용 목록 재검사(최대 3번), 해석 주소가 사설·link-local·메타데이터면 거부(모의 DNS 로 시험). 막히면 실행이 `blocked`(이유 표시)로 남고 소스는 그대로다.
+- 파서: RSS 2.0·RSS 1.0·Atom·HTML 페이지. 응답 1MB 상한, **DTD·ENTITY 선언이 있으면 읽지 않음**(엔티티 확장 없음 — 기본 5개·숫자 참조만), 깊이 32·요소 50,000 상한, 한 번 앞으로만 훑는 선형 파서(단계 수 시험). 본문 HTML 은 T18 `htmlToText` 로 텍스트만(스크립트 제외).
+- 중복: 외부 키 = guid(없으면 정규화 링크). 이 소스에서 **받아들인 적 있는** 같은 키·같은 내용 → 중복(`same_item`), 같은 키·다른 내용 → 새 항목(`updated` — 받아들이면 같은 출처에 새 버전 + 새 소재, 기존 소재 그대로), 기존 소재 URL 과 같은 링크 → 중복, 같은 피드 안 반복 → 중복. 내부 주소 링크·키 없음·빈 본문·20,000자 초과·100개 초과 → 건너뜀.
+- 받아들이기는 미리보기를 믿지 않는다: 모의 수집기로 다시 읽어 내용 checksum·원본 sha256 이 같을 때만 저장(다르면 `failed_changed`). 만든 소재: 입력 `텍스트`, 원문 = 제목 + 본문 텍스트, 출처(`sources.kind`=`collector`, 외부 ID `<소스 ID>:<외부 키>`)·출처 버전(`raw_hash` = 원본 조각 sha256, `extraction_state`=`collected`)·**원본 조각 그대로**(`source_version_originals` — 피드는 `<item>` XML, 페이지는 HTML). 소재 상세에 `수집(모의)` 표시와 `수집한 원본 조각 그대로 받기`. 수집한 글 속 지시("이 글을 즉시 발행하라")는 자료일 뿐 — 게시·배포 호출 없음(A04).
+- 다시 볼 만한 소재(`/captures` 위): 받은 지 30일이 넘은 소재 중 최근 14일의 수집 글·작성 중인 원고와 **핵심어 2개 이상**을 공유하는 것을 이유 줄과 함께 최대 5개(규칙 기반·결정적, AI 호출 없음). `추천에서 닫기`는 기록만 남기고 소재는 바꾸지 않는다.
+- API: `GET|POST /api/collector/sources`, `POST /api/collector/sources/{id}/settings`(`enabled`·`schedule`), `POST /api/collector/sources/{id}/run`, `GET /api/collector/runs/{id}`, `POST /api/collector/runs/{id}/accept`(JSON `{item_ids}` 또는 폼 `item` 여러 개 — 빈 선택·새 항목 아님 400), `POST /api/collector/runs/{id}/discard`, `GET /api/recommendations`, `POST /api/recommendations/{captureId}/dismiss`. 모두 로그인·같은 출처 확인·owner 범위(다른 owner → 404).
+- 내보내기·복원: `collector_sources`·`collector_runs`·`collected_items`(본문 없음 — 발췌 200자)·`recommendation_dismissals` 를 묶음에 넣고 복원한다. **복원한 소스는 꺼진 채(enabled=false)** 들어온다(주기 값은 보존).
+
+### 검증 명령
+| 명령 | 내용 | 기대 |
+| --- | --- | --- |
+| `pnpm lint` | ESLint(flat config, typescript-eslint + eslint-config-next) | exit 0 |
+| `pnpm typecheck` | `tsc --noEmit`(패키지·worker·테스트) + `next typegen && tsc`(web) | exit 0 |
+| `pnpm test` | vitest 단위 테스트(`packages/**`, `apps/**`) | exit 0 |
+| `pnpm test:integration` | vitest 통합 테스트(`tests/integration`, PGlite 메모리 DB) | exit 0 |
+| `pnpm test:e2e` | Playwright E2E — M0에서는 실행하지 않음 | **exit 2 = NOT_RUN** (통과 아님) |
+| `pnpm build` | Next.js 프로덕션 빌드 | exit 0 |
+| `pnpm start` | 빌드 결과 실행(포트 3000). T21-P1a: 운영 빌드이므로 `AUTH_MODE=dev`(기본값)이면 시작을 거부한다(종료 코드 1). `AUTH_MODE=oidc` 면 시작하고 OIDC 설정이 모두 준비됐을 때만 OIDC 로 로그인할 수 있다(T21-P1b) — 로컬 사용은 `pnpm dev` | dev 설정: exit 1 + 한국어 안내 / oidc 설정: `/api/health` 200 |
+| `pnpm db:migrate` / `pnpm db:seed` | SQL migration 적용 / 시드 | exit 0 |
+| `pnpm worker` | worker tick 1회(만료된 업로드 세션 정리 + T11 배포 작업 — 모의 어댑터, 외부 호출 없음. 전사는 web inline worker) 후 종료. `-- --loop 5000` 이면 반복 | exit 0, JSON 출력 |
+| `pnpm drill:mock` | T12 M3 게이트 훈련 + T14 Threads 모의 표 + T15 YouTube 모의 표 + T16 Instagram 모의 표(버리는 메모리 DB, 모의 어댑터·모의 OAuth — 외부 호출 없음) 출력 | exit 0 = 불변식 위반 0, 위반 있으면 exit 1 |
+| `pnpm secrets:rotate [--confirm]` | T13 키 교체: 기본 미리보기(연결 정보·진행 중 연결 요청·정리 대기 봉인별 다시 봉인 대상·현재 키·그 사이 바뀌어 건너뜀·열 수 없음(종류별) 개수만), `--confirm` 이면 현재 키로 다시 봉인. 서버를 끈 상태, 키·암호문·토큰·DB 오류 메시지 본문은 출력하지 않음(오류는 허용된 종류 이름·모양이 맞는 코드만) | exit 0, 열 수 없는 봉인이 있으면 exit 1, 키 미설정·DB 잠금·DB 닫기 실패면 안내 후 exit 1 |
+| `bash scripts/tests/test-dev-cert.sh` | EXPIRY-1 `scripts/dev-cert.sh` 시험(임시 폴더, openssl 이 있으면 실제 키·인증서 생성 검사 — 없으면 해당 시험 SKIP) | exit 0 |
+| `pnpm drill:restore` | T20 복원 훈련: 임시 내보내기 → 버리는 메모리 DB 에 empty_only 복원 → 표·파일·검색 비교(서버를 끈 상태, 외부 호출 없음) | exit 0 = PASS, 불일치면 exit 1, DB 잠금이면 안내 후 exit 1 |
+| `pnpm export` · `pnpm restore:preview <zip>` · `pnpm restore:commit <zip> --mode … --confirm` | 내보내기 / 복원 미리보기 / 복원(T05) | exit 0, JSON 출력 |
+| `pnpm bundle:check <zip>` | 묶음 읽기 전용 확인(FIX2-LIVEL1H2 — 복원 미리보기와 같은 묶음 검증, DB·파일 쓰기 없음. 수동 해결 뒤 묶음 확인: 인계 LIVEL1 절차 7) | exit 0, JSON 출력(실패 exit 1) |
+| `pnpm ledger:resolve --list [--owner <id>]` · `pnpm ledger:resolve --owner <id> --ledger <id> --source provider\|none --actual <금액> --settled <금액> --by '<누가>' --reason '<사유>' [--correct [--overwrite-valid]] [--expect <확인 지문> --confirm]` | provider_unstorable(저장 범위 밖 보고 usage) 수동 해결 — 인계 LIVEL1 절차 2·4~6(FIX4·FIX5-LIVEL1H2, **손으로 쓴 SQL 대신**). `--list` 는 후보·처리 방식(원장 행·감사 기록은 바꾸지 않음). 해결은 기본 미리보기(원장 행·감사 기록은 바꾸지 않음 — `resolved_by`·`reason` 을 받은 그대로 JSON 이스케이프로 보여 주고 마지막에 확인 지문)·그 지문을 `--expect <확인 지문> --confirm` 으로 붙이면 복원 검사와 같은 함수로 검사한 행만 한 트랜잭션으로 적용(`updated 1`, 감사 `usage_ledger.manual_resolve`; 미리보기 뒤 행·입력이 바뀌면 `expect_mismatch`). 이미 해결 기록이 있는 행의 정정은 `--correct`(미리보기가 정정 전 → 후 `settled_amount`·`resolved_at` 을 형식 검사 뒤 표시), 그 행이 이미 복원 검사를 통과할 때만 `--correct --overwrite-valid`(통과하지 않는 행에는 `overwrite_not_needed`). `AUTH_ALLOWED_IDENTITY` 의 owner(1단계 내보내기 owner)만, `--by`·`--reason` 에 `"`·`%`·`\`·`&`·`\|`·`<`·`>`·`^` 와 `/` 로 시작하는 값 불가(어느 셸에서나 같은 글이 되게 하는 규칙 — 셸이 바꾼 글은 미리보기 표시로 확인), `DATABASE_URL` 폴더가 없으면 만들지 않고 exit 1. 서버를 끈 상태. 보고값·스냅숏 값·DB 오류 본문은 출력하지 않음(`--list` 는 절차 3 비교용 보고값만) | exit 0, 거부·대상 없음·지문 불일치·DB 폴더 없음·DB 잠금 exit 1, 사용법 exit 2 |
+
+### PGlite 단일 연결 주의
+- 개발 DB는 PGlite(PostgreSQL WASM)이며 데이터는 `./data/pglite`(워크스페이스 루트 기준, gitignore)에 있다.
+- PGlite는 한 데이터 디렉터리를 **한 프로세스만** 열 수 있다. 그래서 worker는 web 안에서 inline 실행한다(`WORKER_MODE=inline` — 로그인한 "작업 처리 실행"·전사 목록 조회 때 tick, `WORKER_INLINE_INTERVAL_SECONDS` > 0 이면 web 안 타이머로도 주기 tick(T21-P2). 공개 `/api/health` 는 tick 을 돌리지 않는다).
+- 운영 배포 파일(T21-P2, 파일만 — 배포한 적 없음. 운영 로그인은 T21-P1b 로 코드가 생겼지만 실제 IdP 연결은 사용자 단계·별도 승인): `deploy/Caddyfile`·`deploy/content-studio.service`·`deploy/content-studio.env.example`·`deploy/scripts/`(build-release·check-env·backup-data — 실패 즉시 중단)·`deploy/README_KO.md`(저장소 루트와 앱 루트 `Content_Studio_Execution_Pack/` 구분, 설치·확인·업그레이드 전 백업·되돌리기).
+- `pnpm dev`/`pnpm start`가 켜져 있는 동안 `pnpm db:seed`·`pnpm db:migrate`·`pnpm worker`는 잠금 파일(`data/pglite/.content-studio.lock`) 때문에 한국어 안내와 함께 exit 1로 거부된다. 서버를 끄고 실행한다.
+- `WORKER_MODE=separate`는 `DB_DRIVER=postgres`(M3 예정, 아직 미구현)에서만 허용된다.
+
+### 기본 모드에서 외부 쓰기 0
+- LLM: `MockLlmProvider`(결정적, 네트워크 없음, 경고 `모의 응답: 실제 AI 호출 아님`). `LLM_MODE=live`는 M0에 공급자가 없어 거부된다.
+- 게시: `DisabledPublisher`는 항상 예외(`PUBLISH_MODE=disabled` → PublishDisabledError, `enabled`여도 서버 승인 객체가 없어 ApprovalRequiredError). MOCK/DISABLED 결과는 발행 실적으로 저장할 수 없다.
+- 배포 실행(T10): 모의 계정은 `PUBLISH_MODE` 와 무관하게 `MOCK` 작업(QUEUED)만 만든다. 실제 계정은 `PUBLISH_MODE=enabled` + 서버 승인이 있어도 어댑터가 없어 503(`LiveChannelNotConfiguredError`).
+- 작업 처리기(T11): 채널 어댑터는 `MockChannelAdapter` 뿐(프로세스 안 모의 "원격", 네트워크 없음). live 계정은 어댑터가 없어 작업이 `BLOCKED`(`execution_not_allowed`)로 멈춘다. 모의 결과는 `publications.verification = 'MOCK'` 로만 저장되고 `toStorablePublication` 은 여전히 MOCK 결과를 거부한다.
+- 수집: `DisabledCollector`는 항상 CollectorDisabledError.
+- 음성 전사(T08): `MockTranscriber`(결정적, 네트워크 없음, 경고 `모의 전사: 실제 음성 인식 결과가 아닙니다(자리표시 문장)`). `STT_MODE=live`는 어댑터가 없어 거부된다.
+- Next.js 텔레메트리는 `apps/web/scripts/next.mjs`에서 `NEXT_TELEMETRY_DISABLED=1`로 끈다(사용자 전역 설정은 변경하지 않음).

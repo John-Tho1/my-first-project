@@ -1,0 +1,201 @@
+import { consumeOidcLoginState, countRecentLoginDenials, countRecentLoginFailures, createSession, ensureOwner, recordAudit, withLoginAttemptLock } from '@cs/db';
+import {
+  AppError,
+  assertLoginNotRateLimited,
+  buildSessionCookie,
+  callbackRedirectTarget,
+  checkOidcIdentity,
+  generateSessionToken,
+  hashSessionToken,
+  hashUserAgent,
+  isWellFormedOAuthState,
+  LOGIN_FAILURE_REASONS,
+  LOGIN_FAILURE_WINDOW_MS,
+  OIDC_FLOW_COOKIE_NAME,
+  OIDC_CANCEL_AUDIT_MAX,
+  OIDC_CANCEL_AUDIT_WINDOW_MS,
+  OidcCancelledError,
+  oidcClientSettings,
+  OidcIdentityDeniedError,
+  oidcIdentityPolicy,
+  OidcLoginInvalidError,
+  oidcLoginReadiness,
+  OidcNotConfiguredError,
+  OidcProviderUnavailableError,
+  oidcSettingsFingerprint,
+  OidcStateInvalidError,
+  readCookie,
+  requireSecretKeyring,
+  sessionPolicyFingerprint,
+  sessionTtlMs,
+} from '@cs/domain';
+import { OidcLoginFailure } from '@cs/providers';
+import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
+import { warnAuthDenialThrottled } from '../../../../../lib/auth-log';
+import { withOAuthResponseHeaders } from '../../../../../lib/oauth';
+import { getOidcLoginClient } from '../../../../../lib/oidc';
+import { getAppDb, getConfig } from '../../../../../lib/server';
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+
+/** 판정 결과(값 없음). reason = 감사 사유(LOGIN_FAILURE_REASONS 에 든 것만 횟수 제한에 센다), check = 어느 검사인지. */
+interface Failure {
+  reason: 'oidc_invalid' | 'oidc_identity_mismatch' | 'oidc_provider_error' | 'oidc_cancelled';
+  check: string;
+  error: AppError;
+}
+
+const fail = (reason: Failure['reason'], check: string): Failure => {
+  const error =
+    reason === 'oidc_identity_mismatch'
+      ? new OidcIdentityDeniedError()
+      : reason === 'oidc_provider_error'
+        ? new OidcProviderUnavailableError()
+        : reason === 'oidc_cancelled'
+          ? new OidcCancelledError()
+          : check.startsWith('state') || check === 'redirect_mismatch'
+            ? new OidcStateInvalidError()
+            : new OidcLoginInvalidError();
+  return { reason, check, error };
+};
+
+/**
+ * GET /api/auth/oidc/callback?code&state(|error) — OIDC 로그인 완료(T21-P1b). 인증 없음(로그인 전), state·브라우저 결합 쿠키가 CSRF 를 막는다.
+ *
+ * 1) AUTH_MODE=oidc·준비 상태 → 2) 전역 로그인 시도 제한 조기 검사(429 — 맞는 callback 이어도, state 를 소비하지 않고 감사 기록 없음)
+ * 3) 요청 주소(APP_BASE_URL origin + 요청 path — FIX1-FULLREV3(H1)) = OIDC_REDIRECT_URI 정확 일치 → 4) state 형식 → 1회용 소비(같은 브라우저 결합 쿠키·10분·설정 지문)
+ * 5) IdP 의 error 파라미터면 취소 → 6) 라이브러리로 code 교환(PKCE)·ID token 검증(서명·iss·aud·exp·iat·nonce) → 7) 허용 신원(email+email_verified / sub)
+ * 8) 전역 잠금 안(withLoginAttemptLock — T21-P1a 와 같은 판정 경로): 재검사(429) → 실패면 auth.login_denied(reason·check) 기록, 성공이면 owner 확인·세션·auth.login 기록.
+ * 네트워크(6)는 잠금 밖에서 한다(느린 IdP 가 전역 잠금을 붙잡지 않게).
+ * FIX2-T21P1B(P2 :178·:172): callback 은 결합 쿠키(cs_oidc_flow — 브라우저마다 하나, 마지막 시작이 덮어씀)를 **지우지 않는다**(성공·실패 모두).
+ * 요청 당시 결합을 확인해도, 그 응답이 늦게 도착하는 사이 같은 브라우저가 새 로그인을 시작했으면 지우는 Set-Cookie 가 새 흐름의 쿠키를 지운다.
+ * 쿠키는 Max-Age 600초로 스스로 사라지고, 끝난 흐름의 재사용은 서버의 1회용 state(used_at)가 막는다. 결합 검사(소비 때 쿠키 해시 = 행 해시) 자체는 그대로다.
+ * 흐름별 쿠키 이름(state 에서 나온 id)은 쓰지 않았다 — 같은 효과를 더 많은 쿠키·이름 규칙 없이 얻는다.
+ * 응답: 브라우저는 303 / (성공) 또는 /login?error=<코드>, 그 밖은 200 {ok, expires_at} / JSON 오류. code·state·토큰·IdP 오류 본문은 응답·감사·로그에 없다.
+ */
+export async function GET(request: Request): Promise<Response> {
+  const html = wantsHtml(request);
+  let res: Response;
+  try {
+    const config = getConfig();
+    if (!oidcLoginReadiness(config, process.env).ready) throw new OidcNotConfiguredError();
+    const { db } = await getAppDb(config);
+    const limit = { windowMs: LOGIN_FAILURE_WINDOW_MS, reasons: LOGIN_FAILURE_REASONS };
+    assertLoginNotRateLimited(await countRecentLoginFailures(db, { now: new Date(), ...limit }));
+
+    const settings = oidcClientSettings(config, process.env);
+    const keyring = requireSecretKeyring(process.env);
+    const params = new URL(request.url).searchParams;
+    let failure: Failure | null = null;
+    let claims: { sub: string; email?: unknown; email_verified?: unknown } | null = null;
+
+    // FIX1-FULLREV3(H1): request.url 의 origin(운영은 서버 자신의 origin — Next 에 따라 127.0.0.1 또는 localhost)이 아니라 APP_BASE_URL origin + 요청 경로로
+    // 비교(정확 일치). OIDC_REDIRECT_URI 는 준비 판정이 APP_BASE_URL origin + 고정 경로와 같을 때만 통과시키므로(다르면 503 oidc_not_configured),
+    // 여기서 걸리는 것은 요청 경로 자체가 다른 경우(방어선)뿐이다.
+    if (callbackRedirectTarget(config, request.url) !== settings.redirectUri) {
+      failure = fail('oidc_invalid', 'redirect_mismatch');
+    } else {
+      const state = params.get('state');
+      if (!isWellFormedOAuthState(state) || params.getAll('state').length !== 1) {
+        failure = fail('oidc_invalid', 'state_missing');
+      } else {
+        const consumed = await consumeOidcLoginState(db, {
+          state,
+          browserToken: readCookie(request.headers.get('cookie'), OIDC_FLOW_COOKIE_NAME),
+          settingsHash: oidcSettingsFingerprint(settings),
+          keyring,
+        });
+        if (consumed.status !== 'ok') {
+          failure = fail('oidc_invalid', `state_${consumed.status}`);
+        } else if (params.has('error')) {
+          // IdP 가 거부·취소(access_denied 등). 오류 값·설명은 기록하지 않는다.
+          failure = fail('oidc_cancelled', 'provider_error_param');
+        } else {
+          try {
+            claims = await getOidcLoginClient(config, process.env).completeAuthorization({
+              callbackParams: params,
+              expectedState: state,
+              expectedNonce: consumed.secrets.nonce,
+              codeVerifier: consumed.secrets.codeVerifier,
+            });
+          } catch (e) {
+            if (!(e instanceof OidcLoginFailure)) throw e;
+            failure = e.kind === 'unavailable' ? fail('oidc_provider_error', e.step) : fail('oidc_invalid', e.step);
+          }
+          if (claims) {
+            const verdict = checkOidcIdentity(claims, oidcIdentityPolicy(config, process.env));
+            if (!verdict.ok) failure = fail('oidc_identity_mismatch', verdict.check);
+          }
+        }
+      }
+    }
+
+    const cfg = config;
+    const outcome = await withLoginAttemptLock(db, limit, async (tx, { now, failures, seq }) => {
+      assertLoginNotRateLimited(failures); // 던지면 아무것도 쓰지 않은 채 되돌려진다
+      if (failure) {
+        // FIX2-FULLREV2(G15): IdP 취소(callback?error=…)는 인증 없이 시작→callback 으로 반복할 수 있다. 24시간 창 안 기록이 상한에 닿으면
+        // 더 쓰지 않는다(응답은 같은 401, 서버 로그에 이름만 1분 1회). 잠금 안에서 세므로 상한은 정확하다. 실패 횟수(429)에는 계속 세지 않는다.
+        if (
+          failure.reason === 'oidc_cancelled' &&
+          (await countRecentLoginDenials(tx, { now, windowMs: OIDC_CANCEL_AUDIT_WINDOW_MS, reason: 'oidc_cancelled' })) >= OIDC_CANCEL_AUDIT_MAX
+        ) {
+          warnAuthDenialThrottled('oidc_cancelled');
+          // FIX2-FULLREV2(G15 fixup): 상한 뒤에는 위의 1분 1회 줄만 남긴다 — 아래 요청마다의 oidc_login_denied 줄은 건너뛴다(capped)
+          return { kind: 'failed' as const, failure, capped: true };
+        }
+        await recordAudit(tx, {
+          ownerId: null,
+          action: 'auth.login_denied',
+          entity: 'session',
+          versionOrHash: seq,
+          details: { reason: failure.reason, check: failure.check, mode: 'oidc' },
+          at: now,
+        });
+        return { kind: 'failed' as const, failure, capped: false };
+      }
+      const owner = await ensureOwner(tx, cfg.AUTH_ALLOWED_IDENTITY);
+      const token = generateSessionToken();
+      const session = await createSession(tx, {
+        ownerId: owner.id,
+        tokenHash: hashSessionToken(token),
+        expiresAt: new Date(now.getTime() + sessionTtlMs(cfg)),
+        userAgentHash: hashUserAgent(request.headers.get('user-agent')),
+        now,
+        // FIX2-FULLREV2(G16): 지금 인증 정책(AUTH_MODE·issuer·허용 sub·허용 email)의 지문 — 바뀌면 이 세션은 거부된다
+        policyFingerprint: sessionPolicyFingerprint(cfg, process.env),
+      });
+      await recordAudit(tx, {
+        ownerId: owner.id,
+        action: 'auth.login',
+        entity: 'session',
+        entityId: session.id,
+        versionOrHash: seq,
+        details: { mode: 'oidc' },
+        at: now,
+      });
+      return { kind: 'ok' as const, token, session };
+    });
+    if (outcome.kind === 'failed') {
+      if (!outcome.capped) console.warn(`[auth] oidc_login_denied: ${outcome.failure.reason}/${outcome.failure.check}`);
+      throw outcome.failure.error;
+    }
+    const headers = new Headers();
+    headers.append('set-cookie', buildSessionCookie(outcome.token, config));
+    res = html ? seeOther('/', headers) : json({ ok: true, expires_at: outcome.session.expiresAt.toISOString() }, { headers });
+  } catch (e) {
+    res = html ? seeOther(`/login?error=${callbackErrorCode(e)}`) : errorResponse(e, request);
+  }
+  return withOAuthResponseHeaders(res);
+}
+
+function callbackErrorCode(e: unknown): string {
+  if (e instanceof AppError) {
+    if (e.code === 'login_rate_limited') return 'rate_limited';
+    if (e.code.startsWith('oidc_')) return e.code;
+    if (e.code === 'secrets_not_configured') return 'oidc_not_configured';
+    if (e.code === 'login_sequence_exhausted') return 'server';
+  }
+  return 'server';
+}

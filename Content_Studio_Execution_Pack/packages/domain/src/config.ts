@@ -1,0 +1,397 @@
+import { z } from 'zod';
+import { LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_MIN_MAX_OUTPUT_TOKENS } from './llm-live';
+import { isPlainRedirectUri } from './oauth';
+import { isValidOidcClientId, isValidOidcIssuerUrl, isValidOidcScopes, OIDC_DEFAULT_SCOPES } from './oidc-format';
+
+/**
+ * 환경변수 계약(docs/04 "환경변수 계약").
+ * 기본값은 항상 안전 측: LLM 모의, 게시 비활성, 수집 비활성, worker inline.
+ * 실제 키·토큰은 이 스키마에 없다. 비밀은 서버 환경변수로만 주입한다.
+ */
+
+const LABELS: Record<string, string> = {
+  APP_BASE_URL: 'APP_BASE_URL(앱 기본 URL)',
+  APP_TIMEZONE: 'APP_TIMEZONE(표시 시간대)',
+  DB_DRIVER: 'DB_DRIVER(DB 드라이버)',
+  DATABASE_URL: 'DATABASE_URL(DB 위치)',
+  LLM_MODE: 'LLM_MODE(AI 모드)',
+  LLM_PROVIDER: 'LLM_PROVIDER(AI 공급자)',
+  LLM_MODEL: 'LLM_MODEL(AI 모델)',
+  LLM_LIVE_APPROVAL_REF: 'LLM_LIVE_APPROVAL_REF(실제 AI 호출 승인 기록)',
+  LLM_BUDGET_CURRENCY: 'LLM_BUDGET_CURRENCY(예산 통화)',
+  LLM_BUDGET_MONTHLY_LIMIT: 'LLM_BUDGET_MONTHLY_LIMIT(월 예산 상한)',
+  LLM_BUDGET_PER_RUN_MAX: 'LLM_BUDGET_PER_RUN_MAX(1회 예약 상한)',
+  LLM_PRICE_INPUT_PER_1K: 'LLM_PRICE_INPUT_PER_1K(입력 1K 토큰 가격)',
+  LLM_PRICE_OUTPUT_PER_1K: 'LLM_PRICE_OUTPUT_PER_1K(출력 1K 토큰 가격)',
+  LLM_LIVE_MAX_OUTPUT_TOKENS: 'LLM_LIVE_MAX_OUTPUT_TOKENS(실제 AI 1회 출력 토큰 상한)',
+  LLM_LIVE_MAX_RUNS: 'LLM_LIVE_MAX_RUNS(승인 기록당 실제 AI 호출 횟수)',
+  STT_MODE: 'STT_MODE(음성 전사 모드)',
+  STT_PROVIDER: 'STT_PROVIDER(음성 전사 공급자)',
+  STT_MODEL: 'STT_MODEL(음성 전사 모델)',
+  STT_LIVE_APPROVAL_REF: 'STT_LIVE_APPROVAL_REF(실제 음성 전사 승인 기록)',
+  STT_PRICE_PER_MINUTE: 'STT_PRICE_PER_MINUTE(음성 1분 가격)',
+  PUBLISH_MODE: 'PUBLISH_MODE(게시 모드)',
+  PUBLISH_LIVE_APPROVAL_REF: 'PUBLISH_LIVE_APPROVAL_REF(실제 게시 승인 기록)',
+  PUBLISH_LIVE_MAX_POSTS: 'PUBLISH_LIVE_MAX_POSTS(승인 기록당 실제 게시 수, 1~1000)',
+  PUBLISH_LIVE_DAILY_MAX: 'PUBLISH_LIVE_DAILY_MAX(최근 24시간 실제 게시 수 상한, 1~50 — 없으면 일일 상한 없음)',
+  COLLECTOR_MODE: 'COLLECTOR_MODE(수집 모드)',
+  COLLECTOR_SCHEDULER: 'COLLECTOR_SCHEDULER(주기 수집 실행)',
+  WORKER_MODE: 'WORKER_MODE(작업 처리기 모드)',
+  WORKER_INLINE_INTERVAL_SECONDS: 'WORKER_INLINE_INTERVAL_SECONDS(web 안 작업 처리기 주기, 초 — 0 또는 5~600)',
+  AUTH_ALLOWED_IDENTITY: 'AUTH_ALLOWED_IDENTITY(허용 사용자)',
+  AUTH_MODE: 'AUTH_MODE(인증 방식)',
+  AUTH_SESSION_TTL_MINUTES: 'AUTH_SESSION_TTL_MINUTES(세션 유효 시간, 분)',
+  AUTH_COOKIE_SECURE: 'AUTH_COOKIE_SECURE(쿠키 Secure 속성)',
+  AUTH_ALLOWED_SUBJECT: 'AUTH_ALLOWED_SUBJECT(허용 OIDC sub)',
+  OIDC_ISSUER_URL: 'OIDC_ISSUER_URL(OIDC 발급자 URL, https)',
+  OIDC_CLIENT_ID: 'OIDC_CLIENT_ID(OIDC 클라이언트 ID)',
+  OIDC_REDIRECT_URI: 'OIDC_REDIRECT_URI(OIDC redirect URI)',
+  OIDC_SCOPES: 'OIDC_SCOPES(OIDC scope, openid 포함)',
+  STORAGE_DRIVER: 'STORAGE_DRIVER(파일 저장소)',
+  STORAGE_LOCAL_DIR: 'STORAGE_LOCAL_DIR(로컬 파일 경로)',
+  EXPORT_LOCAL_DIR: 'EXPORT_LOCAL_DIR(내보내기 파일 경로)',
+  RESTORE_LOCAL_DIR: 'RESTORE_LOCAL_DIR(복원 파일 경로)',
+  IMPORT_LOCAL_DIR: 'IMPORT_LOCAL_DIR(가져오기 파일 경로)',
+  IMPORT_CONNECTOR_MODE: 'IMPORT_CONNECTOR_MODE(가져오기 커넥터 모드)',
+  JOB_SUBMIT_TIMEOUT_MS: 'JOB_SUBMIT_TIMEOUT_MS(배포 전송 시간 제한, ms)',
+  WORKER_UI_TICK_TIMEOUT_MS: 'WORKER_UI_TICK_TIMEOUT_MS(화면 "작업 처리 실행" 전송 시간 제한, ms)',
+  BACKUP_MAX_AGE_HOURS: 'BACKUP_MAX_AGE_HOURS(백업 경고 기준 시간)',
+  RETENTION_PACKAGES_DAYS: 'RETENTION_PACKAGES_DAYS(배포 파일 보존 일수)',
+  RETENTION_EXPORT_RUNS_KEEP: 'RETENTION_EXPORT_RUNS_KEEP(남길 내보내기 ZIP 수)',
+  RETENTION_JOB_EVENTS_DAYS: 'RETENTION_JOB_EVENTS_DAYS(끝난 작업 이력 보존 일수)',
+  RETENTION_SWEEP_MODE: 'RETENTION_SWEEP_MODE(보존 정리 방식)',
+  OAUTH_MODE: 'OAUTH_MODE(계정 연결 모드)',
+  OAUTH_REDIRECT_URI: 'OAUTH_REDIRECT_URI(계정 연결 redirect URI)',
+  OAUTH_LIVE_APPROVAL_REF: 'OAUTH_LIVE_APPROVAL_REF(실제 계정 연결 승인 기록)',
+  THREADS_APP_ID: 'THREADS_APP_ID(Threads 앱 ID)',
+};
+
+/** 빈 문자열은 "설정하지 않음"으로 취급해 기본값을 적용한다. */
+const emptyToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
+
+const opt = <T extends z.ZodType>(schema: T) => z.preprocess(emptyToUndefined, schema);
+
+/** T20: 정수 문자열(최대 6자리) → min~max, 없으면 기본값. */
+const intRange = (min: number, max: number, def: number) =>
+  z
+    .string()
+    .regex(/^\d{1,6}$/)
+    .transform(Number)
+    .pipe(z.int().min(min).max(max))
+    .default(def);
+
+/** 0 이상, 소수 6자리까지의 10진 문자열(부동소수 오차 없이 micro 단위 정수로 바꾼다 — budget.ts). */
+const decimalString = z.string().regex(/^\d{1,9}(\.\d{1,6})?$/);
+/**
+ * FIX3-LIVEL1: AI 단가(1K 토큰당) 0 ~ 100. 원장 토큰 열 최대(2^31-1) × 100 / 1000 × 2(입력+출력)도 numeric(18,6) 최대(약 1e12) 안에 들어간다.
+ * (실제 단가는 0.004·0.02 수준 — 100 은 넉넉한 상한이고, 그래도 넘는 보고 비용은 db 층이 provider_unstorable 로 막는다.)
+ */
+const priceString = decimalString.refine((v) => Number(v) <= 100);
+
+/** T21-P2: 주기 tick 간격(초)의 허용 범위(0 = 끔은 따로 허용). */
+export const INLINE_INTERVAL_MIN_SECONDS = 5;
+export const INLINE_INTERVAL_MAX_SECONDS = 600;
+
+export const configSchema = z.object({
+  APP_BASE_URL: opt(z.url().default('http://localhost:3000')),
+  APP_TIMEZONE: opt(z.literal('Europe/Moscow').default('Europe/Moscow')),
+  DB_DRIVER: opt(z.enum(['pglite', 'postgres']).default('pglite')),
+  DATABASE_URL: opt(z.string().min(1).default('./data/pglite')),
+  LLM_MODE: opt(z.enum(['mock', 'live']).default('mock')),
+  LLM_PROVIDER: opt(z.string().min(1).optional()),
+  LLM_MODEL: opt(z.string().min(1).optional()),
+  /**
+   * T07(결정 D13): 실제 AI 호출 승인 기록 참조(예: 결정 ID). 사용자가 명시적으로 승인한 뒤에만 설정한다.
+   * 값 자체는 비밀이 아니지만 화면·로그·health 에는 "설정됨/없음"만 보인다. LIVE-L1(D34): 공급자 anthropic·모델·가격·월 상한·서버 환경의 ANTHROPIC_API_KEY 와 함께 있을 때만 실제 호출이 열린다(D34 2단계 승인 뒤에만 설정).
+   */
+  LLM_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /** T07 예산(A15). 금액은 소수 6자리까지의 10진 문자열. 가격이 없으면 live 는 차단, mock 은 0 으로 기록. */
+  LLM_BUDGET_CURRENCY: opt(z.string().regex(/^[A-Z]{3}$/).default('USD')),
+  LLM_BUDGET_MONTHLY_LIMIT: opt(decimalString.optional()),
+  LLM_BUDGET_PER_RUN_MAX: opt(decimalString.optional()),
+  LLM_PRICE_INPUT_PER_1K: opt(priceString.optional()),
+  LLM_PRICE_OUTPUT_PER_1K: opt(priceString.optional()),
+  /**
+   * LIVE-L1(D34): 실제 AI 1회 출력 토큰 상한(1024 ~ 16000, 기본 4096). 예약의 출력 몫이자 요청의 max_tokens 와 같은 값이다
+   * (예약은 보수적 **추정**이지 증명된 비용 상한이 아니다 — 공급자가 usage 를 보고한 경우에만 실제 사용량을 기록한다, budget.ts 머리 주석). Opus 의 thinking 토큰도 출력으로
+   * 과금되므로 너무 작으면 max_tokens 로 끝나 실패한다. 모의에는 쓰지 않는다.
+   */
+  LLM_LIVE_MAX_OUTPUT_TOKENS: opt(intRange(LIVE_LLM_MIN_MAX_OUTPUT_TOKENS, LIVE_LLM_MAX_MAX_OUTPUT_TOKENS, LIVE_LLM_DEFAULT_MAX_OUTPUT_TOKENS)),
+  /**
+   * FIX1-LIVEL1(D34 2단계 범위): 같은 승인 기록(LLM_LIVE_APPROVAL_REF)으로 허용하는 실제 AI 호출 횟수(1 ~ 1000000, 양의 정수). 없으면 제한 없음.
+   * 예약 트랜잭션이 owner 잠금 아래에서 이 owner 의 live 원장 행(스냅숏의 approval_ref 가 같은 것 — 실패 호출 포함)을 세어 넘으면 429 live_run_limit.
+   */
+  LLM_LIVE_MAX_RUNS: opt(
+    z
+      .string()
+      .regex(/^\d{1,7}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(1_000_000))
+      .optional(),
+  ),
+  /**
+   * T08(결정 D9·D15): 음성 전사. 기본 mock(결정적 모의 전사기, 외부 호출 없음). live 는 승인 기록·공급자·모델·가격이 있어도
+   * T08 에는 어댑터(HTTP 호출)가 없어 항상 거부된다. 예산 통화·상한은 LLM_BUDGET_* 를 함께 쓴다(같은 원장).
+   */
+  STT_MODE: opt(z.enum(['mock', 'live']).default('mock')),
+  STT_PROVIDER: opt(z.string().min(1).optional()),
+  STT_MODEL: opt(z.string().min(1).optional()),
+  STT_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  STT_PRICE_PER_MINUTE: opt(decimalString.optional()),
+  PUBLISH_MODE: opt(z.enum(['disabled', 'enabled']).default('disabled')),
+  /**
+   * LIVE-P1(D38 1단계): 실제 게시(현재 Threads 텍스트만) 승인 기록 참조(예: 결정 ID). 사용자가 정확한 범위를 승인한 뒤에만 설정한다.
+   * 없으면 PUBLISH_MODE=enabled 여도 실제 게시는 막힌다(fail closed). 값 자체는 비밀이 아니지만 화면·로그에는 "설정됨/없음"만 보인다.
+   * 전송 의도(send_intents.sanitized_details.live_approval_ref)에 남겨 아래 게시 수를 센다.
+   */
+  PUBLISH_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /**
+   * LIVE-P1(D38 1단계): 같은 승인 기록(PUBLISH_LIVE_APPROVAL_REF)으로 허용하는 실제 게시 수(1 ~ 1000). 없으면 실제 게시는 막힌다(fail closed —
+   * LLM_LIVE_MAX_RUNS 와 달리 "없음 = 제한 없음"이 아니다). 세는 단위 = 이 승인 기록으로 전송 의도를 하나라도 만든(원격에 닿았을 수 있는) 실제 게시
+   * 작업 수 — 같은 작업의 재시도·이어 보내기는 새로 세지 않는다. 전송 직전(beginSend) 승인 기록별 advisory 잠금 아래에서 센다.
+   */
+  PUBLISH_LIVE_MAX_POSTS: opt(
+    z
+      .string()
+      .regex(/^\d{1,4}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(1000))
+      .optional(),
+  ),
+  /**
+   * LIVE-P2(D39): 최근 24시간(이동 창) 실제 게시 수 상한(1 ~ 50, 양의 정수). **없으면 일일 상한 없음**(이전 동작 그대로 — PUBLISH_LIVE_MAX_POSTS 만).
+   * 세는 단위 = 이 owner 의 실제 게시 전송 의도(sanitized_details.live_approval_ref 가 있는 send_intents — 승인 기록 값과 무관)를 최근 24시간 안에 만든
+   * **서로 다른 작업 수**. 같은 작업의 재시도·이어 보내기는 새로 세지 않는다(그 작업이 창 안에 이미 실제 전송 의도를 가지면 새 게시가 아님).
+   * 전송 직전(beginSend) owner 별 advisory 잠금(cs_live_publish_daily:<owner>) 아래에서 센다 — packages/db/src/jobs.ts.
+   */
+  PUBLISH_LIVE_DAILY_MAX: opt(
+    z
+      .string()
+      .regex(/^\d{1,2}$/)
+      .transform(Number)
+      .pipe(z.int().min(1).max(50))
+      .optional(),
+  ),
+  /**
+   * 수집. disabled(기본) = 꺼짐. mock(T19, D33 제안) = 모의 수집기만(메모리 고정 자료, 실제 웹 요청 0). enabled = 실제 수집 요청 —
+   * 실제 수집기가 없어 T03 추출은 501, T19 수집은 준비 안 됨(503 collector_live_not_ready). 어떤 값에서도 네트워크 요청은 없다.
+   */
+  COLLECTOR_MODE: opt(z.enum(['disabled', 'mock', 'enabled']).default('disabled')),
+  /**
+   * T19(D33 제안): 주기 수집 실행. off(기본) = 소스의 주기 설정은 저장만 하고 실행하지 않는다. on = COLLECTOR_MODE=mock 일 때만 worker tick 이
+   * 기한이 된 소스를 모의 수집해 **미리보기만** 만든다(소재 자동 생성 없음 — 사용자가 골라야 저장).
+   */
+  COLLECTOR_SCHEDULER: opt(z.enum(['off', 'on']).default('off')),
+  WORKER_MODE: opt(z.enum(['inline', 'separate']).default('inline')),
+  /**
+   * T21-P2(T21_DEPLOY_REVIEW G3): WORKER_MODE=inline 일 때 web 프로세스 안에서 작업 처리기(tick)를 주기 실행하는 간격(초).
+   * 0(기본) = 끔 — 지금처럼 로그인한 요청(전사 목록 조회·"작업 처리 실행")에서만 처리한다. 개발·시험·운영 모두 기본은 끔이고 운영 환경 파일에서 명시적으로 켠다
+   * (deploy/README_KO.md 권장 30). 켜면 5 ~ 600 — 상한 10분은 오래 지난 예약 판정(SCHEDULE_STALE_GRACE_MS, 60분)보다 충분히 작게 둔 것이다.
+   * 직전 tick 이 끝난 뒤 이 간격만큼 쉬고 다음 tick 을 시작한다(겹치지 않음, 고정 간격·흔들림 없음).
+   */
+  WORKER_INLINE_INTERVAL_SECONDS: opt(
+    z
+      .string()
+      .regex(/^\d{1,4}$/)
+      .transform(Number)
+      .pipe(z.int().refine((v) => v === 0 || (v >= INLINE_INTERVAL_MIN_SECONDS && v <= INLINE_INTERVAL_MAX_SECONDS)))
+      .default(0),
+  ),
+  AUTH_ALLOWED_IDENTITY: opt(z.string().min(3).default('owner@example.local')),
+  /** dev: 비밀번호 없는 개발용 로그인(localhost 전용, D3). oidc: 운영 인증(T21-P1b — 일반 OpenID Connect, 아래 OIDC_* 와 oidc.ts). */
+  AUTH_MODE: opt(z.enum(['dev', 'oidc']).default('dev')),
+  /** 세션 유효 시간(분). 5분 ~ 30일. */
+  AUTH_SESSION_TTL_MINUTES: opt(
+    z
+      .string()
+      .regex(/^\d{1,5}$/)
+      .transform(Number)
+      .pipe(z.int().min(5).max(43200))
+      .default(720),
+  ),
+  /** auto: APP_BASE_URL 이 http://localhost·127.0.0.1 이면 Secure 없이, 그 외에는 Secure. */
+  AUTH_COOKIE_SECURE: opt(z.enum(['auto', 'true', 'false']).default('auto')),
+  /**
+   * T21-P1b: OIDC 로그인에서 허용할 ID token 의 sub(선택). 설정하면 sub 가 정확히 같아야 한다. AUTH_ALLOWED_IDENTITY 를 환경에 명시하면
+   * email(+ email_verified=true) 도 맞아야 한다. 둘 중 하나는 있어야 OIDC 로그인이 준비된다(oidc.ts oidcLoginReadiness). 값은 화면·로그에 내보내지 않는다.
+   */
+  AUTH_ALLOWED_SUBJECT: opt(z.string().min(1).max(255).regex(/^\S+$/).optional()),
+  /**
+   * T21-P1b: OIDC 발급자(issuer) URL — https 만, query·fragment·사용자 정보 없음. discovery 는 이 값 + /.well-known/openid-configuration.
+   * IdP 를 정하지 않는다(Google 등은 사용자가 고른다). 클라이언트 시크릿(OIDC_CLIENT_SECRET)은 이 스키마에 없다 — 서버 환경에서만 읽고 값은 내보내지 않는다.
+   */
+  OIDC_ISSUER_URL: opt(z.string().refine(isValidOidcIssuerUrl).optional()),
+  OIDC_CLIENT_ID: opt(z.string().refine(isValidOidcClientId).optional()),
+  /** T21-P1b: IdP 에 등록한 redirect URI. APP_BASE_URL 의 origin + /api/auth/oidc/callback 과 정확히 같아야 준비된다(oidcLoginReadiness). */
+  OIDC_REDIRECT_URI: opt(z.string().refine(isPlainRedirectUri).optional()),
+  /** T21-P1b: 요청 scope(공백 구분, openid 필수). 기본 "openid email". */
+  OIDC_SCOPES: opt(z.string().refine(isValidOidcScopes).default(OIDC_DEFAULT_SCOPES)),
+  STORAGE_DRIVER: opt(z.enum(['local', 'object']).default('local')),
+  STORAGE_LOCAL_DIR: opt(z.string().min(1).default('./data/assets')),
+  /** T05: 내보내기 묶음(<id>/ 폴더 + <id>.zip)을 두는 곳. 개인 원문이 들어 있으므로 gitignore 된 data/ 아래를 쓴다. */
+  EXPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/exports')),
+  /** T05: 복원 미리보기에 올린 ZIP(<restore_id>.zip)을 두는 곳. */
+  RESTORE_LOCAL_DIR: opt(z.string().min(1).default('./data/restores')),
+  /** T18(D32 제안): 가져오기 미리보기에 올린 ZIP(<import_id>.zip)을 확정·취소 전까지 두는 곳(gitignore 된 data/ 아래). */
+  IMPORT_LOCAL_DIR: opt(z.string().min(1).default('./data/imports')),
+  /**
+   * T18(D32 제안): 앞으로의 Notion·Drive 직접 연결(커넥터) 자리. disabled(기본) = 꺼짐, mock = 프로세스 안 모의 자료만(외부 호출 0).
+   * live 값은 없다 — 실제 커넥터·자격 증명은 별도 승인 전까지 만들지 않는다(다른 앱의 Notion·Drive 연결은 이 앱의 자격 증명이 아니다).
+   */
+  IMPORT_CONNECTOR_MODE: opt(z.enum(['disabled', 'mock']).default('disabled')),
+  /**
+   * T11(D18): 배포 작업의 어댑터 submit 시간 제한(ms). 넘으면 결과 불명(ambiguous) → RECONCILING(재전송하지 않고 조회).
+   * 1초 ~ 10분, 기본 30초. lease 는 heartbeat 로 연장된다.
+   */
+  JOB_SUBMIT_TIMEOUT_MS: opt(
+    z
+      .string()
+      .regex(/^\d{1,6}$/)
+      .transform(Number)
+      .pipe(z.int().min(1000).max(600000))
+      .default(30000),
+  ),
+  /**
+   * 화면 확인 D7: 화면의 "작업 처리 실행(모의 1회)" 버튼(폼 POST /api/worker/tick)이 쓰는 작업당 전송 시간 제한(ms).
+   * 응답이 없는 전송(hang)이 화면을 30초 붙잡지 않게 min(이 값, JOB_SUBMIT_TIMEOUT_MS) 를 쓴다 — 넘으면 기존 시간 초과 → RECONCILING 경로.
+   * 1초 ~ 10분, 기본 10초. 작업 처리기(CLI·백그라운드)와 JSON API 는 JOB_SUBMIT_TIMEOUT_MS 그대로.
+   */
+  WORKER_UI_TICK_TIMEOUT_MS: opt(
+    z
+      .string()
+      .regex(/^\d{1,6}$/)
+      .transform(Number)
+      .pipe(z.int().min(1000).max(600000))
+      .default(10000),
+  ),
+  /** T20(D22): 마지막 내보내기(백업)가 이 시간보다 오래되면 /ops 에 경고(시간, 1 ~ 8760, 기본 24). 외부 알림은 없다. */
+  BACKUP_MAX_AGE_HOURS: opt(intRange(1, 8760, 24)),
+  /** T20: 배포 파일(수동 게시용 ZIP, 다시 만들 수 있음) 보존 일수 — 파일 수정 시각 기준(1 ~ 3650, 기본 30). */
+  RETENTION_PACKAGES_DAYS: opt(intRange(1, 3650, 30)),
+  /** T20: owner 마다 남길 최근 내보내기 ZIP 개수(1 ~ 1000, 기본 10). 실행 기록(export_runs)은 남긴다. */
+  RETENTION_EXPORT_RUNS_KEEP: opt(intRange(1, 1000, 10)),
+  /** T20: 끝난 배포 작업(CONFIRMED·FAILED·CANCELED)의 이력 보존 일수 — 마지막 이력이 이보다 오래된 작업만, JSONL 로 내보낸 뒤 삭제(1 ~ 3650, 기본 180). */
+  RETENTION_JOB_EVENTS_DAYS: opt(intRange(1, 3650, 180)),
+  /** T20: 보존 정리 실행 방식. manual(기본) = /ops 에서 미리보기 → confirm 으로만, auto = worker tick 이 한 시간에 한 번 적용. */
+  RETENTION_SWEEP_MODE: opt(z.enum(['manual', 'auto']).default('manual')),
+  /**
+   * T13(결정 D24): 계정 연결(OAuth). mock(기본) = 모의 계정만 프로세스 안 모의 공급자로 연결(외부 호출 0). live = 실제 계정용이지만
+   * T13 에는 live 어댑터가 없어 준비 상태(liveOAuthReadiness)가 항상 거부한다. 비밀(앱 secret·마스터 키)은 이 스키마에 넣지 않는다 —
+   * 서버가 존재 여부만 따로 확인한다(THREADS_APP_SECRET, SECRETS_MASTER_KEY).
+   */
+  OAUTH_MODE: opt(z.enum(['mock', 'live']).default('mock')),
+  /**
+   * callback 정확 일치 대상. 없으면 APP_BASE_URL + /api/oauth/callback.
+   * FIX2-FULLREV3(K1): 넣으면 APP_BASE_URL origin + /api/oauth/callback 과 정확히 같아야 연결을 시작한다(oauth.ts assertOAuthRedirectUri·liveOAuthReadiness).
+   * FIX-T13: http(s) + host + path 만 — query·fragment·사용자 정보가 있으면 설정 오류(callback 과 절대 맞지 않음).
+   */
+  OAUTH_REDIRECT_URI: opt(
+    z
+      .url()
+      .refine((v) => {
+        try {
+          const u = new URL(v);
+          return (u.protocol === 'http:' || u.protocol === 'https:') && !u.search && !u.hash && !v.includes('?') && !v.includes('#') && !u.username && !u.password && `${u.origin}${u.pathname}` === v;
+        } catch {
+          return false;
+        }
+      })
+      .optional(),
+  ),
+  OAUTH_LIVE_APPROVAL_REF: opt(z.string().min(1).max(200).optional()),
+  /** 앱 ID 는 비밀이 아니지만 화면에는 설정 여부만 보인다. */
+  THREADS_APP_ID: opt(z.string().min(1).max(100).optional()),
+});
+
+export type AppConfig = z.infer<typeof configSchema>;
+
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+/**
+ * 환경변수를 검증해 설정 객체를 만든다. 잘못된 값이면 한국어 메시지로 즉시 실패한다.
+ * 오류 메시지에는 변수 이름만 넣고 입력값 자체는 넣지 않는다(비밀 노출 방지).
+ */
+export function loadConfig(env: Record<string, string | undefined> = process.env): AppConfig {
+  const input: Record<string, string | undefined> = {};
+  for (const key of Object.keys(configSchema.shape)) input[key] = env[key];
+  const parsed = configSchema.safeParse(input);
+  if (!parsed.success) {
+    const lines = parsed.error.issues.map((issue) => {
+      const key = String(issue.path[0] ?? '');
+      return `- ${LABELS[key] ?? key}: 허용되지 않는 값입니다`;
+    });
+    throw new ConfigError(`환경변수 설정이 올바르지 않습니다.\n${lines.join('\n')}`);
+  }
+  // T21-P1a(G1a): 운영 빌드에서 비밀번호 없는 dev 로그인 설정이면 설정 읽기 자체를 실패시킨다(fail closed).
+  if (parsed.data.AUTH_MODE === 'dev' && !isDevAuthAllowedForNodeEnv(env.NODE_ENV)) {
+    throw new ConfigError(DEV_AUTH_REFUSED_CONFIG_MESSAGE);
+  }
+  return parsed.data;
+}
+
+/**
+ * T21-P1a(G1a, docs/handoffs/T21_DEPLOY_REVIEW.md §2): 비밀번호 없는 개발용 로그인(AUTH_MODE=dev)을 허용하는 실행 환경.
+ * NODE_ENV 가 없거나 빈 값·`development`·`test` 일 때만 허용한다. `production` 을 포함한 그 밖의 값은 모두 거부한다(fail closed).
+ *
+ * 탈출구(운영 빌드를 로컬에서 dev 로그인으로 실행)는 두지 않는다: Next route handler 는 소켓의 실제 원격 주소를 주지 않고,
+ * Host·Origin·X-Forwarded-* 는 클라이언트·프록시가 바꿀 수 있어 "loopback 에서 온 요청"을 믿을 수 있게 판별할 수 없다.
+ * 로컬 개발은 `pnpm dev`(NODE_ENV=development)로 한다.
+ */
+export function isDevAuthAllowedForNodeEnv(nodeEnv: string | undefined): boolean {
+  return nodeEnv === undefined || nodeEnv === '' || nodeEnv === 'development' || nodeEnv === 'test';
+}
+
+/**
+ * 원시 환경변수 기준 판정(설정 객체를 만들기 전 — 서버 시작 훅·로그인 경로의 첫 검사).
+ * AUTH_MODE 가 없거나 빈 값(기본값 dev)·`dev` 이고 NODE_ENV 가 허용 목록 밖이면 true.
+ * 그 밖의 잘못된 AUTH_MODE 값은 여기서 판정하지 않고 loadConfig 가 거부한다.
+ */
+export function devAuthRefusedByRuntime(env: Record<string, string | undefined>): boolean {
+  const mode = env.AUTH_MODE;
+  const isDev = mode === undefined || mode.trim() === '' || mode === 'dev';
+  return isDev && !isDevAuthAllowedForNodeEnv(env.NODE_ENV);
+}
+
+/** 설정 이름만 말한다(값 없음). 서버 시작 거부·설정 읽기 실패에 같은 문구를 쓴다. */
+export const DEV_AUTH_REFUSED_CONFIG_MESSAGE =
+  `환경변수 설정이 올바르지 않습니다.\n- ${LABELS.AUTH_MODE}: 운영 빌드(NODE_ENV=production 등)에서는 비밀번호 없는 개발용 로그인을 쓸 수 없습니다. ` +
+  '운영 인증을 설정하세요(로컬 개발은 pnpm dev)';
+
+export interface Modes {
+  llm: AppConfig['LLM_MODE'];
+  publish: AppConfig['PUBLISH_MODE'];
+  collectors: AppConfig['COLLECTOR_MODE'];
+}
+
+export function getModes(config: AppConfig): Modes {
+  return { llm: config.LLM_MODE, publish: config.PUBLISH_MODE, collectors: config.COLLECTOR_MODE };
+}
+
+export interface ModeBadge {
+  key: keyof Modes;
+  label: string;
+  /** 외부 효과가 가능한 상태면 true (UI 강조용) */
+  live: boolean;
+}
+
+/** UI 배지용 한국어 라벨. 실제 상태를 그대로 보여 준다. */
+export function describeModes(config: AppConfig): ModeBadge[] {
+  return [
+    { key: 'llm', label: `LLM: ${config.LLM_MODE === 'mock' ? '모의' : '실제'}`, live: config.LLM_MODE === 'live' },
+    {
+      key: 'publish',
+      label: `게시: ${config.PUBLISH_MODE === 'enabled' ? '활성' : '비활성'}`,
+      live: config.PUBLISH_MODE === 'enabled',
+    },
+    {
+      key: 'collectors',
+      label: `수집: ${config.COLLECTOR_MODE === 'enabled' ? '활성' : config.COLLECTOR_MODE === 'mock' ? '모의' : '비활성'}`,
+      live: config.COLLECTOR_MODE === 'enabled',
+    },
+  ];
+}

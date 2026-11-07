@@ -1,0 +1,5 @@
+-- FIX-T18 round 2(Codex review-FIX-T18 P1 captures/[id]:123): drizzle-kit 출력 그대로(머리말 2줄만 더함).
+-- import_items.outcome 에 original_backfilled(0039 이전 가져오기의 빠진 원본을 같은 바이트로 채움 — 소재 없음, 기존 출처 버전만) 추가.
+ALTER TABLE "import_items" DROP CONSTRAINT "import_items_outcome_chk";--> statement-breakpoint
+ALTER TABLE "import_items" ADD CONSTRAINT "import_items_backfill_chk" CHECK ("import_items"."outcome" is distinct from 'original_backfilled' or ("import_items"."target_source_id" is not null and "import_items"."target_source_version_id" is not null and "import_items"."target_capture_id" is null));--> statement-breakpoint
+ALTER TABLE "import_items" ADD CONSTRAINT "import_items_outcome_chk" CHECK ("import_items"."outcome" is null or "import_items"."outcome" in ('imported', 'versioned', 'skipped_identical', 'skipped_unselected', 'skipped_conflict', 'skipped_unsupported', 'failed_changed', 'original_backfilled'));

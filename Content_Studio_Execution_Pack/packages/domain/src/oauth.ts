@@ -1,0 +1,560 @@
+/**
+ * T13(결정 D24): 계정 연결(OAuth) 공통 틀 — 공급자 인터페이스, state·PKCE, scope, 연결 상태(health) 판정, live 준비 상태.
+ *
+ * - T13 은 모의 공급자(Threads 형태, 프로세스 안, 네트워크 없음)만 있다. 실제 Meta OAuth 왕복·토큰 발급은 하지 않는다.
+ *   LIVE-T1(D31): 실제 Threads 연결 공급자(@cs/providers LiveThreadsOAuthProvider)가 생겼다 — 준비 상태(liveOAuthReadiness)가 모두 갖춰진
+ *   실제(live) Threads 계정만. LIVE-P1(D38 1단계): 실제 게시의 환경 조건은 livePublishReadiness(PUBLISH_MODE·승인 기록·게시 수 상한).
+ * - state: 32바이트 난수(base64url). 서버에는 SHA-256 만 저장, 한 번만 쓰임, owner + 로그인 세션 + 계정에 묶임, TTL 10분.
+ * - PKCE: S256(verifier 32바이트 난수 base64url → SHA-256 → base64url). verifier 는 서버에 암호화해 둔다(브라우저로 나가지 않음).
+ * - scope: 게시에 필요한 최소(Threads 기본 + 게시). reply·insights 는 기본으로 요청하지 않는다(docs/03). 실제 이름은 T14 에서 공식 문서로 재확인.
+ * - 토큰·code·state·verifier 는 오류 메시지·감사·응답·로그에 넣지 않는다(코드 값만).
+ */
+import { createHash, randomBytes } from 'node:crypto';
+import { z } from 'zod';
+import type { AppConfig } from './config';
+import { AppError, GuardError } from './errors';
+import { readSecretKeyring } from './secrets';
+import type { Channel } from './channel';
+
+/** T15(D27): mock_google = Google(YouTube) 형 모의 공급자(프로세스 안, 네트워크 없음). 실제 Google 공급자는 없다. */
+/** T16(D29 제안): mock_instagram = Instagram(Meta 형, Instagram 로그인 흉내) 모의 공급자(프로세스 안, 네트워크 없음). 실제 Meta 공급자는 없다. */
+export const OAUTH_PROVIDER_IDS = ['mock_threads', 'threads', 'mock_google', 'mock_instagram'] as const;
+/** 모의 공급자 ID(연결 정보 is_mock = true — DB CHECK 와 같아야 한다). */
+export const MOCK_OAUTH_PROVIDER_IDS = ['mock_threads', 'mock_google', 'mock_instagram'] as const;
+export type OAuthProviderId = (typeof OAUTH_PROVIDER_IDS)[number];
+
+/** T13 잠정 scope(D24 — T14 에서 공식 문서로 재확인). 게시에 필요한 최소만. */
+export const THREADS_REQUIRED_SCOPES = ['threads_basic', 'threads_content_publish'] as const;
+/** 기본 연결에서 요청하지 않는 scope(답글·통계). 공급자가 이 값을 요청 URL 에 넣으면 시험이 실패한다. */
+export const THREADS_NOT_REQUESTED_BY_DEFAULT = ['threads_manage_replies', 'threads_read_replies', 'threads_manage_insights'] as const;
+
+/**
+ * T15(D27): YouTube 업로드에 필요한 최소 scope — **모의 자리 표시 이름**(실제 Google scope 이름이 아니다). live 전에 공식 문서로
+ * 실제 이름(업로드 전용 scope)을 다시 확인한다. 읽기·관리·분석 scope 는 요청하지 않는다.
+ */
+export const YOUTUBE_REQUIRED_SCOPES = ['youtube.upload(mock)'] as const;
+/** 기본 연결에서 요청하지 않는 scope(모의 자리 표시 — 전체 관리·분석). */
+export const YOUTUBE_NOT_REQUESTED_BY_DEFAULT = ['youtube.manage(mock)', 'youtube.analytics(mock)'] as const;
+
+/**
+ * T16(D29 제안): Instagram 게시에 필요한 최소 scope — **모의 자리 표시 이름**("(mock) — 공식 이름 live 전 재확인"). 실제 Meta 권한 이름이 아니다.
+ * Instagram 로그인(비즈니스·크리에이터 계정) 기준의 기본 + 콘텐츠 게시만 요청하고, 댓글·메시지·통계는 기본으로 요청하지 않는다(docs/03 — 최소 권한,
+ * Instagram 로그인과 Facebook 로그인의 계정·권한 조건을 섞지 않는다).
+ */
+export const INSTAGRAM_REQUIRED_SCOPES = ['instagram_basic(mock)', 'instagram_content_publish(mock)'] as const;
+/** 기본 연결에서 요청하지 않는 scope(모의 자리 표시 — 댓글·메시지·통계). */
+export const INSTAGRAM_NOT_REQUESTED_BY_DEFAULT = ['instagram_manage_comments(mock)', 'instagram_manage_messages(mock)', 'instagram_manage_insights(mock)'] as const;
+
+/** 채널별 필요한 최소 scope(Threads·YouTube·Instagram — 블로그는 연결 공급자가 없어 빈 목록). */
+export function requiredScopesForPlatform(platform: string): readonly string[] {
+  if (platform === 'threads') return THREADS_REQUIRED_SCOPES;
+  if (platform === 'youtube') return YOUTUBE_REQUIRED_SCOPES;
+  if (platform === 'instagram') return INSTAGRAM_REQUIRED_SCOPES;
+  return [];
+}
+
+export const OAUTH_STATE_TTL_MS = 10 * 60_000;
+/** 만료 7일 전부터 "곧 만료"(Threads 장기 토큰은 60일 — 공식 문서 재확인은 T14). */
+export const OAUTH_EXPIRING_SOON_MS = 7 * 24 * 3600_000;
+
+export interface OAuthAuthorizeRequest {
+  state: string;
+  codeChallenge: string;
+  redirectUri: string;
+  scopes: readonly string[];
+  /** 모의 공급자 전용: 연결할 계정(실제 공급자는 사용자가 로그인한 계정) */
+  loginHint?: string;
+}
+
+export interface OAuthTokenSet {
+  accessToken: string;
+  /** Threads 는 별도 refresh token 이 없다(장기 토큰 자체로 갱신) — null */
+  refreshToken: string | null;
+  /**
+   * 연결 정보의 만료(oauth_credentials.expires_at — health 판정). Threads = 장기 access token 만료.
+   * T15(D27) Google 형: refresh token 이 있는 동안 연결은 유효하므로 refresh token 의 수명(모의 180일)을 쓴다.
+   */
+  expiresAt: Date;
+  /** T15(D27): access token 자체의 짧은 만료(Google 형 ~1시간). 봉인한 토큰 안에만 둔다 — 지나면 보내기 전에 갱신한다. Threads 는 없음. */
+  accessExpiresAt?: Date | null;
+  scopes: string[];
+}
+
+export interface OAuthAccountInfo {
+  externalAccountId: string;
+  displayName: string;
+}
+
+/** 저장된(복호화한) 토큰. 메모리에서만 쓰고 버린다. */
+export interface StoredOAuthTokens {
+  accessToken: string;
+  refreshToken: string | null;
+  /** T15: access token 만료(ISO, 봉인 안). 없으면 연결 정보 만료(expires_at)만 본다. */
+  accessExpiresAt?: string | null;
+}
+
+/**
+ * 공급자 인터페이스. 모든 메서드는 실패 시 OAuthProviderError(code 만) 를 던진다.
+ * mock=true 인 공급자는 네트워크를 쓰지 않고, 그 토큰은 실제 연결·실제 게시로 인정되지 않는다.
+ */
+export interface OAuthProvider {
+  readonly id: OAuthProviderId;
+  readonly platform: Channel;
+  readonly mock: boolean;
+  /**
+   * LIVE-T1(D31): 공급자가 PKCE(code_challenge)를 받는가. 생략 = true(모의 공급자 — S256).
+   * 실제 Threads 는 공식 문서에 PKCE 가 없어 false — state(세션 결합·1회용) + redirect URI 정확 일치 + 서버 쪽 client_secret 으로 막는다.
+   * false 여도 연결 요청 행에는 verifier 를 봉인해 둔다(틀 공통) — 다만 authorize URL 에 challenge 를 싣지 않는다.
+   */
+  readonly pkce?: boolean;
+  requiredScopes(): readonly string[];
+  buildAuthorizeUrl(req: OAuthAuthorizeRequest): string;
+  exchangeCode(input: { code: string; codeVerifier: string; redirectUri: string; now: Date }): Promise<OAuthTokenSet>;
+  refresh(input: { tokens: StoredOAuthTokens; now: Date }): Promise<OAuthTokenSet>;
+  /**
+   * 공급자 철회. void = 철회됨. LIVE-T1(D31): 공급자에 토큰 철회 API 가 없으면 { remoteRevoke: 'unsupported' } 를 돌려준다(네트워크 호출 없음) —
+   * 호출자는 T13 의 로컬 삭제 규칙(암호문 삭제·revoked_at·승인 철회)을 그대로 적용하고 원격 철회는 "지원 안 함"으로 기록한다.
+   */
+  revoke(input: { tokens: StoredOAuthTokens; now: Date }): Promise<void | OAuthRevokeOutcome>;
+  accountInfo(input: { accessToken: string; now: Date }): Promise<OAuthAccountInfo>;
+}
+
+/** LIVE-T1(D31): 원격 철회를 지원하지 않는 공급자의 revoke 결과 */
+export interface OAuthRevokeOutcome {
+  remoteRevoke: 'unsupported';
+}
+export const isRevokeUnsupported = (v: unknown): v is OAuthRevokeOutcome =>
+  !!v && typeof v === 'object' && (v as { remoteRevoke?: unknown }).remoteRevoke === 'unsupported';
+
+export type OAuthProviderErrorCode =
+  | 'invalid_grant'
+  | 'pkce_mismatch'
+  | 'redirect_mismatch'
+  | 'code_expired'
+  | 'code_reused'
+  | 'invalid_token'
+  | 'token_expired'
+  | 'token_revoked'
+  | 'scope_not_allowed'
+  | 'invalid_request'
+  /** LIVE-T1: 앱 ID·앱 시크릿이 공급자에서 거부됨(설정 문제 — 다시 시도해도 같다) */
+  | 'invalid_client'
+  /** 일시·원인 불명(네트워크·시간 초과·요청 제한·5xx·형식 오류 포함). T13 규칙: 철회 결과로는 unknown, 갱신 실패여도 상태는 active 유지. */
+  | 'provider_error';
+
+/**
+ * LIVE-T1(D31): 공급자 오류의 부가 정보 — **숫자·열거 값만**(공급자 메시지 원문·URL·토큰·시크릿 없음). 감사에 그대로 남겨도 된다.
+ * ambiguous = 요청이 공급자에 닿아 쓰기(코드 소비·토큰 발급)가 일어났을 수 있지만 결과를 모른다(네트워크 끊김·시간 초과·5xx·2xx 형식 오류).
+ */
+export interface OAuthProviderErrorDetail {
+  reason: 'network' | 'timeout' | 'rate_limited' | 'server_error' | 'oauth_exception' | 'http_error' | 'malformed_response' | 'host_not_allowed' | 'local_check';
+  step?: 'authorize' | 'exchange' | 'long_lived' | 'refresh' | 'account';
+  httpStatus?: number;
+  providerCode?: number;
+  providerSubcode?: number;
+  ambiguous?: boolean;
+  retryAfterSec?: number;
+  /**
+   * FIX1-LIVET1(Codex review-LIVET1 Q3): 단기 토큰은 이미 받았는데 그 뒤(장기 교환)에서 실패 — 공급자에 단기 토큰이 유효하게 남아 있을 수 있다
+   * (철회 API 없음 → 철회하지 못함). "토큰 발급 없음"으로 기록하지 않게 표시한다.
+   */
+  shortTokenIssued?: boolean;
+}
+
+/** 공급자 오류 — 코드만 담는다(토큰·code 값 없음). LIVE-T1: 부가 정보(detail)도 숫자·열거 값만. cause 는 붙이지 않는다(원 오류에 URL·시크릿이 있을 수 있음). */
+export class OAuthProviderError extends Error {
+  readonly code: OAuthProviderErrorCode;
+  readonly detail: OAuthProviderErrorDetail | null;
+  constructor(code: OAuthProviderErrorCode, detail?: OAuthProviderErrorDetail) {
+    super(`oauth provider error: ${code}`);
+    this.name = 'OAuthProviderError';
+    this.code = code;
+    this.detail = detail ?? null;
+  }
+}
+
+// ---- 흐름 오류(HTTP) ----
+
+export type OAuthFlowErrorCode =
+  | 'oauth_state_invalid'
+  | 'oauth_state_expired'
+  | 'oauth_state_used'
+  | 'oauth_redirect_mismatch'
+  | 'oauth_denied'
+  | 'oauth_exchange_failed'
+  | 'oauth_bad_request';
+
+const FLOW_MESSAGES: Record<OAuthFlowErrorCode, string> = {
+  oauth_state_invalid: '연결 요청을 확인할 수 없습니다. 설정 화면에서 다시 연결하세요.',
+  oauth_state_expired: '연결 요청 시간이 지났습니다(10분). 다시 연결하세요.',
+  oauth_state_used: '이미 처리한 연결 요청입니다. 다시 연결하세요.',
+  oauth_redirect_mismatch: '연결 응답 주소가 등록된 redirect URI 와 다릅니다.',
+  oauth_denied: '연결이 취소되었습니다(공급자에서 거부).',
+  oauth_exchange_failed: '연결을 마치지 못했습니다(인증 코드 교환 실패). 다시 연결하세요.',
+  oauth_bad_request: '연결 응답 형식이 올바르지 않습니다.',
+};
+
+export class OAuthFlowError extends AppError {
+  constructor(code: OAuthFlowErrorCode, extra?: Record<string, unknown>) {
+    super('bad_request', code, FLOW_MESSAGES[code], extra);
+  }
+}
+
+export class OAuthNotSupportedError extends AppError {
+  constructor() {
+    super('bad_request', 'oauth_not_supported', 'Threads·YouTube·Instagram 모의 계정만 연결할 수 있습니다(다른 채널·실제 계정 연결은 이후 작업).');
+  }
+}
+
+export class OAuthAccountMismatchError extends AppError {
+  constructor() {
+    super('conflict', 'oauth_account_mismatch', '연결한 계정이 이 배포 계정과 다릅니다. 연결 정보를 저장하지 않았습니다(계정을 바꾸려면 새 계정으로 추가해야 합니다).');
+  }
+}
+
+export class CredentialNotFoundError extends AppError {
+  constructor() {
+    super('conflict', 'credential_not_connected', '이 계정에는 저장된 연결 정보가 없습니다. 먼저 연결하세요.');
+  }
+}
+
+/** FIX-T13: 연결 해제가 진행 중이라 연결 정보를 바꿀 수 없음 */
+export class CredentialBusyError extends AppError {
+  constructor() {
+    super('conflict', 'credential_busy', '연결 해제가 진행 중입니다. 해제를 마친 뒤 다시 연결하세요.');
+  }
+}
+
+export class CredentialRefreshFailedError extends AppError {
+  constructor(code: string) {
+    super('conflict', 'credential_refresh_failed', '연결 정보를 갱신하지 못했습니다. 계정을 다시 연결하세요.', { reason: code });
+  }
+}
+
+/** 실행 차단(409): 이 계정의 연결 정보가 쓸 수 없는 상태. */
+export class AccountCredentialBlockedError extends AppError {
+  constructor(items: Array<{ item_id: string; account_id: string; status: CredentialStatus }>) {
+    super('conflict', 'account_credential_blocked', '배포 계정 연결이 만료·철회되었거나 다시 연결이 필요해 실행하지 않았습니다(아무것도 대기열에 넣지 않음).', { items });
+  }
+}
+
+/** live 계정 연결이 준비되지 않음(fail-closed). */
+export class LiveOAuthNotConfiguredError extends GuardError {
+  readonly missing: string[];
+  constructor(missing: string[] = []) {
+    super(
+      'LIVE_OAUTH_NOT_CONFIGURED',
+      `실제 계정 연결(OAuth)이 준비·승인되어 있지 않습니다. 외부로 아무것도 보내지 않았습니다.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
+    );
+    this.missing = missing;
+  }
+}
+
+/** FIX1-LIVET1(Codex review-LIVET1 P1): 실제 연결 정보 갱신(th_refresh_token)은 D31 승인 범위 밖 — 별도 승인 전까지 이 표식이 남는다. */
+export const LIVE_THREADS_REFRESH_MARKER = 'LIVE_THREADS_REFRESH(D31 범위 밖)';
+
+/**
+ * FIX1-LIVET1(Codex review-LIVET1 P1): 실제(live) 계정의 연결 정보 갱신 요청 — 서버 공통 갱신 진입점(refreshCredential)과 실제 공급자 refresh 가
+ * 외부 호출 없이 거부한다(409). 연결 정보·상태는 바꾸지 않는다. 수동 API·작업 처리기·worker 어느 경로든 같다.
+ */
+export class LiveRefreshOutOfScopeError extends AppError {
+  constructor() {
+    super(
+      'conflict',
+      'live_refresh_out_of_scope',
+      '실제 계정의 연결 정보 갱신은 아직 승인 범위 밖이라 하지 않았습니다(' + LIVE_THREADS_REFRESH_MARKER + '). 외부로 아무것도 보내지 않았고 연결 정보는 그대로입니다. 만료 전에 다시 연결하세요.',
+      { marker: LIVE_THREADS_REFRESH_MARKER },
+    );
+  }
+}
+
+// ---- state·PKCE ----
+
+const B64U_43 = /^[A-Za-z0-9_-]{43}$/;
+
+export const newOAuthState = (): string => randomBytes(32).toString('base64url');
+export const newCodeVerifier = (): string => randomBytes(32).toString('base64url');
+export const isWellFormedOAuthState = (v: unknown): v is string => typeof v === 'string' && B64U_43.test(v);
+export const isWellFormedCodeVerifier = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9._~-]{43,128}$/.test(v);
+export const hashOAuthState = (state: string): string => createHash('sha256').update(state, 'utf8').digest('hex');
+/** RFC 7636 S256 */
+export const codeChallengeS256 = (verifier: string): string => createHash('sha256').update(verifier, 'ascii').digest('base64url');
+
+/**
+ * FIX-T13(Codex P2): redirect URI 는 scheme + host(+port) + path 만(query·fragment·사용자 정보 없음, http/https).
+ * callback 은 APP_BASE_URL origin + 요청 path(FIX1-FULLREV3(H1) — callbackRedirectTarget)와 정확히 비교하므로 query 가 있으면 절대 맞을 수 없다 — 설정 검증에서 거부한다.
+ */
+export function isPlainRedirectUri(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (u.search || u.hash || raw.includes('?') || raw.includes('#') || u.username || u.password) return false;
+  return `${u.origin}${u.pathname}` === raw;
+}
+
+/** callback 의 redirect URI(정확 일치 대상). 설정이 없으면 APP_BASE_URL(의 origin) + /api/oauth/callback. */
+export function oauthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): string {
+  if (config.OAUTH_REDIRECT_URI) return config.OAUTH_REDIRECT_URI;
+  return expectedOAuthRedirectUri(config);
+}
+
+/** FIX2-FULLREV3(K1): 계정 연결 callback 경로(이 앱에 실제로 있는 route — apps/web/app/api/oauth/callback). */
+export const OAUTH_CALLBACK_PATH = '/api/oauth/callback';
+
+/**
+ * FIX2-FULLREV3(K1): 이 앱이 공급자에 등록해야 하는 계정 연결 redirect URI = APP_BASE_URL 의 origin + OAUTH_CALLBACK_PATH(정확 일치 대상).
+ * OIDC 의 expectedOidcRedirectUri 와 같은 방식이다.
+ */
+export function expectedOAuthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL'>): string {
+  return `${new URL(config.APP_BASE_URL).origin}${OAUTH_CALLBACK_PATH}`;
+}
+
+/**
+ * 요청 URL 에서 query 를 뺀 origin + path. FIX1-FULLREV3(H1): callback 의 redirect 비교에는 쓰지 않는다 —
+ * 운영(`next start --hostname 127.0.0.1` + Caddy)에서 request.url 의 origin 은 서버 자신(Next 에 따라 127.0.0.1 또는 localhost)이라 공개 주소와 절대 같지 않다.
+ * callback 은 callbackRedirectTarget 을 쓴다.
+ */
+export function requestRedirectTarget(url: string): string {
+  const u = new URL(url);
+  return `${u.origin}${u.pathname}`;
+}
+
+/**
+ * FIX1-FULLREV3(H1): callback 의 redirect 비교 대상 = 설정된 공개 주소(APP_BASE_URL)의 origin + 요청 pathname(query 제외).
+ * request.url 의 origin(운영에서는 서버 자신의 127.0.0.1/localhost)·Host·X-Forwarded-Host 는 믿지 않는다 — 공개 origin 은 설정값이 정본이다.
+ * 등록 redirect URI(OIDC_REDIRECT_URI·OAUTH redirect)와는 여전히 정확 일치로 비교하므로, 경로가 다르거나
+ * redirect URI 가 APP_BASE_URL 과 다른 origin 에 설정돼 있으면 그대로 불일치다.
+ */
+export function callbackRedirectTarget(config: Pick<AppConfig, 'APP_BASE_URL'>, requestUrl: string): string {
+  return `${new URL(config.APP_BASE_URL).origin}${new URL(requestUrl).pathname}`;
+}
+
+/**
+ * 준비 상태·연결 시작 거부에 쓰는 이름(값 없음).
+ * FIX2-FULLREV3(K1): origin 만이 아니라 전체 URI 를 본다 — 이름도 "APP_BASE_URL 과 다른 origin" 에서 바꿨다.
+ * (등록 redirect 와의 불일치 'OAUTH_REDIRECT_URI(불일치)' 와는 다른 이름 — 무엇을 고쳐야 하는지 구분되게)
+ */
+export const OAUTH_REDIRECT_URI_MISMATCH = 'OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)';
+
+/**
+ * FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 가 설정돼 있고 expectedOAuthRedirectUri(APP_BASE_URL origin + /api/oauth/callback)와
+ * **정확히** 다른가. callback 은 APP_BASE_URL origin + 요청 경로(callbackRedirectTarget)를 이 값과 정확히 비교하고, 요청은 공급자가 이 값으로 돌려보낸다.
+ * - origin 이 다르면 callback 이 언제나 oauth_redirect_mismatch.
+ * - origin 은 같고 경로가 다르면(예: /oauth/callback, 끝 `/` 붙은 /api/oauth/callback/) 공급자가 route 가 없는 경로로 돌려보내(404)
+ *   또는 불일치로 실패한다 — 어느 쪽이든 연결을 마칠 수 없다(FIX1 은 origin 만 봐서 이 경우 동의 화면까지 보냈다).
+ * 그래서 준비 상태(liveOAuthReadiness)와 연결 시작(assertOAuthRedirectUri)이 미리 거부한다. 설정 없음은 기본값(= 기대값)이라 언제나 일치.
+ * 형식이 틀린 값은 여기서 보지 않는다(설정 검증·준비 상태의 형식 항목이 따로 잡는다).
+ */
+export function oauthRedirectUriMismatch(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): boolean {
+  if (!config.OAUTH_REDIRECT_URI) return false;
+  try {
+    return config.OAUTH_REDIRECT_URI !== expectedOAuthRedirectUri(config);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): 계정 연결 시작(모의·실제 모두) 전에 부른다 — OAUTH_REDIRECT_URI 가 기대값과 정확히 같지 않으면
+ * 공급자 인증 창으로 보내지 않는다(state 행·감사·authorize URL 없음, 외부 호출 0). 503 oauth_redirect_uri_mismatch.
+ */
+export function assertOAuthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): void {
+  if (!oauthRedirectUriMismatch(config)) return;
+  throw new AppError(
+    'service_unavailable',
+    'oauth_redirect_uri_mismatch',
+    `계정 연결 redirect 주소(OAUTH_REDIRECT_URI)가 앱 공개 주소(APP_BASE_URL)의 origin + ${OAUTH_CALLBACK_PATH} 와 정확히 같지 않아 연결을 시작하지 않았습니다. 연결을 마칠 수 없기 때문입니다. 외부로 아무것도 보내지 않았습니다. (준비 안 됨: ${OAUTH_REDIRECT_URI_MISMATCH})`,
+    { missing: [OAUTH_REDIRECT_URI_MISMATCH] },
+  );
+}
+
+export const oauthCallbackQuerySchema = z
+  .object({
+    state: z.string().max(200).optional(),
+    code: z.string().max(2000).optional(),
+    error: z.string().max(200).optional(),
+    error_description: z.string().max(2000).optional(),
+  })
+  .strip();
+
+// ---- 연결 상태(health) ----
+
+export const CREDENTIAL_STATUSES = ['not_connected', 'connected', 'expiring_soon', 'expired', 'revoked', 'needs_reconnect', 'error'] as const;
+export type CredentialStatus = (typeof CREDENTIAL_STATUSES)[number];
+
+export const CREDENTIAL_STATUS_LABEL: Record<CredentialStatus, string> = {
+  not_connected: '연결 정보 없음',
+  connected: '연결됨',
+  expiring_soon: '곧 만료',
+  expired: '만료됨',
+  revoked: '연결 해제됨',
+  needs_reconnect: '다시 연결 필요',
+  error: '오류',
+};
+
+export type AccountCredentialState = 'none' | 'linked' | 'needs_reconnect';
+
+export interface CredentialHealthInput {
+  account: { kind: string; credentialState: string };
+  credential: {
+    status: string;
+    expiresAt: Date | null;
+    scopes: readonly string[];
+    revokedAt: Date | null;
+    lastErrorCode: string | null;
+  } | null;
+  /**
+   * FIX3-T13 → FIX4-T13: 정리 대기(oauth_pending_tokens) 중 가장 중요한 종류(refresh_unknown·verify_current·cleanup_revoke).
+   * 있으면 연결 정보 행이 없어도(첫 연결)·상태와 관계없이 실행 불가.
+   */
+  pendingKind?: string | null;
+  requiredScopes: readonly string[];
+  now: Date;
+}
+
+export interface CredentialHealth {
+  status: CredentialStatus;
+  /** 실행(배포)에 쓸 수 있는가 — connected·expiring_soon, 또는 연결 정보가 필요 없는 모의 계정(not_connected + mock) */
+  usable: boolean;
+  /** 이 계정의 실행에 연결 정보가 필요한가(live 계정, 또는 한 번이라도 연결한 계정) */
+  required: boolean;
+  reason: string | null;
+  missingScopes: string[];
+}
+
+/**
+ * 연결 상태 판정(순수 함수). 우선순위: 정리 대기 → 연결 정보 없음 → 철회 → 오류 → scope 부족 → 만료 → 곧 만료 → 연결됨.
+ * - FIX3-T13: 정리 대기 표시(발급받은 토큰의 저장 여부 불명·정리 철회 실패)가 있으면 error(reason pending_<kind>) — 정리될 때까지 실행 차단.
+ *   FIX4-T13: 연결 정보 행이 없어도(첫 연결 정리 대기) 먼저 본다 — 연결한 적 없는 모의 계정도 차단. verify_current = 현재 토큰 확인 대기.
+ * - 연결 정보가 없을 때: live 계정·복원으로 "다시 연결 필요"가 된 계정은 needs_reconnect, 연결한 적 없는 모의 계정은 not_connected
+ *   (M3 모의 동작 그대로 — 실행 가능, 결과는 항상 MOCK).
+ * - 철회(revoked)·만료·오류·scope 부족은 실행 불가.
+ */
+export function credentialHealth(input: CredentialHealthInput): CredentialHealth {
+  const { account, credential, requiredScopes, now, pendingKind } = input;
+  const required = account.kind !== 'mock' || account.credentialState !== 'none';
+  const out = (status: CredentialStatus, reason: string | null = null, missingScopes: string[] = []): CredentialHealth => ({
+    status,
+    usable: status === 'connected' || status === 'expiring_soon' || (status === 'not_connected' && !required),
+    required,
+    reason,
+    missingScopes,
+  });
+  if (pendingKind) return out('error', `pending_${pendingKind}`);
+  if (!credential) {
+    if (account.kind !== 'mock') return out('needs_reconnect', 'no_credential');
+    if (account.credentialState === 'needs_reconnect') return out('needs_reconnect', 'restored_without_credential');
+    if (account.credentialState === 'linked') return out('needs_reconnect', 'no_credential');
+    return out('not_connected');
+  }
+  if (credential.revokedAt || credential.status === 'revoked') return out('revoked');
+  // FIX-T13: 연결 해제 진행 중(공급자 철회 대기·불완전) — 실행 차단
+  if (credential.status === 'revoking') return out('revoked', 'revoking');
+  if (credential.status === 'error') return out('error', credential.lastErrorCode ?? 'unknown');
+  const granted = new Set(credential.scopes);
+  const missing = requiredScopes.filter((s) => !granted.has(s));
+  if (missing.length) return out('needs_reconnect', 'scope_missing', missing);
+  if (!credential.expiresAt || credential.expiresAt.getTime() <= now.getTime()) return out('expired', 'token_expired');
+  if (credential.expiresAt.getTime() - now.getTime() <= OAUTH_EXPIRING_SOON_MS) return out('expiring_soon');
+  return out('connected');
+}
+
+// ---- live 준비 상태 ----
+
+export interface LiveOAuthReadiness {
+  /** 실제 계정 **연결**(OAuth 왕복·프로필 조회)을 시작할 수 있는가 — 게시와는 별개(livePublishReadiness) */
+  ready: boolean;
+  missing: string[];
+}
+
+/**
+ * LIVE-T1(D31): 실제 게시는 승인 범위 밖이라는 표식. LIVE-P1(D38): 게시 준비 판정(livePublishReadiness)에서는 빠졌고, 실제 계정이
+ * "실제 게시 계정으로 사용"(connected)이 아닐 때의 연결 상태 안내(db accountHealthView notice)에만 남는다.
+ */
+export const LIVE_THREADS_PUBLISH_MARKER = 'LIVE_THREADS_PUBLISH(D31 범위 밖)';
+
+/**
+ * FIX1-LIVET1(Codex review-LIVET1 P2): Threads 앱 ID·시크릿 형식 — 준비 판정(liveOAuthReadiness)과 실제 공급자 생성자(LiveThreadsOAuthProvider)가
+ * **같은 함수**를 쓴다(화면의 "준비됨"과 실제 공급자 선택이 어긋나지 않게).
+ * 앱 ID: 숫자 1~30자리. 시크릿: 앞뒤 공백을 뗀 값이 공백 없는 1~512자(서버는 뗀 값을 쓴다).
+ */
+export const isValidThreadsAppId = (v: string | null | undefined): boolean => typeof v === 'string' && /^\d{1,30}$/.test(v);
+export const isValidThreadsAppSecret = (v: string | null | undefined): boolean => typeof v === 'string' && /^\S{1,512}$/.test(v.trim());
+export type ThreadsAppSecretState = 'missing' | 'invalid' | 'ok';
+/** 환경의 THREADS_APP_SECRET 상태(값은 돌려주지 않는다) */
+export function threadsAppSecretState(env: Record<string, string | undefined>): ThreadsAppSecretState {
+  if (!envPresent(env, 'THREADS_APP_SECRET')) return 'missing';
+  return isValidThreadsAppSecret(env.THREADS_APP_SECRET) ? 'ok' : 'invalid';
+}
+
+/**
+ * 실제 Threads 계정 **연결**의 전제 조건(이름만, 값 없음). LIVE-T1(D31): 모두 갖춰지면 ready=true(실제 Threads OAuth 공급자 선택 가능).
+ * 조건: OAUTH_MODE=live · THREADS_APP_ID(존재·형식) · THREADS_APP_SECRET(존재·형식) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path,
+ * APP_BASE_URL origin + /api/oauth/callback 과 정확히 같음(FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1)),
+ * 등록 redirect 와 일치) · SECRETS_MASTER_KEY · OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다.
+ * FIX1-LIVET1(P2): 공급자 선택(resolveOAuthProvider)은 이 함수의 missing 을 그대로 쓴다 — ready === (실제 공급자 선택 성공)(Threads 계정 기준).
+ * registeredRedirectUri: callback 이 정확 일치로 비교할 등록 redirect URI(주면 OAUTH_REDIRECT_URI 와 같아야 한다).
+ */
+export function liveOAuthReadiness(
+  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
+  secrets: { threadsAppSecret: ThreadsAppSecretState; masterKeyConfigured: boolean },
+  registeredRedirectUri?: string,
+): LiveOAuthReadiness {
+  const missing: string[] = [];
+  if (config.OAUTH_MODE !== 'live') missing.push('OAUTH_MODE=live');
+  if (!config.THREADS_APP_ID) missing.push('THREADS_APP_ID');
+  else if (!isValidThreadsAppId(config.THREADS_APP_ID)) missing.push('THREADS_APP_ID(형식)');
+  if (secrets.threadsAppSecret === 'missing') missing.push('THREADS_APP_SECRET');
+  else if (secrets.threadsAppSecret === 'invalid') missing.push('THREADS_APP_SECRET(형식)');
+  if (!config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI');
+  else if (!isPlainRedirectUri(config.OAUTH_REDIRECT_URI)) missing.push('OAUTH_REDIRECT_URI(형식)');
+  // FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): APP_BASE_URL origin + /api/oauth/callback 과 정확히 같지 않으면(다른 origin·다른 경로·끝 `/`)
+  // 연결을 마칠 수 없다 — 동의 화면으로 보내기 전에 준비 안 됨으로 알린다
+  else if (oauthRedirectUriMismatch(config)) missing.push(OAUTH_REDIRECT_URI_MISMATCH);
+  else if (registeredRedirectUri !== undefined && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
+  if (!secrets.masterKeyConfigured) missing.push('SECRETS_MASTER_KEY');
+  if (!config.OAUTH_LIVE_APPROVAL_REF) missing.push('OAUTH_LIVE_APPROVAL_REF');
+  return { ready: missing.length === 0, missing };
+}
+
+/** 환경에서 비밀 상태를 읽어(값 없이) liveOAuthReadiness 를 부른다 — 화면 표시(web)와 공급자 선택(providers)이 같이 쓴다. */
+export function liveOAuthReadinessFromEnv(
+  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
+  env: Record<string, string | undefined>,
+  registeredRedirectUri?: string,
+): LiveOAuthReadiness {
+  return liveOAuthReadiness(config, { threadsAppSecret: threadsAppSecretState(env), masterKeyConfigured: readSecretKeyring(env).ok }, registeredRedirectUri);
+}
+
+/**
+ * LIVE-P1(D38 1단계, LIVE-T1 의 "항상 준비 안 됨"을 대체): 실제 게시의 **환경** 조건(이름만, 값 없음). 모두 있어야 ready.
+ * PUBLISH_MODE=enabled · PUBLISH_LIVE_APPROVAL_REF · PUBLISH_LIVE_MAX_POSTS. 기본값(disabled·없음)이면 준비 안 됨(fail closed).
+ * 이것만으로 게시되지 않는다 — 서버 승인(정확한 payload hash)·실제 Threads 계정(게시 계정으로 사용 — connected)·쓸 수 있는 연결 정보·
+ * 승인 기록별 게시 수 상한은 실행(assertExecutionAllowed)·전송 직전(beginSend)이 따로 검사한다. 화면 표시와 서버 게이트가 같은 함수를 쓴다.
+ */
+export function livePublishReadiness(
+  config: Pick<AppConfig, 'PUBLISH_MODE' | 'PUBLISH_LIVE_APPROVAL_REF' | 'PUBLISH_LIVE_MAX_POSTS'>,
+): { ready: boolean; missing: string[] } {
+  const missing: string[] = [];
+  if (config.PUBLISH_MODE !== 'enabled') missing.push('PUBLISH_MODE=enabled');
+  if (!config.PUBLISH_LIVE_APPROVAL_REF) missing.push('PUBLISH_LIVE_APPROVAL_REF');
+  if (config.PUBLISH_LIVE_MAX_POSTS === undefined || config.PUBLISH_LIVE_MAX_POSTS === null) missing.push('PUBLISH_LIVE_MAX_POSTS');
+  return { ready: missing.length === 0, missing };
+}
+
+/**
+ * LIVE-T1(D31): 실제(live) 계정 행을 만들 때 외부 계정 ID 를 아직 모르면 이 접두 + UUID 로 둔다("연결 전"). 첫 실제 연결 callback 이
+ * 공급자 프로필의 ID 로 한 번만 바꾼다(묶기). 'mock:' 접두가 아니므로 DB CHECK(kind=mock ⇔ mock: 접두)와 맞는다.
+ */
+export const UNBOUND_LIVE_EXTERNAL_PREFIX = 'pending:';
+export const isUnboundLiveExternalId = (v: string): boolean => v.startsWith(UNBOUND_LIVE_EXTERNAL_PREFIX);
+
+/** 환경에 비밀이 "있는지"만 본다(값을 읽어 돌려주지 않음). */
+export function envPresent(env: Record<string, string | undefined>, name: string): boolean {
+  const v = env[name];
+  return typeof v === 'string' && v.trim() !== '';
+}

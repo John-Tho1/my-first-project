@@ -1,0 +1,270 @@
+/** 외부 효과를 막는 가드의 오류. 모두 "기본 거부(fail closed)"를 표현한다. */
+export class GuardError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+export class PublishDisabledError extends GuardError {
+  constructor() {
+    super('PUBLISH_DISABLED', '게시가 비활성화되어 있습니다(PUBLISH_MODE=disabled). 외부 게시를 수행하지 않습니다.');
+  }
+}
+
+export class ApprovalRequiredError extends GuardError {
+  constructor() {
+    super(
+      'APPROVAL_REQUIRED',
+      '서버에서 검증된 승인이 없어 게시할 수 없습니다. 배포함에서 정확한 배포 내용을 승인해야 합니다.',
+    );
+  }
+}
+
+/** T10: live 채널 어댑터는 M4 전까지 없다 — 모든 조건(PUBLISH_MODE·승인)이 있어도 거부(503). 외부 호출 없음. */
+export class LiveChannelNotConfiguredError extends GuardError {
+  constructor() {
+    super('LIVE_CHANNEL_NOT_CONFIGURED', '실제 채널 게시 어댑터가 아직 없습니다(M4). 외부로 아무것도 보내지 않았습니다.');
+  }
+}
+
+export class CollectorDisabledError extends GuardError {
+  constructor() {
+    super('COLLECTOR_DISABLED', '수집이 비활성화되어 있습니다(COLLECTOR_MODE=disabled). 외부 자료를 가져오지 않습니다.');
+  }
+}
+
+export class LiveLlmNotAllowedError extends GuardError {
+  constructor(reason: string) {
+    super('LIVE_LLM_NOT_ALLOWED', `실제 AI 호출이 허용되지 않습니다: ${reason}`);
+  }
+}
+
+export class LiveProviderNotConfiguredError extends GuardError {
+  /** T07: 빠진 전제 조건 이름(값 없음). */
+  readonly missing: string[];
+  constructor(missing: string[] = []) {
+    super(
+      'LIVE_PROVIDER_NOT_CONFIGURED',
+      `실제 AI 공급자가 구현·승인되어 있지 않습니다. LLM_MODE=mock 으로 실행하세요.${missing.length ? ` (준비 안 됨: ${missing.join(', ')})` : ''}`,
+    );
+    this.missing = missing;
+  }
+}
+
+/**
+ * 요청 처리 오류(T02). web 의 apiHandler 가 kind → HTTP 상태로 변환한다.
+ * message 는 사용자에게 보여도 되는 한국어 문장만 넣는다(입력값·환경변수 값·경로 금지).
+ */
+export type AppErrorKind =
+  | 'bad_request'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'csrf'
+  | 'not_found'
+  | 'conflict'
+  | 'payload_too_large'
+  | 'unsupported_media_type'
+  | 'not_implemented'
+  | 'service_unavailable'
+  /** T06: AI(모의 포함) 호출 실패 → 502 */
+  | 'llm_failed'
+  /** T07: AI 예산 상한 초과 → 429 */
+  | 'budget_exceeded'
+  /** T08: 의도적으로 지운 자료(원음 삭제 등) → 410 */
+  | 'gone'
+  /** T21-P1a: 로그인 시도 횟수 제한 → 429 */
+  | 'too_many_requests'
+  /** T21-P1b: 외부 인증 공급자(IdP) 통신 실패·시간 초과·5xx → 502 */
+  | 'upstream_failed';
+
+export class AppError extends Error {
+  readonly kind: AppErrorKind;
+  readonly code: string;
+  /**
+   * 응답 본문에 함께 내보낼 추가 필드(T03: 409 충돌의 current/yours).
+   * 사용자 본인의 데이터만 넣는다. 다른 owner 의 데이터·비밀·경로는 넣지 않는다.
+   */
+  readonly extra: Record<string, unknown> | undefined;
+  constructor(kind: AppErrorKind, code: string, message: string, extra?: Record<string, unknown>) {
+    super(message);
+    this.name = new.target.name;
+    this.kind = kind;
+    this.code = code;
+    this.extra = extra;
+  }
+}
+
+export class BadRequestError extends AppError {
+  constructor(message = '요청 형식이 올바르지 않습니다') {
+    super('bad_request', 'bad_request', message);
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor() {
+    super('unauthorized', 'unauthorized', '로그인이 필요합니다');
+  }
+}
+
+/** 로그인 거부. 어떤 식별자가 허용되는지 드러내지 않는 일반 문구만 쓴다. */
+export class LoginDeniedError extends AppError {
+  constructor() {
+    super('unauthorized', 'login_denied', '로그인할 수 없습니다. 입력한 정보를 확인하세요.');
+  }
+}
+
+export class CsrfError extends AppError {
+  constructor() {
+    super('csrf', 'csrf', '요청 출처를 확인할 수 없어 거부했습니다');
+  }
+}
+
+/**
+ * T21-P1a(G1a): 운영 빌드(NODE_ENV=production)에서 비밀번호 없는 개발용 로그인(AUTH_MODE=dev) 거부 → 503.
+ * 설정 이름만 말하고 값은 넣지 않는다.
+ */
+export class DevLoginRefusedInProductionError extends AppError {
+  constructor() {
+    super(
+      'service_unavailable',
+      'dev_login_refused_in_production',
+      '운영 빌드에서는 개발용 로그인(AUTH_MODE=dev)을 쓸 수 없습니다. 운영 인증 설정이 필요합니다',
+    );
+  }
+}
+
+/**
+ * FIX3-T21P1A: 다음 로그인 순번이 읽을 수 있는 범위(10진 30자리)를 넘는다 → 503. 읽을 수 없는 순번을 쓰지 않고 로그인을 거부한다(fail closed).
+ */
+export class LoginSequenceExhaustedError extends AppError {
+  constructor() {
+    super('service_unavailable', 'login_sequence_exhausted', '로그인 기록 순번이 한도에 도달해 로그인할 수 없습니다. 관리자 확인이 필요합니다');
+  }
+}
+
+/**
+ * T21-P1a: 최근 실패한 로그인 시도가 상한을 넘었다 → 429. 입력한 식별자가 맞든 틀리든 같은 응답이다
+ * (어떤 식별자가 허용되는지 드러내지 않음).
+ */
+export class LoginRateLimitedError extends AppError {
+  constructor() {
+    super('too_many_requests', 'login_rate_limited', '로그인 시도가 너무 많습니다. 잠시 뒤(최대 15분) 다시 시도하세요.');
+  }
+}
+
+export class DevLoginNotAllowedError extends AppError {
+  constructor() {
+    super(
+      'forbidden',
+      'dev_login_not_allowed',
+      '개발용 로그인(AUTH_MODE=dev)은 APP_BASE_URL 이 localhost 또는 127.0.0.1 일 때만 허용됩니다',
+    );
+  }
+}
+
+/**
+ * T21-P1b: OIDC 로그인 설정이 준비되지 않음(oidcLoginReadiness) — 503. 응답에는 빠진 설정 이름도 넣지 않는다(인증 없는 경로).
+ * 이름은 서버 로그(시작 경로의 경고)·로그인 후 설정 화면·GET /api/health/details 에서.
+ */
+export class OidcNotConfiguredError extends AppError {
+  constructor() {
+    super('service_unavailable', 'oidc_not_configured', 'OIDC 로그인 설정이 준비되지 않았습니다. 서버 설정을 확인하세요.');
+  }
+}
+
+/** T21-P1b: AUTH_MODE=oidc 인데 식별자 입력(개발용) 로그인을 시도함 — 403. */
+export class IdentityLoginDisabledError extends AppError {
+  constructor() {
+    super('forbidden', 'identity_login_disabled', '이 서버는 OIDC 로그인만 허용합니다. 로그인 화면의 "OIDC로 로그인"을 쓰세요.');
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = '찾을 수 없습니다') {
+    super('not_found', 'not_found', message);
+  }
+}
+
+export class PayloadTooLargeError extends AppError {
+  constructor(message = '파일이 너무 큽니다. 최대 10MB 까지 올릴 수 있습니다.') {
+    super('payload_too_large', 'payload_too_large', message);
+  }
+}
+
+export class UnsupportedMediaTypeError extends AppError {
+  constructor(
+    message = '지원하지 않는 파일 형식입니다. PNG·JPEG·WebP 이미지, PDF, 텍스트(UTF-8) 파일만 올릴 수 있습니다.',
+  ) {
+    super('unsupported_media_type', 'unsupported_media_type', message);
+  }
+}
+
+export class InvalidStorageKeyError extends AppError {
+  constructor() {
+    super('bad_request', 'invalid_storage_key', '허용되지 않는 파일 저장 키입니다');
+  }
+}
+
+export class ObjectStorageNotImplementedError extends AppError {
+  constructor() {
+    super(
+      'not_implemented',
+      'object_storage_not_implemented',
+      'STORAGE_DRIVER=object 는 아직 구현되지 않았습니다. 현재는 local 만 지원합니다.',
+    );
+  }
+}
+
+// ---- T03: 수집(captures) ----
+
+/** http(s) 가 아니거나 해석할 수 없는 URL. */
+export class InvalidUrlError extends AppError {
+  constructor(message = 'http:// 또는 https:// 로 시작하는 올바른 URL 을 입력하세요') {
+    super('bad_request', 'invalid_url', message);
+  }
+}
+
+/** 내부망·로컬·메타데이터 주소(A05). 추출(fetch) 전에 거부한다. 저장된 capture 는 그대로 둔다. */
+export class UrlNotAllowedError extends AppError {
+  constructor() {
+    super('bad_request', 'url_not_allowed', '내부망·로컬 주소는 추출할 수 없습니다');
+  }
+}
+
+/** 원문(raw_text)은 저장 후 바꿀 수 없다. 메모·제목·위험 표시만 수정한다. */
+export class RawTextImmutableError extends AppError {
+  constructor() {
+    super('bad_request', 'raw_text_immutable', '원문은 수정할 수 없습니다. 메모·제목·위험 표시만 수정할 수 있습니다.');
+  }
+}
+
+/** 오래된 revision 으로 수정(A02). current(서버 값)와 yours(제출 값)를 함께 돌려줘 입력을 잃지 않게 한다. */
+export class ConflictError extends AppError {
+  constructor(extra: { current: Record<string, unknown>; yours?: Record<string, unknown> }) {
+    super('conflict', 'conflict', '다른 곳에서 먼저 수정되었습니다. 현재 내용과 비교한 뒤 다시 저장하세요.', extra);
+  }
+}
+
+/** COLLECTOR_MODE=disabled 에서의 추출 요청. 외부 fetch 를 하지 않는다. */
+export class CollectorNotEnabledError extends AppError {
+  constructor() {
+    super('forbidden', 'collector_disabled', '수집 기능이 비활성 상태입니다(M5에서 활성화)');
+  }
+}
+
+/** COLLECTOR_MODE=enabled 여도 실제 수집기는 아직 없다(T19). 외부 fetch 를 하지 않는다. */
+export class CollectorNotImplementedError extends AppError {
+  constructor() {
+    super('not_implemented', 'collector_not_implemented', '실제 수집기는 아직 구현되지 않았습니다(T19). 외부 자료를 가져오지 않았습니다.');
+  }
+}
+
+/** T08: 원음 보존을 끈 전사 뒤 삭제된 파일 — 410. 메타데이터(asset 행)는 남는다. */
+export class GoneError extends AppError {
+  constructor(message = '원본 파일은 전사 후 삭제되었습니다(원음 보존 안 함). 메타데이터만 남아 있습니다.') {
+    super('gone', 'asset_deleted', message);
+  }
+}

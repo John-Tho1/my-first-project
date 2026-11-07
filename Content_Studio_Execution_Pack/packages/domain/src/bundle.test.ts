@@ -1,0 +1,627 @@
+import { describe, expect, it } from 'vitest';
+import {
+  buildBundle,
+  BundleError,
+  checkIntegrity,
+  EXCLUDED_TABLES,
+  EXPORTED_TABLES,
+  fencedVerbatim,
+  parseBundle,
+  renderCaptureMarkdown,
+  renderContentMarkdown,
+  ROW_SCHEMAS,
+  sha256Hex,
+  stableStringify,
+  type BundleTables,
+  type BuildBundleInput,
+} from './bundle';
+import { readZip, writeZip, type ZipEntry } from './zip';
+
+const OWNER = '11111111-1111-4111-8111-111111111111';
+const CAP = '22222222-2222-4222-8222-222222222222';
+const CONTENT = '33333333-3333-4333-8333-333333333333';
+const V1 = '44444444-4444-4444-8444-444444444441';
+const V2 = '44444444-4444-4444-8444-444444444442';
+const ASSET = '55555555-5555-4555-8555-555555555555';
+const CC = '66666666-6666-4666-8666-666666666666';
+const TS = '2026-09-01T06:10:00.123456Z';
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const RAW = "주재원 첫 해 메모\n```\n코드 울타리 ``` 포함 · 앞뒤 공백 유지  ";
+const MIGRATIONS = ['0000_a', '0001_b'];
+
+function tables(): BundleTables {
+  return {
+    users: [{ id: OWNER, identity_masked: 'ow***@example.local' }],
+    brand_profiles: [],
+    sources: [],
+    source_versions: [],
+    captures: [
+      {
+        id: CAP,
+        raw_text: RAW,
+        input_type: 'text',
+        source_id: null,
+        received_at: TS,
+        risk: 'none',
+        user_note: '메모',
+        command_key: 'fx-1',
+        title: null,
+        revision: 1,
+        updated_at: TS,
+        content_hash: 'abc',
+        capture_transcript_id: null,
+      },
+    ],
+    capture_revisions: [],
+    ideas: [],
+    idea_captures: [],
+    contents: [
+      {
+        id: CONTENT,
+        idea_id: null,
+        series: null,
+        title: '원고',
+        audience: null,
+        tags: ['주재원'],
+        revision: 1,
+        current_version_id: V2,
+        lifecycle: 'draft',
+        created_at: TS,
+        updated_at: TS,
+      },
+    ],
+    content_versions: [
+      { id: V1, content_id: CONTENT, version: 1, body: '첫 본문', created_by: 'owner', ai_run_id: null, created_at: TS, note: null },
+      { id: V2, content_id: CONTENT, version: 2, body: '둘째 본문', created_by: 'owner', ai_run_id: null, created_at: TS, note: '고침' },
+    ],
+    content_captures: [{ id: CC, content_id: CONTENT, capture_id: CAP, role: 'origin', created_at: TS }],
+    interview_answers: [],
+    generation_runs: [],
+    claim_confirmations: [],
+    claims: [],
+    claim_sources: [],
+    usage_ledger: [],
+    variants: [],
+    variant_versions: [],
+    variant_assets: [],
+    assets: [
+      {
+        id: ASSET,
+        key: `assets/${OWNER}/${ASSET}`,
+        mime: 'image/png',
+        bytes: PNG.byteLength,
+        checksum: sha256Hex(PNG),
+        rights_status: 'owned',
+        verification_state: 'VERIFIED',
+        verification_scope: 'signature_size_checksum',
+        deleted_at: null,
+        created_at: TS,
+      },
+    ],
+    transcription_jobs: [],
+    transcripts: [],
+    audit_events: [], channel_accounts: [], distribution_plans: [], distribution_items: [], approvals: [], jobs: [], job_events: [], execute_commands: [], send_intents: [], publications: [], mock_scenarios: [], remote_steps: [], import_runs: [], import_items: [], source_version_originals: [], collector_sources: [], collector_runs: [], collected_items: [], recommendation_dismissals: [],
+  };
+}
+
+function input(over: Partial<BuildBundleInput> = {}): BuildBundleInput {
+  return {
+    exportId: '77777777-7777-4777-8777-777777777777',
+    exportedAt: '2026-09-24T12:00:00.000Z',
+    appVersion: '0.1.0',
+    migrations: MIGRATIONS,
+    owner: { id: OWNER, identityMasked: 'ow***@example.local' },
+    tables: tables(),
+    assetBytes: new Map([[ASSET, PNG]]),
+    ...over,
+  };
+}
+
+const roundTrip = (entries: ZipEntry[]) => readZip(writeZip(entries));
+
+describe('stableStringify', () => {
+  it('키 순서와 무관하게 같은 바이트', () => {
+    expect(stableStringify({ b: 1, a: { d: [3, { z: 1, y: 2 }], c: null } })).toBe(stableStringify({ a: { c: null, d: [3, { y: 2, z: 1 }] }, b: 1 }));
+  });
+});
+
+describe('buildBundle', () => {
+  it('같은 데이터를 다시 내보내면 표 sha256 이 같다(내보내기 ID·시각이 달라도)', () => {
+    const a = buildBundle(input());
+    const shuffled = tables();
+    shuffled.content_versions.reverse();
+    const b = buildBundle(input({ exportId: '88888888-8888-4888-8888-888888888888', exportedAt: '2026-09-25T00:00:00.000Z', tables: shuffled }));
+    expect(b.manifest.tables).toEqual(a.manifest.tables);
+    expect(a.manifest.files.find((f) => f.path === 'data/captures.json')).toEqual(b.manifest.files.find((f) => f.path === 'data/captures.json'));
+  });
+
+  it('manifest 는 모든 파일(자신 제외)의 sha256 을 담고, 세션 같은 제외 표는 없다', () => {
+    const b = buildBundle(input());
+    const paths = b.entries.map((e) => e.path);
+    expect(paths[0]).toBe('manifest.json');
+    expect(b.manifest.files.map((f) => f.path).sort()).toEqual(paths.slice(1).sort());
+    for (const e of b.entries.slice(1)) expect(b.manifest.files.find((f) => f.path === e.path)!.sha256).toBe(sha256Hex(e.bytes));
+    expect(paths.some((p) => /session/i.test(p))).toBe(false);
+    expect(Object.keys(b.manifest.tables).sort()).toEqual([...EXPORTED_TABLES].sort());
+    expect(b.manifest.excluded_tables).toEqual(expect.arrayContaining(['sessions']));
+    expect(paths).toContain(`assets/${ASSET}.png`);
+    expect(paths).toContain(`markdown/contents/${CONTENT}.md`);
+    expect(paths).toContain(`markdown/captures/${CAP}.md`);
+    expect(paths).toContain('README.md');
+    // 표 JSON 에 owner_id 없음
+    const caps = new TextDecoder().decode(b.entries.find((e) => e.path === 'data/captures.json')!.bytes);
+    expect(caps).not.toContain('owner_id');
+  });
+
+  it('저장소에 파일이 없으면 missing + 경고, 실패하지 않는다', () => {
+    const b = buildBundle(input({ assetBytes: new Map([[ASSET, null]]) }));
+    expect(b.manifest.assets[0]).toMatchObject({ id: ASSET, missing: true });
+    expect(b.manifest.warnings).toEqual([expect.objectContaining({ code: 'asset_missing', asset_id: ASSET })]);
+    expect(b.entries.some((e) => e.path.startsWith('assets/'))).toBe(false);
+    // missing 묶음도 검증을 통과한다
+    const parsed = parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS });
+    expect(parsed.assetBytes.size).toBe(0);
+  });
+});
+
+describe('Markdown', () => {
+  it('소재 원문은 한 글자도 바꾸지 않고 담는다(``` 가 있어도 더 긴 울타리)', () => {
+    const md = renderCaptureMarkdown(tables().captures[0]!, [], null);
+    expect(md).toContain(RAW);
+    expect(fencedVerbatim(RAW)).toMatch(/^````text\n/);
+  });
+
+  it('원고: 현재 본문(v2)과 버전 이력 전체 본문', () => {
+    const t = tables();
+    const md = renderContentMarkdown(t.contents[0]!, t.content_versions, [CAP]);
+    expect(md).toContain('## 현재 본문 (v2)\n\n둘째 본문');
+    expect(md).toContain('## 버전 이력');
+    expect(md).toContain('### v1\n\n첫 본문');
+    expect(md).toContain('메모: 고침');
+    expect(md).toContain(`origin_capture_ids: ["${CAP}"]`);
+    expect(md).toMatch(/\(MSK\)/);
+  });
+});
+
+describe('ROW_SCHEMAS', () => {
+  it('모르는 열(owner_id 포함)은 거부한다', () => {
+    const cap = tables().captures[0]!;
+    expect(ROW_SCHEMAS.captures.safeParse(cap).success).toBe(true);
+    expect(ROW_SCHEMAS.captures.safeParse({ ...cap, owner_id: OWNER }).success).toBe(false);
+    expect(ROW_SCHEMAS.captures.safeParse({ ...cap, extra: 1 }).success).toBe(false);
+    expect(ROW_SCHEMAS.assets.safeParse({ ...tables().assets[0]!, key: '../x' }).success).toBe(false);
+  });
+
+  it('제외 표와 내보내기 표는 겹치지 않는다', () => {
+    for (const t of Object.keys(EXCLUDED_TABLES)) expect((EXPORTED_TABLES as readonly string[]).includes(t)).toBe(false);
+  });
+});
+
+describe('parseBundle', () => {
+  const good = () => buildBundle(input()).entries;
+
+  it('정상 묶음: 표·asset 바이트·manifest sha256', () => {
+    const p = parseBundle(roundTrip(good()), { migrations: [...MIGRATIONS, '0002_c'] });
+    expect(p.tables.captures[0]!.raw_text).toBe(RAW);
+    expect(Buffer.from(p.assetBytes.get(ASSET)!).equals(Buffer.from(PNG))).toBe(true);
+    expect(p.manifestSha256).toBe(sha256Hex(good()[0]!.bytes));
+  });
+
+  it('data/captures.json 한 바이트 변조 → manifest_mismatch(경로 포함)', () => {
+    const entries = good().map((e) => {
+      if (e.path !== 'data/captures.json') return e;
+      const b = new Uint8Array(e.bytes);
+      b[10] = b[10]! ^ 0x01;
+      return { path: e.path, bytes: b };
+    });
+    try {
+      parseBundle(roundTrip(entries), { migrations: MIGRATIONS });
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(BundleError);
+      expect((e as BundleError).code).toBe('manifest_mismatch');
+      expect((e as BundleError).extra).toEqual({ paths: ['data/captures.json'] });
+    }
+  });
+
+  it('목록에 없는 파일 추가·파일 삭제도 manifest_mismatch', () => {
+    const extra = [...good(), { path: 'data/sessions.json', bytes: new Uint8Array([1]) }];
+    expect(() => parseBundle(extra, { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'manifest_mismatch' }));
+    const missing = good().filter((e) => !e.path.startsWith('assets/'));
+    expect(() => parseBundle(missing, { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'manifest_mismatch' }));
+  });
+
+  it('더 새로운 migration 에서 만든 묶음은 schema_incompatible', () => {
+    expect(() => parseBundle(good(), { migrations: ['0000_a'] })).toThrow(expect.objectContaining({ code: 'schema_incompatible' }));
+    expect(() => parseBundle(good(), { migrations: ['0000_a', '0001_x'] })).toThrow(expect.objectContaining({ code: 'schema_incompatible' }));
+  });
+
+  it('형식 버전이 다르면 unsupported_version, manifest 없으면 invalid_bundle', () => {
+    const entries = good();
+    const m = JSON.parse(new TextDecoder().decode(entries[0]!.bytes));
+    m.format_version = 2;
+    const v2 = [{ path: 'manifest.json', bytes: new TextEncoder().encode(JSON.stringify(m)) }, ...entries.slice(1)];
+    expect(() => parseBundle(v2, { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'unsupported_version' }));
+    expect(() => parseBundle(entries.slice(1), { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'invalid_bundle' }));
+  });
+
+  it('manifest 까지 맞춰 고친 묶음이라도 행에 모르는 열이 있으면 invalid_rows, 참조가 끊기면 integrity', () => {
+    const withOwner = tables();
+    (withOwner.captures[0] as Record<string, unknown>).owner_id = OWNER;
+    expect(() => parseBundle(buildBundle(input({ tables: withOwner })).entries, { migrations: MIGRATIONS })).toThrow(
+      expect.objectContaining({ code: 'invalid_rows' }),
+    );
+    const broken = tables();
+    broken.content_captures[0]!.capture_id = '99999999-9999-4999-8999-999999999999';
+    expect(() => parseBundle(buildBundle(input({ tables: broken })).entries, { migrations: MIGRATIONS })).toThrow(
+      expect.objectContaining({ code: 'integrity' }),
+    );
+    const wrongCurrent = tables();
+    wrongCurrent.contents[0]!.current_version_id = '99999999-9999-4999-8999-999999999999';
+    expect(() => parseBundle(buildBundle(input({ tables: wrongCurrent })).entries, { migrations: MIGRATIONS })).toThrow(
+      expect.objectContaining({ code: 'integrity' }),
+    );
+  });
+
+  it('asset 바이트를 바꾸고 manifest.files 까지 맞춰도 assets.checksum 과 다르면 거부', () => {
+    const other = new Uint8Array([...PNG, 9]);
+    const b = buildBundle(input());
+    const m = JSON.parse(new TextDecoder().decode(b.manifestBytes));
+    const p = `assets/${ASSET}.png`;
+    const f = m.files.find((x: { path: string }) => x.path === p);
+    f.sha256 = sha256Hex(other);
+    f.bytes = other.byteLength;
+    const entries = [
+      { path: 'manifest.json', bytes: new TextEncoder().encode(stableStringify(m)) },
+      ...b.entries.slice(1).map((e) => (e.path === p ? { path: p, bytes: other } : e)),
+    ];
+    expect(() => parseBundle(entries, { migrations: MIGRATIONS })).toThrow(expect.objectContaining({ code: 'manifest_mismatch' }));
+  });
+});
+
+describe('T08 전사 표·지운 원본', () => {
+  const JOB = '77777777-7777-4777-8777-777777777777';
+  const T1 = '88888888-8888-4888-8888-888888888881';
+  const LEDGER = '99999999-9999-4999-8999-999999999999';
+  const withJob = (): BundleTables => {
+    const t = tables();
+    t.transcription_jobs = [
+      {
+        id: JOB,
+        asset_id: ASSET,
+        state: 'succeeded',
+        provider: 'mock',
+        model: 'mock-stt-v1',
+        progress: 100,
+        transcript_version_id: T1,
+        error: null,
+        attempts: 1,
+        keep_original: true,
+        audio_seconds: 60,
+        created_at: TS,
+        started_at: TS,
+        finished_at: TS,
+      },
+    ];
+    t.transcripts = [{ id: T1, job_id: JOB, version: 1, text: '[모의 전사 1] 문장', segments: [{ start_ms: 0, end_ms: 60000, text: '[모의 전사 1] 문장' }], created_by: 'mock', created_at: TS }];
+    t.usage_ledger = [
+      {
+        id: LEDGER,
+        run_id: null,
+        transcription_job_id: JOB,
+        audio_seconds: 60,
+        reserved_amount: '0.000000',
+        actual_amount: '0.000000',
+        currency: 'USD',
+        tokens_in: null,
+        tokens_out: null,
+        pricing_snapshot: { kind: 'stt' },
+        state: 'settled',
+        failed: false,
+        overage_amount: '0.000000',
+        over_budget: false,
+        created_at: TS,
+        settled_at: TS,
+      },
+    ];
+    t.captures[0]!.capture_transcript_id = T1;
+    return t;
+  };
+
+  it('정상 관계는 통과하고 묶음을 왕복한다', () => {
+    expect(() => checkIntegrity(withJob())).not.toThrow();
+    const b = buildBundle(input({ tables: withJob() }));
+    const parsed = parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS });
+    expect(parsed.tables.transcripts[0]!.text).toBe('[모의 전사 1] 문장');
+    expect(parsed.tables.captures[0]!.capture_transcript_id).toBe(T1);
+  });
+
+  it('LIVEL1-H1: 보고값 경계 — 40자리 허용·41자리 거부, 소수 5·7자리, 뒤 공백·줄바꿈, 비ASCII 숫자, null·배열·객체 거부', () => {
+    const base = { reported_tokens_in: '1', reported_tokens_out: '1', reported_cost: '1.000000' };
+    const check = (rep: Record<string, unknown>) => {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: 'provider_unstorable', ...base, ...rep };
+      return () => checkIntegrity(t);
+    };
+    const d40 = '1'.repeat(40);
+    const d41 = '1'.repeat(41);
+    // 40자리 허용
+    expect(check({ reported_tokens_in: d40 })).not.toThrow();
+    expect(check({ reported_tokens_out: d40 })).not.toThrow();
+    expect(check({ reported_cost: `${d40}.000000` })).not.toThrow();
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['in 41자리', { reported_tokens_in: d41 }],
+      ['out 41자리', { reported_tokens_out: d41 }],
+      ['cost 정수부 41자리', { reported_cost: `${d41}.000000` }],
+      ['cost 소수 5자리', { reported_cost: '1.00000' }],
+      ['cost 소수 7자리', { reported_cost: '1.0000000' }],
+      ['in 뒤 공백', { reported_tokens_in: '1 ' }],
+      ['in 뒤 줄바꿈', { reported_tokens_in: '1\n' }],
+      ['cost 뒤 줄바꿈', { reported_cost: '1.000000\n' }],
+      ['cost 뒤 공백', { reported_cost: '1.000000 ' }],
+      ['in 전각 숫자', { reported_tokens_in: '１' }],
+      ['in 아라비아-인도 숫자', { reported_tokens_in: '٣' }],
+      ['cost 전각 숫자', { reported_cost: '１.000000' }],
+      ['cost 데바나가리 숫자', { reported_cost: '1.००००००' }],
+      ['in null', { reported_tokens_in: null }],
+      ['out 배열', { reported_tokens_out: ['1'] }],
+      ['cost 객체', { reported_cost: { v: '1.000000' } }],
+      ['cost null', { reported_cost: null }],
+    ];
+    for (const [label, rep] of bad) expect(check(rep), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
+  it('FIX4-LIVEL1: provider_unstorable 행은 reported_tokens_in/out(음이 아닌 정수 10진 문자열)·reported_cost(정수부 + 소수 6자리) 필수', () => {
+    const REP = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
+    const withSnap = (snap: Record<string, unknown>) => {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', ...snap };
+      return t;
+    };
+    // 정상: 보통 값, 0, MAX_SAFE_INTEGER 근처와 그 너머(문자열이므로 정밀도 손실 없음)
+    for (const ok of [
+      REP,
+      { reported_tokens_in: '0', reported_tokens_out: '0', reported_cost: '0.000000' },
+      { reported_tokens_in: '9007199254740991', reported_tokens_out: '9007199254740993', reported_cost: '36028797018963.968000' },
+      { reported_tokens_in: '123456789012345678901234567890', reported_tokens_out: '1', reported_cost: '493827156049382715604938271.560000' },
+    ]) {
+      expect(() => checkIntegrity(withSnap({ usage_source: 'provider_unstorable', ...ok }))).not.toThrow();
+    }
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['in 없음', { reported_tokens_out: '7', reported_cost: REP.reported_cost }],
+      ['out 없음', { reported_tokens_in: '1', reported_cost: REP.reported_cost }],
+      ['cost 없음', { reported_tokens_in: '1', reported_tokens_out: '7' }],
+      ['in 음수', { ...REP, reported_tokens_in: '-1' }],
+      ['out 소수', { ...REP, reported_tokens_out: '1.5' }],
+      ['in 지수', { ...REP, reported_tokens_in: '1e5' }],
+      ['in 앞자리 0', { ...REP, reported_tokens_in: '01' }],
+      ['in 부호', { ...REP, reported_tokens_in: '+1' }],
+      ['in 공백', { ...REP, reported_tokens_in: ' 1' }],
+      ['in 숫자형', { ...REP, reported_tokens_in: 1 }],
+      ['in 빈 문자열', { ...REP, reported_tokens_in: '' }],
+      ['cost 문자', { ...REP, reported_cost: 'abc' }],
+      ['cost 음수', { ...REP, reported_cost: '-1.000000' }],
+      ['cost 소수 6자리 아님', { ...REP, reported_cost: '1.5' }],
+      ['cost 소수 없음', { ...REP, reported_cost: '1' }],
+      ['cost 지수', { ...REP, reported_cost: '1e3.000000' }],
+      ['cost 앞자리 0', { ...REP, reported_cost: '01.000000' }],
+      ['cost 숫자형', { ...REP, reported_cost: 1.5 }],
+    ];
+    for (const [label, rep] of bad) {
+      expect(() => checkIntegrity(withSnap({ usage_source: 'provider_unstorable', ...rep })), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+    // reported_* 는 provider_unstorable 에서만 — 다른 출처·키 없는(이전) 행에 있으면 거부
+    for (const src of ['provider', 'estimate', 'none']) {
+      expect(() => checkIntegrity(withSnap({ usage_source: src, ...REP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+      expect(() => checkIntegrity(withSnap({ usage_source: src, reported_cost: REP.reported_cost }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+    expect(() => checkIntegrity(withSnap({ ...REP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withSnap({ reported_tokens_in: '1' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
+  it('LIVEL1-H2: 수동 해결 resolution 형식 — provider·none 에서만, 키 6개 정확히, 각 값 형식, 재정산액은 확정액과 같거나(상한으로 깎아 재정산한 경우만) 더 큼', () => {
+    type Row = BundleTables['usage_ledger'][number];
+    const ORIGINAL = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
+    const RES = {
+      resolved_at: '2026-10-10T12:00:00.000Z',
+      resolved_by: 'operator',
+      reason: '콘솔 확인 결과 실제 청구 9.95 USD 로 판단',
+      settled_amount: '9.950000',
+      original_usage_source: 'provider_unstorable',
+      original_reported: ORIGINAL,
+    };
+    // 수동 해결 뒤 행: 재정산(인계 절차 5) — state settled, actual 9.95, 예약 0.105476 → 초과 기록
+    const RESOLVED_ROW: Partial<Row> = { state: 'settled', reserved_amount: '0.105476', actual_amount: '9.950000', overage_amount: '9.844524', over_budget: true };
+    const make = (snap: Record<string, unknown>, row: Partial<Row> = {}) => {
+      const t = withJob();
+      Object.assign(t.usage_ledger[0]!, RESOLVED_ROW, row);
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', ...snap };
+      return () => checkIntegrity(t);
+    };
+    const res = (over: Record<string, unknown>) => ({ usage_source: 'provider', resolution: { ...RES, ...over } });
+    const d40 = '1'.repeat(40);
+    const ok: Array<[string, Record<string, unknown>, Partial<Row>?]> = [
+      ['provider + 유효한 resolution', res({})],
+      ['none + 예약액 유지(재정산액 = 확정액 = 예약액)', { usage_source: 'none', resolution: { ...RES, settled_amount: '0.105476' } }, { actual_amount: '0.105476', overage_amount: '0.000000', over_budget: false }],
+      ['확정액 소수 2자리(9.95) vs 재정산액 9.950000 — micro 로 비교', res({}), { actual_amount: '9.95' }],
+      ['original_reported 40자리 경계', res({ original_reported: { reported_tokens_in: d40, reported_tokens_out: d40, reported_cost: `${d40}.000000` } })],
+      ['재정산액 0(0.000000 = 확정액 0)', { usage_source: 'none', resolution: { ...RES, settled_amount: '0.000000' } }, { reserved_amount: '0.000000', actual_amount: '0.000000', overage_amount: '0.000000', over_budget: false }],
+      ['운영자 200자·사유 4000자(상한 경계)', res({ resolved_by: 'o'.repeat(200), reason: 'r'.repeat(4000) })],
+      ['resolved_at 마이크로초·소수 없음', res({ resolved_at: '2026-10-10T12:00:00Z' })],
+      // 인계 절차 5: 실제 청구가 numeric(18,6)·예산을 넘으면 actual_amount 는 상한으로 두고 사유에 적는다 — 재정산액에 실제 청구액을 적은 경우
+      ['상한 재정산: 확정액 = numeric(18,6) 최대, 재정산액 = 실제 청구(정수부 13자리)', res({ settled_amount: '1234567890123.000000' }), { actual_amount: '999999999999.999999', overage_amount: '999999999999.894523' }],
+      ['상한 재정산: 확정액 = 월 상한 10, 재정산액 = 실제 청구 25', res({ settled_amount: '25.000000' }), { actual_amount: '10.000000', overage_amount: '9.894524' }],
+      ['상한 재정산: 재정산액 정수부 40자리', res({ settled_amount: `${d40}.000000` }), { actual_amount: '999999999999.999999', overage_amount: '999999999999.894523' }],
+    ];
+    for (const [label, snap, row] of ok) expect(make(snap, row), label).not.toThrow();
+    // resolution 이 없는 행은 출처와 무관하게 지금과 같다
+    for (const src of ['provider', 'estimate', 'none']) expect(make({ usage_source: src }), `resolution 없음 ${src}`).not.toThrow();
+    expect(make({ usage_source: 'provider_unstorable', ...ORIGINAL }), 'resolution 없음 provider_unstorable').not.toThrow();
+    expect(make({}), 'resolution 없음 · usage_source 없음').not.toThrow();
+
+    const without = (k: string) => {
+      const r: Record<string, unknown> = { ...RES };
+      delete r[k];
+      return { usage_source: 'provider', resolution: r };
+    };
+    const origWithout = (k: string) => {
+      const o: Record<string, unknown> = { ...ORIGINAL };
+      delete o[k];
+      return res({ original_reported: o });
+    };
+    const bad: Array<[string, Record<string, unknown>, Partial<Row>?]> = [
+      // (a) 출처: provider·none 에서만
+      ['estimate 에 resolution', { usage_source: 'estimate', resolution: RES }],
+      ['usage_source 없음 + resolution', { resolution: RES }],
+      ['provider_unstorable 인데 resolution(반쯤 끝난 상태)', { usage_source: 'provider_unstorable', ...ORIGINAL, resolution: RES }],
+      // (b) 모양: 평범한 객체 + 키 정확히 6개
+      ['resolution null', { usage_source: 'provider', resolution: null }],
+      ['resolution 문자열', { usage_source: 'provider', resolution: 'resolved' }],
+      ['resolution 배열', { usage_source: 'provider', resolution: [RES] }],
+      ['resolution 숫자', { usage_source: 'provider', resolution: 1 }],
+      ...(['resolved_at', 'resolved_by', 'reason', 'settled_amount', 'original_usage_source', 'original_reported'] as const).map(
+        (k) => [`${k} 없음`, without(k)] as [string, Record<string, unknown>],
+      ),
+      ['모르는 키', res({ note: 'x' })],
+      // (c) resolved_at: UTC ISO(Z)
+      ['resolved_at 날짜만', res({ resolved_at: '2026-10-10' })],
+      ['resolved_at Z 없음', res({ resolved_at: '2026-10-10T12:00:00' })],
+      ['resolved_at +03:00', res({ resolved_at: '2026-10-10T12:00:00+03:00' })],
+      ['resolved_at 숫자', res({ resolved_at: 1760097600000 })],
+      // (d) resolved_by·reason: 비어 있지 않은 문자열, 길이 상한
+      ['resolved_by 빈 문자열', res({ resolved_by: '' })],
+      ['resolved_by 공백만', res({ resolved_by: '  ' })],
+      ['resolved_by 숫자', res({ resolved_by: 1 })],
+      ['resolved_by 201자', res({ resolved_by: 'o'.repeat(201) })],
+      ['reason 빈 문자열', res({ reason: '' })],
+      ['reason 공백만', res({ reason: ' \n ' })],
+      ['reason null', res({ reason: null })],
+      ['reason 4001자', res({ reason: 'r'.repeat(4001) })],
+      // (e) settled_amount: 정수부 + 소수 정확히 6자리, 행은 settled·확정액 있음, 재정산액 ≥ 확정액(더 크면 상한 재정산 — 확정액 > 예약액)
+      ['settled_amount 소수 2자리', res({ settled_amount: '9.95' })],
+      ['settled_amount 음수', res({ settled_amount: '-1.000000' })],
+      ['settled_amount 지수', res({ settled_amount: '1e3' })],
+      ['settled_amount 앞자리 0', res({ settled_amount: '09.950000' })],
+      ['settled_amount 정수부 41자리', res({ settled_amount: `${'1'.repeat(41)}.000000` })],
+      ['settled_amount 숫자형', res({ settled_amount: 9.95 })],
+      ['settled_amount 뒤 공백', res({ settled_amount: '9.950000 ' })],
+      ['재정산액 < 확정액(9.94 vs 9.95)', res({ settled_amount: '9.940000' })],
+      ['재정산액만 적고 확정액은 예약액 그대로(절차 5 빠뜨림)', res({}), { actual_amount: '0.105476', overage_amount: '0.000000', over_budget: false }],
+      ['state reserved', res({}), { state: 'reserved', actual_amount: null }],
+      ['state released', res({}), { state: 'released' }],
+      ['settled 인데 actual_amount null', res({}), { actual_amount: null }],
+      // (f) original_usage_source
+      ['original_usage_source provider', res({ original_usage_source: 'provider' })],
+      ['original_usage_source 없음 값(null)', res({ original_usage_source: null })],
+      // (g) original_reported: 키 3개 정확히, 기존 보고값 형식
+      ...(['reported_tokens_in', 'reported_tokens_out', 'reported_cost'] as const).map((k) => [`original_reported.${k} 없음`, origWithout(k)] as [string, Record<string, unknown>]),
+      ['original_reported 모르는 키', res({ original_reported: { ...ORIGINAL, extra: '1' } })],
+      ['original_reported tokens -1', res({ original_reported: { ...ORIGINAL, reported_tokens_in: '-1' } })],
+      ['original_reported tokens 01', res({ original_reported: { ...ORIGINAL, reported_tokens_out: '01' } })],
+      ['original_reported tokens 41자리', res({ original_reported: { ...ORIGINAL, reported_tokens_in: '1'.repeat(41) } })],
+      ['original_reported cost 1.5', res({ original_reported: { ...ORIGINAL, reported_cost: '1.5' } })],
+      ['original_reported null', res({ original_reported: null })],
+      ['original_reported 배열', res({ original_reported: [ORIGINAL] })],
+      // 기존 규칙 유지: 해결된 행이라도 최상위 reported_* 가 남으면 거부
+      ['provider + 유효한 resolution + 최상위 reported_cost', { ...res({}), reported_cost: ORIGINAL.reported_cost }],
+    ];
+    for (const [label, snap, row] of bad) expect(make(snap, row), label).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // 문제 목록은 값이 아니라 고정 문구(다른 무결성 문제와 같은 방식)
+    const err = (() => {
+      try {
+        make(res({ reason: 'SECRET-REASON-값', settled_amount: '9.940000' }))();
+      } catch (e) {
+        return e as BundleError;
+      }
+      return null;
+    })();
+    expect(err?.extra).toEqual({ problems: ['usage_ledger.pricing_snapshot.resolution 형식'] });
+    expect(`${err?.message} ${JSON.stringify(err?.extra)}`).not.toContain('SECRET-REASON-값');
+    expect(`${err?.message} ${JSON.stringify(err?.extra)}`).not.toContain('9.940000');
+  });
+
+  it('FIX3-LIVEL1: 원장 pricing_snapshot.usage_source 는 provider·estimate·none·provider_unstorable 또는 없음(이전 행)만 — 그 밖은 integrity', () => {
+    // FIX4-LIVEL1: provider_unstorable 은 보고값 세 개가 필수가 됐다(의도한 동작 변경) — 이 시험은 출처 값만 보므로 유효한 보고값을 함께 둔다.
+    const REPORTED = { reported_tokens_in: '2147483648', reported_tokens_out: '7', reported_cost: '8589.934620' };
+    for (const v of ['provider', 'estimate', 'none', 'provider_unstorable']) {
+      const ok = withJob();
+      ok.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: v, ...(v === 'provider_unstorable' ? REPORTED : {}) };
+      expect(() => checkIntegrity(ok)).not.toThrow();
+    }
+    expect(() => checkIntegrity(withJob())).not.toThrow(); // 키 없음 = 이전 행
+    for (const bad of ['bogus', '', 'PROVIDER', 1, null, true, ['provider']]) {
+      const t = withJob();
+      t.usage_ledger[0]!.pricing_snapshot = { kind: 'stt', usage_source: bad };
+      expect(() => checkIntegrity(t)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    }
+  });
+
+  it('원장은 run_id·transcription_job_id 중 정확히 하나, job 의 첫 전사는 같은 job, 소재의 전사는 묶음 안', () => {
+    const both = withJob();
+    both.usage_ledger[0]!.run_id = JOB;
+    expect(() => checkIntegrity(both)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const none = withJob();
+    none.usage_ledger[0]!.transcription_job_id = null;
+    expect(() => checkIntegrity(none)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const otherJob = withJob();
+    otherJob.transcripts[0]!.job_id = '77777777-7777-4777-8777-000000000000';
+    expect(() => checkIntegrity(otherJob)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const noTranscript = withJob();
+    noTranscript.transcription_jobs[0]!.transcript_version_id = null;
+    expect(() => checkIntegrity(noTranscript)).toThrow(expect.objectContaining({ code: 'integrity' }));
+    const dangling = withJob();
+    dangling.transcripts = [];
+    dangling.transcription_jobs[0]!.transcript_version_id = null;
+    dangling.transcription_jobs[0]!.state = 'failed';
+    expect(() => checkIntegrity(dangling)).toThrow(expect.objectContaining({ code: 'integrity' })); // 소재가 없는 전사를 가리킴
+    const dupVersion = withJob();
+    dupVersion.transcripts.push({ ...dupVersion.transcripts[0]!, id: '88888888-8888-4888-8888-888888888882' });
+    expect(() => checkIntegrity(dupVersion)).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+
+  it('지운 원본(deleted_at)은 파일 없이 메타데이터만 + asset_deleted 경고(누락 경고와 구분)', () => {
+    const t = tables();
+    t.assets[0]!.deleted_at = TS;
+    const b = buildBundle(input({ tables: t }));
+    expect(b.manifest.assets[0]).toMatchObject({ id: ASSET, missing: true });
+    expect(b.manifest.warnings).toEqual([expect.objectContaining({ code: 'asset_deleted', asset_id: ASSET })]);
+    expect(b.entries.some((e) => e.path.startsWith('assets/'))).toBe(false);
+    expect(parseBundle(roundTrip(b.entries), { migrations: MIGRATIONS }).tables.assets[0]!.deleted_at).toBe(TS);
+  });
+});
+
+describe('FIX-T19 round 1 수집 항목 원장 상태(Codex review-T19 P1 0041:31)', () => {
+  const SRC = '88888888-8888-4888-8888-888888888881';
+  const RUN = '88888888-8888-4888-8888-888888888882';
+  const ITEM = '88888888-8888-4888-8888-888888888883';
+  const SHA = 'a'.repeat(64);
+  const withItem = (over: Partial<BundleTables['collected_items'][number]>): BundleTables => {
+    const t = tables();
+    t.collector_sources = [
+      { id: SRC, kind: 'rss', url: 'https://a.mock.example/feed.xml', normalized_url: 'https://a.mock.example/feed.xml', host: 'a.mock.example', label: null, enabled: false, schedule: 'off', last_run_at: null, last_status: null, created_at: TS, updated_at: TS },
+    ];
+    t.collector_runs = [
+      { id: RUN, source_id: SRC, trigger: 'manual', mode: 'mock', status: 'preview', error_code: null, counts: {}, result: null, created_at: TS, accepted_at: null, closed_at: null },
+    ];
+    t.collected_items = [
+      {
+        id: ITEM, run_id: RUN, source_id: SRC, position: 0, external_key: 'guid:g1', guid: 'g1', link: null, link_normalized: null, title: 't', excerpt: '', published_text: null, published_at: null,
+        content_checksum: SHA, raw_sha256: SHA, byte_size: 1, decision: 'new', reason: 'new', outcome: null, capture_id: null, source_version_id: null, accepted_at: null, created_at: TS,
+        ...over,
+      },
+    ];
+    return t;
+  };
+
+  it('outcome 이 null(또는 accepted 아님)인데 소재·시각이 채워진 항목은 integrity — 정상(null·모두 비움)은 통과', () => {
+    expect(() => checkIntegrity(withItem({}))).not.toThrow();
+    expect(() => checkIntegrity(withItem({ outcome: 'not_selected' }))).not.toThrow();
+    expect(() => checkIntegrity(withItem({ capture_id: CAP }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withItem({ accepted_at: TS }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    expect(() => checkIntegrity(withItem({ outcome: 'not_selected', capture_id: CAP, accepted_at: TS }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // accepted 인데 연결이 비면 integrity
+    expect(() => checkIntegrity(withItem({ outcome: 'accepted' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+    // 새 항목이 아닌데 outcome 이 있으면 integrity
+    expect(() => checkIntegrity(withItem({ decision: 'duplicate', reason: 'same_item', outcome: 'not_selected' }))).toThrow(expect.objectContaining({ code: 'integrity' }));
+  });
+});

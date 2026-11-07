@@ -1,0 +1,28 @@
+{
+  "name": "@cs/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/next.mjs dev",
+    "build": "node scripts/next.mjs build",
+    "start": "node scripts/next.mjs start",
+    "typecheck": "node scripts/next.mjs typegen && tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@cs/db": "workspace:*",
+    "@cs/domain": "workspace:*",
+    "@cs/providers": "workspace:*",
+    "@cs/worker": "workspace:*",
+    "@electric-sql/pglite": "0.5.8",
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "5.9.3"
+  }
+}

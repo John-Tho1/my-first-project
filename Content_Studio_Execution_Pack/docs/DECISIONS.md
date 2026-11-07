@@ -1,0 +1,589 @@
+# 결정 기록 (Decision log)
+형식: `templates/DECISION_LOG.md`. 결정마다 한 항목.
+
+## D3 — M1 로그인은 비밀번호 없는 개발용 세션 모드
+- Decision ID / date: D3 / 2026-09-24 (Europe/Moscow)
+- Question: 운영 인증 공급자(OIDC)와 운영 환경이 아직 없고, 규칙상 자체 비밀번호·암호 구현이 금지된 상태에서 T02(단일 사용자 로그인·owner 제한·세션 만료·파일 접근 제어)를 어떻게 구현하는가?
+- Options:
+  1. OIDC 공급자를 지금 선정·연결 — 외부 계정·운영 환경이 필요해 M1 범위를 넘고 외부 연결 승인이 필요.
+  2. 자체 비밀번호 로그인 — docs/02 "자체 암호화/비밀번호 구현 금지" 위반.
+  3. 비밀번호 없는 개발용 세션 모드(localhost 전용) + OIDC 자리만 남김.
+- Chosen option: 3. `AUTH_MODE=dev|oidc`(기본 dev). dev 로그인은 `APP_BASE_URL` 이 localhost/127.0.0.1 일 때만, 허용 식별자 1개(`AUTH_ALLOWED_IDENTITY`)와 상수 시간 비교로 일치할 때만 세션을 만든다. `oidc` 는 T13 전까지 모든 로그인 시도를 거부한다. 세션 토큰은 32바이트 CSPRNG 난수(Node `crypto`), DB 에는 sha256 해시만, 쿠키는 HttpOnly·SameSite=Lax·(설정에 따라) Secure, 만료·폐기는 요청마다 서버가 확인한다. 상태 변경 요청은 Origin/Referer + Sec-Fetch-Site 로 CSRF 를 막는다. owner 제한은 route 와 DB query 계층 모두에서 강제한다.
+- Evidence / assumption: 앱은 현재 개발자 PC(localhost)에서만 실행된다. 단일 사용자이며 외부 노출이 없다는 가정. 새 의존성 없이 Node `crypto` 와 Next 기본 기능만 사용.
+- Reversible?: 예. `sessions` 테이블·쿠키·접근 제어 계층은 OIDC 도입 후에도 그대로 쓰고, 로그인 수단만 교체한다.
+- User decision required?: 확인 요청 — 오케스트레이터가 결정했으며 사용자 확인을 요청한다.
+- Exact authorized scope (if applicable): 로컬 개발 환경(localhost) 한정. 외부 연결·운영 배포 없음.
+- Consequences: 인증 강도는 "localhost 에 접근할 수 있는 사람 = owner" 수준이다. 로그인 시도 횟수 제한(rate limit)은 구현하지 않았다. 인터넷에 노출되는 배포에는 쓸 수 없으며(서버 가드가 localhost 외 APP_BASE_URL 에서 dev 로그인을 거부) 운영 전 T13 이 선행되어야 한다.
+- When to revisit: T13(OIDC·비밀 암호화) 착수 시, 또는 localhost 밖에서 앱을 열어야 할 필요가 생길 때.
+
+## D4 — T03 유사 소재 판정은 문자 bigram Jaccard, 폼 충돌은 query 리다이렉트(+긴 입력은 409 HTML)
+- Decision ID / date: D4 / 2026-09-24 (Europe/Moscow)
+- Question: (1) 외부 라이브러리·AI 호출 없이 한국어 소재의 "주제 유사" 후보를 어떻게 고르는가? (2) HTML 폼 수정이 409 충돌일 때 사용자가 입력한 값을 어떻게 잃지 않는가?
+- Options: (1) 단어 단위 Jaccard / 문자 bigram Jaccard / 임베딩(외부 호출·비용) (2) 409 HTML 직접 렌더 / 입력값을 query 에 실어 303 / 세션 임시 저장
+- Chosen option: (1) NFC·소문자·URL·공백·문장부호 제거 후 문자 bigram Jaccard, 기준 0.45, 최근 200건 대상. 정확 중복(정규화 URL·content_hash)은 따로 판정하고 유사 목록에서 뺀다. (2) 제출 값을 `?conflict=1&y_…` 로 실어 303(퍼센트 인코딩 후 2000자 이하). 넘으면 잘라내지 않고 같은 비교표·폼을 담은 409 HTML 을 직접 응답한다.
+- Evidence / assumption: 한국어는 조사·띄어쓰기 차이로 단어 집합이 크게 달라져 단어 Jaccard 가 근사 중복을 놓친다. bigram 은 테스트 문장(근사 중복 ≥0.45, 무관 <0.45)에서 구분됐다. 기준값은 가정이며 실사용 데이터로 조정해야 한다. 한국어 메모 200자 정도면 인코딩 후 2000자를 넘기 쉬워 query 만으로는 입력 손실이 생긴다.
+- Reversible?: 예. 유사도 함수와 기준은 `packages/domain/src/similarity.ts` 한 곳, 충돌 처리는 `apps/web/app/api/captures/[id]/route.ts` 한 곳.
+- User decision required?: 아니오(구현 세부). 기준값 조정은 사용 후 확인.
+- Exact authorized scope (if applicable): 해당 없음(외부 연결 없음).
+- Consequences: 짧은 문장(몇 글자)은 점수가 불안정하다. 200건 밖의 오래된 소재는 유사 후보에서 빠진다. 충돌 query 에 메모 내용이 실려 브라우저 기록에 남는다(본인 브라우저·본인 데이터, 외부 링크는 no-referrer).
+- When to revisit: T04 검색(한국어 FTS) 도입 시, 또는 소재가 수천 건을 넘어 최근 200건 비교가 부족할 때.
+
+## D5 — T04 검색은 pg_trgm 색인 + ILIKE 부분 문자열 일치, 페이지는 종류별 cursor
+- Decision ID / date: D5 / 2026-09-24 (Europe/Moscow)
+- Question: 외부 검색 엔진·형태소 분석기 없이(PGlite, 새 의존성 금지) 한국어 소재·원고·카드를 어떻게 찾고, 세 종류를 섞은 결과를 어떻게 페이지로 나누는가? docs/05 M1 은 "영문 FTS 만으로 충분하다고 가정하지 않음"을 요구한다.
+- Options: (1) PostgreSQL `to_tsvector('simple')` FTS — 한국어는 띄어쓰기 단위 토큰이라 "주재원"으로 "주재원으로"를 못 찾음. (2) pg_trgm 유사도(`%`) 일치 — 오타를 허용하지만 관련 없는 결과가 섞이고, 짧은 한국어 질의는 유사도가 낮아 놓칠 수 있음. (3) ILIKE 부분 문자열 일치 + pg_trgm GIN 색인으로 가속, 유사도는 점수로만. 페이지: (a) 세 종류 UNION + 합성 cursor (b) 종류별 keyset cursor.
+- Chosen option: (3) + (b). PGlite 0.5.8 의 `@electric-sql/pglite/contrib/pg_trgm` 이 동작함을 확인했다(한국어 trigram 생성, GIN 색인, plpgsql 트리거 포함). `createDb` 가 메모리·파일 DB 모두에 확장을 등록하고 migration 0003 이 `CREATE EXTENSION IF NOT EXISTS pg_trgm` 과 GIN(gin_trgm_ops) 색인(captures.raw_text, contents.title, content_versions.body, ideas.idea)을 만든다. 일치 = 검색어를 공백으로 나눈 조각이 모두 대상 필드 중 하나에 ILIKE 로 포함(`%`·`_`·`\` 는 escape). `word_similarity` 는 `score` 로만 돌려주고 정렬·일치에 쓰지 않는다. 결과는 종류별 (시각 desc, id desc) keyset: `type=all` 은 종류별 첫 limit 건(+ 종류별 다음 cursor), `type=<종류>` 는 `next_cursor` 로 이어 본다. 필터가 그 종류에 없는 속성이면(소재의 연재·상태, 원고의 위험 등) 그 종류는 빈 결과. 날짜 필터는 MSK(UTC+3) 하루 경계.
+- Evidence / assumption: 통합 테스트(tests/integration/search.test.ts)가 `주재원`→fx-007, `재고 리스`→fx-001, `ai`→"AI" 2건 이상, 무관 질의 0건, 다른 owner 행 미포함, 종류별 cursor 누락·중복 없음을 확인한다. 색인 효과(실행 계획)는 소량 데이터라 측정하지 않았다 — 가정. 원고 본문은 현재 버전만 검색한다(이전 버전 문구는 안 걸림).
+- Reversible?: 예. 검색은 `packages/db/src/search.ts` 한 곳, 색인은 migration 으로 추가/삭제 가능. PostgreSQL(M3 DB_DRIVER=postgres) 에서도 pg_trgm 은 표준 contrib 확장이다(운영 DB 에 확장 설치 권한 필요 — 확인 필요).
+- User decision required?: 아니오(구현 세부).
+- Exact authorized scope (if applicable): 해당 없음(외부 연결·새 의존성 없음 — pg_trgm 은 이미 설치된 PGlite 패키지에 포함).
+- Consequences: 오타·띄어쓰기 변형("재고리스")은 못 찾는다. 관련도 순 정렬이 아니라 최근 순이다. 2글자 이하 질의는 trigram 색인을 못 타고 순차 검색이 된다(개인용 데이터량에서는 문제 없다고 가정). 종류를 섞은 한 줄 순위는 없다.
+- When to revisit: 소재·원고가 수천 건을 넘어 검색이 느려질 때, 또는 관련도 순·오타 허용이 필요해질 때(M2 이후).
+
+## D6 — T05 내보내기 묶음은 store-only ZIP, owner 재지정·ID 보존, asset key 유지, add_missing 은 덮어쓰지 않음
+- Decision ID / date: D6 / 2026-09-24 (Europe/Moscow)
+- Question: 새 의존성 없이(ZIP 라이브러리 금지) 이식 가능한 export 를 어떤 형식으로 만들고, 다른 환경(다른 owner id)으로 복원할 때 ID·관계·파일을 어떻게 다루는가? 이미 데이터가 있는 곳에 복원하면 무엇을 하는가?
+- Options: (1) 형식: 폴더만 / tar / deflate ZIP(직접 구현) / **store-only ZIP**(method 0, `zlib.crc32`). (2) owner: 원래 owner id 로 users 행까지 복원 / **현재 로그인 owner 로 재지정**. (3) 엔터티 ID: 새로 발급(관계 재매핑) / **그대로 보존**. (4) asset 저장 key: 새 owner 로 다시 만들기 / **원래 key(`assets/<원래 owner>/<uuid>`) 그대로**. (5) 기존 데이터: 덮어쓰기 / **빈 환경에만(empty_only)** / **없는 것만 추가(add_missing, 덮어쓰기 없음)**.
+- Chosen option: store-only ZIP(ZIP64·암호화·압축 없음, 2 GiB 상한) + 같은 내용을 풀어 둔 폴더. 표 JSON 은 owner_id 열 없이(owner 는 manifest.owner) 키 정렬·2칸 들여쓰기로 직렬화해, 같은 데이터면 다른 owner 로 복원한 뒤 다시 내보내도 표 sha256 이 같다(users·audit_events 제외). 복원은 모든 행의 owner_id 를 현재 owner 로 바꾸고 ID 는 그대로 둔다. asset key 는 그대로 쓴다 — 저장소 adapter 는 owner 를 모르고 접근 권한은 `assets.owner_id` 로 강제되며, key 는 전역 unique 라 충돌하지 않는다. 기본은 empty_only(소재·카드·원고·파일·출처 0건 + 충돌 0). add_missing 은 없는 ID 만 INSERT(`ON CONFLICT DO NOTHING`), 같은 행은 건너뛰고, 다른 행·다른 owner 가 쓰는 ID·부모가 복원되지 않은 행·다른 unique 충돌은 모두 "충돌"로 보고만 한다. 기존 행 UPDATE 는 없다(예외: 이번에 넣은 원고의 current_version_id null → 버전 id). 미리보기는 커밋과 같은 코드를 트랜잭션 안에서 실행하고 rollback 해서 계산한다.
+- Evidence / assumption: `tests/integration/export-restore.test.ts` 가 빈 DB 복원 후 11개 복원 표의 모든 행(ID·값·관계·원고 본문 바이트·current_version_id·asset checksum·저장소 파일 sha256)과 한국어 검색 결과가 일치함을, 한 바이트 변조가 `manifest_mismatch` 로 거부되고 DB 가 그대로임을, add_missing 이 바뀐 행을 덮어쓰지 않음을 확인한다. 시각은 마이크로초까지 보존한다(JS Date 를 거치지 않음). Node 22.12+ 의 `zlib.crc32` 사용.
+- Reversible?: 예. 형식은 `format_version` 으로 구분하고(v1 외 거부), 복원 규칙은 `packages/db/src/restore.ts` 한 곳.
+- User decision required?: 확인 요청 — 묶음은 암호화하지 않는다(docs/02 "backup 의 개인 데이터는 암호화"는 운영 백업(T20) 범위로 남김). 보관 위치·보존 기간은 사용자가 정한다.
+- Exact authorized scope (if applicable): 해당 없음(로컬 파일만, 외부 전송 없음).
+- Consequences: 다른 도구로 압축해 다시 묶은 ZIP(deflate)은 거부된다 — 이 앱이 만든 ZIP 만 복원 가능. 업로드 미리보기는 ZIP 전체를 메모리에 올린다(≤256MB, multipart 는 임시 파일 → 메모리). 같은 DB 안에서 다른 owner 에게 같은 묶음을 복원하면 ID 가 이미 쓰이고 있어 전부 충돌(id_in_use)이 된다 — 새 ID 발급 복원은 없다. 커밋 도중 실패하면 DB 는 rollback 되지만 이미 쓴 asset 파일은 고아로 남을 수 있다. users(식별자 원문)·audit_events 는 복원하지 않는다.
+- When to revisit: 대용량 asset(M2 T08) 또는 운영 백업·복원 drill(T20)에서 암호화·스트리밍 ZIP·ZIP64 가 필요해질 때, 또는 여러 owner 를 한 DB 에 합칠 필요가 생길 때.
+
+## D7 — M2 의 AI 는 모의(mock)로 진행, live 경계는 T07 에서 구현하되 실제 키·호출은 별도 승인
+- Decision ID / date: D7 / 2026-09-24 (Europe/Moscow)
+- Question: M2(T06~T09) 작성 지원 기능을 실제 LLM 호출 없이 어디까지 만들 것인가?
+- Options: (1) 처음부터 live provider 연결 (2) 전부 모의 (3) T06·T09 는 모의만, T07 에서 provider adapter·예산 예약·차단(fail-closed)까지 구현하고 실제 키·호출은 별도 승인 후.
+- Chosen option: (3). 저장소·브라우저·프롬프트·로그에 키를 두지 않는다. 기본값은 LLM_MODE=mock 유지.
+- Evidence / assumption: M1 의 MockLlmProvider(결정적, experience claim → needs_user_confirmation)와 assertLiveLlmAllowed 가 이미 있다.
+- Reversible?: 예. live 전환은 환경변수와 승인으로만.
+- User decision required?: 확정됨(사용자, 2026-09-24).
+- Exact authorized scope: 외부 호출 0, 과금 0.
+- Consequences: T07 의 live 경로는 모의 provider 로만 검증된다. 실제 모델 품질·비용은 승인 뒤에야 측정된다.
+- When to revisit: T07 완료 후 사용자가 D8 을 정할 때.
+
+## D8 — 첫 live LLM 공급자·모델은 T07 착수 시 결정(미정)
+- Decision ID / date: D8 / 2026-09-24 (Europe/Moscow)
+- Question: 어떤 공급자·모델을 첫 live 연결로 쓰는가?
+- Chosen option: 미정. 후보·모델 ID·요금 상한은 사용자가 그 시점 공식 자료로 확인해 정한다. 문서에 요금·모델 ID 숫자를 미리 고정하지 않는다.
+- User decision required?: 예 — T07 착수 시.
+- When to revisit: T07 착수.
+
+## D9 — T08 음성 전사는 업로드·job·진행 상태까지 모의, 실제 STT 는 승인 후
+- Decision ID / date: D9 / 2026-09-24 (Europe/Moscow)
+- Chosen option: 업로드 세션·job 상태·진행 표시·지원 기기 fallback·원음 보존(선택)을 모의 전사기로 구현한다. 외부 STT 연결은 공급자·범위·비용을 적은 승인 뒤에만.
+- User decision required?: 확정됨(사용자, 2026-09-24). 외부 STT 는 별도 승인.
+- Consequences: 전사 품질은 M2 에서 측정되지 않는다.
+
+## D10 — Content Studio 는 M2 동안 현 위치(my-first-project/Content_Studio_Execution_Pack/) 유지
+- Decision ID / date: D10 / 2026-09-24 (Europe/Moscow)
+- Chosen option: 별도 저장소 분리는 M3 전에 재검토(docs/ENVIRONMENT.md §7). 상위 저장소의 Codex 스크립트·규칙과 공존한다.
+- User decision required?: 확정됨(사용자, 2026-09-24).
+- When to revisit: M3 착수 전.
+
+## D11 — M1 Codex 잔존 P1(파일 복구 감사의 COMMIT 실패 창)은 잔존 위험으로 기록, VERIFIED 상태 분리는 T08 로 이관
+- Decision ID / date: D11 / 2026-09-24 (Europe/Moscow)
+- Question: Codex 재검증(GPT-6 Astra / xhigh)에서 남은 P1 — `POST /api/assets/uploads` 의 유실 파일 복구에서 `storage.put` 성공 뒤 DB COMMIT 이 실패하면 파일만 남고 `asset.restore` 감사가 영구 누락 — 을 M2 전에 해결할 것인가? "서명 몇 바이트로 VERIFIED" 지적은 상태값을 나눌 것인가?
+- Options: (a) 잔존 위험으로 기록하고 M2 착수, 파일 저장소–DB 정합성(outbox/reconciliation)은 T08 업로드 세션·job 설계와 함께 (b) M2 전에 asset 복구 outbox 를 구현·재검증.
+- Chosen option: (a). VERIFIED 는 상태값·명세를 유지하고 UI 라벨을 "서버 확인됨(형식 서명·크기·checksum)" 으로 바꿔 실제 검증 범위를 표시(16a9e5b). 상태 분리·구조 검증 도입 여부는 T08 결정으로 이관.
+- Evidence / assumption: 로컬 PGlite 는 단일 연결·단일 프로세스라 put 성공 뒤 COMMIT 만 실패하는 경우는 프로세스 크래시 수준의 장애에서만 발생한다고 가정(측정 없음). 복구 자체는 행 잠금 트랜잭션으로 직렬화되어 동시 복구·감사 중복은 막힌다(테스트 있음).
+- Reversible?: 예. T08 에서 복구 의도 테이블을 추가하면 해소된다.
+- User decision required?: 확정됨(사용자, 2026-09-24, 권고안 채택).
+- Consequences: 그 장애 창에서는 파일은 복구되지만 감사 이력이 없다. 화면 체크리스트 12항목은 M2 착수 뒤 사용자가 확인한다(.handoffs/screen-notes.md).
+- When to revisit: T08 착수 시(업로드 세션·job 상태 설계).
+
+## D12 — T06 작성 지원: 제안은 현재가 아닌 ai:mock 버전, 질문 3개 고정, 채택 = 새 사용자 버전, A03 은 `ready` 전이에서 서버 차단
+- Decision ID / date: D12 / 2026-09-24 (Europe/Moscow)
+- Question: 모의 AI 로 outline/draft/revise 를 만들 때 제안을 어디에 두고, 사용자 원문 보존·입력 버전 고정·A03(미확인 1인칭 경험 차단)을 어떻게 서버에서 강제하는가?
+- Options: (1) 제안 저장: 별도 proposals 표 / run 의 jsonb 에만 / **content_versions 의 현재가 아닌 불변 버전**(created_by='ai:mock', ai_run_id). (2) 인터뷰 질문: AI 가 생성 / **고정 3개**(상황·판단·독자에게 남길 한 가지). (3) 채택: current_version_id 를 제안 버전으로 옮김 / **제안 본문으로 새 사용자 버전 추가**. (4) A03 차단 지점: 화면 경고만 / 게시 승인(M3) / **상태 `ready` 전이(서버)**.
+- Chosen option: 제안은 `content_versions` 에 현재가 아닌 버전으로 저장(버전 번호 = 최대+1, `contents.current_version_id` 불변). 기존 본문 저장도 번호를 "현재+1" 에서 "최대+1" 로 바꿨다(제안 번호와 충돌 방지). `generation_runs` 에 입력 버전(현재 본문 버전 id·브랜드 프로필 id/버전·답변 id 정렬 목록)·prompt_version(`t06-assist-v1`)·provider/model(mock)·status(running→succeeded|failed)·output_ref·output_json(claims·followup_questions·warnings)을 남긴다. 채택은 제안 본문으로 `created_by='owner'`, `ai_run_id=<run>` 인 새 버전을 만들어 현재로 옮긴다(작업 지시의 'user' 대신 기존 사용자 버전 값 `owner` 를 그대로 사용 — 사용자 문장 판정이 한 값으로 유지됨). 채택 조건: base_version = 현재 **그리고** run 의 입력 버전 = 현재(그 사이 본문이 바뀌었거나 이미 채택했으면 409 `stale_base`). A03: 채택한 **모든** run(마지막 run 만이 아님)의 `experience` 또는 `needs_user_confirmation` claim 중 `claim_confirmations` 에 없는 것이 있으면 `updateContentMeta` 가 잠금 안에서 `ready` 전이를 409 `unconfirmed_experience_claims` 로 거부하고, 이미 `ready` 인 원고에서 그런 제안을 채택하는 것도 같은 409 로 거부한다(우회 방지 — 확인은 채택 전에도 할 수 있다). 확인은 사용자 요청(`POST /claims/confirm`)으로만 저장한다. `interview_answers`·`claim_confirmations` 는 DB 트리거로 UPDATE·DELETE 금지. live 모드는 `getLlm` 이 `assertLiveLlmAllowed` 후에도 `LiveProviderNotConfiguredError` 로 거부(503, run 없음). 실패 주입은 `NODE_ENV=test` 이고 `LLM_MOCK_FAIL_NEXT=1` 일 때만.
+- Evidence / assumption: `tests/integration/writing.test.ts`(18개)가 브랜드 append·409·owner 범위, 답변 append·최신·불변, assist 성공(현재 버전 불변·ai:mock·MOCK_WARNING)·stale 409(run·버전 0)·실패 주입(run failed·본문 그대로)·live 503(run 0), 채택·재채택 409, A03 409 → 확인 → ready 200, 새 표 export→빈 DB 복원 왕복을 확인한다. 모의 provider 는 답변→본문 순 자료의 앞 3문장으로 claim 을 만든다(1인칭 표현 → experience).
+- Reversible?: 예. 제안·채택·확인은 모두 추가 행이라 되돌릴 데이터 변환이 없다. 게이트 위치는 `packages/db/src/claims-gate.ts` 한 곳.
+- User decision required?: 확인 요청 — (a) 채택 버전 created_by 를 `owner` 로 둔 것, (b) A03 을 `ready` 전이에서 막는 것(게시 승인은 M3), (c) **수동 복사는 추적하지 않음 — 사용자 결정 필요**: 제안을 채택하지 않고 본문에 직접 복사해 저장하면(`aiRunId` 없는 사용자 버전) A03 게이트가 걸리지 않는다. 현재 구현은 이것을 A03 전체 충족으로 보지 않는다(Codex review-T06 P1, 미구현·명시적 한계). (d) `resolution='removed'` 는 서버가 본문을 대조하지 않는 사용자 표시라는 것.
+- Exact authorized scope (if applicable): 외부 호출 0, 과금 0(D7).
+- Consequences: 버전 목록에 AI 제안 버전이 섞여 보인다("AI 제안(모의)" 표시). 채택하지 않은 제안의 경험 claim 은 막지 않는다. 복원(add_missing)에서 run 이 충돌로 빠지고 채택 버전만 들어가면 게이트가 그 run 을 보지 못한다. 프롬프트 내보내기는 보기만 있고, 결과 붙여넣기 가져오기는 T06 범위 밖. run 이 `running` 인 채로 프로세스가 죽으면 그대로 남는다(재시도는 새 run).
+- When to revisit: T07(claim–source 연결·user_confirmed 근거·live provider 경계·비용 예약) 착수 시.
+- FIX round 1(Codex review-T06, 2026-09-24): (P0) 묶음 검증이 `content_versions.ai_run_id` 가 **같은 원고**의 run 인지 확인하고, 복원은 모든 표를 적용한 뒤 "이번에 넣은 버전의 run 이 이번에 넣었거나 동일"인지 사후 확인해 아니면 `restore_conflict`(dependency)로 전체 중단한다(버전↔run 순환이라 PARENTS 대신 사후 검사). (P1) `claim_confirmations.resolution`('confirmed' = 내 경험이 맞음 / 'removed' = 본문에서 뺐음, 기본 confirmed, migration 0006) — 둘 다 사용자 주장이고 게이트는 둘 다 해결로 본다. 거짓 경험을 사실이라고 확인하지 않고도 검토를 끝낼 수 있다. (P1) 작성실은 최근 10개 run 에 더해 미해결 경험 claim 이 남은 run 과 URL 의 `?run=`(owner·원고 범위 직접 조회)을 항상 보여 준다. (P2) `interview_answers.seq`(원고 잠금 안에서 최대+1, 0006 에서 기존 행을 (created_at, id) 순으로 채움, (content_id, seq) unique)로 최신 답변을 판정한다. (P2) Brand Profile 저장은 owner 행을 잠가 직렬화하고, 409 본문의 current 는 응답 시점에 다시 읽는다. 수동 복사 우회(P1)는 위 (c) 로 남긴다.
+- FIX round 2(Codex review-FIX-T06, 2026-09-25): 'removed'(본문에서 뺐음)는 **현재 본문에 그 claim 문장이 없을 때만** 유효하다. 저장 시 원고 잠금 안에서 현재 본문을 검사해 문장이 있으면 409 `claim_still_in_body`(행 없음), 없으면 그때의 현재 버전을 `body_version_id` 로 함께 저장한다(migration 0007). 게이트도 매번 현재 본문을 다시 검사해, 제외했던 문장을 다시 넣으면 그 claim 은 다시 미해결이 된다. 'confirmed' 는 본문과 무관한 영구 사용자 주장으로 유지. 한 claim 에 해결 방식별 한 행(unique (run_id, claim_index, resolution))이라 제외 후 다시 넣은 문장을 나중에 '확인'할 수 있다. 포함 검사는 `@cs/domain` 의 `bodyContainsClaim`(NFKC·소문자·글자와 숫자만 남긴 뒤 부분 문자열 일치 — 공백·문장부호 차이 무시, 유사도·어미 변화 비교 없음)이다. 한계: 문장을 조금만 바꿔 쓰면(어미·조사 한 글자) "없음"으로 판정되어 제외가 허용된다 — 의미 비교가 아니라 문자열 비교다. 폼의 `resolution` 은 받은 값을 그대로 검증하고(잘못된 값 400/폼 오류), `?run=` 은 소문자 UUID 로 한 번 정규화해 조회와 선택에 같은 값을 쓴다.
+
+## D13 — T07 근거·비용·live 경계: 허용 출처 목록 밖 출처는 저장 안 함, 글자/3 토큰 추정 예약, 실패 호출은 예약액 전액 확정, live 는 승인 기록이 있어도 어댑터 없음
+- Decision ID / date: D13 / 2026-09-25 (Europe/Moscow)
+- Question: 실제 AI 키·호출 없이(D7) 입력 버전 고정·claim–source 연결·비용 예약(A15)·live 차단을 어디까지 구현하고, 추정·실패·모의 비용을 어떻게 기록하는가?
+- Options: (1) 토큰 추정: 공급자 토크나이저(D8 미정이라 불가) / **글자 수 ÷ 3 올림(보수적 경험칙)**. (2) 실패한 호출: 예약 해제(0) / **예약액 전체를 실제액으로 확정(failed=true)**. (3) 모의 비용: 기록 안 함 / **가격이 없으면 0 으로 예약·확정 기록, 가격을 설정하면 모의에서도 한도 검사**. (4) live 열기: 환경변수만으로 / **승인 기록(LLM_LIVE_APPROVAL_REF)+가격+월 상한+공급자·모델이 있어도 T07 에는 HTTP 어댑터가 없어 항상 거부**. (5) 모델이 낸 출처: 저장 후 표시 / **허용 source_version 목록 밖은 저장하지 않고 개수·경고·needs_check 만**.
+- Chosen option: 각 괄호의 굵은 선택. 세부: 예약액 = ⌈입력 추정 × 입력 단가/1000⌉ + ⌈max(256, 입력/2) × 출력 단가/1000⌉(micro 단위 정수 계산, numeric(18,6) 저장). 월 사용액 = 이번 달(MSK) 원장의 reserved 예약액 + settled 실제액. 예약은 run 기록과 같은 트랜잭션에서 원고 잠금 → owner(users) 행 잠금 → 합계 → 검사 순으로 하고, 초과하면 429 `budget_exceeded`(run·원장·버전 없음). 경계값(= 상한)은 허용. 모의 provider 의 사용량은 입력 = 프롬프트 글자/3, 출력 = 제안 글자/3(결정적). 허용 출처 = 이 원고에 연결된 소재(content_captures)의 출처(sources)의 source_versions 뿐이며, 요청의 `source_version_ids` 가 그 밖이면 404. 출처가 있으면 프롬프트에 "허용 출처" 절이 붙고 prompt_version 은 `t07-assist-v2`(없으면 t06-assist-v1 과 동일). claims·claim_sources 는 추가 전용(트리거), evidence_grade 'user_confirmed' 는 저장하지 않고 claim_confirmations(confirmed)에서 파생한다. health·설정 화면은 live 준비 상태를 "빠진 조건 이름"으로만 보여 준다(값 없음).
+- Evidence / assumption: `tests/integration/budget-claims.test.ts`(17개) — 예약·확정 금액, 월/1회 상한 429(아무것도 쓰지 않음), 실패 확정, 동시 3건 중 2건만 성공(모두 예약된 뒤 확정되도록 provider 대기), 출처 404/400, 만든 출처 미저장, user_confirmed 파생, live 전제 조건별 503·무기록, health, export→복원 왕복. 글자/3 은 실제 토큰 수와 다를 수 있다(측정 없음 — 공급자 결정 후 교정).
+- Reversible?: 예. 추정식·여유분은 `packages/domain/src/budget.ts` 한 곳, 원장 행은 pricing_snapshot 을 남겨 나중에 재계산할 수 있다.
+- User decision required?: 예 — (a) 월 상한·1회 상한·통화 값(설정하지 않으면 모의만 동작), (b) live 공급자·모델·단가(D8)와 승인 기록 참조 값, (c) 실패 호출을 전액 비용으로 보는 보수적 정책 유지 여부, (d) 글자/3 추정이 과소 추정일 때의 여유(현재 없음).
+- Exact authorized scope (if applicable): 외부 호출 0, 과금 0, 비밀 0. `LiveLlmProvider` 에는 HTTP 코드가 없다(`// T07: 실제 호출은 별도 승인 후 구현(D8)`).
+- Consequences: 모의에서도 가격을 설정하면 한도 때문에 제안이 거부될 수 있다. 프로세스가 provider 호출 중 죽으면 원장은 reserved 로 남아 이번 달 합계에 예약액으로 계속 잡힌다(정리 경로 없음, released 는 아직 쓰지 않음). 실제 비용이 예약보다 클 수 있다(추정 초과) — 상한은 예약 시점에만 검사한다.
+- When to revisit: D8(공급자·모델) 결정과 live 어댑터 구현 승인 시.
+- FIX round 1(Codex review-T07, 2026-09-25): (P1) 예약액은 "최대 가능 비용"(입력 추정 + 출력 상한)이며 출력 상한을 provider 계약 `maxOutputTokens` 로 넘긴다(모의는 지키고, live 골격은 값을 그대로 전달해야 함). 그래도 실제액이 예약을 넘으면 `usage_ledger.overage_amount`·`over_budget=true`(migration 0010)로 **숨기거나 자르지 않고** 기록하고, run output_json·감사에도 표시한다. 그 결과 월 합계가 상한을 넘으면 다음 예약이 거부된다. 확정(성공·실패)도 예약과 같은 owner 행 잠금 아래에서 한다. (P1) 통화: 합계·검사는 통화별이고, 이번 달 원장에 설정과 다른 통화가 있으면 예약을 409 `budget_currency_mismatch` 로 거부한다(가격 설정 여부와 무관 — 명시적 단일 통화). 설정 화면은 통화별 사용액·초과액을 보여 주고, 다른 통화 원장이 든 묶음 복원은 허용하되 미리보기 경고(`ledger_currency_mismatch`). (P1) 모델 출력은 `sanitizeLlmOutput` 한 번으로 정제해(허용 목록 밖 참조 제거, 그 문자열(4자 이상)이 제안 본문·경고·질문·태그·claim 문장에 다시 나오면 `[출처 미확인 URL 제거]`) 제안 버전·output_json·claims 행·HTTP 응답에 같은 객체를 쓴다(원고 assist·채널 AI 초안 모두). (P1) `claims.evidence_grade` 는 'none'|'source' 만 저장·복원(DB CHECK, 0010 에서 기존 'user_confirmed' 는 'none' 으로), 'user_confirmed' 는 claim_confirmations 에서만 파생. (P1) 작성실은 허용 출처를 체크박스로 고르게 하고, 기본은 출처마다 최신 버전(최대 50, 빠진 버전 수 표시) — 서버 상한 50 은 그대로. (P2) 금액은 bigint micro 로 계산하고 numeric(18,6) 범위·형식 밖 값은 거부.
+- FIX round 2(Codex review-FIX-T07, 2026-09-25): (P1) 출력 정제는 source_refs 에 기대지 않는다 — 제안 본문·경고·후속 질문·태그·claim 문장의 URL(https?://, www.)과 [출처…] 인용 중 허용 출처(locator·id)로 풀리지 않는 것은 '[출처 미확인 URL 제거]' 로 바꾸고 "확인 필요" 경고, [n] 숫자 인용은 허용 출처 번호(1..허용 수, 프롬프트 순서) 안일 때만 두고 아니면 — 그리고 source_refs 에서 버린 4자 미만 참조가 글에 남으면 — 안전하게 고칠 수 없으므로 출력 전체를 검증 실패(run failed, error `unverifiable_citation`, 제안 없음, 502 llm_failed)로 처리한다(원고 assist·채널 초안 모두). 사용자 원문에 있던 URL 도 허용 출처가 아니면 AI 제안에서는 빠진다(보수적). (P2) 월 합계는 행 범위(numeric(18,6))를 적용하지 않는 bigint micro(`sumToMicro`, SQL 은 제한 없는 numeric 합). (P2) 모든 월 조회(사용액·통화 목록·사용량)는 MSK `월 시작 ≤ created_at < 다음 달 시작`.
+- FIX round 3(Codex review-FIX2-T07, 2026-09-25): 정제를 인용 문법으로 다시 만들었다 — 받아들이는 형태는 `[n]`(1..허용 수), `[출처: <URL|UUID>]`(괄호 안 값을 꺼내 비교), URL(`https?://`, `www.`), 맨 도메인(`host.tld[/…]`, 점과 영문 2~24자 TLD, 흔한 파일 확장자 제외)뿐이고, 판정은 전체 값 동등성만(부분 문자열 비교 없음): URL 은 `normalizeUrl().normalized`(scheme·host 소문자, 기본 포트·fragment·추적 파라미터 제거, 파라미터 정렬, 끝 슬래시) — **경로·쿼리 대소문자는 구분**, http↔https·www 유무는 정규형이 다르면 다른 출처(별칭 없음); UUID 는 허용 id 와 정확히; `[n]` 은 길이와 무관하게 번호 규칙(범위 밖이면 출력 전체 실패). 풀리지 않는 URL·맨 도메인·[출처…] 는 '[출처 미확인 URL 제거]' + 확인 필요 경고 + claim needs_check. "버린 4자 미만 참조" 휴리스틱은 없앴다(문법이 대신한다) — 대신 source_refs 에만 있던 자유 문자열(URL·UUID·[n] 이 아닌 서지 문구)은 본문에서 찾아 지우지 않는다.
+- FIX round 4(Codex review-FIX3-T07, 2026-09-25): **자유문 인용 검증을 그만두고 구조화 인용만 허용 + 자유문 출처는 fail-closed.** 근거: 라운드 1–3 에서 자유문 URL 을 "검증해 허용"할 때마다 새 우회(접두 일치 뒤의 포트·쿼리·괄호, `출처:fake.example`, `//host`, 전각 마침표, 버린 서지 문구의 본문 잔존)가 나왔다 — 자유문 검증은 이길 수 없는 경쟁이다(Codex 장기 제안 채택). 규칙: 인용은 `claims[].source_refs`(허용 source_version id — 그 밖은 버리고 개수·경고)와 글 속 `[n]`(1 ≤ n ≤ 허용 수, 허용 id 정렬 순서 = 프롬프트 번호)뿐이고, 표시 "[출처 n]" 은 서버가 허용 목록에서 만든다(`citationLabel`, 작성실 claim 목록). 제안 본문·경고·후속 질문·태그·claim 문장을 NFKC 정규화한 뒤 `://`·`www.`·프로토콜 상대 `//host`·`[출처…]`·호스트 모양 토큰(문자·숫자·하이픈 라벨을 `.`/`。`(전각 `．`·`｡` 포함)으로 이은 뒤 영문 2–24자 TLD, 포트·경로·쿼리·괄호가 붙어도)·버린 source_refs 문구(정확한 문구, 대소문자 무시)·범위 밖 `[n]` 중 하나라도 있으면 **허용 여부를 따지지 않고** 출력 전체를 `unverifiable_citation` 으로 실패시킨다(run failed, 제안·claims 없음, 본문 그대로, 502 llm_failed, 원장은 예약액 확정 — T07 규칙). 허용 locator 와 같은 URL 도 자유문으로 쓰면 실패한다. 글을 고쳐 살리는 정제(`[출처 미확인 URL 제거]` 치환·URL 정규형 비교)는 없앴다. 오탐 예외는 좁게: 실제 TLD 가 아닌 파일 확장자(.ts .json .pdf …, 경로·포트가 없을 때), 대문자 이름의 `.md`(README.md), 이메일(@ 뒤), 소수. **트레이드오프**: 그 밖의 "단어.영문" 표기(React.Component, St.Petersburg, 소문자 `notes.md`)는 실패할 수 있고, 사용자 본문·답변에 URL 이 있으면 그 문장을 되풀이하는 모의 제안도 실패한다(모의는 앞 문장을 claim 으로 씀). 프롬프트는 t07-assist-v3(허용 출처를 `[n] id · locator · 요약` 으로 번호 매기고 "출처는 [n] 으로만, URL·도메인·문헌 제목을 쓰면 출력 전체 거부" 지시). **사용자 결정 필요**: 입력(자료)에서 URL 을 빼고 프롬프트에 넣을지(모의·live 실패 감소, 대신 모델이 URL 을 모름) — 현재는 빼지 않는다. 채널 AI 초안은 허용 출처가 없으므로 `[n]` 도 실패.
+- FIX round 5(Codex review-FIX4-T07, 2026-09-25): 탐지 누락 보완 — IPv4(점 네 묶음, 포트·경로 무관)·괄호 IPv6, 영문으로 시작하고 숫자·하이픈을 포함하는 TLD(퍼니코드 `xn--p1ai` 등), TLD 뒤 경계를 "영문·숫자·하이픈이 아닌 모든 문자 또는 끝"으로 넓혀 한국어 조사가 바로 붙은 도메인(`fake.example에 따르면`)도 실패. **대소문자로 파일 이름을 믿는 예외(대문자 이름의 .md)를 없앴다** — `README.md`·`FAKE.md`·`fake.md` 모두 실패(README.md 오탐을 받아들임, 해당 통과 테스트는 삭제). 남은 예외는 실제 TLD 가 아닌 코드·문서 확장자(.ts .json .pdf …, 대소문자 무관, 경로·포트 없을 때)·이메일·소수뿐. 추가 오탐: 점 네 묶음 버전 표기(`1.2.3.4`). 화면 안내는 실제 범위로 고침 — 자동 거부는 URL·도메인·IP 모양, 범위 밖 번호, 버린 source_refs 문구뿐이고 일반 문헌 제목·기관명은 자동 검증되지 않으며, 출처 없는 확인 필요 주장에 "출처 미검증 · 사용자 확인 필요"를 표시한다.
+- FIX round 6(Codex review-FIX5-T07, 2026-09-25): 탐지 전에 보이지 않는 서식 문자(Unicode Cf 전체 — 제로폭 공백·결합자·비결합자·BOM·소프트 하이픈·단어 결합자·방향 제어 등)를 지우고 이어 붙인 뒤 NFKC 로 정규화한 문자열에서 URL·호스트·IP·번호 인용·버린 참조 문구를 찾는다(`fake\u200B.example`·`fake.e\u00ADxample` 도 실패). 원문은 바꾸지 않는다(탐지되면 실행 전체가 실패하므로 저장되지 않음). 괄호 IPv6 는 영역 ID(`%eth0`, `%25eth0`)가 붙어도 실패.
+- FIX round 7(Codex review-FIX6-T07, 2026-09-25): 탐지 전처리에서 Cf 에 더해 Default_Ignorable_Code_Point 명시 범위(변형 선택자 U+FE00–FE0F, CGJ U+034F, 한글 채움 문자 U+115F·U+1160·U+3164·U+FFA0, 몽골 변형 선택자, 태그 문자 U+E0000–E0FFF 등)도 지운다. 실제 결합 발음 부호(나머지 Mn, 예 U+0301)는 남긴다.
+
+## D14 — T09 채널 초안: stale 은 파생 값, 채널 모양은 결정적 변환(잠정 한도), 배포 파일은 승인·게시가 아님, 게시 어댑터 없음
+- Decision ID / date: D14 / 2026-09-25 (Europe/Moscow)
+- Question: 게시 없이(PUBLISH_MODE=disabled, M3 이전) 채널별 초안·stale·미디어 완성·배포 파일을 어떻게 저장·판정하고, 무엇을 "준비됨"으로 보여 줄 것인가?
+- Options: (1) stale: 저장 플래그(원고 수정 시 갱신) / **파생(현재 버전의 content_version_id ≠ 원고 현재 버전)**. (2) 파생본 상태: DRAFT/REVIEW/APPROVED / **draft·review 만(APPROVED 는 M3)**. (3) 초안 만들기: AI 만 / **결정적 변환 + 선택적 모의 AI 제안(채택 전 비현재)**. (4) 배포 파일 기록: 새 표 / **표 없이 owner 폴더(`EXPORT_LOCAL_DIR/packages/<owner>/<id>.zip`)** — 표를 늘리지 않고 owner 범위를 경로로 강제. (5) 영상: 아무 파일이나 역할만 video / **역할과 실제 형식(video/*)이 맞아야 인정**.
+- Chosen option: 각 굵은 선택. 세부: 채널 모양 — threads 문단별 글(각 ≤500 코드 포인트, 긴 문단은 공백에서 잘라 이어짐, 최대 20), instagram 첫 문단 캡션(≤2200) + 문단별 카드(≤10, 각 ≤300), youtube 첫 줄(#·> 제거) 제목(≤100) + 나머지 설명(≤5000) + 원고 전체 대본 + 빈 태그, blog 첫 줄 제목(≤200) + 원고 Markdown. **이 한도는 잠정값**(게시 어댑터 M4 전에 공식 자료로 재확인). 사용자 수정·첨부 변경·AI 제안 채택은 새 현재 버전을 만들고 lifecycle 을 draft 로 되돌린다(docs/03 "수정 시 재검토"). 수정만으로는 stale 이 풀리지 않는다 — "현재 원문으로 다시 초안"(결정적 변환)을 새로 만들어야 한다. AI 가 자동으로 다시 만드는 경로는 없다. review 조건: 현재 버전·stale 아님(409 stale_variant)·채널 필수 미디어(instagram 이미지 ≥1, youtube 영상 1, 409 media_incomplete)·원고의 미해결 경험 claim 없음 + 이 파생본이 채택한 AI 제안의 미해결 경험 claim 없음(409 unconfirmed_experience_claims, 이 파생본 본문 기준). 채널 초안 AI run 은 generation_runs(mode='variant', variant_id)·원장(T07)·claims(variant_version_id, content_version_id = 파생 기준 원고 버전)을 그대로 쓰고, 원고 작성 보조 목록에는 나오지 않는다. claims unique 는 (run_id, claim_index) 로 바꿨다(한 원고 버전에서 여러 run). 배포 파일 ZIP 에는 채널별 현재 버전의 본문·메타데이터·첨부(저장소 파일 sha256 = assets.checksum 일 때만, 아니면 missing + 경고)와 manifest(`is_approval:false`, `is_publication:false`, `publish_mode`, `mock`, 파생본별 stale·미디어 완성·lifecycle, 모든 파일 sha256)가 들어간다.
+- Evidence / assumption: `tests/integration/variants.test.ts`(13개) — 네 채널 초안, stale → 검토 409 → 다시 초안 → 검토, AI 초안(비현재·run·원장·claims)·채택·오래된 제안 409, 실패 주입, 미디어 409·역할/형식 400, 다른 owner 파일·파생본·배포 파일 404, A03, 배포 ZIP 내용·sha256·manifest, export→복원 왕복. `packages/domain/src/channel.test.ts`(25개).
+- Reversible?: 예. 변환·한도는 `packages/domain/src/channel.ts` 한 곳, 파생본 버전은 불변이라 이력이 남는다.
+- User decision required?: 예 — (a) 채널 한도·모양(잠정값) 확인, (b) **완성 영상 업로드가 아직 없어(허용 형식: 이미지·PDF·텍스트) YouTube 파생본은 검토로 갈 수 없다** — 영상 업로드를 T08(업로드 세션)에서 열지, YouTube 를 대본 패키지만으로 검토 가능하게 할지, (c) 수정 시 draft 로 되돌리는 규칙 유지 여부, (d) 배포 파일 보관 기간·정리(현재 자동 삭제 없음).
+- Exact authorized scope (if applicable): 외부 호출 0, 게시 0(채널 어댑터·OAuth·배포 작업 표 없음 — M3 이후).
+- Consequences: 원고가 바뀌어도 이미 review 인 파생본은 review 로 남되 stale 로 보인다(보류·재승인은 M3 배포 작업에서 강제). 배포 파일은 DB 기록이 없어 export 묶음에 들어가지 않는다(감사 기록만). 채널 초안 AI 의 claim 은 파생본 검토 게이트에만 걸리고 원고 `ready` 게이트에는 영향이 없다.
+- When to revisit: M3(승인 스냅샷·배포 작업)·M4(채널 어댑터) 착수 시, 또는 T08 에서 영상 업로드를 열 때.
+- FIX round 1(Codex review-T09, 2026-09-25): (P0) 검사 대상 = 나가는 글: `renderVariantText(channel, body, metadata)`(threads 글·이어지는 글 / instagram 캡션·카드 / youtube 제목·설명·대본·태그 / blog 제목·Markdown + 본문)로 'removed' 확인·파생본 claim 게이트를 하고, 배포 파일에 `<channel>/output.txt` 로 같은 글을 넣는다. 본문과 중복되는 칸(threads 이어지는 글·text, instagram 캡션, youtube 대본, blog Markdown)은 **서버가 다시 만드는 대신 사용자 수정에서 본문과 다르면 400 `metadata_body_mismatch`** 로 거부한다(더 작은 변경 — 편집 폼 모양 그대로). (P1) 묶음·복원: 파생본 버전의 ai_run_id 는 같은 파생본의 mode='variant' run, 원고 버전의 ai_run_id 는 원고 run, claim 의 variant_version_id·content_version_id 는 그 run 의 제안·입력 버전이어야 한다(아니면 integrity). (P1) 복원 사후 처리: 이번에 넣은 review 파생본을 복원된 행(현재 버전·원고 현재 버전·실제 첨부)으로 다시 검사해 stale·미디어 부족·현재 버전 없음이면 draft 로 낮추고 `downgraded_variants`(이유 포함)를 미리보기·결과에 남긴다(A03 claim 은 검사하지 않음 — review 재요청 때 걸림). (P1) 제안 처리 상태: `generation_runs.proposal_status`(proposed | adopted | dismissed, migration 0011 — 기존 채택 run 은 adopted 로 채움). 미채택 제안은 이 상태로 찾아 뒤의 수정·첨부 후에도 보이고 채택 가능하며, 무시(`POST /api/variants/{id}/proposals/{runId}/dismiss`, `POST /api/contents/{id}/assist/{runId}/dismiss`)하면 목록에서 빠지고 채택은 409. (P2) 첨부 상한(20개·position ≤50)을 JSON·폼·DB 함수 모두 검사. (P2) 배포 파일은 `EXPORT_LOCAL_DIR/packages/<owner>/<content>/<id>.zip` — 작성실에는 그 원고의 것만(제목 표시), 내려받기는 owner 폴더 안에서 id 로 찾는다(이전 경로도 내려받기 가능, 목록에는 안 보임).
+- FIX round 2(Codex review-FIX-T09, 2026-09-25): (P1) 0011 이전 묶음의 run 은 proposal_status 가 없으므로 채택 이력(그 run 을 ai_run_id 로 가진 사용자 원고·파생본 버전)으로 'adopted'/'proposed' 를 채우고(migration 0011 과 같은 규칙), 명시한 상태가 채택 이력과 모순되면(채택 버전 없는 'adopted', 채택 버전 있는 'proposed'/'dismissed') 묶음을 거부한다. (P1) 복원 사후 검사는 검토 요청과 같은 규칙(`variantReviewBlockers`: 현재 버전·stale·미디어·원고와 파생본의 미해결 경험 claim — 나가는 글 전체 기준, 복원된 claim_confirmations 사용)으로 이번에 넣은 review 파생본을 검사해 draft 로 낮추고 `unresolved_claims` 등 이유를 남긴다. (P1) add_missing 에서 이미 있는(동일) 파생본 버전에 새 첨부를 붙이는 묶음 행은 `immutable_version` 충돌로 거부한다 — 버전은 불변이라 첨부 집합도 바뀌지 않는다(재검증 대신 거부를 택함). (P2) 작성실의 "무시"는 채택 가능 여부와 따로, 성공한 'proposed' 제안이면 원고가 바뀌어 채택할 수 없어도 보인다(`proposalActions`).
+
+## D15 — T08 업로드 세션·VERIFIED 범위·원음 삭제·모의 전사: VERIFIED 는 "형식 서명·크기·checksum", 원음 삭제는 성공 뒤 메타데이터만 남김, STT live 는 어댑터 없음
+- Decision ID / date: D15 / 2026-09-25 (Europe/Moscow)
+- Question: (a) 큰 음성·영상 파일을 어떤 단위·한도·만료로 받고, 끊긴 업로드를 어떻게 이어 갈 것인가(A14)? (b) D11 에서 넘어온 "VERIFIED 가 실제로 무엇을 확인했는가"를 상태값을 나눠 표현할 것인가? (c) 원음 보존을 끄면 무엇을 지우고 무엇을 남기는가? (d) 모의 전사 job 의 진행·비용·취소 규칙은?
+- Options: (a) 한 요청 업로드 / **조각 업로드 세션(4–8MiB, 기본 8MiB, 음성 200MB·영상 2GB, 24시간 만료, 조각 번호별 sha256 멱등)**. (b) 상태값 분리(VERIFIED_SIGNATURE 등) / **상태값 유지 + `assets.verification_scope`(기본 'signature_size_checksum')로 범위 기록**. (c) 행까지 삭제 / **파일만 삭제하고 행 유지(`assets.deleted_at`, 다운로드 410, 내보내기에는 메타데이터만 + `asset_deleted` 경고)**. (d) 한 번에 완료 / **tick 마다 25씩 진행(inline worker), T07 원장 공유, 실패 = 예약액 확정, 시작 전 취소 = 해제(0), 처리 중 취소 = 예약액 확정(failed=true)**.
+- Chosen option: 각 굵은 선택. 세부: 완료 검사는 조각을 번호 순으로 스트림으로 이어 붙이며 조각별 sha256(기록과 같아야 함)·전체 sha256·앞부분 64바이트 서명을 계산한다(전체를 메모리에 올리지 않음). 서명 판정: MP3(ID3v2.2–2.4 또는 MPEG 오디오 프레임 머리), WAV(RIFF…WAVE), MP4 계열(ftyp — 'qt  ' 는 MOV, 'M4A '/'M4B ' 는 음성 전용, 나머지 브랜드는 audio/mp4·video/mp4 둘 다), WebM(EBML + DocType 'webm' — matroska 는 거부). 신고 형식과 서명이 다르면 415 `mime_mismatch`. 디코딩·재생 가능 여부는 확인하지 않는다. 같은 owner 의 같은 checksum asset 이 있으면 그 asset 을 쓴다(지운 원본이면 이 파일로 되살림, T02 규칙). 전사 job 은 asset 당 진행 중 1개(부분 unique 색인). 비용 예약 = ⌈초 × STT_PRICE_PER_MINUTE / 60⌉(길이 = duration_seconds 또는 ⌈bytes/16000⌉초 — ≈128kbps 가정, 측정 아님), 통화·월 상한·1회 상한은 LLM_BUDGET_* 공용(같은 원장, run_id 대신 transcription_job_id). 전사 결과는 job 을 다시 잠가 아직 running 일 때만 기록한다(그 사이 취소되면 버림). 전사 버전은 불변(추가 전용 트리거), 사용자 수정은 새 버전(base_version 낙관적 잠금). 원음 삭제는 전사 성공 뒤, 채널 초안에 첨부된 파일은 지우지 않는다(요청 시 409 `asset_in_use`, 처리 시에도 다시 확인해 건너뛰고 감사 기록). 지운 파일은 새로 첨부할 수 없다(410). 업로드 세션·조각은 내보내기에서 제외(EXCLUDED_TABLES), 전사 job·버전은 포함하고, 복원 때 진행 중이던 job 은 canceled + 예약 원장 예약액 확정(복원 환경에서 다시 돌리지 않음, `interrupted_transcriptions`). STT live: `LiveTranscriber` 는 승인 기록(`STT_LIVE_APPROVAL_REF`)·STT_MODE=live·공급자·모델·가격·월 상한이 있어도 HTTP 호출 없이 거부(503 `live_stt_not_configured`, 기록 없음). 브라우저 녹음은 기기 확인 전이라 `MediaRecorder` 지원 여부 안내만 한다.
+- Evidence / assumption: `tests/integration/uploads-transcription.test.ts`(24개) — 세션 한도, 조각 멱등·409·x-chunk-sha256, 이어 올리기(GET → next_index), 동시 조각·동시 완료, 완료 → VERIFIED·다운로드 동일 바이트, checksum·형식 거부 + 조각 삭제, 중단, 24시간 만료 tick, 전사 25/50/75/100·v1 모의·원장 확정·가격 있는 예약/확정·월 상한 429(기록 없음), 실패 주입, 두 가지 취소, 수정 409·트리거, 소재 보내기, 원음 삭제 410, live 503·fetch 0, health, 다른 owner 404, export → 빈 DB 복원(진행 중 job canceled). 단위: `upload.test.ts`(조각 계획·서명·비슷한 파일 거부), `stt.test.ts`(추정·비용·준비 상태), providers `stt.test.ts`(모의 결정성·live 거부·putFile/openStream), bundle 무결성.
+- Reversible?: 예. verification_scope 는 문자열이라 구조 검증(예: 컨테이너 파싱)을 더하면 새 값으로 기록하면 된다. 조각 크기·한도·만료는 `packages/domain/src/upload.ts` 한 곳.
+- User decision required?: 예 — (a) 한도(음성 200MB·영상 2GB)·만료 24시간·조각 8MiB 확인, (b) VERIFIED 범위 표시("서버 확인됨(형식 서명·크기·checksum)")로 충분한지 또는 디코딩 검증을 추가할지, (c) 원음 보존 기본값(켬) 유지 여부, (d) 실제 STT 공급자·모델·1분 가격·승인 기록(D9 — 별도 승인 전에는 연결하지 않음), (e) D14(b): 이제 영상 업로드가 열려 YouTube 파생본에 영상을 첨부할 수 있다 — 기존 결정 유지 여부.
+- Exact authorized scope (if applicable): 외부 호출 0, 유료 사용 0, 비밀 0. STT 어댑터(HTTP) 없음.
+- Consequences: 서명만 맞고 뒤가 깨진 파일도 VERIFIED 가 된다(범위를 화면·응답에 표시). 내보내기·배포 파일 ZIP 은 여전히 메모리에서 만들므로 큰 영상이 여러 개면 메모리를 많이 쓴다(잔존 위험). 완료 도중 프로세스가 죽으면 세션이 completed 로 남고 만료(24시간) 때 정리된다(재시도는 새 세션). 원음 삭제 뒤 파일 삭제가 실패하면 파일만 남는다(다운로드는 이미 410).
+- When to revisit: 실제 STT 연결 승인 시, 브라우저 녹음 추가 시(기기 확인 뒤), M3 object storage(서명된 업로드 URL)·postgres worker 분리 시.
+- FIX round 1(Codex review-T08, 2026-09-25): (P0) 원음 삭제는 asset 행 잠금 트랜잭션 안에서 "첨부 없음 재확인 → 파일 삭제 → deleted_at" 순(파일 삭제 실패 → 롤백). 재업로드 복구(지운 원본·없는 파일)는 같은 행 잠금 아래 **새 저장 key** 로 쓰고 `assets.key` 를 바꾼다 — 옛 key 에 대한 늦은 삭제가 새 파일에 닿지 않는다. (P0) 채널 초안 첨부는 붙일 asset 행을 id 오름차순으로 `FOR UPDATE` 한 뒤 deleted_at 을 다시 본다(삭제와 직렬화). (P0) 조립 쓰기는 `bytesWritten` 만큼 반복(진행 0 → 실패), 크기·sha256·서명은 실제로 쓴 바이트로 계산하고 닫은 뒤 파일 크기도 대조. (P1) 완료 최종 커밋은 세션 행을 다시 잠가 아직 completed(처리 중)일 때만 파일을 asset key 로 옮기고 기록한다 — 만료·중단된 세션은 verified 가 되지 않고(409 `upload_expired`), 옮긴 파일은 되돌릴 때 지운다. 잠금 순서는 완료·거부·만료·중단 모두 세션 행 → 조각. (P1) 화면은 파일 sha256(증분 해시)을 신고하고, 이어 올리기는 신고 sha256·크기·받은 조각별 sha256 이 모두 같을 때만(`GET` 이 `chunks[{index, sha256}]`·`checksum_expected`·`resumable` 반환). 서버의 `sha256` 은 선택으로 두었다(없으면 `resumable:false` — 화면은 그런 세션을 이어 쓰지 않는다). (P1) 전사 목록 폴링은 실패해도 다음 조회를 예약한다(진행 중 1.5초, 없음 10초, 실패 2→4→8→10초), 화면을 떠나면 멈춘다.
+- FIX round 2(Codex review-FIX-T08, 2026-09-25): 파일 삭제는 **의도 먼저**(migration 0013 `assets.pending_delete_key`). 원음 삭제는 asset 행 잠금 아래 deleted_at + pending_delete_key(=현재 key)를 커밋하고, 커밋 뒤 그 key 의 파일을 지운 다음 표시를 비운다. 파일 삭제 실패·프로세스 중단이면 표시가 남고 worker tick(`assets.cleanup`, 저장소가 주어진 inline tick)이 다시 시도한다 — 지운 원본은 파일 유무와 관계없이 410. 정리는 삭제 대상 key 를 지워지지 않은 asset 이 쓰고 있으면 파일을 두고 표시만 비운다. 재업로드 복구는 옛 key 를 pending_delete_key 로 넘기고(deleted_at 이 있어도 파일이 없다고 가정하지 않음) 커밋 뒤 정리한다. 0013 은 기존 deleted_at 행의 key 를 삭제 대상으로 채운다. pending_delete_key 는 운영 상태라 내보내기 묶음에 넣지 않고 복원 행은 null(묶음이 다른 파일 삭제를 지시하지 못하게). 앞선 라운드의 "파일 삭제 실패 시 deleted_at 롤백" 동작·테스트는 이 설계로 대체했다. 전사 목록 폴링은 조회를 한 번에 하나만 하고(조회 중 poke 는 끝난 직후 한 번으로 합침) 응답 순번이 최신일 때만 반영한다.
+- FIX round 3(Codex review-FIX2-T08, 2026-09-25): 정리 재시도 backoff(migration 0014 `assets.pending_delete_attempts`·`pending_delete_next_at`) — tick 은 다음 시도 시각이 된 의도만 `next_at NULLS FIRST, id` 순으로 50개 처리, 실패하면 횟수+1·다음 시각 = min(2^횟수 분, 6시간), 성공·새 의도면 초기화. 계속 실패하는 의도가 배치를 독점하지 않는다. 세 열은 운영 상태라 묶음에 넣지 않는다(복원 행은 DB 기본값).
+- FIX round 4(Codex review-FIX3-T08, 2026-09-25): 삭제 의도는 만들 때 다음 시도 시각 = 만든 시각(NULL 없음, migration 0015 가 기존 NULL 을 asset 생성 시각으로 채움) — tick 은 `다음 시도 시각, id` 한 시간축으로 줄을 세워 새 의도와 재시도가 서로 굶기지 않는다. tick 은 때가 된 행을 `FOR UPDATE SKIP LOCKED` 로 가져가(claim) 다음 시도 시각을 60초 미룬 뒤 처리한다(동시 tick 이 같은 의도를 두 번 시도하지 않음). 실패 기록은 SQL 한 문장(횟수+1, 다음 시각 = GREATEST(현재, now + LEAST(2^(횟수+1) 분, 6시간)), 같은 key 일 때만)으로 원자적·단조.
+
+## D16 — M2 잔여 결정 일괄 확정(권고안 채택) 및 화면 체크리스트 완료
+- Decision ID / date: D16 / 2026-09-25 (Europe/Moscow)
+- Question: M2 마감 시점의 미결 항목(M2_STATUS §3 A~G)을 어떻게 정하는가?
+- Chosen option (사용자, 2026-09-25 아침, 권고안 전부 승인):
+  - A. T06 `removed`(본문에서 뺐음)는 **사용자 단언 + 문자열 재삽입 가드**로 유지. 어미 변경 등 의미 단위 삭제는 서버가 증명하지 않음을 D12·UI 도움말에 명시. claim–구간 연결은 구현하지 않음.
+  - B. 제안을 손으로 복사해 저장하는 경로는 A03 미적용 — 한계로 수용(M3 이후 재검토).
+  - C. T07 인용 정제는 구조화 인용(`source_refs`·`[n]`)만 인정하고 자유 텍스트의 URL·도메인·IP 유사 토큰은 fail-closed 유지. 오탐(README.md, 1.2.3.4, 사용자 원문 URL → 모의 제안 실패)은 live 도입 전까지 수용. 입력 URL 치환은 하지 않음.
+  - D. D14: YouTube 파생본 review 는 **영상 첨부 필수** 유지(T08 로 영상 업로드가 열렸으므로 대본만 허용 예외 없음). 채널 글자 수 한도는 M4 착수 전 공식 자료로 재확인. 새 버전마다 draft 복귀 유지. 패키지 파일 보존 기간은 무기한(정리 없음) — 운영 백업(T20)에서 재검토.
+  - E. D15: 한도(음성 200MB·영상 2GB·24h 만료·8MiB 조각) 유지. VERIFIED 는 서명·크기·checksum 범위 유지(디코딩 검증 없음, 라벨로 표시). 원음 보존 기본값 켬 유지. sha256 은 서버에서 선택(없으면 resumable:false) 유지. 실제 STT 공급자·가격·승인은 D9 대로 별도 승인 전 미연결.
+  - F. D13: 월 한도·건당 상한·통화 값은 live 도입(D8) 시점에 정한다(그때까지 mock 은 가격 없음 → 0 기록·한도 미적용). 실패 호출 전액 과금 유지. 월 경계를 넘는 예약은 예약 시점 월에 귀속(현 구현).
+  - G. 화면 체크리스트 12항목(LOCAL_RUNBOOK §3): 사용자가 로컬 dev 서버(HEAD 5ec8d3b, migration 0015)에서 확인 완료. 별도 불편·오류 보고 없음.
+- Evidence / assumption: Codex 재검증 판정(docs/handoffs/M2_CODEX_VERDICTS.md). T06 P1 2건은 위 A·B 결정으로 종결(코드 변경 없음).
+- Reversible?: 예. 각 항목은 해당 결정(D12~D15) 개정으로 되돌릴 수 있다.
+- User decision required?: 확정됨.
+- Consequences: M1·M2 Codex 경계 전부 종결. M3(T10~T12) 착수 가능.
+- When to revisit: live LLM/STT 승인(D8·D9) 시점, M4 착수 전(채널 한도), T20(백업·보존).
+
+## D17 — T10 배포 계획·승인·실행: 항목 = 불변 스냅샷(트리거), 승인 무효화는 편집 훅 + 실행 시 재검사, 실행 = QUEUED 작업만(MOCK), 명령 멱등 표, 모의 계정 seed, 작업은 복원하지 않음, 파생본 `approved`
+- Decision ID / date: D17 / 2026-09-25 (Europe/Moscow)
+- Question: M3 T10 에서 "정확한 payload 에 대한 서버 승인"(docs/03 승인 스냅샷)·A06(수정 뒤 승인 무효)·실행 멱등(A07 로컬 절반)·A13(과거 예약)을 실제 채널·OAuth 없이 어떻게 저장·강제하고, 내보내기·복원에서 무엇을 옮기는가?
+- Options: (1) 스냅샷: 파생본 버전 참조만 / **항목에 canonical payload(jsonb) + SHA-256, 스냅샷 열은 DB 트리거로 불변(status·updated_at 만 변경)**. (2) 무효화: 실행 시 재검사만 / 편집 훅만 / **둘 다(편집 경로가 같은 트랜잭션에서 철회 + 승인·실행 때 실제 행과 다시 대조)**. (3) 실행: 바로 모의 처리 / **QUEUED 작업 생성까지(처리는 T11)**. (4) 명령 멱등: 작업 key 만 / **execute_commands(owner, command_key) 표 + jobs.idempotency_key unique + 항목당 진행 중 작업 1개(부분 unique)**. (5) 계정: 표 없이 상수 / **channel_accounts 에 모의 행(seed, 플랫폼마다 1개)**. (6) 복원: 전부 / 전부 제외 / **계정·계획·항목·승인은 복원(hash 그대로), 작업·작업 이력·실행 명령은 내보내기만**. (7) 파생본 상태: 승인 여부를 파생값으로 / **`approved` 저장(서버 승인만 만든다)**.
+- Chosen option: 각 굵은 선택. 세부:
+  - canonical payload(`@cs/domain` distribution.ts): content_version_id·variant_version_id·brand_profile_version_id·channel_account_id·provider_account_id(= external_account_id)·channel·text(채널별 필드 + `renderVariantText` 결과 `rendered`)·assets[{id, checksum, role, order, mime}](position 순)·visibility·scheduled_at_utc(ISO|null)·timezone·provider_metadata({})·snapshot_version(1). canonical JSON = 키 재귀 정렬·공백 없음·문자열 NFC·null 유지·undefined 제외, hash = SHA-256 hex. 링크는 본문 안에 있으므로 별도 필드로 뽑지 않았다.
+  - 로컬 key(docs/03) unique(owner, plan, channel_account, variant_version, payload_hash). 승인 행은 INSERT 트리거로 항목 hash·목적과 같아야 하고, UPDATE 는 revoked_at·revoke_reason 을 NULL → 값으로 한 번만, DELETE 금지. 항목마다 활성 승인 1개(부분 unique). job_events·execute_commands 는 추가 전용.
+  - 계획 만들기: 파생본 `review`(이미 `approved` 인 파생본도 허용 — 다른 계정·일정으로 새 계획을 만들 수 있게, 브리프와 다른 점) · `variantReviewBlockers` 없음 · 계정 owner·플랫폼 = 채널(400 `channel_mismatch`)·준비됨(409 `account_not_ready`) · 모의 계정은 `mock_publish` 만(400 `mock_only`) · 공개 범위 기본 `private` · 예약은 `scheduleFromMsk`(Intl 로 오프셋 계산, 지금 + 1분 이하 400 `schedule_in_past`). 스냅샷 = 파생본 **현재** 버전 + owner 첨부 + 원고 현재 버전 + 현재 브랜드 프로필(없으면 null). 요청의 approved·approval 같은 키는 zod 가 버린다.
+  - 승인: 항목 PLANNED, expected hash = 저장 hash(409 `hash_mismatch`), purpose = requested_result, 활성 승인 없음(409 `already_approved`), 그리고 `snapshotProblems`(파생본 현재 버전·lifecycle, 원고 현재 버전, 첨부 id·checksum·순서·삭제, 계정 준비·외부 ID·플랫폼, 저장 행으로 다시 만든 payload 의 hash, 예약 시각 경과, 검토 차단 사유) 가 비어야 한다 — 아니면 409 `snapshot_stale`(항목은 PLANNED 그대로, `approval.refused` 감사만 남기고 새 계획 필요). 통과 → 승인 행 + 파생본 review → approved + 계획 상태 재계산(`computePlanStatus`).
+  - 무효화(`approval-invalidation.ts`): 파생본 새 현재 버전(수정·채택·다시 초안 = `body_changed`, 첨부 = `assets_changed`), 원고 새 현재 버전(`content_changed`, 승인됨 파생본 → draft), 계정 상태 변경(`account_changed`, 승인됨 → review)이 같은 트랜잭션에서 PLANNED·QUEUED 항목의 활성 승인을 `invalidated:<이유>` 로 철회, QUEUED 작업 → BLOCKED(+job_event), QUEUED 항목 → PLANNED. 실행 재검사에서 어긋나면 실행 트랜잭션은 아무것도 쓰지 않고, 별도 트랜잭션이 다시 검사해 사유별로 철회한 뒤 409 `snapshot_stale`(예: 예약 시각 경과 = `invalidated:schedule_passed`).
+  - 사용자 철회: `user` / `user: <이유>`. QUEUED 작업 → BLOCKED(`approval_revoked` 이벤트), 항목 → PLANNED, 파생본 → review(그 버전의 다른 활성 승인이 없을 때), 같은 계획에서 다시 승인 가능. LEASED 이후 상태는 T11(CANCEL_REQUESTED).
+  - 실행: (1) execute_commands 로 같은 key → 저장 결과 `idempotent_replay:true` (2) 계획 FOR UPDATE → 같은 key 재확인 → 항목 FOR UPDATE(id 순) (3) item_ids 없으면 "승인된 PLANNED 항목" 전부, 하나도 없으면 진행 중 항목이 있을 때 409 `already_executed`, 아니면 403 `approval_required`; 있으면 모두 PLANNED + 활성 승인 hash 일치 (4) 재검사 (5) `assertExecutionAllowed`(모의 → `{mode:'MOCK'}`; live 는 PUBLISH_MODE=enabled + 서버 승인 객체가 있어도 `LiveChannelNotConfiguredError` 503) (6) 작업 `{kind:'publish', payload_ref:item.id, state:'QUEUED', idempotency_key:'publish:<item>:<approval>', next_run_at: 예약 ?? now}` + job_event 1(null → QUEUED, mode MOCK, command_key 는 sha256 앞 16자만) + 항목 QUEUED + 계획 재계산 + execute_commands + 감사 `plan.execute`(key 해시만). unique 위반(작업 key·항목당 진행 중 작업) → 409 `already_executed`, 같은 명령 key 경합 → 저장 결과.
+  - 잠금 순서(교착 방지, 모든 경로): contents → variants → distribution_plans → distribution_items → approvals → jobs. 실행은 계획 → 항목만 잠그고 원고·파생본은 읽기만 한다.
+  - 계획 상태(`computePlanStatus`, 저장값은 이것으로만 갱신·revision+1): 진행 중 항목 → executing, PLANNED 항목 중 활성 승인 0/일부/전부 → draft/partially_approved/approved, 나머지(모두 끝남)는 completed/canceled/partial/failed(T11/T12 가 쓸 값).
+  - 모의 계정: `external_account_id = 'mock:<platform>:<uuid>'`(행마다 고유). seed 는 플랫폼마다 모의 계정이 없을 때만 만든다(재실행 0). 행마다 고유하게 한 이유: 다른 환경의 묶음을 seed 된 환경에 복원해도 unique(owner, platform, external_account_id) 충돌 없이 그 묶음의 모의 계정이 함께 들어오게(그 결과 같은 플랫폼 모의 계정이 둘일 수 있음 — 받아들임).
+  - 내보내기·복원: 새 표 7개 모두 EXPORTED_TABLES. 복원 = channel_accounts·distribution_plans·distribution_items·approvals(스냅샷·hash 그대로, 묶음 무결성 검사가 payload_hash = sha256(canonical(payload_json))·payload 의 ID/공개 범위/일정/외부 계정 ID = 항목 열·승인 hash/목적 = 항목·항목당 활성 승인 1개를 확인 — 조작된 스냅샷은 묶음 전체 거부). jobs·job_events·execute_commands 는 NON_RESTORED(users·audit_events 와 같이 내보내기만). 복원 사후 처리: 진행 중이던 항목(QUEUED 등)은 `BLOCKED` 로 넣고(`blocked_items`, 새 환경에서 맹목 재전송 없음), 이번에 넣은 활성 승인은 복원된 행으로 `snapshotProblems` 를 돌려 문제가 있으면 `revoke_reason='restore_stale'` 로 철회(`revoked_approvals`), 활성 승인이 없는 approved 파생본은 review 로, 계획 상태는 재계산. review·approved 파생본의 검토 차단 사유 검사(D14 FIX)는 approved 에도 적용.
+  - 파생본 `approved`: DB CHECK 에 추가. review → approved 는 approveItems 만, approved → review 는 철회, → draft 는 새 버전·원고 변경. 사용자 lifecycle API 로 approved 를 바꾸면 409 `variant_approved`.
+- Evidence / assumption: `tests/integration/distribution.test.ts`(20개): 모의 계정 seed·멱등, 계획 게이트(draft·stale·미디어·채널 불일치·다른 owner·mock_only), 미리보기 hash = 저장 스냅샷 재계산, `{approved:true}` → 승인 0, 승인(confirm 400·hash 409·다른 owner 404·성공·already_approved·partially_approved), A06 (a)~(d), 승인 없음 실행 403·작업 0, 실행 성공·같은 key 재호출·다른 key 409, 동시 실행(다른 key·같은 key), 실행 뒤 철회(BLOCKED·event·PLANNED·review·재승인·재실행), A13(과거 400·UTC 저장·MSK 표시·next_run_at·예약 경과 후 실행 거부), DB 트리거, export→빈 DB 복원(작업 제외·BLOCKED·restore_stale·hash 보존), 조작된 payload 묶음 거부, HTML 승인 폼(no_items·confirm_required). `external-writes.test.ts`: 기본 설정에서 계획→승인→실행이 MOCK QUEUED 작업만 만들고 publisher·fetch 호출 0. 단위: `distribution.test.ts`(canonical JSON·hash·NFC·배열 순서·undefined·고정 hash, payload 필드, scheduleFromMsk·Intl 일반성·DST 틈, 스키마, 상태 규칙), `guards.test.ts`(mock → MOCK, live+disabled → PublishDisabled, live+enabled+승인 → LiveChannelNotConfigured). PGlite 는 연결이 하나라 "동시" 테스트는 실제로 직렬화된다 — PostgreSQL 에서의 행 잠금 경합은 아직 관찰하지 않았다.
+- Reversible?: 예. 스냅샷 모양은 `snapshot_version` 으로 판별(바꾸면 2), 무효화 규칙은 approval-invalidation.ts 한 곳, 복원 규칙은 restore.ts 사후 처리 한 곳.
+- User decision required?: 확인 요청 — (a) 이미 `approved` 인 파생본으로 새 계획을 허용한 것(브리프는 review 만), (b) 모의 계정 공개 범위 기본값 `private`, (c) 복원 시 진행 중 항목을 `BLOCKED` 로 넣는 것과 그 결과 계획 상태가 `failed` 로 계산될 수 있는 것(T11 에서 BLOCKED 처리 규칙과 함께 재검토), (d) 브랜드 프로필 새 버전은 승인을 무효로 하지 않는다(나가는 글에 영향 없음 — 스냅샷에는 승인 당시 버전 ID 가 남음).
+- Exact authorized scope (if applicable): 외부 호출 0, 게시 0(모의 계정만, 채널 어댑터·OAuth·비밀 없음), 새 의존성 0.
+- Consequences: 승인 뒤 무엇이든 바뀌면 그 계획 항목은 다시 승인할 수 없고 새 계획을 만들어야 한다(같은 key 재활용 금지 — docs/03). 작업은 T11 전까지 QUEUED 로 남는다. 복원한 환경에서는 진행 중이던 항목이 BLOCKED 로 남는다.
+- When to revisit: T11(lease·재시도·취소·BLOCKED 처리)·T12(Mock 어댑터 결과)·M4(live 어댑터·OAuth — `assertExecutionAllowed` 의 live 분기).
+
+## D18 — T11 작업 처리기: 전이 표 한 곳, 전송 의도 = outbox 기록(SENDING 과 한 트랜잭션), lease 만료 → RECONCILING, UNKNOWN 은 자동 재전송 없음, 모의 원격 지도, publications MOCK 제약, 의도·결과는 내보내기만
+- Decision ID / date: D18 / 2026-09-25 (Europe/Moscow)
+- Question: M3 T11 에서 DB 작업함(lease·재시도·원격 재확인·취소)을 실제 채널 없이 어떻게 만들고, "원격 성공 후 응답 유실은 자동 재게시하지 않음(A08·A20)"·"두 worker 중복 전송 없음(A07)"·"재시도 중 철회 차단(A10)"·"전송 중 취소 성공 주장 금지(A11)"를 서버·DB 에서 강제하는가?
+- Options: (1) 상태 전이: 호출부마다 대입 / **도메인 표 `JOB_TRANSITIONS` + `transitionJobState`(표에 없는 전이는 오류) — DB `transitionJob` 은 사건(event)만 받는다**. (2) 전송 기록: 작업 행의 상태만 / **`send_intents`(작업·시도당 1행, key `<job>:<attempt>` = 어댑터 멱등 토큰)를 승인 재검사·SENDING 전이와 같은 트랜잭션에서 외부 호출 전에 기록**. (3) lease 만료: 무조건 재대기 / **의도 없음 → QUEUED, 의도 있음 → RECONCILING(재전송 금지)**. (4) 조회 lease: 상태 전이 / **상태는 그대로 두고 lease 열만(RECONCILING·REMOTE_PROCESSING·CANCEL_REQUESTED)**. (5) 모의 원격: 없음 / **프로세스 안 지도(intentKey → 결과) + 시나리오**. (6) 결과 기록: 작업 행 / **`publications`(추가 전용, 모의 CHECK)**. (7) 복원: 복원 / **내보내기만**.
+- Chosen option: 각 굵은 선택. 세부:
+  - 작업 상태: `QUEUED|LEASED|SENDING|REMOTE_PROCESSING|RETRY_WAIT|BLOCKED|RECONCILING|UNKNOWN|CANCEL_REQUESTED|CANCELED|CONFIRMED|FAILED`(T10 의 `DONE` 은 쓰인 적이 없어 migration 에서 `CONFIRMED` 로 바꿈). 항목당 진행 중 작업 1개(부분 unique: BLOCKED·끝난 상태 제외). 사건: lease, send_start, remote_accepted, remote_processing, confirmed, transient_failure, permanent_failure, ambiguous, reconciled_found, reconciled_not_found, reconcile_unsupported, reconcile_retry(자기 전이 — 조회 기록), blocked, cancel_requested, canceled, cancel_too_late, lease_expired_before_intent, lease_expired_after_intent, unblock(표에만, 사용처 없음). `UNKNOWN` 에서 나가는 전이는 찾음·처리 중·조회 기록뿐 — 재전송 경로가 없다. 항목 상태 = `itemStatusForJob`(LEASED 는 QUEUED 로 보임). 예외: 보내기 전 재검사에서 승인 없음·스냅샷 변경으로 막히면 작업 `BLOCKED`, 항목은 **`PLANNED`**(T10 의 철회 규칙과 같게 — 다시 승인하거나 새 계획).
+  - tick: ① lease 만료 복구(작업마다 짧은 트랜잭션, 전역 잠금 순서) ② lease — 한 트랜잭션에서 `next_run_at <= now` 인 QUEUED·RETRY_WAIT(→ LEASED, attempt+1) 와 lease 없는 조회 대상(상태 유지)을 `FOR UPDATE SKIP LOCKED` 로 고른다(최대 20, 기본 5; lease 60초) ③ 처리. 전송: 트랜잭션 1 = 항목(원고→파생본→계획→항목)·승인·작업 잠금 → 취소 요청이면 CANCELED(보내지 않음) → 활성 승인 hash = 항목 hash(아니면 BLOCKED `approval_missing`, A10) → `snapshotProblems`(예약 시각 경과 제외; 문제면 승인 철회 + BLOCKED `snapshot_stale`) → `assertExecutionAllowed`·어댑터(live 는 BLOCKED `execution_not_allowed`) → `validate`(실패 FAILED) → SENDING + 의도 기록. 그다음 DB 잠금 없이 `prepare`·`submit`(heartbeat 가 `lease_until` 연장, `JOB_SUBMIT_TIMEOUT_MS` 기본 30초 초과·예외 = ambiguous). 트랜잭션 2 = 의도 결과 한 번 기록 → `classifyOutcome` → CONFIRMED(+publication)·REMOTE_PROCESSING(15초 뒤 조회)·RETRY_WAIT/FAILED·FAILED·BLOCKED(auth)·RECONCILING(10초 뒤 조회). lease 를 잃었으면(복구가 먼저 RECONCILING 으로 옮김) 결과만 의도에 남기고 전이는 조회 경로에 맡긴다.
+  - 조회(RECONCILING·REMOTE_PROCESSING·CANCEL_REQUESTED): `adapter.reconcile(intent_key, external_id)` — found → CONFIRMED(+publication, 의도가 pending 이면 accepted 로 채움) / processing → REMOTE_PROCESSING(20회 넘으면 UNKNOWN) / not_found 이고 어댑터가 `definitive_not_found` → RETRY_WAIT(재시도 한도 안, 새 시도 = 새 의도; 취소 요청이면 CANCELED) / 그 밖(unsupported·unknown) → 10·20·40초 간격 재조회, 3회째 UNKNOWN. 취소 요청이고 어댑터가 `cancel` 을 지원하며 외부 ID 가 있으면 `adapter.cancel` 을 먼저 부르고 `canceled` 라고 답할 때만 CANCELED(원격 취소)로 기록.
+  - 재시도(잠정값): 부작용 없는 일시 오류만. 지연 = min(30초 × 2^(n-1), 15분) × (0.8~1.2), `Retry-After` 보다 짧지 않게, 최대 5회(`jobs.max_attempts`), Retry-After 가 1시간을 넘으면 바로 FAILED(시간 한도). 부작용 불명 → 조회, 401 → BLOCKED(M3 refresh 없음), 분류 없는 거절 → FAILED(자동 반복 안 함). 보내기 전에 되풀이해 죽는 작업은 시도 한도에서 FAILED(`lease_expired_max_attempts`).
+  - lease 만료 복구: LEASED → QUEUED(`lease_expired_before_intent`) · SENDING → RECONCILING(`lease_expired_after_intent`, A20) · CANCEL_REQUESTED 는 이번 시도 의도가 없으면 CANCELED, 있으면 lease 만 풀고 조회 · 조회 lease 는 lease 만 푼다.
+  - 취소(`cancelItem`, 항목·승인·작업 잠금): QUEUED·RETRY_WAIT·BLOCKED → CANCELED(`{canceled:true}`), LEASED·SENDING·REMOTE_PROCESSING·RECONCILING → CANCEL_REQUESTED(`{cancel_requested:true, message:'취소 확인 중'}`), UNKNOWN → 409 `cancel_unknown`, 끝남·PLANNED → 409 `not_cancellable`. 승인 기록은 그대로. 전송 단계 작업의 **사용자 승인 철회**도 CANCEL_REQUESTED 를 기록한다(docs/03). RETRY_WAIT 작업의 철회는 즉시 막지 않고 다음 전송 직전 재검사가 BLOCKED 로 막는다(A10 — 재검사가 정본).
+  - 사용자 재확인(`reconcileItem`): RECONCILING·UNKNOWN·REMOTE_PROCESSING 만, 조회만 하고 found 면 CONFIRMED, 아니면 상태 그대로(`reconcile_retry` 기록). 절대 submit 하지 않는다. UNKNOWN 에서 "다시 보내기"는 만들지 않았다(T12 이후).
+  - 모의 어댑터(`MockChannelAdapter`, @cs/providers): 외부 ID `mock:<platform>:<uuid>`, 링크 `mock://<platform>/<uuid>`(실제 URL 없음), 비공개 → `UPLOADED_PRIVATE`, 그 밖 → `PUBLISHED`. 프로세스 싱글턴 레지스트리(globalThis)라 web 과 inline worker 가 같은 "원격" 지도를 본다. 시나리오: 프로그램 설정(테스트·T12) → `MOCK_CHANNEL_SCENARIO`(NODE_ENV≠production 에서만) → success. capabilities 기본 `{read:true, cancel:false, definitive_not_found:true, mock:true}`. **이 프로세스가 submit 을 받은 적 없는 intentKey 는 조회에서 `unknown`**(재시작한 모의 원격이 "안 보냈다"고 꾸며 재전송을 부추기지 않게). 같은 intentKey 재전송 → 같은 결과(원격 멱등).
+  - 계약 타입(`ChannelAdapter`·`AdapterResult`·`ReconcileResult`·`AdapterContext` 등)은 **@cs/domain jobs.ts** 에 두고 providers 가 다시 내보낸다 — @cs/db(작업 처리기)와 apps/worker 가 providers 에 의존하지 않게(새 workspace 의존성·lockfile 변경 없음). worker 는 어댑터를 주입받고, `pnpm worker` CLI 는 루트 워크스페이스의 @cs/providers 에서 모의 레지스트리를 가져온다.
+  - `publications`: (item, external_id) unique, `is_mock = (verification = 'MOCK')`, 모의는 `mock:` 외부 ID·`mock://`(또는 null) 링크, 실제(`is_mock=false`)는 `mock:` 금지 — CHECK. 트리거로 DELETE 금지, UPDATE 는 verification·verified_at·remote_visibility 만. 모의 결과는 `verification='MOCK'` 로만 저장되고 화면·API 에 `MOCK — 실제 발행 실적 아님`. `send_intents`: (job, attempt)·intent_key unique, key = job||':'||attempt CHECK, 트리거로 DELETE 금지·결과는 pending 에서 한 번만.
+  - 계획 상태 규칙은 `planStatusFrom` 하나(T10 `computePlanStatus` 가 위임): 진행 중(QUEUED·SENDING·REMOTE_PROCESSING·RETRY_WAIT·RECONCILING·CANCEL_REQUESTED) → executing, PLANNED 승인 수 → draft/partially_approved/approved, 모두 CONFIRMED → completed, 모두 CANCELED → canceled, CONFIRMED 또는 UNKNOWN 이 있으면 partial, 나머지 → failed.
+  - API: `POST /api/distribution-items/{id}/cancel`·`/reconcile`, `GET /api/jobs/{id}`(비밀·본문 없음), `POST /api/worker/tick`(로그인 owner 의 작업만, CSRF). `/api/health` 에 `jobs` 개수(queued, leased(=LEASED+SENDING), retry_wait, reconciling(=RECONCILING+REMOTE_PROCESSING+CANCEL_REQUESTED), unknown, blocked). inline tick 은 최대 5개.
+  - 내보내기·복원: `send_intents`·`publications` 는 EXPORTED + NON_RESTORED(jobs 와 같이 내보내기만). 원격 결과는 복원 환경이 다시 확인할 사실이지 믿고 이어 갈 기록이 아니다. 복원된 CONFIRMED 항목은 결과 행 없이 CONFIRMED 로 남는다(진행 중 항목은 T10 대로 BLOCKED). 묶음의 jobs 행은 0017 열이 없으면 기본값, `DONE` 은 이전 묶음 호환으로만 받는다.
+- Evidence / assumption: `tests/integration/jobs.test.ts`(24개): 성공(이력 seq·의도 accepted·MOCK publication·계획 completed·`toStorablePublication` 거부), DB CHECK·트리거, A07(worker A lease → B 0건·B 가 A 행으로 처리해도 lease_lost, 같은 명령 재호출·다른 key 409 + tick 2회 → 결과 1), A08·A20(ambiguous_sent → 조회로 CONFIRMED·의도 1·submit 1, 의도 뒤 lease 만료 → 재전송 없이 CONFIRMED, 의도 전 만료 → 시도 2 로 한 번, 한도 도달 → FAILED, ambiguous_not_sent → RETRY_WAIT → 의도 2·결과 1, read 끔 ×3 → UNKNOWN·이후 lease 0·취소 409·재확인으로 CONFIRMED, 재확인 not_found → 상태 그대로, processing → REMOTE_PROCESSING → CONFIRMED, hang → 시간 초과 RECONCILING), 재시도(5회 → FAILED + 다른 채널 CONFIRMED → partial, submit 6), permanent/auth(재시도 없음), A10(RETRY_WAIT 중 철회 → BLOCKED approval_missing, 의도 1), A11(QUEUED 취소 즉시, SENDING 중 취소 → 응답 "취소 확인 중" → cancel_too_late CONFIRMED, lease 뒤 취소 → 보내지 않고 CANCELED, RECONCILING 취소 → 원격 없음 CANCELED), 재시작(파일 PGlite 닫고 다시 열기 → 작업·의도·이력 보존, 새 모의 원격은 unknown → UNKNOWN·submit 0), 다른 owner 404·작업 JSON 에 본문·호스트 이름 없음, tick API(CSRF 403·401·400·내 작업만)·계획 조회 MOCK 결과·health jobs, HTML 폼 303. `external-writes.test.ts`: 실행 + worker tick 이 모의 어댑터만 부르고 publisher·fetch 0. 단위: `jobs.test.ts`(허용 전이 전부·불법 전이 전부·UNKNOWN 재전송 경로 없음·retryDelay 경계/jitter/Retry-After/상한·decideRetry·classifyOutcome·planStatusFrom·tickSchema), `channel-adapter.test.ts`(시나리오·원격 지도·재시작 unknown·read/cancel 끔·멱등·hang·env 운영 무시·fetch 0·레지스트리). **PGlite 는 연결이 하나라 SKIP LOCKED 경합은 실제로 직렬화된다** — PostgreSQL 에서의 동시 lease 는 관찰하지 않았다.
+- Reversible?: 예. 전이는 표 한 곳, 재시도 숫자는 jobs.ts 상수, 모의 동작은 channel-adapter.ts, 복원 규칙은 NON_RESTORED 목록.
+- User decision required?: 확인 요청 — (a) 재시도 숫자(30초·15분·±20%·5회·Retry-After 1시간)는 잠정값, (b) 보내기 전 승인 문제로 막힌 항목을 `PLANNED` 로 되돌리는 것(작업은 BLOCKED), (c) `UNKNOWN` 이 있으면 계획을 `partial` 로 부르는 것, (d) RETRY_WAIT 중 철회를 즉시가 아니라 다음 전송 직전에 막는 것, (e) 복원된 CONFIRMED 항목이 결과 행 없이 남는 것.
+- Exact authorized scope (if applicable): 외부 호출 0(모의 어댑터만, 네트워크 없음), 새 의존성 0, 비밀 0, OAuth·실계정 0.
+- Consequences: `UNKNOWN` 항목은 사용자가 재확인할 때까지 그대로다("다시 보내기"는 T12 이후). 모의 원격 지도는 프로세스 메모리라 서버를 재시작하면 결과 불명 작업은 UNKNOWN 으로 끝난다(재전송하지 않음). T12 는 항목별 시나리오 선택·PARTIAL 전체 행렬을 더한다.
+- When to revisit: T12(모의 시나리오 UI·PARTIAL 행렬), M4(live 어댑터 capabilities·refresh 1회·실제 Retry-After·PostgreSQL 동시성), 운영 알림(M5, UNKNOWN·반복 실패 표시).
+
+## D19 — T12 모의 시나리오·M3 게이트: 시나리오 표는 승인 스냅샷 밖, 계획 상태 `attention`, 보류 재시도 = 같은 작업 새 시도, RETRY_WAIT 철회 즉시 차단, 재시작 → UNKNOWN, 브랜드 변경 무효화
+- Decision ID / date: D19 / 2026-09-25 (Europe/Moscow)
+- Question: M3 T12 에서 MockChannelAdapter 로 성공·실패·불명확·부분 성공을 항목별로 재현·화면 확인하고, M3 통과 조건(승인 없는 실행 거부·수정 뒤 승인 거부·중복 전송 방지·응답 유실 뒤 자동 재게시 없음·재시작 뒤 상태 보존·성공 화면 MOCK)을 한 번에 증명하려면 무엇을 어디에 두는가? T10·T11 검토 질문(브랜드 변경·첨부 교체·복원·command_key 재사용·UNKNOWN 계획 상태·RETRY_WAIT 철회 시점·RECONCILING 취소·재시작) 중 코드로 답할 수 있는 것은?
+- Options: (1) 시나리오 저장: 계정 capability_snapshot / 승인 payload / **별도 표 `mock_scenarios`(항목당 1행, 모의 계정만 — 트리거)**. (2) 계획 상태: UNKNOWN·BLOCKED 만 있으면 `failed`/`partial` 그대로 / **새 값 `attention`(확인 필요)**. (3) 401 보류 뒤: 새 계획만 / 새 작업 / **같은 작업을 사용자가 `retry`(BLOCKED → QUEUED, 다음 lease = 새 시도·새 의도)**. (4) RETRY_WAIT 중 철회: 다음 전송 직전 차단(T11) / **즉시 BLOCKED + 항목 PLANNED(재검사는 그대로 최종 방어선)**. (5) 브랜드 프로필 새 버전: 무효화 안 함(D17 d) / **활성 승인 철회(`invalidated:brand_changed`) + `snapshotProblems` 에 `brand_changed`**.
+- Chosen option: 각 굵은 선택. 세부:
+  - **시나리오**(`@cs/domain` `MOCK_SCENARIO_VALUES` = DB CHECK): success · success_public · processing_then_confirm · transient · transient_then_success · rate_limited(429, Retry-After 5초) · server_error_no_side_effect(503) · server_error_side_effect_unknown(쓰기 뒤 5xx → ambiguous 분류, 조회) · permanent(400) · auth(401) · ambiguous_sent · ambiguous_not_sent · hang · cancel_supported · reconcile_unsupported, 지연 0~5000ms. 스냅샷·payload 밖에 두므로 시나리오를 바꿔도 hash·승인·계획 상태가 그대로다(시험으로 확인). 작업 처리기가 모의 계정 항목의 행을 **같은 트랜잭션(beginSend)·조회 직전(remoteCheck)**에 읽어 `AdapterContext.mockScenario` 로 넘긴다(브리프의 "어댑터에 주입하는 resolver" 대신 — 어댑터는 DB 를 모르고, 레지스트리는 프로세스 싱글턴이라 DB 가 여럿인 시험·훈련에서도 항목별 값이 섞이지 않게). 우선순위: 항목별 → 프로그램 설정(시험) → `MOCK_CHANNEL_SCENARIO`(운영 빌드 무시) → success. API `PUT /api/distribution-items/{id}/mock-scenario`(owner·CSRF·모의 계정만 400 `not_mock_account`·끝난 항목 409 `item_finished`, 폼은 POST). 내보내기만(NON_RESTORED).
+  - **모의 결과**: `success` 는 승인된 공개 범위를 따르되 **YouTube 는 A12 대로 `UPLOADED_PRIVATE`·private 를 처리 중으로 먼저 돌려주고 조회에서 확인(여전히 private)** — 화면 `비공개 업로드 완료, 공개 전환 확인 필요`. 공개 결과(`PUBLISHED`·public)는 `success_public` 이고 payload 가 public 일 때만(아니면 영구 거절 `visibility_not_approved` — "비공개 업로드만 승인한 경우 public 전환 허용 안 함", docs/03). capabilities: `cancel=true` 는 `cancel_supported` 만, `reconcile_unsupported` 는 조회가 unsupported(3회 뒤 UNKNOWN). 외부 ID·링크는 계속 `mock:`/`mock://`.
+  - **계획 상태 규칙**(`planStatusFrom` 하나, 우선순위): 진행 중 → executing / 모두 PLANNED → draft·partially_approved·approved / 모두 CONFIRMED → completed / 모두 CANCELED → canceled / CONFIRMED 있음 → **partial**(부분 성공) / BLOCKED·UNKNOWN·PLANNED 있음 → **attention**(확인 필요) / 나머지(FAILED·CANCELED 만) → failed. 항목 2개 모든 조합 행렬 시험. migration 0018 이 CHECK 에 `attention` 을 더하고 기존 계획을 재분류. 화면 `부분 성공`·`확인 필요`, `/api/health.jobs.attention_plans`.
+  - **보류 재시도** `POST /api/distribution-items/{id}/retry`(명시적 사용자 동작, 감사 `item.retry`): 항목·최근 작업 모두 BLOCKED, 마지막 의도가 pending·ambiguous 아님(409 `outcome_unknown`), 활성 승인 hash = 항목 hash(409 `approval_required`), 스냅샷 재검사(예약 경과 제외, 409 `snapshot_stale` — 아무것도 바꾸지 않음), 시도 한도 안(409 `attempts_exhausted`) → 같은 작업 `unblock`(BLOCKED → QUEUED). 작업 없는 보류(복원된 진행 중 항목)는 409 `not_retryable` — 원격 결과를 모르므로 맹목 재전송 금지. **승인 문제 보류**(항목이 PLANNED 로 돌아감)는 재시도가 아니라 다시 승인 → 새 `command_key` 실행 = 그 항목만 새 작업(T10 규칙 그대로, 시험으로 확인).
+  - **A10 두 시점**: 사용자 철회·편집 무효화는 QUEUED 에 더해 RETRY_WAIT 작업도 즉시 BLOCKED(이벤트 `approval_revoked`/`approval_invalidated`, 항목 PLANNED). 편집 훅 대상 항목 상태에 RETRY_WAIT 추가. 훅을 거치지 않은 변경은 여전히 beginSend 재검사가 `approval_missing` 으로 막는다.
+  - **브랜드 프로필**: canonical payload 의 `brand_profile_version_id` 는 hash 에 들어가므로 `createBrandProfileVersion` 트랜잭션에서 `invalidateApprovalsForBrandProfile`(다른 브랜드를 가리키는 활성 승인 철회, 파생본 approved → review), `snapshotProblems` 에 `brand_changed`(현재 브랜드 ≠ 스냅샷). D17 (d) 를 뒤집는다 — 이제 브랜드 새 버전 뒤 옛 계획은 새로 만들어야 한다.
+  - **재시작**: 모의 원격 지도는 프로세스 메모리라 재시작 뒤 결과 불명 작업은 3회 확인 불가 → UNKNOWN(재전송 0)이 **예상된 동작**이다. 원격을 다시 볼 수 있으면 사용자 재확인으로 CONFIRMED(시험·훈련으로 확인).
+  - **RECONCILING 취소**: CANCEL_REQUESTED → 조회에서 원격이 받았으면 CONFIRMED + `cancel_too_late`, 없으면 CANCELED — 재전송 없음(T11 동작을 시험으로 고정). `cancel_supported` 는 어댑터 원격 취소 → CANCELED.
+  - **M3 게이트 훈련** `pnpm drill:mock`(`packages/db/scripts/drill.ts` + `drill-matrix.ts`, 버리는 메모리 DB): 시나리오 × 1, PARTIAL 계획, 더블 실행, worker 2개, lease 만료, 재시작, A10 → 표 `시나리오 | 최종 job 상태 | 항목 상태 | intent 수 | publication(MOCK) | 재전송 여부`, 불변식(확인 항목 중복 전송·MOCK 아닌 결과·결과 불명 뒤 맹목 재전송·결과 없는 CONFIRMED·fetch 호출·기대 상태 불일치) 위반 시 exit 1. `tests/integration/m3-gate.test.ts` 가 같은 표를 확인.
+- Evidence / assumption: `tests/integration/m3-gate.test.ts`(훈련 표 전체·A09 API 경로·HTML 폼·health), `tests/integration/m3-hardening.test.ts`(시나리오 API 가드·hash 불변·트리거, 재시도 거부 사유·재승인 경로, C1 브랜드 두 경로, C2 첨부 교체·checksum 제자리 변조·불변 버전에 첨부 행 추가 → 실행 거부, C3 복원 무결성·NON_RESTORED, C4 command_key 재사용·경합, C6 두 시점, C7 두 결과·원격 취소, C8 재시작), 단위 `jobs.test.ts`(planStatusFrom 행렬)·`channel-adapter.test.ts`(새 시나리오). `jobs.test.ts` 의 T11 기대값 중 계획 상태(`failed`/`partial` → `attention`)·A10 시점(다음 tick → 즉시)·health 키가 이 결정으로 바뀌었다. PGlite 는 연결 하나라 "동시" 실행·lease 경합은 여전히 직렬화된 증명이다.
+- Reversible?: 예. 시나리오는 표 하나(내보내기만)·어댑터 한 곳, 계획 상태는 `planStatusFrom` 한 곳(되돌리면 0018 CHECK·재분류 UPDATE 를 되돌리는 migration 필요), 재시도는 API 하나.
+- User decision required?: 확인 요청 — (a) `attention` 이름·규칙(PLANNED + CANCELED 도 attention), (b) 브랜드 새 버전이 승인을 무효로 하는 것(D17 d 뒤집음 — 승인 뒤 말투만 바꿔도 새 계획 필요), (c) 401 보류 재시도가 새 승인 없이 같은 승인으로 다시 보내는 것(승인 범위 안의 "정상 재시도"로 봄, docs/03), (d) 보류 항목에는 편집 훅이 승인을 철회하지 않고 재시도 때 재검사로 막는 것, (e) 원고·첨부 행의 제자리 변경(assets.checksum UPDATE, 불변 버전의 variant_assets INSERT)을 DB 가 막지 않는 것 — 지금은 실행·재시도 재검사가 막는다.
+- Exact authorized scope (if applicable): 외부 호출 0(모의 어댑터만), 새 의존성 0, 비밀 0, OAuth·실계정 0.
+- Consequences: M3 게이트를 `pnpm drill:mock` 한 명령으로 사람이 볼 수 있다. 성공 화면·API 는 모두 MOCK 이며 실제 발행 실적으로 저장되지 않는다. 브랜드 프로필을 바꾸면 승인된 옛 계획은 다시 만들어야 한다.
+- When to revisit: M4(live 어댑터 — 실제 capabilities·refresh 1회·Retry-After·원격 취소, 시나리오 표는 live 계정에 쓰이지 않음), PostgreSQL 전환(실제 동시성), 운영 알림(M5, attention 계획 알림).
+
+## D20 — M3 잔여 결정(D19-a~d) 권고안 확정, M4(T13) 착수 보류
+- Decision ID / date: D20 / 2026-09-25 (Europe/Moscow)
+- Question: 클라우드 세션이 M3 마감에 남긴 결정(docs/handoffs/M3_LOCAL_RETURN.md §4)을 어떻게 정하는가?
+- Chosen option (사용자, 2026-09-25, 권고안 전부 채택):
+  - D19-a. 브랜드 프로필 새 버전 → 활성 승인 무효화(`invalidated:brand_changed`) **유지**(D17(d) 뒤집음 확정 — 브랜드 버전이 payload hash 에 들어가므로 일관).
+  - D19-b. `assets.checksum` 제자리 UPDATE 와 기존(불변) 버전에 대한 `variant_assets` INSERT 를 **DB 트리거로 강제** — Codex 판정 뒤 M3 FIX 라운드에서 작은 migration 으로 추가(현재는 실행·재시도 재검사가 막음).
+  - D19-c. 항목별 모의 시나리오는 모의 계정 한정으로 production 동작 유지, M4 live 계정 도입 시 `NODE_ENV` 게이트 재검토.
+  - D19-d. 재시도 수치(30s·15min·±20%·5회·lease 60s·timeout 30s) 잠정 유지, 실계정 연결 전 공식 rate limit 으로 재조정.
+  - M4/T13(OAuth·비밀 암호화)은 실계정·외부 승인이 필요하므로 사용자가 첫 채널(Threads 권고)·앱 등록·scope·테스트 계정·마스터 키 보관 방식을 확인해 줄 때까지 **착수하지 않는다**. 그 전에는 M3 FIX 라운드와 T20 의 mock 가능 부분만.
+- Evidence / assumption: 로컬 재검증(Windows/Node 24, HEAD b14af3e): lint·typecheck·build 통과, unit 530, integration 312, db:migrate 0016~0018, db:seed 모의 계정 4, drill:mock 불변식 위반 0. Codex(GPT-6 Astra/xhigh) T10~T12 검증은 진행 중 — 결과는 M3 FIX 라운드 인계 문서에.
+- Reversible?: 예(각 항목 D17~D19 개정).
+- User decision required?: 확정됨.
+- Consequences: M3 FIX 라운드 착수 가능. D19-b 트리거는 FIX 라운드 산출물.
+- When to revisit: M4 착수 시(D19-c·d), PostgreSQL 전환 시(트리거 호환).
+- **Follow-up (M3 FIX round 1, Codex review-T10, 2026-09-25) — D19-b 트리거 규칙 확정(migration `0019_t10_fix_restore_triggers`)**:
+  - `assets_content_immutable`(BEFORE UPDATE ON assets): `checksum`·`bytes` 는 값이 정해진 뒤 바꿀 수 없다(다른 파일 = 새 asset). 다른 열(삭제 표시·정리 큐·key 이동)은 그대로.
+  - `variant_assets_version_open`(BEFORE INSERT ON variant_assets): 다음 중 하나면 거부 — (a) 그 파생본 버전을 참조하는 `distribution_items` 가 있음(배포 스냅샷에 쓰인 버전은 첨부 목록 고정), (b) 그 파생본의 **현재 버전 번호가 이 버전보다 큼**(지나간 옛 버전). UPDATE·DELETE 는 0009 `variant_assets_immutable` 가 이미 막는다. 한 줄 규칙: "첨부는 아직 배포에 쓰이지 않은 현재(또는 막 만든 새) 버전에만 추가된다".
+  - 왜 이 모양인가: 정상 경로(`insertCurrentVariantVersion` — 새 버전 INSERT → 같은 트랜잭션에서 첨부 INSERT → 현재 버전 갱신)는 새 버전이 현재보다 새것이라 통과한다. 복원은 모든 `variant_versions` 를 넣은 뒤 `variant_assets` 를 넣지만 파생본 `current_version_id` 를 모든 표를 넣은 **뒤에** 연결하므로(그 전까지 NULL) (b) 에 걸리지 않고, 항목(`distribution_items`)은 `variant_assets` 보다 뒤에 들어가 (a) 에도 걸리지 않는다 — "나중 버전이 있으면 거부" 규칙은 복원 순서(버전 전체 → 첨부 전체)를 깨므로 쓰지 않았다. 실행·재시도 재검사(`snapshotProblems`)는 트리거를 끈 우회에 대한 이중 방어로 그대로 둔다(`m3-hardening` C2 가 트리거 거부 + 트리거를 끈 우회 → 실행 거부를 모두 확인).
+  - 같은 FIX 라운드의 D17 개정: 복원은 결과 불명을 BLOCKED 로 덮어쓰지 않는다 — 전송 중·결과 불명(SENDING·REMOTE_PROCESSING·RECONCILING·UNKNOWN·CANCEL_REQUESTED) → UNKNOWN, 보내기 전 대기(QUEUED·RETRY_WAIT) → BLOCKED, 둘 다 `distribution_items.restored_needs_review = true`(자동 실행·재시도 금지 속성, 재시도 API 409 `outcome_unknown`/`not_retryable`). 묶음 행 스키마에 계획 상태 `attention` 과 `restored_needs_review`(기본 false — 0019 이전 묶음 호환)를 더했다. 전역 잠금 순서는 `channel_accounts → contents → variants → distribution_plans → distribution_items → approvals → jobs`(approval-invalidation.ts 머리 주석). 실제 PostgreSQL 동시 실행 검증은 not_run.
+- **Follow-up (M3 FIX round 1, Codex review-T11·T12, 2026-09-25) — D18·D19 개정**:
+  - **D19(d) 뒤집음(T12 P0)**: 편집 훅(파생본·원고·브랜드·계정 변경)은 보류(BLOCKED) 항목의 활성 승인도 `invalidated:<이유>` 로 철회한다(감사 `approval.invalidate`). 항목은 PLANNED(다시 승인·새 실행 키)로, **작업은 BLOCKED 그대로** — 확정되지 않은 전송을 실행 가능한 상태로 되돌리지 않는다. 재시도 API 는 409 `approval_required`. 복원 표시(`restored_needs_review`)가 있는 보류 항목은 승인만 철회하고 BLOCKED 로 둔다. 훅을 거치지 않은 변경은 여전히 재시도·전송 직전 재검사(`snapshot_stale`)가 막는다.
+  - **진행 중 전송(T11 P0)**: 모의 원격은 submit 이 진행 중인 key 를 조회에 `unknown`(mock_in_flight)으로 답한다(확정적 not_found 아님). 작업 처리기의 heartbeat 는 lease 를 잃으면 `LeaseLostError` 를 던지고 중단 신호를 보낸다 — 어댑터는 부작용 직전에 heartbeat·신호를 확인하고 멈춘다(prepare 뒤에도 확인). lease 를 잃은 옛 시도의 결과가 부작용 가능(accepted·processing·ambiguous·쓰기 뒤 5xx)인데 작업이 새 시도를 기다리면(QUEUED·LEASED·RETRY_WAIT) 새 전이 `late_result` → RECONCILING(새 의도 없이 조회).
+  - **lease(T11 P1)**: tick 은 지금 처리할 작업 하나씩만 lease 한다(이번 tick 에 처리한 작업 제외, tick 당 최대 maxJobs). `beginSend` 는 lease 가 만료됐으면 아무것도 쓰지 않는다. 시작 전 만료(LEASED, 의도 없음)는 시도가 아니다 — 복구가 attempt 를 되돌리고, 끝없는 재lease 는 `lease_expired_before_intent` 횟수가 max_attempts 에 이르면 FAILED(`lease_expired_max_attempts`).
+  - **복원 이력(T11 P1, D17(6) 개정)**: jobs·send_intents·publications 를 **읽기 전용 이력**으로 복원한다(job_events·execute_commands·mock_scenarios 는 계속 내보내기만). 작업은 끝난 상태·BLOCKED·UNKNOWN 으로만(`restoredJobState`), lease 없이, `jobs.restored_needs_review = true`(0020) — worker 는 lease 하지 않고 재시도는 거부, 재확인(조회만)은 복원된 전송 의도 key 로 가능. CONFIRMED 인데 원격 결과가 묶음에 없는 항목은 UNKNOWN(+표시), 그 CONFIRMED 작업도 UNKNOWN.
+  - **계획 상태(T12 P1)**: migration 0020 이 모든 계획을 `planStatusFrom` 과 같은 규칙(SQL)으로 다시 계산한다(0018 의 부분 재분류 보완).
+  - **화면(T11·T12 P2)**: 승인 철회 안내는 저장된 결과 수(BLOCKED 된 작업·CANCEL_REQUESTED 로 기록된 작업)로만 말한다. 보류 이유는 구조화된 코드(이벤트 event·lastErrorCode)로 판단하고 상세 사유(`invalidated:…`·사용자 사유)는 따로 보이며, 스냅샷이 바뀐 PLANNED 항목에는 "새 계획 만들기"를 안내한다. 실제 PostgreSQL 동시 실행 검증은 not_run.
+- **Follow-up (M3 FIX round 2, Codex review-FIX-T10, 2026-09-25) — 첨부 트리거는 마지막 방어선, 실제 직렬화는 잠금**:
+  - 첨부 INSERT 의 실제 직렬화는 앱 경로다: `insertCurrentVariantVersion` 이 첨부를 넣기 전에 전역 순서대로 파생본 행 FOR UPDATE → 버전 행 FOR UPDATE 를 잡고, 잠금 뒤 "이 버전을 참조하는 배포 항목 없음"(409 `variant_version_referenced`)·"현재보다 옛 버전 아님"(409 `variant_version_superseded`)을 다시 검사한다. `createPlan` 의 파생본 FOR SHARE·항목 INSERT 의 버전 FK KEY SHARE 와 충돌하므로 둘은 서로 기다리고, 뒤에 온 쪽은 커밋된 결과를 본다.
+  - `variant_assets_version_open` 트리거(migration 0021 로 교체)는 같은 순서로 파생본·버전 행을 FOR UPDATE 로 잠근 뒤 0019 규칙을 검사한다 — 앱 밖 INSERT 에 대한 **backstop** 이다.
+  - 복원(`add_missing`)이 기존 파생본에 옛 버전의 첨부를 보충하려 하면 사전 검사가 명시적 충돌(`immutable_version` — 대상의 현재 버전이 더 새것, `snapshot_referenced` — 배포 항목이 그 버전을 참조)로 남기고 나머지 복원은 진행한다. 사전 검사 뒤 경합으로 트리거가 거부해도 savepoint 로 같은 충돌로 바꾼다(원시 DB 오류로 중단하지 않음). 옛 버전 행 자체는 보충된다(첨부 없는 버전 — 검토 조건은 현재 버전으로만 판단).
+  - 실제 PostgreSQL 두 연결 교차 실행 검증은 not_run(PGlite 는 연결 하나 — 시험은 두 순서의 결과와 잠금 흔적(xmax)만 확인).
+- **Follow-up (M3 FIX round 2, Codex review-FIX-T11T12, 2026-09-25) — 시도는 전송 의도를 쓸 때만 센다**: lease 는 `attempt` 를 바꾸지 않고, `beginSend` 가 전송 의도 INSERT 와 같은 트랜잭션에서 `attempt + 1`(의도 key `<job>:<attempt>`)로 올린다. 시도를 다 쓴 작업이 lease 되면 보내지 않고 FAILED(`attempts_exhausted`). 의도 없이 만료된 lease 는 시도가 아니다 — `jobs.lease_expired_before_intent`(migration 0022)를 1 올리고 QUEUED 로 되돌리며, 이 횟수가 `PRE_INTENT_EXPIRY_LIMIT`(5, max_attempts 와 별개)에 이르면 보내지 않은 채 FAILED(`lease_expired_before_intent`). 취소 요청이 전송 전(LEASED·QUEUED)에 들어왔는지는 의도 유무가 아니라 가장 최근 `cancel_requested` 이벤트의 이전 상태로 판단한다. 화면: 철회 결과 수 파싱을 lib `revocationCountParam` 로 옮겨 시험하고(정규식 오타 수정), PLANNED 항목에 활성 승인이 있으면 과거 작업의 보류 사유보다 우선한다("승인 없음" 표시 안 함).
+- **Follow-up (M3 FIX round 3, Codex review-FIX2-T11T12, 2026-09-25) — 업그레이드 시 attempt 정규화(migration 0023)**: 0022 이전 worker 는 lease 때 attempt 를 먼저 올렸다. 0023 은 끝나지 않은 작업(CONFIRMED·FAILED·CANCELED 제외) 중 attempt 가 그 작업의 가장 큰 전송 의도 번호보다 큰 행을 그 번호(의도 없으면 0)로 되돌린다 — 이미 의도가 있는 시도 번호는 유지, 개수가 아니라 최대 번호를 쓰는 것은 다음 의도 key `<job>:<attempt+1>` 가 기존 key 와 겹치지 않게 하려는 것. **전제: 구버전 worker(CLI·inline tick·/api/worker/tick 을 부르는 서버)를 멈춘 뒤 migration 을 적용한다** — 적용 중에 구버전이 lease 하면 다시 선증가한다.
+
+
+## D21 — M3 화면 검증 FIX(D1·D2·D3·D5·D8·D9): 화면 폼은 본문이 기준, 성공 배너는 저장된 상태로, 재확인 결과는 4종, dev 파일 캐시 끔
+- Decision ID / date: D21 / 2026-10-01 (Europe/Moscow)
+- Question: M3 화면 확인(.handoffs/screen-notes-m3.md "완료 기록")에서 나온 결함 D1·D2·D3·D5·D8·D9 를 승인·발행 불변식을 건드리지 않고 어떻게 고치는가?
+- Options: (1) 채널 초안 편집 폼: 사용자가 JSON 중복 칸을 계속 직접 맞춤 / 브라우저 쪽 스크립트로 맞춤 / **서버가 폼 경로에서만 본문으로 중복 칸을 만든다(JSON API 는 T09 불일치 거부 그대로)**. (2) 성공 배너: 쿼리 값 그대로 / 서명된 쿼리 / **쿼리는 "보여 달라"는 신호일 뿐, 표시 여부·수는 저장된 상태에서**. (3) 재확인 결과: found/not_found 2종 / **found·not_found·unsupported·unknown 4종**. (4) D9: dev 시작 때 캐시 삭제 스크립트 / **Turbopack dev 파일 시스템 캐시 끄기**.
+- Chosen option: 각 굵은 선택. 세부:
+  - D1: 줄바꿈 표기(\r\n·\r·\n)는 `variantBodyMismatch` 에서 양쪽 모두 LF 로 맞춘 뒤 비교한다(JSON API 도 표기 차이로는 거부하지 않음). 화면 폼(`formToVariantEdit`)은 본문을 LF 로 바꿔 저장한다. JSON API 가 보낸 CRLF 본문은 예전처럼 그대로 저장된다(변경 없음).
+  - D2: 폼 경로 = `appendVariantVersion(..., bodyAuthoritative: true)` → `deriveBodyFields`: threads 는 본문을 빈 줄로 나눈 문단(앞뒤 공백 제거·빈 문단 제외) = thread_parts, text = 첫 문단, 저장 본문 = 문단을 빈 줄 하나로 다시 이은 것; 문단 하나가 500자 초과면 400 `thread_part_too_long`, 20개 초과면 400 `thread_too_many_parts`(자르거나 나누지 않음). instagram caption·youtube script·blog markdown = 본문. 나머지 칸(카드·제목·설명·태그)은 사용자 JSON 그대로, 채널 스키마 검사는 그대로. 화면 JSON 칸에는 본문 외 항목만 보이고(`editableMetadata`), 빈 칸은 {}. 오류는 고정 문구 코드(`metadata_json`·`invalid_metadata`·`metadata_body_mismatch`·`thread_part_too_long`·`thread_too_many_parts`)로 리다이렉트하고 채널 초안 영역에도 보인다.
+  - D5: `bannersFromState(query, planDetail)` — 승인 배너는 활성 승인이 있는 항목 수(≥1), 실행 배너는 작업이 있는 항목·작업 수(작업 ≥1, replay 표시 유지), 취소·취소 확인 중은 CANCELED·CANCEL_REQUESTED 항목/작업이 있을 때만, 재시도는 QUEUED 작업이 있을 때만. 정보성 배너(created·ticked·scenario_saved)와 철회 배너(revoked_* — 저장된 결과 수)는 그대로.
+  - D8: 화면 재확인 리다이렉트 `reconciled=<found|not_found|unsupported|unknown>`(원격 processing 도 unknown). 옛 값 found·not_found 는 그대로 유효, 알 수 없는 값은 배너 없음. unsupported·unknown 문구는 "없다는 뜻이 아님·다시 보내지 않음"을 명시.
+  - D3: 홈 「최근 배포」 = `listRecentPlans`(배포함 `listPlans` 재사용, 최근 5개·새것부터·owner 한정) + 배포함과 같은 상태 문구·MOCK 표시·MSK 시각·「배포함 전체 보기」, 없으면 안내 문구.
+  - D9: `apps/web/next.config.ts` `experimental.turbopackFileSystemCacheForDev: false`(next 16.3.6 에 있는 옵션). production build 는 영향 없음. 재시작 동작은 오케스트레이터가 실제로 확인한다.
+- Evidence / assumption: 결함 재현은 각 시험이 HEAD 77a152d 소스에서 실패하는 것으로 확인(D1 단위·통합, D2 통합, D8 통합). 브라우저 확인은 이 FIX 에서 하지 않았다(dev 서버 미기동).
+- Reversible?: 예(폼 경로 플래그·화면 헬퍼·설정 한 줄).
+- User decision required?: 아니오(화면 결함 수정). 단 threads 본문 정규화(빈 줄 여러 개 → 하나, 문단 앞뒤 공백 제거)가 사용자 의도와 다르면 알려 달라.
+- Consequences: 화면 폼에서 JSON 의 중복 칸은 무시된다(옛 화면을 열어 둔 채 thread_parts 를 고쳐도 본문이 이긴다). JSON API 규칙(T09)은 바뀌지 않는다. dev 첫 컴파일이 조금 느려질 수 있다.
+- When to revisit: 화면에 클라이언트 편집기를 둘 때(D2), 실제 원격 조회가 생길 때(M4 — D8 문구), Next 업그레이드 시(D9 옵션 존재·기본값).
+
+## D22 — T20 운영·복원 훈련·보존(로컬·모의 범위): 숫자는 기록에서만, 훈련 = 메모리 DB 에 empty_only, 보존 정리는 내보낸 뒤 삭제·기본 수동, 외부 알림 없음
+- Decision ID / date: D22 / 2026-10-01 (Europe/Moscow)
+- Question: docs/02 "운영·복원"(job 지연·반복 실패·UNKNOWN·용량·비용·backup age 표시, 운영 전 복원 1회 통과)과 docs/07 "백업/보존 초안"을 실계정·외부 저장소·외부 알림 없이(D20: M4 보류) 어떻게 구현하는가?
+- Options: (1) 표시: 상태 배지("정상") / **기록에서 센 숫자만, 원천 없으면 "측정 없음"**. (2) 복원 훈련 대상: 두 번째 파일 DB / 같은 DB 의 다른 owner / **버리는 메모리 PGlite + 빈 임시 저장소에 empty_only**. (3) 훈련 묶음: export_runs 에 기록 / **기록 안 함(백업으로 세지 않음), 끝나면 삭제**. (4) 보존: 바로 삭제 / **job_events 는 JSONL 로 내보낸 뒤 삭제, 파일은 정책대로 삭제**. (5) 실행: worker 자동 / **기본 수동(미리보기 → confirm=yes), auto 는 설정으로**. (6) 알림: 이메일·메시지 / **앱 화면(/ops)만**.
+- Chosen option: 각 굵은 선택. 세부:
+  - 기준값(설정, 잠정): `BACKUP_MAX_AGE_HOURS` 24, 반복 실패 = 지난 7일 전송 의도 결과 rejected·ambiguous 3회 이상(코드 상수), `RETENTION_JOB_EVENTS_DAYS` 180, `RETENTION_PACKAGES_DAYS` 30, `RETENTION_EXPORT_RUNS_KEEP` 10, `RETENTION_SWEEP_MODE` manual. 업로드 세션 24시간은 기존 D15 고정값(설정 추가 안 함). 앱은 파일 로그가 없어 `RETENTION_LOG_DAYS` 는 문서로만 둔다(설정 없음).
+  - 백업 나이 = 마지막 **완료된 export_runs**(owner) 이후 시간. 파일이 아직 있는지·외부로 옮겼는지는 판단하지 않는다(로컬 ZIP 만). 기준 초과면 경고, 기록 없으면 "백업 나이를 잴 수 없음".
+  - 복원 훈련: 임시 내보내기(record:false) → 인증 비밀 없음 확인(sessions 표·session 파일·token_hash·식별자 원문) → 메모리 DB + 임시 폴더 저장소에 미리보기·empty_only 커밋 → RESTORED_TABLES 마다 행 수·ID 집합·내용 sha256(stableStringify, owner 열 없음) 비교. 복원이 안전을 위해 바꾸는 열(D17~D19: jobs 상태·lease·표시, distribution_items 상태·표시, distribution_plans 상태·revision, approvals 철회, variants lifecycle, transcription_jobs·usage_ledger 정리 열)은 내용 비교에서만 뺀다. 파일: 복원 저장소 바이트 sha256 = checksum = 원본(원본 파일이 없으면 FAIL), 검색: 원본에서 찾히는 소재 1건을 같은 검색어로. 결과는 `restore_drills`(migration 0024, export/restore 제외 표)에 표·종류·ID·열 이름만.
+  - 화면 훈련(`POST /api/ops/restore-drill`)은 운영 DB 를 읽기만 하므로 파일 잠금과 무관. CLI `pnpm drill:restore` 는 운영 DB 를 열므로 dev 서버가 켜져 있으면 기존 잠금 안내로 exit 1.
+  - 보존 정리 대상은 정확히 셋(job_events·배포 파일 ZIP·내보내기 ZIP). job_events 는 끝난 작업(CONFIRMED·FAILED·CANCELED)이면서 마지막 이력이 기준보다 오래된 작업의 이력 전체만. migration 0024 가 `job_events_immutable` 트리거를 `job_events_guard` 로 바꿔 `set_config('cs.retention_sweep','on', true)` 가 켜진 트랜잭션에서 끝난 작업의 행 삭제만 허용한다(UPDATE·그 밖의 DELETE 는 계속 거부). 앱은 작업 행을 잠그고 다시 확인한 뒤 JSONL 을 쓰고 되읽어 줄 수를 확인한 다음 지운다. export_runs 행은 이력으로 남긴다.
+- Evidence / assumption: 통합 테스트 tests/integration/ops-retention.test.ts — 배포 이력(확정·보류·실패 의도)이 있는 owner 의 훈련 PASS, 복원 행 변조·원본 파일 누락 → FAIL, 보존 미리보기 무변경, 적용 후 원문 표 행 수 불변·보류 작업·다른 owner 이력 유지, 트리거가 표시 없는/끝나지 않은 작업 삭제를 거부. 훈련은 처음에 계획 상태 재계산(revision) 때문에 FAIL 로 나와 변환 열 목록에 넣었다(거짓 실패 제거 — 거짓 통과 위험은 인계 문서 질문).
+- Reversible?: 예(설정·migration 0024 의 트리거 함수는 되돌릴 수 있음, restore_drills 는 운영 기록).
+- User decision required?: 예 — (a) 기준값(24시간·180일·30일·10개) 확인, (b) 보존 정리 기본 manual 유지 여부(auto 로 바꾸면 오래된 내보내기 ZIP 도 자동으로 지워짐), (c) 백업을 이 PC 밖(외부 디스크·클라우드)으로 옮길지 — 지금은 로컬 ZIP 만이며 외부 저장소는 연결하지 않았다, (d) 외부 알림(M5 선택 기능)을 쓸지.
+- Consequences: "백업으로 안전" 같은 문구는 없다 — 복원 훈련 PASS 와 백업 나이라는 사실만 보여 준다. 훈련 PASS 는 "지금 DB 를 내보내 빈 환경에 넣으면 같아진다"는 뜻이지 과거 ZIP 이 온전하다는 뜻은 아니다. job_events 를 지운 작업은 화면 이력이 비고, JSONL 보관 파일이 근거가 된다(보관 파일 자체의 보존 기간은 미정).
+- When to revisit: PostgreSQL 전환(트리거·set_config 호환, 훈련 대상 DB), 외부 백업 저장소 도입, M5 외부 알림, 실계정(M4) 연결 시 기준값.
+
+### D22 후속 (2026-10-02, Codex T20 FIX 라운드 1~6 반영, HEAD 6e99eef)
+- 보존 정리의 "백업" 정의가 바뀜: export_runs 행이 아니라 **검증된 ZIP 파일**(크기 = zip_bytes, 전 엔트리 해제·checksum, manifest sha256 = 생성 시 저장값)만 keep 으로 센다. 검증된 백업이 keep 미만이면 아무것도 지우지 않는다. 남길 ZIP 과 삭제 후보 ZIP 모두 삭제 직전 캐시 없이 실제 바이트로 재검증한다.
+- 손상·접근 불가 ZIP 과 그 폴더는 **무기한 보존**(자동 삭제 없음, /ops 에 candidates_damaged_kept 로 표시). 폴더만 남은 실행은 ZIP 부재(ENOENT)가 확인된 경우에만 정리한다. → 사용자 결정 (b2): 이 규칙 유지 여부.
+- sweep 은 3단계(계획 감사 커밋 → 파일 삭제 → 결과 감사, sweep_id 로 연결). 결과 없는 실행·일부만 처리된 실행은 뒤에 성공이 있어도 /ops 에 계속 표시된다. 프로세스 간 배타는 없음(단일 worker 전제, PostgreSQL 다중 worker 전 영속 sweep 상태 필요 — Codex 권고, 미구현).
+- 복원 훈련은 변환 열을 제외하지 않고 **전 컬럼** 을 비교한다. 기대값은 restore-expect.ts 가 묶음 행에서 독립 재계산하며(복원 코드 호출 없음), 복원 판정 시각은 commitRestore 의 now 로 주입한다. 검증 범위(빈 표·파일 0·검색 skipped·jobs/approvals 없음)는 restore_drills.scope_json(0026)에 저장되고 "PASS(부분 검증: …)" 로 표시된다. 예외도 fail 행 + error_code(0025).
+- Codex 권고 중 **미반영(사용자 결정)**: Q5 백업 나이는 완료 기록이 아니라 검증 가능한 파일·확인된 외부 사본 기준이어야 하고 보관 중인 과거 ZIP 의 복원 훈련은 별도 지표여야 함(현재는 마지막 완료 export 기준 그대로) → (c) 와 함께 결정. Q6 공개 `/api/health` 의 `ops` 숫자를 세션 뒤로 옮길지 → (e).
+
+## D23 — D22 사용자 결정 확정 (T20 운영·보존·백업)
+- Decision ID / date: D23 / 2026-10-02 (Europe/Moscow), 사용자 확정.
+- Question: D22 의 사용자 결정 항목 (a)~(e) 와 Codex T20 Q5·Q6 권고 처리.
+- Chosen option:
+  - (a) 기준값 확정: `BACKUP_MAX_AGE_HOURS` 24, `RETENTION_JOB_EVENTS_DAYS` 180, `RETENTION_PACKAGES_DAYS` 30, `RETENTION_EXPORT_RUNS_KEEP` 10. 코드 변경 없음.
+  - (b) 보존 정리 기본 `manual` 유지. (b2) 손상·접근 불가 ZIP 과 그 폴더 무기한 보존 규칙 유지. 코드 변경 없음.
+  - (c) 백업을 이 PC 밖으로 옮기지 않는다. 백업 나이는 **마지막 완료 export 기준을 유지**한다 — Codex Q5 권고(검증 가능한 파일·외부 사본 기준)는 채택하지 않음. /ops 는 백업 나이와 별도로 마지막 복원 훈련을 표시하고, 보존 정리는 이미 검증된 ZIP 만 백업으로 센다(D22 후속). 코드 변경 없음.
+  - (d) 외부 알림(이메일·메시지) 사용 안 함. /ops 화면만. 코드 변경 없음.
+  - (e) Codex Q6 채택: 공개 `/api/health` 에서 `ops` 블록을 뺐다. 같은 숫자는 로그인이 필요한 `GET /api/ops/summary` 로 옮겼고 **로그인한 owner 범위**로 센다(이전 health 는 모든 owner 합계). 폴더 바이트는 이 PC 폴더 전체 측정이라 owner 구분이 없다.
+- Evidence: tests/integration/ops-retention.test.ts "D23(e)" — health 에 ops·숫자 키 없음, summary 세션 없음·잘못된 세션 401(숫자 미노출), 새 owner 0·null(다른 owner 미집계), A 의 숫자 = opsSnapshot, 51개 계획 owner 정확히 51.
+- 남은 범위(이번 결정 밖): 공개 `/api/health` 에는 여전히 `jobs`(상태별 작업 수·`attention_plans`, T11/T12), `uploads`(업로드 임시 영역 사용량, T08), `db.captures`(소재 수)가 모든 owner 합계로 남아 있다. 이 숫자도 세션 뒤로 옮길지는 사용자 결정 대상.
+- Reversible?: 예.
+
+## D24 — M4 착수: T13(OAuth·계정·비밀 보호)을 로컬·모의 범위로 시작, 실계정 연결은 계속 승인 대기
+- Decision ID / date: D24 / 2026-10-02 (Europe/Moscow). 사용자 지시 "M4 작업 시작해줘"(D20 의 착수 보류 해제).
+- Question: D20 이 착수 조건으로 둔 항목(첫 채널·앱 등록·scope·테스트 계정·마스터 키 보관)이 아직 정해지지 않은 상태에서 무엇을 먼저 하는가?
+- Chosen option (잠정 기본값, 사용자가 바꿀 수 있음):
+  - 첫 채널: **Threads**(D20 권고). T13 은 채널 공통 틀 + Threads 형태의 **모의 OAuth 공급자**로 구현한다. 실제 Meta 앱 등록·OAuth 왕복·토큰 발급은 하지 않는다.
+  - scope: 게시에 필요한 최소 scope 만 요청하는 구조(Threads 는 기본 + 게시 권한, reply·insights 는 요청하지 않음 — docs/03). 실제 scope 이름은 공식 문서 재확인 후 T14 에서 확정.
+  - 마스터 키: 서버 환경변수(`.env.local`, 저장소·DB·백업·export 밖)에서 읽는다. 키 버전(`key_version`)을 함께 저장해 교체할 수 있게 한다. 암호화는 Node 표준 `crypto` 의 AES-256-GCM(자체 알고리즘 구현 아님 — docs/02 "자체 암호화 구현 금지" 준수).
+  - 토큰은 export·backup·restore·로그·감사·브라우저·LLM 입력·API 응답에 나가지 않는다. 복원 후 계정은 "다시 연결 필요" 상태.
+  - 기본값 그대로: `PUBLISH_MODE=disabled`, 실제 외부 호출 0. live OAuth 는 환경 조건(앱 ID·비밀·redirect URI·승인 기록)이 모두 갖춰지고 사용자가 정확한 범위를 승인하기 전까지 `blocked_external`.
+- 실계정 연결 전 사용자에게 받을 것: Meta 앱 등록 여부와 앱 ID 보관 방식, 테스트용 Threads 계정, redirect URI(로컬/운영), 마스터 키를 둘 위치 확인, 첫 실계정 시험의 정확한 원고·공개 범위.
+- Reversible?: 예.
+
+## D25 — T13 구현 중 잠정 판단 5건 확정 (사용자, 2026-10-02, 권고안 채택)
+1. 연결 철회(revoke) → 그 계정의 활성 승인 무효화(`account_changed`), 다시 연결할 때까지 실행 차단. 토큰 갱신·같은 계정 재연결은 승인 유지(다른 계정 정체성으로 돌아온 콜백은 409 `oauth_account_mismatch`). **유지.**
+2. 요청 scope 중 일부만 허용 → 자격 증명은 저장하되 `needs_reconnect`, 실행 차단. **유지.**
+3. 모의 동의 화면의 테스트용 매개변수(`mock_user`·`mock_grant`·`mock_deny`) → **운영(`NODE_ENV=production`)에서는 거부**하도록 바꾼다(T13 FIX 라운드). 개발·테스트에서만 허용.
+4. API 경로는 기존 `/api/channel-accounts/{id}/…` 유지. docs/04 API 표를 코드에 맞춰 갱신.
+5. 키 교체는 실행 명령을 추가한다(T13 FIX 라운드): 기본은 미리보기(몇 건을 재암호화할지 숫자만), `--confirm` 일 때만 적용. 파일 DB 를 열므로 dev 서버가 꺼져 있어야 한다. 키 값은 출력하지 않는다.
+
+## D26 — T14 Threads 텍스트(모의 어댑터만): 어댑터 선택 규칙, 원격 단계 기록(remote_steps)·모의 ID CHECK, 스레드 이어 붙이기·부분 스레드 재개, 잠정 요청 제한, 401 처리, 실계정 시험 blocked_external
+- Decision ID / date: D26 / 2026-10-02 (Europe/Moscow). 구현자 잠정 판단 — 사용자 확인 요청 항목은 아래 "User decision required".
+- Question: docs/05 T14("Threads 텍스트·컨테이너 참조 저장·성공 확인·요청 제한")를 실제 Threads/Meta 호출·앱 등록·실계정 없이(D24) 어떻게 구현하고, docs/03 의 2단계 게시(컨테이너 → threads_publish)·결과 불명 규칙(A08)·부분 성공(A09)을 서버·DB 에서 강제하는가?
+- Options: (1) 어댑터: 일반 모의 어댑터에 Threads 흉내를 더함 / **별도 Threads 모의 어댑터 + 프로세스 안 시뮬레이터(ThreadsMockApi)**. (2) 단계 참조: send_intents 의 상세(JSON)에 / publications 에 / **새 표 remote_steps(게시물·종류마다 한 행, 원격 호출 전에 기록)**. (3) 재개: 조회(reconcile)가 직접 게시 / 일반 not_found → 재시도 / **새 조회 결과 `resumable` + 새 사건 `resume`(RECONCILING·REMOTE_PROCESSING → RETRY_WAIT) — 다음 시도(새 전송 의도)가 같은 참조로 이어 보냄**. (4) 요청 제한: 새 표 / **remote_steps 의 게시 기록에서 파생(새 표 없음)**.
+- Chosen option: 각 굵은 선택. 세부:
+  - **어댑터 선택 규칙**(`@cs/domain` `adapterIdFor`, 레지스트리·시나리오 검사·화면이 모두 이것만 쓴다): kind='mock' + platform='threads' + `channel_accounts.credential_state` ≠ 'none'(T13 모의 OAuth 로 연결한 적 있음 — linked·needs_reconnect) → `mock_threads`(ThreadsMockChannelAdapter). 그 밖의 모의 계정(seed 계정 — 연결한 적 없음) → `mock_generic`(M3 MockChannelAdapter 그대로; M3 시험·drill M3 표 불변). live → 어댑터 없음(`LiveChannelNotConfiguredError` — 변경 없음). 해제 뒤에도 credential_state 는 linked 로 남으므로(D25-1, T13 결정 2) Threads 어댑터가 선택되고 T13 게이트가 막는다. 전송 의도 `sanitized_details.adapter_id` 에 보낸 어댑터를 남기고(결과를 채운 뒤에도 유지) 조회는 그 어댑터로 한다 — 그 사이 선택 규칙의 입력이 바뀌어도 같은 원격을 본다.
+  - **시뮬레이터**(providers `threads-mock.ts`, 프로세스 싱글턴, 네트워크 없음): createContainer → `mockthr_ct_<uuid>`(IN_PROGRESS 를 몇 번 조회할지 프로그램 가능) · getContainer · publish(creation_id) → `mockthr_post_<uuid>` · getPost(`mock://threads/<id>`) · findPublishedByContainer · 사용자별 게시 예산(429 + retry-after). 오류 종류 auth_invalid_token 401 / permission_denied 403 / invalid_parameter 400 / not_found 404 / rate_limited 429 / server_error 5xx(side_effect none|unknown) / timeout. 토큰은 T13 모의 OAuth 저장소가 발급한 것(해제·만료 아님, 같은 사용자)만 통과. 같은 컨테이너의 두 번째 게시는 거절(`container_already_published` — 게시물이 두 개 생기지 않는다는 **모의 가정**, 실제 Threads 동작은 live 전에 확인). 시나리오(threads_*)는 시뮬레이터 동작만 정하고 첫 시도에서만 장애를 낸다(400 은 매번) — payload·hash 불변.
+  - **원격 단계 기록**(migration `0031_t14_threads_steps`, 표 `remote_steps`): id, owner, job(+owner FK), intent(send_intents FK, 트리거가 같은 작업·owner 확인), item(+owner FK), step_index, kind(container|publish), post_index, remote_id, status(created|finished|published|error), 시각. unique(job, post_index, kind) + unique(remote_id). CHECK publish ⇔ published, **`remote_id LIKE 'mock%'`(live 어댑터가 없는 동안 — live 를 붙일 때 다시 정한다)**. 트리거 `remote_steps_guard`: DELETE 거부, 식별 열·remote_id 변경 거부, published 불변, created 로 되돌리기 거부. 어댑터는 작업 처리기가 넣는 `ctx.steps`(호출마다 짧은 트랜잭션 — 원격 호출 동안 DB 잠금 없음)로만 읽고 쓴다. **각 참조는 다음 원격 호출 전에 기록**: 컨테이너 ID → (조회) → 게시 → 게시 ID. 내보내기만(NON_RESTORED, bundle 행 스키마·무결성 검사 추가) — 원격 결과는 복원 환경이 다시 확인할 사실.
+  - **스레드 이어 붙이기·부분 스레드**: 게시물 i 는 i-1 의 게시 ID 에 답글로(순서대로). 재개·재확인은 기록을 먼저 읽고 게시 기록이 있는 게시물은 건너뛰며(재게시 없음), 컨테이너 기록이 있으면 새로 만들지 않는다. 조회 판정: 단계 기록 없음 → `not_found`(게시는 기록된 컨테이너로만 하므로 확실; 기록 전에 응답을 잃은 컨테이너는 게시되지 않은 채 남는다) / 컨테이너 PUBLISHED → 게시 ID 를 찾아 기록 / FINISHED·게시 없음 → `resumable`(published_parts = 이미 게시된 수) / IN_PROGRESS → processing / 컨테이너를 원격이 모름(재시작)·만료·오류·읽기 실패 → `unknown`(3회 뒤 UNKNOWN, 맹목 재게시 없음 — 만료 컨테이너는 게시물당 컨테이너 1개 규칙 때문에 새로 만들지 않는다). 작업 처리기: `resumable` → `resume`(RETRY_WAIT, 즉시) → 다음 시도가 같은 컨테이너로 이어 감. 사용자 재확인은 조회만(이어 보내지 않음). 취소 요청 중 `resumable` 이면 게시된 것이 없을 때만 CANCELED, 일부 게시됐으면 `UNKNOWN`(`thread_partial_cancel_requested` — 취소 성공이라고 하지 않음). **publication 은 스레드 전체가 게시된 뒤에만 항목당 1개**(첫 게시물 링크), 게시물별 ID 는 remote_steps 에만. 스레드 중간에 401·403·400 으로 멈추면 앞 게시물은 원격에 남고 항목은 BLOCKED/FAILED(단계 목록이 사실을 보여 준다).
+  - **잠정 요청 제한**: capabilities.rate_limit = 24시간 250 게시 단위(checked_at·api_version null, source "provisional — 공식 자료 재확인 필요(D19-d, D24)"), text = 게시물 500 코드 포인트·20개(channel.ts 잠정값). 작업 처리기는 전송 의도 전에(beginSend) 그 계정의 창 안 게시 단계 수 + 이번 작업의 남은 게시물 수가 한도를 넘으면 의도 없이 `local_rate_limited`(LEASED → RETRY_WAIT, next_run_at = 창 안 가장 오래된 게시 + 창; 시도 수 안 씀). 창 안 사용이 0 이면 허용(한도보다 큰 스레드도 영원히 막히지 않게). 원격 429 는 기존 retryDelay(Retry-After 이상, 1시간 넘으면 FAILED). 화면 `요청 제한 — HH:mm MSK 이후 재시도`. 숫자는 공식 rate limit 확인 뒤 바꾼다(사실로 고정하지 않음 — docs/03).
+  - **401·연결 정보 처리(T13 FIX3 와 일관)**: 토큰은 작업 처리기 안에서 `readAccessTokenForSend`(계정 → 연결 정보 잠금, health usable 일 때만 봉인 해제, 복호화 실패는 readForUse 와 같은 세대 조건으로 error 기록)로만 꺼내 어댑터 메모리(WeakMap)에 둔다. 쓸 수 없으면 원격 호출 없이 `auth`(코드 credential_<상태> 등) — 실제로는 T13 게이트가 beginSend 에서 먼저 막는다(정리 대기 pending_* 포함). 원격 401 → BLOCKED(자동 재시도 없음) + T13 의 기존 확인 경로 `checkCredential` 을 한 번 부른다(공급자가 무효라 하면 연결 정보 error → 실행·재시도 게이트가 막고 "다시 연결"; 유효하다 하면 그대로). docs/03 의 "refresh 한 번"은 하지 않았다 — Threads 형 갱신은 유효한 토큰이 있어야 하므로 401 뒤 갱신은 의미가 없고, 갱신은 T13 의 만료 전 자동 갱신이 맡는다(질문). invalid_token 을 철회 완료로 보는 T13 FIX3 규칙은 그대로.
+  - **공개 범위(모의 가정)**: 원격 공개 범위 = 승인한 공개 범위(private → UPLOADED_PRIVATE/private, public → PUBLISHED/public). 실제 Threads 의 공개 범위(프로필 설정)는 live 전에 확인한다.
+  - **publication 외부 ID**: 기존 CHECK(`mock:%`)를 약화하지 않으려고 `mock:threads:<mockthr_post_…>`, 링크 `mock://threads/<mockthr_post_…>`. 단계 표에는 원시 모의 ID.
+  - **실계정 시험**: docs/05 "각 작업 통과: 계약 테스트 + 사용자가 정한 계정·원고·공개 범위의 실계정 시험" 중 실계정 절반은 **`blocked_external`** — D24 의 사용자 준비물(Meta 앱 등록·앱 ID 보관, 테스트 Threads 계정, redirect URI, 마스터 키 위치, 첫 시험 원고·공개 범위)과 정확한 범위 승인 전에는 하지 않는다. live 계정은 지금처럼 `LiveChannelNotConfiguredError`, `liveOAuthReadiness` 의 `LIVE_OAUTH_ADAPTER(T14 미구현)` 그대로.
+- Evidence / assumption: 단위 `packages/providers/src/threads-mock.test.ts`(시뮬레이터 상태 기계·토큰·예산·장애, 오류 분류 표, 스레드 순서·답글, validate, 토큰 없음, A08 두 경우·처리 지연·부분 스레드·조회 판정·시나리오, 선택 규칙), `packages/domain/src/jobs.test.ts`(resume·local_rate_limited 전이, localRateLimitDecision, scenarioApplies). 통합 `tests/integration/threads.test.ts`(T13 route 로 연결: 단일·3개 성공, A08 sent/not_sent, 처리 지연, 부분 스레드, 보낸 어댑터로 조회, 사용자 재확인 조회만, A09 두 경우, 게이트 3종, 로컬 제한·429·400·403, 시나리오 API, DB 트리거, web tick route, 토큰 누출 검사·내보내기, drill Threads 표). `pnpm drill:mock` 에 Threads 표 추가(M3 표는 그대로). PGlite 연결 하나 — 실제 PostgreSQL 동시성은 관찰하지 않았다.
+- Reversible?: 예. 선택 규칙은 adapterIdFor 한 곳, 단계 표는 내보내기만(복원 경로 없음), 잠정 숫자는 어댑터 상수, 새 전이 2개는 도메인 표.
+- User decision required?: 확인 요청 — (a) 선택 규칙(연결한 적 있는 모의 Threads 계정만 Threads 모의 어댑터), (b) 401 뒤 "refresh 한 번" 대신 T13 연결 확인 한 번, (c) 잠정 요청 제한 값(24시간 250)과 "창 안 사용 0 이면 허용", (d) 부분 스레드가 멈추면(401·403·400) 앞 게시물이 원격에 남는 것과 그 항목 상태(BLOCKED/FAILED + 단계 목록), (e) 취소 요청 중 일부 게시된 스레드를 UNKNOWN 으로 두는 것, (f) 모의 공개 범위 = 승인 공개 범위 가정.
+- Exact authorized scope (if applicable): 외부 호출 0(모의 시뮬레이터만, 네트워크 없음), 새 의존성 0, 비밀 0(시험 키는 실행 중 난수), 실계정·앱 등록 0.
+- Consequences: 모의 연결한 Threads 계정으로 개발 화면에서 2단계 게시·재개·요청 제한을 끝까지 볼 수 있다. 모든 결과는 MOCK 이며 실제 발행 실적이 아니다. remote_steps 의 모의 ID CHECK 때문에 live 어댑터는 이 표 규칙을 다시 정하는 migration 없이 붙일 수 없다(의도된 차단).
+- When to revisit: 실계정 연결(D24 준비물 수령 뒤) — 공식 rate limit·글자 수·컨테이너 만료·같은 컨테이너 재게시 동작·공개 범위·401 갱신 규칙·scope 이름을 공식 문서로 재확인하고 remote_steps CHECK 를 바꾼다. PostgreSQL 전환(동시성).
+
+## D27 — T15 YouTube 재개 업로드(모의 어댑터·모의 Google OAuth 만): 공급자·scope 자리 표시, 어댑터 선택, 요청 결과 규칙, 업로드 단계·단조 offset, 조각 크기, 잠정 할당량, 강제 비공개, 업로드 뒤 취소, 실계정 시험 blocked_external
+- Decision ID / date: D27 / 2026-10-02 (Europe/Moscow). 구현자 잠정 판단 — 사용자 확인 요청 항목은 아래 "User decision required".
+- Question: docs/05 T15("YouTube resumable upload·private 결과·processing 상태·조건부 schedule")를 실제 Google/YouTube 호출·OAuth 앱 등록·실계정 없이(D24) 어떻게 구현하고, docs/02 "장시간 영상 업로드"(검증된 파일·세션 URI/offset/video ID 보관·웹 요청 안에서 전체 영상 처리 금지)·docs/03 YouTube 행(미검증 프로젝트 private 제한, 업로드 성공 ≠ 공개 성공, publishAt 조건, 승인 스냅샷)·A08·A12·A13·A14 를 서버·DB 에서 강제하는가?
+- Options: (1) OAuth: Threads 형 모의 공급자 재사용 / **Google 형 모의 공급자를 같은 틀에 추가(mock_google — T13 저장·봉인·세대·잠금 순서·정리 대기·철회 경로 그대로)**. (2) 업로드 단계 기록: 새 표 / **remote_steps 에 종류 upload_session·video 와 진행 열(received_bytes·total_bytes·resume_count)**. (3) 재개: 같은 시도 안에서 즉시 재개 / **결과 불명 → 조회(`resumable`) → 다음 시도(새 전송 의도)가 같은 세션으로**. (4) 원격 할당량 초과: Retry-After 1시간 상한으로 FAILED / **결과의 `retry_at`(초기화 시각)까지 RETRY_WAIT(시도 한도는 그대로)**.
+- Chosen option: 각 굵은 선택. 세부:
+  - **모의 Google OAuth**(`MockGoogleOAuthProvider`, provider id `mock_google`, 동의 화면 `/api/oauth/mock-google/authorize`): authorization code + PKCE S256 + state(T13 그대로), scope 는 업로드용 **자리 표시 이름 `youtube.upload(mock)` 하나**(관리·분석 자리 표시 이름은 기본 요청 안 함) — **실제 Google scope 이름이 아니며 live 전에 공식 문서로 다시 확인**한다. 토큰 `mockyt_at_`(1시간)·`mockyt_rt_`(180일 — 연결 정보 `expires_at` = refresh 기준이라 health 판정은 그대로). access token 만료는 봉인한 평문 안 `access_expires_at` 에만 두고, `readAccessTokenForSend` 가 만료(여유 5분)면 `credential_access_token_stale` → 작업 처리기가 T13 `refreshCredential` 을 한 번 부르고 다시 읽는다(`JobRunOptions.credentials.refresh`). 갱신은 **모의 가정: 회전**(새 access·refresh, 이전 묶음 무효 — 실제 Google 은 보통 refresh token 을 유지하므로 live 전에 재확인; 회전으로 둔 이유는 T13 의 세대 충돌 정리 철회가 새 묶음만 철회하게 하려는 것). 철회는 그 동의(grant)의 토큰 전부. DB CHECK(0032): oauth 공급자에 `mock_google`, `is_mock = provider ∈ {mock_threads, mock_google}`. Health 게이트·T13 규칙 변경 없음.
+  - **어댑터 선택**(`adapterIdFor` 한 곳): 모의 + youtube + credential_state ≠ none → `mock_youtube`(YouTubeMockChannelAdapter). seed 모의 계정(연결 없음) → `mock_generic`(M3 그대로 — M3 drill·시험 불변). 전송 의도의 `adapter_id` 로 조회.
+  - **요청 결과 규칙**(T10 개정): 모의 연결한 YouTube 계정은 `upload_private`(생략 시 기본) 또는 `public_publish`(여전히 MOCK — 결과·화면 MOCK), `mock_publish` 는 400 `requested_result_not_supported`. seed 모의 계정·Threads 모의 연결 계정은 `mock_publish` 만(그대로). `upload_private` = private·publish_at 없음, `public_publish` = public·unlisted(publish_at 없음) 또는 private + publish_at(처음부터 명확히 승인한 예약 공개 — docs/03). publish_at 은 YouTube 만·`scheduleFromMsk`(미래 1분 이후)·업로드 일정보다 뒤, 승인 스냅샷 `provider_metadata.publish_at`(ISO UTC)에 들어가 hash 대상 — 없으면 `{}` 이라 기존 payload·hash 불변, 묶음 스키마는 YouTube 만 허용. 어댑터 `validate` 가 같은 규칙을 다시 본다(`approval_mismatch`·`publish_at_requires_private`), submit 은 원격 호출 전에 publish_at ≤ 지금 + 1분이면 거부, `snapshotProblems` 에 `publish_at_passed`(무효화 사유 schedule_passed).
+  - **업로드 단계 저장**(migration `0032_t15_youtube_upload`): `remote_steps.kind` 에 `upload_session`(remote_id = 세션 URI, post_index = 세션 순번, 상태 created|finished|expired|error)·`video`(remote_id = 영상 ID, post_index 0, uploaded|processed|error), 종류별 상태 CHECK. 새 열 received_bytes(원격이 확인한 받은 바이트)·total_bytes·resume_count. 트리거 `remote_steps_guard` 교체: 0031 규칙 + **received_bytes 는 앞으로만**(줄이거나 NULL 로 되돌리기 거부), total_bytes 불변, resume_count 앞으로만, 끝난 상태(published·processed·expired·error) 불변. 앱 `recordRemoteStep` 도 같은 규칙(409 `remote_step_regress`). **세션 URI 는 첫 조각 전에, 받은 바이트는 조각마다** 기록 — 각각 자기 짧은 트랜잭션(원격 호출 동안 DB 잠금 없음). 세션 URI 는 업로드 권한이 담긴 값으로 다뤄 화면·API·감사·로그에는 `세션 있음` 만, 내보내기 묶음에서는 `mock-redacted:session:<sha256 앞 16자>` 로 가린다(remote_steps 는 계속 내보내기만).
+  - **재개 규칙**: 유효할 수 있는 세션(created·finished)이 있으면 새 세션을 만들지 않고 queryOffset → 받은 바이트부터 이어 올림(resume_count + 1). 끊김·시간 초과·5xx(조각) → ambiguous → 조회: 받은 바이트 < 전체 → `resumable` → `resume`(RETRY_WAIT 즉시) → 다음 시도가 같은 세션 / 다 받음(영상 ID) → 영상 기록 → 처리 확인 / 만료(영상 없음을 원격이 증명) → 단계 expired + `not_found`(확실) → 다음 시도가 새 세션 / 원격이 세션을 모름(재시작)·읽기 실패 → `unknown`(3회 뒤 UNKNOWN). 단계 기록 없음 → `not_found`(영상은 기록된 세션으로만 올리므로 확실 — 기록 전 응답을 잃은 세션은 바이트 없이 만료된다).
+  - **조각 크기**: 기본 8MiB(D15 업로드 조각과 같은 값, 256KiB 배수), 어댑터 설정으로 바꿀 수 있다(시험 64KiB). 저장소 `readRange(key, start, end)`(최대 64MiB) — 업로드는 조각 하나씩만 메모리에 둔다(시험이 읽기 크기 ≤ 조각 크기를 확인).
+  - **처리·결과**: 마지막 조각 → 영상 ID 기록 → `processing`(REMOTE_PROCESSING, 결과 없음) → 조회 getVideo: uploaded → processing, processed → found(+ processed 기록), failed·rejected → 새 조회 결과 `failed` → FAILED(영구, 코드 `youtube_rejected:<사유>`). 결과 종류는 **원격이 보고한 값**으로: private → UPLOADED_PRIVATE, private + publishAt → SCHEDULED_REMOTE, public·unlisted → PUBLISHED. 작업 이력의 확인 사건에 `requested_visibility`(승인)·`remote_visibility`(원격)를 함께 남긴다(A12, 새 열 없음 — 요청값은 불변 항목 열).
+  - **강제 비공개**: 시뮬레이터의 미검증 API 프로젝트(기본)는 public·unlisted 요청을 private 로 강제하고 publishAt 을 버린다(공개 제한 — docs/03). 그래서 모의 기본값에서는 SCHEDULED_REMOTE·PUBLISHED 가 나오지 않는다. 검증된 프로젝트는 시험·개발 시나리오(`youtube_project_verified`·`youtube_scheduled_private`)로만 흉내 낸다.
+  - **할당량(잠정)**: capabilities.rate_limit = 24시간 업로드 시작 6회(10,000 단위/일 ÷ 1,600 단위/업로드 추정, `checked_at: null`, source provisional — D19-d). 작업 처리기는 어댑터의 `rateStepKinds = ['upload_session']` 으로 센다(재개는 새 단위 아님). 넘으면 전송 의도·세션 없이 RETRY_WAIT(`local_rate_limited`, 창이 풀리는 시각, 화면 `할당량 소진 — HH:mm MSK 이후 재시도`). 실제 할당량은 프로젝트마다 다르고 하루 단위 초기화(롤링 창이 아님)라 live 전에 공식 자료로 바꾼다. 원격 403 quotaExceeded → 부작용 없는 일시 오류 + `retry_at`(초기화 시각)까지 RETRY_WAIT(`decideRetryAt`, 시도 한도 그대로).
+  - **401**: T14 와 같이 BLOCKED + T13 `checkCredential` 1회. 403 forbidden·400 → FAILED.
+  - **취소**: 업로드 중 취소 요청이면 조각 사이에서 멈추고(영상 없음) CANCELED. 영상 ID 가 생긴 뒤에는 삭제 명령이 범위 밖(capabilities.cancel=false, cancel → unsupported `youtube_delete_out_of_scope`) — T11 규칙대로 원격 확인 뒤 `cancel_too_late` → CONFIRMED, 화면 `업로드됨 — 삭제는 별도 동작(범위 밖)`(브리프의 "CANCEL_REQUESTED 유지" 대신 — 확인된 사실을 CONFIRMED 로 남기고 취소 성공이라고 하지 않는 기존 A11 규칙과 맞춤). 전이 표에 CANCEL_REQUESTED → permanent_failure(→ FAILED) 추가(취소 요청 중 원격 거부 확인).
+  - **썸네일**: 영상 외 첨부(썸네일)가 있으면 validate 가 `thumbnail_not_supported_t15`(FAILED) — 승인한 첨부를 일부만 보내지 않는다(thumbnails.set 은 범위 밖).
+  - **실계정 시험**: `blocked_external` — Google Cloud 프로젝트·OAuth 동의 화면·실제 scope 이름·테스트 채널·API 프로젝트 감사(공개 제한 해제) 여부·redirect URI·마스터 키 위치·첫 시험 영상과 공개 범위를 사용자에게 받고 정확한 범위를 승인받기 전에는 하지 않는다. live 계정은 지금처럼 어댑터 없음(`LiveChannelNotConfiguredError`), live OAuth 는 `LiveOAuthNotConfiguredError`.
+- Evidence / assumption: 단위 `packages/providers/src/youtube-mock.test.ts`(시뮬레이터 offset·끊김·만료·강제 비공개·메타데이터·할당량·토큰, 오류 분류 표, 결과 종류, 선택 규칙·시나리오, validate 조합 표, submit/reconcile — 같은 세션 재개·응답 유실·만료 → 새 세션·재시작 unknown·처리 지연·거부·원격 호출 없는 거부·취소, Google 형 공급자 PKCE·회전·철회·scope), `packages/domain/src/jobs.test.ts`·`distribution.test.ts`(T15 절). 통합 `tests/integration/youtube.test.ts`(T13 route 로 Google 형 모의 연결, T08 업로드 API 로 올린 VERIFIED 합성 영상: 성공·A14·A08·만료·처리 지연·A12·검증된 public·예약·publish_at 거부·validate approval_mismatch·로컬/원격 할당량·401·거부·A09·정리 대기 차단·access token 갱신·취소 두 경우·트리거·web tick route·토큰/세션 URI 누출 검사·내보내기 가림·drill 표). `pnpm drill:mock` 에 YouTube 표 추가. PGlite 연결 하나 — 실제 PostgreSQL 동시성은 관찰하지 않았다. 합성 영상은 MP4 서명만 맞는 바이트(디코딩 검증 없음 — D15 범위).
+- Reversible?: 예. 선택 규칙·요청 결과 규칙은 한 곳씩, 잠정 숫자는 어댑터 상수, 단계 규칙은 0032 트리거 하나, 새 전이 1개·조회 결과 1개는 도메인 표.
+- User decision required?: 확인 요청 — (a) 자리 표시 scope 이름과 "실제 이름은 live 전 재확인", (b) 모의 갱신을 회전으로 둔 것, (c) 모의 연결 YouTube 계정에 `upload_private`·`public_publish` 를 허용하고 `mock_publish` 를 막은 것(기본 upload_private), (d) 예약 공개를 `public_publish + private + publish_at` 으로 표현한 것, (e) 잠정 할당량(24시간 6회, 롤링 창)과 원격 할당량 초과의 초기화 시각 대기, (f) 업로드 뒤 취소를 CONFIRMED + "삭제는 범위 밖"으로 끝내는 것, (g) 썸네일이 있으면 실패시키는 것, (h) 세션 URI 를 내보내기에서 가리는 것.
+- Exact authorized scope (if applicable): 외부 호출 0(모의 시뮬레이터·모의 공급자만, 네트워크 없음), 새 의존성 0, 비밀 0(시험 키는 실행 중 난수), 실계정·OAuth 앱 등록 0.
+- Consequences: 모의 연결한 YouTube 계정으로 개발 화면에서 재개 업로드·처리·결과 종류를 끝까지 볼 수 있다. 모든 결과는 MOCK 이며 실제 발행 실적이 아니다. remote_steps 의 모의 ID CHECK 는 그대로라 live 어댑터는 이 표 규칙을 다시 정하는 migration 없이 붙일 수 없다(의도된 차단). 한 번의 submit 이 파일 전체를 올리므로 실제 2GB 업로드는 `JOB_SUBMIT_TIMEOUT_MS`(기본 30초)를 넘는다 — 모의는 메모리라 빠르지만 live 전에 진행 기반 시간 제한(조각마다 연장)으로 바꿔야 한다.
+- When to revisit: 실계정 연결 승인 시(공식 scope·할당량 단위·하루 초기화 시각·조각 단위 규칙·세션 만료·refresh token 회전 여부·미검증 프로젝트 제한·publishAt 규칙 재확인, remote_steps CHECK 개정, submit 시간 제한), PostgreSQL 전환.
+
+## D28 — 인계·판정 사본을 docs/handoffs/ 에 추적하되 코드 커밋과 분리 (AGENTS.md "gitignored .handoffs/" 규칙의 예외 범위)
+- Decision ID / date: D28 / 2026-10-02. Codex FIX4-T13 P2(docs/handoffs/T13_IMPLEMENTATION_HANDOFF.md:253)에 대한 처리.
+- 배경: AGENTS.md 는 리뷰·인계 산출물을 gitignored `.handoffs/` 나 저장소 밖에 두라고 한다. 그러나 사용자가 로컬 ↔ 클라우드 세션 이동을 요청했고(2026-09-25 M3, 2026-10-02 M4), 클라우드는 로컬 `.handoffs/` 를 볼 수 없어 M2 이후 인계·판정 사본을 `docs/handoffs/` 에 커밋해 왔다.
+- Chosen option: `docs/handoffs/` 사본 추적은 유지한다(세션 간 인계에 필요). 대신 (1) 인계·판정 사본은 **docs 전용 커밋**으로만 넣고, 리뷰 대상 코드 커밋에는 섞지 않는다(ea85ac6 은 섞였음 — 이후 커밋부터 적용). (2) 리뷰 대상 HEAD 를 SHA 기록만을 위해 바꾸지 않는다(SHA 는 뒤따르는 docs 전용 커밋에 기록). (3) Codex 리뷰 전문은 계속 로컬 `.handoffs/` 에만 두고, docs/handoffs 에는 판정·지적 제목 요약만(클라우드 수정 라운드에 전문이 필요할 때만 사본).
+- Reversible?: 예. 사용자가 원하면 docs/handoffs 를 저장소 밖(예: 별도 브랜치)으로 옮긴다.
+
+### D26 후속 (T14 FIX round 1, Codex review-T14, 코드 6f766d2)
+- remote_steps 는 "내보내기만" 에서 **읽기 전용 이력 복원**으로 바꾼다(job·intent·item 과 함께, 업로드 세션 URI 는 가린 값 그대로). 복원한 작업의 조회가 not_found 면 unknown(단계 없음 restored_steps_missing / 단계 있음 restored_not_found_unverified).
+- 조회 어댑터는 의도에 기록된 것만 쓴다: adapter_id 없음 → `mock_generic`(T14 이전 유일 어댑터), 모르는 ID → unknown(adapter_unresolved). 현재 계정 상태로 고른 어댑터로 대체하지 않는다. 다른 어댑터로 기록된 단계가 있는 작업은 전송 차단(adapter_changed).
+- 만료 컨테이너의 publish 오류도 조회 경로(→ unknown).
+- 처리 지연(REMOTE_PROCESSING) 뒤의 재개는 시도 한도에 넣지 않는다(jobs.resume_count, migration 0034, 상한 20). 결과 불명 뒤 재개는 시도로 센다.
+- 부분 게시 뒤 대기(QUEUED·RETRY_WAIT·BLOCKED) 중 취소 → UNKNOWN(cancel_partial, thread_partial_canceled) — "보내지 않음" 이라 말하지 않는다(A11).
+- 요청 제한 검사는 계정별 advisory 잠금 + 같은 계정 진행 중 작업의 남은 단위 예약. 창이 비면(used=0) 한도보다 큰 작업 허용 규칙은 그대로(잠정).
+- 별도 `pnpm worker` 프로세스는 web 이 발급한 모의 토큰을 모른다(프로세스 메모리) → 원격 401 → BLOCKED·게시 0. 실계정 어댑터에서는 DB 의 봉인 토큰을 쓰므로 해당 없음.
+
+### D27 후속 (T15 FIX round 1, Codex review-T15, 코드 cc26535)
+- 웹 요청 경로(POST /api/worker/tick·inline worker 의 health·목록 tick)는 영상 전체를 올리지 않는다: 작업당 조각 1개·5초 예산(`WEB_TICK_UPLOAD_SLICE`) 뒤 `upload_yield`(SENDING → RETRY_WAIT 즉시, resume_count+1 — 시도 아님, 받은 바이트가 늘어야만 yield). 별도 worker 프로세스는 예산 없음(30초 submit 제한은 그대로 — live 전 재검토).
+- 할당량 단위는 기록된 단계로 계산한다(어댑터 훅 rateUnitsRemaining): 영상이 있거나 살아 있을 수 있는 세션이면 0, 세션 없음·만료·오류면 1. 만료 세션은 창 안 사용량으로 남고 새 세션 비용을 상쇄하지 않는다. 사전 검사 뒤 세션이 만료돼 새 세션이 필요해지면 그 시도는 부수 효과 없이 끝나고(upload_session_requires_quota_check) 다음 시도가 할당량을 다시 검사한다.
+- 모의 시뮬레이터의 queryOffset 만료 주입은 완료된 세션에는 적용하지 않는다.
+- 남은 위험: yield 마다 전송 의도 1건(2GB 를 웹 tick 으로만 올리면 최대 256건), inline 모드는 웹 요청이 와야 진행.
+
+## D29 — T16 Instagram(모의만): 잠정 판단(구현자 제안, 오케스트레이터 기록) — 사용자 확인 필요
+- Decision ID / date: D29 / 2026-10-03. 코드 620ed86. 출처: docs/handoffs/T16_IMPLEMENTATION_HANDOFF.md "Proposed D29".
+- 상태: **잠정**. 아래 "User decision required" 항목은 실계정 연결 전 사용자 확인이 필요하다(D24 와 같은 원칙). 특히 공개 미디어 URL 방식은 개인 첨부를 외부에서 접근 가능하게 만드는 결정이라 사용자 승인 전에는 모의 구현만 둔다.
+
+## Proposed D29 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D30 — 사용자 결정 (2026-10-03 아침): D29 공개 미디어 URL·D26/D27·D23·D28·실계정 준비·T17 보류·M5 착수
+- Decision ID / date: D30 / 2026-10-03 (Europe/Moscow), 사용자 확정.
+1. **D29(a) 공개 미디어 URL 방식: ① 채택** — 이 앱이 짧은 수명의 서명 URL 로 미디어를 직접 제공한다. 결과: 실제 Instagram 게시에는 앱이 인터넷에서 HTTPS 로 접근 가능해야 하므로 운영 배포(T21, 별도 승인)가 선행 조건이다. 로컬(localhost)에서는 실제 Instagram 이 파일을 가져갈 수 없다. 구현 원칙(실계정 작업 때): 서명·만료(분 단위)·1회성 또는 짧은 재사용, 경로에 asset ID·checksum 노출 금지, 접근 로그 기록, 원격이 가져간 뒤 철회, 승인된 checksum 과 같은 바이트만 제공. 그 전까지는 모의 구현(MockPublicMediaUrlProvider) 유지. D29 의 나머지(b~) 수치·이름은 잠정 유지.
+2. **D26(Threads)·D27(YouTube): 잠정값 그대로 진행** — 실계정 연결 시 공식 문서로 재확인하는 원칙(각 D 의 When to revisit)은 그대로.
+3. **D23 남은 항목: Codex 권고대로 옮긴다** — 공개 `/api/health` 의 `jobs`(상태별 수·attention_plans)·`uploads`·`db.captures` 를 로그인 뒤(GET /api/ops/summary, owner 범위)로 옮기고 공개 health 는 생존·준비 상태만.
+4. **D28: 현재 방식 유지** — 인계·판정 사본은 docs/handoffs/ 에 추적, docs 전용 커밋으로만.
+5. **실계정 연결 준비물: 사용자 "준비됨"** — 실제 외부 연결·호출·게시는 정확한 범위(첫 채널·첫 시험의 원고·공개 범위·호출 종류·자격 증명 위치)를 사용자가 승인한 뒤에만(AGENTS.md "Before real external connections … present exact scope for explicit approval"). 앱 ID·비밀 값은 사용자가 `.env.local` 에 직접 넣고, 대화·저장소·로그에는 남기지 않는다.
+6. **T17 추가 채널: 보류. M5 모의 작업 착수** — T18(Notion·Drive 선택 가져오기, 파일·모의), T19(허용 소스 수집, 모의 수집기·기본 OFF). T21(운영 배포)은 별도 승인.
+
+## D31 — 실계정 연결 범위 승인: Threads, 2단계(OAuth 연결·프로필 조회)까지
+- Decision ID / date: D31 / 2026-10-03, 사용자 승인("Threads로 하는데 동의 2단계까지만 진행").
+- 승인 범위(정확히):
+  1. 1단계 — Threads 실제 OAuth·연결 확인 어댑터 코드 작성. 시험은 기록된 응답(fixture)으로만, 네트워크 호출 없음.
+  2. 2단계 — 사용자 테스트 Threads 계정 1개를 실제 OAuth 로 연결: 인증 창(threads.com/oauth/authorize) → 코드 교환(POST graph.threads.com/oauth/access_token) → 필요하면 장기 토큰 교환 → 프로필 조회(/me, 필드 id·username) 1회. 요청 scope 는 `threads_basic,threads_content_publish` 만(reply·insights 요청 안 함). 토큰은 T13 규칙대로 서버 암호화 저장.
+- **승인 범위 밖(별도 승인 필요)**: 실제 게시(3단계, 컨테이너 생성·threads_publish), 다른 계정·채널, 운영 배포, 터널 등 앱을 외부에 노출하는 일.
+- 설정: `OAUTH_MODE=live`, `OAUTH_LIVE_APPROVAL_REF=D31`, `PUBLISH_MODE` 는 **disabled 유지**(게시 불가). 앱 ID·시크릿·redirect URI 는 사용자가 `.env.local` 에 직접 넣는다(대화·저장소·로그에 값 없음).
+- redirect URI: 앱 대시보드의 유효한 OAuth 리디렉션 URI 와 정확히 일치해야 함(공식 문서 2026-08-12 판 확인). 로컬 기본값 `http://localhost:3000/api/oauth/callback`. Meta 가 http 를 거부하면 HTTPS 로컬 주소가 필요 — 그때 방법을 다시 정한다(외부 노출 방식은 별도 승인).
+
+## D32 — T18 Notion·Drive 선택 가져오기(파일·모의): 잠정 판단 → 2026-10-12 확정(아래 "D32·D33 확정")
+- Decision ID / date: D32 / 2026-10-03. 코드 1427118. 출처: docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md "Proposed D32".
+- 상태: **잠정**. 실제 Notion·Drive 연결(OAuth·API)은 하지 않으며 별도 승인 대상.
+
+## Proposed D32 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D33 — T19 허용 소스 수집·재추천(모의 수집기): 잠정 판단 → 2026-10-12 확정(아래 "D32·D33 확정")
+- Decision ID / date: D33 / 2026-10-03. 코드 4a2e02f. 출처: docs/handoffs/T19_IMPLEMENTATION_HANDOFF.md "Proposed D33".
+- 상태: **잠정**. 실제 웹 수집(실제 HTTP 요청)은 없으며 별도 승인 대상.
+
+## Proposed D33 (DECISIONS.md 에 넣지 않음 — 오케스트레이터·사용자 확인용 초안)
+
+## D34 — 첫 실제 AI 공급자: Claude(Anthropic), 월 상한 10 USD — D8 결정, 1단계(코드·기록된 응답 시험)까지 승인
+- Decision ID / date: D34 / 2026-10-10 (Europe/Moscow), 사용자 결정("2번 먼저, Claude로 월 상한 10 USD로 진행해줘"). D8(미정)을 닫는다.
+- 공급자·모델: Anthropic Messages API, 공식 TypeScript SDK `@anthropic-ai/sdk`(정확한 버전 고정, 공개 후 2주 이상 지난 판). 기본 모델 `claude-opus-5-5`(2026-10 기준 입력 4 USD·출력 20 USD / 1M 토큰 → `LLM_PRICE_INPUT_PER_1K=0.004`, `LLM_PRICE_OUTPUT_PER_1K=0.02`). 모델은 `LLM_MODEL` 로 바꿀 수 있고 단가도 같이 바꿔야 한다.
+- 예산: `LLM_BUDGET_MONTHLY_LIMIT=10`(USD). 1회 상한(`LLM_BUDGET_PER_RUN_MAX`)은 구현자 제안값을 따른다(잠정).
+- 승인 범위(정확히):
+  1. 1단계 — 실제 Claude 어댑터 코드 작성. 시험은 기록된 응답(fixture)·가짜 fetch 로만, 네트워크 호출 0, 과금 0.
+  2. 2단계(**별도 승인 필요**) — 사용자가 `ANTHROPIC_API_KEY` 를 `.env.local` 에 직접 넣고, 사용자가 고른 가상/공개 소재 1건으로 실제 호출 1회 확인.
+- 불변: 키는 서버에만(대화·저장소·로그·브라우저·프롬프트에 값 없음). 예약 비용이 실제 비용의 상한이 되도록 `max_tokens` = 예약 출력 상한. 모델 출력은 승인을 만들지 않고, 허용 출처 밖 인용·미제공 1인칭 경험은 기존 규칙대로 막는다.
+- 거부 대체 모델(server-side fallback): 켜지 않는다(잠정) — 대체 모델 단가가 예약 계산 밖이라 월 상한 보장이 깨진다. 거부(`refusal`)는 실패로 기록하고 사용자 원문은 보존.
+- When to revisit: 2단계 실제 호출 뒤 실제 토큰 사용량으로 예약 추정식 교정.
+- **2단계 승인(2026-10-12, 사용자 "2단계 승인")**: 실제 Claude 호출 1회. 소재는 구현자가 만든 가상 소재(AI 자동화 주제, 실명·회사·수치 없음 — `docs/handoffs/LIVEL1_STAGE2_MATERIAL.md`). 설정: `LLM_MODE=live`·`LLM_PROVIDER=anthropic`·`LLM_MODEL=claude-opus-5-5`·단가 0.004/0.02·월 10·1회 0.5·출력 4096·`LLM_LIVE_MAX_RUNS=1`·`LLM_LIVE_APPROVAL_REF=D34-2`. 키는 사용자가 `.env.local` 에 직접 입력. 공유 범위: run 상태·오류 코드·예약액·실제액·tokens_in/out 만. 끝나면 `LLM_LIVE_APPROVAL_REF` 제거. 범위 밖: 두 번째 호출, 실제 사용자 원고, 채널 초안(variants) 실제 호출, 게시.
+- **2단계 결과(2026-10-12 15:38 MSK)**: 실제 Claude 호출 1회 **성공**. 가상 소재 원고 버전 1, 모드 '개요', provider anthropic · model claude-opus-5-5. run succeeded, 제안은 버전 2(AI 제안·현재 본문 아님). 원장: 예약 0.105476 USD · 실제 0.035192 USD · 토큰 입력 1988 · 출력 1362(usage_source provider). 예약 입력 추정 ≈ 5889 토큰(실제의 약 3배 — 보수적). 모델이 허용 목록 밖 출처 4건을 냈고 서버가 버렸다(설계대로). 공개 범위 밖 동작 없음(게시 disabled). 직후 `LLM_LIVE_APPROVAL_REF` 제거로 잠금(키는 `.env.local` 에 남음 — 사용자 소유).
+
+## D35 — Claude 평상시 사용 허용(실제 AI 작성 보조·채널 초안), 월 10 USD 안에서
+- Decision ID / date: D35 / 2026-10-12 (Europe/Moscow), 사용자 결정("1번 진행해줘" — Claude 평상시 사용 허용, 오케스트레이터 추천값 수용).
+- 범위: 사용자 본인 원고에 대한 작성 보조(assist)와 채널 초안(variants) AI 호출. 공급자·모델 D34 그대로(Anthropic, `claude-opus-5-5`).
+- 설정: `LLM_LIVE_APPROVAL_REF=D35`, `LLM_BUDGET_MONTHLY_LIMIT=10`(USD), `LLM_BUDGET_PER_RUN_MAX=0.5`, `LLM_LIVE_MAX_OUTPUT_TOKENS=4096`, `LLM_LIVE_MAX_RUNS=300`(이 승인 기록 아래 실제 호출 총 횟수 안전장치 — 월 상한이 먼저 걸리는 것이 정상. 다 쓰면 새 승인 기록으로 갱신).
+- 입력 규칙(AGENTS.md 그대로): 고용주 기밀·고객·직원·비공개 수치·자격 증명은 넣지 않는다. 사용자가 직접 확인한 개인 경험·공개 자료만. 앱은 이를 자동 판별하지 않는다(사용자 책임) — 화면 안내 유지.
+- 불변: 게시(PUBLISH_MODE)는 계속 disabled. AI 출력은 승인을 만들지 않고, 1인칭 경험 문단은 확인 전 '준비됨' 전환 불가. 동시 요청의 초과액은 합쳐질 수 있다(D34 기록) — 한 번에 하나씩 쓰는 것을 권장.
+- 되돌리기: `.env.local` 에서 `LLM_LIVE_APPROVAL_REF` 를 지우면 즉시 실제 호출 차단(dev 서버 재시작).
+
+## D32·D33 확정 (2026-10-12, 사용자 "D32·D33 권고대로")
+- D32(T18 가져오기)와 D33(T19 수집·재추천)의 잠정 판단을 **현재 구현 그대로 확정**한다. 세부 근거는 `docs/handoffs/T18_IMPLEMENTATION_HANDOFF.md`·`T19_IMPLEMENTATION_HANDOFF.md` 의 "Proposed D32/D33".
+- D32: 입력은 사용자가 올린 Notion·Drive 내보내기 ZIP 의 .md·.markdown·.txt·.html·.htm·.csv 만(.docx·이미지는 목록만 — 필요 시 다음 라운드), 충돌 기본 건너뜀(체크한 항목만 새 버전), 20,000자 초과 페이지 건너뜀, 가져온 소재 위험 표시 none, 원장(import_runs·import_items) 내보내기·복원 포함, 상한 그대로.
+- D33: 허용 소스 = 사용자가 직접 등록한 https 주소(owner 당 50, 호스트 정확 일치), 주기 실행 기본 꺼짐·켜도 미리보기만, 고쳐진 글은 새 소재·버린 글은 다시 표시, 재추천 30일/14일/핵심어 2개/최대 5개/닫기 영구, 원장(수집 실행·항목·닫기) 내보내기·복원 포함. 실제 등록할 소스 목록·rights_status 는 실제 사용 때 사용자가 정한다.
+- 범위 밖(별도 승인): 실제 Notion·Drive API 연결, 실제 웹 수집(COLLECTOR_MODE=enabled), 주기 실행 켜기.
+- **D35 일시 중지 (2026-10-12)**: T21 검토 중 확인 — Anthropic 지원 국가·지역 목록(https://www.anthropic.com/supported-countries, 2026-10-12 열람)에 러시아가 없고, 제한은 "지원되지 않는 지역에 물리적으로 있는 사람의 사용"에 적용된다. 사용자의 실제 사용 위치를 앱·구현자가 확인할 수 없으므로 `.env.local` 의 `LLM_LIVE_APPROVAL_REF` 를 주석 처리해 실제 호출을 멈췄다(되돌리기: 주석 해제 + 서버 재시작). 재개 여부는 사용자가 지원 지역에서 사용하는지 직접 확인한 뒤 결정. 서버 위치로 우회하지 않는다(docs/07).
+
+## D36 — 오래 지난 예약 자동 전송 차단 기준 60분(잠정, 사용자 확인 필요)
+- Decision ID / date: D36 / 2026-10-12. 출처: T21-P2 구현(`packages/db/src/jobs.ts` beginSend, `SCHEDULE_STALE_GRACE_MS`).
+- 배경: docs/07 "장시간 오프라인 뒤 오래된 예약을 자동 공개하지 않는다" 규칙이 코드에 없었다. T21-P2 주기 타이머가 생기면 재시작 직후 사람이 없어도 지난 예약이 나갈 수 있어 추가.
+- 잠정 규칙: 예약 작업의 첫 전송 시점에 예약 시각보다 **60분 넘게 늦으면** 보내지 않고 BLOCKED(`schedule_stale`). 승인은 유지되고 사용자가 "재시도"를 누를 때만 전송. PUBLISH_MODE 는 여전히 disabled(모의만).
+- 사용자 결정 필요: 기준 시간(60분)이 적절한지.
+- **D36 확정 (2026-10-13, 사용자 "3번 괜찮아")**: 오래 지난 예약 자동 전송 차단 기준 60분을 확정한다.
+
+## D37 — 운영 배포(T21) 대기 (2026-10-13, 사용자 "4번은 아직 배포는 하지 않고 대기")
+- 로컬 선행 작업(P1a·P1b·P2·P3)은 Codex PASS 로 끝났지만 실제 배포는 하지 않는다. IdP·호스팅·도메인·서버 밖 백업 위치 결정과 배포 승인은 사용자가 다시 요청할 때.
+- **D35 재개 (2026-10-13)**: 사용자가 사용 위치(Anthropic 지원 지역)를 직접 확인하고 `LLM_LIVE_APPROVAL_REF` 를 다시 켰다(사용자 판단). 설정 D35 그대로(월 10 USD·1회 0.5 USD·호출 수 300).
+- **D31 2단계 결과 (2026-10-13 15:41 MSK)**: 실제 Threads OAuth 연결 **성공** — @yongho.tho, 권한 threads_basic·threads_content_publish 허락, 장기 토큰 만료 2026-12-12(자동 갱신 범위 밖 → 그 전에 재연결), 프로필 조회 1회. 게시 없음(PUBLISH_MODE disabled). 진행 중 조정: Meta 가 http://localhost redirect 를 거부("안전하지 않은 로그인 차단") → **외부 노출 없이** 로컬 HTTPS(자체 서명 인증서 `data/dev-certs`, git 제외, 30일)로 `https://localhost:3000/api/oauth/callback` 사용, dev 서버를 127.0.0.1 에만 바인드. 테스터 초대 수락 필요(오류 1349245) → 사용자 수락 후 성공. 발견: dev 로그에 콜백 query(code) 기록 → DEV-LOG 로 수정.
+
+## D38 — 실제 게시: Threads 글 1건 (2026-10-13)
+- 1단계(사용자 "실제 게시 진행해보자"): LIVE-P1(코드 320dadb) 실제 Threads 글 게시 어댑터 코드. 시험은 기록된 응답·가짜 fetch 만, 네트워크 0.
+- 2단계 승인(사용자 "본문 그대로 좋아, 진행해줘", 조건: LIVE-P1 Codex PASS 뒤): 계정 @yongho.tho, 글자만(첨부 없음), 승인 즉시 1건,
+  본문 정확히: "[테스트] Content Studio에서 보내는 첫 게시물입니다. 반복 업무 하나를 정해 AI 자동화로 줄여 보는 실험을 기록하려고 합니다."
+  공개 범위: 계정 공개 설정을 따름. PUBLISH_LIVE_MAX_POSTS=1. 삭제 API 권한 없음 → 필요 시 사용자가 Threads 앱에서 직접 삭제.
+  범위 밖: 두 번째 게시, 다른 계정·채널, 예약 게시, 이미지·링크, 배포. 끝나면 PUBLISH_LIVE_APPROVAL_REF 제거·PUBLISH_MODE=disabled 로 복귀.
+- **D38 1단계 결과 (2026-10-13 20:06 MSK)**: LIVE-P1 320dadb → FIX 1a22434 → **FIX2 b8a7200 Codex PASS**(gpt-6-astra · xhigh). 검사 unit 1630·integration 895·drill:mock 위반 0 PASS. 오케스트레이터가 `./data/pglite` 백업(`data/pglite.bak-20261013-pre0044`) 뒤 `db:migrate`(0044) 적용, `drill:restore` PASS. 실제 게시·외부 호출 없음(PUBLISH_MODE disabled 그대로).
+- 2단계 준비 값(사용자가 `.env.local` 에 직접): `PUBLISH_MODE=enabled`, `PUBLISH_LIVE_APPROVAL_REF=D38`, `PUBLISH_LIVE_MAX_POSTS=1`. 결과 불명이면 자동 재게시 없이 UNKNOWN — Threads 에서 직접 확인.
+- **D38 2단계 1차 실행 (2026-10-14 12:21 MSK)**: 계획 9aabb159 → 작업 c94807f5 가 컨테이너 생성에서 `container_permission_denied`(영구)로 실패 — **게시 없음**(publish 요청 안 보냄). 사용자 확인: Meta 사용 사례·Threads 앱 양쪽에 threads_content_publish 허용됨. 원인 숫자 코드는 당시 저장하지 않아 미상 → LIVEP1-DIAG(숫자 진단만 저장).
+- **추가 승인 (2026-10-14, 사용자 "나머지 진행해줘")**: 같은 본문·같은 계정으로 시도 1회 추가(실제 게시는 여전히 최대 1건), 진단 기록 추가, 위치 경로·메뉴·UI 정리. 실패 시도가 기존 승인 기록(D38)의 한도 1을 썼으므로 재시도는 새 승인 기록 `PUBLISH_LIVE_APPROVAL_REF=D38-3`, `PUBLISH_LIVE_MAX_POSTS=1` 로, 새 계획(같은 초안)으로 한다.
+- **D38 2단계 결과 (2026-10-14 14:23 MSK)**: 새 승인 기록 `D38-3`(한도 1)으로 새 계획 26578f3c → 작업 6e236a8f. 컨테이너 생성 성공(1차의 권한 오류 재발 없음 — Meta 쪽 권한 반영 지연으로 추정), 게시 요청 전송 뒤 **화면 버튼 tick 의 10초 제한(uiTickTimeoutMs)** 에 걸려 `submit_timeout` → 결과 불명(RECONCILING, 재게시 없음 — 설계대로). 수동 재확인(목록 조회 1회)이 확인 후보 `https://www.threads.com/@yongho.tho/post/DeeRJ-LjgdA` 를 기록(미확인 표시). **사용자가 Threads 에서 게시 확인("잘 올라갔어") — 실제 게시 1건 성공.** 앱 상태는 설계상 UNKNOWN/RECONCILING 로 남는다(본문·시각 일치만으로 확정하지 않음).
+- 잠금(2026-10-14): `.env.local` 의 `PUBLISH_MODE=disabled`, `PUBLISH_LIVE_APPROVAL_REF` 비움, dev 서버 재시작 뒤 health `publish: disabled` 확인.
+- 발견·후속: (1) 실제 Threads 는 컨테이너 생성 ~5초·상태 확인 ~1.5초 — 화면 tick 10초 제한이 짧다(LIVEP1-TIMEOUT). (2) 결과 불명 항목을 사용자가 "Threads 에서 확인함"으로 표시하는 수단이 없다(후보 링크만). (3) UI 정리(메뉴 묶음·위치 경로·문구 축소) 요청.
+- **D38 마무리 (2026-10-14 18:18 MSK)**: 사용자가 계획 26578f3c 항목에서 "Threads에서 확인함" — publication threads:18032037416904820(USER_CONFIRMED, PUBLISHED, 공개 범위 unknown), 항목 CONFIRMED·계획 completed. 게시 기능은 잠긴 상태 유지(PUBLISH_MODE=disabled).
+
+## D39 — Threads 평상시 실제 게시 허용(하루 3건 상한·즉시 중지 스위치) + 만료 관리 (2026-10-19)
+- 사용자 승인(2026-10-19, "2단계 권장안 승인하고, 3단계 만료관리도 해줘"). 권장안: 게시 허용은 한 번만 켜고, 글마다 승인은 앱 안 승인 버튼(정확한 본문·계정·공개 범위·예약 시각 고정, 편집 시 승인 무효 — 기존 불변식 그대로), 하루 상한 3건, 즉시 끄는 스위치.
+- 범위: 계정 @yongho.tho("실제 게시 계정으로 사용"한 Threads 계정)만, Threads 글자 게시만(기존 어댑터 범위 — 이미지·링크 첨부 없음), 즉시 게시와 승인된 예약 게시(로컬 서버가 켜져 있을 때만 실행, D36 60분 지나면 차단). 다른 채널(Instagram·YouTube 실제)·다른 계정·배포는 범위 밖.
+- 상한: 실제 게시 전송 의도 기준 **최근 24시간 3건**(`PUBLISH_LIVE_DAILY_MAX=3`, 같은 작업의 재시도·이어 보내기는 새로 세지 않음). 승인 기록 `PUBLISH_LIVE_APPROVAL_REF=D39`, `PUBLISH_LIVE_MAX_POSTS=1000`(기록당 총량 — 일일 상한이 실제 제한).
+- 즉시 중지: 설정 화면 "실제 게시 일시 중지" — 서버 재시작 없이 바로 막힘(DB 저장, 전송 직전 트랜잭션 안에서 확인). 재개는 로그인한 소유자만. 완전히 끄기는 기존대로 `PUBLISH_MODE=disabled`.
+- 결과 불명 처리·재게시 금지·USER_CONFIRMED 는 D38 그대로.
+- 만료 관리: Threads 연결 만료(현재 2026-12-12) 14일 전부터 홈·설정에 경고 + 설정의 "다시 연결"(D31 연결 범위 안 — 토큰 갱신 API 호출은 추가하지 않음). 로컬 인증서(`data/dev-certs`, 만료 2026-11-12) 14일 전부터 홈에 경고(개발 모드만) + 갱신 스크립트(로컬 openssl, 외부 호출 없음).
+- 시행 순서: LIVE-P2(상한·스위치)·EXPIRY-1 구현 → Codex PASS → `.env.local` 설정 → 서버 재시작 → health·화면 확인. 그 전까지 게시는 잠긴 상태(PUBLISH_MODE=disabled).
+- **명확화(2026-10-23, FIX2-CODEX — Codex review-LIVEP2 Q2, 사용자 결정 "다 권고 사항으로 진행해줘")**: 결정 내용(최근 24시간 3건)은 그대로이고, 위 상한 줄의 "같은 작업의 재시도·이어 보내기는 새로 세지 않음"이 무엇을 뜻하는지만 코드대로 적는다(`packages/db/src/live-publish.ts` `livePublishDailyUsage` · `packages/db/src/jobs.ts` beginSend).
+  - 세는 것: 이 owner 의 실제 게시 전송 의도(승인 기록 값과 무관, 결과와도 무관 — 게시 시도 표식 전에 멈춘 시도의 의도도)가 창(`created_at > 지금 − 24시간`) 안에 하나라도 있는 **서로 다른 작업 수**.
+  - 같은 작업의 재시도·이어 보내기는 **최근 24시간 창 안에서는 한 번만 센다**: 그 작업의 실제 전송 의도가 이미 창 안에 있으면 새로 세지 않고 일일 상한으로 막지도 않는다(상한이 차 있어도 보낸다 — 중지·승인 기록 총량 같은 다른 검사는 그대로).
+  - **창이 지나면 다시 센다**: 그 작업의 가장 최근 실제 전송 의도가 창 밖이 된 뒤 다시 보내면 새 게시로 센다 — 그때 다른 작업이 상한만큼 있으면 보류(`live_publish_daily_limit`). 과소 집계를 막는 보수적 선택이다(Codex 답 2).
+  - 승인 기록당 총량(`PUBLISH_LIVE_MAX_POSTS`, D38)은 창 없이 작업당 한 번 센다(그 승인 기록으로 전송 의도를 만든 적 있는 작업 수 — 재시도로 늘지 않음).
+  - 근거 시험: `tests/integration/live-publish-daily.test.ts` "같은 작업의 재시도는 새로 세지 않는다…"(창 안)·"D39 명확화…"(창 밖). 코드는 바꾸지 않았다.
+
+## D40 — 전체 코드 Claude 검토 2차(FULLREV2) 결정 5건 (2026-11-02)
+- Context: `docs/handoffs/FULLREV2_CLAUDE_REVIEW.md`(HEAD 09ddca0, Claude 독립 검토 — Codex 아님)의 확정 33건 중 제품 동작을 정해야 고칠 수 있는 5건. 사용자 결정(2026-11-02 "권고대로")으로 검토 기록의 권고안을 채택한다.
+- Decision:
+  1. **G2 중복 게시 경고(docs/03 "동일 본문 재게시는 경고 후 새 승인")**: 같은 owner 의 다른 계획에 같은 글(같은 채널 초안 버전 + 같은 계정, 또는 같은 payload_hash)의 항목이 이미 게시 기록이 있거나(USER_CONFIRMED 포함), 결과 불명이거나, 진행 중이면 새 계획 만들기·승인·실행 화면에 경고한다. 실제 계정(kind live) 항목은 그때 서버가 확인값(`acknowledge_duplicate`)을 받아야 승인·실행한다(없으면 409). 모의 계정은 경고만.
+  2. **G9 위험 표시**: 원고의 아이디어 또는 연결 소재 중 위험 표시가 `needs_check`('확인 필요')인 것이 있으면 승인·실행·전송 직전 재검사에서 막는다. 위험 표시를 `needs_check` 로 바꾸면 그 원고 항목의 활성 승인을 무효화한다.
+  3. **G16 세션**: 세션에 인증 정책 지문(AUTH_MODE·OIDC issuer·허용 sub·허용 identity)을 저장하고, 현재 정책과 다르면 그 세션을 거부한다(migration 추가).
+  4. **G20 1인칭 판별**: 어휘('저희'·'우리 ○○'·'저도'·'제게' 등)와 앞 경계(괄호·꺾쇠·따옴표·강조 기호 뒤)를 넓힌다. 정규식 휴리스틱이라는 한계(LIVEL1 남은 위험)는 그대로다.
+  5. **G29 변경 없는 저장**: 원고 본문이 줄바꿈 표기만 정리해 같으면 메모 유무와 관계없이 새 버전을 만들지 않는다. 승인·파생본은 그대로 두고 화면에 '변경 없음'을 알린다(메모는 저장되지 않음).
+- Consequences:
+  - G2: 의도한 재게시에도 확인 단계가 하나 늘어난다. 실행 뒤 전송 전에 생긴 중복은 서버가 다시 막지 않는다(화면 경고만).
+  - G9: '확인 필요' 표시가 게시 게이트가 된다. 표시를 지워야 다시 승인할 수 있다.
+  - G16: migration 적용 뒤 처음에는 기존 세션이 모두 끊겨 다시 로그인해야 한다.
+  - G20: 확인할 경험 claim 이 늘 수 있다(오탐은 막는 쪽).
+  - G29: 메모만 바꾸는 저장은 할 수 없다.
+- 시행: FIX1-FULLREV2(G2) → FIX2-FULLREV2(G9·G16) → FIX3-FULLREV2(G20·G29). 각 묶음은 Claude 반박 검토 → 전체 검사 → 커밋, Codex 검증은 사용자 PC.
+
+## D41 — 복원(add_missing)이 기존 활성 승인을 무효화하는 D6 예외 (2026-11-03)
+- Decision ID / date: D41 / 2026-11-03 (Europe/Moscow)
+- Context:
+  - D6 은 복원이 기존 행을 UPDATE 하지 않는다고 정했다(예외: 이번에 넣은 원고의 current_version_id).
+  - FULLREV2 G19 를 FIX2-FULLREV2(6d54488)에서 고쳤다. add_missing 으로 이 환경보다 높은 브랜드 프로필 버전이 들어와 현재 브랜드가 바뀌면, 기존 활성 승인을 무효화한다.
+  - 같은 묶음 보완(G9 복원 경로)도 같은 성격이다. 이미 있던 원고에 '확인 필요'(needs_check) 소재 연결이 새로 들어오면 그 원고 항목의 활성 승인을 무효화한다.
+  - 두 경우 모두 기존 approvals·jobs·distribution_items·variants 행을 바꾼다. 인계(FULLREV2_IMPLEMENTATION_HANDOFF FIX round 2)의 남은 위험에 "DECISIONS 미기록"으로 남아 있었다.
+- Decision (사용자 결정 2026-11-03 "G19 D6 예외 DECISIONS에 기록해줘"): D6 의 예외로 인정한다.
+  1. 복원 전 현재 브랜드와 복원 뒤 현재 브랜드가 다르면 `invalidateApprovalsForBrandProfile`(`packages/db/src/restore.ts`)을 부른다. 새 브랜드 버전 훅과 같은 규칙이다: `invalidated:brand_changed`, 대기 작업 BLOCKED, 항목 PLANNED.
+  2. add_missing 이 기존('same') 원고에 needs_check 소재 연결(content_captures)을 넣으면 `invalidateApprovalsForRisk` 를 부른다. 위험 표시 훅과 같은 규칙이다(`invalidated:risk_needs_check`).
+  3. 범위: 실행을 막는 쪽으로만 바꾼다(승인 철회·대기 작업 보류·항목 PLANNED·파생본 review). 승인을 새로 주거나 되살리거나, 게시·삭제를 하지는 않는다. 그 밖의 기존 행 UPDATE 금지(D6)는 그대로다.
+  4. 무효로 한 승인은 복원 미리보기와 결과의 `invalidated_approvals` 에 보고한다. 묶음 승인의 `restore_stale` 철회(`revoked_approvals`)와는 섞지 않는다(drill 정확 비교). 미리보기는 rollback 되는 같은 트랜잭션이라 아무것도 바꾸지 않는다.
+- Why: 복원으로 '현재 브랜드'나 원고의 위험 사실이 바뀌었는데 기존 승인을 그대로 두면 상태가 어긋난다. 예약 시각에 전송 직전 재검사(beginSend)가 그때서야 막고, 예약 게시는 조용히 BLOCKED 가 된다. 같은 변경을 앱 화면에서 하면 즉시 철회·보고하므로 복원도 같은 규칙을 따른다(D19 승인 무효화 훅과 일치).
+- Consequences:
+  - add_missing 복원 뒤 기존 예약·실행 대기 항목이 다시 승인이 필요한 상태(PLANNED)가 될 수 있다. 미리보기에서 그 목록을 먼저 보여 준다.
+  - D6 의 "기존 행 UPDATE 없음"은 이 두 실행 차단 경로를 뺀 나머지에만 적용된다.
+- Evidence: `tests/integration/fullrev2-restore-approvals.test.ts`.
+  - G19: 높은 브랜드 버전 묶음 → 기존 승인 brand_changed·항목 PLANNED·작업 BLOCKED, 미리보기는 변경 없이 보고만 한다. 높은 버전이 없으면 무효화 0.
+  - G9 보완: needs_check 소재 연결 → 무효화. risk none 이면 0.
+- Reversible?: 예. 규칙은 `packages/db/src/restore.ts` 한 곳이다. 되돌리면 전송 직전 재검사만 남는다(실행은 여전히 막힌다).
+- User decision required?: 아니오(이 결정으로 기록).
+- Exact authorized scope (if applicable): 해당 없음(로컬 DB 복원 규칙, 외부 호출 없음).
+
+## D42 — Codex 를 쓰지 않고 구현·독립 검토를 모두 Claude Code 에서 한다 (2026-11-07)
+- Decision ID / date: D42 / 2026-11-07 (Europe/Moscow)
+- Context:
+  - 지금까지는 Claude Code 가 구현하고, 사용자 PC 의 Codex(gpt-6-astra / xhigh)가 독립 검증했다(대기열·ChatGPT 프롬프트 1–22).
+  - 클라우드 세션에는 Codex 가 없어 검증이 사용자 PC 왕복을 기다렸다.
+  - FULLREV1·FULLREV2·FIX 라운드에서는 Claude 반박 검토(새 컨텍스트 서브에이전트, P0/P1 3관점 2명 유지)를 이미 써 왔다.
+- Decision (사용자 결정 2026-11-07 "이제부터 Codex 활용하지 않고 모두 클로드코드에서 진행할 수 있도록 수정해줘"):
+  1. 구현·독립 검토·수정·재검토를 모두 Claude Code 에서 한다. 독립 검토는 **새 컨텍스트·읽기 전용 Claude 검토자 서브에이전트**가 하며, 구현자의 결론을 받지 않는다.
+  2. 확정 규칙: P0/P1 은 서로 다른 관점(코드 추적·방어 장치·명세)의 검증자 3명 중 2명이 유지할 때, P2 는 1명이 유지할 때 확정한다. 주 세션은 확정 지적을 코드로 재현한 뒤 고친다.
+  3. gate: 확정 P0/P1 = 0, 최종 트리 전체 검사 통과(단계별 종료코드), 확정 P2 는 반영 또는 남은 위험으로 기록. 보완분은 재검토한다.
+  4. 표기: Claude 검토 결과를 다른 도구의 판정이라고 쓰지 않는다. 검토자·구현자 보고와 주 세션이 직접 실행한 증거를 구분한다.
+  5. 정리:
+     - 고친 것: AGENTS.md·CLAUDE.md(앱·상위), prompts(CLAUDE_START·CLAUDE_FIX, CODEX_REVIEW → CLAUDE_REVIEW), templates, docs/06_AGENT_WORKFLOW.md·README_KO·ENVIRONMENT.
+     - 상위 저장소: `/codex-review`·`/codex-task` 를 `/claude-review`·`/claude-task` 로 바꿨다. `scripts/codex-*.sh`·`scripts/link-check.sh`·`.codex/config.toml.example` 는 삭제했다.
+     - 앱: `scripts/codex-review-commit.sh`·`codex-review-queue.sh`·그 시험을 삭제했다.
+     - 과거 Codex 기록(*CODEX* 인계·CODEX_QUEUE·CODEX_CHATGPT_PROMPTS)은 이력으로 남기고 종료 표시를 붙였다.
+- Why: 검증 대기 시간을 없애고, 이미 같은 절차로 확정·기각 근거를 남겨 온 Claude 반박 검토를 표준으로 삼는다.
+- Consequences:
+  - 다른 회사 모델의 교차 검증(모델 다양성)은 없어진다. 같은 계열 모델이 같은 맹점을 공유할 수 있다.
+  - 이를 줄이려고 검토자에게 구현자 결론을 주지 않고, 관점을 나눈 다수 검증자와 실행 증거(시험·변이 확인·브라우저 E2E)를 함께 쓴다.
+  - Codex 대기열 22번(9479869)은 Claude 반박 검토(확정 0)로 대신했다.
+- Reversible?: 예. Codex 스크립트·설정은 git 이력에 남아 있어 되살릴 수 있다.
+- User decision required?: 아니오(이 결정으로 기록).
+- Exact authorized scope (if applicable): 해당 없음(개발 절차·저장소 도구 정리, 외부 호출 없음).

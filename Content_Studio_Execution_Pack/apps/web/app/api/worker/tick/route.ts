@@ -1,0 +1,67 @@
+import { newWorkerId, recordAudit, runJobsTick } from '@cs/db';
+import { assertSameOrigin, isUuid, livePublishReadiness, tickSchema, WEB_TICK_UPLOAD_SLICE } from '@cs/domain';
+import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
+import { readRequestFields, validationError } from '../../../../lib/body';
+import { distributeFormFailure, MAX_DISTRIBUTION_REQUEST } from '../../../../lib/distribution';
+import { requireMockOAuthReady, jobCredentials } from '../../../../lib/oauth';
+import { getChannelAdapters, getConfig, getStorage } from '../../../../lib/server';
+import { requireOwner } from '../../../../lib/session';
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+
+/**
+ * POST /api/worker/tick — { max_jobs?(1~20, 기본 5), worker_id? } → 200 { worker_id, recovered, leased, results }.
+ * 로그인한 owner 의 배포 작업만 한 번 처리한다(lease 만료 복구 → lease → 모의 어댑터 전송·조회). 화면의 "작업 처리 실행(모의 1회)".
+ * 외부 호출 없음(모의 어댑터만). CSRF(같은 출처) 검사.
+ * 화면 폼(버튼)은 작업당 전송 시간 제한을 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS)(기본 10초)로 줄인다(화면 확인 D7, 모의 작업) —
+ * LIVEP1-TIMEOUT: 실제 Threads 작업은 실제 지연에 맞게 max(이 값, LIVE_SUBMIT_BUDGET_MS 60초)를 쓴다(작업 처리기 budgetFor — 호출당 10초 제한은 그대로).
+ * 넘으면 기존 시간 초과 → RECONCILING(다시 보내지 않고 조회). JSON 호출은 JOB_SUBMIT_TIMEOUT_MS 그대로.
+ * FIX-T15(Codex review-T15 P1, docs/02 "웹 요청 안에서 전체 영상 처리 금지"): 영상 업로드는 작업당 조각 1개(WEB_TICK_UPLOAD_SLICE — 5초 상한)만
+ * 보내고 받은 바이트를 기록한 뒤 양보한다(RETRY_WAIT 즉시, upload_yield). 다음 tick 이 같은 세션으로 이어 올린다.
+ */
+/** 화면 폼이면 min(WORKER_UI_TICK_TIMEOUT_MS, JOB_SUBMIT_TIMEOUT_MS), 아니면 JOB_SUBMIT_TIMEOUT_MS. */
+function uiTickTimeoutMs(config: { JOB_SUBMIT_TIMEOUT_MS: number; WORKER_UI_TICK_TIMEOUT_MS: number }, form: boolean): number {
+  return form ? Math.min(config.WORKER_UI_TICK_TIMEOUT_MS, config.JOB_SUBMIT_TIMEOUT_MS) : config.JOB_SUBMIT_TIMEOUT_MS;
+}
+
+export async function POST(request: Request): Promise<Response> {
+  const html = wantsHtml(request);
+  let back = '/distribute';
+  try {
+    const config = getConfig();
+    assertSameOrigin(request, config);
+    const owner = await requireOwner(request);
+    const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
+    if (body.kind === 'form' && body.data.plan_id && isUuid(body.data.plan_id)) back = `/distribute/${body.data.plan_id.toLowerCase()}`;
+    // FIX-LIVEP1(Codex P1): 계획 화면의 버튼(폼 plan_id)은 그 계획의 작업만 처리한다 — 화면 안내(모의만·실제 게시 포함)와 실제 동작이 같게.
+    const input = body.kind === 'form' ? { max_jobs: body.data.max_jobs || undefined, plan_id: body.data.plan_id || undefined } : body.data;
+    const parsed = tickSchema.safeParse(input);
+    if (!parsed.success) throw validationError(parsed.error);
+    const workerId = parsed.data.worker_id ? `api-${parsed.data.worker_id}`.slice(0, 40) : newWorkerId('api');
+    // M4-DEV1: 재시작 뒤 첫 작업 처리면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, 모의 모드만)
+    await requireMockOAuthReady(config, owner.db); // FIX1-M4DEV1: 다시 채우기 실패면 공급자 호출·상태 변경 없이 503 mock_rehydration_unavailable
+    const r = await runJobsTick(owner.db, getChannelAdapters(config), {
+      workerId,
+      config,
+      ownerId: owner.ownerId,
+      planId: parsed.data.plan_id,
+      maxJobs: parsed.data.max_jobs ?? 5,
+      submitTimeoutMs: uiTickTimeoutMs(config, body.kind === 'form'),
+      credentials: jobCredentials(config, owner.db),
+      media: getStorage(config),
+      uploadSlice: WEB_TICK_UPLOAD_SLICE,
+    });
+    await recordAudit(owner.db, {
+      ownerId: owner.ownerId,
+      action: 'worker.tick',
+      entity: 'worker',
+      details: { leased: r.leased, recovered: r.recovered, mode: livePublishReadiness(config).ready ? 'MOCK_OR_LIVE' : 'MOCK', plan_scoped: !!parsed.data.plan_id },
+    });
+    if (html) return seeOther(`${back}?ticked=${r.leased}`);
+    return json({ ...r, mode: livePublishReadiness(config).ready ? 'MOCK_OR_LIVE' : 'MOCK' });
+  } catch (e) {
+    if (html) return distributeFormFailure(e, request, back);
+    return errorResponse(e, request);
+  }
+}

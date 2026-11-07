@@ -1,0 +1,46 @@
+import { executePlan } from '@cs/db';
+import { assertSameOrigin, executeSchema } from '@cs/domain';
+import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
+import { readRequestFields, validationError } from '../../../../../lib/body';
+import { distributeFormFailure, formToExecute, MAX_DISTRIBUTION_REQUEST } from '../../../../../lib/distribution';
+import { getConfig } from '../../../../../lib/server';
+import { requireOwner } from '../../../../../lib/session';
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+
+type Ctx = { params: Promise<{ id: string }> };
+
+/**
+ * POST /api/distribution-plans/{id}/execute — { command_key(8~64), item_ids? } → 200 { plan_id, queued: [{ item_id, job_id, mode: 'MOCK'|'LIVE' }], mode, notice, idempotent_replay }.
+ * LIVE-P1(D38): 실제 Threads 항목은 실제 게시 게이트(PUBLISH_MODE·승인 기록·게시 수 상한·정확한 계정)를 모두 통과할 때만 mode LIVE 로 대기열에 들어간다(아니면 전체 거부 503/429).
+ * 승인 없음 403 approval_required(아무것도 넣지 않음), 스냅샷 변경 409 snapshot_stale(승인 철회), 이미 실행 409 already_executed.
+ * 같은 command_key 재호출 → 저장된 결과(idempotent_replay: true). 실제 게시가 아니다 — 작업은 QUEUED 로만 생기고 T11 이 처리한다.
+ * FIX1-FULLREV2(G2, D40-1): 실제 게시 항목에 그때 다른 계획의 같은 글(이미 게시됨·결과 불명·진행 중)이 있으면 acknowledge_duplicate: true(폼은 체크박스) 필요 —
+ * 없으면 409 duplicate_publish_unacknowledged(아무것도 넣지 않음·실행 키도 남기지 않음). 모의 항목은 경고만(duplicate_warnings).
+ */
+export async function POST(request: Request, ctx: Ctx): Promise<Response> {
+  const html = wantsHtml(request);
+  const { id } = await ctx.params;
+  const back = `/distribute/${encodeURIComponent(id)}`;
+  try {
+    const config = getConfig();
+    assertSameOrigin(request, config);
+    const owner = await requireOwner(request);
+    const body = await readRequestFields(request, MAX_DISTRIBUTION_REQUEST);
+    const parsed = executeSchema.safeParse(body.kind === 'form' ? formToExecute(body.data) : body.data);
+    if (!parsed.success) throw validationError(parsed.error);
+    const r = await executePlan(
+      owner.db,
+      owner.ownerId,
+      id.toLowerCase(),
+      { commandKey: parsed.data.command_key, itemIds: parsed.data.item_ids, acknowledgeDuplicate: parsed.data.acknowledge_duplicate === true },
+      config,
+    );
+    if (html) return seeOther(`/distribute/${r.plan_id}?executed=${r.queued.length}${r.idempotent_replay ? '&replay=1' : ''}`);
+    return json(r);
+  } catch (e) {
+    if (html) return distributeFormFailure(e, request, back);
+    return errorResponse(e, request);
+  }
+}

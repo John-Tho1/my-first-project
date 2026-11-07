@@ -220,5 +220,44 @@
 ### 남은 위험
 1. 표시 host 가 틀릴 수 있다(비밀은 아님). 마지막 `@` 기준이라 fragment 의 `@` 뒤를 host 로 보이고, pglite 드라이버로 postgres 모양 값을 열면 실제로는 로컬 폴더인데 `postgres://host` 로 보인다. 고치면 인코딩하지 않은 `/` 비밀번호가 다시 새는 쪽과 부딪쳐 두었다.
 2. `=`·`@` 가 든 PGlite 폴더 경로는 `(숨김)` 으로만 보인다(정보만 줄어듦).
-3. `export.ts`·`restore.ts`·`restore-drill.ts` 의 `throw e` 는 그대로다. Postgres 드라이버를 붙일 때 같은 `dbCliErrorLine` 으로 바꿀 것.
+3. `export.ts`·`restore.ts`·`restore-drill.ts` 의 `throw e` 는 그대로다. Postgres 드라이버를 붙일 때 같은 `dbCliErrorLine` 으로 바꿀 것. — **해결(`3bc5729`)**: 아래 '후속 2'.
 4. 일반 잠금 재시도 오류(`lock.ts` '잠금 파일을 만들지 못했습니다')는 이제 `Error` 로만 보인다.
+
+## 후속 2 — export·restore·restore-drill·worker CLI 오류 출력(후속 남은 위험 3)
+
+- BASE_SHA: `c253559` (`c253559a7be5133c04bc3f966d53c462cf139fb1`, docs) · **HEAD_SHA: `3bc5729`** (`3bc572948088ef34ebac13f9be88ee75d9da61fe`)
+- 출처: 사용자 지시 "진행해줘"(2026-11-07). 위 '후속' 남은 위험 3.
+
+### 처리
+- `packages/db/scripts/export.ts`·`restore.ts`·`restore-drill.ts`:
+  - `openDb` 실패와 예상하지 못한 오류를 다시 던지지 않는다. `dbCliErrorLine` 한 줄을 찍고 종료코드 1 로 끝난다.
+  - DB 닫기 오류도 같다.
+  - `restore.ts` 의 AppError 출력(코드·안내 문구)은 그대로다.
+- `apps/worker/src/cli.ts`: DB 열기·닫기만 같은 방식으로 바꿨다. tick 안의 오류와 `assertWorkerModeSupported` 의 다른 오류(DB 전)는 범위 밖이다.
+
+### Claude 독립 검토(D42)
+- 1회(검토자 1명): P0·P1 0, P2 1건 — worker 의 DB 닫기가 그대로였고 시험도 그 경로를 보지 않았다.
+  - 처리: 다른 세 스크립트와 같은 형태로 고치고 시험 단언을 더했다. 같은 형태라 별도 재검토는 하지 않았다(주 세션 변이 확인만).
+- 검토자가 확인한 것:
+  - 모든 경로의 종료코드가 같다(성공 0, 실패 1, restore 사용법 2).
+  - restore AppError 출력이 바이트 단위로 같다.
+  - 잃는 내부 오류 문구(export 의 절대 경로 검사 등)는 도달하지 않거나 방어용이다.
+
+### 시험
+- `packages/db/src/db-label.test.ts` 에 소스 검사 1건을 더했다(세 스크립트 + worker: 열기·닫기·예상 밖 오류 형태, `throw e`·`e.message`·`e.stack` 없음 — restore 의 AppError 줄 1개만).
+- 변이 확인(주 세션):
+  - 다음을 각각 되돌리면 시험이 실패했다: 네 파일의 열기 catch, restore 의 다시 던지기, worker 닫기.
+  - 첫 시도는 시험 정규식이 틀려(조사 '을' 과 '를') 기준선부터 실패했다. 그 상태의 변이 결과는 버리고, 정규식을 고친 뒤 다시 했다.
+- 실제 실행(주 세션):
+  - `memory://`: export·restore-drill 은 owner 없음 안내로, restore preview 는 파일 없음 안내로 그대로 나왔다.
+  - `DB_DRIVER=postgres` + postgres 모양 URL: export·restore-drill 은 고정 안내 한 줄, 종료코드 1 이었다.
+
+### 명령
+클라우드 Node 22.22.0, `3bc5729` 와 같은 트리. 단계별 종료코드 기준:
+- install(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: 각 exit 0
+- **unit 89 files / 2259 · integration 78 files / 1328**: exit 0
+- drill:mock 위반 0 · dev-cert 472/472 · deploy 셸 시험(비root) PASS
+
+### 남은 위험
+1. worker tick 안에서 던진 오류는 여전히 Node 가 메시지·스택을 찍는다(범위 밖). tick 오류의 원천이 많아 일괄로 숨기면 진단이 어려워진다. 실제 Postgres·실계정을 붙이기 전에 따로 본다.
+2. 내부 방어 오류(예: '묶음 경로가 폴더를 벗어났습니다')는 이제 `Error` 로만 보인다.

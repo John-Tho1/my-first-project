@@ -524,3 +524,10 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Claude 독립 검토 3회: P2 6건 중 5건 반영, 1건은 남은 위험. 마지막 확정 0.
 - 전체 검사(단계별 exit 0): unit 89/2258 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
 - 남은 위험: export·restore 스크립트의 `throw e`(Postgres 붙일 때 정리), 표시 host 부정확(비밀 아님). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — DB CLI 오류 출력 후속(클라우드 세션)
+- 사용자 지시 "진행해줘". 코드 커밋 `3bc5729`(BASE `c253559`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속 2'.
+- export·restore·restore-drill·worker CLI 의 DB 열기·예상 밖·닫기 오류를 종류·코드만 출력한다(restore AppError 그대로).
+- Claude 독립 검토 1회: P2 1건(worker 닫기) 반영.
+- 전체 검사(단계별 exit 0): unit 89/2259 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: worker tick 안 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.

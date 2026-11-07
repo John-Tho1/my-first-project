@@ -1,4 +1,5 @@
 export * from './client';
+export * from './db-label';
 export * from './queries';
 export * from './captures';
 export * from './ideas';

@@ -158,3 +158,14 @@
 
 ### 검토자에게 물을 것
 1. K1 준비 이름 `OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)` 을 기존 `OAUTH_REDIRECT_URI(불일치)`(등록 redirect ≠ 설정값)와 따로 둔 것이 운영자에게 더 분명한가?
+
+### f7d4c3e 재검증(Claude 독립 검토, 2026-11-07 — 사용자 지시 "계속 진행해줘", 절차 9단계)
+- 새 컨텍스트·읽기 전용 검토자 1명이 `git show f7d4c3e` 를 검토했다(보완분 재검토 뒤 주 세션이 고친 K2 문구 포함).
+- 결과: **확정 지적 0**(P0·P1·P2 없음).
+- 확인한 것:
+  - K1: 정규 표기 검사 때문에 맞는 값이 거부되지 않는다. 시험·drill 의 redirect 고정값이 모두 기대값과 같다. 옛 이름은 코드에 남지 않았다.
+  - K2: `restoredReview` 는 `toPlanned` 가 빼는 분기와 정확히 같다. 문구는 `RESTORED_RETRY_RECOVERY` 를 그대로 쓴다.
+  - K3: trigger 는 요청 경로에만 붙고 worker 경로는 그대로다.
+  - 단언 약화와 보이지 않는 문자는 없다.
+- 검토자 실행(단일 파일): `restore-view.test.ts`·domain `oauth.test.ts` 34/34.
+- 스타일 메모(지적 아님): `docs/04` 의 K3 문장이 어색하다.

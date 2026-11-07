@@ -513,3 +513,7 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 보완분 재검토 P2 2건(K2 문구가 사용자 결정과 어긋남, 인계 옛 오류 코드)을 반영했다.
 - 최종 트리 전체 검사(단계별 exit 0): unit 88/2250 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
 - not_run: 실제 Caddy 배포·IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저. M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — f7d4c3e 재검증(클라우드 세션)
+- Claude 독립 검토(검토자 1명): FIX2-FULLREV3 `f7d4c3e` 확정 지적 0. FULLREV3 확정 지적(H1–H8)과 그 재검증 지적(K1–K3)은 모두 반영했다.
+- 남은 것: 인계 '남은 위험'(실제 Caddy 배포 미확인, migrate.ts 의 DATABASE_URL 출력 등). M4/D20 보류 조건은 그대로다.

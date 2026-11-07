@@ -544,3 +544,10 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 결과: `docs/handoffs/FULLREV4_CLAUDE_REVIEW.md`. P0·P1 없음. 범위 diff 안에서는 확정 0.
   - 기존 코드에서 확정 P2 1건(J1): 승인 무효화 때 lease 된 작업이 남고, lease 복구와 재승인 뒤 사용자 실행은 409 인데 옛 작업이 새 승인으로 게시된다. 두 번 게시는 없다.
 - 코드는 고치지 않았다. 다음: 권고 FIX1-FULLREV4(J1), 사용자 확인 뒤.
+
+## 2026-11-07 — FIX1-FULLREV4(J1, 클라우드 세션)
+- 사용자 지시 "권고대로 진행해줘". 코드 커밋 `0020226`(BASE `af3894e`). 인계: `docs/handoffs/FULLREV4_IMPLEMENTATION_HANDOFF.md`.
+- `beginSend` 가 작업이 만들어진 승인(작업 키)과 지금 활성 승인이 같은지 확인한다. 다르면 approval_missing(부분 게시면 UNKNOWN). 무효화 뒤 lease 복구된 옛 작업이 재승인된 새 승인으로 사용자 실행 없이 게시되지 않는다.
+- Claude 독립 검토 2명(코드 추적·방어 장치): 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2260 · integration 79/1332 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: 409 한 주기, lease 만료 5회 되풀이 시 FAILED(게시 없음). M4/D20 보류 조건은 그대로다.

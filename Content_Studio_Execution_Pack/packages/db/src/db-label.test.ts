@@ -1,3 +1,4 @@
+import { DrizzleQueryError } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { DbDriverNotImplementedError } from './client';
 import { databaseLabel, dbCliErrorLine } from './db-label';
@@ -101,7 +102,31 @@ describe('FULLREV3 후속: export·restore·restore-drill·worker CLI 도 열기
     }
     const worker = read('../../../apps/worker/src/cli.ts');
     expect(worker).toMatch(/openDb\(config\)\.catch\(\(e: unknown\) => \{\s*console\.error\(dbCliErrorLine\('DB 를 열지 못했습니다', e\)\);\s*process\.exit\(1\);/);
+    // 후속 3: tick 오류·시작 오류도 다시 던지지 않는다(DrizzleQueryError 메시지에는 쿼리 파라미터 값이 들어간다)
+    expect(worker).not.toMatch(/throw e;/);
+    expect(worker).toMatch(/\} while \(!stopping\);\s*\} catch \(e\) \{[\s\S]*?console\.error\(dbCliErrorLine\('worker tick 을 마치지 못했습니다', e\)\);\s*process\.exitCode = 1;\s*\} finally \{/);
+    expect(worker).toMatch(/console\.error\(dbCliErrorLine\('worker 를 시작하지 못했습니다', e\)\);\s*process\.exit\(1\);/);
+    // 재검토 P2: DB 를 연 뒤의 준비(createStorage 등)도 보호된 try 안 — openDb 와 try 사이에 던질 수 있는 준비 코드가 없다
+    const openAt = worker.indexOf('const handle = await openDb(');
+    const tryAt = worker.indexOf('\ntry {\n', openAt);
+    expect(openAt).toBeGreaterThan(0);
+    expect(tryAt).toBeGreaterThan(openAt);
+    const between = worker.slice(openAt, tryAt);
+    expect(between).not.toMatch(/(createStorage|createChannelAdapterRegistry|oauthRedirectUri|newWorkerId|requireSecretKeyring)\(/);
+    expect(worker.slice(tryAt)).toMatch(/^\ntry \{\n {2}const workerId = newWorkerId\('cli'\);[\s\S]*const media = createStorage\(config, resolveFromRoot\);\n {2}do \{/);
     // 재검토 P2: worker 의 DB 닫기도 같은 방식
     expect(worker).toMatch(/try \{\s*await handle\.close\(\);\s*\} catch \(e\) \{\s*console\.error\(dbCliErrorLine\('DB 를 닫지 못했습니다', e\)\);/);
+  });
+});
+
+describe('후속 3: DB 쿼리 오류(DrizzleQueryError)의 쿼리·파라미터 값을 쓰지 않는다', () => {
+  it('실제 drizzle 오류 객체(메시지에 Failed query … params: …) → 종류만', () => {
+    const cause = Object.assign(new Error('duplicate key value violates unique constraint'), { code: '23505' });
+    const e = new DrizzleQueryError('update channel_credentials set sealed = $1 where id = $2', ['v1.SEALED-TOKEN-abc', 'acc-1'], cause);
+    expect(e.message).toContain('SEALED-TOKEN'); // 전제: drizzle 메시지에는 파라미터 값이 들어 있다
+    const line = dbCliErrorLine('worker tick 을 마치지 못했습니다', e);
+    // drizzle 0.45 는 바깥 객체에 name·code 를 두지 않는다 → 'Error'(SQLSTATE 는 cause 안 — 일부러 읽지 않음)
+    expect(line).toBe('worker tick 을 마치지 못했습니다(오류 종류: Error).');
+    for (const leaked of ['SEALED', 'channel_credentials', 'acc-1', 'duplicate key']) expect(line).not.toContain(leaked);
   });
 });

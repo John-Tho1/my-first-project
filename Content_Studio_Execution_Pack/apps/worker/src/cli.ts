@@ -29,7 +29,9 @@ try {
     console.error(e.message);
     process.exit(1);
   }
-  throw e;
+  // FULLREV3 후속 3: 그 밖의 오류도 다시 던지지 않는다(Node 가 메시지·스택을 찍음) — 종류·코드만
+  console.error(dbCliErrorLine('worker 를 시작하지 못했습니다', e));
+  process.exit(1);
 }
 const loopMs = parseLoop(process.argv.slice(2));
 // FULLREV3 후속(DB CLI 출력): 열기 오류를 다시 던지지 않는다 — Node 가 메시지·스택(파일 오류는 경로 = DATABASE_URL)을 찍기 때문. 잠금·드라이버 미구현은 고정 안내, 그 밖은 종류·코드만.
@@ -37,21 +39,8 @@ const handle = await openDb(config).catch((e: unknown) => {
   console.error(dbCliErrorLine('DB 를 열지 못했습니다', e));
   process.exit(1);
 });
-const workerId = newWorkerId('cli');
-// LIVE-P1(D38 1단계): 모의 어댑터 + 실제 Threads 텍스트 게시 어댑터(실제 게시 환경 조건이 모두 있을 때만 선택 — 기본 설정에서는 막힘)
-const channelAdapters = createChannelAdapterRegistry(config);
-// T14(D26): Threads 모의 어댑터의 전송 토큰(서버 안 봉인 해제)과 401 뒤 T13 확인 경로. 키는 환경변수에서만(값 출력 없음).
-const keyring = () => requireSecretKeyring(process.env);
-const redirectUri = oauthRedirectUri(config);
-const providerFor = (acc: Parameters<typeof resolveOAuthProvider>[0]) => resolveOAuthProvider(acc, config, process.env, redirectUri);
-const jobCredentials = {
-  keyring,
-  check: (ownerId: string, accountId: string, now: Date) => checkCredential(handle.db, { ownerId, accountId, providerFor, keyring, now }),
-  // T15(D27): 짧은 access token(Google 형 모의)은 보내기 전에 T13 갱신 경로로 한 번 갱신
-  refresh: (ownerId: string, accountId: string, now: Date) => refreshCredential(handle.db, { ownerId, accountId, providerFor, keyring, now, trigger: 'auto' }),
-};
-// T15(D27): YouTube 모의 업로드가 VERIFIED 영상 파일을 조각으로 읽는 로컬 저장소
-const media = createStorage(config, resolveFromRoot);
+// FULLREV3 후속 3(재검토 P2): DB 를 연 뒤의 준비(어댑터·저장소 — 예: STORAGE_DRIVER=object 는 createStorage 가 던짐)도 아래 try 안에서 —
+// 던지면 메시지·스택 없이 한 줄 + DB 닫기.
 let stopping = false;
 let wake: (() => void) | null = null;
 const stop = () => {
@@ -61,6 +50,21 @@ const stop = () => {
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 try {
+  const workerId = newWorkerId('cli');
+  // LIVE-P1(D38 1단계): 모의 어댑터 + 실제 Threads 텍스트 게시 어댑터(실제 게시 환경 조건이 모두 있을 때만 선택 — 기본 설정에서는 막힘)
+  const channelAdapters = createChannelAdapterRegistry(config);
+  // T14(D26): Threads 모의 어댑터의 전송 토큰(서버 안 봉인 해제)과 401 뒤 T13 확인 경로. 키는 환경변수에서만(값 출력 없음).
+  const keyring = () => requireSecretKeyring(process.env);
+  const redirectUri = oauthRedirectUri(config);
+  const providerFor = (acc: Parameters<typeof resolveOAuthProvider>[0]) => resolveOAuthProvider(acc, config, process.env, redirectUri);
+  const jobCredentials = {
+    keyring,
+    check: (ownerId: string, accountId: string, now: Date) => checkCredential(handle.db, { ownerId, accountId, providerFor, keyring, now }),
+    // T15(D27): 짧은 access token(Google 형 모의)은 보내기 전에 T13 갱신 경로로 한 번 갱신
+    refresh: (ownerId: string, accountId: string, now: Date) => refreshCredential(handle.db, { ownerId, accountId, providerFor, keyring, now, trigger: 'auto' }),
+  };
+  // T15(D27): YouTube 모의 업로드가 VERIFIED 영상 파일을 조각으로 읽는 로컬 저장소
+  const media = createStorage(config, resolveFromRoot);
   do {
     // M4-DEV1: 이 프로세스의 첫 tick 이면 DB 의 모의 연결 정보로 모의 공급자 메모리를 다시 채운다(프로세스당 한 번, OAUTH_MODE=mock·키 있음만).
     // 토큰은 모의 공급자 메모리로만 — 출력은 tick JSON 그대로(토큰·개수 없음).
@@ -82,8 +86,14 @@ try {
     });
     wake = null;
   } while (!stopping);
+} catch (e) {
+  // FULLREV3 후속 3: tick 이 던진 오류를 맨 위로 보내지 않는다 — Node 가 메시지·스택을 찍고, DB 쿼리 오류(DrizzleQueryError)는
+  // 메시지에 쿼리 파라미터 값(봉인된 토큰·원고 내용 등)이 들어간다. 메시지를 쓰지 않고 허용 목록의 종류·코드만 찍고 예전처럼 끝낸다
+  // (반복 모드도 멈춤, exit 1). drizzle 쿼리 오류는 바깥 객체에 이름·코드가 없어 'Error' 로만 보인다(SQLSTATE 는 cause 안 — 일부러 읽지 않음).
+  console.error(dbCliErrorLine('worker tick 을 마치지 못했습니다', e));
+  process.exitCode = 1;
 } finally {
-  // FULLREV3 후속(DB CLI 출력): 닫기 오류도 메시지·스택 없이 종류·코드만(DB 스크립트와 같음). tick 안의 오류는 이번 범위 밖.
+  // FULLREV3 후속(DB CLI 출력): 닫기 오류도 메시지·스택 없이 종류·코드만(DB 스크립트와 같음).
   try {
     await handle.close();
   } catch (e) {

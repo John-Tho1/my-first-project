@@ -299,7 +299,18 @@ export function isPlainRedirectUri(raw: string): boolean {
 /** callback 의 redirect URI(정확 일치 대상). 설정이 없으면 APP_BASE_URL(의 origin) + /api/oauth/callback. */
 export function oauthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): string {
   if (config.OAUTH_REDIRECT_URI) return config.OAUTH_REDIRECT_URI;
-  return `${new URL(config.APP_BASE_URL).origin}/api/oauth/callback`;
+  return expectedOAuthRedirectUri(config);
+}
+
+/** FIX2-FULLREV3(K1): 계정 연결 callback 경로(이 앱에 실제로 있는 route — apps/web/app/api/oauth/callback). */
+export const OAUTH_CALLBACK_PATH = '/api/oauth/callback';
+
+/**
+ * FIX2-FULLREV3(K1): 이 앱이 공급자에 등록해야 하는 계정 연결 redirect URI = APP_BASE_URL 의 origin + OAUTH_CALLBACK_PATH(정확 일치 대상).
+ * OIDC 의 expectedOidcRedirectUri 와 같은 방식이다.
+ */
+export function expectedOAuthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL'>): string {
+  return `${new URL(config.APP_BASE_URL).origin}${OAUTH_CALLBACK_PATH}`;
 }
 
 /**
@@ -322,35 +333,42 @@ export function callbackRedirectTarget(config: Pick<AppConfig, 'APP_BASE_URL'>, 
   return `${new URL(config.APP_BASE_URL).origin}${new URL(requestUrl).pathname}`;
 }
 
-/** FIX1-FULLREV3(H1 후속): 준비 상태·연결 시작 거부에 쓰는 이름(값 없음). */
-export const OAUTH_REDIRECT_ORIGIN_MISMATCH = 'OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)';
+/**
+ * 준비 상태·연결 시작 거부에 쓰는 이름(값 없음).
+ * FIX2-FULLREV3(K1): origin 만이 아니라 전체 URI 를 본다 — 이름도 "APP_BASE_URL 과 다른 origin" 에서 바꿨다.
+ * (등록 redirect 와의 불일치 'OAUTH_REDIRECT_URI(불일치)' 와는 다른 이름 — 무엇을 고쳐야 하는지 구분되게)
+ */
+export const OAUTH_REDIRECT_URI_MISMATCH = 'OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)';
 
 /**
- * FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 설정돼 있고 그 origin 이 APP_BASE_URL 의 origin 과 다른가.
- * callback 은 APP_BASE_URL origin + 요청 경로(callbackRedirectTarget)를 이 값과 정확히 비교하므로, origin 이 다르면 동의 화면 뒤 callback 이
- * **언제나** oauth_redirect_mismatch 로 실패한다. 그래서 준비 상태(liveOAuthReadiness)와 연결 시작(assertOAuthRedirectOrigin)이 미리 거부한다.
+ * FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 가 설정돼 있고 expectedOAuthRedirectUri(APP_BASE_URL origin + /api/oauth/callback)와
+ * **정확히** 다른가. callback 은 APP_BASE_URL origin + 요청 경로(callbackRedirectTarget)를 이 값과 정확히 비교하고, 요청은 공급자가 이 값으로 돌려보낸다.
+ * - origin 이 다르면 callback 이 언제나 oauth_redirect_mismatch.
+ * - origin 은 같고 경로가 다르면(예: /oauth/callback, 끝 `/` 붙은 /api/oauth/callback/) 공급자가 route 가 없는 경로로 돌려보내(404)
+ *   또는 불일치로 실패한다 — 어느 쪽이든 연결을 마칠 수 없다(FIX1 은 origin 만 봐서 이 경우 동의 화면까지 보냈다).
+ * 그래서 준비 상태(liveOAuthReadiness)와 연결 시작(assertOAuthRedirectUri)이 미리 거부한다. 설정 없음은 기본값(= 기대값)이라 언제나 일치.
  * 형식이 틀린 값은 여기서 보지 않는다(설정 검증·준비 상태의 형식 항목이 따로 잡는다).
  */
-export function oauthRedirectOriginMismatch(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): boolean {
+export function oauthRedirectUriMismatch(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): boolean {
   if (!config.OAUTH_REDIRECT_URI) return false;
   try {
-    return new URL(config.OAUTH_REDIRECT_URI).origin !== new URL(config.APP_BASE_URL).origin;
+    return config.OAUTH_REDIRECT_URI !== expectedOAuthRedirectUri(config);
   } catch {
     return false;
   }
 }
 
 /**
- * FIX1-FULLREV3(H1 후속): 계정 연결 시작(모의·실제 모두) 전에 부른다 — origin 이 다르면 공급자 인증 창으로 보내지 않는다
- * (state 행·감사·authorize URL 없음, 외부 호출 0). 503 oauth_redirect_origin_mismatch.
+ * FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): 계정 연결 시작(모의·실제 모두) 전에 부른다 — OAUTH_REDIRECT_URI 가 기대값과 정확히 같지 않으면
+ * 공급자 인증 창으로 보내지 않는다(state 행·감사·authorize URL 없음, 외부 호출 0). 503 oauth_redirect_uri_mismatch.
  */
-export function assertOAuthRedirectOrigin(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): void {
-  if (!oauthRedirectOriginMismatch(config)) return;
+export function assertOAuthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): void {
+  if (!oauthRedirectUriMismatch(config)) return;
   throw new AppError(
     'service_unavailable',
-    'oauth_redirect_origin_mismatch',
-    `계정 연결 redirect 주소(OAUTH_REDIRECT_URI)가 앱 공개 주소(APP_BASE_URL)와 다른 origin 이라 연결을 시작하지 않았습니다. 연결을 마칠 수 없기 때문입니다. 외부로 아무것도 보내지 않았습니다. (준비 안 됨: ${OAUTH_REDIRECT_ORIGIN_MISMATCH})`,
-    { missing: [OAUTH_REDIRECT_ORIGIN_MISMATCH] },
+    'oauth_redirect_uri_mismatch',
+    `계정 연결 redirect 주소(OAUTH_REDIRECT_URI)가 앱 공개 주소(APP_BASE_URL)의 origin + ${OAUTH_CALLBACK_PATH} 와 정확히 같지 않아 연결을 시작하지 않았습니다. 연결을 마칠 수 없기 때문입니다. 외부로 아무것도 보내지 않았습니다. (준비 안 됨: ${OAUTH_REDIRECT_URI_MISMATCH})`,
+    { missing: [OAUTH_REDIRECT_URI_MISMATCH] },
   );
 }
 
@@ -476,7 +494,7 @@ export function threadsAppSecretState(env: Record<string, string | undefined>): 
 /**
  * 실제 Threads 계정 **연결**의 전제 조건(이름만, 값 없음). LIVE-T1(D31): 모두 갖춰지면 ready=true(실제 Threads OAuth 공급자 선택 가능).
  * 조건: OAUTH_MODE=live · THREADS_APP_ID(존재·형식) · THREADS_APP_SECRET(존재·형식) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path,
- * APP_BASE_URL 과 같은 origin(FIX1-FULLREV3(H1 후속)),
+ * APP_BASE_URL origin + /api/oauth/callback 과 정확히 같음(FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1)),
  * 등록 redirect 와 일치) · SECRETS_MASTER_KEY · OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다.
  * FIX1-LIVET1(P2): 공급자 선택(resolveOAuthProvider)은 이 함수의 missing 을 그대로 쓴다 — ready === (실제 공급자 선택 성공)(Threads 계정 기준).
  * registeredRedirectUri: callback 이 정확 일치로 비교할 등록 redirect URI(주면 OAUTH_REDIRECT_URI 와 같아야 한다).
@@ -494,8 +512,9 @@ export function liveOAuthReadiness(
   else if (secrets.threadsAppSecret === 'invalid') missing.push('THREADS_APP_SECRET(형식)');
   if (!config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI');
   else if (!isPlainRedirectUri(config.OAUTH_REDIRECT_URI)) missing.push('OAUTH_REDIRECT_URI(형식)');
-  // FIX1-FULLREV3(H1 후속): APP_BASE_URL 과 다른 origin 이면 callback 이 언제나 불일치 — 동의 화면으로 보내기 전에 준비 안 됨으로 알린다
-  else if (oauthRedirectOriginMismatch(config)) missing.push(OAUTH_REDIRECT_ORIGIN_MISMATCH);
+  // FIX1-FULLREV3(H1 후속) → FIX2-FULLREV3(K1): APP_BASE_URL origin + /api/oauth/callback 과 정확히 같지 않으면(다른 origin·다른 경로·끝 `/`)
+  // 연결을 마칠 수 없다 — 동의 화면으로 보내기 전에 준비 안 됨으로 알린다
+  else if (oauthRedirectUriMismatch(config)) missing.push(OAUTH_REDIRECT_URI_MISMATCH);
   else if (registeredRedirectUri !== undefined && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
   if (!secrets.masterKeyConfigured) missing.push('SECRETS_MASTER_KEY');
   if (!config.OAUTH_LIVE_APPROVAL_REF) missing.push('OAUTH_LIVE_APPROVAL_REF');

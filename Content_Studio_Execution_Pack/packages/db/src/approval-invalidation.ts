@@ -261,6 +261,11 @@ export interface RevokedApproval {
    * 작업·항목 상태는 그대로 두고 승인만 철회했는지. 복원 보고가 이 값을 그대로 쓴다(상태 목록을 따로 베끼지 않는다).
    */
   inFlight: boolean;
+  /**
+   * FIX2-FULLREV3(K2): 철회 직전 항목이 BLOCKED 이고 이전 복원의 확인 표시(restored_needs_review)가 있어 PLANNED 로 돌리지 **않은** 항목인지.
+   * 이 항목은 BLOCKED 그대로라 다시 승인하면 409 item_not_planned — 복원 보고·화면이 "실행 전으로"로 세지 않게 따로 알린다.
+   */
+  restoredReview: boolean;
 }
 
 /** FIX1-FULLREV(F2): 부분 게시 뒤 철회·무효로 남은 게시물을 보내지 않고 UNKNOWN 으로 둔 작업의 사유 코드(취소의 thread_partial_canceled 와 구분). */
@@ -428,6 +433,8 @@ export async function revokeActiveApprovalsLocked(
       leasedPartialJobIds: leasedPartialIds,
       itemStatusBefore: item.status,
       inFlight: (IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(item.status),
+      // FIX2-FULLREV3(K2): 위 toPlanned 에서 빠진 갈래(BLOCKED + 복원 확인 표시) — 항목은 BLOCKED 그대로
+      restoredReview: item.status === 'BLOCKED' && item.restoredNeedsReview,
     });
   }
   return out;

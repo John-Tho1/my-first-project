@@ -152,7 +152,17 @@ export interface ApplyReport {
    * 항목도 실행 전(PLANNED)으로 두지 않는다 — 그 작업의 다음 전송은 보내지 않고 결과 불명(UNKNOWN)으로 정해진다(revokeActiveApprovalsLocked 의 leasedPartialJobIds).
    * 세 칸 모두 옛 미리보기·결과 기록에는 없다(화면은 []·false 로 읽는다).
    */
-  invalidatedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[]; blocked_job_ids: string[]; partial_job_ids?: string[]; leased_partial_job_ids?: string[]; in_flight?: boolean }>;
+  // FIX2-FULLREV3(K2): restored_review — 이전 복원의 확인 표시로 BLOCKED 그대로 둔 항목(옛 기록에는 없음 → false 로 읽는다)
+  invalidatedApprovals: Array<{
+    approval_id: string;
+    item_id: string;
+    reasons: string[];
+    blocked_job_ids: string[];
+    partial_job_ids?: string[];
+    leased_partial_job_ids?: string[];
+    in_flight?: boolean;
+    restored_review?: boolean;
+  }>;
   /**
    * FIX-T13(Codex review-T13 P1 #4): 복원 뒤 "다시 연결 필요"가 된 계정 — 새로 넣은 연결 이력 계정(linked → needs_reconnect)과,
    * 이미 있던(동일) 계정 중 로컬이 none 인데 묶음이 linked·needs_reconnect 인 계정(연결 이력을 잃지 않게 needs_reconnect 로 올림).
@@ -176,6 +186,7 @@ const MAX_CONFLICTS_LISTED = 200;
  * FIX1-FULLREV3(H3): 복원 보고 한 줄 — 부분 게시로 UNKNOWN 에 둔 작업(partial_job_ids)·진행 중 항목(in_flight)을 버리지 않는다.
  * FIX1-FULLREV3(H3 후속): 부분 게시가 있는 lease 된 작업(leased_partial_job_ids)도 보고하고, in_flight 는 RevokedApproval.inFlight 를 그대로 쓴다
  * (진행 중 상태 목록을 여기서 따로 베끼지 않는다).
+ * FIX2-FULLREV3(K2): 이전 복원의 확인 표시로 BLOCKED 그대로 둔 항목(restored_review)도 보고한다.
  */
 function invalidatedEntry(r: RevokedApproval, reason: 'brand_changed' | 'risk_needs_check'): ApplyReport['invalidatedApprovals'][number] {
   return {
@@ -186,6 +197,8 @@ function invalidatedEntry(r: RevokedApproval, reason: 'brand_changed' | 'risk_ne
     partial_job_ids: r.partialJobIds,
     leased_partial_job_ids: r.leasedPartialJobIds,
     in_flight: r.inFlight,
+    // FIX2-FULLREV3(K2): BLOCKED + 이전 복원 확인 표시 — 실행 전으로 돌리지 않았다(다시 승인하면 item_not_planned)
+    restored_review: r.restoredReview,
   };
 }
 

@@ -423,6 +423,9 @@ describe('FIX1-FULLREV3(H6 후속) — 원음 보존을 끈 요청이 기존 성
   const assetRow = async (id: string) => (await db.select().from(schema.assets).where(eq(schema.assets.id, id)))[0]!;
   const auditsOf = async (assetId: string, action: string) =>
     (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.entityId, assetId), eq(schema.auditEvents.action, action)))).length;
+  // FIX2-FULLREV3(K3): 감사 details 를 정확히 본다(trigger 표식)
+  const auditDetailsOf = async (assetId: string, action: string) =>
+    (await db.select().from(schema.auditEvents).where(and(eq(schema.auditEvents.entityId, assetId), eq(schema.auditEvents.action, action)))).map((e) => e.sanitizedDetails);
   async function succeededKept(seedN: number) {
     const assetId = await uploadAsset(seedN);
     const first = await transcribe(assetId, { keep_original: true });
@@ -447,6 +450,8 @@ describe('FIX1-FULLREV3(H6 후속) — 원음 보존을 끈 요청이 기존 성
     expect(row.deletedAt).not.toBeNull();
     expect(row.pendingDeleteKey).toBeNull(); // 커밋 뒤 파일까지 지웠다
     expect(await auditsOf(assetId, 'asset.delete_original')).toBe(1);
+    // FIX2-FULLREV3(K3): job_id 는 원음 보존을 켰던 기존 작업 — 나중 요청(기존 성공 작업 경로)이 지웠다는 표식을 함께 남긴다(비밀·경로 없음)
+    expect(await auditDetailsOf(assetId, 'asset.delete_original')).toEqual([{ job_id: jobId, trigger: 'request_existing' }]);
     const dl = await assetGET(new Request(`${BASE}/api/assets/${assetId}`, { headers: { accept: 'application/json', ...cookieHeader(tokenA) } }), ctx(assetId));
     expect(dl.status).toBe(410);
     expect(await jobsFor(assetId)).toBe(jobsBefore);
@@ -477,11 +482,24 @@ describe('FIX1-FULLREV3(H6 후속) — 원음 보존을 끈 요청이 기존 성
     expect(row.pendingDeleteKey).toBeNull();
     expect(await auditsOf(assetId, 'asset.delete_original')).toBe(0);
     expect(await auditsOf(assetId, 'asset.delete_original_skipped')).toBe(1);
+    // FIX2-FULLREV3(K3): 건너뛴 감사에도 같은 표식
+    expect(await auditDetailsOf(assetId, 'asset.delete_original_skipped')).toEqual([{ reason: 'attached_to_variant', job_id: jobId, trigger: 'request_existing' }]);
     expect(await jobsFor(assetId)).toBe(jobsBefore);
     expect(await ledgerRows()).toBe(ledgerBefore);
     const note = transcribeOriginalNote(body);
     expect(note).toContain('원본 파일은 지우지 않았습니다');
     expect(note).toContain('채널 초안에 첨부된 파일');
+  });
+
+  it('FIX2-FULLREV3(K3): 작업 성공 뒤 삭제(worker — 처음부터 keep_original=false)의 감사는 전과 같다(trigger 없음)', async () => {
+    const assetId = await uploadAsset(314);
+    const first = await transcribe(assetId, { keep_original: false });
+    expect(first.status).toBe(202);
+    const jobId = (await first.json()).job.id as string;
+    for (let i = 0; i < 6; i++) await poll();
+    expect((await poll()).find((j) => j.id === jobId)?.state).toBe('succeeded');
+    expect((await assetRow(assetId)).deletedAt).not.toBeNull();
+    expect(await auditDetailsOf(assetId, 'asset.delete_original')).toEqual([{ job_id: jobId }]);
   });
 
   it('keep_original=true(기본)는 전과 같다 — 원본 그대로, 원본 칸 없음', async () => {

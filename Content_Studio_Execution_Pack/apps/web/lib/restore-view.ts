@@ -2,7 +2,7 @@
  * FIX2-T13(Codex review-FIX-T13 Q11): 복원 미리보기·결과 화면의 "다시 연결 필요" 안내 문구. 플랫폼·표시 이름만 쓴다(계정 ID·비밀 없음).
  * 옛 미리보기 기록(reconnect_required_labels 없음)은 개수만 보여 준다.
  */
-import { CHANNEL_LABEL, type Channel } from '@cs/domain';
+import { CHANNEL_LABEL, RESTORED_RETRY_RECOVERY, type Channel } from '@cs/domain';
 
 export interface ReconnectSource {
   reconnect_required_accounts?: string[] | null;
@@ -37,6 +37,8 @@ export interface InvalidatedApprovalEntry {
   partial_job_ids?: string[] | null;
   leased_partial_job_ids?: string[] | null;
   in_flight?: boolean | null;
+  /** FIX2-FULLREV3(K2): 이전 복원의 확인 표시로 BLOCKED 그대로 둔 항목(옛 기록에는 없음 → false — 지금까지 문구 그대로). */
+  restored_review?: boolean | null;
 }
 
 export interface InvalidationNotice {
@@ -52,12 +54,22 @@ export interface InvalidationNotice {
  * - 보내기 직전 부분 게시(leased_partial_job_ids 있음, FIX1-FULLREV3(H3 후속)): lease 된(보내기 전) 작업에 이미 게시된 단계·게시 시도 표식이 있어
  *   항목을 실행 전으로 두지 않는다 — 그 작업의 다음 전송은 다시 보내지 않고 결과 불명(UNKNOWN)으로 정해진다.
  * - 진행 중(in_flight, FIX1-FULLREV3(H2)): 작업·항목 상태 그대로, 다음 전송이 보내지 않고 멈춘다.
+ * - 이전 복원 확인 표시(restored_review, FIX2-FULLREV3(K2)): BLOCKED 항목에 이전 복원의 '확인 필요' 표시가 있어 실행 전으로 돌리지 않았다
+ *   (다시 승인하면 item_not_planned) — "실행 전으로"에 세지 않고 채널에서 결과를 확인한 뒤 새 계획을 만들라고 따로 알린다.
  * 모두 "실행 전으로"일 때(옛 기록 포함)는 지금까지와 같은 문구 그대로다.
  */
 export function restoreInvalidationNotices(entries: readonly InvalidatedApprovalEntry[] | null | undefined, committed: boolean): InvalidationNotice[] {
   const list = entries ?? [];
   const kindOf = (e: InvalidatedApprovalEntry) =>
-    (e.partial_job_ids ?? []).length > 0 ? 'partial' : (e.leased_partial_job_ids ?? []).length > 0 ? 'leased_partial' : e.in_flight ? 'in_flight' : 'planned';
+    (e.partial_job_ids ?? []).length > 0
+      ? 'partial'
+      : (e.leased_partial_job_ids ?? []).length > 0
+        ? 'leased_partial'
+        : e.in_flight
+          ? 'in_flight'
+          : e.restored_review // FIX2-FULLREV3(K2): BLOCKED 그대로 — 실행 전으로 세지 않는다
+            ? 'restored_review'
+            : 'planned';
   const split = (reason: string) => {
     const of = list.filter((e) => e.reasons.includes(reason));
     return { total: of.length, planned: of.filter((e) => kindOf(e) === 'planned').length };
@@ -123,6 +135,17 @@ export function restoreInvalidationNotices(entries: readonly InvalidatedApproval
       text: committed
         ? `무효가 된 승인 중 ${inFlight}건은 전송 중이던 항목이라 지금 시도는 결과를 그대로 기록합니다 — 다음 전송(재개·재시도)은 보내지 않고 멈추며(게시된 것이 없으면 실행 전으로, 일부 게시됐으면 결과 불명(UNKNOWN)), 다시 보내려면 다시 승인해야 합니다.`
         : `무효가 될 승인 중 ${inFlight}건은 전송 중인 항목이라 지금 시도는 결과를 그대로 기록하고, 다음 전송(재개·재시도)은 보내지 않고 멈춥니다(다시 승인 필요).`,
+    });
+  }
+  // FIX2-FULLREV3(K2): 이전 복원에서 확인이 필요하다고 표시된 보류(BLOCKED) 항목 — 실행 전으로 돌리지 않았다(다시 승인하면 item_not_planned).
+  // 복구 길은 복원 항목 재시도 거절과 같은 조건부 문구(FIX5-FULLREV T2 사용자 결정 — 게시물이 없을 때만 새 계획). 계정 kind 를 모르므로 MOCK 문구는 쓰지 않는다.
+  const restoredReview = list.filter((e) => kindOf(e) === 'restored_review').length;
+  if (restoredReview) {
+    out.push({
+      testid: 'restore-restored-review',
+      text: committed
+        ? `무효가 된 승인 중 ${restoredReview}건은 이전 복원에서 확인이 필요한 보류 항목이라 실행 전으로 돌리지 않았습니다(그대로 보류 — 다시 승인할 수 없음). ${RESTORED_RETRY_RECOVERY}`
+        : `무효가 될 승인 중 ${restoredReview}건은 이전 복원에서 확인이 필요한 보류 항목이라 실행 전으로 돌리지 않습니다(그대로 보류 — 다시 승인할 수 없음). 복원 뒤 ${RESTORED_RETRY_RECOVERY}`,
     });
   }
   return out;

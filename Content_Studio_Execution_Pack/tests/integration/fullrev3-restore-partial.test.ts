@@ -256,7 +256,7 @@ describe('FIX1-FULLREV3(H3): 복원이 무효로 한 승인 중 부분 게시 �
       await createBrandProfileVersion(m.b.db, m.src, { base_version: brands[0]!.version, ...BRAND, pen_name: '복원 필명 lease 버전' });
       const zip = await exportZip(m.b.db, m.src, m.srcStore, `${tag}-back`);
       const approvalId = (await approvalsOf(pt.item.id))[0]!.id;
-      const expected = [{ approval_id: approvalId, item_id: pt.item.id, reasons: ['brand_changed'], blocked_job_ids: [], partial_job_ids: [], leased_partial_job_ids: [pt.jobId], in_flight: false }];
+      const expected = [{ approval_id: approvalId, item_id: pt.item.id, reasons: ['brand_changed'], blocked_job_ids: [], partial_job_ids: [], leased_partial_job_ids: [pt.jobId], in_flight: false, restored_review: false }]; // FIX2-FULLREV3(K2): restored_review 도 정확히
       const p = await createRestorePreview(db, owner, zip, { restoresDir, source: 'upload' });
       expect(p.preview.invalidated_approvals.filter((e) => e.item_id === pt.item.id)).toEqual(expected);
       const pv = await renderRestore(p.restoreId);
@@ -304,8 +304,8 @@ describe('FIX1-FULLREV3(H3): 복원이 무효로 한 승인 중 부분 게시 �
       const zip = await exportZip(m.b.db, m.src, m.srcStore, `${tag}-back`);
 
       const expected = byItem([
-        { approval_id: (await approvalsOf(pt.item.id))[0]!.id, item_id: pt.item.id, reasons: ['brand_changed'], blocked_job_ids: [], partial_job_ids: [pt.jobId], leased_partial_job_ids: [], in_flight: false },
-        { approval_id: (await approvalsOf(q.item.id))[0]!.id, item_id: q.item.id, reasons: ['brand_changed'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false },
+        { approval_id: (await approvalsOf(pt.item.id))[0]!.id, item_id: pt.item.id, reasons: ['brand_changed'], blocked_job_ids: [], partial_job_ids: [pt.jobId], leased_partial_job_ids: [], in_flight: false, restored_review: false },
+        { approval_id: (await approvalsOf(q.item.id))[0]!.id, item_id: q.item.id, reasons: ['brand_changed'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false, restored_review: false },
       ]);
       const p = await createRestorePreview(db, owner, zip, { restoresDir, source: 'upload' });
       expect(p.preview.tables.brand_profiles).toMatchObject({ new: 1 });
@@ -372,9 +372,9 @@ describe('FIX1-FULLREV3(H3): 복원이 무효로 한 승인 중 부분 게시 �
       const zip = await exportZip(m.b.db, m.src, m.srcStore, `${tag}-back`);
 
       const expected = byItem([
-        { approval_id: (await approvalsOf(pt.item.id))[0]!.id, item_id: pt.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [], partial_job_ids: [pt.jobId], leased_partial_job_ids: [], in_flight: false },
-        { approval_id: (await approvalsOf(rp.item.id))[0]!.id, item_id: rp.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [], partial_job_ids: [], leased_partial_job_ids: [], in_flight: true },
-        { approval_id: (await approvalsOf(q.item.id))[0]!.id, item_id: q.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false },
+        { approval_id: (await approvalsOf(pt.item.id))[0]!.id, item_id: pt.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [], partial_job_ids: [pt.jobId], leased_partial_job_ids: [], in_flight: false, restored_review: false },
+        { approval_id: (await approvalsOf(rp.item.id))[0]!.id, item_id: rp.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [], partial_job_ids: [], leased_partial_job_ids: [], in_flight: true, restored_review: false },
+        { approval_id: (await approvalsOf(q.item.id))[0]!.id, item_id: q.item.id, reasons: ['risk_needs_check'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false, restored_review: false },
       ]);
       const p = await createRestorePreview(db, owner, zip, { restoresDir, source: 'upload' });
       expect(p.preview.tables.content_captures).toMatchObject({ new: 3 });
@@ -433,5 +433,101 @@ describe('FIX1-FULLREV3(H3): 복원이 무효로 한 승인 중 부분 게시 �
     expect(api.postsOf(rp.acc.external)).toHaveLength(0);
     await tick(pt.planId, 20 * MIN);
     expect(api.postsOf(pt.acc.external)).toHaveLength(2);
+  });
+});
+
+// FIX2-FULLREV3(K2): 이전 복원이 대기 항목을 BLOCKED + restored_needs_review 로 넣은 뒤(활성 승인 남음) 다음 복원이 브랜드 새 버전·'확인 필요' 소재 연결로
+// 그 승인을 무효로 하면, 항목은 BLOCKED 그대로다(revokeActiveApprovalsLocked 의 toPlanned 에서 빠짐 — 다시 승인하면 409 item_not_planned).
+// 예전에는 보고 줄에 구분 칸이 없어 화면이 "실행 전으로 … 다시 계획·승인"으로 셌다. 이제 restored_review=true 로 보고하고 따로 안내한다.
+// 상태 만들기: 실제 첫 복원으로 "활성 승인이 남은 BLOCKED + 복원 표시" 항목을 만들려면 복원 재검사(snapshotProblems — 연결 정보가 묶음 밖이라 계정이
+// needs_reconnect)가 승인을 restore_stale 로 철회해 버려 실제 진입점만으로는 만들기 어렵다. 그래서 대기(QUEUED) 항목을 실제 경로로 만든 뒤
+// 복원이 남기는 모양(항목·작업 BLOCKED + restored_needs_review)으로 DB 를 직접 바꾼다(live-threads-publish 등 기존 시험과 같은 방식).
+describe('FIX2-FULLREV3(K2): 이전 복원 확인 표시로 보류된 항목의 승인을 복원이 무효로 하면 restored_review 로 보고하고 "실행 전으로"로 세지 않는다', () => {
+  async function restoredBlocked() {
+    const q = await queued();
+    await db.update(schema.distributionItems).set({ status: 'BLOCKED', restoredNeedsReview: true }).where(eq(schema.distributionItems.id, q.item.id));
+    await db.update(schema.jobs).set({ state: 'BLOCKED', restoredNeedsReview: true }).where(eq(schema.jobs.id, q.jobId));
+    expect(await approvalsOf(q.item.id)).toEqual([expect.objectContaining({ revokedAt: null })]);
+    return q;
+  }
+  it.each([
+    ['brand_changed', 'restore-brand-invalidated'],
+    ['risk_needs_check', 'restore-risk-invalidated'],
+  ] as const)('%s: 보류(BLOCKED+복원 표시) 항목 → restored_review=true·항목/작업 BLOCKED 그대로·다시 승인 409 item_not_planned · 대기 항목은 실행 전으로 · 화면 안내 따로', async (reason, reasonTestid) => {
+    const rr = await restoredBlocked();
+    const q = await queued();
+    const tag = randomUUID().slice(0, 6);
+    const m = await mirror(tag);
+    try {
+      if (reason === 'brand_changed') {
+        const brands = await m.b.db.select().from(schema.brandProfiles).where(eq(schema.brandProfiles.ownerId, m.src)).orderBy(desc(schema.brandProfiles.version));
+        await createBrandProfileVersion(m.b.db, m.src, { base_version: brands[0]!.version, ...BRAND, pen_name: `복원 필명 K2 ${tag}` });
+      } else {
+        const { capture } = await createCapture(m.b.db, m.src, { input_type: 'text', raw_text: `복원 위험 소재 K2 ${tag}`, command_key: `k2-${tag}` });
+        await m.b.db.update(schema.captures).set({ risk: 'needs_check' }).where(eq(schema.captures.id, capture.id));
+        for (const x of [rr, q]) await linkContentCaptures(m.b.db, m.src, x.contentId, [capture.id]);
+      }
+      const zip = await exportZip(m.b.db, m.src, m.srcStore, `${tag}-back`);
+      const expected = byItem([
+        {
+          approval_id: (await approvalsOf(rr.item.id))[0]!.id,
+          item_id: rr.item.id,
+          reasons: [reason],
+          blocked_job_ids: [],
+          partial_job_ids: [],
+          leased_partial_job_ids: [],
+          in_flight: false,
+          restored_review: true,
+        },
+        {
+          approval_id: (await approvalsOf(q.item.id))[0]!.id,
+          item_id: q.item.id,
+          reasons: [reason],
+          blocked_job_ids: [q.jobId],
+          partial_job_ids: [],
+          leased_partial_job_ids: [],
+          in_flight: false,
+          restored_review: false,
+        },
+      ]);
+      const mineOf = <T extends { item_id: string }>(xs: readonly T[]) => byItem(xs.filter((e) => e.item_id === rr.item.id || e.item_id === q.item.id));
+      const p = await createRestorePreview(db, owner, zip, { restoresDir, source: 'upload' });
+      expect(mineOf(p.preview.invalidated_approvals)).toEqual(expected);
+      expect((await itemOf(rr.item.id)).status).toBe('BLOCKED');
+      const pv = await renderRestore(p.restoreId);
+      expect(noticeOf(pv, 'restore-restored-review')).toContain('무효가 될 승인 중');
+      expect(noticeOf(pv, 'restore-restored-review')).toContain('이전 복원에서 확인이 필요한 보류 항목이라 실행 전으로 돌리지 않습니다');
+
+      const r = await commitRestore(db, assets(), owner, p.restoreId, { mode: 'add_missing', confirm: true, restoresDir });
+      expect(mineOf(r.invalidated_approvals)).toEqual(expected);
+      // 보류 항목: 승인은 철회, 항목·작업은 BLOCKED 그대로(실행 전으로 가지 않음)
+      expect((await itemOf(rr.item.id))).toMatchObject({ status: 'BLOCKED', restoredNeedsReview: true });
+      expect((await jobsOf(rr.item.id))[0]).toMatchObject({ id: rr.jobId, state: 'BLOCKED' });
+      expect((await approvalsOf(rr.item.id))[0]!.revokeReason).toBe(`invalidated:${reason}`);
+      // 대기 항목: 지금 규칙 그대로
+      expect((await itemOf(q.item.id)).status).toBe('PLANNED');
+      // 화면이 말한 대로 다시 승인할 수 없다(실행 전이 아니다)
+      const again = await approvePOST(
+        post(`/api/distribution-plans/${rr.planId}/approve`, { item_ids: [rr.item.id], expected_hashes: { [rr.item.id]: rr.item.payload_hash }, confirm: true, purpose: 'mock_publish' }),
+        ctx(rr.planId),
+      );
+      expect(again.status).toBe(409);
+      expect((await again.json()).error).toBe('item_not_planned');
+
+      const cv = await renderRestore(p.restoreId);
+      const rrText = noticeOf(cv, 'restore-restored-review')!;
+      const all = r.invalidated_approvals.filter((e) => e.reasons.includes(reason));
+      const rrCount = all.filter((e) => e.restored_review).length;
+      expect(rrCount).toBe(1);
+      expect(rrText).toBe(
+        '무효가 된 승인 중 1건은 이전 복원에서 확인이 필요한 보류 항목이라 실행 전으로 돌리지 않았습니다(그대로 보류 — 다시 승인할 수 없음). 채널에서 이 계정의 최근 게시물을 직접 확인하세요 — 있으면 그대로 두고, 직접 확인해 게시물이 없을 때만 새 배포 계획으로 다시 승인하세요(확인하지 않고 새 계획을 만들면 같은 내용이 두 번 올라갈 수 있습니다).',
+      );
+      // 사유 안내의 "실행 전으로" 수는 보류 항목을 빼고 센다
+      const plannedCount = all.filter((e) => !(e.partial_job_ids ?? []).length && !(e.leased_partial_job_ids ?? []).length && !e.in_flight && !e.restored_review).length;
+      expect(plannedCount).toBeGreaterThanOrEqual(1);
+      expect(noticeOf(cv, reasonTestid)).toContain(`그중 ${plannedCount}건은 대기 중이던 실행을 보류하고 항목을 실행 전으로 돌렸습니다`);
+    } finally {
+      await m.b.close();
+    }
   });
 });

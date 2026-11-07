@@ -175,7 +175,7 @@ describe('FIX2-FULLREV2(G19): add_missing 으로 현재 브랜드가 바뀌면 �
       await createBrandProfileVersion(s.a.db, s.owner, { base_version: 3, ...BRAND, pen_name: '복원 필명 v4' });
       await createBrandProfileVersion(s.a.db, s.owner, { base_version: 4, ...BRAND, pen_name: '복원 필명 v5' });
       const zip2 = await exportZip(s.a.db, s.owner, `${tag}-2`);
-      const expected = [{ approval_id: q.approvalId, item_id: s.itemId, reasons: ['brand_changed'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false }]; // FIX1-FULLREV3(H3): 부분 게시 없음·진행 중 아님도 정확히(H3 후속: lease 된 부분 게시 작업도 없음)
+      const expected = [{ approval_id: q.approvalId, item_id: s.itemId, reasons: ['brand_changed'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false, restored_review: false }]; // FIX1-FULLREV3(H3): 부분 게시 없음·진행 중 아님도 정확히(H3 후속: lease 된 부분 게시 작업도 없음) · FIX2-FULLREV3(K2): 복원 표시 보류 항목 아님도 정확히
 
       const p = await preview(b.db, target, zip2, `${tag}-2`);
       expect(p.preview.tables.brand_profiles).toMatchObject({ new: 2 });
@@ -261,7 +261,7 @@ describe("FIX2-FULLREV2(G9 fixup): add_missing 이 이미 있던 원고에 '확�
     await withDbs(async (s, b, target) => {
       const tag = randomUUID().slice(0, 6);
       const q = await linkedBundle(s, b, target, tag, 'needs_check');
-      const expected = [{ approval_id: q.approvalId, item_id: s.itemId, reasons: ['risk_needs_check'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false }]; // FIX1-FULLREV3(H3): 부분 게시 없음·진행 중 아님도 정확히(H3 후속: lease 된 부분 게시 작업도 없음)
+      const expected = [{ approval_id: q.approvalId, item_id: s.itemId, reasons: ['risk_needs_check'], blocked_job_ids: [q.jobId], partial_job_ids: [], leased_partial_job_ids: [], in_flight: false, restored_review: false }]; // FIX1-FULLREV3(H3): 부분 게시 없음·진행 중 아님도 정확히(H3 후속: lease 된 부분 게시 작업도 없음) · FIX2-FULLREV3(K2): 복원 표시 보류 항목 아님도 정확히
 
       const p = await preview(b.db, target, q.zip, `${tag}-2`);
       expect(p.preview.tables.contents).toMatchObject({ new: 0, existing_same: 1 });

@@ -14,9 +14,11 @@ import {
   LIVE_THREADS_PUBLISH_MARKER,
   isValidThreadsAppId,
   isValidThreadsAppSecret,
-  assertOAuthRedirectOrigin,
+  assertOAuthRedirectUri,
+  expectedOAuthRedirectUri,
+  OAUTH_REDIRECT_URI_MISMATCH,
   liveOAuthReadiness,
-  oauthRedirectOriginMismatch,
+  oauthRedirectUriMismatch,
   threadsAppSecretState,
   livePublishReadiness,
   UNBOUND_LIVE_EXTERNAL_PREFIX,
@@ -158,22 +160,54 @@ describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 �
     const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecret: 'ok', masterKeyConfigured: true, ...sec });
     expect(r).toEqual({ ready: false, missing: [name] });
   });
-  it('FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin → OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin) 하나만 · 연결 시작 거부', () => {
+  // FIX2-FULLREV3(K1): 예전 이름 'OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)'·코드 oauth_redirect_origin_mismatch → 전체 URI 정확 일치의
+  // 'OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)'·oauth_redirect_uri_mismatch. 다른 origin 사례는 그대로 같은 엄격도로 남긴다.
+  it('FIX1-FULLREV3(H1 후속)·FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin → OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름) 하나만 · 연결 시작 거부', () => {
+    expect(OAUTH_REDIRECT_URI_MISMATCH).toBe('OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)');
     for (const base of ['http://localhost:3000', 'https://www.studio.example.test', 'https://studio.example.test:8443', 'http://studio.example.test']) {
       const config = loadConfig({ ...FULL, APP_BASE_URL: base });
       expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI)).toEqual({
         ready: false,
-        missing: ['OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)'],
+        missing: ['OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)'],
       });
-      expect(oauthRedirectOriginMismatch(config)).toBe(true);
-      expect(() => assertOAuthRedirectOrigin(config)).toThrow(expect.objectContaining({ code: 'oauth_redirect_origin_mismatch', kind: 'service_unavailable' }));
+      expect(oauthRedirectUriMismatch(config)).toBe(true);
+      expect(() => assertOAuthRedirectUri(config)).toThrow(expect.objectContaining({ code: 'oauth_redirect_uri_mismatch', kind: 'service_unavailable' }));
     }
-    // 같은 origin(경로 기본값 포함)·설정 없음(기본값 = APP_BASE_URL origin)은 통과
+    // 같은 URI(APP_BASE_URL 의 경로는 무시 — origin + /api/oauth/callback)·설정 없음(기본값 = 기대값)은 통과
     const same = loadConfig({ ...FULL, APP_BASE_URL: 'https://studio.example.test/app' });
-    expect(oauthRedirectOriginMismatch(same)).toBe(false);
-    expect(() => assertOAuthRedirectOrigin(same)).not.toThrow();
-    expect(oauthRedirectOriginMismatch(loadConfig({}))).toBe(false);
-    expect(() => assertOAuthRedirectOrigin(loadConfig({ APP_BASE_URL: 'https://studio.example.test' }))).not.toThrow();
+    expect(expectedOAuthRedirectUri(same)).toBe('https://studio.example.test/api/oauth/callback');
+    expect(oauthRedirectUriMismatch(same)).toBe(false);
+    expect(() => assertOAuthRedirectUri(same)).not.toThrow();
+    expect(liveOAuthReadiness(same, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI)).toEqual({ ready: true, missing: [] });
+    expect(oauthRedirectUriMismatch(loadConfig({}))).toBe(false);
+    expect(() => assertOAuthRedirectUri(loadConfig({ APP_BASE_URL: 'https://studio.example.test' }))).not.toThrow();
+  });
+  it('FIX2-FULLREV3(K1): origin 은 같아도 경로가 다르거나 끝 `/` 가 붙으면 불일치 — 준비 안 됨 하나만 · 연결 시작 거부(503 oauth_redirect_uri_mismatch)', () => {
+    for (const redirect of [
+      'https://studio.example.test/oauth/callback',
+      'https://studio.example.test/api/oauth/callback/',
+      'https://studio.example.test/api/oauth/callback2',
+      'https://studio.example.test/API/oauth/callback',
+      'https://studio.example.test/app/api/oauth/callback',
+    ]) {
+      const config = loadConfig({ ...FULL, OAUTH_REDIRECT_URI: redirect });
+      expect(oauthRedirectUriMismatch(config), redirect).toBe(true);
+      // 실제 배선과 같이 등록 redirect = 설정값(oauthRedirectUri)으로 준다 — 그래도 기대값과 달라 준비 안 됨
+      expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, redirect), redirect).toEqual({
+        ready: false,
+        missing: [OAUTH_REDIRECT_URI_MISMATCH],
+      });
+      let err: unknown;
+      try {
+        assertOAuthRedirectUri(config);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, redirect).toEqual(expect.objectContaining({ code: 'oauth_redirect_uri_mismatch', kind: 'service_unavailable' }));
+      expect((err as { extra?: unknown }).extra, redirect).toEqual({ missing: [OAUTH_REDIRECT_URI_MISMATCH] });
+      // 오류 문구에 설정값(URI)을 싣지 않는다 — 이름만
+      expect((err as Error).message, redirect).not.toContain(redirect);
+    }
   });
   it('FIX1-LIVET1: 등록 redirect URI 를 주면 설정값과 정확히 같아야 한다(불일치 → OAUTH_REDIRECT_URI(불일치)), 형식 검증 함수', () => {
     const config = loadConfig({ ...FULL });

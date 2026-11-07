@@ -133,7 +133,8 @@ export async function requestTranscription(db: Db, ownerId: string, assetId: str
   // (deleteOriginal — asset 잠금 아래 첨부 재확인·의도 먼저·감사 asset.delete_original / _skipped)로 지운다. 트랜잭션 밖(파일 삭제는 커밋 뒤).
   // 새 작업·원장은 만들지 않는다.
   if (r.existing && !input.keepOriginal && r.originalPresent && input.files) {
-    const out = await deleteOriginalDetailed(db, input.files, r.job, now);
+    // FIX2-FULLREV3(K3): 감사에는 원음 보존을 켰던 기존 작업(job_id)만 남아 "나중 요청이 지웠다"가 보이지 않았다 — 이 경로 표식(trigger)을 함께 남긴다
+    const out = await deleteOriginalDetailed(db, input.files, r.job, now, { trigger: 'request_existing' });
     if (out.deleted || out.reason === 'already_deleted') return { ...r.job, originalDeleted: true };
     return { ...r.job, originalDeleted: false, originalKeptReason: out.reason === 'attached_to_variant' ? 'asset_in_use' : 'cleanup_pending' };
   }
@@ -363,13 +364,21 @@ export async function deleteOriginal(
 /** FIX1-FULLREV3(H6 후속): deleteOriginal 과 같은 동작 — 지우지 않았으면 그 이유도 돌려준다(전사 요청의 기존 성공 작업 경로가 화면에 알린다). */
 export type DeleteOriginalOutcome = { deleted: true } | { deleted: false; reason: 'already_deleted' | 'cleanup_pending' | 'attached_to_variant' };
 
+/**
+ * FIX2-FULLREV3(K3): 원본 삭제를 일으킨 경로 표식(감사 details.trigger). 'request_existing' = 기존 성공 작업을 돌려주는 전사 요청(원음 보존 끄기)이
+ * 지운 경우 — job_id 는 원음 보존을 켰던 그 기존 작업이라, 표식이 없으면 감사만으로는 나중 요청이 지웠다는 것을 알 수 없다.
+ * 없으면(작업 성공 뒤 삭제 — worker) details 는 전과 같다. 값은 고정 문자열뿐(비밀·경로 없음).
+ */
+export type DeleteOriginalTrigger = 'request_existing';
+
 export async function deleteOriginalDetailed(
   db: Db,
   files: AssetDeleter,
   job: Pick<TranscriptionJobRow, 'id' | 'ownerId' | 'assetId'>,
   now: Date,
-  hooks: { afterIntent?: () => Promise<void> } = {},
+  hooks: { afterIntent?: () => Promise<void>; trigger?: DeleteOriginalTrigger } = {},
 ): Promise<DeleteOriginalOutcome> {
+  const via: Record<string, string> = hooks.trigger ? { trigger: hooks.trigger } : {};
   // 앞선 삭제 의도(예: 복구로 바뀐 옛 key)가 남아 있으면 먼저 처리한다 — 표시 칸은 하나다.
   await cleanupPendingDelete(db, files, job.ownerId, job.assetId, now);
   const done = await db.transaction(async (tx) => {
@@ -381,7 +390,7 @@ export async function deleteOriginalDetailed(
         action: 'asset.delete_original_skipped',
         entity: 'asset',
         entityId: a.id,
-        details: { reason: 'cleanup_pending', job_id: job.id },
+        details: { reason: 'cleanup_pending', job_id: job.id, ...via },
         at: now,
       });
       return 'cleanup_pending' as const;
@@ -392,13 +401,13 @@ export async function deleteOriginalDetailed(
         action: 'asset.delete_original_skipped',
         entity: 'asset',
         entityId: a.id,
-        details: { reason: 'attached_to_variant', job_id: job.id },
+        details: { reason: 'attached_to_variant', job_id: job.id, ...via },
         at: now,
       });
       return 'attached_to_variant' as const;
     }
     await tx.update(assets).set({ deletedAt: now, pendingDeleteKey: a.key, pendingDeleteAttempts: 0, pendingDeleteNextAt: now }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
-    await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id }, at: now });
+    await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id, ...via }, at: now });
     return true;
   });
   if (done !== true) return { deleted: false, reason: done };

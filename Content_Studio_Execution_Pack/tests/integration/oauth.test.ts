@@ -2999,7 +2999,9 @@ describe('FIX1-FULLREV3(H1): 운영 배포 형태(next start --hostname 127.0.0.
 
   // FIX1-FULLREV3(H1 후속): 예전에는 다른 origin 의 OAUTH_REDIRECT_URI 로 연결 시작이 200 이고 동의 화면 뒤 callback 이 불일치였다. 이제 연결 시작이
   // 미리 503 으로 거부한다(인증 창으로 보내지 않음). callback 의 방어선(불일치 → oauth_redirect_mismatch)은 시작 뒤 설정이 바뀐 경우로 그대로 확인한다.
-  it('FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 이면 연결 시작이 503 oauth_redirect_origin_mismatch(state·감사 없음, fetch 0) · 폼은 안내 코드로', async () => {
+  // FIX2-FULLREV3(K1): 코드 oauth_redirect_origin_mismatch → oauth_redirect_uri_mismatch, 이름 'OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)' →
+  // 'OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)'(같은 엄격도 — 정확 일치 비교 그대로).
+  it('FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 이면 연결 시작이 503 oauth_redirect_uri_mismatch(state·감사 없음, fetch 0) · 폼은 안내 코드로', async () => {
     vi.stubEnv('APP_BASE_URL', PUBLIC);
     vi.stubEnv('OAUTH_REDIRECT_URI', 'https://other.example.com/api/oauth/callback');
     const accountId = await newThreadsAccount();
@@ -3009,8 +3011,8 @@ describe('FIX1-FULLREV3(H1): 운영 배포 형태(next start --hostname 127.0.0.
       const c = await connectPOST(pub(`/api/channel-accounts/${accountId}/connect`), ctx(accountId));
       expect(c.status).toBe(503);
       const body = await c.json();
-      expect(body.error).toBe('oauth_redirect_origin_mismatch');
-      expect(body.message).toContain('OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)');
+      expect(body.error).toBe('oauth_redirect_uri_mismatch');
+      expect(body.message).toContain('OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)');
       expect(JSON.stringify(body)).not.toContain('other.example.com');
       expect(await stateRowsOf(accountId)).toHaveLength(0);
       expect((await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId, accountId))).length).toBe(auditsBefore);
@@ -3024,13 +3026,63 @@ describe('FIX1-FULLREV3(H1): 운영 배포 형태(next start --hostname 127.0.0.
         ctx(accountId),
       );
       expect(form.status).toBe(303);
-      expect(form.headers.get('location')).toBe('/settings?account_error=oauth_redirect_origin_mismatch#accounts');
+      expect(form.headers.get('location')).toBe('/settings?account_error=oauth_redirect_uri_mismatch#accounts');
       expect(await stateRowsOf(accountId)).toHaveLength(0);
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();
     }
     expect(await credRow(accountId)).toBeNull();
+  });
+
+  // FIX2-FULLREV3(K1): 예전(FIX1)에는 origin 만 비교해서 같은 origin 의 다른 경로(/oauth/callback)·끝 `/`(…/callback/)가 연결 시작 200 →
+  // 동의 화면 → 공급자가 route 없는 경로(404)나 불일치로 돌려보내 연결을 끝낼 수 없었다. 이제 연결 시작이 미리 503 으로 거부한다.
+  it.each(['https://studio.example.com/oauth/callback', 'https://studio.example.com/api/oauth/callback/'])(
+    'FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 가 같은 origin 의 다른 경로(%s)면 연결 시작이 503 oauth_redirect_uri_mismatch(state·감사 없음, fetch 0) · 폼은 안내 코드로',
+    async (redirect) => {
+      vi.stubEnv('APP_BASE_URL', PUBLIC);
+      expect(new URL(redirect).origin).toBe(new URL(PUBLIC).origin);
+      vi.stubEnv('OAUTH_REDIRECT_URI', redirect);
+      const accountId = await newThreadsAccount();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      try {
+        const auditsBefore = (await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId, accountId))).length;
+        const c = await connectPOST(pub(`/api/channel-accounts/${accountId}/connect`), ctx(accountId));
+        expect(c.status).toBe(503);
+        const body = await c.json();
+        expect(body.error).toBe('oauth_redirect_uri_mismatch');
+        expect(body.message).toContain('OAUTH_REDIRECT_URI(APP_BASE_URL/api/oauth/callback 과 다름)');
+        expect(body).not.toHaveProperty('authorize_url');
+        expect(JSON.stringify(body)).not.toContain(redirect);
+        expect(await stateRowsOf(accountId)).toHaveLength(0);
+        expect((await db.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId, accountId))).length).toBe(auditsBefore);
+        const form = await connectPOST(
+          new Request(`https://localhost:3000/api/channel-accounts/${accountId}/connect`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', origin: PUBLIC, ...cookieHeader(tokenA) },
+            body: '',
+          }),
+          ctx(accountId),
+        );
+        expect(form.status).toBe(303);
+        expect(form.headers.get('location')).toBe('/settings?account_error=oauth_redirect_uri_mismatch#accounts');
+        expect(await stateRowsOf(accountId)).toHaveLength(0);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        fetchSpy.mockRestore();
+      }
+      expect(await credRow(accountId)).toBeNull();
+    },
+  );
+
+  it('FIX2-FULLREV3(K1): OAUTH_REDIRECT_URI 를 기대값(APP_BASE_URL origin + /api/oauth/callback)과 정확히 같게 명시하면 연결 시작 200 · 연결된다', async () => {
+    vi.stubEnv('APP_BASE_URL', PUBLIC);
+    vi.stubEnv('OAUTH_REDIRECT_URI', `${PUBLIC}/api/oauth/callback`);
+    const accountId = await newThreadsAccount();
+    const location = await beginPublic(accountId);
+    const r = await callback(asServerSeen(location));
+    expect(r.status, await r.clone().text()).toBe(200);
+    expect((await r.json()).account.status).toBe('connected');
   });
 
   it('callback 방어선: 연결 시작 뒤 OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 으로 바뀌면 요청 origin 이 그 주소여도 oauth_redirect_mismatch', async () => {

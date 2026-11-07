@@ -491,3 +491,15 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 결과: `docs/handoffs/FULLREV3_CLAUDE_REVIEW.md` — 확정 8(**P1 1**·P2 7), P0 없음, 기각 1.
   - P1 H1: 문서대로 운영 배포하면 OIDC 로그인과 계정 연결 콜백이 항상 redirect 불일치다(Next `request.url` 호스트가 서버 설정 — 실제 실험으로 재현). 운영 배포(D37) 전에 꼭 고쳐야 한다.
 - 코드는 아직 고치지 않았다. 다음: 권고 수정 묶음 FIX1-FULLREV3(사용자 확인 뒤).
+
+## 2026-11-07 — FIX1-FULLREV3(FULLREV3 H1–H8 수정, 클라우드 세션)
+- 사용자 지시 "권고대로 진행해줘". 코드 커밋 `e1fdc02`(BASE `26b44c1`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` FIX round 1.
+- 처리:
+  - H1(P1): 운영 callback redirect 비교를 `APP_BASE_URL` origin + 요청 경로로 바꿨다. `OAUTH_REDIRECT_URI` origin 불일치는 연결 시작에서 미리 503 으로 막는다.
+  - H2–H6: 위험 표시 전송 중 철회, 복원 부분 게시 안내, 1인칭 축약형, 충돌 textarea 앞 줄바꿈, 전사 중복 요청.
+  - H7·H8: 절차 문서와 명령.
+- Claude 독립 검토(D42): 구현 뒤 반박 검토 3명 → 확정 P2 6건 보완. 보완분 재검토 1명 → P2 1건(문서) 수정. P0·P1 확정 0.
+- gate 에서 처음 돌린 deploy 셸 시험이 시험 자체의 정렬 의존(같은 초 사본)으로 간헐 실패했다. 시험을 고쳤다(단언 그대로, 비root 10회 연속 통과).
+- 최종 트리 전체 검사(단계별 exit 0): unit 88/2248 · integration 78/1322 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- not_run: 실제 Caddy + `next start` 배포(H1 은 첫 배포 때 OIDC 로그인 한 번으로 확인), 실제 IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저.
+- 남은 위험: 인계 문서 '남은 위험' 1–7(migrate.ts 의 DATABASE_URL 출력 포함). M4/D20 보류 조건은 그대로다.

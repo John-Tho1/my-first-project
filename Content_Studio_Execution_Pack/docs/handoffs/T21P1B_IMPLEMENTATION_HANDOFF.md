@@ -72,6 +72,7 @@
 ## 남은 위험 / not_run
 1. **실제 IdP 미검증(not_run)**: discovery 문서·키 교체·시계 오차·`email_verified` 표기·클라이언트 인증 방식은 가짜 IdP 로만 확인. 자체 호스팅 IdP 의 도메인은 시험 가드가 이름으로 막지 못한다(앱 경로는 주입 fetch 로만 나감).
 2. **프록시 뒤 redirect 정확 일치**: callback 은 `requestRedirectTarget(request.url)`(origin+path)을 `OIDC_REDIRECT_URI` 와 비교한다(T13 Threads callback 과 같은 패턴). Caddy 뒤에서 Next 가 `request.url` 을 `https://<도메인>` 으로 만드는지(Host 보존·`X-Forwarded-Proto`) **확인하지 않았다** — 어긋나면 모든 OIDC callback 이 `redirect_mismatch`(실패로 셈)가 되어 15분 잠김. 첫 배포 때 확인 필요.
+   - **갱신(2026-11-07, FULLREV3 H1 → FIX1-FULLREV3 `e1fdc02`)**: 실제로 어긋남을 확인했다(`next start --hostname 127.0.0.1` 의 `request.url` 호스트는 서버 설정이고, 스킴만 X-Forwarded-Proto 를 따른다). 두 callback 은 이제 `APP_BASE_URL` origin + 요청 경로로 비교한다. 실제 Caddy 배포는 여전히 not_run 이다 — `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md`.
 3. 전역 실패 창(T21-P1a 대가 그대로): 누구나 임의 state 로 callback 을 10번 치면 15분 동안 주인도 새로 로그인 못 함(기존 세션은 유지). 프록시 요청 제한 없음.
 4. 시작 경로는 인증 없이 DB 행을 만든다 — 상한 100개(오래된 것 삭제)로 크기는 묶었지만, 시작을 계속 치면 주인의 진행 중 요청(10분 안)이 밀려나 다시 시작해야 할 수 있다.
 5. `deploy/Caddyfile` 의 `Referrer-Policy "same-origin"`(지연 적용)이 앱의 `no-referrer` 를 덮어쓸 수 있다(같은 출처로만 Referer 전송 — code 가 외부로 새지는 않음). 이번 과제에서 Caddyfile 은 바꾸지 않음.

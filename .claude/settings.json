@@ -1,8 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "Bash(./scripts/codex-review.sh:*)",
-      "Bash(./scripts/codex-task.sh:*)",
       "Bash(git diff:*)",
       "Bash(git status:*)",
       "Bash(git log:*)"

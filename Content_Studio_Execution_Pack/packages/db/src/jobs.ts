@@ -905,6 +905,17 @@ async function staleScheduleConfirmed(
   return staleScheduleConfirmedBy(rows, { approvalId: target.approvalId, payloadHash: target.payloadHash, scheduledAtUtc: target.scheduledAtUtc.toISOString() });
 }
 
+/**
+ * FIX1-FULLREV4(J1): 작업 키(publish:<항목 ID>:<승인 ID> — executePlan 이 작업을 만드는 유일한 경로, 작업 표가 생긴 0016 부터 같은 형식)에서 이 작업을
+ * 만든 승인을 엄격히 읽어 지금 활성 승인과 비교한다. 같으면 null, 다른 승인이면 'other_approval', 키 형식이 다르거나 항목 ID 가 다르면 'key_unparsed'
+ * (어떤 승인으로 만들었는지 모르므로 보내지 않는다 — 안전 쪽). 새 열(migration) 대신 기존 unique 키를 쓴다.
+ */
+function approvalBindingOf(job: Pick<JobRow, 'idempotencyKey' | 'itemId'>, activeApprovalId: string): 'other_approval' | 'key_unparsed' | null {
+  const parts = job.idempotencyKey.split(':');
+  if (parts.length !== 3 || parts[0] !== 'publish' || !job.itemId || parts[1] !== job.itemId || !isUuid(parts[2]!)) return 'key_unparsed';
+  return parts[2] === activeApprovalId ? null : 'other_approval';
+}
+
 /** 1단계(한 트랜잭션): 재검사 + SENDING + 전송 의도. 보낼 수 없으면 상태를 정하고 null. */
 async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRow, opts: JobRunOptions, now: Date): Promise<SendPlan | JobState | 'lease_lost'> {
   const ownerId = leased.ownerId;
@@ -925,13 +936,19 @@ async function beginSend(db: Db, registry: ChannelAdapterRegistry, leased: JobRo
     }
     if (job.state !== 'LEASED') return 'lease_lost' as const;
     const approval = active.get(item.id);
-    if (!approval || approval.payloadHash !== item.payloadHash) {
+    // FIX1-FULLREV4(J1): 활성 승인이 **이 작업을 만든 승인**(작업 키 publish:<항목>:<승인>)과 같아야 보낸다. 승인 무효화는 LEASED 작업을 막지 않으므로
+    // (항목만 PLANNED) 되돌린 원인(계정 끔→켬·위험 표시 해제) 뒤 다시 승인(B)하면, lease 만료 복구로 되살아난 옛 작업(승인 A)이 사용자의 실행 없이
+    // 승인 B 로 게시됐다. 다르거나 키에서 승인을 알 수 없으면 승인 없음과 같다(보내지 않음 → 작업 BLOCKED·항목 PLANNED — 승인 B 는 그대로 두므로
+    // 사용자의 다음 실행이 새 작업으로 게시). 작업을 다른 승인으로 옮기는 정상 경로는 없다(승인은 PLANNED 항목에만 — 그때 옛 작업은 끝났거나 BLOCKED).
+    const binding = approval && approval.payloadHash === item.payloadHash ? approvalBindingOf(job, approval.id) : null;
+    if (!approval || approval.payloadHash !== item.payloadHash || binding) {
       // A10: 승인이 없거나 바뀌었으면 다음 외부 전송을 막는다. 아직 보내지 않았으므로 항목은 PLANNED(다시 승인 가능, T10 과 같은 규칙).
       // FIX1-FULLREV(F2 후속): 단, 앞선 시도가 스레드 일부를 게시한 작업(재개 대기 뒤 lease — 철회 훅이 lease 된 작업을 보기 전 경합 등)은
       // PLANNED 로 두지 않는다(다시 승인·실행하면 새 작업이 처음부터 다시 게시). 남은 부분은 보내지 않고 UNKNOWN(thread_partial_revoked).
-      const stop = { reason: 'approval_missing', code: THREAD_PARTIAL_REVOKED_CODE, details: { attempt: job.attempt } };
+      const bound = binding ? { approval_binding: binding } : {};
+      const stop = { reason: 'approval_missing', code: THREAD_PARTIAL_REVOKED_CODE, details: { attempt: job.attempt, ...bound } };
       return stopUnlessPartial(tx, ownerId, job, item, stop, now, () =>
-        settle(tx, ownerId, job, item, 'blocked', { reason: 'approval_missing', attempt: job.attempt }, now, { ...CLEAR_LEASE, lastErrorCode: 'approval_missing' }, 'PLANNED'),
+        settle(tx, ownerId, job, item, 'blocked', { reason: 'approval_missing', attempt: job.attempt, ...bound }, now, { ...CLEAR_LEASE, lastErrorCode: 'approval_missing' }, 'PLANNED'),
       );
     }
     // 예약 시각 경과는 예약 작업이 실행될 때 당연하므로 제외한다.

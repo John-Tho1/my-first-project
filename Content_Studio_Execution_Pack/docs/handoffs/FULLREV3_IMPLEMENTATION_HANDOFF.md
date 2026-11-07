@@ -304,3 +304,8 @@
 1. 오류 원인 진단이 어려워진다: drizzle 쿼리 오류는 `Error` 로만 보인다. 원인을 보려면 개발 환경에서 따로 재현해야 한다.
 2. 맨 위의 `loadRootEnv`·`loadConfig` 오류는 그대로 스택을 찍는다(메시지에 값 없음 — 설정 이름·파일 경로만).
 3. web 서버(Next) 쪽 route 의 처리되지 않은 오류 출력은 이번 범위 밖이다(inline worker 는 이미 허용 이름·코드만 찍음).
+   - **확인(2026-11-07, 주 세션 grep — 코드 변경 없음)**:
+     - API route 62개는 모두 `apiHandler`/`errorResponse`(처리하지 못한 오류는 `[api] 처리하지 못한 오류:<이름>` 만 찍음)를 거친다. 예외 4개도 안전하다: 모의 authorize 3개는 `oauthEndpoint` 감싸개를 쓰고, `/api/health` 는 자체 catch 가 있다.
+     - 남는 경로는 화면(서버 컴포넌트) 렌더 중 처리되지 않은 오류다. Next 가 기본 로그로 메시지를 찍으므로, 그 오류가 DrizzleQueryError 면 쿼리 파라미터 값이 서버 로그(journalctl)에 남을 수 있다.
+     - 화면 쿼리의 파라미터는 주로 owner id·검색어·원고 id 이고, 봉인된 토큰을 쓰는 쿼리(갱신·삽입)는 API·worker 경로에 있다. 그래서 낮음으로 본다.
+     - 고친다면 `instrumentation.ts` 의 `onRequestError` 로는 Next 의 기본 출력을 막지 못한다. 화면별 DB 호출을 감싸거나 로그 수집 단계에서 걸러야 한다. 실제 Postgres·운영 로그 수집을 붙일 때 결정한다.

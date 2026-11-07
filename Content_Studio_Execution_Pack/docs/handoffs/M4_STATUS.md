@@ -503,3 +503,13 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 최종 트리 전체 검사(단계별 exit 0): unit 88/2248 · integration 78/1322 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
 - not_run: 실제 Caddy + `next start` 배포(H1 은 첫 배포 때 OIDC 로그인 한 번으로 확인), 실제 IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저.
 - 남은 위험: 인계 문서 '남은 위험' 1–7(migrate.ts 의 DATABASE_URL 출력 포함). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — FIX2-FULLREV3(e1fdc02 재검증, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘" → 절차 9단계(새 커밋 재검증). e1fdc02 를 영역 3개(인증·OAuth / 승인·복원 / 작성·전사·도구)로 나눠 Claude 독립 검토. P0·P1 0, 확정 P2 3건(K1–K3).
+- 코드 커밋 `f7d4c3e`(BASE `26601dc`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` FIX round 2.
+  - K1: 계정 연결 redirect 정확 일치 사전 거부(`oauth_redirect_uri_mismatch`).
+  - K2: 복원 확인 표시 보류 항목 안내(게시물이 없을 때만 새 계획 — FIX5-FULLREV T2 문구). 지금은 도달 불가 상태라 방어용.
+  - K3: 원음 삭제 감사 trigger.
+- 보완분 재검토 P2 2건(K2 문구가 사용자 결정과 어긋남, 인계 옛 오류 코드)을 반영했다.
+- 최종 트리 전체 검사(단계별 exit 0): unit 88/2250 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- not_run: 실제 Caddy 배포·IdP·계정, 실제 PostgreSQL 다중 연결, Chromium 외 브라우저. M4/D20 보류 조건은 그대로다.

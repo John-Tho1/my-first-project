@@ -531,3 +531,10 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Claude 독립 검토 1회: P2 1건(worker 닫기) 반영.
 - 전체 검사(단계별 exit 0): unit 89/2259 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
 - 남은 위험: worker tick 안 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — worker CLI 오류 출력(클라우드 세션)
+- 사용자 지시 "계속 진행해줘". 코드 커밋 `e0d0817`(BASE `4ad5123`). 인계: `docs/handoffs/FULLREV3_IMPLEMENTATION_HANDOFF.md` '후속 3'.
+- `pnpm worker` 의 tick·시작·준비 오류를 메시지·스택 없이 한 줄로 낸다(DrizzleQueryError 메시지의 쿼리 파라미터 값 노출 방지). DB 닫기는 그대로다.
+- Claude 독립 검토 2회: P2 2건 반영, 마지막 확정 0.
+- 전체 검사(단계별 exit 0): unit 89/2260 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
+- 남은 위험: 진단 정보 감소, web(Next) route 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.

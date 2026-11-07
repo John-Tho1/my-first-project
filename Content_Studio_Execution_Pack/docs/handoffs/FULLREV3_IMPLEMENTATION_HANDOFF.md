@@ -259,5 +259,48 @@
 - drill:mock 위반 0 · dev-cert 472/472 · deploy 셸 시험(비root) PASS
 
 ### 남은 위험
-1. worker tick 안에서 던진 오류는 여전히 Node 가 메시지·스택을 찍는다(범위 밖). tick 오류의 원천이 많아 일괄로 숨기면 진단이 어려워진다. 실제 Postgres·실계정을 붙이기 전에 따로 본다.
+1. worker tick 안에서 던진 오류는 여전히 Node 가 메시지·스택을 찍는다(범위 밖). — **해결(`e0d0817`)**: 아래 '후속 3'. tick 오류의 원천이 많아 일괄로 숨기면 진단이 어려워진다. 실제 Postgres·실계정을 붙이기 전에 따로 본다.
 2. 내부 방어 오류(예: '묶음 경로가 폴더를 벗어났습니다')는 이제 `Error` 로만 보인다.
+
+## 후속 3 — worker CLI tick·시작·준비 오류(후속 2 남은 위험 1)
+
+- BASE_SHA: `4ad5123` (`4ad51233fcb15ef5c64ca005d7b4cc24b4e0feea`, docs) · **HEAD_SHA: `e0d0817`** (`e0d08173ceb77baf77030def3deb367a68033881`)
+- 출처: 사용자 지시 "계속 진행해줘"(2026-11-07).
+- 근거: drizzle-orm 0.45.3 의 `DrizzleQueryError` 메시지는 `Failed query: …\nparams: …` 로 쿼리 파라미터 값(봉인된 토큰·원고 내용 등)을 담는다. worker 내부(`packages/db/src/jobs.ts`)는 이미 이름만 찍었고, 노출 경로는 CLI 맨 위층(던진 오류를 Node 가 그대로 출력)뿐이었다.
+
+### 처리(`apps/worker/src/cli.ts`)
+- tick 오류: `catch` 에서 `dbCliErrorLine('worker tick 을 마치지 못했습니다', e)` 한 줄을 찍고 `exitCode = 1` 로 둔다(예전처럼 반복 모드도 멈춤). `finally` 의 DB 닫기는 그대로다.
+- DB 를 연 뒤의 준비(어댑터·저장소·연결 정보 함수)를 보호된 `try` 안으로 옮겼다. 예: `STORAGE_DRIVER=object` 면 `createStorage` 가 던진다 → 한 줄 + DB 닫기.
+- 시작 검사(`assertWorkerModeSupported`)의 다른 오류도 한 줄. 지금은 `WorkerModeError` 만 던지므로 미래 대비다.
+- drizzle 쿼리 오류는 바깥 객체에 이름·코드가 없어 `Error` 로만 보인다. SQLSTATE 는 `cause` 안에 있지만 일부러 읽지 않는다(`describeErrorSafely` 는 바꾸지 않음).
+
+### Claude 독립 검토(D42)
+- 1차: P2 2건.
+  - 시험이 이름을 흉내 낸 오류를 써서 실제 drizzle 오류 모양(`Error`, 코드 없음)과 달랐다. 주석도 'SQLSTATE 등'이라고 잘못 적었다.
+  - `openDb` 와 `try` 사이의 준비 코드가 던지면 스택을 찍고 DB 를 닫지 않았다.
+- 2차: **확정 0**.
+  - 신호 처리·변수 범위·성공 경로(한 번, `--loop`, SIGINT)는 그대로다.
+  - 타이머가 남아 프로세스가 멈추는 경우는 없다(모든 `setTimeout` 에 `clearTimeout` 이 짝지어 있음).
+  - 시험은 실제 클래스를 쓰고 그 전제가 맞다.
+
+### 시험
+- `packages/db/src/db-label.test.ts`:
+  - 실제 `DrizzleQueryError`(메시지에 파라미터 값이 있다는 전제를 먼저 확인)로 출력이 `Error` 한 줄이고 토큰·표 이름·파라미터·원인 문구가 없음을 확인한다.
+  - worker 소스 검사: `throw e` 없음, tick catch·시작 오류 한 줄, `openDb` 와 `try` 사이에 준비 호출 없음, 준비 코드가 `try` 첫머리에 있음.
+- 변이 확인(주 세션): 다음을 각각 되돌리면 시험이 실패했다: 준비 코드를 `try` 밖으로, tick 오류 다시 던지기, 시작 오류 다시 던지기.
+  - 시험 작성 중 두 번 기준선이 실패했다. 한 번은 앞쪽의 다른 `try` 를 잡았고, 한 번은 주석 문구 'createStorage' 에 걸렸다. 그때의 변이 결과는 버리고 고친 뒤 다시 했다.
+- 실제 실행(주 세션):
+  - `memory://` 정상 tick → JSON 출력, 종료코드 0.
+  - `STORAGE_DRIVER=object` → `worker tick 을 마치지 못했습니다(오류 종류: Error).`, 종료코드 1.
+- 전체 검사 1회차에서 lint 가 실패했다(`no-regex-spaces` — 시험 정규식의 두 칸 공백). `{2}` 로 고치고 전체 검사를 처음부터 다시 돌렸다.
+
+### 명령
+클라우드 Node 22.22.0, `e0d0817` 와 같은 트리. 단계별 종료코드 기준:
+- install(lockfile `8db0ef8abda74fda` 불변) · lint · typecheck · build: 각 exit 0
+- **unit 89 files / 2260 · integration 78 files / 1328**: exit 0
+- drill:mock 위반 0 · dev-cert 472/472 · deploy 셸 시험(비root) PASS
+
+### 남은 위험
+1. 오류 원인 진단이 어려워진다: drizzle 쿼리 오류는 `Error` 로만 보인다. 원인을 보려면 개발 환경에서 따로 재현해야 한다.
+2. 맨 위의 `loadRootEnv`·`loadConfig` 오류는 그대로 스택을 찍는다(메시지에 값 없음 — 설정 이름·파일 경로만).
+3. web 서버(Next) 쪽 route 의 처리되지 않은 오류 출력은 이번 범위 밖이다(inline worker 는 이미 허용 이름·코드만 찍음).

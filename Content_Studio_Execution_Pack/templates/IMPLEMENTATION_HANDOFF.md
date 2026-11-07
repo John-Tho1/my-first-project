@@ -12,7 +12,7 @@
 - External calls performed (exact scope, or none):
 - Mock-only functionality:
 - Known risks / not run:
-- Questions specifically for Codex:
+- Questions for the independent reviewer:
 - Next authorized task:
 코드 commit 후 생성하며 .handoffs/ 또는 저장소 밖에 보관한다.
 

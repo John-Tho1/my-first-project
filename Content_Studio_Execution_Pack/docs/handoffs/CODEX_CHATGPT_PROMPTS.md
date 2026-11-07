@@ -1,3 +1,5 @@
+> **종료(2026-11-07, D42): Codex 를 더 쓰지 않는다.** 아래 프롬프트는 이력이다. 이후 검증은 prompts/CLAUDE_REVIEW.md 로 Claude 독립 검토를 돌린다. 22번은 Claude 반박 검토로 대신했다(확정 0).
+
 # Codex 검증 — ChatGPT(Codex 웹)용 프롬프트
 
 - 같은 검증을 로컬 CLI 대신 ChatGPT 의 Codex(웹)에서 돌릴 때 쓴다. 대기열은 `CODEX_QUEUE.txt` 와 같다(위에서부터, 17건 — 15번 FIX5-FULLREV·16번 FIX1-CODEX·17번 FIX2-CODEX 는 2026-10-23 추가). 프롬프트 내용은 `scripts/codex-review-commit.sh` 의 리뷰 지시와 같고, 웹에서는 Codex 가 저장소를 직접 읽도록 바꿨다.

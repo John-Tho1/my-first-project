@@ -52,6 +52,8 @@ Codex CLI 0.155.1 확인된 하위 명령: `exec`, `review`(`--uncommitted`, `--
 | 검증 | 테스트 러너 없음, 브라우저 수동 확인 | pnpm lint/typecheck/test/build | **충돌** |
 | 핸드오프 위치 | `.ai/handoff/` (gitignore) | `.handoffs/` 또는 저장소 밖 | 경로 상이 |
 | Codex 역할 | read-only 리뷰, `scripts/codex-review.sh` | read-only 리뷰, worktree 기반 | 호환 |
+
+> 2026-11-07(D42): Codex 는 더 쓰지 않는다. 위 Codex 관련 행·설명은 당시 환경 기록이다. 상위 저장소의 `scripts/codex-*.sh`·`.codex/config.toml.example` 와 이 앱의 Codex 실행 스크립트는 삭제했다. 검증은 Claude 독립 검토(docs/06_AGENT_WORKFLOW.md)로 한다.
 | 금지 옵션 | `--yolo`, `danger-full-access` 금지 | 우회 플래그 금지 | 호환 |
 
 Claude Code는 작업 폴더에 가장 가까운 CLAUDE.md/AGENTS.md를 우선 적용하므로 이 폴더 안에서는 이 폴더의 규칙이 적용된다. Codex도 하위 AGENTS.md를 함께 읽는다. 다만 상위 규칙의 "패키지 매니저 금지"가 문자 그대로 전체 저장소에 걸려 있어, **상위 AGENTS.md에 "`Content_Studio_Execution_Pack/`은 자체 AGENTS.md를 따른다"는 범위 조항 1줄을 추가하는 것을 권고**한다(사용자 확인 후 반영, T00에서는 변경하지 않음).

@@ -9,9 +9,11 @@ Use public, synthetic or user-confirmed personal material. No employer confident
 Keep Korean product UI. Show actual publication visibility and verification status.
 
 ## Collaboration
-Claude Code is the primary implementer. Codex is the independent verifier for the specified BASE/HEAD.
-One bounded task per handoff. Do not edit the same worktree concurrently.
-Codex reports findings by default; send fixes back to Claude.
+All work runs in Claude Code (user decision 2026-11-07, D42 — Codex is not used).
+The Claude Code main session is the implementer. Independent verification is done by Claude reviewer subagents in a fresh context, read-only, for the specified BASE/HEAD (prompts/CLAUDE_REVIEW.md, docs/06_AGENT_WORKFLOW.md).
+One bounded task per handoff. Do not edit the same worktree concurrently (implementers run one after another; reviewers are read-only).
+Reviewers report findings; the main session reproduces each finding before fixing it.
+Label Claude reviews as Claude reviews. Never present them as another tool's verdict.
 No automatic merge/deploy. No invented test results or claims that another agent ran.
 
 ## Invariants

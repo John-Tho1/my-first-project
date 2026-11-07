@@ -1,9 +1,8 @@
-# AGENTS.md — 공용 에이전트 컨텍스트 (SSOT)
+# AGENTS.md — 프로젝트 규칙 (SSOT)
 
-> 이 파일은 **Claude Code와 Codex CLI가 공유하는 단일 컨텍스트 원본**이다.
-> Codex는 `AGENTS.md`를, Claude Code는 `CLAUDE.md`를 읽는다.
-> `CLAUDE.md`는 이 파일을 `@AGENTS.md`로 import만 하므로, **프로젝트 규칙은 항상 여기에만 쓴다.**
-> 같은 내용을 두 파일에 중복 기재하면 두 모델 모두에서 토큰이 이중으로 소모된다.
+> 이 저장소의 프로젝트 규칙 원본이다. Claude Code 는 `CLAUDE.md` 를 읽고, `CLAUDE.md` 는 이 파일을 `@AGENTS.md` 로 import 한다.
+> **프로젝트 규칙은 항상 여기에만 쓴다**(두 파일에 중복 기재하지 않는다).
+> 2026-11-07 사용자 결정: **Codex 를 쓰지 않는다.** 구현·검증·서브 작업을 모두 Claude Code 에서 진행한다(아래 4절).
 
 ## 1. 프로젝트 개요
 
@@ -36,21 +35,22 @@ node --check <(sed -n '/<script>/,/<\/script>/p' quote-calculator.html | sed '1d
 #    - 0·음수·빈 값 입력 시 NaN이 노출되지 않는지
 ```
 
-## 4. 역할 분담 (Claude Code ↔ Codex)
+## 4. 역할 분담 (모두 Claude Code)
 
-| 역할 | 담당 | 근거 |
+| 역할 | 담당 | 방법 |
 |---|---|---|
-| 설계·구현·리팩터링(주작업) | **Claude Code** | 멀티파일 편집·계획 수립 |
-| 코드 리뷰·회귀 검증·반대 의견 | **Codex CLI** (`scripts/codex-review.sh`) | 독립된 컨텍스트에서 교차 검증 |
-| 격리된 서브 태스크 | **Codex CLI** (`scripts/codex-task.sh`) | 주 세션 컨텍스트를 오염시키지 않음 |
+| 설계·구현·리팩터링(주작업) | **Claude Code 주 세션** | 멀티파일 편집·계획 수립 |
+| 코드 리뷰·회귀 검증·반대 의견 | **Claude Code 독립 검토자**(서브에이전트, 새 컨텍스트) | `/claude-review` — 읽기 전용, 반박 검토 |
+| 격리된 서브 태스크 | **Claude Code 서브에이전트** | `/claude-task` — 위임 뒤 `git diff` 로 직접 확인 |
 
-**핸드오프 규칙**
-- 두 에이전트 간 결과물은 반드시 `.ai/handoff/` 디렉터리의 파일로 주고받는다. 대화 본문에 리포트 전문을 붙여넣지 않는다.
-- 리뷰어(Codex)는 **read-only 샌드박스**로 실행한다. 리뷰어가 코드를 직접 고치지 않는다.
-- Codex의 지적은 그대로 수용하지 않고, Claude Code가 근거를 확인한 뒤 반영 여부를 판단한다.
+**검토·인계 규칙**
+- 독립 검토자는 구현자의 결론을 받지 않고 코드·diff·규칙만 받아 새 컨텍스트에서 본다. **읽기 전용**이다(파일 수정·git 상태 변경 금지). 지적은 재현 시나리오(파일:줄)와 함께 보고한다.
+- 검토자의 지적은 그대로 수용하지 않는다. 주 세션이 코드로 재현·확인한 뒤 반영 여부를 판단한다.
+- 결과 보고서는 `.ai/handoff/` 에 파일로 남기고, 대화에는 지적 요약만 쓴다.
+- Claude 검토 결과를 다른 도구(Codex 등)의 판정이라고 표기하지 않는다.
 
 ## 5. 금지 사항
 
 - `.ai/handoff/` 산출물을 커밋하지 않는다(`.gitignore` 처리됨).
-- 인증 토큰·API 키를 이 파일이나 `.codex/config.toml`에 직접 쓰지 않는다. 환경변수를 참조한다.
-- `--sandbox danger-full-access` / `--yolo` 류 옵션은 이 저장소에서 사용하지 않는다.
+- 인증 토큰·API 키를 이 파일이나 설정 파일에 직접 쓰지 않는다. 환경변수를 참조한다.
+- 권한·샌드박스를 우회하는 옵션(`--dangerously-skip-permissions`, `--sandbox danger-full-access`, `--yolo` 류)은 이 저장소에서 사용하지 않는다.

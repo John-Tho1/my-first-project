@@ -14,7 +14,7 @@ docs/04_DATA_AND_API.md, docs/05_BACKLOG_AND_ACCEPTANCE.md, docs/06_AGENT_WORKFL
 3. M0+M1만 작업별로 구현한다. 우선 T01 구동+mock, 이후 수집→저장→검색→수정→export/restore의 수직 흐름.
 4. 외부 연결이 없어도 진행하라. UI 기본값은 한국어, MSK 표시, LLM mock, publish disabled, collectors disabled.
 5. 각 작업의 의미 있는 테스트를 실행하고 실제 결과와 사용자가 볼 수 있는 실행 방법/화면을 제시한다.
-6. 코드 commit 후 BASE/HEAD와 IMPLEMENTATION_HANDOFF를 준비하고 Codex 검증 경계에서 멈춘다. 검증자가 연결돼 있지 않으면 인계자료를 만들고 미검증임을 밝혀라.
+6. 코드 commit 후 BASE/HEAD와 IMPLEMENTATION_HANDOFF를 준비한다. 그다음 prompts/CLAUDE_REVIEW.md로 Claude 독립 검토(새 컨텍스트·읽기 전용 서브에이전트)를 돌린다. 확정 지적은 prompts/CLAUDE_FIX.md로 고치고 재검토한다. 독립 검토를 돌리지 못했으면 미검증임을 밝혀라.
 7. M2 이후를 임의로 한 번에 구현하거나 공개 배포하지 마라.
 
 다음은 이후 사용자의 구체 승인이 필요하다: 실제 OAuth 연결, 외부 자료 가져오기, API 과금 발생 live 호출, SNS/YouTube 시험 포함 업로드·게시, 운영 배포·유료 인프라.

@@ -1,3 +1,5 @@
+> **폐기(2026-11-07, 사용자 결정): 이 저장소는 Codex 를 쓰지 않는다.** 아래는 이전 Claude Code ↔ Codex 병행 설정의 기록이며, 언급된 `scripts/codex-*.sh`·`scripts/link-check.sh`·`.codex/config.toml.example`·`/codex-*` 명령은 삭제됐다. 현재 절차는 `CLAUDE.md`(`/claude-review`·`/claude-task`)를 따른다.
+
 # Claude Code ↔ Codex CLI 병행 개발 설정 가이드
 
 작성일 2026-09-19 · 대상 저장소 `my-first-project`

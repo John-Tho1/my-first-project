@@ -1,3 +1,4 @@
+# 종료(2026-11-07, D42): Codex 를 더 쓰지 않는다. 이 대기열은 이력이다. 22번(9479869 FIX4-FULLREV2)은 Claude 반박 검토로 대신했다(FULLREV2_IMPLEMENTATION_HANDOFF.md FIX round 4 'Claude 반박 검토', 확정 0).
 # Codex 검증 대기열 — bash scripts/codex-review-queue.sh 가 위에서부터 순서대로 검토한다(사용자 PC 전용, gpt-6-astra / xhigh).
 # 형식: <SHA> <작업명> <인계문서>[,<인계문서>...]   (경로는 앱 폴더 기준)
 # 결과: .handoffs/review-<작업명>.md (커밋 대상 아님). 이미 "## 판정" 이 있는 작업은 건너뛴다.

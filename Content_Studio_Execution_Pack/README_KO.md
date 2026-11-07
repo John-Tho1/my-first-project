@@ -1,7 +1,7 @@
 # 개인 콘텐츠 스튜디오 — 실행계획·개발 착수 패키지
 기준일: 2026-09-24 (Europe/Moscow) · 설계 v1.0 · 개발용 가칭: Content Studio
 
-이 패키지는 **실행 가능한 앱이 아니라 구현 명세와 Claude Code/Codex 인계 자료**다. 앱 코드·OAuth 연결·실제 게시·배포는 아직 수행하지 않았다.
+이 패키지는 **실행 가능한 앱이 아니라 구현 명세와 Claude Code 인계 자료**다. 앱 코드·OAuth 연결·실제 게시·배포는 아직 수행하지 않았다.
 
 ## Idea — 권고안
 모바일과 PC에서 쓰는 개인용 웹앱으로 시작한다. 메모·링크·음성을 쉽게 모으고, AI의 짧은 질문으로 소재를 글로 발전시키며, 작성한 원본을 검색·재사용한다. 사용자가 채널별 최종본과 계정을 확인하고 배포를 실행하면 게시 작업을 추적한다.
@@ -19,7 +19,7 @@
 - 언어: 한국어 우선. 영어 파생본은 명시적 선택. 앱 시간표시: Europe/Moscow.
 
 ## Evidence — 근거와 확인 범위
-[확실] 위 방향과 Claude Code 주 구현·Codex 검증 방식은 이번 대화에서 사용자가 정했다.
+[확실] 위 방향과 Claude Code 주 구현·Codex 검증 방식은 이번 대화에서 사용자가 정했다. 검증 방식은 2026-11-07 사용자 결정(D42)으로 Claude 독립 검토로 바뀌었다.
 [확실] 직전 단계에서 관련 Notion·Drive를 실제 조회했다. Content Vault 속성 16건, 그중 본문 4건을 읽었다. 이전 조회값은 마이그레이션 직전에 재확인한다.
 [공식자료] API 및 코딩 도구의 공식 자료를 검색·확인했다. 출처·접근 제한은 docs/08_SOURCES.md에 기록했다.
 [미확인] 사용자 PC의 Claude Code/Codex 설치·인증·기존 연결 설정, Git 저장소, 도메인, 서버, SNS 계정 종류·API 승인, 실행 지역의 서비스 지원, 예산.
@@ -39,7 +39,7 @@ ChatGPT에서 연결된 Notion·Drive 권한은 새 웹앱으로 이전되지 �
 기술 오류를 제외한 일상 화면에는 큐, API, 토큰 같은 구현 용어를 노출하지 않는다. 배포 화면은 예를 들어 “YouTube: 비공개 업로드 완료, 공개 전환 확인 필요”처럼 실제 결과를 표현한다.
 
 ## 범위와 단계
-| 단계 | Claude Code 구현 | Codex 통과 기준 | 참고 기간 [추정] |
+| 단계 | Claude Code 구현 | 독립 검토 통과 기준 | 참고 기간 [추정] |
 | --- | --- | --- | --- |
 | M0 환경·결정 | 저장소/버전/명령 점검, UI 뼈대, 가상 데이터, 외부 호출 차단 | 문서 정합성·clean-room·기본 구동 | 1–2 개발일 |
 | M1 수집·아카이브 | 텍스트/URL 저장, 편집·검색·태그, 원문 내보내기/복원 | 저장 손실·중복·접근 제어·복원 | 3–5 개발일 |
@@ -88,18 +88,18 @@ flowchart TD
 7. AI/API 비용은 서비스 요금과 별개다. 가격을 가정하지 않고 설정한 상한·사용량을 기록한다.
 8. DB+파일 백업과 복원 시험이 운영 배포의 조건이다.
 
-## Claude Code와 Codex 역할
+## Claude Code 역할 (D42 — Codex 미사용, 2026-11-07)
 사용자: 독자·문체·공개 범위 및 실제 연결/게시/운영 배포 결정.
-Claude Code: 하나의 작업을 구현하고 테스트·변경 내역·검증할 커밋을 인계.
-Codex: 별도 worktree의 같은 HEAD를 읽고 위험 중심으로 검증. 기본은 수정 없이 보고; 동작 테스트는 비밀 없는 격리 환경에서 실행.
-Claude Code: 지적사항 수정 → 새로운 HEAD → Codex 재검증.
-Codex “문제 없음”은 테스트 통과나 사용자 발행 승인과 같지 않다. 자세한 절차는 docs/06_AGENT_WORKFLOW.md.
+Claude Code(주 세션): 하나의 작업을 구현하고 테스트·변경 내역·검증할 커밋을 고정.
+Claude 독립 검토자(새 컨텍스트 서브에이전트, 읽기 전용): 같은 HEAD 를 위험 중심으로 반박 검토. 수정 없이 보고.
+Claude Code: 지적을 재현한 뒤 수정 → 새로운 HEAD → 재검토 → 전체 검사.
+검토의 "문제 없음"은 테스트 통과나 사용자 발행 승인과 같지 않다. 자세한 절차는 docs/06_AGENT_WORKFLOW.md.
 
 ## Next Decision — 지금 시작하는 방법
 1. ZIP을 개인 프로젝트 폴더에 푼다. 기존 저장소가 있다면 통째로 덮어쓰지 않고 문서를 검토해 합친다.
 2. Claude Code에서 prompts/CLAUDE_START.md를 읽게 한다. 첫 작업 범위는 M0+M1.
-3. 인계 커밋이 만들어지면 Codex에 prompts/CODEX_REVIEW.md와 인계 기록을 준다.
-4. 결과를 prompts/CLAUDE_FIX.md와 함께 Claude Code에 전달한다.
+3. 작업 커밋이 만들어지면 Claude Code 가 prompts/CLAUDE_REVIEW.md 로 독립 검토자를 돌린다.
+4. 확정 지적은 prompts/CLAUDE_FIX.md 로 재현·수정하고 재검토한다.
 5. M3까지는 가상 데이터·모의 게시를 기본으로 계속 구현할 수 있다. 실제 계정 연결·API 과금·게시·운영 배포는 구체 실행안을 확인하고 사용자가 결정한다.
 
 채널 우선순위·환경 정보가 없어도 M0–M3 설계와 구현은 시작 가능하다. 정확한 서비스·예산·주간 루틴은 M0에서 선택한다.
@@ -110,7 +110,7 @@ Codex “문제 없음”은 테스트 통과나 사용자 발행 승인과 같�
 - docs/03_DISTRIBUTION.md: 채널 어댑터·승인·재시도 상태
 - docs/04_DATA_AND_API.md: 데이터·API 계약
 - docs/05_BACKLOG_AND_ACCEPTANCE.md + tasks.json: 구현 순서·완료 조건
-- docs/06_AGENT_WORKFLOW.md: Claude Code ↔ Codex 진행법
+- docs/06_AGENT_WORKFLOW.md: Claude Code 구현·독립 검토·수정 진행법
 - docs/07_MIGRATION_AND_OPERATIONS.md: 선택 가져오기·운영/백업
 - docs/08_SOURCES.md: 공식 근거·미확인 사항
 - AGENTS.md, CLAUDE.md: 저장소 작업 규칙

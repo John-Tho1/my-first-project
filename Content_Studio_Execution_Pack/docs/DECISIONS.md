@@ -562,3 +562,28 @@
 - Reversible?: 예. 규칙은 `packages/db/src/restore.ts` 한 곳이다. 되돌리면 전송 직전 재검사만 남는다(실행은 여전히 막힌다).
 - User decision required?: 아니오(이 결정으로 기록).
 - Exact authorized scope (if applicable): 해당 없음(로컬 DB 복원 규칙, 외부 호출 없음).
+
+## D42 — Codex 를 쓰지 않고 구현·독립 검토를 모두 Claude Code 에서 한다 (2026-11-07)
+- Decision ID / date: D42 / 2026-11-07 (Europe/Moscow)
+- Context:
+  - 지금까지는 Claude Code 가 구현하고, 사용자 PC 의 Codex(gpt-6-astra / xhigh)가 독립 검증했다(대기열·ChatGPT 프롬프트 1–22).
+  - 클라우드 세션에는 Codex 가 없어 검증이 사용자 PC 왕복을 기다렸다.
+  - FULLREV1·FULLREV2·FIX 라운드에서는 Claude 반박 검토(새 컨텍스트 서브에이전트, P0/P1 3관점 2명 유지)를 이미 써 왔다.
+- Decision (사용자 결정 2026-11-07 "이제부터 Codex 활용하지 않고 모두 클로드코드에서 진행할 수 있도록 수정해줘"):
+  1. 구현·독립 검토·수정·재검토를 모두 Claude Code 에서 한다. 독립 검토는 **새 컨텍스트·읽기 전용 Claude 검토자 서브에이전트**가 하며, 구현자의 결론을 받지 않는다.
+  2. 확정 규칙: P0/P1 은 서로 다른 관점(코드 추적·방어 장치·명세)의 검증자 3명 중 2명이 유지할 때, P2 는 1명이 유지할 때 확정한다. 주 세션은 확정 지적을 코드로 재현한 뒤 고친다.
+  3. gate: 확정 P0/P1 = 0, 최종 트리 전체 검사 통과(단계별 종료코드), 확정 P2 는 반영 또는 남은 위험으로 기록. 보완분은 재검토한다.
+  4. 표기: Claude 검토 결과를 다른 도구의 판정이라고 쓰지 않는다. 검토자·구현자 보고와 주 세션이 직접 실행한 증거를 구분한다.
+  5. 정리:
+     - 고친 것: AGENTS.md·CLAUDE.md(앱·상위), prompts(CLAUDE_START·CLAUDE_FIX, CODEX_REVIEW → CLAUDE_REVIEW), templates, docs/06_AGENT_WORKFLOW.md·README_KO·ENVIRONMENT.
+     - 상위 저장소: `/codex-review`·`/codex-task` 를 `/claude-review`·`/claude-task` 로 바꿨다. `scripts/codex-*.sh`·`scripts/link-check.sh`·`.codex/config.toml.example` 는 삭제했다.
+     - 앱: `scripts/codex-review-commit.sh`·`codex-review-queue.sh`·그 시험을 삭제했다.
+     - 과거 Codex 기록(*CODEX* 인계·CODEX_QUEUE·CODEX_CHATGPT_PROMPTS)은 이력으로 남기고 종료 표시를 붙였다.
+- Why: 검증 대기 시간을 없애고, 이미 같은 절차로 확정·기각 근거를 남겨 온 Claude 반박 검토를 표준으로 삼는다.
+- Consequences:
+  - 다른 회사 모델의 교차 검증(모델 다양성)은 없어진다. 같은 계열 모델이 같은 맹점을 공유할 수 있다.
+  - 이를 줄이려고 검토자에게 구현자 결론을 주지 않고, 관점을 나눈 다수 검증자와 실행 증거(시험·변이 확인·브라우저 E2E)를 함께 쓴다.
+  - Codex 대기열 22번(9479869)은 Claude 반박 검토(확정 0)로 대신했다.
+- Reversible?: 예. Codex 스크립트·설정은 git 이력에 남아 있어 되살릴 수 있다.
+- User decision required?: 아니오(이 결정으로 기록).
+- Exact authorized scope (if applicable): 해당 없음(개발 절차·저장소 도구 정리, 외부 호출 없음).

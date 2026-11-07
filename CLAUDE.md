@@ -6,33 +6,31 @@
 
 ---
 
-## Claude Code 전용 운영 규칙
+## Claude Code 운영 규칙 (Codex 미사용 — 2026-11-07)
 
-### Codex 호출 시점
-다음 상황에서는 스스로 판단하지 말고 Codex에 교차 검증을 요청한다.
+### 독립 검토를 돌리는 때
+다음 상황에서는 스스로 판단하지 말고 **Claude 독립 검토자**에게 교차 검증을 맡긴다(`/claude-review`).
 
 1. 계산 로직(환율·마진·합계)을 수정했을 때
 2. 한 번에 3개 이상의 함수/블록을 건드렸을 때
 3. 사용자가 "검증", "리뷰", "확인해줘"라고 요청했을 때
 
-```bash
-./scripts/codex-review.sh              # 커밋 안 된 변경 전체를 리뷰
-./scripts/codex-review.sh --base main  # main 대비 브랜치 전체를 리뷰
+```text
+/claude-review              # 커밋 안 된 변경 전체를 검토
+/claude-review --base main  # main 대비 브랜치 전체를 검토
+/claude-review --commit <SHA>
 ```
 
-리뷰 결과는 `.ai/handoff/review-<timestamp>.md`에 저장된다.
+검토자는 새 컨텍스트의 서브에이전트로, 읽기 전용이다. 결과는 `.ai/handoff/review-<timestamp>.md` 에 저장한다.
 **리포트 전문을 대화에 붙여넣지 말고, 지적 항목만 요약해 사용자에게 보고한다.**
+보안 관점이 필요하면 `/security-review`, 일반 버그 탐색은 `/code-review` 를 함께 쓸 수 있다.
 
 ### 서브 개발 위임
-주 세션 컨텍스트를 아끼려면 독립적인 단위 작업은 Codex에 넘긴다.
-
-```bash
-./scripts/codex-task.sh "입력값 검증 함수에 음수·빈 문자열 처리를 추가해줘"
-```
-
-위임 후에는 반드시 `git diff`로 결과를 직접 확인한다. Codex의 변경을 검토 없이 커밋하지 않는다.
+주 세션 컨텍스트를 아끼려면 독립적인 단위 작업은 Claude 서브에이전트에 넘긴다(`/claude-task "…"`).
+위임 후에는 반드시 `git diff` 로 결과를 직접 확인한다. 서브에이전트의 변경을 검토 없이 커밋하지 않는다.
+같은 작업 트리에서 두 에이전트가 동시에 파일을 고치지 않는다(차례로 하거나 별도 worktree).
 
 ### 컨텍스트 절약
 - `AGENTS.md`에 있는 내용을 대화에서 다시 설명하지 않는다.
 - `quote-calculator.html` 전체를 반복해서 읽지 말고, `sed -n 'A,Bp'`로 필요한 구간만 읽는다.
-- Codex 리포트는 파일 경로로 참조하고, 필요한 줄만 발췌한다.
+- 검토 리포트는 파일 경로로 참조하고, 필요한 줄만 발췌한다.

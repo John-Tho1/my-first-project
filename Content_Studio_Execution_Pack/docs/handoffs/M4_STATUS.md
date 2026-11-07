@@ -473,3 +473,15 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 사용자 요청 "Claude로 반박 검토 해줘". Codex 는 이 컨테이너에 없어 돌리지 못했다(사용자 PC 전용). 이 결과는 Codex 판정이 아니다.
 - 결과: 9479869 확정 지적 0. 'OIDC 클라이언트와 같은 비교'라는 설명이 부정확했다(실제로는 라이브러리보다 엄격). 그래서 코드 주석(동작 변경 없음)과 인계 문서를 정정했다.
 - Codex 재확인 대상은 그대로 22번이다(사용자 PC).
+
+## 2026-11-07 — Codex 미사용 전환(D42, 클라우드 세션)
+- 사용자 결정 "이제부터 Codex 활용하지 않고 모두 클로드코드에서 진행할 수 있도록 수정해줘". 구현·독립 검토·수정·재검토를 모두 Claude Code 에서 한다.
+  - 독립 검토자: 새 컨텍스트·읽기 전용 서브에이전트. P0/P1 3관점 2명 유지, P2 1명 유지.
+- 바꾼 것:
+  - 규칙: AGENTS/CLAUDE(상위·앱)
+  - 지시문: CLAUDE_START·CLAUDE_FIX, CLAUDE_REVIEW(CODEX_REVIEW 대체)
+  - 템플릿과 문서: docs/06·README_KO·ENVIRONMENT·02
+  - 상위 명령: `/claude-review`·`/claude-task`(codex 명령 대체)
+- 삭제한 것: 상위 `scripts/codex-*.sh`·`link-check.sh`·`.codex/config.toml.example`, 앱 `codex-review-commit.sh`·`codex-review-queue.sh`·그 시험.
+- Codex 대기열·ChatGPT 프롬프트는 종료 표시(이력 보존)를 붙였다. 22번은 Claude 반박 검토(확정 0)로 대신했다.
+- 다음 작업부터 검증 기록은 "Claude 독립 검토"로 적는다.

@@ -1,11 +1,11 @@
-# .ai/handoff — 에이전트 간 핸드오프 영역
+# .ai/handoff — 검토·위임 산출물 영역
 
-Claude Code와 Codex CLI가 결과물을 주고받는 디렉터리다.
+Claude Code 주 세션과 Claude 서브에이전트(독립 검토자·위임 작업)가 결과물을 남기는 디렉터리다. (2026-11-07부터 Codex 는 쓰지 않는다.)
 
 | 파일 | 생성 주체 | 내용 |
 |---|---|---|
-| `review-<timestamp>.md` | `scripts/codex-review.sh` | Codex의 코드 리뷰 리포트 |
-| `task-<timestamp>.md`   | `scripts/codex-task.sh`   | Codex가 수행한 서브 작업 보고 |
+| `review-<timestamp>.md` | `/claude-review` | Claude 독립 검토자의 코드 리뷰 리포트 |
+| `task-<timestamp>.md`   | `/claude-task`   | Claude 서브에이전트가 수행한 서브 작업 보고 |
 
 규칙
 - 이 디렉터리의 산출물은 **커밋하지 않는다**(`.gitignore` 처리됨).

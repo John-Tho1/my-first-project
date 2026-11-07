@@ -1,4 +1,5 @@
-# Codex review
+# Claude independent review
+- Reviewer: Claude Code subagent (fresh context, read-only) — not another tool's verdict
 - Task:
 - BASE / reviewed HEAD:
 - Verdict: pass / fail / blocked

@@ -59,7 +59,7 @@ Drive 대용량 영상은 선택적으로 앱 저장소에 복사하거나 승�
 ## 접근 제어·비밀
 모든 읽기/쓰기 API와 파일 URL에서 로그인·owner를 서버가 확인. 단일 사용자라도 다른 계정의 ID를 받아 데이터에 접근하지 못하게 한다.
 OAuth state/redirect URI 검증, 가능한 흐름에서 PKCE, 최소 scope, token expiry·refresh·revoke 처리. 토큰은 서버 암호화 저장, master key는 DB/백업과 별도.
-AI prompt·브라우저·오류 로그에 토큰/세션 URI/비공개 raw URL을 포함하지 않는다. 테스트와 Codex review 환경에는 운영 credentials를 주지 않는다.
+AI prompt·브라우저·오류 로그에 토큰/세션 URI/비공개 raw URL을 포함하지 않는다. 테스트와 검토(review) 환경에는 운영 credentials를 주지 않는다.
 승인 검사와 PUBLISH_MODE는 서버/worker에서 강제. UI 버튼이나 AGENTS.md만으로 막지 않는다.
 외부 HTML/Markdown sanitize, active content 실행 금지. URL fetch는 HTTP(S) 한정, private/loopback/link-local/metadata IP 및 redirect 재검사, DNS rebinding·큰 파일·시간 초과 대응. 지원 어려운 웹페이지는 수동 발췌.
 AI에게 외부 문서의 지시를 따르거나 게시 도구를 호출할 권한을 주지 않는다.

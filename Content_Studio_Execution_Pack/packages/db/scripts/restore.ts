@@ -11,7 +11,7 @@ import { createStorage } from '@cs/providers';
 import {
   commitRestore,
   createRestorePreview,
-  DbLockedError,
+  dbCliErrorLine,
   ensureOwner,
   loadRootEnv,
   openDb,
@@ -62,12 +62,10 @@ try {
   process.exit(1);
 }
 
+// FULLREV3 후속(DB CLI 출력): 열기 오류를 다시 던지지 않는다 — Node 가 메시지·스택(파일 오류는 경로 = DATABASE_URL)을 찍기 때문. 잠금·드라이버 미구현은 고정 안내, 그 밖은 종류·코드만.
 const handle = await openDb(config).catch((e: unknown) => {
-  if (e instanceof DbLockedError) {
-    console.error(e.message);
-    process.exit(1);
-  }
-  throw e;
+  console.error(dbCliErrorLine('DB 를 열지 못했습니다', e));
+  process.exit(1);
 });
 try {
   const owner = await ensureOwner(handle.db, config.AUTH_ALLOWED_IDENTITY);
@@ -88,8 +86,14 @@ try {
     console.error(JSON.stringify({ ok: false, error: e.code, message: e.message, ...(e.extra ?? {}) }));
     process.exitCode = 1;
   } else {
-    throw e;
+    console.error(dbCliErrorLine('복원을 마치지 못했습니다', e));
+    process.exitCode = 1;
   }
 } finally {
-  await handle.close();
+  try {
+    await handle.close();
+  } catch (e) {
+    console.error(dbCliErrorLine('DB 를 닫지 못했습니다', e));
+    process.exitCode = 1;
+  }
 }

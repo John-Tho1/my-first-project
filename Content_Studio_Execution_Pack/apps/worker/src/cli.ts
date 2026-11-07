@@ -4,7 +4,7 @@
  * dev 서버가 같은 PGlite 디렉터리를 열고 있으면 먼저 종료한다(한 디렉터리 한 프로세스).
  * 모의 어댑터는 @cs/providers 에서 가져온다(apps/worker/package.json 에 workspace 의존성으로 선언 — CLI 진입점만 쓰고, runWorkerTick 은 레지스트리를 주입받는다).
  */
-import { checkCredential, DbLockedError, loadMockCredentialsForRehydration, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
+import { checkCredential, dbCliErrorLine, loadMockCredentialsForRehydration, loadRootEnv, newWorkerId, openDb, refreshCredential, resolveFromRoot } from '@cs/db';
 import { loadConfig, oauthRedirectUri, readSecretKeyring, requireSecretKeyring } from '@cs/domain';
 import { createChannelAdapterRegistry, createCollectorAdapter, createStorage, ensureMockOAuthRehydrated, mockCredentialWorkAllowed, resolveOAuthProvider } from '@cs/providers';
 import { assertWorkerModeSupported, runWorkerTick, WorkerModeError } from './index';
@@ -32,12 +32,10 @@ try {
   throw e;
 }
 const loopMs = parseLoop(process.argv.slice(2));
+// FULLREV3 후속(DB CLI 출력): 열기 오류를 다시 던지지 않는다 — Node 가 메시지·스택(파일 오류는 경로 = DATABASE_URL)을 찍기 때문. 잠금·드라이버 미구현은 고정 안내, 그 밖은 종류·코드만.
 const handle = await openDb(config).catch((e: unknown) => {
-  if (e instanceof DbLockedError) {
-    console.error(e.message);
-    process.exit(1);
-  }
-  throw e;
+  console.error(dbCliErrorLine('DB 를 열지 못했습니다', e));
+  process.exit(1);
 });
 const workerId = newWorkerId('cli');
 // LIVE-P1(D38 1단계): 모의 어댑터 + 실제 Threads 텍스트 게시 어댑터(실제 게시 환경 조건이 모두 있을 때만 선택 — 기본 설정에서는 막힘)
@@ -85,5 +83,11 @@ try {
     wake = null;
   } while (!stopping);
 } finally {
-  await handle.close();
+  // FULLREV3 후속(DB CLI 출력): 닫기 오류도 메시지·스택 없이 종류·코드만(DB 스크립트와 같음). tick 안의 오류는 이번 범위 밖.
+  try {
+    await handle.close();
+  } catch (e) {
+    console.error(dbCliErrorLine('DB 를 닫지 못했습니다', e));
+    process.exitCode = 1;
+  }
 }

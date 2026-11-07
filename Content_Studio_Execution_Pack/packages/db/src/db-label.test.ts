@@ -82,3 +82,26 @@ describe('dbCliErrorLine — DB CLI 오류 한 줄에 값·경로를 넣지 않�
     expect(dbCliErrorLine('x', lock)).toBe(lock.message);
   });
 });
+
+describe('FULLREV3 후속: export·restore·restore-drill·worker CLI 도 열기 오류를 다시 던지지 않는다', () => {
+  it('openDb 실패·예상하지 못한 오류·DB 닫기 오류는 dbCliErrorLine 한 줄(메시지·스택 없음)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+    for (const name of ['export.ts', 'restore.ts', 'restore-drill.ts']) {
+      const src = read(`../scripts/${name}`);
+      expect(src).not.toMatch(/throw e;/);
+      expect(src).toMatch(/openDb\(config\)\.catch\(\(e: unknown\) => \{\s*console\.error\(dbCliErrorLine\('DB 를 열지 못했습니다', e\)\);\s*process\.exit\(1\);/);
+      expect(src).toMatch(/try \{\s*await handle\.close\(\);\s*\} catch \(e\) \{\s*console\.error\(dbCliErrorLine\('DB 를 닫지 못했습니다', e\)\);/);
+      expect(src).toMatch(/\} catch \(e\) \{[\s\S]*dbCliErrorLine\('(내보내기를|복원을|복원 훈련을) 마치지 못했습니다', e\)/);
+      // 메시지 본문은 앱이 만든 AppError(restore.ts — 코드·안내 문구)만
+      const messages = src.match(/e\.message/g) ?? [];
+      expect(messages.length).toBe(name === 'restore.ts' ? 1 : 0);
+      expect(src).not.toMatch(/e\.stack/);
+    }
+    const worker = read('../../../apps/worker/src/cli.ts');
+    expect(worker).toMatch(/openDb\(config\)\.catch\(\(e: unknown\) => \{\s*console\.error\(dbCliErrorLine\('DB 를 열지 못했습니다', e\)\);\s*process\.exit\(1\);/);
+    // 재검토 P2: worker 의 DB 닫기도 같은 방식
+    expect(worker).toMatch(/try \{\s*await handle\.close\(\);\s*\} catch \(e\) \{\s*console\.error\(dbCliErrorLine\('DB 를 닫지 못했습니다', e\)\);/);
+  });
+});

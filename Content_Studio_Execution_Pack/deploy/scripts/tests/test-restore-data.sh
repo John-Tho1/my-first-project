@@ -141,11 +141,13 @@ t "연속 두 번 실행 → 직전 사본 두 개(덮어쓰지 않음), 직전 
 P="$(mk_case twice)"
 run_capture r restore "$P"
 expect_rc 0 "$r_rc" "$r_out"
+# FIX1-FULLREV3(H7): 이름의 시각은 초 단위라 두 번이 같은 초에 끝나면 mktemp 꼬리(무작위)로 정렬된다 →
+# 첫 실행이 만든 사본(옛 내용)을 이름 순서가 아니라 첫 실행 직후에 집어 둔다.
+first="$(ls "$P/bk"/data-before-restore-*.tar.gz | head -1)"
 run_capture r2 restore "$P"
 expect_rc 0 "$r2_rc" "$r2_out"
 n="$(ls "$P/bk"/data-before-restore-*.tar.gz 2>/dev/null | wc -l)"
 [[ "$n" -eq 2 ]] && ok "직전 사본 2개" || ng "직전 사본 $n 개"
-first="$(ls "$P/bk"/data-before-restore-*.tar.gz | head -1)"
 sum_before="$(cksum <"$first")"
 RESTORE_ARGS=("$first")
 run_capture r3 restore "$P"

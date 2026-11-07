@@ -126,6 +126,9 @@ export const ACCOUNT_ERROR_TEXT: Record<string, string> = {
   secrets_not_configured: '서버 비밀 암호화 키(SECRETS_MASTER_KEY·SECRETS_KEY_VERSION)가 설정되지 않아 계정을 연결할 수 없습니다. 다른 기능은 그대로 쓸 수 있습니다.',
   oauth_not_supported: 'Threads·YouTube·Instagram 모의 계정과 실제 Threads 계정만 연결할 수 있습니다.',
   live_oauth_not_configured: '실제 계정 연결 준비가 끝나지 않았습니다(설정 화면의 "준비 안 됨" 이름을 확인하세요). 외부로 아무것도 보내지 않았습니다.',
+  // FIX1-FULLREV3(H1 후속)
+  oauth_redirect_origin_mismatch:
+    '계정 연결 redirect 주소(OAUTH_REDIRECT_URI)가 앱 공개 주소(APP_BASE_URL)와 다른 origin 이라 연결을 시작하지 않았습니다(연결을 마칠 수 없음). 외부로 아무것도 보내지 않았습니다.',
   oauth_account_duplicate: '이 Threads 계정은 이미 다른 배포 계정 행에 연결되어 있어 저장하지 않았습니다.',
   live_refresh_out_of_scope: '실제 계정의 연결 정보 갱신은 아직 승인 범위 밖이라 하지 않았습니다(LIVE_THREADS_REFRESH(D31 범위 밖)). 외부로 아무것도 보내지 않았고 연결 정보는 그대로입니다.',
   bad_request: '요청 형식이 올바르지 않습니다.',

@@ -4,7 +4,7 @@ import { EXPORTED_TABLES, formatMsk } from '@cs/domain';
 import { getSession } from '../../../../lib/auth';
 import { Breadcrumbs } from '../../../../lib/breadcrumbs';
 import { BACKUP_ERROR_TEXT } from '../../../../lib/backup';
-import { reconnectNotice } from '../../../../lib/restore-view';
+import { reconnectNotice, restoreInvalidationNotices } from '../../../../lib/restore-view';
 import { getAppDb, getConfig } from '../../../../lib/server';
 import { ownText } from '../../../../lib/lookup';
 
@@ -61,11 +61,11 @@ export default async function RestorePage({
   const committed = run.status === 'committed' && result;
   // FIX2-T13: 복원으로 "다시 연결 필요"가 되는 배포 계정(이름·플랫폼만)
   const reconnect = reconnectNotice(committed ? result : p, Boolean(committed));
-  // FIX2-FULLREV2(G19): 현재 브랜드가 바뀌어 무효가 된(될) 이 환경의 기존 승인 수(옛 미리보기·결과에는 칸이 없다 → 0)
-  const invalidated = (committed ? result.invalidated_approvals : p.invalidated_approvals) ?? [];
-  const brandInvalidated = invalidated.filter((a) => a.reasons.includes('brand_changed')).length;
-  // FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효가 된(될) 기존 승인 수
-  const riskInvalidated = invalidated.filter((a) => a.reasons.includes('risk_needs_check')).length;
+  // FIX2-FULLREV2(G19): 현재 브랜드가 바뀌어 무효가 된(될) 이 환경의 기존 승인(옛 미리보기·결과에는 칸이 없다 → 안내 없음)
+  // FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효가 된(될) 기존 승인
+  // FIX1-FULLREV3(H3): 부분 게시로 UNKNOWN 에 둔 작업(partial_job_ids)·진행 중 항목(in_flight)은 "실행 전으로"와 따로 안내한다(옛 기록은 []·false).
+  // FIX1-FULLREV3(H3 후속): 부분 게시가 있는 lease 된 작업(leased_partial_job_ids)도 따로 안내한다.
+  const invalidationNotices = restoreInvalidationNotices(committed ? result.invalidated_approvals : p.invalidated_approvals, Boolean(committed));
 
   return (
     <main className="container">
@@ -135,20 +135,11 @@ export default async function RestorePage({
           </li>
           <li>DB migration: {p.schema_migrations.join(', ')}</li>
         </ul>
-        {brandInvalidated ? (
-          <p className="notice" role="alert">
-            {committed
-              ? `복원으로 브랜드 프로필 새 버전이 들어와, 이 환경에 있던 승인 ${brandInvalidated}건을 무효로 했습니다(대기 중이던 실행은 보류, 항목은 실행 전으로). 배포 계획에서 새 브랜드로 다시 계획·승인하세요.`
-              : `복원하면 브랜드 프로필 새 버전이 들어와, 이 환경에 있는 승인 ${brandInvalidated}건이 무효가 됩니다(대기 중인 실행은 보류, 항목은 실행 전으로).`}
+        {invalidationNotices.map((n) => (
+          <p key={n.testid} className="notice" role="alert" data-testid={n.testid}>
+            {n.text}
           </p>
-        ) : null}
-        {riskInvalidated ? (
-          <p className="notice" role="alert" data-testid="restore-risk-invalidated">
-            {committed
-              ? `복원으로 이 환경의 원고에 위험 표시 '확인 필요' 소재가 연결되어, 그 원고의 승인 ${riskInvalidated}건을 무효로 했습니다(대기 중이던 실행은 보류, 항목은 실행 전으로). 소재의 '확인 필요'를 해제한 뒤 다시 승인하세요.`
-              : `복원하면 이 환경의 원고에 위험 표시 '확인 필요' 소재가 연결되어, 그 원고의 승인 ${riskInvalidated}건이 무효가 됩니다(대기 중인 실행은 보류, 항목은 실행 전으로).`}
-          </p>
-        ) : null}
+        ))}
         {reconnect ? (
           <>
             <h3>배포 계정 다시 연결 필요</h3>

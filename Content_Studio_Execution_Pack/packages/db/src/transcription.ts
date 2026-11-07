@@ -12,7 +12,7 @@
  * - 전사 버전은 불변(추가 전용). 사용자 수정은 base_version 이 최신일 때만 새 버전(아니면 409 stale_transcript).
  * 모든 조회·변경은 owner_id 를 WHERE 에 넣는다(다른 owner → 404).
  */
-import { and, asc, desc, eq, inArray, max, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, max, sql } from 'drizzle-orm';
 import {
   AppError,
   BadRequestError,
@@ -86,15 +86,88 @@ export interface RequestTranscriptionInput {
   keepOriginal: boolean;
   policy: SttBudgetPolicy;
   model: string;
+  /** FIX1-FULLREV3(H6): true 면 이미 성공한 전사가 있어도 새 작업(과 비용 예약)을 만든다 — 사용자가 일부러 다시 전사할 때만(화면 자동·재시도 경로는 보내지 않음). */
+  force?: boolean;
+  /**
+   * FIX1-FULLREV3(H6 후속): 원음 보존을 끈(keepOriginal=false) 요청이 기존 성공 작업을 만나면 이 저장소로 원본을 지운다(deleteOriginal 과 같은 경로 —
+   * 첨부된 파일은 지우지 않음·의도 먼저·감사 기록). 주지 않으면 원본을 건드리지 않는다(originalDeleted 없음).
+   */
+  files?: AssetDeleter;
   now?: Date;
 }
 
-export async function requestTranscription(db: Db, ownerId: string, assetId: string, input: RequestTranscriptionInput): Promise<TranscriptionJobRow> {
+async function assertNoActiveJob(tx: DbOrTx, ownerId: string, assetId: string): Promise<void> {
+  const active = await tx
+    .select({ id: transcriptionJobs.id })
+    .from(transcriptionJobs)
+    .where(and(eq(transcriptionJobs.assetId, assetId), eq(transcriptionJobs.ownerId, ownerId), inArray(transcriptionJobs.state, ['queued', 'running'])))
+    .limit(1);
+  if (active[0]) {
+    throw new AppError('conflict', 'transcription_in_progress', '이 파일의 전사 작업이 이미 진행 중입니다', { job_id: active[0].id });
+  }
+}
+
+/** FIX1-FULLREV3(H6 후속): 원음 보존을 끈 요청이 기존 성공 작업을 만났는데 원본을 지우지 못한 이유. */
+export type OriginalKeptReason = 'asset_in_use' | 'cleanup_pending';
+
+/**
+ * FIX1-FULLREV3(H6): existing=true 면 새 작업을 만들지 않고 이 asset 의 기존 성공 작업을 돌려준 것(새 예약·전사 요청 감사 기록 없음).
+ * FIX1-FULLREV3(H6 후속): originalDeleted — keepOriginal=false 요청이 기존 성공 작업을 만났고 원본이 아직 있었을 때만 채운다.
+ * true = 이 요청이 원본을 지웠다(의도 커밋, 파일은 지우거나 정리 대기), false = 지우지 않았다(originalKeptReason). 그 밖에는 undefined(전과 같음).
+ */
+export type RequestTranscriptionResult = TranscriptionJobRow & { existing: boolean; originalDeleted?: boolean; originalKeptReason?: OriginalKeptReason };
+
+/**
+ * FIX1-FULLREV3(H6): 같은 asset 에 성공한 전사(succeeded + 전사 버전 있음)가 있으면 force 가 아닌 요청은 그 작업을 돌려준다(멱등).
+ * 전사 요청이 서버에 커밋됐는데 응답을 잃은 화면이 '전사만 다시 요청'(또는 같은 파일 다시 고르기)으로 다시 보내도, 첫 작업이 끝난 뒤라면
+ * 같은 asset 에 작업·비용 예약이 하나 더 생기지 않는다. '최근'의 기준은 따로 두지 않는다 — asset 내용은 불변(checksum)이라 성공한 전사가
+ * 있는 한 그 전사가 현재 전사다. 원음 보존을 끈 성공 작업은 asset 을 지우므로(deleted_at), 이 확인은 410 검사보다 먼저 한다
+ * (지워진 원본에 대한 재시도도 기존 성공 작업을 돌려받는다 — 410 이면 화면이 다시 올리라고 안내해 새 작업이 생긴다).
+ * 진행 중(queued·running)은 성공 작업이 있어도 먼저 409 transcription_in_progress(전과 같음), 실패·취소만 있으면 전과 같이 새 작업을 만든다.
+ */
+export async function requestTranscription(db: Db, ownerId: string, assetId: string, input: RequestTranscriptionInput): Promise<RequestTranscriptionResult> {
   if (!isUuid(assetId)) throw new NotFoundError(ASSET_NOT_FOUND);
   const now = input.now ?? new Date();
+  const r = await requestTranscriptionTx(db, ownerId, assetId, input, now);
+  // FIX1-FULLREV3(H6 후속): 기존 성공 작업을 돌려줄 때도 이 요청의 원음 보존 끄기를 버리지 않는다. 원본이 아직 있으면 성공 뒤 삭제와 같은 경로
+  // (deleteOriginal — asset 잠금 아래 첨부 재확인·의도 먼저·감사 asset.delete_original / _skipped)로 지운다. 트랜잭션 밖(파일 삭제는 커밋 뒤).
+  // 새 작업·원장은 만들지 않는다.
+  if (r.existing && !input.keepOriginal && r.originalPresent && input.files) {
+    const out = await deleteOriginalDetailed(db, input.files, r.job, now);
+    if (out.deleted || out.reason === 'already_deleted') return { ...r.job, originalDeleted: true };
+    return { ...r.job, originalDeleted: false, originalKeptReason: out.reason === 'attached_to_variant' ? 'asset_in_use' : 'cleanup_pending' };
+  }
+  return r.job;
+}
+
+async function requestTranscriptionTx(
+  db: Db,
+  ownerId: string,
+  assetId: string,
+  input: RequestTranscriptionInput,
+  now: Date,
+): Promise<{ job: RequestTranscriptionResult; existing: boolean; originalPresent: boolean }> {
   return db.transaction(async (tx) => {
     const asset = (await tx.select().from(assets).where(and(eq(assets.id, assetId), eq(assets.ownerId, ownerId))).for('update'))[0];
     if (!asset) throw new NotFoundError(ASSET_NOT_FOUND);
+    if (input.force !== true) {
+      // 진행 중 작업이 있으면 성공 작업보다 먼저 409(전과 같은 응답 — 화면은 'already' 로 키를 거둔다)
+      await assertNoActiveJob(tx, ownerId, asset.id);
+      const done = await tx
+        .select()
+        .from(transcriptionJobs)
+        .where(
+          and(
+            eq(transcriptionJobs.assetId, asset.id),
+            eq(transcriptionJobs.ownerId, ownerId),
+            eq(transcriptionJobs.state, 'succeeded'),
+            isNotNull(transcriptionJobs.transcriptVersionId),
+          ),
+        )
+        .orderBy(desc(transcriptionJobs.createdAt), asc(transcriptionJobs.id))
+        .limit(1);
+      if (done[0]) return { job: { ...done[0], existing: true }, existing: true, originalPresent: asset.deletedAt === null };
+    }
     if (asset.deletedAt !== null) throw new GoneError();
     if (!isTranscribableMime(asset.mime)) throw new UnsupportedMediaError('전사할 수 있는 음성·영상 파일이 아닙니다');
     if (asset.verificationState !== 'VERIFIED') {
@@ -103,14 +176,7 @@ export async function requestTranscription(db: Db, ownerId: string, assetId: str
     if (!input.keepOriginal && (await assetInUse(tx, ownerId, asset.id))) {
       throw new AppError('conflict', 'asset_in_use', '채널 초안에 첨부된 파일은 원본을 지울 수 없습니다. 원음 보존을 켜고 다시 요청하세요.');
     }
-    const active = await tx
-      .select({ id: transcriptionJobs.id })
-      .from(transcriptionJobs)
-      .where(and(eq(transcriptionJobs.assetId, asset.id), eq(transcriptionJobs.ownerId, ownerId), inArray(transcriptionJobs.state, ['queued', 'running'])))
-      .limit(1);
-    if (active[0]) {
-      throw new AppError('conflict', 'transcription_in_progress', '이 파일의 전사 작업이 이미 진행 중입니다', { job_id: active[0].id });
-    }
+    await assertNoActiveJob(tx, ownerId, asset.id);
     const seconds = estimateAudioSeconds(asset.bytes, input.durationSeconds);
     const reservation = sttReserveFor(input.policy, seconds, input.durationSeconds === undefined);
     await reserveMicroOrThrow(tx, ownerId, input.policy, reservation.reserveMicro, now);
@@ -139,7 +205,7 @@ export async function requestTranscription(db: Db, ownerId: string, assetId: str
       details: { provider: job.provider, audio_seconds: seconds, keep_original: input.keepOriginal },
       at: now,
     });
-    return job;
+    return { job: { ...job, existing: false }, existing: false, originalPresent: true };
   });
 }
 
@@ -291,11 +357,24 @@ export async function deleteOriginal(
   now: Date,
   hooks: { afterIntent?: () => Promise<void> } = {},
 ): Promise<boolean> {
+  return (await deleteOriginalDetailed(db, files, job, now, hooks)).deleted;
+}
+
+/** FIX1-FULLREV3(H6 후속): deleteOriginal 과 같은 동작 — 지우지 않았으면 그 이유도 돌려준다(전사 요청의 기존 성공 작업 경로가 화면에 알린다). */
+export type DeleteOriginalOutcome = { deleted: true } | { deleted: false; reason: 'already_deleted' | 'cleanup_pending' | 'attached_to_variant' };
+
+export async function deleteOriginalDetailed(
+  db: Db,
+  files: AssetDeleter,
+  job: Pick<TranscriptionJobRow, 'id' | 'ownerId' | 'assetId'>,
+  now: Date,
+  hooks: { afterIntent?: () => Promise<void> } = {},
+): Promise<DeleteOriginalOutcome> {
   // 앞선 삭제 의도(예: 복구로 바뀐 옛 key)가 남아 있으면 먼저 처리한다 — 표시 칸은 하나다.
   await cleanupPendingDelete(db, files, job.ownerId, job.assetId, now);
   const done = await db.transaction(async (tx) => {
     const a = (await tx.select().from(assets).where(and(eq(assets.id, job.assetId), eq(assets.ownerId, job.ownerId))).for('update'))[0];
-    if (!a || a.deletedAt !== null) return null;
+    if (!a || a.deletedAt !== null) return 'already_deleted' as const;
     if (a.pendingDeleteKey !== null && a.pendingDeleteKey !== a.key) {
       await recordAudit(tx, {
         ownerId: job.ownerId,
@@ -305,7 +384,7 @@ export async function deleteOriginal(
         details: { reason: 'cleanup_pending', job_id: job.id },
         at: now,
       });
-      return null;
+      return 'cleanup_pending' as const;
     }
     if (await assetInUse(tx, job.ownerId, a.id)) {
       await recordAudit(tx, {
@@ -316,17 +395,17 @@ export async function deleteOriginal(
         details: { reason: 'attached_to_variant', job_id: job.id },
         at: now,
       });
-      return null;
+      return 'attached_to_variant' as const;
     }
     await tx.update(assets).set({ deletedAt: now, pendingDeleteKey: a.key, pendingDeleteAttempts: 0, pendingDeleteNextAt: now }).where(and(eq(assets.id, a.id), eq(assets.ownerId, job.ownerId)));
     await recordAudit(tx, { ownerId: job.ownerId, action: 'asset.delete_original', entity: 'asset', entityId: a.id, versionOrHash: a.checksum, details: { job_id: job.id }, at: now });
     return true;
   });
-  if (done !== true) return false;
+  if (done !== true) return { deleted: false, reason: done };
   await hooks.afterIntent?.();
   // 커밋 뒤 파일 삭제(실패해도 표시가 남아 worker 가 다시 시도)
   await cleanupPendingDelete(db, files, job.ownerId, job.assetId, now);
-  return true;
+  return { deleted: true };
 }
 
 /**

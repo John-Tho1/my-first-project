@@ -55,7 +55,7 @@ function compareHash(name: RestoredTable, row: Record<string, unknown>): string 
 }
 import { exportZipPath, getExportRun, readMigrationTags, type BlobStore } from './export';
 import { variantReviewBlockers } from './variants';
-import { invalidateApprovalsForBrandProfile, invalidateApprovalsForRisk, recomputePlanStatus, settleApprovedVariants } from './approval-invalidation';
+import { invalidateApprovalsForBrandProfile, invalidateApprovalsForRisk, recomputePlanStatus, settleApprovedVariants, type RevokedApproval } from './approval-invalidation';
 import { snapshotProblems } from './distribution';
 import { getCurrentBrandProfile } from './writing';
 import { assets, captures, contents, distributionItems, ideas, jobs, publications, restoreRuns, sources } from './schema';
@@ -145,8 +145,14 @@ export interface ApplyReport {
    * `invalidated:brand_changed` 로 무효로 한 것(새 브랜드 버전 훅 invalidateApprovalsForBrandProfile 과 같은 규칙 — 대기 작업 BLOCKED, 항목 PLANNED).
    * revokedApprovals(묶음에서 들어온 승인의 restore_stale)와 따로 둔다 — 복원 훈련은 revokedApprovals 를 묶음 기대값과 정확히 대조한다.
    * FIX2-FULLREV2(G9 fixup): 이미 있던 원고에 '확인 필요' 소재 연결이 들어와 무효로 한 기존 승인도 여기에(reasons ['risk_needs_check']).
+   * FIX1-FULLREV3(H3): partial_job_ids — 이미 일부가 게시됐거나 게시 시도 표식이 있어 실행 전(PLANNED)이 아니라 UNKNOWN(thread_partial_revoked)으로 둔 작업
+   * (revokeActiveApprovalsLocked 의 partialJobIds, 승인 철회 경로의 partial_job_ids·revoked_partial 과 같은 뜻). in_flight — 진행 중(SENDING·REMOTE_PROCESSING·
+   * RECONCILING·CANCEL_REQUESTED) 항목이라 작업·항목 상태는 그대로 두고 승인만 무효로 한 것(FIX1-FULLREV3(H2) — 다음 전송은 approval_missing 으로 멈춘다).
+   * FIX1-FULLREV3(H3 후속): leased_partial_job_ids — lease 만 잡고 보내기 전(LEASED)인데 이미 일부가 게시됐거나 게시 시도 표식이 있는 작업. 작업은 그대로,
+   * 항목도 실행 전(PLANNED)으로 두지 않는다 — 그 작업의 다음 전송은 보내지 않고 결과 불명(UNKNOWN)으로 정해진다(revokeActiveApprovalsLocked 의 leasedPartialJobIds).
+   * 세 칸 모두 옛 미리보기·결과 기록에는 없다(화면은 []·false 로 읽는다).
    */
-  invalidatedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[]; blocked_job_ids: string[] }>;
+  invalidatedApprovals: Array<{ approval_id: string; item_id: string; reasons: string[]; blocked_job_ids: string[]; partial_job_ids?: string[]; leased_partial_job_ids?: string[]; in_flight?: boolean }>;
   /**
    * FIX-T13(Codex review-T13 P1 #4): 복원 뒤 "다시 연결 필요"가 된 계정 — 새로 넣은 연결 이력 계정(linked → needs_reconnect)과,
    * 이미 있던(동일) 계정 중 로컬이 none 인데 묶음이 linked·needs_reconnect 인 계정(연결 이력을 잃지 않게 needs_reconnect 로 올림).
@@ -165,6 +171,23 @@ export interface ReconnectLabel {
 }
 
 const MAX_CONFLICTS_LISTED = 200;
+
+/**
+ * FIX1-FULLREV3(H3): 복원 보고 한 줄 — 부분 게시로 UNKNOWN 에 둔 작업(partial_job_ids)·진행 중 항목(in_flight)을 버리지 않는다.
+ * FIX1-FULLREV3(H3 후속): 부분 게시가 있는 lease 된 작업(leased_partial_job_ids)도 보고하고, in_flight 는 RevokedApproval.inFlight 를 그대로 쓴다
+ * (진행 중 상태 목록을 여기서 따로 베끼지 않는다).
+ */
+function invalidatedEntry(r: RevokedApproval, reason: 'brand_changed' | 'risk_needs_check'): ApplyReport['invalidatedApprovals'][number] {
+  return {
+    approval_id: r.approvalId,
+    item_id: r.itemId,
+    reasons: [reason],
+    blocked_job_ids: r.blockedJobIds,
+    partial_job_ids: r.partialJobIds,
+    leased_partial_job_ids: r.leasedPartialJobIds,
+    in_flight: r.inFlight,
+  };
+}
 
 /**
  * 묶음의 부모 참조(같은 owner 에 있어야 삽입 가능). owned=true 는 부모가 "이번에 넣었거나 동일"일 때만(기존 다른 행에 덧붙이지 않음).
@@ -559,12 +582,13 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
   const brandAfter = await getCurrentBrandProfile(tx, ownerId);
   if (brandAfter && brandAfter.id !== brandBefore) {
     for (const r of await invalidateApprovalsForBrandProfile(tx, ownerId, brandAfter.id, restoreNow)) {
-      invalidatedApprovals.push({ approval_id: r.approvalId, item_id: r.itemId, reasons: ['brand_changed'], blocked_job_ids: r.blockedJobIds });
+      invalidatedApprovals.push(invalidatedEntry(r, 'brand_changed'));
     }
   }
   // FIX2-FULLREV2(G9 fixup, D40-2): add_missing 이 이미 있던(동일) 원고에 위험 표시 '확인 필요' 소재를 잇는 content_captures 행을 넣으면, 그 원고의
   // 기존 활성 승인을 소재 위험 표시 훅(invalidateApprovalsForRisk)과 같은 규칙으로 무효로 한다(invalidated:risk_needs_check — 대기 작업 BLOCKED,
   // 항목 PLANNED, 계획 재계산, 파생본 approved → review). 미리보기는 같은 트랜잭션을 되돌리므로 보고만 한다.
+  // FIX1-FULLREV3(H2·H3): 진행 중 항목의 승인도 무효로 한다(작업·항목 상태 그대로 — in_flight), 부분 게시 작업은 UNKNOWN(partial_job_ids) — 보고에 둘 다 남긴다.
   // 아이디어는 해당 없음: contents.idea_id 는 원고 행의 열이라 기존 원고에는 복원이 바꾸지 않고(UPDATE 없음), 새로 넣은 원고의 승인은 위 재검사가 맡는다.
   const riskLinkedContents = new Set<string>();
   for (const cc of bundle.tables.content_captures as unknown as Array<{ id: string; content_id: string; capture_id: string }>) {
@@ -577,7 +601,7 @@ export async function applyBundle(tx: DbOrTx, ownerId: string, bundle: ParsedBun
     if (cap[0]?.risk === 'needs_check') riskLinkedContents.add(cc.content_id);
   }
   for (const r of await invalidateApprovalsForRisk(tx, ownerId, { contentIds: [...riskLinkedContents].sort() }, restoreNow)) {
-    invalidatedApprovals.push({ approval_id: r.approvalId, item_id: r.itemId, reasons: ['risk_needs_check'], blocked_job_ids: r.blockedJobIds });
+    invalidatedApprovals.push(invalidatedEntry(r, 'risk_needs_check'));
   }
   await settleApprovedVariants(
     tx,

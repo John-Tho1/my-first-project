@@ -254,11 +254,73 @@ describe('state(1회용·10분·같은 브라우저)', () => {
     await expectDenied(await callback(a.callbackUrl, a.flow), 400, 'oidc_state_invalid', 'oidc_invalid', 'state_settings_changed');
   });
 
-  it('callback 주소가 OIDC_REDIRECT_URI 와 다르면(다른 origin) → redirect_mismatch, state 를 보지 않는다', async () => {
+  // FIX1-FULLREV3(H1): 이 시험은 원래 요청 origin 을 127.0.0.1 로 바꿔 redirect_mismatch 를 기대했다. 이제 공개 origin 은 APP_BASE_URL 이
+  // 정본이라 요청 origin 은 비교하지 않는다(운영의 request.url 은 서버 자신의 origin). 같은 강도로 경로 불일치(끝 /·다른 경로)를 확인한다.
+  it('callback 경로가 OIDC_REDIRECT_URI 와 다르면(끝 /·다른 경로) → redirect_mismatch, state 를 보지 않는다', async () => {
     const a = await begin();
-    const other = a.callbackUrl.replace(BASE, 'http://127.0.0.1:3000');
-    await expectDenied(await callback(other, a.flow), 400, 'oidc_state_invalid', 'oidc_invalid', 'redirect_mismatch');
+    for (const other of [
+      a.callbackUrl.replace('/api/auth/oidc/callback?', '/api/auth/oidc/callback/?'),
+      a.callbackUrl.replace('/api/auth/oidc/callback?', '/api/auth/oidc/other?'),
+    ]) {
+      expect(other).not.toBe(a.callbackUrl);
+      await expectDenied(await callback(other, a.flow), 400, 'oidc_state_invalid', 'oidc_invalid', 'redirect_mismatch');
+    }
     expect((await callback(a.callbackUrl, a.flow)).status).toBe(200);
+  });
+});
+
+describe('FIX1-FULLREV3(H1): 운영 배포 형태(next start --hostname 127.0.0.1 + Caddy) — request.url 은 서버 자신의 origin(Next 에 따라 127.0.0.1 또는 localhost)', () => {
+  const PUBLIC = 'https://studio.example.com';
+  const PUBLIC_REDIRECT = `${PUBLIC}/api/auth/oidc/callback`;
+  /** Next 가 route handler 에 주는 request.url 모양: 스킴은 X-Forwarded-Proto, 호스트는 서버 자신(Next 버전에 따라 127.0.0.1:3000 또는 localhost:3000) */
+  const asServerSeen = (url: string, origin = 'https://localhost:3000') => url.replace(PUBLIC, origin);
+
+  it.each(['https://localhost:3000', 'https://127.0.0.1:3000'])('APP_BASE_URL·OIDC_REDIRECT_URI 가 공개 주소이고 요청 URL 이 서버 자신의 origin(%s/…)이어도 redirect_mismatch 없이 로그인된다', async (serverOrigin) => {
+    vi.stubEnv('APP_BASE_URL', PUBLIC);
+    vi.stubEnv('OIDC_REDIRECT_URI', PUBLIC_REDIRECT);
+    const res = await rec(await startRoute.GET(new Request(`${serverOrigin}/api/auth/oidc/start`, { headers: { accept: 'application/json', 'sec-fetch-site': 'same-origin' } })));
+    expect(res.status).toBe(303);
+    const authUrl = res.headers.get('location')!;
+    expect(new URL(authUrl).searchParams.get('redirect_uri')).toBe(PUBLIC_REDIRECT);
+    const cbUrl = idp.authorize(authUrl, GOOD);
+    expect(cbUrl.startsWith(`${PUBLIC_REDIRECT}?`)).toBe(true);
+    const fetchesBefore = idp.calls.length;
+    const before = await sessionCount();
+    const cb = await callback(asServerSeen(cbUrl, serverOrigin), flowCookieOf(res));
+    expect(cb.status, await cb.clone().text()).toBe(200);
+    expect((await cb.json()).ok).toBe(true);
+    expect(await sessionCount()).toBe(before + 1);
+    // 비교를 넘어 IdP 의 token 교환까지 진행했다(가짜 IdP — 실제 네트워크 0)
+    expect(idp.calls.slice(fetchesBefore).some((c) => c.path === '/token')).toBe(true);
+    expect((await audits('auth.login_denied')).filter((r) => (r.sanitizedDetails as { check?: string }).check === 'redirect_mismatch')).toHaveLength(0);
+    expect(await failures()).toBe(0);
+  });
+
+  it('운영 형태에서도 경로가 다르면 redirect_mismatch(실패로 센다), Host·X-Forwarded-Host 로 공개 origin 을 흉내 내도 바뀌지 않는다', async () => {
+    vi.stubEnv('APP_BASE_URL', PUBLIC);
+    vi.stubEnv('OIDC_REDIRECT_URI', PUBLIC_REDIRECT);
+    const res = await startRoute.GET(new Request('https://localhost:3000/api/auth/oidc/start', { headers: { accept: 'application/json', 'sec-fetch-site': 'same-origin' } }));
+    const flow = flowCookieOf(res);
+    const cbUrl = idp.authorize(res.headers.get('location')!, GOOD);
+    const wrongPath = asServerSeen(cbUrl).replace('/api/auth/oidc/callback?', '/api/auth/oidc/callback/?');
+    await expectDenied(
+      await rec(await callbackRoute.GET(new Request(wrongPath, { headers: { accept: 'application/json', cookie: `cs_oidc_flow=${flow}`, host: 'studio.example.com', 'x-forwarded-host': 'studio.example.com' } }))),
+      400,
+      'oidc_state_invalid',
+      'oidc_invalid',
+      'redirect_mismatch',
+    );
+    expect(await failures()).toBe(1);
+    // state 는 보지 않았으므로 맞는 경로로는 그대로 성공
+    expect((await callback(asServerSeen(cbUrl, 'http://127.0.0.1:3000'), flow)).status).toBe(200);
+  });
+
+  it('OIDC_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 이면 준비 안 됨(503 oidc_not_configured) — 요청 origin 이 그 주소여도', async () => {
+    vi.stubEnv('APP_BASE_URL', PUBLIC);
+    vi.stubEnv('OIDC_REDIRECT_URI', 'https://other.example.com/api/auth/oidc/callback');
+    const r = await callback('https://other.example.com/api/auth/oidc/callback?code=x&state=' + 'A'.repeat(43), null);
+    expect(r.status).toBe(503);
+    expect((await r.json()).error).toBe('oidc_not_configured');
   });
 });
 

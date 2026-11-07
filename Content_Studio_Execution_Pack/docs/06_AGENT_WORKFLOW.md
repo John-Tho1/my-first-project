@@ -22,6 +22,7 @@
 5. **보완**(prompts/CLAUDE_FIX.md): 주 세션이 확정 지적을 코드로 재현한 뒤 고친다(직접 또는 보완 서브에이전트). 보완분은 새 검토자로 짧게 재검토한다. 재검토에서 확정된 것도 같은 방식으로 처리한다.
 6. **전체 검사**를 최종 트리에서 순차로 돌리고, 단계별 종료코드를 근거로 삼는다. 묶음 스크립트의 종료코드는 근거가 아니다.
    - install --frozen-lockfile(lockfile 불변), lint, typecheck, build, unit, integration, drill:mock, test-dev-cert.sh
+   - deploy 셸 시험 `bash deploy/scripts/tests/run-all.sh` — root 로는 거부한다(guard.sh). 클라우드 컨테이너처럼 root 셸이면 `setpriv --reuid=nobody --regid=nogroup --clear-groups -- env HOME=/tmp TMPDIR=/tmp bash deploy/scripts/tests/run-all.sh` 로 비root 실행한다(저장소 권한을 넓히지 않는다 — 읽기 권한이 없으면 not_run 으로 남긴다). (FULLREV3 H7 — `TMPDIR=/tmp` 은 root 의 TMPDIR(비root 가 쓸 수 없는 경로)을 물려받지 않게)
    - 검사 중 파일이 바뀌었으면 결과를 쓰지 않고 다시 돌린다.
 7. **gate**: 확정 P0/P1 = 0, 전체 검사 통과(같은 트리), 확정 P2 는 반영 또는 남은 위험으로 기록. 보이지 않는 문자 검사와 지워진 시험 줄 확인을 직접 한다.
 8. 코드 커밋과 docs 전용 커밋(D28)을 나눈다. docs 커밋에는 인계 문서 절(BASE/HEAD 전체 SHA, 처리·시험·명령·남은 위험·검토자에게 물을 것)과 M4_STATUS 를 넣는다. 전체 SHA 는 `git rev-parse` 로 확인해 적는다(짐작 금지).

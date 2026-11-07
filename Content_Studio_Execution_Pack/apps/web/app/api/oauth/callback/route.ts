@@ -1,5 +1,5 @@
 import { completeOAuthCallback } from '@cs/db';
-import { oauthCallbackQuerySchema, OAuthFlowError, requestRedirectTarget } from '@cs/domain';
+import { callbackRedirectTarget, oauthCallbackQuerySchema, OAuthFlowError } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../lib/api';
 import { accountFormFailure, requireMockOAuthReady, oauthDeps, oauthEndpoint } from '../../../../lib/oauth';
 import { getConfig } from '../../../../lib/server';
@@ -31,7 +31,9 @@ export const GET = oauthEndpoint(async (request: Request): Promise<Response> => 
       ownerId: owner.ownerId,
       sessionId: owner.sessionId,
       query: parsed.data,
-      requestTarget: requestRedirectTarget(request.url),
+      // FIX1-FULLREV3(H1): 운영의 request.url 은 서버 자신의 origin(Next 에 따라 127.0.0.1 또는 localhost)이다 — APP_BASE_URL origin + 요청 경로로 비교.
+      // OAUTH_REDIRECT_URI 의 origin 이 APP_BASE_URL 과 다르면 연결 시작에서 이미 503 oauth_redirect_origin_mismatch(FIX1-FULLREV3 H1 후속) — 여기는 방어선.
+      requestTarget: callbackRedirectTarget(config, request.url),
       redirectUri: deps.redirectUri,
       providerFor: deps.providerFor,
       keyring: deps.keyring,

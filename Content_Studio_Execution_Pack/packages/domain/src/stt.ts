@@ -116,6 +116,8 @@ export const transcribeRequestSchema = z
   .object({
     duration_seconds: z.int().min(1).max(MAX_AUDIO_SECONDS).optional(),
     keep_original: z.boolean().optional(),
+    // FIX1-FULLREV3(H6): 이미 성공한 전사가 있는 asset 을 일부러 다시 전사할 때만 true(새 작업·비용 예약). 없거나 false 면 기존 성공 작업을 돌려준다.
+    force: z.boolean().optional(),
   })
   .strict();
 

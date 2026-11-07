@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from './config';
 import {
+  callbackRedirectTarget,
   codeChallengeS256,
   credentialHealth,
   hashOAuthState,
@@ -13,7 +14,9 @@ import {
   LIVE_THREADS_PUBLISH_MARKER,
   isValidThreadsAppId,
   isValidThreadsAppSecret,
+  assertOAuthRedirectOrigin,
   liveOAuthReadiness,
+  oauthRedirectOriginMismatch,
   threadsAppSecretState,
   livePublishReadiness,
   UNBOUND_LIVE_EXTERNAL_PREFIX,
@@ -49,6 +52,21 @@ describe('PKCE·state', () => {
     expect(oauthRedirectUri(loadConfig({}))).toBe('http://localhost:3000/api/oauth/callback');
     expect(oauthRedirectUri(loadConfig({ OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback' }))).toBe('https://studio.example.test/api/oauth/callback');
     expect(requestRedirectTarget('http://localhost:3000/api/oauth/callback?code=x&state=y')).toBe('http://localhost:3000/api/oauth/callback');
+  });
+  it('FIX1-FULLREV3(H1): callback 비교 대상 = APP_BASE_URL origin + 요청 path(요청 origin·query 무시)', () => {
+    const prod = { APP_BASE_URL: 'https://studio.example.com' };
+    // 운영 형태: next start --hostname 127.0.0.1 뒤의 request.url 은 서버 자신의 origin
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/auth/oidc/callback?code=x&state=y')).toBe('https://studio.example.com/api/auth/oidc/callback');
+    expect(callbackRedirectTarget(prod, 'http://127.0.0.1:3000/api/oauth/callback?code=x')).toBe('https://studio.example.com/api/oauth/callback');
+    // APP_BASE_URL 의 경로·query·끝 / 는 쓰지 않는다(origin 만)
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'https://studio.example.com/app/?x=1' }, 'https://localhost:3000/api/oauth/callback')).toBe('https://studio.example.com/api/oauth/callback');
+    // 경로는 요청 그대로 — 다른 경로·끝 / 는 등록값과 달라진다
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/oauth/callback/')).toBe('https://studio.example.com/api/oauth/callback/');
+    expect(callbackRedirectTarget(prod, 'https://localhost:3000/api/oauth/other')).toBe('https://studio.example.com/api/oauth/other');
+    // dev 형태: 요청 origin = APP_BASE_URL 이면 이전(requestRedirectTarget)과 같다
+    const dev = 'http://localhost:3000/api/oauth/callback?code=x&state=y';
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'http://localhost:3000' }, dev)).toBe(requestRedirectTarget(dev));
+    expect(callbackRedirectTarget({ APP_BASE_URL: 'http://127.0.0.1:3000' }, 'http://127.0.0.1:3000/api/auth/oidc/callback')).toBe('http://127.0.0.1:3000/api/auth/oidc/callback');
   });
 });
 
@@ -109,6 +127,8 @@ describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 �
     OAUTH_MODE: 'live',
     // FIX1-LIVET1(Codex review-LIVET1 P2): 숫자 아닌 앱 ID 는 이제 준비 안 됨(THREADS_APP_ID(형식)) — 공급자 생성자와 같은 검증
     THREADS_APP_ID: '000000000000001',
+    // FIX1-FULLREV3(H1 후속): redirect 는 APP_BASE_URL 과 같은 origin 이어야 준비된다 — 공개 주소를 함께 둔다
+    APP_BASE_URL: 'https://studio.example.test',
     OAUTH_REDIRECT_URI: 'https://studio.example.test/api/oauth/callback',
     OAUTH_LIVE_APPROVAL_REF: 'D31',
   } as const;
@@ -137,6 +157,23 @@ describe('live 준비 상태 — 연결(LIVE-T1)과 게시(D31 범위 밖)를 �
   ] as const)('%s 하나만 빠짐 → ready=false, 그 이름 하나만', (_n, cfg, sec, name) => {
     const r = liveOAuthReadiness(loadConfig({ ...FULL, ...cfg } as Record<string, string | undefined>), { threadsAppSecret: 'ok', masterKeyConfigured: true, ...sec });
     expect(r).toEqual({ ready: false, missing: [name] });
+  });
+  it('FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin → OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin) 하나만 · 연결 시작 거부', () => {
+    for (const base of ['http://localhost:3000', 'https://www.studio.example.test', 'https://studio.example.test:8443', 'http://studio.example.test']) {
+      const config = loadConfig({ ...FULL, APP_BASE_URL: base });
+      expect(liveOAuthReadiness(config, { threadsAppSecret: 'ok', masterKeyConfigured: true }, FULL.OAUTH_REDIRECT_URI)).toEqual({
+        ready: false,
+        missing: ['OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)'],
+      });
+      expect(oauthRedirectOriginMismatch(config)).toBe(true);
+      expect(() => assertOAuthRedirectOrigin(config)).toThrow(expect.objectContaining({ code: 'oauth_redirect_origin_mismatch', kind: 'service_unavailable' }));
+    }
+    // 같은 origin(경로 기본값 포함)·설정 없음(기본값 = APP_BASE_URL origin)은 통과
+    const same = loadConfig({ ...FULL, APP_BASE_URL: 'https://studio.example.test/app' });
+    expect(oauthRedirectOriginMismatch(same)).toBe(false);
+    expect(() => assertOAuthRedirectOrigin(same)).not.toThrow();
+    expect(oauthRedirectOriginMismatch(loadConfig({}))).toBe(false);
+    expect(() => assertOAuthRedirectOrigin(loadConfig({ APP_BASE_URL: 'https://studio.example.test' }))).not.toThrow();
   });
   it('FIX1-LIVET1: 등록 redirect URI 를 주면 설정값과 정확히 같아야 한다(불일치 → OAUTH_REDIRECT_URI(불일치)), 형식 검증 함수', () => {
     const config = loadConfig({ ...FULL });

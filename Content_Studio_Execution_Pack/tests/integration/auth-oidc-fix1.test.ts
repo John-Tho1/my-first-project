@@ -107,7 +107,8 @@ describe('P2 callback:172 — 결합 쿠키는 확인된 흐름을 끝낼 때만
   it('관계없는 callback(state 없음·모르는 state·redirect 불일치)은 진행 중 흐름의 쿠키를 지우지 않는다', async () => {
     const jar = new Jar();
     const auth = await start(jar);
-    for (const url of [`${REDIRECT}?code=x`, `${REDIRECT}?code=x&state=${'A'.repeat(43)}`, idp.authorize(auth, USER).replace(BASE, 'http://127.0.0.1:3000')]) {
+    for (const url of [`${REDIRECT}?code=x`, `${REDIRECT}?code=x&state=${'A'.repeat(43)}`, idp.authorize(auth, USER).replace('/api/auth/oidc/callback?', '/api/auth/oidc/callback/?')]) {
+      // FIX1-FULLREV3(H1): redirect 불일치는 이제 경로로 만든다(요청 origin 은 비교하지 않음 — APP_BASE_URL origin 이 정본)
       const res = await callback(url, jar);
       expect(res.status).toBe(400);
       expect(flowCleared(res)).toBe(false);

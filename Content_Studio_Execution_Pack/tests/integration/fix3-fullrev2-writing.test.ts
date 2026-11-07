@@ -41,7 +41,7 @@ import { GET as searchGET } from '../../apps/web/app/api/search/route';
 import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
 import { POST as approvePOST } from '../../apps/web/app/api/distribution-plans/[id]/approve/route';
 import { WRITING_ERROR_TEXT } from '../../apps/web/lib/writing';
-import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
+import { BASE, browserTextareaRaw, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 // react·react-dom 은 apps/web 의 의존성이다(루트 시험에서 직접 import 하지 않음 — fullrev2-risk-needs-check 와 같은 방식).
 const webRequire = createRequire(path.resolve(import.meta.dirname, '../../apps/web/package.json'));
@@ -440,7 +440,7 @@ function conflictForm(html: string): { action: string; fields: Record<string, st
   const [, action, inner] = forms[0]!;
   const fields: Record<string, string> = {};
   for (const m of inner!.matchAll(/<input\b[^>]*\bname="([^"]*)"[^>]*\bvalue="([^"]*)"[^>]*>/g)) fields[unesc(m[1]!)] = unesc(m[2]!);
-  for (const m of inner!.matchAll(/<textarea\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/textarea>/g)) fields[unesc(m[1]!)] = unesc(m[2]!);
+  for (const m of inner!.matchAll(/<textarea\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/textarea>/g)) fields[unesc(m[1]!)] = unesc(browserTextareaRaw(m[2]!)); // FIX1-FULLREV3(H5): 브라우저 파서 규칙
   for (const m of inner!.matchAll(/<select\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/select>/g)) {
     const sel = /<option value="([^"]*)" selected>/.exec(m[2]!) ?? /<option value="([^"]*)"/.exec(m[2]!);
     fields[unesc(m[1]!)] = unesc(sel![1]!);

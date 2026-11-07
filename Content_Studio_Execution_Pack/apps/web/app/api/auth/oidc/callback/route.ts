@@ -3,6 +3,7 @@ import {
   AppError,
   assertLoginNotRateLimited,
   buildSessionCookie,
+  callbackRedirectTarget,
   checkOidcIdentity,
   generateSessionToken,
   hashSessionToken,
@@ -24,7 +25,6 @@ import {
   oidcSettingsFingerprint,
   OidcStateInvalidError,
   readCookie,
-  requestRedirectTarget,
   requireSecretKeyring,
   sessionPolicyFingerprint,
   sessionTtlMs,
@@ -64,7 +64,7 @@ const fail = (reason: Failure['reason'], check: string): Failure => {
  * GET /api/auth/oidc/callback?code&state(|error) — OIDC 로그인 완료(T21-P1b). 인증 없음(로그인 전), state·브라우저 결합 쿠키가 CSRF 를 막는다.
  *
  * 1) AUTH_MODE=oidc·준비 상태 → 2) 전역 로그인 시도 제한 조기 검사(429 — 맞는 callback 이어도, state 를 소비하지 않고 감사 기록 없음)
- * 3) 요청 주소(origin+path) = OIDC_REDIRECT_URI 정확 일치 → 4) state 형식 → 1회용 소비(같은 브라우저 결합 쿠키·10분·설정 지문)
+ * 3) 요청 주소(APP_BASE_URL origin + 요청 path — FIX1-FULLREV3(H1)) = OIDC_REDIRECT_URI 정확 일치 → 4) state 형식 → 1회용 소비(같은 브라우저 결합 쿠키·10분·설정 지문)
  * 5) IdP 의 error 파라미터면 취소 → 6) 라이브러리로 code 교환(PKCE)·ID token 검증(서명·iss·aud·exp·iat·nonce) → 7) 허용 신원(email+email_verified / sub)
  * 8) 전역 잠금 안(withLoginAttemptLock — T21-P1a 와 같은 판정 경로): 재검사(429) → 실패면 auth.login_denied(reason·check) 기록, 성공이면 owner 확인·세션·auth.login 기록.
  * 네트워크(6)는 잠금 밖에서 한다(느린 IdP 가 전역 잠금을 붙잡지 않게).
@@ -90,7 +90,10 @@ export async function GET(request: Request): Promise<Response> {
     let failure: Failure | null = null;
     let claims: { sub: string; email?: unknown; email_verified?: unknown } | null = null;
 
-    if (requestRedirectTarget(request.url) !== settings.redirectUri) {
+    // FIX1-FULLREV3(H1): request.url 의 origin(운영은 서버 자신의 origin — Next 에 따라 127.0.0.1 또는 localhost)이 아니라 APP_BASE_URL origin + 요청 경로로
+    // 비교(정확 일치). OIDC_REDIRECT_URI 는 준비 판정이 APP_BASE_URL origin + 고정 경로와 같을 때만 통과시키므로(다르면 503 oidc_not_configured),
+    // 여기서 걸리는 것은 요청 경로 자체가 다른 경우(방어선)뿐이다.
+    if (callbackRedirectTarget(config, request.url) !== settings.redirectUri) {
       failure = fail('oidc_invalid', 'redirect_mismatch');
     } else {
       const state = params.get('state');

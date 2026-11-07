@@ -87,6 +87,7 @@ const RISK_TEXT: Record<string, string> = { none: '위험 표시 없음', needs_
 /**
  * 긴 입력의 충돌 화면(409, 서버 렌더 HTML). 스크립트 없음, 모든 값 escape.
  * 현재 서버 내용과 내가 입력한 내용을 나란히 보여 주고, 내 입력을 채운 폼으로 현재 revision 기준 재저장을 할 수 있다.
+ * FIX1-FULLREV3(H5): <textarea> 여는 태그 바로 뒤 LF 하나는 HTML 파서가 버리므로 LF 하나를 먼저 넣는다(메모 맨 앞 빈 줄 보존).
  */
 export function renderConflictHtml(
   id: string,
@@ -114,7 +115,7 @@ ${row('위험', RISK_TEXT[current.risk] ?? current.risk, yours.risk ? (RISK_TEXT
 <form method="post" action="/api/captures/${esc(id)}">
 <input type="hidden" name="_method" value="PATCH">
 <input type="hidden" name="expected_revision" value="${current.revision}">
-<label for="user_note">메모</label><textarea id="user_note" name="user_note" rows="6" maxlength="2000">${esc(yours.user_note ?? '')}</textarea>
+<label for="user_note">메모</label><textarea id="user_note" name="user_note" rows="6" maxlength="2000">\n${esc(yours.user_note ?? '')}</textarea>
 <label for="title">제목</label><input id="title" name="title" maxlength="200" value="${esc(yours.title ?? '')}">
 <label for="risk">위험</label><select id="risk" name="risk">${riskOpt('none')}${riskOpt('needs_check')}</select>
 <p><button type="submit">내 입력으로 다시 저장(현재 수정 ${current.revision} 기준)</button> <a href="/captures/${esc(id)}">저장하지 않고 돌아가기</a></p>

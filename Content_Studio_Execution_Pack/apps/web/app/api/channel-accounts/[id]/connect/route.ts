@@ -1,5 +1,5 @@
 import { startOAuthConnect } from '@cs/db';
-import { assertSameOrigin } from '@cs/domain';
+import { assertOAuthRedirectOrigin, assertSameOrigin } from '@cs/domain';
 import { errorResponse, json, seeOther, wantsHtml } from '../../../../../lib/api';
 import { accountFormFailure, oauthDeps } from '../../../../../lib/oauth';
 import { getConfig } from '../../../../../lib/server';
@@ -16,6 +16,7 @@ type Ctx = { params: Promise<{ id: string }> };
  * authorize_url 에는 OAuth 규약상 state·PKCE challenge 가 들어간다(verifier 는 서버에 봉인, state 는 서버에 hash 만).
  * 모의 계정은 모의 공급자(네트워크 없음). LIVE-T1(D31): 실제 Threads 계정은 준비 상태가 모두 갖춰졌을 때만 threads.com 인증 창 주소(이 요청 자체는
  * 외부 호출 없음 — 주소만 만든다), 아니면 503 live_oauth_not_configured(빠진 이름만). 마스터 키가 없으면 503 secrets_not_configured.
+ * FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 이면 모의·실제 모두 503 oauth_redirect_origin_mismatch.
  */
 export async function POST(request: Request, ctx: Ctx): Promise<Response> {
   const html = wantsHtml(request);
@@ -24,6 +25,9 @@ export async function POST(request: Request, ctx: Ctx): Promise<Response> {
     const config = getConfig();
     assertSameOrigin(request, config);
     const owner = await requireOwner(request);
+    // FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 APP_BASE_URL 과 다른 origin 이면 callback 이 언제나 불일치 — 인증 창으로 보내기 전에 503
+    // (state 행·감사 없음, 외부 호출 0). 실제 계정은 준비 상태(liveOAuthReadiness)에도 같은 이름이 나온다.
+    assertOAuthRedirectOrigin(config);
     const deps = oauthDeps(config);
     const r = await startOAuthConnect(owner.db, {
       ownerId: owner.ownerId,

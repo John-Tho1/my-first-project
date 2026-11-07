@@ -17,7 +17,7 @@ import { PATCH as capturePATCH, POST as captureFormPOST } from '../../apps/web/a
 import { PATCH as contentPATCH, POST as contentFormPOST } from '../../apps/web/app/api/contents/[id]/route';
 import { POST as versionsPOST } from '../../apps/web/app/api/contents/[id]/versions/route';
 import { PATCH as ideaPATCH, POST as ideaFormPOST } from '../../apps/web/app/api/ideas/[id]/route';
-import { BASE, cookieHeader, login, ORIGIN_HEADERS } from './helpers';
+import { BASE, browserTextareaRaw, cookieHeader, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 
@@ -82,7 +82,7 @@ function conflictForm(html: string): { action: string; fields: Record<string, st
   const [, action, inner] = forms[0]!;
   const fields: Record<string, string> = {};
   for (const m of inner!.matchAll(/<input\b[^>]*\bname="([^"]*)"[^>]*\bvalue="([^"]*)"[^>]*>/g)) fields[unesc(m[1]!)] = unesc(m[2]!);
-  for (const m of inner!.matchAll(/<textarea\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/textarea>/g)) fields[unesc(m[1]!)] = unesc(m[2]!);
+  for (const m of inner!.matchAll(/<textarea\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/textarea>/g)) fields[unesc(m[1]!)] = unesc(browserTextareaRaw(m[2]!)); // FIX1-FULLREV3(H5): 브라우저 파서 규칙
   for (const m of inner!.matchAll(/<select\b[^>]*\bname="([^"]*)"[^>]*>([\s\S]*?)<\/select>/g)) {
     const sel = /<option value="([^"]*)" selected>/.exec(m[2]!) ?? /<option value="([^"]*)"/.exec(m[2]!);
     fields[unesc(m[1]!)] = unesc(sel![1]!);

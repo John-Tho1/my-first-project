@@ -65,11 +65,15 @@ export const REVOCABLE_ITEM_STATUSES = ['PLANNED', 'QUEUED', 'RETRY_WAIT', 'BLOC
  * FIX1-FULLREV2(G8 후속): SENDING 시도가 보류(표식 전 즉시 중지·auth)로 끝나면 finishSend 가 같은 규칙으로 정한다(blockedUnlessApprovalGone — 승인 없는 BLOCKED 항목은
  * 재시도·다시 승인 둘 다 막혀 막다른 길이 되므로).
  * 이유: beginSend 의 스냅샷 재검사는 "지금" 계정 상태만 본다 — 사용 중지 → 다시 사용처럼 되돌린 계정 변경은 잡지 못해, 진행 중이던 항목만 다시 승인 없이
- * 다음 시도를 보낼 수 있었다(같은 변경에서 대기 항목은 다시 승인해야 함). 편집 훅(원고·파생본·브랜드)은 그대로 — 그 변경은 단조라 beginSend 가 잡는다.
+ * 다음 시도를 보낼 수 있었다(같은 변경에서 대기 항목은 다시 승인해야 함).
+ * FIX1-FULLREV3(H2): 위험 표시 훅(invalidateApprovalsForRisk — '확인 필요')도 같은 목록을 쓴다. 위험 표시도 되돌릴 수 있는 변경이다('확인 필요' → 해제):
+ * beginSend 의 재검사는 "지금" 표시만 보므로, 진행 중 항목의 승인을 남겨 두면 해제 뒤 재개된 다음 전송이 옛 승인으로 게시된다(D40-2 위반).
+ * 편집 훅(원고·파생본·브랜드)은 그대로 — 그 변경은 단조라(새 버전·새 브랜드는 되돌려도 다른 버전) beginSend 의 스냅샷 재검사가 잡는다.
  * UNKNOWN 은 넣지 않는다(재전송 경로가 없다).
  */
 const IN_FLIGHT_ITEM_STATUSES = ['SENDING', 'REMOTE_PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED'] as const;
-const ACCOUNT_INVALIDATION_ITEM_STATUSES: readonly string[] = [...REVOCABLE_ITEM_STATUSES, ...IN_FLIGHT_ITEM_STATUSES];
+/** FIX1-FULLREV3(H2): 되돌릴 수 있는 변경(계정 상태·위험 표시)의 무효화 훅이 보는 항목 상태 — 기본 목록 + 진행 중 상태. */
+const IN_FLIGHT_INCLUSIVE_ITEM_STATUSES: readonly string[] = [...REVOCABLE_ITEM_STATUSES, ...IN_FLIGHT_ITEM_STATUSES];
 /** 철회 시 BLOCKED 로 막는 작업 상태(아직 보내지 않은 대기 작업). */
 const BLOCK_ON_REVOKE_JOB_STATES = ['QUEUED', 'RETRY_WAIT'] as const;
 const isRevocable = (status: string) => (REVOCABLE_ITEM_STATUSES as readonly string[]).includes(status);
@@ -244,6 +248,19 @@ export interface RevokedApproval {
    * UNKNOWN(thread_partial_revoked)으로 둔 작업 — 이 항목은 실행 전(PLANNED)으로 돌아가지 않는다(다시 승인·실행으로 처음부터 다시 보내지 않음).
    */
   partialJobIds: string[];
+  /**
+   * FIX1-FULLREV3(H3 후속): lease 만 잡고 아직 보내기 전인 작업(LEASED) 중 이미 게시된 단계·게시 시도 표식이 있는 작업. 작업은 여기서 건드리지 않고
+   * 항목도 PLANNED 로 두지 않는다(항목은 QUEUED·RETRY_WAIT 그대로) — 그 작업의 보내기 직전 재검사(beginSend)가 보내지 않고 UNKNOWN 으로 정한다.
+   * partialJobIds(지금 UNKNOWN 으로 둔 작업)와 따로 둔다 — 보고·화면이 "실행 전으로"와 구분한다.
+   */
+  leasedPartialJobIds: string[];
+  /** FIX1-FULLREV3(H3): 철회 직전 항목 상태(잠근 값). */
+  itemStatusBefore: string;
+  /**
+   * FIX1-FULLREV3(H3 후속): 철회 직전 항목이 진행 중(IN_FLIGHT_ITEM_STATUSES — SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)이라
+   * 작업·항목 상태는 그대로 두고 승인만 철회했는지. 복원 보고가 이 값을 그대로 쓴다(상태 목록을 따로 베끼지 않는다).
+   */
+  inFlight: boolean;
 }
 
 /** FIX1-FULLREV(F2): 부분 게시 뒤 철회·무효로 남은 게시물을 보내지 않고 UNKNOWN 으로 둔 작업의 사유 코드(취소의 thread_partial_canceled 와 구분). */
@@ -279,7 +296,7 @@ export async function partialSendOf(tx: DbOrTx, ownerId: string, jobId: string):
  * 진행 상태(LEASED·SENDING…)는 여기서 건드리지 않는다: 사용자 철회는 revokeApproval 이 requestCancelLocked 로 CANCEL_REQUESTED 를 기록한다.
  * FIX1-FULLREV(F2 후속): 단, 부분 게시가 있는 LEASED 작업의 항목은 PLANNED 로 두지 않는다(작업은 그대로 — beginSend 가 UNKNOWN 으로 정한다).
  * FIX1-FULLREV2(G8): 계정 무효화는 진행 중 항목(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)도 넘긴다 — 승인만 철회하고 작업·항목 상태는 그대로다
- * (대기 작업이 없으므로 위 갈래에 걸리지 않음).
+ * (대기 작업이 없으므로 위 갈래에 걸리지 않음). FIX1-FULLREV3(H2): 위험 표시('확인 필요') 무효화도 같다.
  * worker 의 전송 직전 재검사(beginSend)는 그대로 최종 방어선이다.
  */
 export async function revokeActiveApprovalsLocked(
@@ -357,7 +374,8 @@ export async function revokeActiveApprovalsLocked(
     // 부분 게시를 확인한다. 있으면 항목을 PLANNED 로 두지 않는다(그 사이 다시 승인·실행하면 새 작업이 이미 게시된 부분을 처음부터 다시 게시).
     // 작업은 전송 단계라 여기서 건드리지 않는다 — 보내기 직전 재검사(beginSend, lease 만료 복구 뒤에도)가 UNKNOWN(thread_partial_revoked)으로 정한다.
     // FIX1-FULLREV(F2 후속2): 보내기 전 lease 만료가 한도에 이르러도 FAILED 가 아니라 UNKNOWN(thread_partial_stopped) — jobs.ts stopUnlessPartial.
-    let leasedPartial = 0;
+    // FIX1-FULLREV3(H3 후속): 개수만이 아니라 작업 ID 를 보고한다(복원 보고가 이 항목을 "실행 전으로"로 잘못 분류하지 않게).
+    const leasedPartialIds: string[] = [];
     if (toPlanned) {
       const leased = await tx
         .select({ id: jobs.id })
@@ -365,9 +383,10 @@ export async function revokeActiveApprovalsLocked(
         .where(and(eq(jobs.ownerId, ownerId), eq(jobs.itemId, item.id), eq(jobs.state, 'LEASED')))
         .orderBy(asc(jobs.id));
       for (const j of leased) {
-        if (await partialSendOf(tx, ownerId, j.id)) leasedPartial++;
+        if (await partialSendOf(tx, ownerId, j.id)) leasedPartialIds.push(j.id);
       }
     }
+    const leasedPartial = leasedPartialIds.length;
     if (partial.length > 0) {
       // 항목은 작업을 따른다(cancelItem 의 settle 과 같음 — UNKNOWN). 계획 상태는 호출자가 다시 계산한다.
       await syncItemStatus(tx, ownerId, item.id, 'UNKNOWN', now);
@@ -406,6 +425,9 @@ export async function revokeActiveApprovalsLocked(
       reason,
       blockedJobIds: queued.map((j) => j.id),
       partialJobIds: partial.map((p) => p.id),
+      leasedPartialJobIds: leasedPartialIds,
+      itemStatusBefore: item.status,
+      inFlight: (IN_FLIGHT_ITEM_STATUSES as readonly string[]).includes(item.status),
     });
   }
   return out;
@@ -475,7 +497,7 @@ export async function settleApprovedVariants(
 
 /**
  * 공통: 조건에 맞는 항목(활성 승인 있음, 기본 REVOCABLE_ITEM_STATUSES)을 잠그고 철회 → 계획 재계산 → 파생본 정리.
- * FIX1-FULLREV2(G8): statuses = 잠근 뒤 다시 거르는 항목 상태(계정 무효화만 진행 중 상태를 더한다).
+ * FIX1-FULLREV2(G8): statuses = 잠근 뒤 다시 거르는 항목 상태(계정 무효화와 FIX1-FULLREV3(H2) 위험 표시 무효화만 진행 중 상태를 더한다).
  */
 async function invalidateWhere(
   tx: DbOrTx,
@@ -554,8 +576,8 @@ export async function invalidateApprovalsForContent(tx: DbOrTx, ownerId: string,
  * IN_FLIGHT_ITEM_STATUSES 설명). 그래서 사용 중지 → 다시 사용 뒤에도 그 항목의 다음 전송은 다시 승인해야 한다(D25-1·docs/04 "사용 중지 = 활성 승인 철회").
  */
 export async function invalidateApprovalsForAccount(tx: DbOrTx, ownerId: string, accountId: string, now: Date): Promise<RevokedApproval[]> {
-  const ids = await itemsWithActiveApproval(tx, ownerId, eq(distributionItems.channelAccountId, accountId), ACCOUNT_INVALIDATION_ITEM_STATUSES);
-  return invalidateWhere(tx, ownerId, ids, 'account_changed', 'review', now, ACCOUNT_INVALIDATION_ITEM_STATUSES);
+  const ids = await itemsWithActiveApproval(tx, ownerId, eq(distributionItems.channelAccountId, accountId), IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
+  return invalidateWhere(tx, ownerId, ids, 'account_changed', 'review', now, IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
 }
 
 /**
@@ -577,6 +599,10 @@ export async function invalidateApprovalsForBrandProfile(tx: DbOrTx, ownerId: st
  * 그 아이디어로 만든 원고(contents.idea_id) 또는 그 소재를 연결한 원고(content_captures)의 파생본을 담은 항목의 활성 승인을
  * `invalidated:risk_needs_check` 로 철회한다(QUEUED 작업 → BLOCKED, 항목 → PLANNED — 다른 편집 훅과 같은 규칙). 본문은 그대로라 승인됨 → review.
  * '확인 필요'를 해제해도 철회한 승인은 되살리지 않는다(다시 승인). 훅을 거치지 않은 변경은 snapshotProblems(risk_needs_check)가 승인·실행·전송 직전에 막는다.
+ * FIX1-FULLREV3(H2): 세 출처(아이디어·소재·복원 contentIds) 모두 진행 중 항목(SENDING·REMOTE_PROCESSING·RECONCILING·CANCEL_REQUESTED)의 승인도 철회한다
+ * (계정 훅과 같은 IN_FLIGHT_INCLUSIVE_ITEM_STATUSES — 작업·항목 상태는 그대로, 지금 시도는 결과를 기록한다). 표시를 해제한 뒤 재개된 다음 전송은
+ * 보내기 직전 approval_missing(stopUnlessPartial: 게시된 것이 없으면 항목 PLANNED, 있으면 UNKNOWN), 보내는 중 시도가 보류로 끝나면 finishSend 의
+ * blockedUnlessApprovalGone 이 같은 규칙으로 정한다.
  */
 export async function invalidateApprovalsForRisk(
   tx: DbOrTx,
@@ -587,8 +613,8 @@ export async function invalidateApprovalsForRisk(
 ): Promise<RevokedApproval[]> {
   if ('contentIds' in source) {
     if (source.contentIds.length === 0) return [];
-    const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, [...source.contentIds]));
-    return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now);
+    const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, [...source.contentIds]), IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
+    return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now, IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
   }
   const contentIds =
     'ideaId' in source
@@ -597,8 +623,8 @@ export async function invalidateApprovalsForRisk(
           .select({ id: contentCaptures.contentId })
           .from(contentCaptures)
           .where(and(eq(contentCaptures.ownerId, ownerId), eq(contentCaptures.captureId, source.captureId)));
-  const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, contentIds));
-  return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now);
+  const ids = await itemsWithActiveApproval(tx, ownerId, inArray(variants.contentId, contentIds), IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
+  return invalidateWhere(tx, ownerId, ids, 'risk_needs_check', 'review', now, IN_FLIGHT_INCLUSIVE_ITEM_STATUSES);
 }
 
 /** 실행 시점 재검사에서 stale 로 판정된 항목(별도 트랜잭션): 사유별로 철회한다. */

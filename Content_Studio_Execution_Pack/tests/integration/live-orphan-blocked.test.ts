@@ -6,6 +6,7 @@
  * + FIX1-FULLREV2(G7): 컨테이너 finished 기록 뒤 24시간 넘게 보류된 작업의 재시도는 표식 전에 상태를 다시 읽어 EXPIRED 면 표식·게시 없이 FAILED.
  * + FIX1-FULLREV2(G8): 원격 처리 중 "실제 게시 계정으로 사용" 중지 → 다시 사용은 그 항목의 승인도 철회 — 재개 뒤 다시 승인 없이 게시하지 않음.
  * + FIX1-FULLREV2(G8 후속): 보내는 중 같은 토글 뒤 그 시도가 표식 전 즉시 중지로 보류돼도 막다른 길(BLOCKED — 재시도·다시 승인 둘 다 409)이 아니라 항목 PLANNED(다시 승인 가능).
+ * + FIX1-FULLREV3(H2): 원격 처리 중 원고의 아이디어 위험 표시 '확인 필요' → 해제도 그 항목의 승인을 철회 — 재개 뒤 다시 승인 없이 게시하지 않음.
  * **실제 네트워크 호출 0**: OAuth 는 fixture(globalThis.fetch 교체), 게시 어댑터에는 fixture fetch 주입. 토큰·시크릿은 가짜(FAKE_…), ID 는 가짜 숫자.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -17,6 +18,7 @@ import { and, asc, eq, isNull } from 'drizzle-orm';
 import {
   closeDb,
   createContent,
+  createIdea,
   createVariantDraft,
   getDb,
   getPlanDetail,
@@ -44,9 +46,10 @@ import { POST as approvePOST } from '../../apps/web/app/api/distribution-plans/[
 import { POST as executePOST } from '../../apps/web/app/api/distribution-plans/[id]/execute/route';
 import { POST as plansPOST } from '../../apps/web/app/api/distribution-plans/route';
 import { GET as callbackGET } from '../../apps/web/app/api/oauth/callback/route';
+import { PATCH as ideaPATCH } from '../../apps/web/app/api/ideas/[id]/route';
 import { blockInfoOf, liveItemHeadline } from '../../apps/web/lib/distribution';
 import { jobCredentials } from '../../apps/web/lib/oauth';
-import { BASE, cookieHeader, jsonPost, login } from './helpers';
+import { BASE, cookieHeader, jsonPost, login, ORIGIN_HEADERS } from './helpers';
 
 const A = 'owner@example.local';
 const KEY = randomBytes(32).toString('base64');
@@ -782,5 +785,73 @@ describe('FIX1-FULLREV2(G8 후속) 실제 게시 변형: 보내는 중 "실제 �
     expect(publishesOf(fx.calls)).toHaveLength(0);
     expect(await jobsOf(p.item.id)).toHaveLength(2);
     expect((await itemOf(p.item.id)).status).toBe('CONFIRMED');
+  });
+});
+
+describe("FIX1-FULLREV3(H2) 실제 게시 변형: 원격 처리 중 아이디어 위험 표시 '확인 필요' → 해제 → 재개해도 다시 승인 없이 게시하지 않음", () => {
+  it("REMOTE_PROCESSING(컨테이너 IN_PROGRESS) → 아이디어 '확인 필요'(PATCH — 승인 invalidated:risk_needs_check, 작업·항목 그대로) → 해제(승인 되살아나지 않음) → 조회 FINISHED·표식 없음 → 재개 → 보내기 직전 approval_missing → 작업 BLOCKED·항목 PLANNED · threads_publish 0 · 다시 승인 가능", async () => {
+    const TEXT = 'FULLREV3 H2 원격 처리 중 위험 표시 글.';
+    const idea = await createIdea(db, owner, { idea: `H2 실제 게시 아이디어 ${randomUUID().slice(0, 6)}` });
+    const { content } = await createContent(db, owner, { title: `H2 ${randomUUID().slice(0, 6)}`, body: TEXT, ideaId: idea.id });
+    const { variant } = await createVariantDraft(db, owner, content.id, { channel: 'threads', baseVersion: 1 });
+    await setVariantLifecycle(db, owner, variant.id, { lifecycle: 'review', baseVersion: 1 });
+    const res = await plansPOST(post('/api/distribution-plans', { items: [{ variant_id: variant.id, channel_account_id: liveAccount }] }));
+    expect(res.status, await res.clone().text()).toBe(201);
+    const pj = (await res.json()) as { plan: { id: string }; items: Array<{ id: string; payload_hash: string }> };
+    const p = { planId: pj.plan.id, item: pj.items[0]! };
+    expect((await approve(p.planId, p.item)).status).toBe(200);
+    const cfg = fullCfg('H2-live', '5');
+    expect((await execute(p.planId)).status).toBe(200);
+    let containerStatus = 'IN_PROGRESS';
+    const fx = publishFixture((ids) => {
+      const r = P(ids);
+      return {
+        ...happy(TEXT)(ids),
+        [r.status]: () => jsonRes(200, { status: containerStatus, id: ids.ct }),
+      };
+    });
+    const reg = registryWith(fx.fetch, cfg);
+    expect((await tickAt(reg, cfg, p.planId, 0)).results).toEqual({ REMOTE_PROCESSING: 1 });
+    const [rp] = await jobsOf(p.item.id);
+    expect(rp).toMatchObject({ state: 'REMOTE_PROCESSING', attempt: 1 });
+    const approvalId = await activeApprovalId(p.item.id);
+
+    const setRisk = async (risk: 'none' | 'needs_check') => {
+      const rev = (await db.select().from(schema.ideas).where(eq(schema.ideas.id, idea.id)))[0]!.revision;
+      const r = await ideaPATCH(
+        new Request(`${BASE}/api/ideas/${idea.id}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', accept: 'application/json', ...ORIGIN_HEADERS, ...cookieHeader(token) },
+          body: JSON.stringify({ expected_revision: rev, risk }),
+        }),
+        ctx(idea.id),
+      );
+      expect(r.status, await r.clone().text()).toBe(200);
+    };
+    await setRisk('needs_check');
+    const ap = (await db.select().from(schema.approvals).where(eq(schema.approvals.id, approvalId)))[0]!;
+    expect(ap.revokedAt).not.toBeNull();
+    expect(ap.revokeReason).toBe('invalidated:risk_needs_check');
+    expect((await jobsOf(p.item.id))[0]).toMatchObject({ id: rp!.id, state: 'REMOTE_PROCESSING', cancelRequestedAt: null });
+    expect((await itemOf(p.item.id)).status).toBe('REMOTE_PROCESSING');
+    await setRisk('none');
+    expect(await db.select().from(schema.approvals).where(and(eq(schema.approvals.distributionItemId, p.item.id), isNull(schema.approvals.revokedAt)))).toHaveLength(0);
+
+    containerStatus = 'FINISHED';
+    expect((await tickAt(reg, cfg, p.planId, 16_000)).results).toEqual({ RETRY_WAIT: 1 });
+    expect((await tickAt(reg, cfg, p.planId, 17_000)).results).toEqual({ BLOCKED: 1 });
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    const [job] = await jobsOf(p.item.id);
+    expect(job).toMatchObject({ id: rp!.id, state: 'BLOCKED', lastErrorCode: 'approval_missing', leaseOwner: null });
+    const last = (await db.select().from(schema.jobEvents).where(eq(schema.jobEvents.jobId, job!.id)).orderBy(asc(schema.jobEvents.eventSeq))).at(-1)!;
+    expect(last).toMatchObject({ stateBefore: 'LEASED', stateAfter: 'BLOCKED' });
+    expect(last.sanitizedDetails).toMatchObject({ transition: 'blocked', reason: 'approval_missing' });
+    expect((await itemOf(p.item.id)).status).toBe('PLANNED');
+    expect((await stepsOf(p.item.id)).map((s) => s.kind)).toEqual(['container']);
+    expect((await tickAt(reg, cfg, p.planId, 20 * 60_000)).results).toEqual({});
+    expect(publishesOf(fx.calls)).toHaveLength(0);
+    // 복구 길: 해제한 뒤 다시 승인(새 승인 기록)
+    const re = await approve(p.planId, p.item);
+    expect(re.status, await re.clone().text()).toBe(200);
   });
 });

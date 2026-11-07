@@ -69,7 +69,9 @@ export function isLoopbackHostname(host) {
  * hostname 을 주지 않았을 때의 dev 기본값 — 언제나 loopback. APP_BASE_URL 의 호스트가 127.0.0.1 이면 127.0.0.1, 그 밖(localhost·없음·잘못된 값)은 localhost.
  * 127.0.0.1 로 고정하지 않는 이유: Next 는 --hostname 값으로 route handler 의 request.url 을 만든다(router-utils/resolve-routes.js 의 initUrl
  * `${protocol}://${hostname || 'localhost'}:${port}`). APP_BASE_URL 이 localhost(기본값·로컬 HTTPS)인데 127.0.0.1 로 띄우면 OAuth callback 의
- * redirect 정확 일치(requestRedirectTarget)가 어긋나 모의·실제 Threads 연결이 oauth_redirect_mismatch 로 실패한다.
+ * redirect 정확 일치(requestRedirectTarget)가 어긋나 모의·실제 Threads 연결이 oauth_redirect_mismatch 로 실패했다.
+ * FIX1-FULLREV3(H1): 이제 callback 은 APP_BASE_URL origin + 요청 경로(callbackRedirectTarget)로 비교하므로 그 이유는 사라졌지만,
+ * 브라우저가 여는 주소와 서버가 아는 주소를 같게 두는 편이 덜 헷갈리므로 기본값은 그대로 둔다.
  * localhost 는 OS 가 loopback(127.0.0.1 또는 ::1)으로 푼다.
  * @param {string | undefined} appBaseUrl
  * @returns {'localhost' | '127.0.0.1'}

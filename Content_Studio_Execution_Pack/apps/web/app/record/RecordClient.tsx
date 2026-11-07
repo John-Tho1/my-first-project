@@ -7,6 +7,8 @@
  * - 전사 목록: 진행 중 작업이 있으면 1.5초마다 GET(inline worker 가 그때 한 단계씩 진행).
  * - FIX3-FULLREV2(G23): 전사 수정 초안은 편집을 시작한 버전(base)을 기억하고 그 base 로 저장한다(stale_transcript 잠금 유지).
  * - FIX3-FULLREV2(G25): 이어 올리기 키는 전사 요청이 성공한 뒤에만 지운다. 업로드 성공 + 전사 요청 실패는 '전사만 다시 요청'.
+ * - FIX1-FULLREV3(H6): 응답을 잃은 전사 요청 — 폴링 목록에 그 asset 의 진행 중·성공 작업이 보이면 '전사만 다시 요청'과 키를 거둔다.
+ *   서버가 기존 성공 작업을 돌려주면(200 existing) 새 요청이 아니라고 안내한다. 이 화면은 force(일부러 다시 전사)를 보내지 않는다.
  */
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
@@ -17,8 +19,12 @@ import {
   editDraft,
   rebaseDraft,
   storedSessionAction,
+  pendingTranscribeSettled,
+  transcribeOriginalNote,
+  type TranscribeOriginalOutcome,
   TRANSCRIBE_RETRY_LABEL,
   transcribeFailureAction,
+  transcribeSettledMessage,
   uploadFailureMessage,
   withConflict,
   type StoredSessionAction,
@@ -173,8 +179,16 @@ export default function RecordClient() {
   const [pollError, setPollError] = useState<string>('');
   const [drafts, setDrafts] = useState<Record<string, TranscriptDraft>>({});
   // FIX3-FULLREV2(G25): 업로드는 끝났고 전사 요청만 실패 — 같은 asset 에 다시 요청한다(이어 올리기 키는 성공 뒤에만 지움).
-  const [pendingTranscribe, setPendingTranscribe] = useState<{ assetId: string; key: string } | null>(null);
+  // FIX1-FULLREV3(H6 후속): keepOriginal — 그 요청의 원음 보존 값(폴링 판정이 원음 보존 끄기 요청을 함부로 거두지 않게)
+  const [pendingTranscribe, setPendingTranscribe] = useState<{ assetId: string; key: string; keepOriginal: boolean } | null>(null);
   const poller = useRef<{ stop: () => void; poke: () => void } | null>(null);
+  // FIX1-FULLREV3(H6): 폴링 콜백(마운트 때 한 번 만든 함수)이 지금 값을 보게 하는 거울. 요청 중(busy)에는 판정하지 않는다.
+  const pendingRef = useRef(pendingTranscribe);
+  const busyRef = useRef(busy);
+  useEffect(() => {
+    pendingRef.current = pendingTranscribe;
+    busyRef.current = busy;
+  }, [pendingTranscribe, busy]);
 
   // FIX-T08(P1): 폴링 루프 — 실패해도 항상 다음 조회를 예약(2초→10초 backoff), 진행 중이면 1.5초, 없으면 10초. 화면을 떠나면 멈춘다.
   useEffect(() => {
@@ -190,6 +204,16 @@ export default function RecordClient() {
       (r) => {
         setJobs(r.jobs);
         setPollError('');
+        // FIX1-FULLREV3(H6): 응답을 잃었지만 서버에 들어간 전사 요청 — 목록에 그 asset 의 진행 중·성공 작업이 보이면 재시도 버튼·키를 거둔다.
+        const pending = pendingRef.current;
+        const settled = pending && !busyRef.current ? pendingTranscribeSettled(pending, r.jobs) : null;
+        if (pending && settled) {
+          writeStored(pending.key, null);
+          pendingRef.current = null;
+          setPendingTranscribe(null);
+          setError('');
+          setStatus(transcribeSettledMessage(settled.state));
+        }
         return { active: r.jobs.some((j) => j.state === 'queued' || j.state === 'running') };
       },
     );
@@ -269,13 +293,19 @@ export default function RecordClient() {
 
   /** 전사 요청. 실패하면 asset 을 남겨 '전사만 다시 요청'으로 재시도하게 하고, 성공한 뒤에만 이어 올리기 키를 지운다(G25). */
   async function requestTranscription(assetId: string, key: string) {
-    setPendingTranscribe({ assetId, key });
+    setPendingTranscribe({ assetId, key, keepOriginal });
     // FIX3-FULLREV2(G25 보강): 파일이 서버에 없거나(404·410) 확인되지 않음(asset_not_verified)이면 같은 asset 재요청은 소용없다 —
     // 성공과 똑같이 키를 지우고 '전사만 다시 요청'도 거둔 뒤 AssetGoneError 로 알린다(호출부가 새 업로드로 넘어가거나 다시 올리라고 안내).
     let gone: ApiCallError | null = null;
     let already = false;
+    let existing: string | null = null;
+    let original: TranscribeOriginalOutcome | null = null;
     try {
-      await call(`/api/assets/${assetId}/transcribe`, jsonInit('POST', { keep_original: keepOriginal }));
+      // FIX1-FULLREV3(H6): force 는 보내지 않는다 — 이미 성공한 전사가 있으면 서버가 그 작업을 돌려준다(200 existing, 새 예약 없음).
+      const r: { existing?: boolean; job?: { state?: string } } & TranscribeOriginalOutcome = await call(`/api/assets/${assetId}/transcribe`, jsonInit('POST', { keep_original: keepOriginal }));
+      if (r.existing === true) existing = r.job?.state ?? 'succeeded';
+      // FIX1-FULLREV3(H6 후속): 원음 보존을 끈 요청이 기존 성공 작업을 만나면 서버가 원본을 지웠는지(또는 왜 못 지웠는지) 알려 준다
+      if (r.existing === true) original = r;
     } catch (e) {
       const action = e instanceof ApiCallError ? transcribeFailureAction(e.status, e.code) : 'retry';
       if (action === 'retry') throw e;
@@ -286,9 +316,11 @@ export default function RecordClient() {
     setPendingTranscribe(null);
     if (gone) throw new AssetGoneError(gone.message);
     setStatus(
-      already
-        ? '이 파일의 전사 작업이 이미 진행 중입니다 — 다시 요청하지 않았습니다. 아래 목록에서 진행률을 확인하세요.'
-        : '전사를 요청했습니다(모의). 아래 목록에서 진행률을 확인하세요.',
+      existing !== null
+        ? transcribeSettledMessage(existing) + transcribeOriginalNote(original)
+        : already
+          ? '이 파일의 전사 작업이 이미 진행 중입니다 — 다시 요청하지 않았습니다. 아래 목록에서 진행률을 확인하세요.'
+          : '전사를 요청했습니다(모의). 아래 목록에서 진행률을 확인하세요.',
     );
     setProgress(null);
     await loadJobs();

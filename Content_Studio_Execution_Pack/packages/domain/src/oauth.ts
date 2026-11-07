@@ -282,7 +282,7 @@ export const codeChallengeS256 = (verifier: string): string => createHash('sha25
 
 /**
  * FIX-T13(Codex P2): redirect URI 는 scheme + host(+port) + path 만(query·fragment·사용자 정보 없음, http/https).
- * callback 은 요청의 origin + path 와 정확히 비교하므로 query 가 있으면 절대 맞을 수 없다 — 설정 검증에서 거부한다.
+ * callback 은 APP_BASE_URL origin + 요청 path(FIX1-FULLREV3(H1) — callbackRedirectTarget)와 정확히 비교하므로 query 가 있으면 절대 맞을 수 없다 — 설정 검증에서 거부한다.
  */
 export function isPlainRedirectUri(raw: string): boolean {
   let u: URL;
@@ -302,10 +302,56 @@ export function oauthRedirectUri(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH
   return `${new URL(config.APP_BASE_URL).origin}/api/oauth/callback`;
 }
 
-/** 요청 URL 에서 query 를 뺀 origin + path(정확 일치 비교용). */
+/**
+ * 요청 URL 에서 query 를 뺀 origin + path. FIX1-FULLREV3(H1): callback 의 redirect 비교에는 쓰지 않는다 —
+ * 운영(`next start --hostname 127.0.0.1` + Caddy)에서 request.url 의 origin 은 서버 자신(Next 에 따라 127.0.0.1 또는 localhost)이라 공개 주소와 절대 같지 않다.
+ * callback 은 callbackRedirectTarget 을 쓴다.
+ */
 export function requestRedirectTarget(url: string): string {
   const u = new URL(url);
   return `${u.origin}${u.pathname}`;
+}
+
+/**
+ * FIX1-FULLREV3(H1): callback 의 redirect 비교 대상 = 설정된 공개 주소(APP_BASE_URL)의 origin + 요청 pathname(query 제외).
+ * request.url 의 origin(운영에서는 서버 자신의 127.0.0.1/localhost)·Host·X-Forwarded-Host 는 믿지 않는다 — 공개 origin 은 설정값이 정본이다.
+ * 등록 redirect URI(OIDC_REDIRECT_URI·OAUTH redirect)와는 여전히 정확 일치로 비교하므로, 경로가 다르거나
+ * redirect URI 가 APP_BASE_URL 과 다른 origin 에 설정돼 있으면 그대로 불일치다.
+ */
+export function callbackRedirectTarget(config: Pick<AppConfig, 'APP_BASE_URL'>, requestUrl: string): string {
+  return `${new URL(config.APP_BASE_URL).origin}${new URL(requestUrl).pathname}`;
+}
+
+/** FIX1-FULLREV3(H1 후속): 준비 상태·연결 시작 거부에 쓰는 이름(값 없음). */
+export const OAUTH_REDIRECT_ORIGIN_MISMATCH = 'OAUTH_REDIRECT_URI(APP_BASE_URL 과 다른 origin)';
+
+/**
+ * FIX1-FULLREV3(H1 후속): OAUTH_REDIRECT_URI 가 설정돼 있고 그 origin 이 APP_BASE_URL 의 origin 과 다른가.
+ * callback 은 APP_BASE_URL origin + 요청 경로(callbackRedirectTarget)를 이 값과 정확히 비교하므로, origin 이 다르면 동의 화면 뒤 callback 이
+ * **언제나** oauth_redirect_mismatch 로 실패한다. 그래서 준비 상태(liveOAuthReadiness)와 연결 시작(assertOAuthRedirectOrigin)이 미리 거부한다.
+ * 형식이 틀린 값은 여기서 보지 않는다(설정 검증·준비 상태의 형식 항목이 따로 잡는다).
+ */
+export function oauthRedirectOriginMismatch(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): boolean {
+  if (!config.OAUTH_REDIRECT_URI) return false;
+  try {
+    return new URL(config.OAUTH_REDIRECT_URI).origin !== new URL(config.APP_BASE_URL).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FIX1-FULLREV3(H1 후속): 계정 연결 시작(모의·실제 모두) 전에 부른다 — origin 이 다르면 공급자 인증 창으로 보내지 않는다
+ * (state 행·감사·authorize URL 없음, 외부 호출 0). 503 oauth_redirect_origin_mismatch.
+ */
+export function assertOAuthRedirectOrigin(config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_REDIRECT_URI'>): void {
+  if (!oauthRedirectOriginMismatch(config)) return;
+  throw new AppError(
+    'service_unavailable',
+    'oauth_redirect_origin_mismatch',
+    `계정 연결 redirect 주소(OAUTH_REDIRECT_URI)가 앱 공개 주소(APP_BASE_URL)와 다른 origin 이라 연결을 시작하지 않았습니다. 연결을 마칠 수 없기 때문입니다. 외부로 아무것도 보내지 않았습니다. (준비 안 됨: ${OAUTH_REDIRECT_ORIGIN_MISMATCH})`,
+    { missing: [OAUTH_REDIRECT_ORIGIN_MISMATCH] },
+  );
 }
 
 export const oauthCallbackQuerySchema = z
@@ -430,12 +476,13 @@ export function threadsAppSecretState(env: Record<string, string | undefined>): 
 /**
  * 실제 Threads 계정 **연결**의 전제 조건(이름만, 값 없음). LIVE-T1(D31): 모두 갖춰지면 ready=true(실제 Threads OAuth 공급자 선택 가능).
  * 조건: OAUTH_MODE=live · THREADS_APP_ID(존재·형식) · THREADS_APP_SECRET(존재·형식) · OAUTH_REDIRECT_URI(설정·형식 — scheme+host+path,
+ * APP_BASE_URL 과 같은 origin(FIX1-FULLREV3(H1 후속)),
  * 등록 redirect 와 일치) · SECRETS_MASTER_KEY · OAUTH_LIVE_APPROVAL_REF. PUBLISH_MODE 는 보지 않는다 — D31 은 PUBLISH_MODE=disabled 로 연결만 승인했다.
  * FIX1-LIVET1(P2): 공급자 선택(resolveOAuthProvider)은 이 함수의 missing 을 그대로 쓴다 — ready === (실제 공급자 선택 성공)(Threads 계정 기준).
  * registeredRedirectUri: callback 이 정확 일치로 비교할 등록 redirect URI(주면 OAUTH_REDIRECT_URI 와 같아야 한다).
  */
 export function liveOAuthReadiness(
-  config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
+  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
   secrets: { threadsAppSecret: ThreadsAppSecretState; masterKeyConfigured: boolean },
   registeredRedirectUri?: string,
 ): LiveOAuthReadiness {
@@ -447,6 +494,8 @@ export function liveOAuthReadiness(
   else if (secrets.threadsAppSecret === 'invalid') missing.push('THREADS_APP_SECRET(형식)');
   if (!config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI');
   else if (!isPlainRedirectUri(config.OAUTH_REDIRECT_URI)) missing.push('OAUTH_REDIRECT_URI(형식)');
+  // FIX1-FULLREV3(H1 후속): APP_BASE_URL 과 다른 origin 이면 callback 이 언제나 불일치 — 동의 화면으로 보내기 전에 준비 안 됨으로 알린다
+  else if (oauthRedirectOriginMismatch(config)) missing.push(OAUTH_REDIRECT_ORIGIN_MISMATCH);
   else if (registeredRedirectUri !== undefined && registeredRedirectUri !== config.OAUTH_REDIRECT_URI) missing.push('OAUTH_REDIRECT_URI(불일치)');
   if (!secrets.masterKeyConfigured) missing.push('SECRETS_MASTER_KEY');
   if (!config.OAUTH_LIVE_APPROVAL_REF) missing.push('OAUTH_LIVE_APPROVAL_REF');
@@ -455,7 +504,7 @@ export function liveOAuthReadiness(
 
 /** 환경에서 비밀 상태를 읽어(값 없이) liveOAuthReadiness 를 부른다 — 화면 표시(web)와 공급자 선택(providers)이 같이 쓴다. */
 export function liveOAuthReadinessFromEnv(
-  config: Pick<AppConfig, 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
+  config: Pick<AppConfig, 'APP_BASE_URL' | 'OAUTH_MODE' | 'THREADS_APP_ID' | 'OAUTH_LIVE_APPROVAL_REF' | 'OAUTH_REDIRECT_URI'>,
   env: Record<string, string | undefined>,
   registeredRedirectUri?: string,
 ): LiveOAuthReadiness {

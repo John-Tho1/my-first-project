@@ -320,8 +320,11 @@ export async function contentRiskFlags(tx: DbOrTx, ownerId: string, contentId: s
  * - 이 잠금이 먼저면 UPDATE 가 승인·실행 커밋을 기다리고, 그 뒤 훅(invalidateApprovalsForRisk)이 커밋된 승인을 보고 철회한다.
  * 잠금 순서: 호출자는 계정(FOR SHARE) 다음, **항목·원고·파생본·계획 잠금 전**에 부른다. 훅 쪽 순서는 아이디어/소재(UPDATE) → 원고 → 파생본 →
  * 계획 → 항목(lockItemsInOrder)이므로 같은 방향이다 — 항목을 쥔 채 아이디어를 기다리는 경로가 없어 교착이 생기지 않는다(훅은 계정을 잠그지 않음).
- * 항목을 먼저 잠그는 전송 직전(beginSend)은 이 잠금을 쓰지 않는다: 거기서 아이디어를 잠그면 훅(아이디어 → 항목)과 순서가 뒤집힌다. 전송 직전의
- * 승인은 이미 커밋돼 있으므로 훅이 그 항목 잠금을 기다렸다가 철회한다(경합이 없다).
+ * 항목을 먼저 잠그는 전송 직전(beginSend)은 이 잠금을 쓰지 않는다: 거기서 아이디어를 잠그면 훅(아이디어 → 항목)과 순서가 뒤집힌다.
+ * FIX1-FULLREV3(H2): 그래서 전송 직전과 훅은 경합한다 — beginSend 가 항목을 쥔 채 (아직 커밋 안 된) 표시 변경 전 값을 읽고 QUEUED → SENDING 으로
+ * 커밋하면, 그 시도는 보낸다(이미 보내기로 정한 한 번 — 계정 훅 G8 과 같은 좁은 시점). 훅은 항목 잠금을 기다린 뒤 SENDING 항목을 보는데,
+ * 진행 중 상태도 철회 대상이라(invalidateApprovalsForRisk 의 IN_FLIGHT_INCLUSIVE_ITEM_STATUSES) 승인을 철회한다. 그 뒤 표시를 해제해도
+ * 다음 전송(재개·재시도)은 보내기 직전 approval_missing 으로, 이 시도가 보류로 끝나면 finishSend 의 blockedUnlessApprovalGone 으로 멈춘다.
  * 항목의 variant_id·파생본의 content_id 는 바뀌지 않으므로 잠금 없이 읽어도 된다. FOR SHARE 는 바깥 FROM(ideas / captures)에만 걸린다.
  */
 export async function lockContentRiskSourcesForItems(tx: DbOrTx, ownerId: string, itemIds: readonly string[]): Promise<void> {

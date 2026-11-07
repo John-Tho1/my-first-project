@@ -39,3 +39,14 @@ export function assetGet(id: string, token?: string): [Request, { params: Promis
     { params: Promise.resolve({ id }) },
   ];
 }
+
+/**
+ * FIX1-FULLREV3(H5): 브라우저가 <textarea>·<pre> 의 원문(여는 태그와 닫는 태그 사이)을 읽는 규칙 — HTML 트리 구성 단계는 여는 태그 바로 뒤
+ * LF 하나(입력 전처리에서 CRLF·CR 도 LF 가 된다)를 버린다. 409 화면 폼을 "사용자가 손대지 않고 다시 제출"하는 시험이 이 규칙을 따라야
+ * 서버가 맨 앞 LF 를 넣지 않았을 때 생기는 빈 줄 손실을 잡는다. raw 는 escape 를 풀기 전 값(escape 는 LF·CR 을 바꾸지 않음).
+ */
+export function browserTextareaRaw(raw: string): string {
+  if (raw.startsWith('\r\n')) return raw.slice(2);
+  if (raw.startsWith('\n') || raw.startsWith('\r')) return raw.slice(1);
+  return raw;
+}

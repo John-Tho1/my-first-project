@@ -229,6 +229,9 @@ export function renderDiffHtml(d: readonly DiffLine[]): string {
 /**
  * 본문 저장 충돌(409): 현재 서버 본문과 내가 쓴 본문을 모두 그대로 보여 주고(A02 원문 손실 없음),
  * 현재→내 본문 diff, 그리고 내 본문이 채워진 재저장 폼(base_version = 현재 버전).
+ * FIX1-FULLREV3(H5): HTML 파서는 <textarea>·<pre> 여는 태그 바로 뒤 LF 하나를 버린다. 그래서 여는 태그 뒤에 LF 하나를 먼저 넣는다 —
+ * 본문이 빈 줄로 시작해도 브라우저가 읽은 값(textarea.value)이 원문과 같고, 다시 저장해도 내용이 다른 새 버전이 생기지 않는다.
+ * 같은 처리를 필드·브랜드 충돌 화면(renderFieldsConflictHtml·renderBrandConflictHtml)과 captures.ts renderConflictHtml 에도 한다.
  */
 export function renderVersionConflictHtml(
   contentId: string,
@@ -242,14 +245,14 @@ export function renderVersionConflictHtml(
 <p class="notice" role="alert">내가 편집을 시작한 뒤(버전 ${yours.base_version}) 다른 곳에서 버전 ${current.version} 이 먼저 저장되었습니다.
 내가 쓴 본문은 아래에 그대로 남아 있습니다. 비교한 뒤 다시 저장하세요.</p>
 <div class="cols">
-<section><h2>현재 서버 본문 (버전 ${current.version})</h2><pre>${esc(current.body)}</pre></section>
-<section><h2>내가 쓴 본문 (버전 ${yours.base_version} 기준)</h2><pre>${esc(yours.body)}</pre></section>
+<section><h2>현재 서버 본문 (버전 ${current.version})</h2><pre>\n${esc(current.body)}</pre></section>
+<section><h2>내가 쓴 본문 (버전 ${yours.base_version} 기준)</h2><pre>\n${esc(yours.body)}</pre></section>
 </div>
 <h2>차이 (현재 버전 ${current.version} → 내 본문)</h2>
 ${renderDiffHtml(diffLines(current.body, yours.body))}
 <form method="post" action="/api/contents/${id}/versions">
 <input type="hidden" name="base_version" value="${current.version}">
-<label for="body">본문(내가 쓴 내용)</label><textarea id="body" name="body" rows="18" maxlength="${MAX_CONTENT_BODY}">${esc(yours.body)}</textarea>
+<label for="body">본문(내가 쓴 내용)</label><textarea id="body" name="body" rows="18" maxlength="${MAX_CONTENT_BODY}">\n${esc(yours.body)}</textarea>
 <label for="note">저장 메모(선택)</label><input id="note" name="note" maxlength="500" value="${esc(yours.note ?? '')}">
 <p><button type="submit">내 본문으로 새 버전 저장(현재 버전 ${current.version} 기준)</button> <a href="/contents/${id}">저장하지 않고 돌아가기</a></p>
 </form>`,
@@ -283,7 +286,7 @@ export function renderFieldsConflictHtml(opts: {
       const label = `<label for="${idAttr}">${esc(f.label)}</label>`;
       const max = f.maxLength ? ` maxlength="${f.maxLength}"` : '';
       if (f.input === 'text') return `${label}<input id="${idAttr}" name="${esc(f.name)}"${max} value="${esc(f.yours)}">`;
-      if (f.input === 'textarea') return `${label}<textarea id="${idAttr}" name="${esc(f.name)}" rows="4"${max}>${esc(f.yours)}</textarea>`;
+      if (f.input === 'textarea') return `${label}<textarea id="${idAttr}" name="${esc(f.name)}" rows="4"${max}>\n${esc(f.yours)}</textarea>`;
       const options = f.input.options
         .map(([v, text]) => `<option value="${esc(v)}"${v === f.yours ? ' selected' : ''}>${esc(text)}</option>`)
         .join('');
@@ -334,7 +337,7 @@ export function renderBrandConflictHtml(opts: { baseVersion: number; currentVers
       const label = `<label for="${idAttr}">${esc(f.label)}</label>`;
       const max = f.maxLength ? ` maxlength="${f.maxLength}"` : '';
       if (f.input === 'text') return `${label}<input id="${idAttr}" name="${esc(f.name)}"${max} value="${esc(f.yours)}">`;
-      if (f.input === 'textarea') return `${label}<textarea id="${idAttr}" name="${esc(f.name)}" rows="${f.rows ?? 4}"${max}>${esc(f.yours)}</textarea>`;
+      if (f.input === 'textarea') return `${label}<textarea id="${idAttr}" name="${esc(f.name)}" rows="${f.rows ?? 4}"${max}>\n${esc(f.yours)}</textarea>`;
       const options = f.input.options
         .map(([v, text]) => `<option value="${esc(v)}"${v === f.yours ? ' selected' : ''}>${esc(text)}</option>`)
         .join('');

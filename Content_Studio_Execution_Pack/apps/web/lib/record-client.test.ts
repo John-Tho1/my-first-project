@@ -12,11 +12,14 @@ import {
   draftSaveBody,
   draftStatus,
   editDraft,
+  pendingTranscribeSettled,
   rebaseDraft,
   STALE_TRANSCRIPT_NOTICE,
   storedSessionAction,
   TRANSCRIBE_RETRY_LABEL,
   transcribeFailureAction,
+  transcribeOriginalNote,
+  transcribeSettledMessage,
   uploadFailureMessage,
   withConflict,
 } from './record-client';
@@ -191,5 +194,75 @@ describe('FIX3-FULLREV2(G25 재검토) — 이미 진행 중(409 transcription_i
     expect(fn).toContain('이 파일의 전사 작업이 이미 진행 중입니다 — 다시 요청하지 않았습니다.');
     // 요청 호출은 한 번뿐(이미 진행 중이면 다시 부르지 않음)
     expect(fn.match(/\/transcribe`/g) ?? []).toHaveLength(1);
+  });
+});
+
+describe('FIX1-FULLREV3(H6) — 응답을 잃은 전사 요청: 폴링 목록에 그 asset 의 작업이 보이면 재시도 버튼·키를 거둔다', () => {
+  const pending = { assetId: 'a-1', key: 'cs-upload:sha256:x' };
+  const job = (asset_id: string, state: string) => ({ id: `${asset_id}-${state}`, asset_id, state });
+
+  it('pendingTranscribeSettled: 같은 asset 의 queued·running·succeeded → 그 작업, failed·canceled·다른 asset·pending 없음 → null', () => {
+    for (const st of ['queued', 'running', 'succeeded']) expect(pendingTranscribeSettled(pending, [job('b', 'running'), job('a-1', st)])).toEqual(job('a-1', st));
+    expect(pendingTranscribeSettled(pending, [job('a-1', 'failed'), job('a-1', 'canceled'), job('b', 'succeeded')])).toBeNull();
+    expect(pendingTranscribeSettled(pending, [])).toBeNull();
+    expect(pendingTranscribeSettled(null, [job('a-1', 'succeeded')])).toBeNull();
+    // 실패 작업 뒤 새 작업이 들어가 있으면 그 새 작업
+    expect(pendingTranscribeSettled(pending, [job('a-1', 'queued'), job('a-1', 'failed')])).toEqual(job('a-1', 'queued'));
+  });
+
+  it('transcribeSettledMessage: 성공 → 이미 끝남(새 비용 예약 없음), 진행 중 → 이미 들어감. 재시도 버튼 문구는 없다', () => {
+    expect(transcribeSettledMessage('succeeded')).toContain('이미 끝났습니다');
+    expect(transcribeSettledMessage('succeeded')).toContain('새 비용 예약 없음');
+    expect(transcribeSettledMessage('running')).toContain('이미 서버에 들어가 있습니다');
+    for (const st of ['succeeded', 'queued']) expect(transcribeSettledMessage(st)).not.toContain(TRANSCRIBE_RETRY_LABEL);
+  });
+
+  it('RecordClient 연결: 폴링 결과에서 pendingTranscribeSettled → 키 삭제·pendingTranscribe 비움·안내, 요청 중(busy)에는 판정 안 함', () => {
+    const s = src();
+    const start = s.indexOf('setJobs(r.jobs);');
+    const end = s.indexOf('return { active:', start);
+    expect(start).toBeGreaterThan(0);
+    const cb = s.slice(start, end);
+    expect(cb).toContain('pending && !busyRef.current ? pendingTranscribeSettled(pending, r.jobs) : null');
+    const iCheck = cb.indexOf('if (pending && settled) {');
+    expect(iCheck).toBeGreaterThan(0);
+    expect(cb.indexOf('writeStored(pending.key, null)')).toBeGreaterThan(iCheck);
+    expect(cb.indexOf('setPendingTranscribe(null)')).toBeGreaterThan(iCheck);
+    expect(cb.indexOf('setStatus(transcribeSettledMessage(settled.state))')).toBeGreaterThan(iCheck);
+    // 폴링 콜백이 지금 값을 보도록 ref 를 맞춘다
+    expect(s).toMatch(/pendingRef\.current = pendingTranscribe;\s*busyRef\.current = busy;/);
+    // 재시도 버튼은 pendingTranscribe 가 있을 때만
+    expect(s).toContain('{pendingTranscribe && !busy ? (');
+  });
+
+  it('RecordClient: 서버의 200 existing 은 새 요청이 아니라고 안내하고, 화면은 force 를 보내지 않는다', () => {
+    const s = src();
+    const fn = s.slice(s.indexOf('async function requestTranscription('), s.indexOf('async function retryTranscription('));
+    expect(fn).toContain("if (r.existing === true) existing = r.job?.state ?? 'succeeded';");
+    expect(fn).toContain('transcribeSettledMessage(existing)');
+    expect(fn).toContain("jsonInit('POST', { keep_original: keepOriginal })");
+    expect(s).not.toMatch(/force\s*:/);
+  });
+  it('FIX1-FULLREV3(H6 후속): 원음 보존을 끈 요청은 원음 보존 작업으로 거두지 않는다(재시도가 원본 처리 결과를 돌려받게), keep_original=false 작업이면 거둔다', () => {
+    const j = (state: string, keep_original: boolean) => ({ id: `${state}-${keep_original}`, asset_id: 'a-1', state, keep_original });
+    expect(pendingTranscribeSettled({ assetId: 'a-1', keepOriginal: false }, [j('succeeded', true)])).toBeNull();
+    expect(pendingTranscribeSettled({ assetId: 'a-1', keepOriginal: false }, [j('succeeded', true), j('running', false)])).toEqual(j('running', false));
+    expect(pendingTranscribeSettled({ assetId: 'a-1', keepOriginal: true }, [j('succeeded', true)])).toEqual(j('succeeded', true));
+    expect(pendingTranscribeSettled({ assetId: 'a-1' }, [j('succeeded', true)])).toEqual(j('succeeded', true));
+  });
+
+  it('FIX1-FULLREV3(H6 후속): transcribeOriginalNote — 지움·첨부라 못 지움·정리 대기·해당 없음', () => {
+    expect(transcribeOriginalNote({ original_deleted: true })).toBe(' 원음 보존을 끈 요청이라 원본 파일을 지웠습니다(전사 본문은 남음, 다운로드는 410).');
+    expect(transcribeOriginalNote({ original_deleted: false, original_kept_reason: 'asset_in_use' })).toContain('채널 초안에 첨부된 파일이라');
+    expect(transcribeOriginalNote({ original_deleted: false, original_kept_reason: 'cleanup_pending' })).toContain('앞선 원본 정리가 아직 끝나지 않았습니다');
+    for (const r of [null, undefined, {}]) expect(transcribeOriginalNote(r)).toBe('');
+  });
+
+  it('FIX1-FULLREV3(H6 후속) RecordClient: 기존 작업 응답의 원본 처리 결과를 안내에 붙이고, 대기 요청에 원음 보존 값을 기억한다', () => {
+    const s = src();
+    const fn = s.slice(s.indexOf('async function requestTranscription('), s.indexOf('async function retryTranscription('));
+    expect(fn).toContain('setPendingTranscribe({ assetId, key, keepOriginal });');
+    expect(fn).toContain('if (r.existing === true) original = r;');
+    expect(fn).toContain('transcribeSettledMessage(existing) + transcribeOriginalNote(original)');
   });
 });

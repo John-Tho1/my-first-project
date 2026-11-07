@@ -387,7 +387,7 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
   it('가격이 있으면 ⌈초 × 1분 가격 / 60⌉ 로 예약·확정(같은 원장·통화)', async () => {
     vi.stubEnv('STT_PRICE_PER_MINUTE', '0.006');
     try {
-      const res = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 90 });
+      const res = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 90, force: true }); // FIX1-FULLREV3(H6): 같은 asset 에 성공 전사가 있어 일부러 다시 전사
       expect(res.status).toBe(202);
       const id = (await res.json()).job.id;
       expect(await ledgerOf(id)).toMatchObject({ state: 'reserved', reservedAmount: '0.009000', currency: 'USD' });
@@ -397,7 +397,7 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
       vi.stubEnv('LLM_BUDGET_MONTHLY_LIMIT', '0.010000');
       const jobs = await n(schema.transcriptionJobs);
       const ledgers = await n(schema.usageLedger);
-      const over = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 90 });
+      const over = await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 90, force: true }); // FIX1-FULLREV3(H6): 같은 asset 에 성공 전사가 있어 일부러 다시 전사
       expect(over.status).toBe(429);
       expect(await n(schema.transcriptionJobs)).toBe(jobs);
       expect(await n(schema.usageLedger)).toBe(ledgers);
@@ -410,7 +410,7 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
   it('실패 주입(NODE_ENV=test, STT_MOCK_FAIL_NEXT=1): failed, 원장은 예약액 확정(failed=true), asset 그대로', async () => {
     vi.stubEnv('STT_PRICE_PER_MINUTE', '0.006');
     try {
-      const id = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60 })).json()).job.id;
+      const id = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60, force: true })).json()).job.id; // FIX1-FULLREV3(H6): 같은 asset 에 성공 전사가 있어 일부러 다시 전사
       await tickJobs(3);
       vi.stubEnv('STT_MOCK_FAIL_NEXT', '1');
       await tickJobs(1);
@@ -431,14 +431,14 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
   it('취소: queued → 예약 해제(released, 0), running → 예약액 확정(failed), 끝난 job 409, 취소 뒤 tick 은 결과를 쓰지 않는다', async () => {
     vi.stubEnv('STT_PRICE_PER_MINUTE', '0.006');
     try {
-      const q = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60 })).json()).job.id;
+      const q = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60, force: true })).json()).job.id; // FIX1-FULLREV3(H6): 같은 asset 에 성공 전사가 있어 일부러 다시 전사
       const c1 = await cancelPOST(bare(`/api/transcription-jobs/${q}/cancel`, tokenA), ctx(q));
       expect(c1.status).toBe(200);
       expect((await c1.json()).job.state).toBe('canceled');
       expect(await ledgerOf(q)).toMatchObject({ state: 'released', actualAmount: '0.000000' });
       expect((await cancelPOST(bare(`/api/transcription-jobs/${q}/cancel`, tokenA), ctx(q))).status).toBe(409);
 
-      const r = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60 })).json()).job.id;
+      const r = (await (await post(transcribePOST, `/api/assets/${assetId}/transcribe`, assetId, { duration_seconds: 60, force: true })).json()).job.id; // FIX1-FULLREV3(H6): 같은 asset 에 성공 전사가 있어 일부러 다시 전사
       await tickJobs(3); // running 75
       expect((await jobOf(r)).state).toBe('running');
       expect((await cancelPOST(bare(`/api/transcription-jobs/${r}/cancel`, tokenA), ctx(r))).status).toBe(200);
@@ -504,7 +504,16 @@ describe('모의 전사 job — 진행·원장·실패·취소', () => {
     const dl = await assetGET(...assetGet(vid, tokenA));
     expect(dl.status).toBe(410);
     expect((await dl.json()).error).toBe('asset_deleted');
-    expect((await post(transcribePOST, `/api/assets/${vid}/transcribe`, vid, {})).status).toBe(410);
+    // FIX1-FULLREV3(H6): 일부러 다시 전사(force)는 원본이 없어 410 — 전과 같다
+    const jobsBefore = await n(schema.transcriptionJobs);
+    const ledgersBefore = await n(schema.usageLedger);
+    expect((await post(transcribePOST, `/api/assets/${vid}/transcribe`, vid, { force: true })).status).toBe(410);
+    // FIX1-FULLREV3(H6): force 가 아닌 재요청(응답을 잃은 화면의 재시도)은 기존 성공 작업을 돌려준다(200 existing, 새 작업·예약 없음)
+    const again = await post(transcribePOST, `/api/assets/${vid}/transcribe`, vid, {});
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ existing: true, job: { id, state: 'succeeded' } });
+    expect(await n(schema.transcriptionJobs)).toBe(jobsBefore);
+    expect(await n(schema.usageLedger)).toBe(ledgersBefore);
     // 전사 본문은 남는다
     expect((await db.select().from(schema.transcripts).where(eq(schema.transcripts.jobId, id))).length).toBe(1);
   });

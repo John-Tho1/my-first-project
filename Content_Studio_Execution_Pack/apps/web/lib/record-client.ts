@@ -4,6 +4,7 @@
  *   (폴링으로 바뀐 최신 번호를 보내면 서버의 stale_transcript 잠금이 무력화된다).
  * - FIX3-FULLREV2(G25): 업로드는 끝났는데 전사 요청만 실패한 경우를 구분한다. 이어 올리기 키는 전사 요청이 성공한 뒤에만 지우고,
  *   저장된 세션이 이미 verified(asset 있음)면 다시 올리지 않고 전사만 요청한다.
+ * - FIX1-FULLREV3(H6): 폴링 목록에 그 asset 의 진행 중·성공 작업이 보이면 '전사만 다시 요청'을 거둔다(pendingTranscribeSettled).
  */
 
 export interface LatestTranscript {
@@ -106,6 +107,52 @@ export function transcribeFailureAction(status: number, code: string | null): 'r
   if (status === 404 || status === 410) return 'reupload';
   if (code === 'not_found' || code === 'asset_deleted' || code === 'asset_not_verified') return 'reupload';
   return 'retry';
+}
+
+/**
+ * FIX1-FULLREV3(H6): 전사 요청이 서버에 커밋됐는데 응답을 잃으면(fetch 오류·커밋 뒤 5xx) '전사만 다시 요청'이 남는다. 폴링한 작업 목록에
+ * 그 asset 의 진행 중(queued·running) 또는 성공(succeeded) 작업이 보이면 요청이 이미 들어간 것으로 본다 — 그 작업을 돌려준다(없으면 null).
+ * 실패·취소 작업만 있으면 null(다시 요청이 맞다). 서버도 같은 asset 에 성공 전사가 있으면 force 없는 요청에 그 작업을 돌려준다(이중 예약 없음).
+ * 작업 목록은 최근 50개뿐이라 그 밖의 오래된 작업은 보지 못한다 — 그때는 서버 쪽 멱등 처리가 막는다.
+ */
+export function pendingTranscribeSettled<J extends { asset_id: string; state: string; keep_original?: boolean }>(
+  pending: { assetId: string; keepOriginal?: boolean } | null,
+  jobs: readonly J[],
+): J | null {
+  if (!pending) return null;
+  return (
+    jobs.find(
+      (j) =>
+        j.asset_id === pending.assetId &&
+        (j.state === 'queued' || j.state === 'running' || j.state === 'succeeded') &&
+        // FIX1-FULLREV3(H6 후속): 원음 보존을 끈 요청이었는데 목록의 작업은 원음 보존 작업이면(그 요청은 기존 성공 작업을 만났을 수 있다 — 서버가 원본을
+        // 지웠는지·첨부라 못 지웠는지는 그 응답에만 있다) 거두지 않는다. '전사만 다시 요청'은 새 작업·예약 없이 원본 처리 결과를 돌려받는다.
+        (pending.keepOriginal !== false || j.keep_original === false),
+    ) ?? null
+  );
+}
+
+/** FIX1-FULLREV3(H6 후속): 서버가 기존 성공 작업을 돌려줄 때의 원본 처리 결과(keep_original=false 요청에서 원본이 아직 있었을 때만 온다). */
+export interface TranscribeOriginalOutcome {
+  original_deleted?: boolean;
+  original_kept_reason?: string;
+}
+
+/** FIX1-FULLREV3(H6 후속): 위 결과의 안내 문구(앞에 공백 포함). 해당 없으면 빈 문자열 — 원본이 어떻게 됐는지 화면이 그대로 말한다. */
+export function transcribeOriginalNote(r: TranscribeOriginalOutcome | null | undefined): string {
+  if (!r || typeof r.original_deleted !== 'boolean') return '';
+  if (r.original_deleted) return ' 원음 보존을 끈 요청이라 원본 파일을 지웠습니다(전사 본문은 남음, 다운로드는 410).';
+  if (r.original_kept_reason === 'asset_in_use') {
+    return ' 원본 파일은 지우지 않았습니다 — 채널 초안에 첨부된 파일이라 원음 보존 끄기를 적용할 수 없습니다. 첨부를 뺀 뒤 다시 요청하세요.';
+  }
+  return ' 원본 파일은 지우지 않았습니다 — 앞선 원본 정리가 아직 끝나지 않았습니다. 잠시 뒤 다시 요청하세요.';
+}
+
+/** FIX1-FULLREV3(H6): 위 판정으로 '전사만 다시 요청'을 거둘 때 · 서버가 기존 성공 작업을 돌려줬을 때의 안내. */
+export function transcribeSettledMessage(state: string): string {
+  return state === 'succeeded'
+    ? '이 파일의 전사는 이미 끝났습니다 — 다시 요청하지 않았습니다(새 비용 예약 없음). 아래 목록에서 결과를 확인하세요.'
+    : '이 파일의 전사 요청은 이미 서버에 들어가 있습니다 — 다시 요청하지 않았습니다. 아래 목록에서 진행률을 확인하세요.';
 }
 
 /** 'reupload' 안내 — 전사만 다시 요청하지 말고 파일을 새로 올리게 한다. */

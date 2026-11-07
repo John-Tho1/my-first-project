@@ -538,3 +538,9 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - Claude 독립 검토 2회: P2 2건 반영, 마지막 확정 0.
 - 전체 검사(단계별 exit 0): unit 89/2260 · integration 78/1328 · drill:mock 위반 0 · dev-cert 472 · deploy 셸 시험 PASS.
 - 남은 위험: 진단 정보 감소, web(Next) route 오류 출력(범위 밖). M4/D20 보류 조건은 그대로다.
+
+## 2026-11-07 — 전체 코드 Claude 독립 검토 4차(FULLREV4, 클라우드 세션)
+- 사용자 선택 "전체 코드 검토 4차". 대상: `bc0e864` 이후 바뀐 코드(HEAD `59f6c26`). 검토자 4 + 검증자 1.
+- 결과: `docs/handoffs/FULLREV4_CLAUDE_REVIEW.md`. P0·P1 없음. 범위 diff 안에서는 확정 0.
+  - 기존 코드에서 확정 P2 1건(J1): 승인 무효화 때 lease 된 작업이 남고, lease 복구와 재승인 뒤 사용자 실행은 409 인데 옛 작업이 새 승인으로 게시된다. 두 번 게시는 없다.
+- 코드는 고치지 않았다. 다음: 권고 FIX1-FULLREV4(J1), 사용자 확인 뒤.

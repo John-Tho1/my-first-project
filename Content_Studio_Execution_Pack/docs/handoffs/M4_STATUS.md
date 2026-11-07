@@ -485,3 +485,9 @@ Threads·YouTube 모의 연결, /ops 계정 집계, 배포 계획 생성(예약 
 - 삭제한 것: 상위 `scripts/codex-*.sh`·`link-check.sh`·`.codex/config.toml.example`, 앱 `codex-review-commit.sh`·`codex-review-queue.sh`·그 시험.
 - Codex 대기열·ChatGPT 프롬프트는 종료 표시(이력 보존)를 붙였다. 22번은 Claude 반박 검토(확정 0)로 대신했다.
 - 다음 작업부터 검증 기록은 "Claude 독립 검토"로 적는다.
+
+## 2026-11-07 — 전체 코드 Claude 독립 검토 3차(FULLREV3, 클라우드 세션)
+- 사용자 지시 "계속 진행해줘" → 선택 "전체 코드 검토 3차". 대상 bc0e864. Claude 독립 검토(D42)이며, 검토자 7 + 검증자 11 이 참여했다.
+- 결과: `docs/handoffs/FULLREV3_CLAUDE_REVIEW.md` — 확정 8(**P1 1**·P2 7), P0 없음, 기각 1.
+  - P1 H1: 문서대로 운영 배포하면 OIDC 로그인과 계정 연결 콜백이 항상 redirect 불일치다(Next `request.url` 호스트가 서버 설정 — 실제 실험으로 재현). 운영 배포(D37) 전에 꼭 고쳐야 한다.
+- 코드는 아직 고치지 않았다. 다음: 권고 수정 묶음 FIX1-FULLREV3(사용자 확인 뒤).
